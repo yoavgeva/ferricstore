@@ -260,10 +260,7 @@ impl Store {
     /// subsequently fails, the backend is in an inconsistent state — which
     /// matches Bitcask's crash-recovery contract (log replay on reopen
     /// reconciles the keydir with what is actually on disk).
-    pub fn prepare_batch_for_async(
-        &mut self,
-        entries: &[(&[u8], &[u8], u64)],
-    ) -> Vec<Vec<u8>> {
+    pub fn prepare_batch_for_async(&mut self, entries: &[(&[u8], &[u8], u64)]) -> Vec<Vec<u8>> {
         use crate::log::encode_record;
 
         let encoded: Vec<Vec<u8>> = entries
@@ -409,9 +406,7 @@ impl Store {
             self.keydir.delete(key);
         }
         if count > 0 {
-            self.writer
-                .sync()
-                .map_err(|e| StoreError(e.to_string()))?;
+            self.writer.sync().map_err(|e| StoreError(e.to_string()))?;
         }
         Ok(count)
     }
@@ -482,7 +477,8 @@ fn replay_log(log_path: &Path, file_id: u64, keydir: &mut KeyDir) -> Result<()> 
 }
 
 fn now_ms() -> u64 {
-    #[allow(clippy::cast_possible_truncation)] // millis won't exceed u64::MAX until year 584 million
+    #[allow(clippy::cast_possible_truncation)]
+    // millis won't exceed u64::MAX until year 584 million
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -700,9 +696,7 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
 
         // Put 10 entries in one batch — all committed with one fsync
-        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0u8..10)
-            .map(|i| (vec![i], vec![i * 2]))
-            .collect();
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0u8..10).map(|i| (vec![i], vec![i * 2])).collect();
         let entries: Vec<(&[u8], &[u8], u64)> = pairs
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice(), 0u64))
@@ -720,9 +714,8 @@ mod tests {
 
         {
             let mut store = Store::open(dir.path()).unwrap();
-            let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0u8..5)
-                .map(|i| (vec![i], vec![i + 100]))
-                .collect();
+            let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+                (0u8..5).map(|i| (vec![i], vec![i + 100])).collect();
             let entries: Vec<(&[u8], &[u8], u64)> = pairs
                 .iter()
                 .map(|(k, v)| (k.as_slice(), v.as_slice(), 0u64))
@@ -760,9 +753,7 @@ mod tests {
         {
             let mut store = Store::open(dir.path()).unwrap();
             for i in 0u32..1000 {
-                store
-                    .put(b"hotkey", format!("v{i}").as_bytes(), 0)
-                    .unwrap();
+                store.put(b"hotkey", format!("v{i}").as_bytes(), 0).unwrap();
             }
         }
 
@@ -804,10 +795,7 @@ mod tests {
         let dir = tmp();
         let mut store = Store::open(dir.path()).unwrap();
         let future_ms = now_ms() + 60_000;
-        let pairs: Vec<(&[u8], &[u8], u64)> = vec![
-            (b"a", b"1", future_ms),
-            (b"b", b"2", 0),
-        ];
+        let pairs: Vec<(&[u8], &[u8], u64)> = vec![(b"a", b"1", future_ms), (b"b", b"2", 0)];
         store.put_batch(&pairs).unwrap();
         assert_eq!(store.get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(store.get(b"b").unwrap(), Some(b"2".to_vec()));
@@ -818,10 +806,8 @@ mod tests {
         let dir = tmp();
         let mut store = Store::open(dir.path()).unwrap();
         let past_ms = now_ms().saturating_sub(1);
-        let pairs: Vec<(&[u8], &[u8], u64)> = vec![
-            (b"expired", b"val", past_ms),
-            (b"live", b"val", 0),
-        ];
+        let pairs: Vec<(&[u8], &[u8], u64)> =
+            vec![(b"expired", b"val", past_ms), (b"live", b"val", 0)];
         store.put_batch(&pairs).unwrap();
         assert!(store.get(b"expired").unwrap().is_none());
         assert!(store.get(b"live").unwrap().is_some());
@@ -835,10 +821,7 @@ mod tests {
 
         {
             let mut store = Store::open(dir.path()).unwrap();
-            let pairs: Vec<(&[u8], &[u8], u64)> = vec![
-                (b"k", b"first", 0),
-                (b"k", b"second", 0),
-            ];
+            let pairs: Vec<(&[u8], &[u8], u64)> = vec![(b"k", b"first", 0), (b"k", b"second", 0)];
             store.put_batch(&pairs).unwrap();
         }
 
@@ -857,8 +840,10 @@ mod tests {
             let kv: Vec<(Vec<u8>, Vec<u8>)> = (0u8..100)
                 .map(|i| (vec![i], vec![i.wrapping_mul(3)]))
                 .collect();
-            let pairs: Vec<(&[u8], &[u8], u64)> =
-                kv.iter().map(|(k, v)| (k.as_slice(), v.as_slice(), 0u64)).collect();
+            let pairs: Vec<(&[u8], &[u8], u64)> = kv
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice(), 0u64))
+                .collect();
             store.put_batch(&pairs).unwrap();
         }
 
@@ -1330,9 +1315,7 @@ mod tests {
 
         // The log file must also exist and the first record must be readable,
         // confirming the data was flushed before the hint was written.
-        let log_path = dir
-            .path()
-            .join(format!("{:020}.log", store.active_file_id));
+        let log_path = dir.path().join(format!("{:020}.log", store.active_file_id));
         let mut reader = crate::log::LogReader::open(&log_path).unwrap();
         let record = reader.read_at(0).unwrap();
         assert!(
@@ -1363,8 +1346,14 @@ mod tests {
         let count = store.purge_expired().unwrap();
         assert_eq!(count, 2, "purge_expired must report 2 purged keys");
 
-        assert!(store.get(b"expired1").unwrap().is_none(), "expired1 must be gone");
-        assert!(store.get(b"expired2").unwrap().is_none(), "expired2 must be gone");
+        assert!(
+            store.get(b"expired1").unwrap().is_none(),
+            "expired1 must be gone"
+        );
+        assert!(
+            store.get(b"expired2").unwrap().is_none(),
+            "expired2 must be gone"
+        );
         assert_eq!(
             store.get(b"live1").unwrap(),
             Some(b"v".to_vec()),
@@ -1534,15 +1523,19 @@ mod tests {
             assert_eq!(records.len(), 5, "expected 5 records before truncation");
 
             // Compute offset of 3rd record (index 2).
-            let rec0_len =
-                (crate::log::HEADER_SIZE + records[0].key.len() + records[0].value.as_ref().map_or(0, Vec::len)) as u64;
-            let rec1_len =
-                (crate::log::HEADER_SIZE + records[1].key.len() + records[1].value.as_ref().map_or(0, Vec::len)) as u64;
+            let rec0_len = (crate::log::HEADER_SIZE
+                + records[0].key.len()
+                + records[0].value.as_ref().map_or(0, Vec::len)) as u64;
+            let rec1_len = (crate::log::HEADER_SIZE
+                + records[1].key.len()
+                + records[1].value.as_ref().map_or(0, Vec::len)) as u64;
             let rec2_start = rec0_len + rec1_len;
             // Truncate to halfway through the 3rd record.
-            let rec2_half_len =
-                (crate::log::HEADER_SIZE + records[2].key.len() + records[2].value.as_ref().map_or(0, Vec::len)) as u64
-                    / 2;
+            let rec2_half_len = (crate::log::HEADER_SIZE
+                + records[2].key.len()
+                + records[2].value.as_ref().map_or(0, Vec::len))
+                as u64
+                / 2;
             let truncate_at = rec2_start + rec2_half_len;
 
             let file = std::fs::OpenOptions::new()
@@ -1567,9 +1560,18 @@ mod tests {
             "key1 must survive"
         );
         // Records 2-4 must be gone (tolerant reader stopped at first error).
-        assert!(store.get(b"key2").unwrap().is_none(), "key2 must be gone after truncation");
-        assert!(store.get(b"key3").unwrap().is_none(), "key3 must be gone after truncation");
-        assert!(store.get(b"key4").unwrap().is_none(), "key4 must be gone after truncation");
+        assert!(
+            store.get(b"key2").unwrap().is_none(),
+            "key2 must be gone after truncation"
+        );
+        assert!(
+            store.get(b"key3").unwrap().is_none(),
+            "key3 must be gone after truncation"
+        );
+        assert!(
+            store.get(b"key4").unwrap().is_none(),
+            "key4 must be gone after truncation"
+        );
         let _ = offsets;
     }
 
@@ -1595,7 +1597,10 @@ mod tests {
                 "offset must increase after put {i}"
             );
         }
-        assert_eq!(store.writer.offset, expected_offset, "final offset must equal sum of record sizes");
+        assert_eq!(
+            store.writer.offset, expected_offset,
+            "final offset must equal sum of record sizes"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1648,7 +1653,10 @@ mod tests {
         // Empty key with non-empty value should work.
         store.put(b"", b"non_empty_value", 0).unwrap();
         let result = store.get(b"").unwrap();
-        assert!(result.is_some(), "empty key with non-empty value must be retrievable");
+        assert!(
+            result.is_some(),
+            "empty key with non-empty value must be retrievable"
+        );
     }
 
     #[test]
@@ -1669,7 +1677,11 @@ mod tests {
         let key = b"\x00\x01\x02";
         store.put(key, b"null_key_val", 0).unwrap();
         let result = store.get(key).unwrap();
-        assert_eq!(result, Some(b"null_key_val".to_vec()), "key with null bytes must round-trip");
+        assert_eq!(
+            result,
+            Some(b"null_key_val".to_vec()),
+            "key with null bytes must round-trip"
+        );
     }
 
     #[test]
@@ -1688,7 +1700,10 @@ mod tests {
         store.put(b"present", b"val", 0).unwrap();
         let result = store.delete(b"present").unwrap();
         assert!(result, "delete on existing key must return true");
-        assert!(store.get(b"present").unwrap().is_none(), "key must be gone after delete");
+        assert!(
+            store.get(b"present").unwrap().is_none(),
+            "key must be gone after delete"
+        );
     }
 
     #[test]
@@ -1729,8 +1744,10 @@ mod tests {
         let kv: Vec<(Vec<u8>, Vec<u8>)> = (0u8..20)
             .map(|i| (format!("bk{i}").into_bytes(), format!("bv{i}").into_bytes()))
             .collect();
-        let entries: Vec<(&[u8], &[u8], u64)> =
-            kv.iter().map(|(k, v)| (k.as_slice(), v.as_slice(), 0u64)).collect();
+        let entries: Vec<(&[u8], &[u8], u64)> = kv
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice(), 0u64))
+            .collect();
         store.put_batch(&entries).unwrap();
         for (k, v) in &kv {
             assert_eq!(
@@ -1747,10 +1764,8 @@ mod tests {
         let dir = tmp();
         let mut store = Store::open(dir.path()).unwrap();
         let past_ms = now_ms().saturating_sub(2000);
-        let entries: Vec<(&[u8], &[u8], u64)> = vec![
-            (b"exp_batch", b"val", past_ms),
-            (b"live_batch", b"val", 0),
-        ];
+        let entries: Vec<(&[u8], &[u8], u64)> =
+            vec![(b"exp_batch", b"val", past_ms), (b"live_batch", b"val", 0)];
         store.put_batch(&entries).unwrap();
         assert!(
             store.get(b"exp_batch").unwrap().is_none(),
@@ -1800,8 +1815,14 @@ mod tests {
         store.put(b"gone", b"v", past_ms).unwrap();
         store.put(b"here", b"v", 0).unwrap();
         let keys = store.keys();
-        assert!(!keys.contains(&b"gone".to_vec()), "expired key must not appear in keys()");
-        assert!(keys.contains(&b"here".to_vec()), "live key must appear in keys()");
+        assert!(
+            !keys.contains(&b"gone".to_vec()),
+            "expired key must not appear in keys()"
+        );
+        assert!(
+            keys.contains(&b"here".to_vec()),
+            "live key must appear in keys()"
+        );
         assert_eq!(keys.len(), 1, "keys() must return exactly 1 live key");
     }
 
@@ -1833,9 +1854,18 @@ mod tests {
         store.purge_expired().unwrap();
 
         let keys = store.keys();
-        assert!(!keys.contains(&b"exp_a".to_vec()), "exp_a must not be in keys after purge");
-        assert!(!keys.contains(&b"exp_b".to_vec()), "exp_b must not be in keys after purge");
-        assert!(keys.contains(&b"live_x".to_vec()), "live_x must still be in keys after purge");
+        assert!(
+            !keys.contains(&b"exp_a".to_vec()),
+            "exp_a must not be in keys after purge"
+        );
+        assert!(
+            !keys.contains(&b"exp_b".to_vec()),
+            "exp_b must not be in keys after purge"
+        );
+        assert!(
+            keys.contains(&b"live_x".to_vec()),
+            "live_x must still be in keys after purge"
+        );
         assert_eq!(keys.len(), 1);
     }
 

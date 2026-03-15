@@ -13,9 +13,9 @@ use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
 use rustler::LocalPid;
+use std::sync::atomic::AtomicU64;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
-use std::sync::atomic::AtomicU64;
 
 use store::Store;
 
@@ -100,7 +100,11 @@ fn new(env: Env, path: String) -> NifResult<Term> {
 /// Get a value by key. Returns `{:ok, value}`, `{:ok, :nil}`, or `{:error, reason}`.
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn get<'a>(env: Env<'a>, resource: ResourceArc<StoreResource>, key: Binary<'a>) -> NifResult<Term<'a>> {
+fn get<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    key: Binary<'a>,
+) -> NifResult<Term<'a>> {
     let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
     match store.get(key.as_slice()) {
         Ok(Some(value)) => {
@@ -256,7 +260,11 @@ fn put_batch_async<'a>(
 /// Delete a key. Returns `{:ok, true}`, `{:ok, false}` (not found), or `{:error, reason}`.
 #[rustler::nif(schedule = "DirtyIo")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn delete<'a>(env: Env<'a>, resource: ResourceArc<StoreResource>, key: Binary<'a>) -> NifResult<Term<'a>> {
+fn delete<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    key: Binary<'a>,
+) -> NifResult<Term<'a>> {
     let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
     match store.delete(key.as_slice()) {
         Ok(true) => Ok((atoms::ok(), atoms::true_()).encode(env)),

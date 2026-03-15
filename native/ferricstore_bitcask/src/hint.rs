@@ -220,9 +220,7 @@ fn read_hint_entry(reader: &mut impl Read) -> Result<Option<HintEntry>> {
 
     // Read the fixed-size body header (30 bytes).
     let mut header = [0u8; HINT_BODY_HEADER_SIZE];
-    reader
-        .read_exact(&mut header)
-        .map_err(HintError::from)?;
+    reader.read_exact(&mut header).map_err(HintError::from)?;
 
     let file_id = u64::from_le_bytes(
         header[0..8]
@@ -521,15 +519,24 @@ mod tests {
         // Write a second hint file with "new_key" over the same path.
         {
             let mut writer = HintWriter::open(&path).unwrap();
-            writer.write_entry(&sample_entry(b"new_key", 2, 128)).unwrap();
+            writer
+                .write_entry(&sample_entry(b"new_key", 2, 128))
+                .unwrap();
             writer.commit().unwrap();
         }
 
         // Only "new_key" must be present.
         let mut reader = HintReader::open(&path).unwrap();
         let entries = reader.read_all().unwrap();
-        assert_eq!(entries.len(), 1, "only new_key should be present after second commit");
-        assert_eq!(entries[0].key, b"new_key", "old_key must be replaced by new_key");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only new_key should be present after second commit"
+        );
+        assert_eq!(
+            entries[0].key, b"new_key",
+            "old_key must be replaced by new_key"
+        );
 
         // No .tmp file should remain after a successful commit.
         assert!(
@@ -717,7 +724,11 @@ mod tests {
         let mut reader = HintReader::open(&path).unwrap();
         let entries = reader.read_all().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key, Vec::<u8>::new(), "empty key must round-trip");
+        assert_eq!(
+            entries[0].key,
+            Vec::<u8>::new(),
+            "empty key must round-trip"
+        );
         assert_eq!(entries[0].file_id, 1);
         assert_eq!(entries[0].value_size, 5);
     }
@@ -768,7 +779,9 @@ mod tests {
 
         {
             let mut writer = HintWriter::open(&path).unwrap();
-            writer.write_entry(&sample_entry(b"committed", 1, 0)).unwrap();
+            writer
+                .write_entry(&sample_entry(b"committed", 1, 0))
+                .unwrap();
             writer.commit().unwrap();
         }
 
@@ -789,11 +802,16 @@ mod tests {
 
         {
             let mut writer = HintWriter::open(&path).unwrap();
-            writer.write_entry(&sample_entry(b"uncommitted", 1, 0)).unwrap();
+            writer
+                .write_entry(&sample_entry(b"uncommitted", 1, 0))
+                .unwrap();
             // Drop without commit.
         }
 
-        assert!(!path.exists(), "final .hint must not exist when commit was never called");
+        assert!(
+            !path.exists(),
+            "final .hint must not exist when commit was never called"
+        );
         assert!(!tmp_path.exists(), ".hint.tmp must be cleaned up by Drop");
     }
 
@@ -860,7 +878,9 @@ mod tests {
 
         {
             let mut writer = HintWriter::open(&path).unwrap();
-            writer.write_entry(&sample_entry(b"crc_load_test", 1, 0)).unwrap();
+            writer
+                .write_entry(&sample_entry(b"crc_load_test", 1, 0))
+                .unwrap();
             writer.commit().unwrap();
         }
 

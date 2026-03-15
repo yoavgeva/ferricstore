@@ -19,9 +19,9 @@ use std::path::Path;
 
 // On Linux, bring in the uring backend modules.
 #[cfg(target_os = "linux")]
-pub mod uring;
-#[cfg(target_os = "linux")]
 pub mod async_uring;
+#[cfg(target_os = "linux")]
+pub mod uring;
 
 /// Synchronous, blocking I/O interface for the append-only log.
 ///
@@ -104,10 +104,7 @@ impl SyncBackend {
     /// Returns an `io::Error` if the file cannot be opened or its size cannot
     /// be determined.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         let offset = file.metadata()?.len();
         Ok(Self {
             writer: BufWriter::new(file),
@@ -230,7 +227,11 @@ mod tests {
         }
 
         let backend = SyncBackend::open(&path).unwrap();
-        assert_eq!(backend.offset(), 4, "offset must resume at file size after reopen");
+        assert_eq!(
+            backend.offset(),
+            4,
+            "offset must resume at file size after reopen"
+        );
     }
 
     #[test]
@@ -285,11 +286,19 @@ mod tests {
 
         let off0 = backend.append(&data10).unwrap();
         assert_eq!(off0, 0, "first append must start at 0");
-        assert_eq!(backend.offset(), 10, "offset must be 10 after 10-byte append");
+        assert_eq!(
+            backend.offset(),
+            10,
+            "offset must be 10 after 10-byte append"
+        );
 
         let off1 = backend.append(&data20).unwrap();
         assert_eq!(off1, 10, "second append must start at 10");
-        assert_eq!(backend.offset(), 30, "offset must be 30 after 20-byte append");
+        assert_eq!(
+            backend.offset(),
+            30,
+            "offset must be 30 after 20-byte append"
+        );
 
         let off2 = backend.append(&data30).unwrap();
         assert_eq!(off2, 30, "third append must start at 30");
@@ -307,7 +316,10 @@ mod tests {
         backend.sync().unwrap();
 
         let contents = std::fs::read(&path).unwrap();
-        assert_eq!(contents, b"hello", "data must be readable from disk after sync");
+        assert_eq!(
+            contents, b"hello",
+            "data must be readable from disk after sync"
+        );
     }
 
     /// append_batch_and_sync with an empty slice returns an empty offsets vec.
@@ -318,8 +330,15 @@ mod tests {
         let mut backend = SyncBackend::open(&path).unwrap();
 
         let offsets = backend.append_batch_and_sync(&[]).unwrap();
-        assert!(offsets.is_empty(), "empty batch must return empty offset vec");
-        assert_eq!(backend.offset(), 0, "offset must remain 0 after empty batch");
+        assert!(
+            offsets.is_empty(),
+            "empty batch must return empty offset vec"
+        );
+        assert_eq!(
+            backend.offset(),
+            0,
+            "offset must remain 0 after empty batch"
+        );
     }
 
     /// Batch ["abc", "de", "f"] → starting offsets [0, 3, 5].
@@ -332,7 +351,11 @@ mod tests {
         let bufs: &[&[u8]] = &[b"abc", b"de", b"f"];
         let offsets = backend.append_batch_and_sync(bufs).unwrap();
 
-        assert_eq!(offsets, vec![0, 3, 5], "batch offsets must match cumulative lengths");
+        assert_eq!(
+            offsets,
+            vec![0, 3, 5],
+            "batch offsets must match cumulative lengths"
+        );
         assert_eq!(backend.offset(), 6, "final offset must be 6 (3+2+1)");
     }
 }

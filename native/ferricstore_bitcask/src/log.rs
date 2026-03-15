@@ -79,8 +79,7 @@ impl LogWriter {
     ///
     /// Returns a `LogError` if the file cannot be opened or its metadata cannot be read.
     pub fn open(path: &Path, file_id: u64) -> Result<Self> {
-        let backend =
-            io_backend::create_backend(path).map_err(|e| LogError(e.to_string()))?;
+        let backend = io_backend::create_backend(path).map_err(|e| LogError(e.to_string()))?;
         let offset = backend.offset();
         Ok(Self {
             backend,
@@ -149,10 +148,7 @@ impl LogWriter {
     /// # Errors
     ///
     /// Returns a `LogError` if any write or the final sync fails.
-    pub fn write_batch(
-        &mut self,
-        entries: &[(&[u8], &[u8], u64)],
-    ) -> Result<Vec<(u64, usize)>> {
+    pub fn write_batch(&mut self, entries: &[(&[u8], &[u8], u64)]) -> Result<Vec<(u64, usize)>> {
         // Encode all records first (owned Vecs, so lifetimes are clear).
         let encoded: Vec<Vec<u8>> = entries
             .iter()
@@ -338,7 +334,8 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 fn now_ms() -> u64 {
-    #[allow(clippy::cast_possible_truncation)] // millis won't exceed u64::MAX until year 584 million
+    #[allow(clippy::cast_possible_truncation)]
+    // millis won't exceed u64::MAX until year 584 million
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -674,7 +671,11 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records[0].value.is_none(), "first record is tombstone");
         assert_eq!(records[1].key, b"k");
-        assert_eq!(records[1].value, Some(b"v".to_vec()), "second record is live");
+        assert_eq!(
+            records[1].value,
+            Some(b"v".to_vec()),
+            "second record is live"
+        );
     }
 
     #[test]
@@ -703,9 +704,12 @@ mod tests {
         let mut reader2 = LogReader::open(&path).unwrap();
         // Must be either an error OR None — never Ok(Some(valid record))
         match reader2.read_at(1) {
-            Err(_) => {} // CRC mismatch or IO error — expected
+            Err(_) => {}   // CRC mismatch or IO error — expected
             Ok(None) => {} // treated as EOF — acceptable
-            Ok(Some(rec)) => panic!("unexpected successful decode at mid-record: key={:?}", rec.key),
+            Ok(Some(rec)) => panic!(
+                "unexpected successful decode at mid-record: key={:?}",
+                rec.key
+            ),
         }
     }
 
@@ -753,7 +757,10 @@ mod tests {
 
         let mut reader = LogReader::open(&path).unwrap();
         let record = reader.read_at(0).unwrap().unwrap();
-        assert!(record.timestamp_ms > 0, "timestamp_ms must be non-zero after a write");
+        assert!(
+            record.timestamp_ms > 0,
+            "timestamp_ms must be non-zero after a write"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -767,7 +774,11 @@ mod tests {
 
     #[test]
     fn crc32_empty_slice_is_consistent() {
-        assert_eq!(crc32(b""), crc32(b""), "crc32 of empty slice must be deterministic");
+        assert_eq!(
+            crc32(b""),
+            crc32(b""),
+            "crc32 of empty slice must be deterministic"
+        );
     }
 
     #[test]
@@ -775,7 +786,11 @@ mod tests {
         let mut data = b"abcdef".to_vec();
         let original = crc32(&data);
         data[3] ^= 0xFF;
-        assert_ne!(crc32(&data), original, "flipping one byte must change the checksum");
+        assert_ne!(
+            crc32(&data),
+            original,
+            "flipping one byte must change the checksum"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -794,7 +809,10 @@ mod tests {
 
         assert_eq!(record.key, key, "key must round-trip");
         assert_eq!(record.value, Some(value.to_vec()), "value must round-trip");
-        assert_eq!(record.expire_at_ms, expire_at, "expire_at_ms must round-trip");
+        assert_eq!(
+            record.expire_at_ms, expire_at,
+            "expire_at_ms must round-trip"
+        );
         assert!(record.timestamp_ms > 0, "timestamp_ms must be set");
     }
 
@@ -866,10 +884,7 @@ mod tests {
             use io::Write as _;
             use std::io::Seek;
             let flip_pos = (HEADER_SIZE + 2 + 2) as u64 + HEADER_SIZE as u64;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             f.seek(io::SeekFrom::Start(flip_pos)).unwrap();
             f.write_all(&[0xFF]).unwrap();
         }
@@ -877,7 +892,11 @@ mod tests {
         let mut reader = LogReader::open(&path).unwrap();
         let records = reader.iter_from_start_tolerant().unwrap();
         // Only the first record is valid; tolerant iterator stops at 2nd CRC error.
-        assert_eq!(records.len(), 1, "tolerant iter must stop at first corrupt record");
+        assert_eq!(
+            records.len(),
+            1,
+            "tolerant iter must stop at first corrupt record"
+        );
         assert_eq!(records[0].key, b"k1");
     }
 
@@ -895,10 +914,7 @@ mod tests {
         // Truncate the last 5 bytes — partial tail record.
         let size = fs::metadata(&path).unwrap().len();
         {
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             f.set_len(size - 5).unwrap();
         }
 
@@ -928,7 +944,11 @@ mod tests {
 
         let mut reader = LogReader::open(&path).unwrap();
         let records = reader.iter_from_start_tolerant().unwrap();
-        assert_eq!(records.len(), 10, "tolerant iter must return all 10 valid records");
+        assert_eq!(
+            records.len(),
+            10,
+            "tolerant iter must return all 10 valid records"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -941,7 +961,10 @@ mod tests {
         let path = dir.path().join("data.log");
         let mut w = LogWriter::open(&path, 1).unwrap();
         let results = w.write_batch(&[]).unwrap();
-        assert!(results.is_empty(), "write_batch with empty slice must return empty vec");
+        assert!(
+            results.is_empty(),
+            "write_batch with empty slice must return empty vec"
+        );
         assert_eq!(w.offset, 0, "offset must stay 0 after empty batch");
     }
 

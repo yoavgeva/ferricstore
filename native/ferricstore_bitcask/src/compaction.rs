@@ -114,23 +114,19 @@ pub fn compact(
         let records = reader.iter_from_start_tolerant()?;
 
         for record in records {
-            let record_len = (HEADER_SIZE
-                + record.key.len()
-                + record.value.as_ref().map_or(0, Vec::len))
-                as u64;
+            let record_len =
+                (HEADER_SIZE + record.key.len() + record.value.as_ref().map_or(0, Vec::len)) as u64;
 
             // Only copy if this offset is still the live entry in the keydir
             let is_live = keydir
                 .get(&record.key)
                 .is_some_and(|e| e.file_id == fid && e.offset == offset);
 
-            let is_expired =
-                record.expire_at_ms != 0 && record.expire_at_ms <= now_ms;
+            let is_expired = record.expire_at_ms != 0 && record.expire_at_ms <= now_ms;
 
             if is_live && !is_expired {
                 if let Some(ref value) = record.value {
-                    let new_offset =
-                        writer.write(&record.key, value, record.expire_at_ms)?;
+                    let new_offset = writer.write(&record.key, value, record.expire_at_ms)?;
                     #[allow(clippy::cast_possible_truncation)]
                     hint_writer.write_entry(&HintEntry {
                         file_id: new_file_id,
@@ -662,7 +658,10 @@ mod tests {
         let _ = off_v1;
 
         let out = compact(dir.path(), &[1], &kd, 99, 0).unwrap();
-        assert_eq!(out.records_written, 1, "only the live (newer) record survives");
+        assert_eq!(
+            out.records_written, 1,
+            "only the live (newer) record survives"
+        );
         assert_eq!(out.records_dropped, 1, "stale first record is dropped");
     }
 
@@ -930,7 +929,10 @@ mod tests {
         }
 
         let out = compact(dir.path(), &[1], &kd, 99, 0).unwrap();
-        assert_eq!(out.records_written, 5, "5 live keys must survive compaction");
+        assert_eq!(
+            out.records_written, 5,
+            "5 live keys must survive compaction"
+        );
 
         let mut hr = HintReader::open(&out.new_hint_path).unwrap();
         let hints = hr.read_all().unwrap();
@@ -1001,9 +1003,21 @@ mod tests {
 
         remove_old_files(dir.path(), &[10, 20]).unwrap();
 
-        assert!(!log_path(dir.path(), 10).exists(), ".log for fid 10 must be deleted");
-        assert!(!hint_path(dir.path(), 10).exists(), ".hint for fid 10 must be deleted");
-        assert!(!log_path(dir.path(), 20).exists(), ".log for fid 20 must be deleted");
-        assert!(!hint_path(dir.path(), 20).exists(), ".hint for fid 20 must be deleted");
+        assert!(
+            !log_path(dir.path(), 10).exists(),
+            ".log for fid 10 must be deleted"
+        );
+        assert!(
+            !hint_path(dir.path(), 10).exists(),
+            ".hint for fid 10 must be deleted"
+        );
+        assert!(
+            !log_path(dir.path(), 20).exists(),
+            ".log for fid 20 must be deleted"
+        );
+        assert!(
+            !hint_path(dir.path(), 20).exists(),
+            ".hint for fid 20 must be deleted"
+        );
     }
 }

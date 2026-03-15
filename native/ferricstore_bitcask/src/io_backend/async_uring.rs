@@ -125,8 +125,7 @@ impl AsyncUringBackend {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let ring = Arc::new(Mutex::new(ring));
-        let pending: Arc<Mutex<HashMap<u64, PendingOp>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<u64, PendingOp>>> = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let completion_thread = {
@@ -233,10 +232,7 @@ impl AsyncUringBackend {
                     // unmoved (Vec heap allocation is stable).
                     unsafe {
                         sq.push(&sqe).map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::Other,
-                                "async_uring: SQ full on write",
-                            )
+                            io::Error::new(io::ErrorKind::Other, "async_uring: SQ full on write")
                         })?;
                     }
                 }
@@ -244,16 +240,11 @@ impl AsyncUringBackend {
                 // Push the fsync SQE. No IO_LINK flag — it is the terminal
                 // SQE in the chain. Its `user_data` is the `op_id` so the
                 // completion thread can look up the PendingOp.
-                let fsync_sqe = opcode::Fsync::new(fd)
-                    .build()
-                    .user_data(op_id);
+                let fsync_sqe = opcode::Fsync::new(fd).build().user_data(op_id);
 
                 unsafe {
                     sq.push(&fsync_sqe).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            "async_uring: SQ full on fsync",
-                        )
+                        io::Error::new(io::ErrorKind::Other, "async_uring: SQ full on fsync")
                     })?;
                 }
             }

@@ -109,11 +109,10 @@ impl UringBackend {
 
         self.ring.submit_and_wait(1)?;
 
-        let cqe = self
-            .ring
-            .completion()
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring: no CQE after write"))?;
+        let cqe =
+            self.ring.completion().next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "io_uring: no CQE after write")
+            })?;
 
         let res = cqe.result();
         if res < 0 {
@@ -148,11 +147,10 @@ impl UringBackend {
 
         self.ring.submit_and_wait(1)?;
 
-        let cqe = self
-            .ring
-            .completion()
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "io_uring: no CQE after fsync"))?;
+        let cqe =
+            self.ring.completion().next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "io_uring: no CQE after fsync")
+            })?;
 
         let res = cqe.result();
         if res < 0 {
@@ -442,8 +440,14 @@ mod tests {
         // Read back the whole file and verify each slice at the reported offset.
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes.len(), 11);
-        assert_eq!(&bytes[offsets[0] as usize..offsets[0] as usize + 5], b"hello");
-        assert_eq!(&bytes[offsets[1] as usize..offsets[1] as usize + 5], b"world");
+        assert_eq!(
+            &bytes[offsets[0] as usize..offsets[0] as usize + 5],
+            b"hello"
+        );
+        assert_eq!(
+            &bytes[offsets[1] as usize..offsets[1] as usize + 5],
+            b"world"
+        );
         assert_eq!(&bytes[offsets[2] as usize..offsets[2] as usize + 1], b"!");
     }
 

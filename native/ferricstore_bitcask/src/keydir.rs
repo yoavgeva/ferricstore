@@ -357,7 +357,11 @@ mod tests {
         kd.put(b"live2".to_vec(), entry(1, 10));
         kd.put(b"live3".to_vec(), entry(1, 20));
         // KeyDir::len() counts all 5 — expiry is a Store-level concern.
-        assert_eq!(kd.len(), 5, "raw KeyDir::len() must count all entries including expired");
+        assert_eq!(
+            kd.len(),
+            5,
+            "raw KeyDir::len() must count all entries including expired"
+        );
     }
 
     /// is_empty() returns false even when all entries are logically expired,
@@ -368,7 +372,10 @@ mod tests {
         kd.put(b"e1".to_vec(), expiring_entry(1, 100));
         kd.put(b"e2".to_vec(), expiring_entry(1, 200));
         // KeyDir::is_empty() checks raw map, not logical expiry.
-        assert!(!kd.is_empty(), "KeyDir::is_empty must return false — it has 2 raw entries");
+        assert!(
+            !kd.is_empty(),
+            "KeyDir::is_empty must return false — it has 2 raw entries"
+        );
         assert_eq!(kd.len(), 2);
     }
 
@@ -419,10 +426,20 @@ mod tests {
         assert_eq!(expired.len(), 2, "2 entries should be expired");
 
         // len() must be unchanged — expired_keys() is read-only.
-        assert_eq!(kd.len(), len_before, "expired_keys() must not remove entries from keydir");
+        assert_eq!(
+            kd.len(),
+            len_before,
+            "expired_keys() must not remove entries from keydir"
+        );
         // The entries are still accessible.
-        assert!(kd.get(b"soon").is_some(), "entry must still exist after expired_keys()");
-        assert!(kd.get(b"later").is_some(), "entry must still exist after expired_keys()");
+        assert!(
+            kd.get(b"soon").is_some(),
+            "entry must still exist after expired_keys()"
+        );
+        assert!(
+            kd.get(b"later").is_some(),
+            "entry must still exist after expired_keys()"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -437,13 +454,22 @@ mod tests {
 
         kd.set_ref_bit(b"k");
         // Verify the bit was set by checking entry directly.
-        assert!(kd.get(b"k").unwrap().ref_bit, "ref_bit must be true after set_ref_bit");
+        assert!(
+            kd.get(b"k").unwrap().ref_bit,
+            "ref_bit must be true after set_ref_bit"
+        );
 
         // Tick — bit was set, so entry gets a second chance (returns false = not eligible).
         let eligible = kd.tick_ref_bit(b"k").unwrap();
-        assert!(!eligible, "entry with ref_bit=true must not be eviction-eligible after tick");
+        assert!(
+            !eligible,
+            "entry with ref_bit=true must not be eviction-eligible after tick"
+        );
         // Bit must now be cleared.
-        assert!(!kd.get(b"k").unwrap().ref_bit, "ref_bit must be false after tick");
+        assert!(
+            !kd.get(b"k").unwrap().ref_bit,
+            "ref_bit must be false after tick"
+        );
     }
 
     /// tick_ref_bit on an entry with ref_bit=false marks it as eviction-eligible.
@@ -452,10 +478,16 @@ mod tests {
         let mut kd = KeyDir::new();
         kd.put(b"evictable".to_vec(), entry(1, 0));
         // ref_bit starts as false (no set_ref_bit call).
-        assert!(!kd.get(b"evictable").unwrap().ref_bit, "ref_bit must start false");
+        assert!(
+            !kd.get(b"evictable").unwrap().ref_bit,
+            "ref_bit must start false"
+        );
 
         let eligible = kd.tick_ref_bit(b"evictable").unwrap();
-        assert!(eligible, "entry with ref_bit=false must be eviction-eligible after tick");
+        assert!(
+            eligible,
+            "entry with ref_bit=false must be eviction-eligible after tick"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -478,6 +510,9 @@ mod tests {
         let mut kd = KeyDir::new();
         kd.put(b"target".to_vec(), entry(1, 42));
         kd.delete(b"target");
-        assert!(kd.get(b"target").is_none(), "get after delete must return None");
+        assert!(
+            kd.get(b"target").is_none(),
+            "get after delete must return None"
+        );
     }
 }
