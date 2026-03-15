@@ -220,7 +220,7 @@ impl AsyncUringBackend {
                 let buf_count = owned_buffers.len();
                 for (i, buf) in owned_buffers.iter().enumerate() {
                     let sqe = opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
-                        .offset(offsets[i] as i64)
+                        .offset(offsets[i])
                         .build()
                         .user_data(WRITE_SQE_TAG)
                         .flags(Flags::IO_LINK);
@@ -365,7 +365,7 @@ impl Drop for AsyncUringBackend {
 
         // Submit a no-op SQE to wake the completion thread if it is blocked
         // inside `submit_and_wait`.
-        if let Ok(mut ring) = self.ring.lock() {
+        if let Ok(ring) = self.ring.lock() {
             let nop = opcode::Nop::new().build().user_data(WRITE_SQE_TAG);
             unsafe {
                 let _ = ring.submission_shared().push(&nop);
@@ -403,7 +403,9 @@ mod tests {
 
     /// Skip the test if io_uring is not available.
     fn requires_io_uring() -> bool {
-        IoUring::builder().build(1).is_ok()
+        IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder()
+            .build(1)
+            .is_ok()
     }
 
     #[test]

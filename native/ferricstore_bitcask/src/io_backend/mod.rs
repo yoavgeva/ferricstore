@@ -150,7 +150,9 @@ impl IoBackend for SyncBackend {
 pub fn detect_io_uring() -> bool {
     #[cfg(target_os = "linux")]
     {
-        io_uring::IoUring::builder().build(1).is_ok()
+        io_uring::IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder()
+            .build(1)
+            .is_ok()
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -95,7 +95,7 @@ impl UringBackend {
         // Build a positioned-write SQE (equivalent to pwrite64).
         // SAFETY: `data` outlives this call — see method doc.
         let sqe = opcode::Write::new(fd, data.as_ptr(), data.len() as u32)
-            .offset(file_offset as i64)
+            .offset(file_offset)
             .build()
             .user_data(0x01);
 
@@ -232,7 +232,7 @@ impl IoBackend for UringBackend {
                 let mut sq = unsafe { self.ring.submission() };
                 for (buf, &file_offset) in chunk.iter().zip(chunk_offsets.iter()) {
                     let sqe = opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
-                        .offset(file_offset as i64)
+                        .offset(file_offset)
                         .build()
                         // Store the file offset as user_data so we can look up
                         // the expected length when draining completions.
