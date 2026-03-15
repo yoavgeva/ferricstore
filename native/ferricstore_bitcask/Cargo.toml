@@ -1,0 +1,22 @@
+[package]
+name = "ferricstore_bitcask"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ferricstore_bitcask"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.37"
+
+# io_uring is Linux-only. On macOS/Windows this dep is completely absent —
+# Cargo does not download, compile, or link it. Falls back to SyncBackend.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3

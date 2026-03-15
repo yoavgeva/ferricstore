@@ -1,0 +1,343 @@
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+
+/// Metadata stored in RAM for every key. Points into a data file on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyEntry {
+    /// Which data file holds the value (monotonically increasing ID).
+    pub file_id: u64,
+    /// Byte offset of the record start inside that file.
+    pub offset: u64,
+    /// Size of the full on-disk record in bytes (used to seek past it).
+    pub value_size: u32,
+    /// Absolute Unix timestamp in milliseconds; 0 = no expiry.
+    pub expire_at_ms: u64,
+    /// Reference bit for clock-hand eviction sweep.
+    pub ref_bit: bool,
+}
+
+/// In-memory index: key → location on disk.
+pub struct KeyDir {
+    map: HashMap<Vec<u8>, KeyEntry>,
+}
+
+impl KeyDir {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    /// Insert or overwrite an entry.
+    pub fn put(&mut self, key: Vec<u8>, entry: KeyEntry) {
+        self.map.insert(key, entry);
+    }
+
+    /// Look up a key. Returns `None` if not found or already logically deleted.
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<&KeyEntry> {
+        self.map.get(key)
+    }
+
+    /// Remove a key from the index (logical delete; the value stays on disk until compaction).
+    pub fn delete(&mut self, key: &[u8]) -> bool {
+        self.map.remove(key).is_some()
+    }
+
+    /// Number of live keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Iterator over all (key, entry) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &KeyEntry)> {
+        self.map.iter()
+    }
+
+    /// Set the reference bit for a key (called on cache promotion / access).
+    pub fn set_ref_bit(&mut self, key: &[u8]) {
+        if let Some(entry) = self.map.get_mut(key) {
+            entry.ref_bit = true;
+        }
+    }
+
+    /// Clear the reference bit and return whether the key is now eviction-eligible.
+    /// Returns `None` if key not found.
+    pub fn tick_ref_bit(&mut self, key: &[u8]) -> Option<bool> {
+        let entry = self.map.get_mut(key)?;
+        if entry.ref_bit {
+            entry.ref_bit = false;
+            Some(false) // given a second chance, not eligible yet
+        } else {
+            Some(true) // bit was already clear — eligible for eviction
+        }
+    }
+
+    /// Return keys whose `expire_at_ms` is non-zero and <= `now_ms`.
+    #[must_use]
+    pub fn expired_keys(&self, now_ms: u64) -> Vec<Vec<u8>> {
+        self.map
+            .iter()
+            .filter(|(_, e)| e.expire_at_ms != 0 && e.expire_at_ms <= now_ms)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+}
+
+impl Default for KeyDir {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(file_id: u64, offset: u64) -> KeyEntry {
+        KeyEntry {
+            file_id,
+            offset,
+            value_size: 10,
+            expire_at_ms: 0,
+            ref_bit: false,
+        }
+    }
+
+    fn expiring_entry(file_id: u64, expire_at_ms: u64) -> KeyEntry {
+        KeyEntry {
+            file_id,
+            offset: 0,
+            value_size: 10,
+            expire_at_ms,
+            ref_bit: false,
+        }
+    }
+
+    #[test]
+    fn starts_empty() {
+        let kd = KeyDir::new();
+        assert!(kd.is_empty());
+        assert_eq!(kd.len(), 0);
+    }
+
+    #[test]
+    fn put_and_get() {
+        let mut kd = KeyDir::new();
+        kd.put(b"hello".to_vec(), entry(1, 0));
+        let e = kd.get(b"hello").unwrap();
+        assert_eq!(e.file_id, 1);
+        assert_eq!(e.offset, 0);
+    }
+
+    #[test]
+    fn get_missing_key_returns_none() {
+        let kd = KeyDir::new();
+        assert!(kd.get(b"nope").is_none());
+    }
+
+    #[test]
+    fn put_overwrites_existing() {
+        let mut kd = KeyDir::new();
+        kd.put(b"k".to_vec(), entry(1, 0));
+        kd.put(b"k".to_vec(), entry(2, 100));
+        let e = kd.get(b"k").unwrap();
+        assert_eq!(e.file_id, 2);
+        assert_eq!(e.offset, 100);
+    }
+
+    #[test]
+    fn delete_removes_key() {
+        let mut kd = KeyDir::new();
+        kd.put(b"k".to_vec(), entry(1, 0));
+        assert!(kd.delete(b"k"));
+        assert!(kd.get(b"k").is_none());
+        assert_eq!(kd.len(), 0);
+    }
+
+    #[test]
+    fn delete_missing_key_returns_false() {
+        let mut kd = KeyDir::new();
+        assert!(!kd.delete(b"ghost"));
+    }
+
+    #[test]
+    fn len_tracks_insertions_and_deletions() {
+        let mut kd = KeyDir::new();
+        kd.put(b"a".to_vec(), entry(1, 0));
+        kd.put(b"b".to_vec(), entry(1, 10));
+        assert_eq!(kd.len(), 2);
+        kd.delete(b"a");
+        assert_eq!(kd.len(), 1);
+    }
+
+    #[test]
+    fn ref_bit_set_and_tick() {
+        let mut kd = KeyDir::new();
+        kd.put(b"k".to_vec(), entry(1, 0));
+
+        // bit starts clear — should be eligible on first tick
+        assert_eq!(kd.tick_ref_bit(b"k"), Some(true));
+
+        // set the bit, then tick — not eligible (gets second chance, bit cleared)
+        kd.set_ref_bit(b"k");
+        assert_eq!(kd.tick_ref_bit(b"k"), Some(false));
+
+        // now bit is clear again — eligible on next tick
+        assert_eq!(kd.tick_ref_bit(b"k"), Some(true));
+    }
+
+    #[test]
+    fn tick_ref_bit_missing_key_returns_none() {
+        let mut kd = KeyDir::new();
+        assert_eq!(kd.tick_ref_bit(b"ghost"), None);
+    }
+
+    #[test]
+    fn expired_keys_empty_when_no_expiry() {
+        let mut kd = KeyDir::new();
+        kd.put(b"k".to_vec(), entry(1, 0)); // expire_at_ms = 0 means never
+        assert!(kd.expired_keys(9_999_999).is_empty());
+    }
+
+    #[test]
+    fn expired_keys_returns_past_due() {
+        let mut kd = KeyDir::new();
+        kd.put(b"old".to_vec(), expiring_entry(1, 1000));
+        kd.put(b"fresh".to_vec(), expiring_entry(1, 9000));
+        kd.put(b"permanent".to_vec(), entry(1, 0));
+
+        let expired = kd.expired_keys(5000);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0], b"old");
+    }
+
+    #[test]
+    fn expired_keys_at_exact_boundary() {
+        let mut kd = KeyDir::new();
+        kd.put(b"edge".to_vec(), expiring_entry(1, 5000));
+        // expire_at_ms <= now_ms, so 5000 <= 5000 is expired
+        assert_eq!(kd.expired_keys(5000).len(), 1);
+        // one ms before: not expired
+        assert!(kd.expired_keys(4999).is_empty());
+    }
+
+    #[test]
+    fn iter_yields_all_entries() {
+        let mut kd = KeyDir::new();
+        kd.put(b"a".to_vec(), entry(1, 0));
+        kd.put(b"b".to_vec(), entry(2, 100));
+        let keys: Vec<_> = kd.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys.len(), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Edge cases
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn zero_length_key_is_valid() {
+        let mut kd = KeyDir::new();
+        kd.put(vec![], entry(1, 0));
+        assert!(kd.get(b"").is_some());
+        assert_eq!(kd.len(), 1);
+    }
+
+    #[test]
+    fn non_utf8_binary_key() {
+        let key: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01];
+        let mut kd = KeyDir::new();
+        kd.put(key.clone(), entry(1, 42));
+        assert_eq!(kd.get(&key).unwrap().offset, 42);
+    }
+
+    #[test]
+    fn large_key_256_bytes() {
+        let key = vec![b'x'; 256];
+        let mut kd = KeyDir::new();
+        kd.put(key.clone(), entry(7, 999));
+        assert_eq!(kd.get(&key).unwrap().file_id, 7);
+    }
+
+    #[test]
+    fn overwrite_changes_file_id_and_offset() {
+        let mut kd = KeyDir::new();
+        kd.put(b"k".to_vec(), entry(1, 0));
+        kd.put(b"k".to_vec(), entry(99, 65536));
+        let e = kd.get(b"k").unwrap();
+        assert_eq!(e.file_id, 99);
+        assert_eq!(e.offset, 65536);
+    }
+
+    #[test]
+    fn delete_then_reinsert_works() {
+        let mut kd = KeyDir::new();
+        kd.put(b"k".to_vec(), entry(1, 0));
+        kd.delete(b"k");
+        kd.put(b"k".to_vec(), entry(2, 50));
+        assert_eq!(kd.get(b"k").unwrap().file_id, 2);
+    }
+
+    #[test]
+    fn many_keys_len_is_accurate() {
+        let mut kd = KeyDir::new();
+        for i in 0u64..1000 {
+            kd.put(i.to_le_bytes().to_vec(), entry(1, i * 100));
+        }
+        assert_eq!(kd.len(), 1000);
+        for i in 0u64..500 {
+            kd.delete(&i.to_le_bytes());
+        }
+        assert_eq!(kd.len(), 500);
+    }
+
+    #[test]
+    fn ref_bit_full_clock_cycle() {
+        // Simulate the clock hand sweeping the same key three times
+        let mut kd = KeyDir::new();
+        kd.put(b"k".to_vec(), entry(1, 0));
+
+        // 1st tick: bit=0 → eligible
+        assert_eq!(kd.tick_ref_bit(b"k"), Some(true));
+        // touch the key (set bit)
+        kd.set_ref_bit(b"k");
+        // 2nd tick: bit=1 → given second chance, bit cleared
+        assert_eq!(kd.tick_ref_bit(b"k"), Some(false));
+        // 3rd tick: bit=0 again → eligible
+        assert_eq!(kd.tick_ref_bit(b"k"), Some(true));
+    }
+
+    #[test]
+    fn expired_keys_all_expired() {
+        let mut kd = KeyDir::new();
+        for i in 1u64..=5 {
+            kd.put(vec![i as u8], expiring_entry(1, i * 100));
+        }
+        let expired = kd.expired_keys(9999);
+        assert_eq!(expired.len(), 5);
+    }
+
+    #[test]
+    fn expired_keys_none_expired() {
+        let mut kd = KeyDir::new();
+        for i in 1u64..=5 {
+            kd.put(vec![i as u8], expiring_entry(1, i * 1_000_000));
+        }
+        assert!(kd.expired_keys(1).is_empty());
+    }
+
+    #[test]
+    fn set_ref_bit_on_missing_key_is_noop() {
+        let mut kd = KeyDir::new();
+        // Must not panic
+        kd.set_ref_bit(b"ghost");
+    }
+}

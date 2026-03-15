@@ -1,0 +1,246 @@
+//! I/O backend abstraction for the Bitcask log writer.
+//!
+//! `IoBackend` is a trait that abstracts over two implementations:
+//! - `SyncBackend`: standard `BufWriter<File>` — works on all platforms
+//! - `UringBackend` (Linux only): `io_uring` via the `io-uring` crate
+//!
+//! The selection happens at runtime via `create_backend`. On macOS the
+//! `io-uring` crate is not even compiled (it is behind a
+//! `cfg(target_os = "linux")` dependency gate), so the macro-expansion of
+//! `create_backend` always returns `SyncBackend` on non-Linux targets.
+//!
+//! All methods block the calling thread until I/O is complete. This matches
+//! the BEAM dirty-scheduler contract: the NIF occupies a dirty thread for
+//! the full duration of the write, but never blocks a normal scheduler.
+
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
+
+// On Linux, bring in the uring backend module.
+#[cfg(target_os = "linux")]
+pub mod uring;
+
+/// Synchronous, blocking I/O interface for the append-only log.
+///
+/// Implementors must block until all bytes are durable when `sync` returns.
+/// The `offset` method must accurately reflect the number of bytes written
+/// since the file was opened (i.e. the current end-of-file position).
+pub trait IoBackend: Send {
+    /// Append `data` to the file. Returns the byte offset where the write
+    /// started (i.e. the value callers should store as the record's offset
+    /// in the keydir).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the write fails.
+    fn append(&mut self, data: &[u8]) -> io::Result<u64>;
+
+    /// Flush any internal write buffer, then fsync the underlying file to
+    /// durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the flush or fsync fails.
+    fn sync(&mut self) -> io::Result<()>;
+
+    /// Current write offset (the byte position immediately after the last
+    /// appended byte). This equals the file size at the time of the last
+    /// successful `append`.
+    fn offset(&self) -> u64;
+
+    /// Append multiple buffers as a single atomic batch, then fsync once.
+    ///
+    /// The default implementation calls `append` for each buffer and then
+    /// `sync`. Platform-specific backends may override this to submit all
+    /// writes in a single syscall before fsyncing (e.g. `io_uring`'s batch
+    /// submission path).
+    ///
+    /// Returns the starting offset of each buffer in the same order as the
+    /// input slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if any write or the final sync fails.
+    fn append_batch_and_sync(&mut self, buffers: &[&[u8]]) -> io::Result<Vec<u64>> {
+        let mut offsets = Vec::with_capacity(buffers.len());
+        for buf in buffers {
+            offsets.push(self.append(buf)?);
+        }
+        self.sync()?;
+        Ok(offsets)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SyncBackend — standard BufWriter<File>, always available
+// ---------------------------------------------------------------------------
+
+/// Standard synchronous I/O backend using `BufWriter<File>`.
+///
+/// This is the fallback backend used on all platforms. On macOS (and any
+/// platform where `io_uring` is unavailable) this is the only backend.
+pub struct SyncBackend {
+    writer: BufWriter<File>,
+    offset: u64,
+}
+
+impl SyncBackend {
+    /// Open (or create) the file at `path` for appending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the file cannot be opened or its size cannot
+    /// be determined.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let offset = file.metadata()?.len();
+        Ok(Self {
+            writer: BufWriter::new(file),
+            offset,
+        })
+    }
+}
+
+impl IoBackend for SyncBackend {
+    fn append(&mut self, data: &[u8]) -> io::Result<u64> {
+        let start = self.offset;
+        self.writer.write_all(data)?;
+        self.offset += data.len() as u64;
+        Ok(start)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        Ok(())
+    }
+
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend factory
+// ---------------------------------------------------------------------------
+
+/// Detect whether `io_uring` is available on this system.
+///
+/// On non-Linux platforms this always returns `false`. On Linux it probes the
+/// kernel by attempting to create a minimal ring. Returns `false` if the
+/// kernel is too old (< 5.1), if `io_uring` is disabled by seccomp policy,
+/// or if it is otherwise unavailable.
+#[must_use]
+pub fn detect_io_uring() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        io_uring::IoUring::builder().build(1).is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Create the best available `IoBackend` for `path`.
+///
+/// On Linux with a kernel that supports `io_uring` (≥ 5.1), returns a
+/// `UringBackend`. Otherwise returns a `SyncBackend`.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if the file cannot be opened.
+pub fn create_backend(path: &Path) -> io::Result<Box<dyn IoBackend>> {
+    #[cfg(target_os = "linux")]
+    if detect_io_uring() {
+        match uring::UringBackend::open(path) {
+            Ok(backend) => return Ok(Box::new(backend)),
+            Err(_) => {
+                // Ring probe succeeded but open failed (unlikely). Fall through
+                // to the sync backend rather than propagating the error.
+            }
+        }
+    }
+
+    Ok(Box::new(SyncBackend::open(path)?))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn tmp() -> TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    #[test]
+    fn detect_io_uring_returns_bool_without_panic() {
+        // Just ensure the function runs without panicking on any platform.
+        let _ = detect_io_uring();
+    }
+
+    #[test]
+    fn sync_backend_append_and_sync() {
+        let dir = tmp();
+        let path = dir.path().join("test.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        let off0 = backend.append(b"hello").unwrap();
+        let off1 = backend.append(b"world").unwrap();
+        backend.sync().unwrap();
+
+        assert_eq!(off0, 0);
+        assert_eq!(off1, 5);
+        assert_eq!(backend.offset(), 10);
+    }
+
+    #[test]
+    fn sync_backend_offset_resumes_after_reopen() {
+        let dir = tmp();
+        let path = dir.path().join("test.log");
+
+        {
+            let mut backend = SyncBackend::open(&path).unwrap();
+            backend.append(b"data").unwrap();
+            backend.sync().unwrap();
+        }
+
+        let backend = SyncBackend::open(&path).unwrap();
+        assert_eq!(backend.offset(), 4, "offset must resume at file size after reopen");
+    }
+
+    #[test]
+    fn sync_backend_batch_writes_offsets_are_correct() {
+        let dir = tmp();
+        let path = dir.path().join("test.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        let bufs: &[&[u8]] = &[b"aaa", b"bb", b"c"];
+        let offsets = backend.append_batch_and_sync(bufs).unwrap();
+
+        assert_eq!(offsets, vec![0, 3, 5]);
+        assert_eq!(backend.offset(), 6);
+    }
+
+    #[test]
+    fn create_backend_returns_a_working_backend() {
+        let dir = tmp();
+        let path = dir.path().join("test.log");
+        let mut backend = create_backend(&path).unwrap();
+
+        let off = backend.append(b"test").unwrap();
+        backend.sync().unwrap();
+
+        assert_eq!(off, 0);
+        assert_eq!(backend.offset(), 4);
+    }
+}
