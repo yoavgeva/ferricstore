@@ -10,6 +10,9 @@
 alias Ferricstore.Commands.Dispatcher
 alias Ferricstore.Store.Router
 
+bench_warmup = System.get_env("BENCH_WARMUP", "2") |> String.to_integer()
+bench_time = System.get_env("BENCH_TIME", "5") |> String.to_integer()
+
 # ---------------------------------------------------------------------------
 # Application startup
 # ---------------------------------------------------------------------------
@@ -104,8 +107,8 @@ Benchee.run(
       Dispatcher.dispatch("KEYS", ["*"], store)
     end
   },
-  time: 5,
-  warmup: 2,
+  time: bench_time,
+  warmup: bench_warmup,
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,

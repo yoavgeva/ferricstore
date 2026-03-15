@@ -11,6 +11,9 @@
 alias Ferricstore.Bitcask.NIF
 alias Ferricstore.Store.Router
 
+bench_warmup = System.get_env("BENCH_WARMUP", "2") |> String.to_integer()
+bench_time = System.get_env("BENCH_TIME", "5") |> String.to_integer()
+
 # ---------------------------------------------------------------------------
 # Application startup with a temporary data directory
 # ---------------------------------------------------------------------------
@@ -93,8 +96,8 @@ Benchee.run(
       end
     }
   },
-  time: 5,
-  warmup: 2,
+  time: bench_time,
+  warmup: bench_warmup,
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,
@@ -129,8 +132,8 @@ Benchee.run(
   Enum.into(keys_inputs, %{}, fn {label, {store, _dir}} ->
     {label, fn -> NIF.keys(store) end}
   end),
-  time: 5,
-  warmup: 2,
+  time: bench_time,
+  warmup: bench_warmup,
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,
@@ -156,8 +159,8 @@ Benchee.run(
     "NIF put_batch: 100 entries" => fn -> NIF.put_batch(batch_store, batch_100) end,
     "NIF put_batch: 1000 entries" => fn -> NIF.put_batch(batch_store, batch_1000) end
   },
-  time: 5,
-  warmup: 2,
+  time: bench_time,
+  warmup: bench_warmup,
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,
@@ -204,8 +207,8 @@ Benchee.run(
       _keys = Router.keys()
     end
   },
-  time: 5,
-  warmup: 2,
+  time: bench_time,
+  warmup: bench_warmup,
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,

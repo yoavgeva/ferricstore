@@ -1,0 +1,81 @@
+name: Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  MIX_ENV: test
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: "Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.19"
+            otp: "27"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: native/ferricstore_bitcask/target
+          key: rust-${{ runner.os }}-${{ hashFiles('native/ferricstore_bitcask/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+
+      - name: Cache Mix deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path native/ferricstore_bitcask/Cargo.toml -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
+
+      - name: Compile
+        run: mix compile --warnings-as-errors
+
+      - name: Run tests
+        run: mix test --warnings-as-errors
+
+      - name: Check io_uring availability
+        id: uring
+        run: |
+          if cat /proc/sys/kernel/io_uring_disabled 2>/dev/null | grep -q "^0$"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run io_uring + scheduler stress tests (Linux, io_uring available)
+        if: steps.uring.outputs.available == 'true'
+        run: mix test --only linux_io_uring --warnings-as-errors

@@ -9,6 +9,9 @@
 
 alias Ferricstore.Resp.Encoder
 
+bench_warmup = System.get_env("BENCH_WARMUP", "2") |> String.to_integer()
+bench_time = System.get_env("BENCH_TIME", "5") |> String.to_integer()
+
 # ---------------------------------------------------------------------------
 # Application startup
 # ---------------------------------------------------------------------------
@@ -142,8 +145,8 @@ Benchee.run(
       {:ok, _get_resp} = :gen_tcp.recv(set_get_sock, 0, 5_000)
     end
   },
-  time: 5,
-  warmup: 2,
+  time: bench_time,
+  warmup: bench_warmup,
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,
@@ -188,8 +191,8 @@ Benchee.run(
       _resp = TcpBench.recv_exact(pipe1000_sock, 5000)
     end
   },
-  time: 5,
-  warmup: 2,
+  time: bench_time,
+  warmup: bench_warmup,
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,
@@ -244,8 +247,8 @@ Benchee.run(
     "Concurrent 100 writers" => fn -> ConcurrentBench.concurrent_sets(port, 100) end,
     "Concurrent 200 writers" => fn -> ConcurrentBench.concurrent_sets(port, 200) end
   },
-  time: 5,
-  warmup: 2,
+  time: bench_time,
+  warmup: bench_warmup,
   memory_time: 1,
   formatters: [
     Benchee.Formatters.Console,
