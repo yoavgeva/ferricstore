@@ -229,7 +229,7 @@ impl IoBackend for UringBackend {
 
             // Step 2: push all SQEs for this chunk.
             {
-                let mut sq = unsafe { self.ring.submission() };
+                let mut sq = self.ring.submission();
                 for (buf, &file_offset) in chunk.iter().zip(chunk_offsets.iter()) {
                     let sqe = opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
                         .offset(file_offset)
@@ -321,7 +321,9 @@ mod tests {
     /// Skip the test if io_uring is not available (old kernel / CI without
     /// the feature). This prevents false failures in restricted environments.
     fn requires_io_uring() -> bool {
-        IoUring::builder().build(1).is_ok()
+        IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder()
+            .build(1)
+            .is_ok()
     }
 
     #[test]

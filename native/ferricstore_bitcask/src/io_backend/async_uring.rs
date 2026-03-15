@@ -199,7 +199,7 @@ impl AsyncUringBackend {
             offsets.push(running);
             running += buf.len() as u64;
         }
-        let total_bytes = running - base_offset;
+        let _total_bytes = running - base_offset;
 
         // 3. Advance offset optimistically. If the I/O fails the backend is
         //    in an inconsistent state anyway (the file may have partial
@@ -209,15 +209,15 @@ impl AsyncUringBackend {
         // 4. Push SQEs under the ring lock.
         let fd = types::Fd(self.fd);
         {
-            let mut ring = self.ring.lock().map_err(|_| {
+            let ring = self.ring.lock().map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "async_uring: ring mutex poisoned")
             })?;
 
             {
-                let sq = unsafe { ring.submission_shared() };
+                let mut sq = unsafe { ring.submission_shared() };
 
                 // Push write SQEs, each linked to the next.
-                let buf_count = owned_buffers.len();
+                let _buf_count = owned_buffers.len();
                 for (i, buf) in owned_buffers.iter().enumerate() {
                     let sqe = opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
                         .offset(offsets[i])
@@ -332,7 +332,7 @@ impl AsyncUringBackend {
     /// Send `{:io_complete, op_id, :ok}` to a BEAM process.
     fn send_ok(pid: LocalPid, op_id: u64) {
         let mut env = OwnedEnv::new();
-        env.send_and_clear(&pid, |env| {
+        let _ = env.send_and_clear(&pid, |env| {
             (atoms::io_complete(), op_id, atoms::ok()).encode(env)
         });
     }
@@ -341,7 +341,7 @@ impl AsyncUringBackend {
     fn send_error(pid: LocalPid, op_id: u64, reason: &str) {
         let reason = reason.to_owned();
         let mut env = OwnedEnv::new();
-        env.send_and_clear(&pid, |env| {
+        let _ = env.send_and_clear(&pid, |env| {
             (
                 atoms::io_complete(),
                 op_id,
@@ -368,7 +368,8 @@ impl Drop for AsyncUringBackend {
         if let Ok(ring) = self.ring.lock() {
             let nop = opcode::Nop::new().build().user_data(WRITE_SQE_TAG);
             unsafe {
-                let _ = ring.submission_shared().push(&nop);
+                let mut sq = ring.submission_shared();
+                let _ = sq.push(&nop);
             }
             let _ = ring.submit();
         }
