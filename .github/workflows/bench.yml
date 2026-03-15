@@ -27,7 +27,7 @@ jobs:
         uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19"
-          otp-version: "27"
+          otp-version: "28"
 
       - name: Set up Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -45,8 +45,8 @@ jobs:
           path: |
             deps
             _build
-          key: mix-bench-${{ runner.os }}-1.19-27-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-bench-${{ runner.os }}-1.19-27-
+          key: mix-bench-${{ runner.os }}-1.19-28-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-bench-${{ runner.os }}-1.19-28-
 
       - name: Install dependencies
         run: mix deps.get
