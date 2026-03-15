@@ -68,7 +68,7 @@ struct PendingOp {
     /// `{:io_complete, op_id, result}` message.
     caller_pid: LocalPid,
     /// Owned copies of the write buffers. These MUST stay alive until the
-    /// fsync CQE for this op_id is drained, because the kernel holds raw
+    /// fsync CQE for this `op_id` is drained, because the kernel holds raw
     /// pointers into them between submission and completion.
     _buffers: Vec<Vec<u8>>,
 }
@@ -85,7 +85,7 @@ struct PendingOp {
 /// and pending-ops map are protected by their own `Mutex` to allow the
 /// background completion thread to access the ring concurrently.
 pub struct AsyncUringBackend {
-    /// io_uring ring instance, shared between the submitter (NIF thread) and
+    /// `io_uring` ring instance, shared between the submitter (NIF thread) and
     /// the completion thread. The Mutex serialises access.
     ring: Arc<Mutex<IoUring>>,
     /// Raw file descriptor for the open data file. Kept alive by `_file`.
@@ -110,13 +110,9 @@ impl AsyncUringBackend {
     /// # Errors
     ///
     /// Returns an `io::Error` if the file cannot be opened, its metadata
-    /// cannot be read, or the io_uring ring cannot be initialised.
+    /// cannot be read, or the `io_uring` ring cannot be initialised.
     pub fn open(path: &std::path::Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         let offset = file.metadata()?.len();
         let fd = file.as_raw_fd();
 
@@ -135,7 +131,7 @@ impl AsyncUringBackend {
             thread::Builder::new()
                 .name("ferric-uring-cq".into())
                 .spawn(move || {
-                    Self::completion_loop(ring, pending, shutdown);
+                    Self::completion_loop(&ring, &pending, &shutdown);
                 })
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
         };
@@ -199,7 +195,8 @@ impl AsyncUringBackend {
             offsets.push(running);
             running += buf.len() as u64;
         }
-        let _total_bytes = running - base_offset;
+        // Total bytes for this batch (for reference; not used further).
+        let _ = running - base_offset;
 
         // 3. Advance offset optimistically. If the I/O fails the backend is
         //    in an inconsistent state anyway (the file may have partial
@@ -217,13 +214,16 @@ impl AsyncUringBackend {
                 let mut sq = unsafe { ring.submission_shared() };
 
                 // Push write SQEs, each linked to the next.
-                let _buf_count = owned_buffers.len();
                 for (i, buf) in owned_buffers.iter().enumerate() {
-                    let sqe = opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
-                        .offset(offsets[i])
-                        .build()
-                        .user_data(WRITE_SQE_TAG)
-                        .flags(Flags::IO_LINK);
+                    let sqe = opcode::Write::new(
+                        fd,
+                        buf.as_ptr(),
+                        u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                    )
+                    .offset(offsets[i])
+                    .build()
+                    .user_data(WRITE_SQE_TAG)
+                    .flags(Flags::IO_LINK);
 
                     // SAFETY: `owned_buffers` are owned Vecs stored in the
                     // `PendingOp` which lives until the completion thread
@@ -274,9 +274,9 @@ impl AsyncUringBackend {
 
     /// Background thread loop: drain CQEs and send BEAM messages.
     fn completion_loop(
-        ring: Arc<Mutex<IoUring>>,
-        pending: Arc<Mutex<HashMap<u64, PendingOp>>>,
-        shutdown: Arc<AtomicBool>,
+        ring: &Arc<Mutex<IoUring>>,
+        pending: &Arc<Mutex<HashMap<u64, PendingOp>>>,
+        shutdown: &Arc<AtomicBool>,
     ) {
         while !shutdown.load(Ordering::Relaxed) {
             // Wait for at least one completion. We use submit_and_wait(1)
@@ -284,9 +284,8 @@ impl AsyncUringBackend {
             // The timeout is effectively indefinite, but the shutdown flag
             // is checked after each wakeup.
             let cqes: Vec<(u64, i32)> = {
-                let mut ring = match ring.lock() {
-                    Ok(r) => r,
-                    Err(_) => break, // Mutex poisoned — exit thread.
+                let Ok(mut ring) = ring.lock() else {
+                    break; // Mutex poisoned — exit thread.
                 };
 
                 // Wait for at least 1 CQE. If we get an error (e.g.
@@ -308,9 +307,8 @@ impl AsyncUringBackend {
 
                 let op_id = user_data;
                 let op = {
-                    let mut pending = match pending.lock() {
-                        Ok(p) => p,
-                        Err(_) => break,
+                    let Ok(mut pending) = pending.lock() else {
+                        break;
                     };
                     pending.remove(&op_id)
                 };

@@ -54,8 +54,8 @@ struct StoreResource {
     /// Only used on Linux with `io_uring`; always present for structural consistency.
     #[allow(dead_code)]
     next_op_id: AtomicU64,
-    /// Async io_uring backend (Linux only, `None` on other platforms or when
-    /// io_uring is unavailable).
+    /// Async `io_uring` backend (Linux only, `None` on other platforms or when
+    /// `io_uring` is unavailable).
     #[cfg(target_os = "linux")]
     async_uring: Option<io_backend::async_uring::AsyncUringBackend>,
 }
@@ -176,7 +176,7 @@ fn put_batch<'a>(
 ///
 /// This NIF does no blocking I/O itself:
 ///   - Record serialisation is pure CPU work (microseconds).
-///   - `submit_batch` pushes SQEs to the io_uring ring buffer and calls
+///   - `submit_batch` pushes SQEs to the `io_uring` ring buffer and calls
 ///     `ring.submit()` — a single non-blocking syscall.
 ///   - The actual `fsync` runs in a dedicated background thread; no scheduler
 ///     thread is ever blocked waiting for disk.
@@ -186,7 +186,7 @@ fn put_batch<'a>(
 /// and lets BEAM schedule the call like an ordinary function call — no
 /// preemption, no thread-pool dispatch, ~1–2µs overhead instead of ~10–20µs.
 ///
-/// On the **fallback path** (macOS / no io_uring) this NIF calls
+/// On the **fallback path** (macOS / no `io_uring`) this NIF calls
 /// `store.put_batch` which DOES block on fsync. Because we've declared
 /// `"Normal"`, that blocking call would freeze a scheduler thread. The
 /// fallback is therefore wrapped in a `spawn_blocking`-style approach: it

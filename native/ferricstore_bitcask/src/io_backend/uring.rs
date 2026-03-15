@@ -33,7 +33,7 @@ use super::IoBackend;
 
 /// Ring capacity in submission-queue entries. Must be a power of two.
 ///
-/// 64 slots covers the largest realistic `put_batch` payload (a GenServer
+/// 64 slots covers the largest realistic `put_batch` payload (a `GenServer`
 /// batch window collecting writes over ~1 ms). Each slot occupies ~64 bytes
 /// in the ring, so this is ~4 KB of ring memory per store shard — negligible.
 const RING_SIZE: u32 = 64;
@@ -67,11 +67,7 @@ impl UringBackend {
     /// Returns an `io::Error` if the file cannot be opened, its metadata
     /// cannot be read, or the ring cannot be initialised.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         let offset = file.metadata()?.len();
 
         let ring = IoUring::builder()
@@ -94,10 +90,14 @@ impl UringBackend {
 
         // Build a positioned-write SQE (equivalent to pwrite64).
         // SAFETY: `data` outlives this call — see method doc.
-        let sqe = opcode::Write::new(fd, data.as_ptr(), data.len() as u32)
-            .offset(file_offset)
-            .build()
-            .user_data(0x01);
+        let sqe = opcode::Write::new(
+            fd,
+            data.as_ptr(),
+            u32::try_from(data.len()).unwrap_or(u32::MAX),
+        )
+        .offset(file_offset)
+        .build()
+        .user_data(0x01);
 
         // SAFETY: buffer is valid for the duration of submit_and_wait.
         unsafe {
@@ -118,7 +118,7 @@ impl UringBackend {
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
         }
-        if res as usize != data.len() {
+        if usize::try_from(res).ok() != Some(data.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
                 format!(
@@ -231,12 +231,16 @@ impl IoBackend for UringBackend {
             {
                 let mut sq = self.ring.submission();
                 for (buf, &file_offset) in chunk.iter().zip(chunk_offsets.iter()) {
-                    let sqe = opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
-                        .offset(file_offset)
-                        .build()
-                        // Store the file offset as user_data so we can look up
-                        // the expected length when draining completions.
-                        .user_data(file_offset);
+                    let sqe = opcode::Write::new(
+                        fd,
+                        buf.as_ptr(),
+                        u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                    )
+                    .offset(file_offset)
+                    .build()
+                    // Store the file offset as user_data so we can look up
+                    // the expected length when draining completions.
+                    .user_data(file_offset);
 
                     // SAFETY: `buf` is borrowed from the caller's `buffers`
                     // slice, which lives for the entire duration of this method
@@ -269,12 +273,11 @@ impl IoBackend for UringBackend {
                 }
                 let file_offset = cqe.user_data();
                 if let Some(&expected_len) = expected.get(&file_offset) {
-                    if res as usize != expected_len {
+                    if usize::try_from(res).ok() != Some(expected_len) {
                         return Err(io::Error::new(
                             io::ErrorKind::WriteZero,
                             format!(
-                                "io_uring short write: expected {} B at offset {}, wrote {} B",
-                                expected_len, file_offset, res
+                                "io_uring short write: expected {expected_len} B at offset {file_offset}, wrote {res} B"
                             ),
                         ));
                     }
@@ -285,10 +288,7 @@ impl IoBackend for UringBackend {
             if completed != chunk_len {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    format!(
-                        "io_uring batch: expected {} completions, got {}",
-                        chunk_len, completed
-                    ),
+                    format!("io_uring batch: expected {chunk_len} completions, got {completed}"),
                 ));
             }
 

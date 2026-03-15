@@ -171,12 +171,9 @@ pub fn detect_io_uring() -> bool {
 pub fn create_backend(path: &Path) -> io::Result<Box<dyn IoBackend>> {
     #[cfg(target_os = "linux")]
     if detect_io_uring() {
-        match uring::UringBackend::open(path) {
-            Ok(backend) => return Ok(Box::new(backend)),
-            Err(_) => {
-                // Ring probe succeeded but open failed (unlikely). Fall through
-                // to the sync backend rather than propagating the error.
-            }
+        if let Ok(backend) = uring::UringBackend::open(path) {
+            return Ok(Box::new(backend));
+            // Ring probe succeeded but open failed (unlikely): fall through.
         }
     }
 
