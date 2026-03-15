@@ -45,6 +45,7 @@ impl From<std::io::Error> for CompactionError {
 pub type Result<T> = std::result::Result<T, CompactionError>;
 
 /// Result of a compaction run.
+#[derive(Debug)]
 pub struct CompactionOutput {
     /// ID of the newly written merged data file.
     pub new_file_id: u64,
@@ -78,6 +79,17 @@ pub fn compact(
     new_file_id: u64,
     now_ms: u64,
 ) -> Result<CompactionOutput> {
+    // Issue 4.3: new_file_id must be strictly greater than every input file ID
+    // so that startup replay processes old files before the compacted output,
+    // preventing stale entries from overwriting compacted keydir entries.
+    if let Some(&max_input_id) = file_ids.iter().max() {
+        if new_file_id <= max_input_id {
+            return Err(CompactionError(format!(
+                "new_file_id ({new_file_id}) must be greater than all input file IDs (max: {max_input_id})",
+            )));
+        }
+    }
+
     let new_log_path = log_path(data_dir, new_file_id);
     let new_hint_path = hint_path(data_dir, new_file_id);
 
@@ -96,7 +108,10 @@ pub fn compact(
         let mut reader = LogReader::open(&source_log)?;
         let mut offset: u64 = 0;
 
-        let records = reader.iter_from_start()?;
+        // Issue 4.1: use the tolerant iterator so that a partial tail record
+        // (from a previous crash) stops iteration silently rather than
+        // returning Err — matching startup recovery semantics.
+        let records = reader.iter_from_start_tolerant()?;
 
         for record in records {
             let record_len = (HEADER_SIZE
@@ -137,7 +152,7 @@ pub fn compact(
     }
 
     writer.sync()?;
-    hint_writer.flush()?;
+    hint_writer.commit()?;
 
     Ok(CompactionOutput {
         new_file_id,
@@ -649,5 +664,346 @@ mod tests {
         let out = compact(dir.path(), &[1], &kd, 99, 0).unwrap();
         assert_eq!(out.records_written, 1, "only the live (newer) record survives");
         assert_eq!(out.records_dropped, 1, "stale first record is dropped");
+    }
+
+    // ------------------------------------------------------------------
+    // Issue 4.1: Compaction must tolerate a corrupt/truncated tail record
+    // ------------------------------------------------------------------
+
+    /// Appending garbage bytes to the end of a log file (simulating a crash
+    /// mid-write) must not cause compaction to fail.  The valid records
+    /// before the corrupt tail must be preserved.
+    #[test]
+    fn compact_tolerates_corrupt_tail_in_input_file() {
+        use std::io::Write as _;
+
+        let dir = tmp();
+
+        // Write 3 live records to file 1.
+        let path = log_path(dir.path(), 1);
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let off_k1 = w.write(b"k1", b"v1", 0).unwrap();
+        let off_k2 = w.write(b"k2", b"v2", 0).unwrap();
+        let off_k3 = w.write(b"k3", b"v3", 0).unwrap();
+        w.sync().unwrap();
+        drop(w);
+
+        // Append 10 bytes of garbage — simulates a partial tail record from a crash.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+                .unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Build keydir pointing to all three live records.
+        let mut kd = KeyDir::new();
+        for (key, off) in [
+            (b"k1".as_slice(), off_k1),
+            (b"k2".as_slice(), off_k2),
+            (b"k3".as_slice(), off_k3),
+        ] {
+            kd.put(
+                key.to_vec(),
+                KeyEntry {
+                    file_id: 1,
+                    offset: off,
+                    value_size: 2,
+                    expire_at_ms: 0,
+                    ref_bit: false,
+                },
+            );
+        }
+
+        // Compaction must succeed despite the garbage tail.
+        let out = compact(dir.path(), &[1], &kd, 100, 0)
+            .expect("compact must not fail on a corrupt tail record");
+
+        assert_eq!(out.records_written, 3, "all 3 live records must be written");
+        assert_eq!(out.records_dropped, 0);
+
+        // All keys must be readable from the new log file.
+        let mut reader = crate::log::LogReader::open(&out.new_log_path).unwrap();
+        let records = reader.iter_from_start().unwrap();
+        assert_eq!(records.len(), 3);
+        let keys: Vec<&[u8]> = records.iter().map(|r| r.key.as_slice()).collect();
+        assert!(keys.contains(&b"k1".as_slice()));
+        assert!(keys.contains(&b"k2".as_slice()));
+        assert!(keys.contains(&b"k3".as_slice()));
+    }
+
+    // ------------------------------------------------------------------
+    // Issue 4.3: Output file ID must be strictly greater than all input IDs
+    // ------------------------------------------------------------------
+
+    /// Calling compact() with new_file_id <= max(file_ids) must return Err.
+    #[test]
+    fn compact_rejects_output_id_not_greater_than_input_ids() {
+        let dir = tmp();
+        make_log(dir.path(), 1, &[(b"a", b"1")]);
+        make_log(dir.path(), 2, &[(b"b", b"2")]);
+        make_log(dir.path(), 3, &[(b"c", b"3")]);
+
+        let kd = KeyDir::new();
+        // Keydir contents do not matter for this check — the guard fires first.
+
+        // new_file_id=2 is less than max input id 3 — must error.
+        let result = compact(dir.path(), &[1, 2, 3], &kd, 2, 0);
+        assert!(
+            result.is_err(),
+            "compact must reject new_file_id (2) <= max input id (3)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("new_file_id") && msg.contains("2") && msg.contains("3"),
+            "error message must mention new_file_id and max input id; got: {msg}"
+        );
+
+        // new_file_id=3 equals max input id — also must error.
+        let result_eq = compact(dir.path(), &[1, 2, 3], &kd, 3, 0);
+        assert!(
+            result_eq.is_err(),
+            "compact must reject new_file_id (3) == max input id (3)"
+        );
+    }
+
+    /// Calling compact() with new_file_id strictly greater than all input IDs
+    /// must succeed.
+    #[test]
+    fn compact_accepts_output_id_greater_than_all_inputs() {
+        let dir = tmp();
+        use crate::log::HEADER_SIZE;
+
+        make_log(dir.path(), 1, &[(b"a", b"1")]);
+        make_log(dir.path(), 2, &[(b"b", b"2")]);
+        make_log(dir.path(), 3, &[(b"c", b"3")]);
+
+        let mut kd = KeyDir::new();
+        kd.put(
+            b"a".to_vec(),
+            KeyEntry {
+                file_id: 1,
+                offset: 0,
+                value_size: 1,
+                expire_at_ms: 0,
+                ref_bit: false,
+            },
+        );
+        kd.put(
+            b"b".to_vec(),
+            KeyEntry {
+                file_id: 2,
+                offset: 0,
+                value_size: 1,
+                expire_at_ms: 0,
+                ref_bit: false,
+            },
+        );
+        kd.put(
+            b"c".to_vec(),
+            KeyEntry {
+                file_id: 3,
+                offset: 0,
+                value_size: 1,
+                expire_at_ms: 0,
+                ref_bit: false,
+            },
+        );
+        let _ = HEADER_SIZE;
+
+        // new_file_id=100 is well above max input id 3 — must succeed.
+        let out = compact(dir.path(), &[1, 2, 3], &kd, 100, 0)
+            .expect("compact must succeed when new_file_id > all input ids");
+
+        assert_eq!(out.new_file_id, 100);
+        assert_eq!(out.records_written, 3);
+    }
+
+    /// Edge case: new_file_id == max_input_id must fail;
+    /// new_file_id == max_input_id + 1 must succeed.
+    #[test]
+    fn compact_output_id_must_exceed_max_input_id() {
+        let dir = tmp();
+        make_log(dir.path(), 5, &[(b"k", b"v")]);
+
+        let mut kd = KeyDir::new();
+        kd.put(
+            b"k".to_vec(),
+            KeyEntry {
+                file_id: 5,
+                offset: 0,
+                value_size: 1,
+                expire_at_ms: 0,
+                ref_bit: false,
+            },
+        );
+
+        // Equal — must fail.
+        assert!(
+            compact(dir.path(), &[5], &kd, 5, 0).is_err(),
+            "new_file_id == max_input_id must fail"
+        );
+
+        // One above — must succeed.
+        let out = compact(dir.path(), &[5], &kd, 6, 0)
+            .expect("new_file_id == max_input_id + 1 must succeed");
+        assert_eq!(out.new_file_id, 6);
+        assert_eq!(out.records_written, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Additional edge cases from coverage requirements
+    // ------------------------------------------------------------------
+
+    /// Write a key 20 times, compact — compacted file has only 1 entry (latest value).
+    #[test]
+    fn compact_single_key_overwritten_many_times() {
+        let dir = tmp();
+        let path = log_path(dir.path(), 1);
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let mut last_offset = 0u64;
+        for i in 0u8..20 {
+            last_offset = w.write(b"hotkey", &[i], 0).unwrap();
+        }
+        w.sync().unwrap();
+
+        // Keydir points only to the last write.
+        let mut kd = KeyDir::new();
+        kd.put(
+            b"hotkey".to_vec(),
+            KeyEntry {
+                file_id: 1,
+                offset: last_offset,
+                value_size: 1,
+                expire_at_ms: 0,
+                ref_bit: false,
+            },
+        );
+
+        let out = compact(dir.path(), &[1], &kd, 99, 0).unwrap();
+        assert_eq!(out.records_written, 1, "only the latest write must survive");
+        assert_eq!(out.records_dropped, 19, "19 stale writes must be dropped");
+
+        // Verify the compacted log has exactly 1 record with the latest value.
+        let mut reader = crate::log::LogReader::open(&out.new_log_path).unwrap();
+        let records = reader.iter_from_start().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, b"hotkey");
+        assert_eq!(records[0].value, Some(vec![19u8])); // last iteration value
+    }
+
+    /// Put 10 keys then delete 5 of them. Compact — compacted file has exactly 5 entries.
+    #[test]
+    fn compact_drops_tombstoned_keys() {
+        let dir = tmp();
+        let path = log_path(dir.path(), 1);
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let mut live_offsets: Vec<(Vec<u8>, u64)> = Vec::new();
+
+        for i in 0u8..10 {
+            let key = vec![i];
+            let offset = w.write(&key, &[i], 0).unwrap();
+            live_offsets.push((key, offset));
+        }
+        // Write tombstones for keys 0..5.
+        for i in 0u8..5 {
+            w.write_tombstone(&[i]).unwrap();
+        }
+        w.sync().unwrap();
+
+        // Keydir has only keys 5..10.
+        let mut kd = KeyDir::new();
+        for (key, offset) in live_offsets.iter().skip(5) {
+            kd.put(
+                key.clone(),
+                KeyEntry {
+                    file_id: 1,
+                    offset: *offset,
+                    value_size: 1,
+                    expire_at_ms: 0,
+                    ref_bit: false,
+                },
+            );
+        }
+
+        let out = compact(dir.path(), &[1], &kd, 99, 0).unwrap();
+        assert_eq!(out.records_written, 5, "5 live keys must survive compaction");
+
+        let mut hr = HintReader::open(&out.new_hint_path).unwrap();
+        let hints = hr.read_all().unwrap();
+        assert_eq!(hints.len(), 5, "hint file must have exactly 5 entries");
+    }
+
+    /// The compacted output file must be smaller than the sum of the input files
+    /// when there is significant write amplification (many overwrites).
+    #[test]
+    fn compact_output_file_is_smaller_than_inputs() {
+        let dir = tmp();
+        let path = log_path(dir.path(), 1);
+        let mut w = LogWriter::open(&path, 1).unwrap();
+
+        // Write each of 10 keys 50 times — only the last write per key is live.
+        let mut last_offsets: std::collections::HashMap<Vec<u8>, u64> =
+            std::collections::HashMap::new();
+        for _round in 0u8..50 {
+            for k in 0u8..10 {
+                let offset = w.write(&[k], &[k; 100], 0).unwrap(); // 100-byte values
+                last_offsets.insert(vec![k], offset);
+            }
+        }
+        w.sync().unwrap();
+
+        let input_size = std::fs::metadata(&path).unwrap().len();
+
+        let mut kd = KeyDir::new();
+        for (key, offset) in &last_offsets {
+            kd.put(
+                key.clone(),
+                KeyEntry {
+                    file_id: 1,
+                    offset: *offset,
+                    value_size: 100,
+                    expire_at_ms: 0,
+                    ref_bit: false,
+                },
+            );
+        }
+
+        let out = compact(dir.path(), &[1], &kd, 99, 0).unwrap();
+        let output_size = std::fs::metadata(&out.new_log_path).unwrap().len();
+
+        assert_eq!(out.records_written, 10, "10 live keys must survive");
+        assert!(
+            output_size < input_size,
+            "compacted output ({output_size} bytes) must be smaller than input ({input_size} bytes)"
+        );
+    }
+
+    /// remove_old_files removes both .log and .hint files for the given file IDs.
+    #[test]
+    fn remove_old_files_deletes_data_and_hint_files() {
+        let dir = tmp();
+
+        // Create log and hint files for IDs 10 and 20.
+        for &fid in &[10u64, 20u64] {
+            make_log(dir.path(), fid, &[(b"k", b"v")]);
+            let hp = hint_path(dir.path(), fid);
+            std::fs::write(&hp, b"fake hint").unwrap();
+        }
+
+        assert!(log_path(dir.path(), 10).exists());
+        assert!(hint_path(dir.path(), 10).exists());
+        assert!(log_path(dir.path(), 20).exists());
+        assert!(hint_path(dir.path(), 20).exists());
+
+        remove_old_files(dir.path(), &[10, 20]).unwrap();
+
+        assert!(!log_path(dir.path(), 10).exists(), ".log for fid 10 must be deleted");
+        assert!(!hint_path(dir.path(), 10).exists(), ".hint for fid 10 must be deleted");
+        assert!(!log_path(dir.path(), 20).exists(), ".log for fid 20 must be deleted");
+        assert!(!hint_path(dir.path(), 20).exists(), ".hint for fid 20 must be deleted");
     }
 }

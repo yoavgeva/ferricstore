@@ -1,0 +1,244 @@
+defmodule Ferricstore.Store.ShardTest do
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Store.Shard
+
+  setup do
+    dir = Path.join(System.tmp_dir!(), "shard_test_#{:rand.uniform(999_999)}")
+    File.mkdir_p!(dir)
+
+    # Use a unique index per test to avoid name collisions
+    index = :erlang.unique_integer([:positive]) |> rem(10_000) |> Kernel.+(10_000)
+    {:ok, pid} = Shard.start_link(index: index, data_dir: dir)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf!(dir)
+    end)
+
+    %{shard: pid, index: index}
+  end
+
+  describe "put and get" do
+    test "put and get returns value", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "key", "value", 0})
+      assert "value" == GenServer.call(shard, {:get, "key"})
+    end
+
+    test "get on missing key returns nil", %{shard: shard} do
+      assert nil == GenServer.call(shard, {:get, "missing"})
+    end
+
+    test "put overwrites previous value", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "key", "v1", 0})
+      :ok = GenServer.call(shard, {:put, "key", "v2", 0})
+      assert "v2" == GenServer.call(shard, {:get, "key"})
+    end
+
+    test "put with expire_at_ms 0 never expires", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "key", "value", 0})
+      assert "value" == GenServer.call(shard, {:get, "key"})
+    end
+
+    test "put with past expire_at_ms returns nil on get", %{shard: shard} do
+      past = System.os_time(:millisecond) - 1000
+      :ok = GenServer.call(shard, {:put, "key", "value", past})
+      assert nil == GenServer.call(shard, {:get, "key"})
+    end
+
+    test "put with future expire_at_ms returns value", %{shard: shard} do
+      future = System.os_time(:millisecond) + 60_000
+      :ok = GenServer.call(shard, {:put, "key", "value", future})
+      assert "value" == GenServer.call(shard, {:get, "key"})
+    end
+  end
+
+  describe "delete" do
+    test "delete existing key returns :ok", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "key", "value", 0})
+      assert :ok == GenServer.call(shard, {:delete, "key"})
+    end
+
+    test "delete missing key returns :ok (idempotent)", %{shard: shard} do
+      assert :ok == GenServer.call(shard, {:delete, "nonexistent"})
+    end
+
+    test "get after delete returns nil", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "key", "value", 0})
+      :ok = GenServer.call(shard, {:delete, "key"})
+      assert nil == GenServer.call(shard, {:get, "key"})
+    end
+  end
+
+  describe "exists?" do
+    test "true for live key", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "key", "value", 0})
+      assert true == GenServer.call(shard, {:exists, "key"})
+    end
+
+    test "false for missing key", %{shard: shard} do
+      assert false == GenServer.call(shard, {:exists, "nokey"})
+    end
+
+    test "false for expired key", %{shard: shard} do
+      past = System.os_time(:millisecond) - 1000
+      :ok = GenServer.call(shard, {:put, "key", "value", past})
+      assert false == GenServer.call(shard, {:exists, "key"})
+    end
+  end
+
+  describe "keys" do
+    test "returns all live keys", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "a", "1", 0})
+      :ok = GenServer.call(shard, {:put, "b", "2", 0})
+      keys = GenServer.call(shard, :keys)
+      assert Enum.sort(keys) == ["a", "b"]
+    end
+
+    test "does not include deleted keys", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "a", "1", 0})
+      :ok = GenServer.call(shard, {:put, "b", "2", 0})
+      :ok = GenServer.call(shard, {:delete, "a"})
+      keys = GenServer.call(shard, :keys)
+      assert keys == ["b"]
+    end
+
+    test "does not include expired keys", %{shard: shard} do
+      past = System.os_time(:millisecond) - 1000
+      :ok = GenServer.call(shard, {:put, "expired", "v", past})
+      :ok = GenServer.call(shard, {:put, "live", "v", 0})
+      keys = GenServer.call(shard, :keys)
+      assert keys == ["live"]
+    end
+  end
+
+  describe "ETS hot cache" do
+    test "put immediately populates ETS", %{shard: shard, index: index} do
+      :ok = GenServer.call(shard, {:put, "cached_key", "val", 0})
+      ets = :ets.whereis(:"shard_ets_#{index}")
+      assert ets != :undefined
+      assert [{_, "val", 0}] = :ets.lookup(ets, "cached_key")
+    end
+
+    test "get warms ETS on miss", %{shard: shard, index: index} do
+      # Put directly via NIF path (bypassing ETS warm), then clear ETS manually
+      :ok = GenServer.call(shard, {:put, "warm_key", "warm_val", 0})
+      ets = :ets.whereis(:"shard_ets_#{index}")
+      :ets.delete(ets, "warm_key")
+      # Now get — should fetch from Bitcask and warm ETS
+      assert "warm_val" == GenServer.call(shard, {:get, "warm_key"})
+      assert [{_, "warm_val", _}] = :ets.lookup(ets, "warm_key")
+    end
+
+    test "delete evicts ETS entry", %{shard: shard, index: index} do
+      :ok = GenServer.call(shard, {:put, "evict_key", "val", 0})
+      :ok = GenServer.call(shard, {:delete, "evict_key"})
+      ets = :ets.whereis(:"shard_ets_#{index}")
+      assert [] == :ets.lookup(ets, "evict_key")
+    end
+
+    test "expired key is evicted from ETS on read", %{shard: shard, index: index} do
+      past = System.os_time(:millisecond) - 1000
+      :ok = GenServer.call(shard, {:put, "exp_key", "val", past})
+      ets = :ets.whereis(:"shard_ets_#{index}")
+      # Confirm entry is in ETS (put always writes to ETS)
+      assert [{_, "val", ^past}] = :ets.lookup(ets, "exp_key")
+      # get should detect expiry and evict
+      assert nil == GenServer.call(shard, {:get, "exp_key"})
+      assert [] == :ets.lookup(ets, "exp_key")
+    end
+  end
+
+  describe "get_meta" do
+    test "returns {value, expire_at_ms} for live key", %{shard: shard} do
+      future = System.os_time(:millisecond) + 60_000
+      :ok = GenServer.call(shard, {:put, "meta_key", "meta_val", future})
+      assert {"meta_val", ^future} = GenServer.call(shard, {:get_meta, "meta_key"})
+    end
+
+    test "returns {value, 0} for key with no expiry", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "noexp", "val", 0})
+      assert {"val", 0} = GenServer.call(shard, {:get_meta, "noexp"})
+    end
+
+    test "returns nil for missing key", %{shard: shard} do
+      assert nil == GenServer.call(shard, {:get_meta, "no_such_key"})
+    end
+
+    test "returns nil for expired key", %{shard: shard} do
+      past = System.os_time(:millisecond) - 1000
+      :ok = GenServer.call(shard, {:put, "exp", "val", past})
+      assert nil == GenServer.call(shard, {:get_meta, "exp"})
+    end
+
+    test "returns {value, 0} for key with expire_at_ms of 0", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "zero_exp", "val", 0})
+      assert {"val", 0} = GenServer.call(shard, {:get_meta, "zero_exp"})
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Additional edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "binary key and value edge cases" do
+    test "handles binary keys with null bytes", %{shard: shard} do
+      key = <<0, 1, 2>>
+      :ok = GenServer.call(shard, {:put, key, "value", 0})
+      assert "value" == GenServer.call(shard, {:get, key})
+    end
+
+    test "handles large value (50KB)", %{shard: shard} do
+      large_value = :crypto.strong_rand_bytes(50_000)
+      :ok = GenServer.call(shard, {:put, "big", large_value, 0})
+      assert large_value == GenServer.call(shard, {:get, "big"})
+    end
+  end
+
+  describe "many keys" do
+    test "handles 500 key-value pairs", %{shard: shard} do
+      for i <- 1..500 do
+        key = "key_#{i}"
+        :ok = GenServer.call(shard, {:put, key, "val_#{i}", 0})
+      end
+
+      keys = GenServer.call(shard, :keys)
+      assert length(keys) == 500
+    end
+  end
+
+  describe "concurrent access" do
+    test "concurrent gets from same shard do not crash", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "shared", "value", 0})
+
+      tasks =
+        for _ <- 1..30 do
+          Task.async(fn ->
+            GenServer.call(shard, {:get, "shared"})
+          end)
+        end
+
+      results = Task.await_many(tasks, 5_000)
+      assert Enum.all?(results, &(&1 == "value"))
+    end
+  end
+
+  describe "consistency" do
+    test "put then immediate exists? is consistent", %{shard: shard} do
+      :ok = GenServer.call(shard, {:put, "fresh", "val", 0})
+      assert true == GenServer.call(shard, {:exists, "fresh"})
+    end
+
+    test "exists? after expired put returns false", %{shard: shard} do
+      past = System.os_time(:millisecond) - 1000
+      :ok = GenServer.call(shard, {:put, "gone", "val", past})
+      assert false == GenServer.call(shard, {:exists, "gone"})
+    end
+  end
+
+  describe "keys edge cases" do
+    test "keys returns empty list for fresh shard", %{shard: shard} do
+      assert [] == GenServer.call(shard, :keys)
+    end
+  end
+end

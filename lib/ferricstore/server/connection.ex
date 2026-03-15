@@ -26,6 +26,7 @@ defmodule Ferricstore.Server.Connection do
 
   @behaviour :ranch_protocol
 
+  alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Resp.{Encoder, Parser}
 
   # Connection state
@@ -156,16 +157,18 @@ defmodule Ferricstore.Server.Connection do
   # Dispatch table
   # ---------------------------------------------------------------------------
 
+  # Protocol-level commands stay in the connection layer.
   defp dispatch("HELLO", args), do: handle_hello(args)
   # CLIENT HELLO [version] is the two-token form sent by some Redis clients.
   defp dispatch("CLIENT", ["HELLO" | args]), do: handle_hello(args)
-  defp dispatch("PING", args), do: handle_ping(args)
   defp dispatch("QUIT", _args), do: {:quit, Encoder.encode(:ok)}
   defp dispatch("RESET", _args), do: {:continue, Encoder.encode({:simple, "RESET"})}
 
-  defp dispatch(cmd, _args) do
-    {:continue,
-     Encoder.encode({:error, "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "})}
+  # All other commands go through the Dispatcher with an injected store.
+  defp dispatch(cmd, args) do
+    store = build_store()
+    result = Dispatcher.dispatch(cmd, args, store)
+    {:continue, Encoder.encode(result)}
   end
 
   # ---------------------------------------------------------------------------
@@ -187,15 +190,25 @@ defmodule Ferricstore.Server.Connection do
   end
 
   # ---------------------------------------------------------------------------
-  # PING handler
+  # Store builder — wraps Router functions into the store map contract
   # ---------------------------------------------------------------------------
 
-  defp handle_ping([]) do
-    {:continue, Encoder.encode({:simple, "PONG"})}
-  end
+  defp build_store do
+    alias Ferricstore.Store.Router
 
-  defp handle_ping([message | _rest]) do
-    {:continue, Encoder.encode(message)}
+    %{
+      get: &Router.get/1,
+      get_meta: &Router.get_meta/1,
+      put: &Router.put/3,
+      delete: &Router.delete/1,
+      exists?: &Router.exists?/1,
+      keys: &Router.keys/0,
+      flush: fn ->
+        Enum.each(Router.keys(), &Router.delete/1)
+        :ok
+      end,
+      dbsize: &Router.dbsize/0
+    }
   end
 
   # ---------------------------------------------------------------------------

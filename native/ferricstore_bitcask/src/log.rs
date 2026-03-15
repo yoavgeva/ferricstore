@@ -119,6 +119,14 @@ impl LogWriter {
         Ok(start)
     }
 
+    /// Advance the write offset without writing data. Used by the async
+    /// `io_uring` path to reserve file space that will be written by an
+    /// `AsyncUringBackend`.
+    pub fn advance_offset(&mut self, bytes: u64) {
+        self.backend.advance_offset(bytes);
+        self.offset += bytes;
+    }
+
     /// Flush the write buffer and fsync the file to durable storage.
     ///
     /// # Errors
@@ -234,7 +242,7 @@ impl LogReader {
 // Encoding helpers
 // ---------------------------------------------------------------------------
 
-fn encode_record(key: &[u8], value: &[u8], expire_at_ms: u64) -> Vec<u8> {
+pub(crate) fn encode_record(key: &[u8], value: &[u8], expire_at_ms: u64) -> Vec<u8> {
     let now_ms = now_ms();
     #[allow(clippy::cast_possible_truncation)]
     let key_size = key.len() as u16;
@@ -746,5 +754,242 @@ mod tests {
         let mut reader = LogReader::open(&path).unwrap();
         let record = reader.read_at(0).unwrap().unwrap();
         assert!(record.timestamp_ms > 0, "timestamp_ms must be non-zero after a write");
+    }
+
+    // ------------------------------------------------------------------
+    // CRC32 function properties
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn crc32_different_bytes_produce_different_checksums() {
+        assert_ne!(crc32(b"hello"), crc32(b"world"));
+    }
+
+    #[test]
+    fn crc32_empty_slice_is_consistent() {
+        assert_eq!(crc32(b""), crc32(b""), "crc32 of empty slice must be deterministic");
+    }
+
+    #[test]
+    fn crc32_single_byte_flip_changes_checksum() {
+        let mut data = b"abcdef".to_vec();
+        let original = crc32(&data);
+        data[3] ^= 0xFF;
+        assert_ne!(crc32(&data), original, "flipping one byte must change the checksum");
+    }
+
+    // ------------------------------------------------------------------
+    // Record encoding/decoding
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn encode_and_decode_record_round_trip() {
+        let key = b"roundtrip_key";
+        let value = b"roundtrip_value";
+        let expire_at = 987_654_321u64;
+        let encoded = encode_record(key, value, expire_at);
+
+        let mut cursor = io::Cursor::new(&encoded);
+        let record = read_next_record(&mut cursor).unwrap().unwrap();
+
+        assert_eq!(record.key, key, "key must round-trip");
+        assert_eq!(record.value, Some(value.to_vec()), "value must round-trip");
+        assert_eq!(record.expire_at_ms, expire_at, "expire_at_ms must round-trip");
+        assert!(record.timestamp_ms > 0, "timestamp_ms must be set");
+    }
+
+    #[test]
+    fn encode_tombstone_value_size_is_zero() {
+        // encode_tombstone calls encode_record with empty value — value_size on disk is 0.
+        let key = b"tomb_key";
+        let encoded = encode_tombstone(key);
+        // The value_size field lives at bytes 22..26 in the encoded record.
+        let value_size = u32::from_le_bytes(encoded[22..26].try_into().unwrap());
+        assert_eq!(value_size, 0, "tombstone must encode value_size=0");
+    }
+
+    #[test]
+    fn decode_truncated_record_returns_error() {
+        let encoded = encode_record(b"key_trunc", b"val_trunc", 0);
+        // Truncate by 1 byte from the end.
+        let truncated = &encoded[..encoded.len() - 1];
+        let mut cursor = io::Cursor::new(truncated);
+        // Should return Err (CRC mismatch or UnexpectedEof on value read).
+        // The header is intact with key_size and value_size set, so it will try
+        // to read the full value and hit UnexpectedEof → Err.
+        assert!(
+            read_next_record(&mut cursor).is_err(),
+            "truncated record must return Err"
+        );
+    }
+
+    #[test]
+    fn decode_empty_buffer_returns_none() {
+        let mut cursor = io::Cursor::new(Vec::<u8>::new());
+        assert!(
+            read_next_record(&mut cursor).unwrap().is_none(),
+            "empty buffer must return Ok(None)"
+        );
+    }
+
+    #[test]
+    fn decode_record_with_flipped_crc_field_returns_error() {
+        let mut encoded = encode_record(b"flip_crc", b"val", 0);
+        // Flip byte 0 — this is the first byte of the stored CRC field.
+        encoded[0] ^= 0xFF;
+        let mut cursor = io::Cursor::new(&encoded);
+        assert!(
+            read_next_record(&mut cursor).is_err(),
+            "flipped CRC field byte must trigger CRC mismatch error"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // iter_from_start_tolerant
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tolerant_iter_stops_at_first_crc_error() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let off3 = w.write(b"k1", b"v1", 0).unwrap();
+        let off4 = w.write(b"k2", b"v2", 0).unwrap();
+        let off5 = w.write(b"k3", b"v3", 0).unwrap();
+        w.sync().unwrap();
+        drop(w);
+        let _ = (off3, off4, off5);
+
+        // Corrupt the start of the 2nd record's key area to break its CRC.
+        // The 1st record occupies bytes 0..(HEADER_SIZE+2+2)=30.
+        {
+            use io::Write as _;
+            use std::io::Seek;
+            let flip_pos = (HEADER_SIZE + 2 + 2) as u64 + HEADER_SIZE as u64;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(io::SeekFrom::Start(flip_pos)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+        }
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start_tolerant().unwrap();
+        // Only the first record is valid; tolerant iterator stops at 2nd CRC error.
+        assert_eq!(records.len(), 1, "tolerant iter must stop at first corrupt record");
+        assert_eq!(records[0].key, b"k1");
+    }
+
+    #[test]
+    fn tolerant_iter_stops_at_truncated_tail() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        w.write(b"r1", b"v1", 0).unwrap();
+        w.write(b"r2", b"v2", 0).unwrap();
+        let _off3 = w.write(b"r3", b"v3", 0).unwrap();
+        w.sync().unwrap();
+        drop(w);
+
+        // Truncate the last 5 bytes — partial tail record.
+        let size = fs::metadata(&path).unwrap().len();
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.set_len(size - 5).unwrap();
+        }
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start_tolerant().unwrap();
+        // Either 2 (r1, r2) or 3 depending on whether the truncation hits the
+        // 3rd record's header or body. In either case must be ≤ 3 and ≥ 2.
+        assert!(
+            records.len() == 2 || records.len() == 3,
+            "tolerant iter must return 2 or 3 records with truncated tail; got {}",
+            records.len()
+        );
+        // The first two must be intact.
+        assert_eq!(records[0].key, b"r1");
+        assert_eq!(records[1].key, b"r2");
+    }
+
+    #[test]
+    fn tolerant_iter_returns_all_records_when_no_corruption() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        for i in 0u8..10 {
+            w.write(&[i], &[i, i], 0).unwrap();
+        }
+        w.sync().unwrap();
+
+        let mut reader = LogReader::open(&path).unwrap();
+        let records = reader.iter_from_start_tolerant().unwrap();
+        assert_eq!(records.len(), 10, "tolerant iter must return all 10 valid records");
+    }
+
+    // ------------------------------------------------------------------
+    // write_batch
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn write_batch_empty_is_ok() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let results = w.write_batch(&[]).unwrap();
+        assert!(results.is_empty(), "write_batch with empty slice must return empty vec");
+        assert_eq!(w.offset, 0, "offset must stay 0 after empty batch");
+    }
+
+    #[test]
+    fn write_batch_offsets_are_monotonically_increasing() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries: Vec<(&[u8], &[u8], u64)> = vec![
+            (b"a", b"1", 0),
+            (b"bb", b"22", 0),
+            (b"ccc", b"333", 0),
+            (b"dddd", b"4444", 0),
+            (b"eeeee", b"55555", 0),
+        ];
+        let results = w.write_batch(&entries).unwrap();
+        assert_eq!(results.len(), 5);
+        let offsets: Vec<u64> = results.iter().map(|(off, _)| *off).collect();
+        for window in offsets.windows(2) {
+            assert!(
+                window[1] > window[0],
+                "batch offsets must be strictly increasing: {:?}",
+                offsets
+            );
+        }
+    }
+
+    #[test]
+    fn write_batch_all_records_readable() {
+        let dir = temp_dir();
+        let path = dir.path().join("data.log");
+        let mut w = LogWriter::open(&path, 1).unwrap();
+        let entries: Vec<(&[u8], &[u8], u64)> = vec![
+            (b"batch_k1", b"batch_v1", 0),
+            (b"batch_k2", b"batch_v2", 1_000_000),
+            (b"batch_k3", b"batch_v3", 0),
+        ];
+        let results = w.write_batch(&entries).unwrap();
+
+        let mut reader = LogReader::open(&path).unwrap();
+        for (i, (off, _)) in results.iter().enumerate() {
+            let record = reader.read_at(*off).unwrap().unwrap();
+            assert_eq!(record.key, entries[i].0, "key at offset {off} must match");
+            assert_eq!(
+                record.value,
+                Some(entries[i].1.to_vec()),
+                "value at offset {off} must match"
+            );
+        }
     }
 }

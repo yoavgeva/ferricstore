@@ -10,18 +10,6 @@ defmodule Ferricstore.Server.ConnectionTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  # Starts the Ranch listener on a random ephemeral port, returns the port.
-  defp start_listener do
-    {:ok, _} = Application.ensure_all_started(:ranch)
-    port = available_port()
-    {:ok, _} = Listener.start(port)
-    port
-  end
-
-  defp stop_listener do
-    :ranch.stop_listener(Listener.ref())
-  end
-
   defp available_port do
     {:ok, sock} = :gen_tcp.listen(0, [])
     {:ok, port} = :inet.port(sock)
@@ -54,9 +42,9 @@ defmodule Ferricstore.Server.ConnectionTest do
   # ---------------------------------------------------------------------------
 
   setup do
-    port = start_listener()
-    on_exit(fn -> stop_listener() end)
-    {:ok, port: port}
+    # The application supervisor manages the Ranch listener.
+    # Use the actual bound port (ephemeral in test env).
+    {:ok, port: Listener.port()}
   end
 
   # ---------------------------------------------------------------------------

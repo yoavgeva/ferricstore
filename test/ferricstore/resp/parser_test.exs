@@ -492,4 +492,130 @@ defmodule Ferricstore.Resp.ParserTest do
       assert {:ok, [^str], ""} = Parser.parse(input)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Attribute type (|)
+  # ---------------------------------------------------------------------------
+
+  describe "attribute type" do
+    test "parses an attribute type" do
+      # |1 = one key-value pair: key=simple "key", value=integer 42
+      input = "|1\r\n+key\r\n:42\r\n"
+      assert {:ok, [{:attribute, %{{:simple, "key"} => 42}}], ""} = Parser.parse(input)
+    end
+
+    test "parses attribute followed by a value" do
+      input = "|1\r\n+key\r\n:42\r\n+OK\r\n"
+
+      assert {:ok, [{:attribute, %{{:simple, "key"} => 42}}, {:simple, "OK"}], ""} =
+               Parser.parse(input)
+    end
+
+    test "parses empty attribute" do
+      assert {:ok, [{:attribute, %{}}], ""} = Parser.parse("|0\r\n")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Blob error — additional edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "blob error edge cases" do
+    test "blob error with negative length returns error" do
+      assert {:error, {:invalid_blob_error_length, -1}} = Parser.parse("!-1\r\n\r\n")
+    end
+
+    test "blob error with length mismatch is incomplete (not enough data)" do
+      # Header says 5 bytes but payload has 11 — the parser reads only 5 bytes
+      # then expects CRLF at position 5. "hello world" has " " at position 5, not CRLF.
+      assert {:error, :bulk_crlf_missing} = Parser.parse("!5\r\nhello world\r\n")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Verbatim string — additional edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "verbatim string edge cases" do
+    test "verbatim string with length < 4 returns error" do
+      assert {:error, {:invalid_verbatim_length, 3}} = Parser.parse("=3\r\nABC\r\n")
+    end
+
+    test "verbatim string with missing colon separator returns error" do
+      # Length 4, payload "ABCD" — no colon after 3-byte encoding
+      assert {:error, :invalid_verbatim_payload} = Parser.parse("=4\r\nABCD\r\n")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Null — additional edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "null edge cases" do
+    test "null with non-empty content returns error" do
+      assert {:error, {:invalid_null, "garbage"}} = Parser.parse("_garbage\r\n")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Double — additional edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "double edge cases" do
+    test "parses NaN double (lowercase)" do
+      assert {:ok, [:nan], ""} = Parser.parse(",nan\r\n")
+    end
+
+    test "parses NaN double (mixed case)" do
+      assert {:ok, [:nan], ""} = Parser.parse(",NaN\r\n")
+    end
+
+    test "parses NaN double (uppercase)" do
+      assert {:ok, [:nan], ""} = Parser.parse(",NAN\r\n")
+    end
+
+    test "parses scientific notation double" do
+      assert {:ok, [1.5e10], ""} = Parser.parse(",1.5e10\r\n")
+    end
+
+    test "parses scientific notation without decimal point" do
+      assert {:ok, [1.0e5], ""} = Parser.parse(",1e5\r\n")
+    end
+
+    test "parses integer-form double" do
+      assert {:ok, [42.0], ""} = Parser.parse(",42\r\n")
+    end
+
+    test "invalid double returns error" do
+      assert {:error, {:invalid_double, "notafloat"}} = Parser.parse(",notafloat\r\n")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Integer — additional edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "integer edge cases" do
+    test "invalid integer returns error" do
+      assert {:error, {:invalid_integer, "abc"}} = Parser.parse(":abc\r\n")
+    end
+
+    test "float-like value in integer position returns error" do
+      assert {:error, {:invalid_integer, "3.14"}} = Parser.parse(":3.14\r\n")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Boolean — additional edge cases (already one test, adding invalid)
+  # ---------------------------------------------------------------------------
+
+  describe "boolean edge cases" do
+    test "invalid boolean value returns error" do
+      assert {:error, {:invalid_boolean, "1"}} = Parser.parse("#1\r\n")
+    end
+
+    test "empty boolean returns error" do
+      assert {:error, {:invalid_boolean, ""}} = Parser.parse("#\r\n")
+    end
+  end
 end

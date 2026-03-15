@@ -17,9 +17,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-// On Linux, bring in the uring backend module.
+// On Linux, bring in the uring backend modules.
 #[cfg(target_os = "linux")]
 pub mod uring;
+#[cfg(target_os = "linux")]
+pub mod async_uring;
 
 /// Synchronous, blocking I/O interface for the append-only log.
 ///
@@ -48,6 +50,15 @@ pub trait IoBackend: Send {
     /// appended byte). This equals the file size at the time of the last
     /// successful `append`.
     fn offset(&self) -> u64;
+
+    /// Advance the internal write offset by `bytes` without actually writing
+    /// any data. Used by the async `io_uring` path to reserve file space that
+    /// will be written by an `AsyncUringBackend` operating on the same file.
+    ///
+    /// The default implementation does nothing. Backends that track an
+    /// internal offset counter (like `SyncBackend`) override this to keep
+    /// their counter in sync with externally-written bytes.
+    fn advance_offset(&mut self, _bytes: u64) {}
 
     /// Append multiple buffers as a single atomic batch, then fsync once.
     ///
@@ -121,6 +132,10 @@ impl IoBackend for SyncBackend {
 
     fn offset(&self) -> u64 {
         self.offset
+    }
+
+    fn advance_offset(&mut self, bytes: u64) {
+        self.offset += bytes;
     }
 }
 
@@ -242,5 +257,82 @@ mod tests {
 
         assert_eq!(off, 0);
         assert_eq!(backend.offset(), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // SyncBackend: additional coverage
+    // ------------------------------------------------------------------
+
+    /// A newly created file starts at offset 0.
+    #[test]
+    fn sync_backend_offset_is_zero_for_new_file() {
+        let dir = tmp();
+        let path = dir.path().join("newfile.log");
+        let backend = SyncBackend::open(&path).unwrap();
+        assert_eq!(backend.offset(), 0, "offset must be 0 for a brand-new file");
+    }
+
+    /// Three appends of 10, 20, 30 bytes result in offset = 60.
+    #[test]
+    fn sync_backend_offset_accumulates_correctly() {
+        let dir = tmp();
+        let path = dir.path().join("accum.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        let data10 = vec![0u8; 10];
+        let data20 = vec![1u8; 20];
+        let data30 = vec![2u8; 30];
+
+        let off0 = backend.append(&data10).unwrap();
+        assert_eq!(off0, 0, "first append must start at 0");
+        assert_eq!(backend.offset(), 10, "offset must be 10 after 10-byte append");
+
+        let off1 = backend.append(&data20).unwrap();
+        assert_eq!(off1, 10, "second append must start at 10");
+        assert_eq!(backend.offset(), 30, "offset must be 30 after 20-byte append");
+
+        let off2 = backend.append(&data30).unwrap();
+        assert_eq!(off2, 30, "third append must start at 30");
+        assert_eq!(backend.offset(), 60, "final offset must be 60");
+    }
+
+    /// After append + sync, the data is readable from disk starting at offset 0.
+    #[test]
+    fn sync_backend_data_is_readable_after_sync() {
+        let dir = tmp();
+        let path = dir.path().join("readable.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        backend.append(b"hello").unwrap();
+        backend.sync().unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"hello", "data must be readable from disk after sync");
+    }
+
+    /// append_batch_and_sync with an empty slice returns an empty offsets vec.
+    #[test]
+    fn sync_backend_batch_empty_is_ok() {
+        let dir = tmp();
+        let path = dir.path().join("empty_batch.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        let offsets = backend.append_batch_and_sync(&[]).unwrap();
+        assert!(offsets.is_empty(), "empty batch must return empty offset vec");
+        assert_eq!(backend.offset(), 0, "offset must remain 0 after empty batch");
+    }
+
+    /// Batch ["abc", "de", "f"] → starting offsets [0, 3, 5].
+    #[test]
+    fn sync_backend_batch_offsets_match_cumulative_lengths() {
+        let dir = tmp();
+        let path = dir.path().join("cumulative.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        let bufs: &[&[u8]] = &[b"abc", b"de", b"f"];
+        let offsets = backend.append_batch_and_sync(bufs).unwrap();
+
+        assert_eq!(offsets, vec![0, 3, 5], "batch offsets must match cumulative lengths");
+        assert_eq!(backend.offset(), 6, "final offset must be 6 (3+2+1)");
     }
 }

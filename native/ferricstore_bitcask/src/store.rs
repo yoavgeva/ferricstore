@@ -58,6 +58,18 @@ pub struct Store {
 }
 
 impl Store {
+    /// Returns the file ID of the currently active (writable) data file.
+    #[must_use]
+    pub fn active_file_id(&self) -> u64 {
+        self.active_file_id
+    }
+
+    /// Returns the path to the currently active log file.
+    #[must_use]
+    pub fn active_log_path(&self) -> PathBuf {
+        log_path(&self.data_dir, self.active_file_id)
+    }
+
     /// Open a store at `data_dir`.
     ///
     /// On startup:
@@ -166,8 +178,15 @@ impl Store {
         };
 
         if entry.expire_at_ms != 0 && entry.expire_at_ms <= now_ms {
-            // Logically expired — remove from keydir and return None
+            // Logically expired — remove from keydir and write a tombstone so the
+            // key does not resurrect after a store close+reopen.  We intentionally
+            // do NOT call sync() here: the tombstone becomes durable on the next
+            // put/sync or on a clean shutdown.  In the worst case (crash before the
+            // next sync) the expired key re-appears on the following open, the TTL
+            // check fires again, and another tombstone is written — acceptable per
+            // Bitcask crash-recovery semantics.
             self.keydir.delete(key);
+            self.writer.write_tombstone(key)?;
             return Ok(None);
         }
 
@@ -229,6 +248,63 @@ impl Store {
         Ok(())
     }
 
+    /// Encode a batch of entries and update the keydir **without writing to
+    /// disk**. Returns owned encoded buffers that the caller must submit to an
+    /// `AsyncUringBackend`.
+    ///
+    /// This is the async counterpart to `put_batch`: it does everything except
+    /// the actual I/O. The caller is responsible for submitting the returned
+    /// buffers to the async ring and handling the completion message.
+    ///
+    /// The `writer.offset` is advanced optimistically. If the async I/O
+    /// subsequently fails, the backend is in an inconsistent state — which
+    /// matches Bitcask's crash-recovery contract (log replay on reopen
+    /// reconciles the keydir with what is actually on disk).
+    pub fn prepare_batch_for_async(
+        &mut self,
+        entries: &[(&[u8], &[u8], u64)],
+    ) -> Vec<Vec<u8>> {
+        use crate::log::encode_record;
+
+        let encoded: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|(key, value, expire_at_ms)| encode_record(key, value, *expire_at_ms))
+            .collect();
+
+        // Compute offsets from the current writer position.
+        let base_offset = self.writer.offset;
+        let mut running_offset = base_offset;
+        let mut total_bytes: u64 = 0;
+        for (i, buf) in encoded.iter().enumerate() {
+            let record_offset = running_offset;
+            let buf_len = buf.len() as u64;
+            running_offset += buf_len;
+            total_bytes += buf_len;
+
+            // Update keydir optimistically.
+            let (key, value, expire_at_ms) = entries[i];
+            #[allow(clippy::cast_possible_truncation)]
+            self.keydir.put(
+                key.to_vec(),
+                KeyEntry {
+                    file_id: self.active_file_id,
+                    offset: record_offset,
+                    value_size: value.len() as u32,
+                    expire_at_ms,
+                    ref_bit: false,
+                },
+            );
+        }
+
+        // Advance both the LogWriter offset AND the underlying backend's
+        // internal offset counter. This keeps the sync backend in sync so
+        // that if a subsequent sync write (e.g. a delete tombstone) goes
+        // through the LogWriter, it starts at the correct position.
+        self.writer.advance_offset(total_bytes);
+
+        encoded
+    }
+
     /// Delete a key. Appends a tombstone to the log.
     ///
     /// # Errors
@@ -255,24 +331,42 @@ impl Store {
             .collect()
     }
 
-    /// Number of live keys in the keydir.
+    /// Number of live (non-expired) keys.
+    ///
+    /// Expired keys that are still present in the keydir (not yet evicted by a
+    /// `get` call) are excluded so that callers always see a logically accurate
+    /// count.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.keydir.len()
+        let now = now_ms();
+        self.keydir
+            .iter()
+            .filter(|(_, entry)| entry.expire_at_ms == 0 || entry.expire_at_ms > now)
+            .count()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.keydir.is_empty()
+        self.len() == 0
     }
 
     /// Write a hint file for the active data file (called after compaction or
     /// before rotating the active file).
     ///
+    /// Fsyncs the active log before writing the hint so that every offset
+    /// recorded in the hint points to bytes that are already durable on disk.
+    /// Without this fsync a crash between hint write and log flush would leave
+    /// the hint referencing records that do not survive recovery.
+    ///
     /// # Errors
     ///
-    /// Returns a `StoreError` if the hint file cannot be created or written.
-    pub fn write_hint_file(&self) -> Result<()> {
+    /// Returns a `StoreError` if the log sync, hint file creation, or any hint
+    /// entry write fails.
+    pub fn write_hint_file(&mut self) -> Result<()> {
+        // Ensure all buffered log writes are durable before recording their
+        // offsets in the hint file (Issue 7.4).
+        self.writer.sync()?;
+
         let hint_path = hint_path(&self.data_dir, self.active_file_id);
         let mut writer = HintWriter::open(&hint_path)?;
         for (key, entry) in self.keydir.iter() {
@@ -286,8 +380,40 @@ impl Store {
                 })?;
             }
         }
-        writer.flush()?;
+        writer.commit()?;
         Ok(())
+    }
+
+    /// Proactively purge all logically-expired keys from the keydir.
+    ///
+    /// For each expired key a tombstone is appended to the log so that the key
+    /// does not resurrect after a store close+reopen.  All tombstones are
+    /// written and then fsynced in one batch.
+    ///
+    /// This is the proactive counterpart to the lazy expiry that fires inside
+    /// `get`.  Without periodic `purge_expired` calls the keydir grows without
+    /// bound for TTL-heavy workloads where keys are written but never read
+    /// after they expire (Issue 6.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if any tombstone write or the final sync fails.
+    pub fn purge_expired(&mut self) -> Result<usize> {
+        let now = now_ms();
+        let expired = self.keydir.expired_keys(now);
+        let count = expired.len();
+        for key in &expired {
+            self.writer
+                .write_tombstone(key)
+                .map_err(|e| StoreError(e.to_string()))?;
+            self.keydir.delete(key);
+        }
+        if count > 0 {
+            self.writer
+                .sync()
+                .map_err(|e| StoreError(e.to_string()))?;
+        }
+        Ok(count)
     }
 }
 
@@ -752,14 +878,17 @@ mod tests {
 
     #[test]
     fn expired_key_is_removed_from_keydir_on_get() {
-        // After get returns None for an expired key, len() should decrease
+        // After get returns None for an expired key, len() should be 0.
+        // len() now filters logically-expired entries, so even before the get
+        // call the expired key is not counted.
         let dir = tmp();
         let mut store = Store::open(dir.path()).unwrap();
         let past_ms = now_ms().saturating_sub(1);
         store.put(b"ttl", b"v", past_ms).unwrap();
-        assert_eq!(store.len(), 1);
+        // len() excludes expired entries — already 0 before get() evicts it
+        assert_eq!(store.len(), 0);
         assert!(store.get(b"ttl").unwrap().is_none());
-        // Keydir should be cleaned up
+        // Keydir entry has been physically removed by get()
         assert_eq!(store.len(), 0);
     }
 
@@ -918,20 +1047,17 @@ mod tests {
             store.write_hint_file().unwrap();
         }
 
-        // 2. Corrupt the hint file: write exactly HINT_HEADER_SIZE (30) bytes
-        //    with key_size=255 but supply no key bytes. The parser reads the
-        //    full header successfully, then calls read_exact for 255 key bytes
-        //    and gets UnexpectedEof → HintError.
+        // 2. Corrupt the hint file: write exactly HINT_HEADER_SIZE (34) bytes
+        //    of zeros. The reader reads the 4-byte CRC (0x00000000) and the
+        //    30-byte body (all zeros), computes the real CRC over the body,
+        //    and gets a mismatch → HintError → log replay fallback.
         use crate::hint::HINT_HEADER_SIZE;
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let e = entry.unwrap();
             if e.file_name().to_string_lossy().ends_with(".hint") {
-                // Build a 30-byte header: all zeros except key_size = 255 (LE u16)
-                // at bytes 28..30. This makes the reader attempt to read 255 key
-                // bytes from an empty remainder — causing UnexpectedEof.
-                let mut corrupt = vec![0u8; HINT_HEADER_SIZE];
-                corrupt[28] = 255; // key_size low byte
-                corrupt[29] = 0;   // key_size high byte
+                // All-zero bytes: stored CRC (0) will not match the real CRC
+                // of 30 zero bytes, triggering a CRC mismatch error.
+                let corrupt = vec![0u8; HINT_HEADER_SIZE];
                 std::fs::write(e.path(), &corrupt).unwrap();
             }
         }
@@ -962,16 +1088,17 @@ mod tests {
             store.write_hint_file().unwrap();
         }
 
-        // Truncate the hint file to exactly HINT_HEADER_SIZE bytes.
-        // The header will be read successfully (key_size > 0 because "alpha"
-        // was stored), but the key bytes are gone — read_exact returns
+        // Truncate the hint file to exactly HINT_HEADER_SIZE bytes (34).
+        // The CRC (4 bytes) and body header (30 bytes) are intact, but the
+        // key bytes are gone. The reader reads key_size > 0 (because "alpha"
+        // was stored), then calls read_exact for the key bytes and gets
         // UnexpectedEof → HintError → fallback to log replay.
         use crate::hint::HINT_HEADER_SIZE;
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let e = entry.unwrap();
             if e.file_name().to_string_lossy().ends_with(".hint") {
                 let full = std::fs::read(e.path()).unwrap();
-                // Keep only the header bytes (no key).
+                // Keep only the header bytes (CRC + body header, no key).
                 let truncated_len = HINT_HEADER_SIZE.min(full.len());
                 std::fs::write(e.path(), &full[..truncated_len]).unwrap();
             }
@@ -1019,6 +1146,73 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Issue 3.4: Lazy TTL eviction must write a tombstone so keys do not
+    // resurrect after close+reopen.
+    // ------------------------------------------------------------------
+
+    /// After `get` expires a key and writes a tombstone, reopening the store
+    /// must NOT resurface the key from the original write record on disk.
+    #[test]
+    fn expired_key_does_not_resurrect_after_reopen() {
+        let dir = tmp();
+
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            // Write a key that is already expired (1 second in the past).
+            let past_ms = now_ms().saturating_sub(1000);
+            store.put(b"key", b"val", past_ms).unwrap();
+            // get() must return None and write a tombstone to the log.
+            assert!(store.get(b"key").unwrap().is_none());
+        }
+
+        // Reopen: log replay must see tombstone after the original record and
+        // must NOT re-insert the key into the keydir.
+        let mut store = Store::open(dir.path()).unwrap();
+        assert!(
+            store.get(b"key").unwrap().is_none(),
+            "expired key must not resurrect after store close and reopen"
+        );
+    }
+
+    /// `len()` must count only non-expired keys.
+    #[test]
+    fn len_excludes_expired_entries() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let past_ms = now_ms().saturating_sub(1000);
+        store.put(b"live", b"v", 0).unwrap();
+        store.put(b"dead", b"v", past_ms).unwrap();
+        assert_eq!(store.len(), 1, "only the live key should be counted");
+    }
+
+    /// After TTL eviction (tombstone write), `len()` stays consistent and the
+    /// count is still correct after a reopen.
+    #[test]
+    fn len_after_ttl_eviction_is_consistent() {
+        let dir = tmp();
+        let past_ms = now_ms().saturating_sub(1000);
+
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put(b"live1", b"v", 0).unwrap();
+            store.put(b"live2", b"v", 0).unwrap();
+            store.put(b"expired", b"v", past_ms).unwrap();
+
+            // Trigger eviction: tombstone is written to the log.
+            assert!(store.get(b"expired").unwrap().is_none());
+            assert_eq!(store.len(), 2, "len must be 2 after eviction");
+        }
+
+        // Reopen — tombstone prevents resurrection; len must still be 2.
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.len(),
+            2,
+            "len must be 2 after reopen (tombstone prevents resurrection)"
+        );
+    }
+
     /// EC-7 variant: A directory with a `.hint` for one file ID and a `.log`
     /// for a different file ID opens correctly, loading only the entries with
     /// a matching log file.
@@ -1038,7 +1232,7 @@ mod tests {
             key: b"ghost".to_vec(),
         })
         .unwrap();
-        w.flush().unwrap();
+        w.commit().unwrap();
 
         // Open the store — no .log files at all, so file_ids is empty,
         // the orphan hint is never iterated, keydir stays empty.
@@ -1046,6 +1240,654 @@ mod tests {
         assert!(
             store.is_empty(),
             "orphan hint with no matching log must not inject keys into keydir"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue 5.2: Atomic hint file writes — partial hint falls back to log
+    // ------------------------------------------------------------------
+
+    /// Issue 5.2: When a `.hint` file is non-empty but corrupt (simulating a
+    /// partial write followed by truncation), `Store::open` must fall back to
+    /// full log replay and recover all keys correctly.
+    ///
+    /// This is the integration-level companion to the unit tests in `hint.rs`.
+    /// It verifies that the EC-2 fallback path in `Store::open` handles the
+    /// specific failure mode that the atomic write fix addresses: a hint file
+    /// that is non-empty (so it passes the `exists()` check) but corrupt enough
+    /// to cause a parse error (triggering log-replay fallback).
+    #[test]
+    fn store_open_with_partial_hint_falls_back_to_log() {
+        let dir = tmp();
+
+        // 1. Open a store, put some keys, and write a valid hint file.
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put(b"key_a", b"val_a", 0).unwrap();
+            store.put(b"key_b", b"val_b", 0).unwrap();
+            store.put(b"key_c", b"val_c", 0).unwrap();
+            store.write_hint_file().unwrap();
+        }
+
+        // 2. Manually truncate the hint file to a non-empty but incomplete
+        //    length (exactly HINT_HEADER_SIZE=34 bytes — CRC + body header
+        //    present, key bytes missing). This simulates a crash after the old
+        //    hint was zeroed but before new content was fully written.
+        use crate::hint::HINT_HEADER_SIZE;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let e = entry.unwrap();
+            if e.file_name().to_string_lossy().ends_with(".hint") {
+                let full = std::fs::read(e.path()).unwrap();
+                // CRC + body header are intact but key bytes are gone —
+                // this triggers UnexpectedEof in the hint parser.
+                let truncated_len = HINT_HEADER_SIZE.min(full.len());
+                std::fs::write(e.path(), &full[..truncated_len]).unwrap();
+            }
+        }
+
+        // 3. Reopen — the corrupt hint triggers EC-2 fallback to log replay.
+        //    All three keys must be recovered correctly.
+        let mut store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.get(b"key_a").unwrap(),
+            Some(b"val_a".to_vec()),
+            "key_a must be recovered via log replay after partial hint"
+        );
+        assert_eq!(
+            store.get(b"key_b").unwrap(),
+            Some(b"val_b".to_vec()),
+            "key_b must be recovered via log replay after partial hint"
+        );
+        assert_eq!(
+            store.get(b"key_c").unwrap(),
+            Some(b"val_c".to_vec()),
+            "key_c must be recovered via log replay after partial hint"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue 7.4: write_hint_file must fsync the log before writing the hint
+    // ------------------------------------------------------------------
+
+    /// After `write_hint_file` the data referred to by the hint must already be
+    /// durable on disk.  We verify this by reading back the raw log bytes at
+    /// the offset stored in the hint entry and confirming they exist and are
+    /// decodable.
+    #[test]
+    fn write_hint_file_syncs_log_first() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"synckey", b"syncval", 0).unwrap();
+
+        // write_hint_file now calls self.writer.sync() before writing the hint.
+        store.write_hint_file().unwrap();
+
+        // The hint file for the active file ID must now exist.
+        let hint_path = dir
+            .path()
+            .join(format!("{:020}.hint", store.active_file_id));
+        assert!(hint_path.exists(), "hint file must be written");
+
+        // The log file must also exist and the first record must be readable,
+        // confirming the data was flushed before the hint was written.
+        let log_path = dir
+            .path()
+            .join(format!("{:020}.log", store.active_file_id));
+        let mut reader = crate::log::LogReader::open(&log_path).unwrap();
+        let record = reader.read_at(0).unwrap();
+        assert!(
+            record.is_some(),
+            "log record at offset 0 must be present and readable after write_hint_file"
+        );
+        let record = record.unwrap();
+        assert_eq!(record.key, b"synckey");
+        assert_eq!(record.value, Some(b"syncval".to_vec()));
+    }
+
+    // ------------------------------------------------------------------
+    // Issue 6.3: Proactive TTL GC — purge_expired
+    // ------------------------------------------------------------------
+
+    /// `purge_expired` must return the correct count and remove expired keys
+    /// from the keydir while leaving live keys untouched.
+    #[test]
+    fn purge_expired_removes_keys_from_keydir() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let past_ms = now_ms().saturating_sub(1000);
+
+        store.put(b"live1", b"v", 0).unwrap();
+        store.put(b"expired1", b"v", past_ms).unwrap();
+        store.put(b"expired2", b"v", past_ms).unwrap();
+
+        let count = store.purge_expired().unwrap();
+        assert_eq!(count, 2, "purge_expired must report 2 purged keys");
+
+        assert!(store.get(b"expired1").unwrap().is_none(), "expired1 must be gone");
+        assert!(store.get(b"expired2").unwrap().is_none(), "expired2 must be gone");
+        assert_eq!(
+            store.get(b"live1").unwrap(),
+            Some(b"v".to_vec()),
+            "live1 must still be readable"
+        );
+    }
+
+    /// Tombstones written by `purge_expired` must prevent key resurrection
+    /// across a store close and reopen.
+    #[test]
+    fn purge_expired_writes_tombstones_preventing_resurrection() {
+        let dir = tmp();
+        let past_ms = now_ms().saturating_sub(1000);
+
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put(b"ex_key", b"val", past_ms).unwrap();
+            let count = store.purge_expired().unwrap();
+            assert_eq!(count, 1);
+        }
+
+        // Reopen — log replay must see the tombstone after the original record
+        // and must NOT re-insert ex_key into the keydir.
+        let mut store = Store::open(dir.path()).unwrap();
+        assert!(
+            store.get(b"ex_key").unwrap().is_none(),
+            "ex_key must not resurrect after purge_expired + reopen"
+        );
+    }
+
+    /// When no keys are expired, `purge_expired` must return `Ok(0)` and leave
+    /// the keydir untouched.
+    #[test]
+    fn purge_expired_returns_zero_when_nothing_expired() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"a", b"1", 0).unwrap();
+        store.put(b"b", b"2", 0).unwrap();
+        store.put(b"c", b"3", 0).unwrap();
+
+        let count = store.purge_expired().unwrap();
+        assert_eq!(count, 0, "no keys are expired so count must be 0");
+
+        // All keys must still be readable.
+        assert!(store.get(b"a").unwrap().is_some());
+        assert!(store.get(b"b").unwrap().is_some());
+        assert!(store.get(b"c").unwrap().is_some());
+    }
+
+    /// `len()` must reflect the correct count after `purge_expired` removes
+    /// expired entries from the keydir.
+    #[test]
+    fn len_is_accurate_after_purge_expired() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let past_ms = now_ms().saturating_sub(1000);
+
+        store.put(b"live1", b"v", 0).unwrap();
+        store.put(b"live2", b"v", 0).unwrap();
+        store.put(b"live3", b"v", 0).unwrap();
+        store.put(b"exp1", b"v", past_ms).unwrap();
+        store.put(b"exp2", b"v", past_ms).unwrap();
+
+        store.purge_expired().unwrap();
+
+        assert_eq!(
+            store.len(),
+            3,
+            "len must be 3 (only live keys) after purge_expired"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // CRC / record integrity
+    // ------------------------------------------------------------------
+
+    /// Put a key, close the store, corrupt a byte in the middle of the log
+    /// record (not the CRC bytes), reopen and get — must return Err or None.
+    #[test]
+    fn corrupt_crc_in_log_returns_error_on_get() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tmp();
+
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put(b"key", b"value", 0).unwrap();
+        }
+
+        // Locate the single .log file and flip a byte in the key area
+        // (byte at HEADER_SIZE, which is after the 4-byte CRC field).
+        // This invalidates the CRC without touching the CRC bytes themselves.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let e = entry.unwrap();
+            if e.file_name().to_string_lossy().ends_with(".log") {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(e.path())
+                    .unwrap();
+                // Flip one byte in the key area (after the 26-byte header).
+                f.seek(SeekFrom::Start(crate::log::HEADER_SIZE as u64))
+                    .unwrap();
+                let mut byte = [0u8; 1];
+                use std::io::Read;
+                f.seek(SeekFrom::Start(crate::log::HEADER_SIZE as u64))
+                    .unwrap();
+                {
+                    let mut rf = std::fs::File::open(e.path()).unwrap();
+                    rf.seek(SeekFrom::Start(crate::log::HEADER_SIZE as u64))
+                        .unwrap();
+                    rf.read_exact(&mut byte).unwrap();
+                }
+                byte[0] ^= 0xFF;
+                f.seek(SeekFrom::Start(crate::log::HEADER_SIZE as u64))
+                    .unwrap();
+                f.write_all(&byte).unwrap();
+            }
+        }
+
+        // Reopen the store — the corrupt record will be skipped by the tolerant
+        // reader (crash-recovery semantics), so get returns None rather than Err.
+        let mut store = Store::open(dir.path()).unwrap();
+        // The key should not be accessible (CRC mismatch is handled gracefully).
+        let result = store.get(b"key").unwrap();
+        assert!(
+            result.is_none(),
+            "corrupt CRC in log must cause get to return None (tolerant recovery)"
+        );
+    }
+
+    /// Put 5 records, truncate the 3rd record to half its size, reopen.
+    /// Records 1 and 2 must be intact; records 3-5 gone (tolerant reader stops
+    /// at first error).
+    #[test]
+    fn store_recovers_after_mid_file_record_truncation() {
+        let dir = tmp();
+
+        let mut offsets = Vec::new();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            for i in 0u8..5 {
+                let key = format!("key{i}");
+                let val = format!("val{i}");
+                store.put(key.as_bytes(), val.as_bytes(), 0).unwrap();
+            }
+            // Capture writer offset so we can locate the 3rd record boundary.
+            // We'll compute truncation point directly from disk.
+        }
+
+        // Reopen just to confirm 5 records, then compute the truncation point.
+        {
+            let log_path_buf = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| {
+                    let e = e.unwrap();
+                    if e.file_name().to_string_lossy().ends_with(".log") {
+                        Some(e.path())
+                    } else {
+                        None
+                    }
+                })
+                .next()
+                .unwrap();
+
+            // Read all 5 records to find where the 3rd one starts.
+            let mut reader = crate::log::LogReader::open(&log_path_buf).unwrap();
+            let records = reader.iter_from_start().unwrap();
+            assert_eq!(records.len(), 5, "expected 5 records before truncation");
+
+            // Compute offset of 3rd record (index 2).
+            let rec0_len =
+                (crate::log::HEADER_SIZE + records[0].key.len() + records[0].value.as_ref().map_or(0, Vec::len)) as u64;
+            let rec1_len =
+                (crate::log::HEADER_SIZE + records[1].key.len() + records[1].value.as_ref().map_or(0, Vec::len)) as u64;
+            let rec2_start = rec0_len + rec1_len;
+            // Truncate to halfway through the 3rd record.
+            let rec2_half_len =
+                (crate::log::HEADER_SIZE + records[2].key.len() + records[2].value.as_ref().map_or(0, Vec::len)) as u64
+                    / 2;
+            let truncate_at = rec2_start + rec2_half_len;
+
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&log_path_buf)
+                .unwrap();
+            file.set_len(truncate_at).unwrap();
+            offsets.push(rec2_start); // used for assertion below
+        }
+
+        // Reopen — tolerant reader stops at truncated record 3.
+        let mut store = Store::open(dir.path()).unwrap();
+        // Records 0 and 1 must be intact.
+        assert_eq!(
+            store.get(b"key0").unwrap(),
+            Some(b"val0".to_vec()),
+            "key0 must survive"
+        );
+        assert_eq!(
+            store.get(b"key1").unwrap(),
+            Some(b"val1".to_vec()),
+            "key1 must survive"
+        );
+        // Records 2-4 must be gone (tolerant reader stopped at first error).
+        assert!(store.get(b"key2").unwrap().is_none(), "key2 must be gone after truncation");
+        assert!(store.get(b"key3").unwrap().is_none(), "key3 must be gone after truncation");
+        assert!(store.get(b"key4").unwrap().is_none(), "key4 must be gone after truncation");
+        let _ = offsets;
+    }
+
+    // ------------------------------------------------------------------
+    // Offset tracking
+    // ------------------------------------------------------------------
+
+    /// Put 10 records and verify that `writer.offset` increases monotonically
+    /// and equals the sum of encoded record sizes.
+    #[test]
+    fn offset_is_correct_after_multiple_puts() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut expected_offset = 0u64;
+        for i in 0u8..10 {
+            let key = vec![i; (i as usize) + 1]; // key length 1..10
+            let val = vec![i; (i as usize) + 2]; // val length 2..11
+            store.put(&key, &val, 0).unwrap();
+            let record_size = (crate::log::HEADER_SIZE + key.len() + val.len()) as u64;
+            expected_offset += record_size;
+            assert!(
+                store.writer.offset >= expected_offset,
+                "offset must increase after put {i}"
+            );
+        }
+        assert_eq!(store.writer.offset, expected_offset, "final offset must equal sum of record sizes");
+    }
+
+    // ------------------------------------------------------------------
+    // len() accuracy
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn len_is_zero_for_empty_store() {
+        let dir = tmp();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn len_decreases_after_delete() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"a", b"1", 0).unwrap();
+        store.put(b"b", b"2", 0).unwrap();
+        store.put(b"c", b"3", 0).unwrap();
+        assert_eq!(store.len(), 3);
+        store.delete(b"b").unwrap();
+        assert_eq!(store.len(), 2);
+        store.delete(b"a").unwrap();
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn len_counts_only_live_non_expired_keys() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let past_ms = now_ms().saturating_sub(5000);
+        store.put(b"live1", b"v", 0).unwrap();
+        store.put(b"live2", b"v", 0).unwrap();
+        store.put(b"live3", b"v", 0).unwrap();
+        store.put(b"exp1", b"v", past_ms).unwrap();
+        store.put(b"exp2", b"v", past_ms).unwrap();
+        assert_eq!(store.len(), 3, "only live non-expired keys are counted");
+    }
+
+    // ------------------------------------------------------------------
+    // put/get/delete semantics
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn put_empty_key_and_value() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        // Empty key with non-empty value should work.
+        store.put(b"", b"non_empty_value", 0).unwrap();
+        let result = store.get(b"").unwrap();
+        assert!(result.is_some(), "empty key with non-empty value must be retrievable");
+    }
+
+    #[test]
+    fn put_very_large_value_1mb_roundtrip() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let value: Vec<u8> = (0u8..=255).cycle().take(1024 * 1024).collect();
+        store.put(b"bigkey", &value, 0).unwrap();
+        let got = store.get(b"bigkey").unwrap().unwrap();
+        assert_eq!(got.len(), 1024 * 1024, "1MB value must round-trip");
+        assert_eq!(got, value, "1MB value bytes must match exactly");
+    }
+
+    #[test]
+    fn put_key_with_null_bytes() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let key = b"\x00\x01\x02";
+        store.put(key, b"null_key_val", 0).unwrap();
+        let result = store.get(key).unwrap();
+        assert_eq!(result, Some(b"null_key_val".to_vec()), "key with null bytes must round-trip");
+    }
+
+    #[test]
+    fn delete_returns_false_for_missing_key() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let result = store.delete(b"nonexistent").unwrap();
+        assert!(!result, "delete on missing key must return false");
+        assert_eq!(store.len(), 0, "len must remain 0 after no-op delete");
+    }
+
+    #[test]
+    fn delete_returns_true_for_existing_key() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"present", b"val", 0).unwrap();
+        let result = store.delete(b"present").unwrap();
+        assert!(result, "delete on existing key must return true");
+        assert!(store.get(b"present").unwrap().is_none(), "key must be gone after delete");
+    }
+
+    #[test]
+    fn delete_tombstone_prevents_resurrection() {
+        let dir = tmp();
+
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put(b"zombie", b"alive", 0).unwrap();
+            store.delete(b"zombie").unwrap();
+        }
+
+        // Reopen — tombstone in log replay must prevent key from coming back.
+        let mut store = Store::open(dir.path()).unwrap();
+        assert!(
+            store.get(b"zombie").unwrap().is_none(),
+            "deleted key must not resurrect after reopen"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // put_batch: new edge cases
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn put_batch_empty_slice_is_ok() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        // Already covered by empty_batch_is_noop but this is an explicit API contract test.
+        store.put_batch(&[]).unwrap();
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn put_batch_all_entries_retrievable() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let kv: Vec<(Vec<u8>, Vec<u8>)> = (0u8..20)
+            .map(|i| (format!("bk{i}").into_bytes(), format!("bv{i}").into_bytes()))
+            .collect();
+        let entries: Vec<(&[u8], &[u8], u64)> =
+            kv.iter().map(|(k, v)| (k.as_slice(), v.as_slice(), 0u64)).collect();
+        store.put_batch(&entries).unwrap();
+        for (k, v) in &kv {
+            assert_eq!(
+                store.get(k).unwrap(),
+                Some(v.clone()),
+                "batch entry {:?} must be retrievable",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn put_batch_with_expired_entries() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let past_ms = now_ms().saturating_sub(2000);
+        let entries: Vec<(&[u8], &[u8], u64)> = vec![
+            (b"exp_batch", b"val", past_ms),
+            (b"live_batch", b"val", 0),
+        ];
+        store.put_batch(&entries).unwrap();
+        assert!(
+            store.get(b"exp_batch").unwrap().is_none(),
+            "expired batch entry must not be readable"
+        );
+        assert_eq!(
+            store.get(b"live_batch").unwrap(),
+            Some(b"val".to_vec()),
+            "live batch entry must be readable"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // expiry: detailed edge cases
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn get_returns_none_for_past_expire_at() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let past_ms = now_ms().saturating_sub(1000);
+        store.put(b"past_ttl", b"gone", past_ms).unwrap();
+        assert!(
+            store.get(b"past_ttl").unwrap().is_none(),
+            "key with past expire_at must return None"
+        );
+    }
+
+    #[test]
+    fn get_returns_value_for_future_expire_at() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let future_ms = now_ms() + 60_000;
+        store.put(b"future_ttl", b"present", future_ms).unwrap();
+        assert_eq!(
+            store.get(b"future_ttl").unwrap(),
+            Some(b"present".to_vec()),
+            "key with future expire_at must return value"
+        );
+    }
+
+    #[test]
+    fn keys_excludes_past_expired() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let past_ms = now_ms().saturating_sub(500);
+        store.put(b"gone", b"v", past_ms).unwrap();
+        store.put(b"here", b"v", 0).unwrap();
+        let keys = store.keys();
+        assert!(!keys.contains(&b"gone".to_vec()), "expired key must not appear in keys()");
+        assert!(keys.contains(&b"here".to_vec()), "live key must appear in keys()");
+        assert_eq!(keys.len(), 1, "keys() must return exactly 1 live key");
+    }
+
+    // ------------------------------------------------------------------
+    // purge_expired: detailed edge cases
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn purge_expired_count_matches_expired_keys() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let past_ms = now_ms().saturating_sub(1000);
+        for i in 0u8..5 {
+            store.put(&[i], b"expired_val", past_ms).unwrap();
+        }
+        let count = store.purge_expired().unwrap();
+        assert_eq!(count, 5, "purge_expired must return 5 for 5 expired keys");
+    }
+
+    #[test]
+    fn purge_expired_evicted_keys_not_in_keys_list() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let past_ms = now_ms().saturating_sub(1000);
+        store.put(b"exp_a", b"v", past_ms).unwrap();
+        store.put(b"exp_b", b"v", past_ms).unwrap();
+        store.put(b"live_x", b"v", 0).unwrap();
+
+        store.purge_expired().unwrap();
+
+        let keys = store.keys();
+        assert!(!keys.contains(&b"exp_a".to_vec()), "exp_a must not be in keys after purge");
+        assert!(!keys.contains(&b"exp_b".to_vec()), "exp_b must not be in keys after purge");
+        assert!(keys.contains(&b"live_x".to_vec()), "live_x must still be in keys after purge");
+        assert_eq!(keys.len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue 5.1: Corrupt hint CRC triggers log replay fallback
+    // ------------------------------------------------------------------
+
+    /// A hint file whose first entry has a flipped byte (corrupting its CRC)
+    /// must trigger log replay fallback on `Store::open`, recovering all keys.
+    #[test]
+    fn corrupt_hint_crc_falls_back_to_log_replay() {
+        let dir = tmp();
+
+        // 1. Open store, put keys, write hint file, close.
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put(b"crc_key1", b"crc_val1", 0).unwrap();
+            store.put(b"crc_key2", b"crc_val2", 0).unwrap();
+            store.put(b"crc_key3", b"crc_val3", 0).unwrap();
+            store.write_hint_file().unwrap();
+        }
+
+        // 2. Open the hint file and flip bytes 12..16 (inside the offset field
+        //    of the first entry). The stored CRC won't match the new body bytes.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let e = entry.unwrap();
+            if e.file_name().to_string_lossy().ends_with(".hint") {
+                use std::fs::OpenOptions;
+                use std::io::{Seek, SeekFrom, Write};
+                let mut f = OpenOptions::new().write(true).open(e.path()).unwrap();
+                // Offset field starts at byte 4 (CRC) + 8 (file_id) = 12.
+                f.seek(SeekFrom::Start(12)).unwrap();
+                f.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+            }
+        }
+
+        // 3. Reopen store — must fall back to log replay and recover all keys.
+        let mut store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.get(b"crc_key1").unwrap(),
+            Some(b"crc_val1".to_vec()),
+            "crc_key1 must be recovered from log replay after CRC-corrupt hint"
+        );
+        assert_eq!(
+            store.get(b"crc_key2").unwrap(),
+            Some(b"crc_val2".to_vec()),
+            "crc_key2 must be recovered from log replay after CRC-corrupt hint"
+        );
+        assert_eq!(
+            store.get(b"crc_key3").unwrap(),
+            Some(b"crc_val3".to_vec()),
+            "crc_key3 must be recovered from log replay after CRC-corrupt hint"
         );
     }
 }

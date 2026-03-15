@@ -6,11 +6,16 @@ defmodule Ferricstore.MixProject do
       app: :ferricstore,
       version: "0.1.0",
       elixir: "~> 1.19",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       compilers: Mix.compilers(),
-      deps: deps()
+      deps: deps(),
+      aliases: aliases()
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   def application do
     [
@@ -25,7 +30,18 @@ defmodule Ferricstore.MixProject do
       {:ranch, "~> 2.2"},
       {:telemetry, "~> 1.4"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:arch_test, "~> 0.2", only: [:dev, :test], runtime: false}
+      {:arch_test, "~> 0.2", only: [:dev, :test], runtime: false},
+      {:benchee, "~> 1.3", only: :bench, runtime: false},
+      {:benchee_html, "~> 1.0", only: :bench, runtime: false}
+    ]
+  end
+
+  defp aliases do
+    [
+      "bench.resp": "run bench/resp_bench.exs",
+      "bench.store": "run bench/store_bench.exs",
+      "bench.commands": "run bench/commands_bench.exs",
+      "bench.tcp": "run bench/tcp_bench.exs"
     ]
   end
 end

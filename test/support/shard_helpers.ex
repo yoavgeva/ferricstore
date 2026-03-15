@@ -1,0 +1,44 @@
+defmodule Ferricstore.Test.ShardHelpers do
+  @moduledoc """
+  Shared helpers for tests that interact with application-supervised shards.
+
+  Use this module in any test that kills or restarts shards to ensure the
+  supervisor tree is fully healthy before and after the test.
+  """
+
+  @doc """
+  Waits until all 4 application-supervised shards (0–3) are alive.
+
+  Polls every 20ms up to `timeout_ms`. Raises if any shard hasn't restarted
+  in time. Call this in `on_exit` callbacks after tests that kill shards.
+  """
+  @spec wait_shards_alive(non_neg_integer()) :: :ok
+  def wait_shards_alive(timeout_ms \\ 3_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    Enum.each(0..3, fn i ->
+      name = :"Ferricstore.Store.Shard.#{i}"
+
+      result =
+        Enum.reduce_while(Stream.repeatedly(fn -> Process.sleep(20) end), :waiting, fn _, _ ->
+          pid = Process.whereis(name)
+
+          cond do
+            is_pid(pid) and Process.alive?(pid) ->
+              {:halt, :ok}
+
+            System.monotonic_time(:millisecond) > deadline ->
+              {:halt, {:timeout, name}}
+
+            true ->
+              {:cont, :waiting}
+          end
+        end)
+
+      case result do
+        :ok -> :ok
+        {:timeout, name} -> raise "Shard #{inspect(name)} did not restart within #{timeout_ms}ms"
+      end
+    end)
+  end
+end

@@ -373,6 +373,83 @@ defmodule Ferricstore.Resp.EncoderTest do
   # Round-trip: encode then parse
   # ---------------------------------------------------------------------------
 
+  # ---------------------------------------------------------------------------
+  # Special float atoms
+  # ---------------------------------------------------------------------------
+
+  describe "encode special float atoms" do
+    test "encodes :infinity as +inf" do
+      assert to_binary(Encoder.encode(:infinity)) == ",inf\r\n"
+    end
+
+    test "encodes :neg_infinity as -inf" do
+      assert to_binary(Encoder.encode(:neg_infinity)) == ",-inf\r\n"
+    end
+
+    test "encodes :nan" do
+      assert to_binary(Encoder.encode(:nan)) == ",nan\r\n"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Additional edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "encode edge cases" do
+    test "encodes verbatim string with binary data containing null bytes" do
+      data = <<0, 1, 2, 3>>
+      result = to_binary(Encoder.encode({:verbatim, "bin", data}))
+      # Payload length: 3 (encoding) + 1 (colon) + 4 (data) = 8
+      assert result == "=8\r\nbin:" <> data <> "\r\n"
+    end
+
+    test "encodes push message with all RESP3 types" do
+      push =
+        {:push, [nil, 42, %{"k" => "v"}, MapSet.new([1])]}
+
+      result = to_binary(Encoder.encode(push))
+      assert String.starts_with?(result, ">4\r\n")
+      # nil
+      assert String.contains?(result, "_\r\n")
+      # integer
+      assert String.contains?(result, ":42\r\n")
+    end
+
+    test "encodes deeply nested structure (5 levels)" do
+      nested = [[[[[42]]]]]
+      result = to_binary(Encoder.encode(nested))
+      # 5 nested array headers: *1 each, then the integer
+      expected = "*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n:42\r\n"
+      assert result == expected
+    end
+
+    test "simple string with lone LF does not raise (only CRLF is rejected)" do
+      # The encoder only rejects \r\n (CRLF pair), not standalone \n
+      result = to_binary(Encoder.encode({:simple, "OK\nINJECTED"}))
+      assert result == "+OK\nINJECTED\r\n"
+    end
+
+    test "simple string with lone CR does not raise (only CRLF is rejected)" do
+      result = to_binary(Encoder.encode({:simple, "OK\rSTILL"}))
+      assert result == "+OK\rSTILL\r\n"
+    end
+
+    test "encodes empty map with no pairs" do
+      assert to_binary(Encoder.encode(%{})) == "%0\r\n"
+    end
+
+    test "encodes MapSet with single element" do
+      result = to_binary(Encoder.encode(MapSet.new([42])))
+      assert result == "~1\r\n:42\r\n"
+    end
+
+    test "encodes blob error with CRLF in message" do
+      msg = "line1\r\nline2"
+      result = to_binary(Encoder.encode({:blob_error, msg}))
+      assert result == "!12\r\nline1\r\nline2\r\n"
+    end
+  end
+
   describe "round-trip through parser" do
     test "simple string round-trips" do
       original = {:simple, "OK"}

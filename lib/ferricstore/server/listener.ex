@@ -2,38 +2,45 @@ defmodule Ferricstore.Server.Listener do
   @moduledoc """
   Ranch TCP listener for the FerricStore Redis-compatible server.
 
-  Starts a `:ranch` listener that accepts TCP connections on the configured
-  port (default 6379) and dispatches each accepted socket to a new
-  `Ferricstore.Server.Connection` process.
+  In production the listener is started automatically by `Ferricstore.Application`
+  via `:ranch.child_spec/5`.  It can also be started manually in tests using
+  `start/1` / `stop/0`.
 
-  ## Usage
+  ## Port 0 (ephemeral) support
 
-      # Start on default port 6379
-      Ferricstore.Server.Listener.start(6379)
+  When the configured port is `0`, the OS assigns a free port.  Call
+  `port/0` after the application has started to discover the actual port.
+  This is the recommended pattern for tests so they never collide with a
+  running development server.
 
-      # Stop the listener
-      Ferricstore.Server.Listener.stop()
+  ## Usage in tests
 
-  The listener is intended to be supervised. Call `child_spec/1` to embed it
-  in a supervisor tree, or call `start/1` directly in tests.
+      port = Ferricstore.Server.Listener.port()
+      {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
   """
 
   @listener_ref __MODULE__
 
-  @doc """
-  Returns the Ranch listener reference atom used to identify this listener.
-  """
+  @doc "Ranch listener reference atom."
   @spec ref() :: atom()
   def ref, do: @listener_ref
 
   @doc """
-  Starts the Ranch TCP listener on the given port.
+  Returns the actual TCP port the listener is bound to.
 
-  Returns `{:ok, pid}` on success or `{:error, reason}` on failure.
+  Works for both fixed ports and ephemeral (port 0) bindings.  Raises if the
+  listener is not running.
+  """
+  @spec port() :: :inet.port_number()
+  def port do
+    :ranch.get_port(@listener_ref)
+  end
 
-  ## Parameters
+  @doc """
+  Starts a Ranch TCP listener on `port` outside of the supervisor tree.
 
-    - `port` - TCP port to listen on (1–65535).
+  Primarily used in isolated tests that do not start the full application.
+  Returns `{:ok, pid}` or `{:error, reason}`.
   """
   @spec start(port :: :inet.port_number()) :: {:ok, pid()} | {:error, term()}
   def start(port) do
@@ -49,9 +56,7 @@ defmodule Ferricstore.Server.Listener do
     )
   end
 
-  @doc """
-  Stops the Ranch TCP listener.
-  """
+  @doc "Stops the Ranch TCP listener started with `start/1`."
   @spec stop() :: :ok
   def stop do
     :ranch.stop_listener(@listener_ref)
