@@ -99,19 +99,15 @@ struct PendingOp {
 /// during the wait, no new SQEs could ever be submitted, so no CQEs would
 /// ever arrive — a deadlock.
 ///
-/// The fix: the completion thread waits for CQEs by calling the raw
-/// `io_uring_enter(2)` syscall via `libc` using only the ring's file
-/// descriptor (an integer that needs no lock). Once the syscall returns, the
-/// thread acquires the ring mutex briefly to drain available CQEs, then
-/// releases the lock before processing them.
+/// The fix: at open time we capture the ring's raw file descriptor (an integer
+/// that needs no lock) and pass it to the completion thread. The thread calls
+/// the raw `io_uring_enter(2)` syscall with that fd to wait for CQEs. Once at
+/// least one CQE is available, the thread acquires the ring mutex briefly to
+/// drain them, then releases the lock before processing each CQE.
 pub struct AsyncUringBackend {
     /// `io_uring` ring instance, shared between the submitter (NIF thread) and
     /// the completion thread. The Mutex serialises SQ pushes and CQ drains.
     ring: Arc<Mutex<IoUring>>,
-    /// Raw fd of the io_uring ring itself (not the data file). Used by the
-    /// completion thread to call `io_uring_enter` without holding the ring
-    /// mutex.
-    ring_fd: RawFd,
     /// Raw file descriptor for the open data file. Kept alive by `_file`.
     fd: RawFd,
     /// Keeps the file open for the lifetime of the backend.
@@ -166,7 +162,6 @@ impl AsyncUringBackend {
 
         Ok(Self {
             ring,
-            ring_fd,
             fd,
             _file: file,
             offset: AtomicU64::new(offset),
@@ -354,14 +349,13 @@ impl AsyncUringBackend {
             // At least 1 CQE is available. Lock the ring briefly to drain
             // all available CQEs, then release the lock before processing.
             let cqes: Vec<(u64, i32)> = {
-                let Ok(mut ring) = ring.lock() else {
+                let Ok(ring) = ring.lock() else {
                     break; // Mutex poisoned — exit thread.
                 };
-                // SAFETY: we hold the only mutable reference to the CQ here
-                // (submission_shared is used only on the submit path which
-                // also holds the ring mutex; the CQ is never accessed without
-                // the mutex except via this unsafe accessor which we only call
-                // from this single completion thread).
+                // SAFETY: we hold the only reference to the CQ here (the ring
+                // mutex is held; submission_shared is only used on the submit
+                // path which also holds the mutex; completion_shared is only
+                // called from this single completion thread).
                 unsafe { ring.completion_shared() }
                     .map(|cqe| (cqe.user_data(), cqe.result()))
                     .collect()
