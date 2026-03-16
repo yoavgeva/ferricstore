@@ -67,7 +67,18 @@ impl UringBackend {
     /// Returns an `io::Error` if the file cannot be opened, its metadata
     /// cannot be read, or the ring cannot be initialised.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // Open without O_APPEND so that explicit pwrite offsets (.offset() on
+        // SQEs) are respected. On some kernel versions O_APPEND causes
+        // IORING_OP_WRITE to ignore the provided offset and always write at
+        // EOF, which corrupts the log layout when advance_offset has logically
+        // reserved space that hasn't yet been physically written by an in-flight
+        // async batch.
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
         let offset = file.metadata()?.len();
 
         let ring = IoUring::builder()
