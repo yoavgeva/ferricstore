@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -116,8 +116,6 @@ pub struct AsyncUringBackend {
     fd: RawFd,
     /// Keeps the file open for the lifetime of the backend.
     _file: File,
-    /// Current write offset (byte position at end of file).
-    offset: AtomicU64,
     /// Map from `op_id` to pending-op metadata. Shared between the submit
     /// path (inserts) and the completion thread (removes + sends messages).
     pending: Arc<Mutex<HashMap<u64, PendingOp>>>,
@@ -137,7 +135,6 @@ impl AsyncUringBackend {
     /// cannot be read, or the `io_uring` ring cannot be initialised.
     pub fn open(path: &std::path::Path) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let offset = file.metadata()?.len();
         let fd = file.as_raw_fd();
 
         let ring = IoUring::builder()
@@ -168,7 +165,6 @@ impl AsyncUringBackend {
             ring,
             fd,
             _file: file,
-            offset: AtomicU64::new(offset),
             pending,
             shutdown,
             completion_thread: Some(completion_thread),
@@ -185,16 +181,13 @@ impl AsyncUringBackend {
     /// # Arguments
     ///
     /// * `buffers` — serialised record bytes to append, in order.
+    /// * `file_offsets` — pre-computed byte offsets for each buffer, one per
+    ///   entry. These are computed by the caller (via `encode_for_async`)
+    ///   from the authoritative `store.writer.offset`. This avoids a
+    ///   redundant internal offset counter that can drift when sync writes
+    ///   interleave with async batches.
     /// * `caller_pid` — the BEAM process to notify on completion.
     /// * `op_id` — unique operation identifier, echoed back in the message.
-    ///
-    /// # Returns
-    ///
-    /// A `Vec<u64>` of starting file offsets, one per buffer (same as
-    /// `IoBackend::append_batch_and_sync`). These offsets are computed
-    /// optimistically from the current write position. If the I/O
-    /// subsequently fails, the caller will learn about it via the BEAM
-    /// message and should not use these offsets.
     ///
     /// # Errors
     ///
@@ -203,30 +196,19 @@ impl AsyncUringBackend {
     pub fn submit_batch(
         &self,
         buffers: &[&[u8]],
+        file_offsets: &[u64],
         caller_pid: LocalPid,
         op_id: u64,
-    ) -> io::Result<Vec<u64>> {
+    ) -> io::Result<()> {
         if buffers.is_empty() {
             // Nothing to write. Return success without submitting to the ring
             // or sending a BEAM message. The caller checks buffers.is_empty()
             // and returns :ok directly instead of {:pending, op_id}.
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         // 1. Copy buffers into owned Vecs.
         let owned_buffers: Vec<Vec<u8>> = buffers.iter().map(|b| b.to_vec()).collect();
-
-        // 2. Compute offsets from the current write position.
-        //    The offset is NOT advanced yet — only advance after a successful
-        //    ring submission to avoid leaving async_uring.offset ahead of any
-        //    actual or caller-committed writes.
-        let base_offset = self.offset.load(Ordering::SeqCst);
-        let mut offsets = Vec::with_capacity(owned_buffers.len());
-        let mut running = base_offset;
-        for buf in &owned_buffers {
-            offsets.push(running);
-            running += buf.len() as u64;
-        }
 
         // 3. Push SQEs under the ring lock and submit to the kernel.
         let fd = types::Fd(self.fd);
@@ -265,7 +247,7 @@ impl AsyncUringBackend {
                         buf.as_ptr(),
                         u32::try_from(buf.len()).unwrap_or(u32::MAX),
                     )
-                    .offset(offsets[i])
+                    .offset(file_offsets[i])
                     .build()
                     .user_data(WRITE_SQE_TAG)
                     .flags(Flags::IO_LINK);
@@ -300,13 +282,7 @@ impl AsyncUringBackend {
             })?;
         }
 
-        // 4. Submission succeeded — advance the offset now.
-        //    The caller (put_batch_async in lib.rs) will also call
-        //    commit_async_batch which advances store.writer.offset by the
-        //    same amount, keeping both counters in sync.
-        self.offset.store(running, Ordering::SeqCst);
-
-        // 5. Register the pending op so the completion thread can find it.
+        // 4. Register the pending op so the completion thread can find it.
         {
             let mut pending = self.pending.lock().map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "async_uring: pending mutex poisoned")
@@ -320,7 +296,7 @@ impl AsyncUringBackend {
             );
         }
 
-        Ok(offsets)
+        Ok(())
     }
 
     /// Background thread loop: drain CQEs and send BEAM messages.
@@ -437,12 +413,6 @@ impl AsyncUringBackend {
                 .encode(env)
         });
     }
-
-    /// Current write offset (the byte position immediately after the last
-    /// optimistically-assigned byte).
-    pub fn offset(&self) -> u64 {
-        self.offset.load(Ordering::SeqCst)
-    }
 }
 
 impl Drop for AsyncUringBackend {
@@ -504,34 +474,14 @@ mod tests {
 
         let dir = tmp();
         let path = dir.path().join("test.log");
-        let backend = AsyncUringBackend::open(&path).unwrap();
-
-        // For an empty batch we need a LocalPid, but since submit_batch
-        // on empty buffers sends the message immediately (no ring
-        // submission), we just check offsets are empty.
-        //
-        // We cannot easily construct a real LocalPid in a Rust unit test
-        // (no BEAM running), so we verify the offset stays 0.
-        assert_eq!(backend.offset(), 0);
+        // Verify that open succeeds without error. We cannot call
+        // submit_batch with an empty buffers slice without a valid
+        // LocalPid, but the constructor itself should succeed.
+        let _backend = AsyncUringBackend::open(&path).unwrap();
     }
 
     #[test]
-    fn async_backend_offset_advances_on_submit() {
-        if !requires_io_uring() {
-            return;
-        }
-
-        let dir = tmp();
-        let path = dir.path().join("test.log");
-        let backend = AsyncUringBackend::open(&path).unwrap();
-
-        // We cannot submit without a valid LocalPid (no BEAM running),
-        // but we can verify offset starts at 0 and that open works.
-        assert_eq!(backend.offset(), 0);
-    }
-
-    #[test]
-    fn async_backend_open_sets_offset_from_existing_file() {
+    fn async_backend_open_succeeds_with_existing_file() {
         if !requires_io_uring() {
             return;
         }
@@ -539,11 +489,10 @@ mod tests {
         let dir = tmp();
         let path = dir.path().join("test.log");
 
-        // Write some data using std::fs first.
+        // Write some data using std::fs first, then verify open succeeds.
         std::fs::write(&path, b"hello").unwrap();
 
-        let backend = AsyncUringBackend::open(&path).unwrap();
-        assert_eq!(backend.offset(), 5, "offset must equal existing file size");
+        let _backend = AsyncUringBackend::open(&path).unwrap();
     }
 
     #[test]

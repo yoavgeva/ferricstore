@@ -248,13 +248,13 @@ fn put_batch_async<'a>(
 
         // Step 2: Submit to the async ring (non-blocking).
         // Only update the keydir and advance offsets if submission succeeds.
-        match async_uring.submit_batch(&buf_refs, caller_pid, op_id) {
-            Ok(_offsets) if buf_refs.is_empty() => {
+        match async_uring.submit_batch(&buf_refs, &file_offsets, caller_pid, op_id) {
+            Ok(()) if buf_refs.is_empty() => {
                 // Empty batch — nothing was submitted to the ring, so no CQE
                 // will arrive. Return :ok immediately instead of {:pending, _}.
                 return Ok(atoms::ok().encode(env));
             }
-            Ok(_offsets) => {
+            Ok(()) => {
                 // Step 3: Ring submission succeeded — commit side effects.
                 // The keydir and writer offset are only updated now, after we
                 // know the SQEs were accepted by the kernel. This ensures that
