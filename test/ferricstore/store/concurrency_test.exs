@@ -28,7 +28,7 @@ defmodule Ferricstore.Store.ConcurrencyTest do
     {:ok, pid} = Shard.start_link(index: index, data_dir: dir)
 
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
+      if Process.alive?(pid), do: catch_exit(GenServer.stop(pid))
       File.rm_rf!(dir)
     end)
 
