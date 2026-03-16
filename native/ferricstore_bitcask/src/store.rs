@@ -248,19 +248,23 @@ impl Store {
         Ok(())
     }
 
-    /// Encode a batch of entries and update the keydir **without writing to
-    /// disk**. Returns owned encoded buffers that the caller must submit to an
-    /// `AsyncUringBackend`.
+    /// Encode a batch of entries into on-disk record bytes and compute the
+    /// file offset at which each record will be written.
     ///
-    /// This is the async counterpart to `put_batch`: it does everything except
-    /// the actual I/O. The caller is responsible for submitting the returned
-    /// buffers to the async ring and handling the completion message.
+    /// This is a **pure** step with no side effects: it does not touch the
+    /// keydir or advance any offsets. The caller must call
+    /// `commit_async_batch` after a successful ring submission to make the
+    /// writes visible via `get`.
     ///
-    /// The `writer.offset` is advanced optimistically. If the async I/O
-    /// subsequently fails, the backend is in an inconsistent state — which
-    /// matches Bitcask's crash-recovery contract (log replay on reopen
-    /// reconciles the keydir with what is actually on disk).
-    pub fn prepare_batch_for_async(&mut self, entries: &[(&[u8], &[u8], u64)]) -> Vec<Vec<u8>> {
+    /// Returns `(encoded_buffers, file_offsets)`:
+    ///   - `encoded_buffers[i]` is the serialised record for `entries[i]`.
+    ///   - `file_offsets[i]` is the byte offset where `encoded_buffers[i]`
+    ///     will be written in the active log file.
+    #[must_use]
+    pub fn encode_for_async(
+        &self,
+        entries: &[(&[u8], &[u8], u64)],
+    ) -> (Vec<Vec<u8>>, Vec<u64>) {
         use crate::log::encode_record;
 
         let encoded: Vec<Vec<u8>> = entries
@@ -268,24 +272,43 @@ impl Store {
             .map(|(key, value, expire_at_ms)| encode_record(key, value, *expire_at_ms))
             .collect();
 
-        // Compute offsets from the current writer position.
-        let base_offset = self.writer.offset;
-        let mut running_offset = base_offset;
-        let mut total_bytes: u64 = 0;
-        for (i, buf) in encoded.iter().enumerate() {
-            let record_offset = running_offset;
-            let buf_len = buf.len() as u64;
-            running_offset += buf_len;
-            total_bytes += buf_len;
+        let mut offsets = Vec::with_capacity(encoded.len());
+        let mut running = self.writer.offset;
+        for buf in &encoded {
+            offsets.push(running);
+            running += buf.len() as u64;
+        }
 
-            // Update keydir optimistically.
-            let (key, value, expire_at_ms) = entries[i];
+        (encoded, offsets)
+    }
+
+    /// Update the keydir and advance the writer offset for a batch that has
+    /// been **successfully submitted** to the async io_uring ring.
+    ///
+    /// Must be called exactly once per successful `submit_batch` call, with
+    /// the same `entries` and `file_offsets` that were passed to
+    /// `encode_for_async`.
+    ///
+    /// # Safety invariant
+    ///
+    /// Call this only after `submit_batch` returns `Ok`. If the ring
+    /// submission fails, do NOT call this — the keydir must not contain
+    /// entries pointing to unwritten file offsets.
+    pub fn commit_async_batch(
+        &mut self,
+        entries: &[(&[u8], &[u8], u64)],
+        file_offsets: &[u64],
+        encoded: &[Vec<u8>],
+    ) {
+        let total_bytes: u64 = encoded.iter().map(|b| b.len() as u64).sum();
+
+        for (i, &(key, value, expire_at_ms)) in entries.iter().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
             self.keydir.put(
                 key.to_vec(),
                 KeyEntry {
                     file_id: self.active_file_id,
-                    offset: record_offset,
+                    offset: file_offsets[i],
                     value_size: value.len() as u32,
                     expire_at_ms,
                     ref_bit: false,
@@ -298,8 +321,6 @@ impl Store {
         // that if a subsequent sync write (e.g. a delete tombstone) goes
         // through the LogWriter, it starts at the correct position.
         self.writer.advance_offset(total_bytes);
-
-        encoded
     }
 
     /// Delete a key. Appends a tombstone to the log.

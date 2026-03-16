@@ -234,8 +234,8 @@ fn put_batch_async<'a>(
     if let Some(ref async_uring) = resource.async_uring {
         let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
 
-        // Encode records and update keydir optimistically.
-        let encoded = store.prepare_batch_for_async(&entries);
+        // Step 1: Encode records and compute file offsets (pure, no side effects).
+        let (encoded, file_offsets) = store.encode_for_async(&entries);
 
         // Build buffer refs from the owned encoded Vecs.
         let buf_refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
@@ -246,7 +246,8 @@ fn put_batch_async<'a>(
         // Get the caller's PID so the background thread can send the result.
         let caller_pid: LocalPid = env.pid();
 
-        // Submit to the async ring (non-blocking).
+        // Step 2: Submit to the async ring (non-blocking).
+        // Only update the keydir and advance offsets if submission succeeds.
         match async_uring.submit_batch(&buf_refs, caller_pid, op_id) {
             Ok(_offsets) if buf_refs.is_empty() => {
                 // Empty batch — nothing was submitted to the ring, so no CQE
@@ -254,12 +255,17 @@ fn put_batch_async<'a>(
                 return Ok(atoms::ok().encode(env));
             }
             Ok(_offsets) => {
+                // Step 3: Ring submission succeeded — commit side effects.
+                // The keydir and writer offset are only updated now, after we
+                // know the SQEs were accepted by the kernel. This ensures that
+                // if submit_batch failed (e.g. ring capacity exceeded), NIF.get
+                // will not try to read from file offsets that were never written.
+                store.commit_async_batch(&entries, &file_offsets, &encoded);
                 return Ok((atoms::pending(), op_id).encode(env));
             }
             Err(e) => {
-                // Ring submission failed — return error. The keydir was
-                // already updated optimistically, which is acceptable per
-                // crash-recovery semantics (log replay reconciles).
+                // Ring submission failed — return error WITHOUT updating the
+                // keydir or advancing offsets. No data was written.
                 return Ok((atoms::error(), e.to_string()).encode(env));
             }
         }

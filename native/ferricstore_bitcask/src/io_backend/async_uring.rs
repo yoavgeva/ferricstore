@@ -46,8 +46,9 @@ use rustler::{Encoder, LocalPid, OwnedEnv};
 /// Ring capacity in submission-queue entries. Must be a power of two.
 /// Each batch occupies N_writes + 1 (fsync) SQEs, so the ring must be large
 /// enough to hold the biggest expected batch plus the fsync SQE.
-/// 256 accommodates batches of up to 255 records without splitting.
-const RING_SIZE: u32 = 256;
+/// 4096 accommodates batches of up to 4095 records without splitting.
+/// Memory cost: ~4096 × 80 bytes ≈ 320 KB per ring (SQE=64B, CQE=16B).
+const RING_SIZE: u32 = 4096;
 
 /// Sentinel `user_data` value used for write SQEs that we do not individually
 /// track. The completion thread ignores CQEs with this tag.
@@ -216,6 +217,9 @@ impl AsyncUringBackend {
         let owned_buffers: Vec<Vec<u8>> = buffers.iter().map(|b| b.to_vec()).collect();
 
         // 2. Compute offsets from the current write position.
+        //    The offset is NOT advanced yet — only advance after a successful
+        //    ring submission to avoid leaving async_uring.offset ahead of any
+        //    actual or caller-committed writes.
         let base_offset = self.offset.load(Ordering::SeqCst);
         let mut offsets = Vec::with_capacity(owned_buffers.len());
         let mut running = base_offset;
@@ -223,15 +227,8 @@ impl AsyncUringBackend {
             offsets.push(running);
             running += buf.len() as u64;
         }
-        // Total bytes for this batch (for reference; not used further).
-        let _ = running - base_offset;
 
-        // 3. Advance offset optimistically. If the I/O fails the backend is
-        //    in an inconsistent state anyway (the file may have partial
-        //    writes), which matches Bitcask's crash-recovery contract.
-        self.offset.store(running, Ordering::SeqCst);
-
-        // 4. Push SQEs under the ring lock.
+        // 3. Push SQEs under the ring lock and submit to the kernel.
         let fd = types::Fd(self.fd);
         {
             let ring = self.ring.lock().map_err(|_| {
@@ -240,6 +237,26 @@ impl AsyncUringBackend {
 
             {
                 let mut sq = unsafe { ring.submission_shared() };
+
+                // Pre-check ring capacity before pushing any SQEs.
+                // This prevents a partial push (which would leave stale SQEs in
+                // the ring buffer that would be inadvertently submitted on the
+                // next call). N writes + 1 fsync = N+1 SQEs total.
+                let needed = owned_buffers.len() + 1;
+                let free = sq.capacity().saturating_sub(sq.len());
+                if free < needed {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "async_uring: batch of {} entries needs {} SQEs but ring only has {} free slots (capacity {}). \
+                             Use put_batch for very large batches.",
+                            owned_buffers.len(),
+                            needed,
+                            free,
+                            sq.capacity(),
+                        ),
+                    ));
+                }
 
                 // Push write SQEs, each linked to the next.
                 for (i, buf) in owned_buffers.iter().enumerate() {
@@ -282,6 +299,12 @@ impl AsyncUringBackend {
                 io::Error::new(io::ErrorKind::Other, format!("async_uring submit: {e}"))
             })?;
         }
+
+        // 4. Submission succeeded — advance the offset now.
+        //    The caller (put_batch_async in lib.rs) will also call
+        //    commit_async_batch which advances store.writer.offset by the
+        //    same amount, keeping both counters in sync.
+        self.offset.store(running, Ordering::SeqCst);
 
         // 5. Register the pending op so the completion thread can find it.
         {

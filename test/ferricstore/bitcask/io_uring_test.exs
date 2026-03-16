@@ -214,7 +214,8 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
       assert_receive {:child_done, _op_id}, 6_000
       refute_receive {:io_complete, _, _}, 50
-      refute Process.alive?(child) or true  # child exited normally
+      # child exited normally after receiving its completion message
+      refute Process.alive?(child)
     end
 
     test "3 sequential batches each produce exactly one completion" do
