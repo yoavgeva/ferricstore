@@ -170,7 +170,8 @@ defmodule Ferricstore.Resp.ParserTest do
     end
 
     test "parses zero as double" do
-      assert {:ok, [0.0], ""} = Parser.parse(",0\r\n")
+      {:ok, [result], ""} = Parser.parse(",0\r\n")
+      assert result == 0.0
     end
 
     test "parses an integer-like double" do

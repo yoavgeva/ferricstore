@@ -90,17 +90,17 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     {pid, sample}
   end
 
-  defp liveness_loop(n, _parent) do
+  defp liveness_loop(n, parent) do
     receive do
       {:sample, from} ->
         send(from, {:count, n})
-        liveness_loop(n + 1, _parent)
+        liveness_loop(n + 1, parent)
 
       :stop ->
         :ok
     after
       0 ->
-        liveness_loop(n + 1, _parent)
+        liveness_loop(n + 1, parent)
     end
   end
 

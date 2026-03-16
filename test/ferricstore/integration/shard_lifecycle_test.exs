@@ -126,12 +126,6 @@ defmodule Ferricstore.Integration.ShardLifecycleTest do
   # TCP helpers (adapted from ConnectionTest / CommandsTcpTest)
   # ---------------------------------------------------------------------------
 
-  defp available_port do
-    {:ok, sock} = :gen_tcp.listen(0, [])
-    {:ok, port} = :inet.port(sock)
-    :gen_tcp.close(sock)
-    port
-  end
 
   defp connect_and_hello(port) do
     {:ok, sock} =

@@ -23,12 +23,6 @@ defmodule Ferricstore.Integration.CommandsTcpTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  defp available_port do
-    {:ok, sock} = :gen_tcp.listen(0, [])
-    {:ok, port} = :inet.port(sock)
-    :gen_tcp.close(sock)
-    port
-  end
 
   defp send_cmd(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))

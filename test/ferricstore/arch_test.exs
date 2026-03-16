@@ -1,6 +1,6 @@
 defmodule Ferricstore.ArchTest do
   use ExUnit.Case, async: true
-  use ArchTest
+  use ArchTest, app: :ferricstore
 
   # ---------------------------------------------------------------------------
   # Dependency rules
