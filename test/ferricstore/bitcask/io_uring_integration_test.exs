@@ -842,33 +842,32 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
       {pid0, idx, dir} = start_shard()
       on_exit(fn -> File.rm_rf!(dir) end)
 
-      current_pid = pid0
+      final_pid =
+        Enum.reduce(1..3, pid0, fn round, pid ->
+          # Write + flush
+          :ok = GenServer.call(pid, {:put, "round#{round}_k", "round#{round}_v", 0})
+          :ok = GenServer.call(pid, :flush)
 
-      for round <- 1..3 do
-        # Write + flush
-        :ok = GenServer.call(current_pid, {:put, "round#{round}_k", "round#{round}_v", 0})
-        :ok = GenServer.call(current_pid, :flush)
+          # Crash
+          ref = Process.monitor(pid)
+          Process.exit(pid, :kill)
+          assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
+          :timer.sleep(30)
 
-        # Crash
-        ref = Process.monitor(current_pid)
-        Process.exit(current_pid, :kill)
-        assert_receive {:DOWN, ^ref, :process, ^current_pid, :killed}, 1_000
-        :timer.sleep(30)
+          # Restart
+          {:ok, new_pid} = Shard.start_link(index: idx, data_dir: dir)
 
-        # Restart
-        {:ok, new_pid} = Shard.start_link(index: idx, data_dir: dir)
+          # All previous rounds' data must survive
+          for prev <- 1..round do
+            assert "round#{prev}_v" == GenServer.call(new_pid, {:get, "round#{prev}_k"}),
+                   "round#{prev}_k lost after restart in round #{round}"
+          end
 
-        # All previous rounds' data must survive
-        for prev <- 1..round do
-          assert "round#{prev}_v" == GenServer.call(new_pid, {:get, "round#{prev}_k"}),
-                 "round#{prev}_k lost after restart in round #{round}"
-        end
-
-        current_pid = new_pid
-      end
+          new_pid
+        end)
 
       # Cleanup last pid
-      if Process.alive?(current_pid), do: GenServer.stop(current_pid)
+      if Process.alive?(final_pid), do: GenServer.stop(final_pid)
     end
 
     test "async writes in-flight during crash: pre-flush data survives" do
