@@ -400,7 +400,7 @@ mod tests {
         tempfile::TempDir::new().unwrap()
     }
 
-    /// Skip the test if io_uring is not available.
+    /// Skip the test if `io_uring` is not available.
     fn requires_io_uring() -> bool {
         IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder()
             .build(1)

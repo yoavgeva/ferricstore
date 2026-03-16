@@ -1017,7 +1017,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// EC-2: When the hint file for a data file contains a well-formed header
-    /// that claims a key_size larger than the remaining bytes (mid-entry
+    /// that claims a `key_size` larger than the remaining bytes (mid-entry
     /// truncation), `Store::open` must succeed by falling back to full log
     /// replay rather than propagating the parse error.
     #[test]
@@ -1506,7 +1506,7 @@ mod tests {
         {
             let log_path_buf = std::fs::read_dir(dir.path())
                 .unwrap()
-                .filter_map(|e| {
+                .find_map(|e| {
                     let e = e.unwrap();
                     if e.file_name().to_string_lossy().ends_with(".log") {
                         Some(e.path())
@@ -1514,7 +1514,6 @@ mod tests {
                         None
                     }
                 })
-                .next()
                 .unwrap();
 
             // Read all 5 records to find where the 3rd one starts.
@@ -1753,8 +1752,7 @@ mod tests {
             assert_eq!(
                 store.get(k).unwrap(),
                 Some(v.clone()),
-                "batch entry {:?} must be retrievable",
-                k
+                "batch entry {k:?} must be retrievable"
             );
         }
     }

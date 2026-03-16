@@ -702,7 +702,7 @@ mod tests {
         );
     }
 
-    /// Empty key round-trips through write_entry / read_all.
+    /// Empty key round-trips through `write_entry` / `read_all`.
     #[test]
     fn hint_entry_empty_key_round_trips() {
         let dir = tmp();
@@ -770,7 +770,7 @@ mod tests {
     // commit() atomicity (additional)
     // ------------------------------------------------------------------
 
-    /// After commit(), no `.hint.tmp` file exists and `.hint` file does.
+    /// After `commit()`, no `.hint.tmp` file exists and `.hint` file does.
     #[test]
     fn commit_renames_tmp_to_final() {
         let dir = tmp();
@@ -870,7 +870,7 @@ mod tests {
         }
     }
 
-    /// A hint file with a corrupt CRC in the first entry causes load_into to return Err.
+    /// A hint file with a corrupt CRC in the first entry causes `load_into` to return Err.
     #[test]
     fn load_into_corrupt_crc_returns_error() {
         let dir = tmp();

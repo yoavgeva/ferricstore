@@ -704,8 +704,7 @@ mod tests {
         let mut reader2 = LogReader::open(&path).unwrap();
         // Must be either an error OR None — never Ok(Some(valid record))
         match reader2.read_at(1) {
-            Err(_) => {}   // CRC mismatch or IO error — expected
-            Ok(None) => {} // treated as EOF — acceptable
+            Err(_) | Ok(None) => {} // CRC mismatch, IO error, or EOF — all acceptable
             Ok(Some(rec)) => panic!(
                 "unexpected successful decode at mid-record: key={:?}",
                 rec.key
@@ -986,8 +985,7 @@ mod tests {
         for window in offsets.windows(2) {
             assert!(
                 window[1] > window[0],
-                "batch offsets must be strictly increasing: {:?}",
-                offsets
+                "batch offsets must be strictly increasing: {offsets:?}"
             );
         }
     }

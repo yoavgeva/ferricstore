@@ -318,7 +318,7 @@ mod tests {
         tempfile::TempDir::new().unwrap()
     }
 
-    /// Skip the test if io_uring is not available (old kernel / CI without
+    /// Skip the test if `io_uring` is not available (old kernel / CI without
     /// the feature). This prevents false failures in restricted environments.
     fn requires_io_uring() -> bool {
         IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder()
@@ -450,7 +450,7 @@ mod tests {
             &bytes[offsets[1] as usize..offsets[1] as usize + 5],
             b"world"
         );
-        assert_eq!(&bytes[offsets[2] as usize..offsets[2] as usize + 1], b"!");
+        assert_eq!(&bytes[(offsets[2] as usize)..=(offsets[2] as usize)], b"!");
     }
 
     #[test]

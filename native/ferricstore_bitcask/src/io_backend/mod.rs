@@ -321,7 +321,7 @@ mod tests {
         );
     }
 
-    /// append_batch_and_sync with an empty slice returns an empty offsets vec.
+    /// `append_batch_and_sync` with an empty slice returns an empty offsets vec.
     #[test]
     fn sync_backend_batch_empty_is_ok() {
         let dir = tmp();

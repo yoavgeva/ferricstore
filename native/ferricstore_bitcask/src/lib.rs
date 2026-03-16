@@ -1,5 +1,16 @@
 #![deny(clippy::all, clippy::pedantic)]
 #![deny(unsafe_code)]
+// These pedantic lints are noisy without adding safety value for this codebase:
+// - possible_truncation: we target 64-bit Linux only; u64→usize is always safe.
+// - cast_sign_loss / cast_lossless: io_uring result codes require these casts.
+// - items_after_statements: common in test helpers and is clear.
+// - doc_markdown: minor style preference, not a correctness issue.
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_lossless)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::doc_link_with_quotes)]
 
 pub mod compaction;
 pub mod hint;

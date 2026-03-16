@@ -738,7 +738,7 @@ mod tests {
     // Issue 4.3: Output file ID must be strictly greater than all input IDs
     // ------------------------------------------------------------------
 
-    /// Calling compact() with new_file_id <= max(file_ids) must return Err.
+    /// Calling `compact()` with `new_file_id` <= `max(file_ids)` must return Err.
     #[test]
     fn compact_rejects_output_id_not_greater_than_input_ids() {
         let dir = tmp();
@@ -757,7 +757,7 @@ mod tests {
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("new_file_id") && msg.contains("2") && msg.contains("3"),
+            msg.contains("new_file_id") && msg.contains('2') && msg.contains('3'),
             "error message must mention new_file_id and max input id; got: {msg}"
         );
 
@@ -769,7 +769,7 @@ mod tests {
         );
     }
 
-    /// Calling compact() with new_file_id strictly greater than all input IDs
+    /// Calling `compact()` with `new_file_id` strictly greater than all input IDs
     /// must succeed.
     #[test]
     fn compact_accepts_output_id_greater_than_all_inputs() {
@@ -821,8 +821,8 @@ mod tests {
         assert_eq!(out.records_written, 3);
     }
 
-    /// Edge case: new_file_id == max_input_id must fail;
-    /// new_file_id == max_input_id + 1 must succeed.
+    /// Edge case: `new_file_id` == `max_input_id` must fail;
+    /// `new_file_id` == `max_input_id` + 1 must succeed.
     #[test]
     fn compact_output_id_must_exceed_max_input_id() {
         let dir = tmp();
@@ -984,7 +984,7 @@ mod tests {
         );
     }
 
-    /// remove_old_files removes both .log and .hint files for the given file IDs.
+    /// `remove_old_files` removes both .log and .hint files for the given file IDs.
     #[test]
     fn remove_old_files_deletes_data_and_hint_files() {
         let dir = tmp();

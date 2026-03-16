@@ -345,7 +345,7 @@ mod tests {
     // len() with expired entries in the raw KeyDir
     // ------------------------------------------------------------------
 
-    /// KeyDir::len() counts ALL entries including expired ones (expiry filtering
+    /// `KeyDir::len()` counts ALL entries including expired ones (expiry filtering
     /// is done at the Store level). Verify the count includes expired entries.
     #[test]
     fn len_includes_expired_entries_in_raw_keydir() {
@@ -364,8 +364,8 @@ mod tests {
         );
     }
 
-    /// is_empty() returns false even when all entries are logically expired,
-    /// because KeyDir has no concept of expiry at this layer.
+    /// `is_empty()` returns false even when all entries are logically expired,
+    /// because `KeyDir` has no concept of expiry at this layer.
     #[test]
     fn is_empty_false_even_when_all_entries_are_expired() {
         let mut kd = KeyDir::new();
@@ -383,7 +383,7 @@ mod tests {
     // expired_keys() read-only semantics
     // ------------------------------------------------------------------
 
-    /// expired_keys() returns empty vec when no entries have a non-zero past expiry.
+    /// `expired_keys()` returns empty vec when no entries have a non-zero past expiry.
     #[test]
     fn expired_keys_returns_empty_for_all_live() {
         let mut kd = KeyDir::new();
@@ -393,7 +393,7 @@ mod tests {
         assert!(expired.is_empty(), "no keys should be expired");
     }
 
-    /// expired_keys() returns all 5 expired keys when all have past expiry.
+    /// `expired_keys()` returns all 5 expired keys when all have past expiry.
     #[test]
     fn expired_keys_returns_all_expired() {
         let mut kd = KeyDir::new();
@@ -412,7 +412,7 @@ mod tests {
         assert!(!expired.contains(&b"live_b".to_vec()));
     }
 
-    /// expired_keys() is read-only: calling it does NOT remove entries from the keydir.
+    /// `expired_keys()` is read-only: calling it does NOT remove entries from the keydir.
     #[test]
     fn expired_keys_does_not_remove_from_keydir() {
         let mut kd = KeyDir::new();
@@ -446,7 +446,7 @@ mod tests {
     // ref_bit clock-hand detailed tests
     // ------------------------------------------------------------------
 
-    /// After set_ref_bit + tick_ref_bit, the bit is false (given second chance).
+    /// After `set_ref_bit` + `tick_ref_bit`, the bit is false (given second chance).
     #[test]
     fn ref_bit_set_then_tick_clears_it() {
         let mut kd = KeyDir::new();
@@ -472,7 +472,7 @@ mod tests {
         );
     }
 
-    /// tick_ref_bit on an entry with ref_bit=false marks it as eviction-eligible.
+    /// `tick_ref_bit` on an entry with `ref_bit=false` marks it as eviction-eligible.
     #[test]
     fn ref_bit_not_set_then_tick_returns_true_for_eviction() {
         let mut kd = KeyDir::new();
@@ -494,7 +494,7 @@ mod tests {
     // delete detailed tests
     // ------------------------------------------------------------------
 
-    /// Deleting a nonexistent key is a noop — len() must not change.
+    /// Deleting a nonexistent key is a noop — `len()` must not change.
     #[test]
     fn delete_nonexistent_key_is_noop() {
         let mut kd = KeyDir::new();
