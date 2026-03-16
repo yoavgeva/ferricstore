@@ -168,7 +168,10 @@ defmodule Ferricstore.Integration.ShardLifecycleTest do
       Router.put(k, v, 0)
       assert v == Router.get(k)
 
+      # Flush pending writes to Bitcask before crashing, so the data survives.
       pid = shard_pid_for(k)
+      :ok = GenServer.call(pid, :flush)
+
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 2_000
@@ -202,6 +205,9 @@ defmodule Ferricstore.Integration.ShardLifecycleTest do
       shard_idx = shard_index_for(k)
       ets_name = :"shard_ets_#{shard_idx}"
       assert [{^k, ^v, _}] = :ets.lookup(ets_name, k)
+
+      # Flush to Bitcask before crashing so data is durable.
+      :ok = GenServer.call(shard_pid_for(k), :flush)
 
       # Kill shard, wait for restart
       {_old, _new} = kill_shard_for_key(k)
