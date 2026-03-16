@@ -50,6 +50,12 @@ const RING_SIZE: u32 = 64;
 /// track. The completion thread ignores CQEs with this tag.
 const WRITE_SQE_TAG: u64 = 0;
 
+/// `IORING_ENTER_GETEVENTS` — instructs the kernel to wait for completions
+/// when `min_complete > 0`. This is flag bit 0 of the `flags` argument to
+/// `io_uring_enter(2)`. It is not (yet) exported by the `libc` crate, so we
+/// define it here from the kernel ABI.
+const IORING_ENTER_GETEVENTS: libc::c_uint = 1;
+
 /// Module-level atoms used in BEAM messages sent from the completion thread.
 mod atoms {
     rustler::atoms! {
@@ -84,10 +90,28 @@ struct PendingOp {
 /// called from the NIF layer through a `Mutex<Store>`. Internally, the ring
 /// and pending-ops map are protected by their own `Mutex` to allow the
 /// background completion thread to access the ring concurrently.
+///
+/// ## Mutex discipline — avoiding deadlock
+///
+/// The completion thread must **not** hold the ring mutex while waiting for
+/// CQEs (i.e. while calling `submit_and_wait`), because the submit path also
+/// needs the ring mutex to push SQEs. If the completion thread held the lock
+/// during the wait, no new SQEs could ever be submitted, so no CQEs would
+/// ever arrive — a deadlock.
+///
+/// The fix: the completion thread waits for CQEs by calling the raw
+/// `io_uring_enter(2)` syscall via `libc` using only the ring's file
+/// descriptor (an integer that needs no lock). Once the syscall returns, the
+/// thread acquires the ring mutex briefly to drain available CQEs, then
+/// releases the lock before processing them.
 pub struct AsyncUringBackend {
     /// `io_uring` ring instance, shared between the submitter (NIF thread) and
-    /// the completion thread. The Mutex serialises access.
+    /// the completion thread. The Mutex serialises SQ pushes and CQ drains.
     ring: Arc<Mutex<IoUring>>,
+    /// Raw fd of the io_uring ring itself (not the data file). Used by the
+    /// completion thread to call `io_uring_enter` without holding the ring
+    /// mutex.
+    ring_fd: RawFd,
     /// Raw file descriptor for the open data file. Kept alive by `_file`.
     fd: RawFd,
     /// Keeps the file open for the lifetime of the backend.
@@ -120,6 +144,10 @@ impl AsyncUringBackend {
             .build(RING_SIZE)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
+        // Capture the ring's fd before moving `ring` into the Arc. This fd is
+        // stable for the lifetime of the IoUring (it is an OwnedFd inside it).
+        let ring_fd = ring.as_raw_fd();
+
         let ring = Arc::new(Mutex::new(ring));
         let pending: Arc<Mutex<HashMap<u64, PendingOp>>> = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -131,13 +159,14 @@ impl AsyncUringBackend {
             thread::Builder::new()
                 .name("ferric-uring-cq".into())
                 .spawn(move || {
-                    Self::completion_loop(&ring, &pending, &shutdown);
+                    Self::completion_loop(ring_fd, &ring, &pending, &shutdown);
                 })
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
         };
 
         Ok(Self {
             ring,
+            ring_fd,
             fd,
             _file: file,
             offset: AtomicU64::new(offset),
@@ -273,28 +302,67 @@ impl AsyncUringBackend {
     }
 
     /// Background thread loop: drain CQEs and send BEAM messages.
+    ///
+    /// # Mutex discipline
+    ///
+    /// This function **must not** hold the ring mutex while waiting for CQEs.
+    /// Waiting for CQEs (via `io_uring_enter` with `IORING_ENTER_GETEVENTS`)
+    /// requires that SQEs can be submitted concurrently — but SQE submission
+    /// also needs the ring mutex. Holding the mutex during the wait would
+    /// prevent any new SQEs from being submitted, so no CQEs would ever arrive,
+    /// causing a deadlock.
+    ///
+    /// Instead we call the `io_uring_enter(2)` syscall directly using only the
+    /// ring's file descriptor (an integer, no lock needed). Once the syscall
+    /// returns we lock briefly to drain available CQEs, then release the lock
+    /// before processing them.
     fn completion_loop(
+        ring_fd: RawFd,
         ring: &Arc<Mutex<IoUring>>,
         pending: &Arc<Mutex<HashMap<u64, PendingOp>>>,
         shutdown: &Arc<AtomicBool>,
     ) {
         while !shutdown.load(Ordering::Relaxed) {
-            // Wait for at least one completion. We use submit_and_wait(1)
-            // with no new SQEs — this blocks until at least 1 CQE is ready.
-            // The timeout is effectively indefinite, but the shutdown flag
-            // is checked after each wakeup.
+            // Wait for at least 1 CQE using the raw syscall, WITHOUT holding
+            // the ring mutex. This allows submit_batch to acquire the mutex
+            // and push SQEs concurrently.
+            //
+            // io_uring_enter(fd, to_submit=0, min_complete=1,
+            //                flags=IORING_ENTER_GETEVENTS, sig=NULL, sigsize=0)
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_io_uring_enter,
+                    ring_fd as libc::c_long,
+                    0_u32, // to_submit: no new SQEs from this call
+                    1_u32, // min_complete: wait for at least 1 CQE
+                    IORING_ENTER_GETEVENTS,
+                    std::ptr::null::<libc::sigset_t>(),
+                    std::mem::size_of::<libc::sigset_t>() as libc::size_t,
+                )
+            };
+
+            if ret < 0 {
+                // EINTR is normal (signal interrupted the wait) — retry.
+                // Any other error means the ring is unusable — exit.
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+                continue;
+            }
+
+            // At least 1 CQE is available. Lock the ring briefly to drain
+            // all available CQEs, then release the lock before processing.
             let cqes: Vec<(u64, i32)> = {
                 let Ok(mut ring) = ring.lock() else {
                     break; // Mutex poisoned — exit thread.
                 };
-
-                // Wait for at least 1 CQE. If we get an error (e.g.
-                // interrupted), just retry.
-                if ring.submit_and_wait(1).is_err() {
-                    continue;
-                }
-
-                ring.completion()
+                // SAFETY: we hold the only mutable reference to the CQ here
+                // (submission_shared is used only on the submit path which
+                // also holds the ring mutex; the CQ is never accessed without
+                // the mutex except via this unsafe accessor which we only call
+                // from this single completion thread).
+                unsafe { ring.completion_shared() }
                     .map(|cqe| (cqe.user_data(), cqe.result()))
                     .collect()
             };

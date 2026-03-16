@@ -10,10 +10,11 @@ crate-type = ["cdylib"]
 [dependencies]
 rustler = "0.37"
 
-# io_uring is Linux-only. On macOS/Windows this dep is completely absent —
-# Cargo does not download, compile, or link it. Falls back to SyncBackend.
+# io_uring is Linux-only. On macOS/Windows these deps are completely absent —
+# Cargo does not download, compile, or link them. Falls back to SyncBackend.
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
