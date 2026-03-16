@@ -42,8 +42,11 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
-      - name: Ensure priv/native directory exists
-        run: mkdir -p priv/native
+      - name: Build NIF (release)
+        run: |
+          cargo build --release --manifest-path native/ferricstore_bitcask/Cargo.toml
+          mkdir -p priv/native
+          cp native/ferricstore_bitcask/target/release/libferricstore_bitcask.so priv/native/ferricstore_bitcask.so
 
       - name: Compile (bench env)
         run: mix compile
