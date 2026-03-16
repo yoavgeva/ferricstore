@@ -1152,7 +1152,8 @@ defmodule Ferricstore.Bitcask.IoUringTest do
       :ok = GenServer.call(pid, {:put, "pre_crash", "safe", 0})
       :ok = GenServer.call(pid, :flush)
 
-      # Kill the shard
+      # Kill the shard (unlink first so the kill signal doesn't propagate to this test process)
+      Process.unlink(pid)
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
@@ -1177,6 +1178,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
       :ok = GenServer.call(pid, {:put, "warm_me", "wval", 0})
       :ok = GenServer.call(pid, :flush)
 
+      Process.unlink(pid)
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
@@ -1478,7 +1480,8 @@ defmodule Ferricstore.Bitcask.IoUringTest do
       :ok = GenServer.call(pid, {:put, "before_restart", "safe", 0})
       :ok = GenServer.call(pid, :flush)
 
-      # Kill and restart
+      # Kill and restart (unlink first so the brutal kill doesn't propagate to this test process)
+      Process.unlink(pid)
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000

@@ -848,7 +848,8 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
           :ok = GenServer.call(pid, {:put, "round#{round}_k", "round#{round}_v", 0})
           :ok = GenServer.call(pid, :flush)
 
-          # Crash
+          # Crash (unlink first so the brutal kill doesn't propagate to the test process)
+          Process.unlink(pid)
           ref = Process.monitor(pid)
           Process.exit(pid, :kill)
           assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
@@ -878,6 +879,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
       :ok = GenServer.call(pid, {:put, "pre_crash_ifl", "safe_val", 0})
       :ok = GenServer.call(pid, :flush)
 
+      Process.unlink(pid)
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
