@@ -224,6 +224,11 @@ defmodule Ferricstore.Integration.ShardLifecycleTest do
           k
         end
 
+      # Flush all shards before the first kill so async writes are durable.
+      # With the async io_uring write path, rapid consecutive puts may still
+      # be in state.pending (batched). An explicit flush drains them to disk.
+      ShardHelpers.flush_all_shards()
+
       # Kill shard 0 three times
       for _ <- 1..3 do
         kill_and_wait_restart(0)

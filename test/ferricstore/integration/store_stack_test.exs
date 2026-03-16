@@ -443,6 +443,14 @@ defmodule Ferricstore.Integration.StoreStackTest do
         Router.put(k, "val_#{k}", 0)
       end
 
+      # Flush all pending async writes to disk before killing the shard.
+      # With the async io_uring write path, puts are kernel-managed once
+      # submitted, but rapid consecutive puts may still be in state.pending
+      # (batched for the next flush). An explicit flush ensures all writes
+      # are durable before we simulate a crash.
+      pid = shard_pid_for(List.first(same_shard_keys))
+      :ok = GenServer.call(pid, :flush)
+
       # Kill the shard
       pid = shard_pid_for(List.first(same_shard_keys))
       ref = Process.monitor(pid)

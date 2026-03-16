@@ -7,6 +7,27 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
 
   @doc """
+  Synchronously flushes all pending async writes on all 4 application-supervised
+  shards (0–3) to disk.
+
+  Call this before killing a shard in tests that verify crash durability, to
+  ensure rapid consecutive puts (which may still be in state.pending due to
+  the async io_uring batch window) are committed to the Bitcask log before the
+  crash is simulated.
+  """
+  @spec flush_all_shards() :: :ok
+  def flush_all_shards do
+    Enum.each(0..3, fn i ->
+      name = :"Ferricstore.Store.Shard.#{i}"
+
+      case Process.whereis(name) do
+        pid when is_pid(pid) -> GenServer.call(pid, :flush)
+        nil -> :ok
+      end
+    end)
+  end
+
+  @doc """
   Waits until all 4 application-supervised shards (0–3) are alive.
 
   Polls every 20ms up to `timeout_ms`. Raises if any shard hasn't restarted
