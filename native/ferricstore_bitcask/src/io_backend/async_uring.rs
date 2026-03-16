@@ -134,7 +134,15 @@ impl AsyncUringBackend {
     /// Returns an `io::Error` if the file cannot be opened, its metadata
     /// cannot be read, or the `io_uring` ring cannot be initialised.
     pub fn open(path: &std::path::Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // Open with write (not append) because every SQE uses an explicit
+        // pwrite offset. O_APPEND would cause the kernel to ignore the
+        // provided offset on some kernel versions and always write at EOF,
+        // corrupting the file layout when multiple batches are in-flight.
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
         let fd = file.as_raw_fd();
 
         let ring = IoUring::builder()
