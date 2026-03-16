@@ -261,10 +261,7 @@ impl Store {
     ///   - `file_offsets[i]` is the byte offset where `encoded_buffers[i]`
     ///     will be written in the active log file.
     #[must_use]
-    pub fn encode_for_async(
-        &self,
-        entries: &[(&[u8], &[u8], u64)],
-    ) -> (Vec<Vec<u8>>, Vec<u64>) {
+    pub fn encode_for_async(&self, entries: &[(&[u8], &[u8], u64)]) -> (Vec<Vec<u8>>, Vec<u64>) {
         use crate::log::encode_record;
 
         let encoded: Vec<Vec<u8>> = entries
