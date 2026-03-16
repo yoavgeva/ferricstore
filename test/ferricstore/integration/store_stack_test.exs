@@ -391,9 +391,12 @@ defmodule Ferricstore.Integration.StoreStackTest do
       # Confirm value is there
       assert "persistent_value" == Router.get(k)
 
-      # Kill the owning shard process
+      # Flush pending writes to Bitcask before killing so data survives the crash.
       pid = shard_pid_for(k)
       assert is_pid(pid), "Expected to find shard PID for key #{k}"
+      :ok = GenServer.call(pid, :flush)
+
+      # Kill the owning shard process
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
 
@@ -421,8 +424,11 @@ defmodule Ferricstore.Integration.StoreStackTest do
       ets_name = shard_ets_for(k)
       assert [{^k, "rebuild_val", _}] = :ets.lookup(ets_name, k)
 
-      # Kill shard
+      # Flush pending writes to Bitcask before killing so data survives the crash.
       pid = shard_pid_for(k)
+      :ok = GenServer.call(pid, :flush)
+
+      # Kill shard
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
