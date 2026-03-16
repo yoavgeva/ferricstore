@@ -32,13 +32,6 @@ jobs:
       - name: Set up Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: native/ferricstore_bitcask/target
-          key: rust-bench-${{ runner.os }}-${{ hashFiles('native/ferricstore_bitcask/Cargo.lock') }}
-          restore-keys: rust-bench-${{ runner.os }}-
-
       - name: Cache Mix deps
         uses: actions/cache@v4
         with:
@@ -48,6 +41,9 @@ jobs:
 
       - name: Install dependencies
         run: mix deps.get
+
+      - name: Ensure priv/native directory exists
+        run: mkdir -p priv/native
 
       - name: Compile (bench env)
         run: mix compile

@@ -36,13 +36,6 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Cache Rust build
-        uses: actions/cache@v4
-        with:
-          path: native/ferricstore_bitcask/target
-          key: rust-${{ runner.os }}-${{ hashFiles('native/ferricstore_bitcask/Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-
-
       - name: Cache Mix deps
         uses: actions/cache@v4
         with:
@@ -58,6 +51,9 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --manifest-path native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
+
+      - name: Ensure priv/native directory exists
+        run: mkdir -p priv/native
 
       - name: Compile
         run: mix compile --warnings-as-errors
