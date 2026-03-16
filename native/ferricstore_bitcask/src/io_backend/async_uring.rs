@@ -44,7 +44,10 @@ use io_uring::{opcode, types, IoUring};
 use rustler::{Encoder, LocalPid, OwnedEnv};
 
 /// Ring capacity in submission-queue entries. Must be a power of two.
-const RING_SIZE: u32 = 64;
+/// Each batch occupies N_writes + 1 (fsync) SQEs, so the ring must be large
+/// enough to hold the biggest expected batch plus the fsync SQE.
+/// 256 accommodates batches of up to 255 records without splitting.
+const RING_SIZE: u32 = 256;
 
 /// Sentinel `user_data` value used for write SQEs that we do not individually
 /// track. The completion thread ignores CQEs with this tag.
@@ -203,8 +206,9 @@ impl AsyncUringBackend {
         op_id: u64,
     ) -> io::Result<Vec<u64>> {
         if buffers.is_empty() {
-            // Nothing to write — notify success immediately.
-            Self::send_ok(caller_pid, op_id);
+            // Nothing to write. Return success without submitting to the ring
+            // or sending a BEAM message. The caller checks buffers.is_empty()
+            // and returns :ok directly instead of {:pending, op_id}.
             return Ok(Vec::new());
         }
 

@@ -248,6 +248,11 @@ fn put_batch_async<'a>(
 
         // Submit to the async ring (non-blocking).
         match async_uring.submit_batch(&buf_refs, caller_pid, op_id) {
+            Ok(_offsets) if buf_refs.is_empty() => {
+                // Empty batch — nothing was submitted to the ring, so no CQE
+                // will arrive. Return :ok immediately instead of {:pending, _}.
+                return Ok(atoms::ok().encode(env));
+            }
             Ok(_offsets) => {
                 return Ok((atoms::pending(), op_id).encode(env));
             }

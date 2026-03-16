@@ -114,11 +114,36 @@ defmodule Ferricstore.Store.Shard do
 
   @impl true
   def handle_call({:get, key}, _from, state) do
-    {:reply, do_get(state, key), state}
+    # Fast path: ETS hit — no need to wait for in-flight writes.
+    case ets_lookup(state.ets, key) do
+      {:hit, value, _expire_at_ms} ->
+        {:reply, value, state}
+
+      :expired ->
+        {:reply, nil, state}
+
+      :miss ->
+        # Cold path: key not in ETS. Flush any pending/in-flight async writes
+        # so Bitcask has the latest data before we query it.
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+        {:reply, warm_from_store(state, key), state}
+    end
   end
 
   def handle_call({:get_meta, key}, _from, state) do
-    {:reply, do_get_meta(state, key), state}
+    case ets_lookup(state.ets, key) do
+      {:hit, value, expire_at_ms} ->
+        {:reply, {value, expire_at_ms}, state}
+
+      :expired ->
+        {:reply, nil, state}
+
+      :miss ->
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+        {:reply, do_get_meta(state, key), state}
+    end
   end
 
   def handle_call({:put, key, value, expire_at_ms}, _from, state) do
@@ -127,11 +152,12 @@ defmodule Ferricstore.Store.Shard do
     new_pending = [{key, value, expire_at_ms} | state.pending]
     new_state = %{state | pending: new_pending}
 
-    # Flush immediately only when this is the first write in a new batch window
-    # AND there is no in-flight async flush. At low concurrency this keeps
-    # single-write durability. At high concurrency the batch window is already
-    # filling up — subsequent puts stay queued for the next flush.
-    if state.pending == [] and state.flush_in_flight == nil do
+    # Flush immediately when no async flush is in-flight. This ensures every
+    # put is submitted to io_uring (and thus kernel-managed) before the call
+    # returns, providing crash durability even if the process is killed before
+    # the timer fires. Multiple puts arriving while a flush is in-flight are
+    # batched together and flushed on the next timer tick after the CQE.
+    if state.flush_in_flight == nil do
       {:reply, :ok, flush_pending(new_state)}
     else
       {:reply, :ok, new_state}
@@ -157,7 +183,19 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:exists, key}, _from, state) do
-    {:reply, do_get(state, key) != nil, state}
+    # For ETS misses we need Bitcask to be up to date — flush first.
+    case ets_lookup(state.ets, key) do
+      {:hit, _value, _expire_at_ms} ->
+        {:reply, true, state}
+
+      :expired ->
+        {:reply, false, state}
+
+      :miss ->
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+        {:reply, do_get(state, key) != nil, state}
+    end
   end
 
   def handle_call(:keys, _from, state) do
