@@ -46,11 +46,9 @@ jobs:
       - name: Cache Mix deps
         uses: actions/cache@v4
         with:
-          path: |
-            deps
-            _build
-          key: mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
+          path: deps
+          key: mix-deps-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-deps-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
 
       - name: Install dependencies
         run: mix deps.get
