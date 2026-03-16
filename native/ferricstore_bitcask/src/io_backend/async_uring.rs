@@ -207,12 +207,56 @@ impl AsyncUringBackend {
             return Ok(());
         }
 
-        // 1. Copy buffers into owned Vecs.
+        // 1. Copy buffers into owned Vecs and capture stable raw pointers.
+        //
+        //    We must capture the (ptr, len) pairs BEFORE moving the Vecs into
+        //    the PendingOp because after the move we can no longer borrow them.
+        //    Vec heap allocations are stable (the data lives on the heap and
+        //    does not move when the Vec is moved), so the raw pointers remain
+        //    valid for as long as the PendingOp is alive in `pending`.
         let owned_buffers: Vec<Vec<u8>> = buffers.iter().map(|b| b.to_vec()).collect();
+        let ptrs: Vec<(*const u8, u32)> = owned_buffers
+            .iter()
+            .map(|b| (b.as_ptr(), u32::try_from(b.len()).unwrap_or(u32::MAX)))
+            .collect();
+
+        // 2. Register the PendingOp BEFORE submitting to the ring.
+        //
+        //    If we inserted AFTER ring.submit(), the kernel could complete the
+        //    I/O before pending.insert() runs. The completion thread would then
+        //    call pending.remove(op_id) and find nothing, silently dropping the
+        //    BEAM message. The caller would block forever waiting for
+        //    {:io_complete, op_id, _}.
+        //
+        //    By inserting first, the completion thread is guaranteed to find
+        //    the PendingOp whenever it processes the CQE — whether the CQE
+        //    arrives before or after ring.submit() returns.
+        //
+        //    ## Lock ordering
+        //
+        //    The completion thread drains CQEs under the ring lock, then
+        //    acquires pending (ring → pending). We must NOT hold pending while
+        //    acquiring ring (pending → ring would invert the order). That is why
+        //    we release the pending lock here before locking the ring below.
+        {
+            let mut pending = self.pending.lock().map_err(|_| {
+                io::Error::new(io::ErrorKind::Other, "async_uring: pending mutex poisoned")
+            })?;
+            pending.insert(
+                op_id,
+                PendingOp {
+                    caller_pid,
+                    _buffers: owned_buffers,
+                },
+            );
+        } // pending lock released before ring lock acquired below
 
         // 3. Push SQEs under the ring lock and submit to the kernel.
+        //
+        //    On any error we remove the PendingOp we just inserted; otherwise
+        //    the entry would leak and the caller would block forever.
         let fd = types::Fd(self.fd);
-        {
+        let submit_result = (|| {
             let ring = self.ring.lock().map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "async_uring: ring mutex poisoned")
             })?;
@@ -224,7 +268,7 @@ impl AsyncUringBackend {
                 // This prevents a partial push (which would leave stale SQEs in
                 // the ring buffer that would be inadvertently submitted on the
                 // next call). N writes + 1 fsync = N+1 SQEs total.
-                let needed = owned_buffers.len() + 1;
+                let needed = ptrs.len() + 1;
                 let free = sq.capacity().saturating_sub(sq.len());
                 if free < needed {
                     return Err(io::Error::new(
@@ -232,7 +276,7 @@ impl AsyncUringBackend {
                         format!(
                             "async_uring: batch of {} entries needs {} SQEs but ring only has {} free slots (capacity {}). \
                              Use put_batch for very large batches.",
-                            owned_buffers.len(),
+                            ptrs.len(),
                             needed,
                             free,
                             sq.capacity(),
@@ -241,22 +285,20 @@ impl AsyncUringBackend {
                 }
 
                 // Push write SQEs, each linked to the next.
-                for (i, buf) in owned_buffers.iter().enumerate() {
-                    let sqe = opcode::Write::new(
-                        fd,
-                        buf.as_ptr(),
-                        u32::try_from(buf.len()).unwrap_or(u32::MAX),
-                    )
-                    .offset(file_offsets[i])
-                    .build()
-                    .user_data(WRITE_SQE_TAG)
-                    .flags(Flags::IO_LINK);
+                for (i, &(ptr, len)) in ptrs.iter().enumerate() {
+                    let sqe = opcode::Write::new(fd, ptr, len)
+                        .offset(file_offsets[i])
+                        .build()
+                        .user_data(WRITE_SQE_TAG)
+                        .flags(Flags::IO_LINK);
 
-                    // SAFETY: `owned_buffers` are owned Vecs stored in the
-                    // `PendingOp` which lives until the completion thread
-                    // drains the fsync CQE for this op_id. The kernel holds
-                    // raw pointers into these Vecs, but they remain valid and
-                    // unmoved (Vec heap allocation is stable).
+                    // SAFETY: `ptr` points into the Vec<u8> stored in the
+                    // PendingOp that was inserted into `pending` above.  The
+                    // PendingOp is only removed by the completion thread after
+                    // it processes the fsync CQE for this op_id, at which point
+                    // the kernel is completely done with all write SQEs in this
+                    // chain.  Vec heap memory is stable — the pointer does not
+                    // move when the Vec is moved into PendingOp.
                     unsafe {
                         sq.push(&sqe).map_err(|_| {
                             io::Error::new(io::ErrorKind::Other, "async_uring: SQ full on write")
@@ -280,20 +322,18 @@ impl AsyncUringBackend {
             ring.submit().map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("async_uring submit: {e}"))
             })?;
-        }
 
-        // 4. Register the pending op so the completion thread can find it.
-        {
-            let mut pending = self.pending.lock().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "async_uring: pending mutex poisoned")
-            })?;
-            pending.insert(
-                op_id,
-                PendingOp {
-                    caller_pid,
-                    _buffers: owned_buffers,
-                },
-            );
+            Ok(())
+        })();
+
+        if submit_result.is_err() {
+            // Ring submission failed — clean up the PendingOp we inserted.
+            // Without this cleanup, `pending` would hold a stale entry that
+            // never gets a CQE, and the caller would wait forever.
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&op_id);
+            }
+            return submit_result;
         }
 
         Ok(())
