@@ -138,10 +138,13 @@ impl AsyncUringBackend {
         // pwrite offset. O_APPEND would cause the kernel to ignore the
         // provided offset on some kernel versions and always write at EOF,
         // corrupting the file layout when multiple batches are in-flight.
+        // truncate(false): preserve existing file content — this is an
+        // append-only log and we must not clobber already-written records.
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(path)?;
         let fd = file.as_raw_fd();
 
