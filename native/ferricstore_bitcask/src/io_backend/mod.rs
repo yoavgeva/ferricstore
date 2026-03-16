@@ -14,7 +14,7 @@
 //! the full duration of the write, but never blocks a normal scheduler.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 // On Linux, bring in the uring backend modules.
@@ -97,14 +97,26 @@ pub struct SyncBackend {
 }
 
 impl SyncBackend {
-    /// Open (or create) the file at `path` for appending.
+    /// Open (or create) the file at `path` for writing.
+    ///
+    /// Opens without `O_APPEND` so that sync writes land at the explicit
+    /// `self.offset` position via seek. This is necessary when the async
+    /// `io_uring` path interleaves with sync writes: `advance_offset` logically
+    /// reserves space before the kernel pwrite completes, so the physical
+    /// file EOF may lag behind `self.offset`. Using `O_APPEND` would write at
+    /// EOF (the lagging position) and clobber space reserved for async data.
     ///
     /// # Errors
     ///
     /// Returns an `io::Error` if the file cannot be opened or its size cannot
     /// be determined.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
         let offset = file.metadata()?.len();
         Ok(Self {
             writer: BufWriter::new(file),
@@ -116,6 +128,11 @@ impl SyncBackend {
 impl IoBackend for SyncBackend {
     fn append(&mut self, data: &[u8]) -> io::Result<u64> {
         let start = self.offset;
+        // Seek to the explicit offset before writing. This is safe even when
+        // the async path has logically advanced `self.offset` beyond the
+        // physical file EOF: the write will extend the file to cover the gap
+        // (sparse region) and then write `data` at exactly `start`.
+        self.writer.seek(SeekFrom::Start(start))?;
         self.writer.write_all(data)?;
         self.offset += data.len() as u64;
         Ok(start)
