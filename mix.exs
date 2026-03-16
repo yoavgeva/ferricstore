@@ -31,6 +31,7 @@ defmodule Ferricstore.MixProject do
       {:telemetry, "~> 1.4"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:arch_test, "~> 0.2", only: [:dev, :test], runtime: false},
+      {:igniter, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:benchee, "~> 1.3", only: :bench, runtime: false},
       {:benchee_html, "~> 1.0", only: :bench, runtime: false}
     ]
