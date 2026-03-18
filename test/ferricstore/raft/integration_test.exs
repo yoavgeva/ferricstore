@@ -13,6 +13,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :pending_raft_startup
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.Cluster

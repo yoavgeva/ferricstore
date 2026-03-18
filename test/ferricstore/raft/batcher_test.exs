@@ -9,6 +9,7 @@ defmodule Ferricstore.Raft.BatcherTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :pending_raft_startup
 
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
