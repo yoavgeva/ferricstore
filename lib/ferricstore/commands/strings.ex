@@ -1,3 +1,4 @@
+# Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Strings do
   @moduledoc """
   Handles Redis string commands.

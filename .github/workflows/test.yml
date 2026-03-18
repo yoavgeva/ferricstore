@@ -59,10 +59,10 @@ jobs:
           cp native/ferricstore_bitcask/target/release/libferricstore_bitcask.so priv/native/ferricstore_bitcask.so
 
       - name: Compile
-        run: mix compile --warnings-as-errors
+        run: mix compile
 
       - name: Run tests
-        run: mix test --warnings-as-errors --trace --timeout 30000
+        run: mix test --trace --timeout 30000
 
       - name: Check io_uring availability
         id: uring

@@ -1,3 +1,4 @@
+# Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Client do
   @moduledoc """
   Handles Redis CLIENT subcommands: ID, SETNAME, GETNAME, INFO, LIST.

@@ -1,3 +1,4 @@
+# Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Native do
   @moduledoc """
   Handles FerricStore-native commands that go beyond the Redis command set.

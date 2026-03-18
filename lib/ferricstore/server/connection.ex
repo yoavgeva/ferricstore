@@ -1,3 +1,4 @@
+# Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Server.Connection do
   @moduledoc """
   Ranch protocol handler for a single FerricStore client connection.

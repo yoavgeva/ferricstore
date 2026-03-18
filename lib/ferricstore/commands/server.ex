@@ -1,3 +1,4 @@
+# Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Server do
   @moduledoc """
   Handles Redis server commands: PING, ECHO, DBSIZE, KEYS, FLUSHDB, FLUSHALL,

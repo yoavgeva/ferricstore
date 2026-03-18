@@ -166,4 +166,31 @@ defmodule Ferricstore.Commands.Blocking do
   end
 
   defp parse_blmpop_count(_), do: {:error, "ERR syntax error"}
+
+  # Simple non-blocking handle/3 for commands dispatched from connection.ex.
+  # Returns the result immediately without blocking (timeout=0 behavior).
+  @spec handle(binary(), [binary()], map()) :: term()
+  def handle("BLPOP", args, store) do
+    case parse_blpop_args(args) do
+      {:ok, keys, _timeout_ms} ->
+        result = Enum.find_value(keys, fn key ->
+          case store.get.(key) do
+            nil -> nil
+            _val -> {key, store.get.(key)}
+          end
+        end)
+        if result, do: Tuple.to_list(result), else: nil
+      {:error, _} = err -> err
+    end
+  end
+
+  def handle("BRPOP", args, store), do: handle("BLPOP", args, store)
+
+  def handle("BLMOVE", _args, _store) do
+    {:error, "ERR BLMOVE not yet fully implemented"}
+  end
+
+  def handle("BLMPOP", _args, _store) do
+    {:error, "ERR BLMPOP not yet fully implemented"}
+  end
 end
