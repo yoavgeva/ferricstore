@@ -88,6 +88,10 @@ defmodule Ferricstore.Raft.IntegrationTest do
       ets = shard_ets_for(k)
       assert [{^k, "dual_val", 0}] = :ets.lookup(ets, k)
 
+      # Flush pending writes to Bitcask before checking NIF directly
+      shard_name = Router.shard_name(Router.shard_for(k))
+      GenServer.call(shard_name, :flush)
+
       # Bitcask should also have it (check via NIF directly)
       shard_pid = shard_pid_for(k)
       state = :sys.get_state(shard_pid)

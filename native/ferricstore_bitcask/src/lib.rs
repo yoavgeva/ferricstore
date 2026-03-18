@@ -432,8 +432,10 @@ fn get_all(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
 /// ## Scheduler contract
 ///
 /// Runs on a Normal BEAM scheduler. Batch reads are serialized by the shard
-/// GenServer. The brief scheduler block is preferable to consuming a DirtyIo
-/// thread.
+/// GenServer. Uses `enif_consume_timeslice` to report progress every 100
+/// entries. Full yielding via `enif_schedule_nif` is not used because the
+/// batch holds a Mutex guard and the per-key file reads make
+/// save/restore across yield points impractical.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 fn get_batch<'a>(
@@ -470,9 +472,10 @@ fn get_batch<'a>(
 /// ## Scheduler contract
 ///
 /// Runs on a Normal BEAM scheduler. Range scans iterate the sorted keydir and
-/// do one pread per matching key. With 10K results this completes in <200ms.
-/// The shard GenServer serializes access. Briefly blocking one Normal scheduler
-/// is preferable to consuming a DirtyIo thread.
+/// do one pread per matching key. Uses `enif_consume_timeslice` to report
+/// progress every 100 entries. Full yielding via `enif_schedule_nif` is not
+/// used because the range iteration holds a Mutex guard and opens file readers
+/// per entry -- save/restore across yield points is not feasible.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 fn get_range<'a>(
