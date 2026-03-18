@@ -783,7 +783,8 @@ fn available_disk_space_for_path(path: &Path) -> Result<u64> {
                     std::io::Error::last_os_error()
                 )));
             }
-            Ok(stat.f_bavail as u64 * stat.f_frsize)
+            #[allow(clippy::unnecessary_cast)]
+            Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
         }
     }
     #[cfg(not(unix))]
