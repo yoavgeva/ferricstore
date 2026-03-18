@@ -9,13 +9,13 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     - holds a Mutex too long under contention → serialises all callers
     - allocates too much memory → GC pressure, binary heap fragmentation
     - runs too many reductions → triggers scheduler preemption warnings
-    - races with DirtyIo NIFs (get/delete/put_batch) on the same store Mutex
+    - races with other Normal NIFs (get/delete/put_batch) on the same store Mutex
 
   Each test here deliberately hammers one of those dimensions and asserts:
     1. The BEAM stays responsive (other processes make progress)
     2. All completions arrive (no lost CQEs, no deadlock)
     3. Data is correct after all operations complete
-    4. The dirty-IO thread pool is not exhausted (measured via scheduler info)
+    4. The dirty-IO thread pool is not consumed (all NIFs use Normal scheduling)
 
   All tests are tagged `:linux_io_uring` — skipped on macOS automatically.
   """
@@ -238,7 +238,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
       _ = {before_q, after_q}
     end
 
-    test "concurrent async + concurrent get (DirtyIo) — no deadlock, pool survives" do
+    test "concurrent async + concurrent get (Normal) — no deadlock, pool survives" do
       dir = tmp_dir()
       store = open_store(dir)
       on_exit(fn -> File.rm_rf!(dir) end)
@@ -273,7 +273,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
              end)
     end
 
-    test "async writes + deletes (DirtyIo) interleaved — no mutex deadlock" do
+    test "async writes + deletes (Normal) interleaved — no mutex deadlock" do
       dir = tmp_dir()
       store = open_store(dir)
       on_exit(fn -> File.rm_rf!(dir) end)
@@ -518,11 +518,11 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
   end
 
   # ---------------------------------------------------------------------------
-  # 5. Mutex contention — Normal NIF vs DirtyIo NIFs on same store
+  # 5. Mutex contention — Normal NIFs on same store
   # ---------------------------------------------------------------------------
 
-  describe "mutex contention: Normal NIF vs DirtyIo NIFs" do
-    test "simultaneous put_batch_async (Normal) + put_batch (DirtyIo) — no deadlock" do
+  describe "mutex contention: Normal NIFs on same store" do
+    test "simultaneous put_batch_async + put_batch (both Normal) — no deadlock" do
       dir = tmp_dir()
       store = open_store(dir)
       on_exit(fn -> File.rm_rf!(dir) end)

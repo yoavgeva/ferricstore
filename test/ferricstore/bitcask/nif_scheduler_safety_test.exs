@@ -1,34 +1,37 @@
 defmodule Ferricstore.Bitcask.NIFSchedulerSafetyTest do
   @moduledoc """
-  Scheduler safety stress tests for DirtyIo-scheduled NIFs.
+  Scheduler safety stress tests for Normal-scheduled NIFs.
 
   ## Problem statement
 
-  All data-plane NIFs (`get_all`, `get_batch`, `get_range`, `keys`,
-  `put_batch`, `purge_expired`, `read_modify_write`, `run_compaction`) are
-  scheduled on `DirtyIo` threads. While this prevents them from blocking
-  normal BEAM schedulers, there are still failure modes:
+  All NIFs use `schedule = "Normal"` to avoid occupying the limited DirtyIo
+  thread pool (default 10 threads shared by the entire BEAM). This means
+  NIFs run directly on BEAM scheduler threads. The design is safe because:
+
+  - The shard GenServer serializes all access (one call at a time per shard)
+  - The Mutex is uncontested in the steady state
+  - Individual NIF calls complete quickly (<1ms for single-key ops, <200ms
+    for 50K-key iterations on NVMe)
+  - BEAM has multiple schedulers, so briefly blocking one is acceptable
+
+  However, we must verify:
 
   1. **Mutex starvation**: Every NIF acquires `StoreResource.store` (a
-     `Mutex<Store>`). A NIF that holds the lock for seconds (e.g. `get_all`
-     with 100K keys, `keys()` with 50K keys) serialises all other DirtyIo
+     `Mutex<Store>`). A NIF that holds the lock too long serialises all
      callers targeting the same shard.
 
-  2. **DirtyIo pool exhaustion**: The default pool is 10 threads. If 10+
-     long-running NIFs run concurrently, subsequent DirtyIo calls queue
-     indefinitely.
+  2. **Normal scheduler starvation**: Since NIFs run on normal schedulers,
+     a long-running NIF could block that scheduler thread. We verify that
+     other processes on other schedulers remain responsive.
 
-  3. **Normal scheduler starvation**: Even though NIFs run on dirty threads,
-     the term construction (building Elixir lists of binaries from Rust
-     `Vec`s) happens before the NIF returns. Large return values can cause
-     the dirty thread to spend significant time in term allocation, during
-     which the Mutex is still held.
+  3. **Term construction overhead**: Building Elixir lists of binaries from
+     Rust `Vec`s happens before the NIF returns. Large return values can
+     cause significant time in term allocation while the Mutex is held.
 
   Each test populates a store with a large dataset, then calls the NIF under
   test while a separate process on a **normal scheduler** runs a tight
-  `system_time` loop. If the BEAM's normal schedulers are starved (which
-  should NOT happen with DirtyIo NIFs), the loop iteration count drops to
-  near zero.
+  `system_time` loop. If the BEAM's normal schedulers are all starved, the
+  loop iteration count drops to near zero.
 
   ## Running
 
