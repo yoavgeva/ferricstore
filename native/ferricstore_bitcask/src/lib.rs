@@ -1,5 +1,7 @@
 #![deny(clippy::all, clippy::pedantic)]
-#![deny(unsafe_code)]
+// Yielding NIFs require `unsafe` for raw extern "C" continuation functions
+// and direct use of `NifReturned::Reschedule` / `enif_schedule_nif`.
+#![allow(unsafe_code)]
 // These pedantic lints are noisy without adding safety value for this codebase:
 // - possible_truncation: we target 64-bit Linux only; u64→usize is always safe.
 // - cast_sign_loss / cast_lossless: io_uring result codes require these casts.
@@ -11,6 +13,11 @@
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::items_after_statements)]
 #![allow(clippy::doc_markdown)]
+// Yielding NIF continuations use raw pointers and similar variable names:
+#![allow(clippy::ptr_as_ptr)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::ref_option)]
+#![allow(clippy::manual_let_else)]
 #![allow(clippy::doc_link_with_quotes)]
 
 pub mod compaction;
@@ -78,9 +85,50 @@ struct StoreResource {
     async_uring: Option<io_backend::async_uring::AsyncUringBackend>,
 }
 
+// ---------------------------------------------------------------------------
+// Yielding NIF continuation state resources
+// ---------------------------------------------------------------------------
+
+/// Number of items to encode per yielding NIF timeslice before checking
+/// whether the BEAM scheduler wants us to yield.
+const YIELD_CHUNK_SIZE: usize = 500;
+
+/// Continuation state for `keys()` — holds pre-collected keys from RAM and
+/// tracks encoding progress across yield points.
+struct KeysIterState {
+    keys: Vec<Vec<u8>>,
+    index: Mutex<usize>,
+}
+
+/// Continuation state for `get_all()` — holds pre-collected key-value pairs
+/// (all disk I/O done upfront under the store Mutex) and tracks encoding
+/// progress across yield points.
+struct GetAllIterState {
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    index: Mutex<usize>,
+}
+
+/// Continuation state for `get_batch()` — holds pre-fetched results
+/// (one Option<Vec<u8>> per requested key) and tracks encoding progress.
+struct GetBatchIterState {
+    results: Vec<Option<Vec<u8>>>,
+    index: Mutex<usize>,
+}
+
+/// Continuation state for `get_range()` — holds pre-fetched sorted key-value
+/// pairs and tracks encoding progress across yield points.
+struct GetRangeIterState {
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    index: Mutex<usize>,
+}
+
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
     let _ = rustler::resource!(StoreResource, env);
+    let _ = rustler::resource!(KeysIterState, env);
+    let _ = rustler::resource!(GetAllIterState, env);
+    let _ = rustler::resource!(GetBatchIterState, env);
+    let _ = rustler::resource!(GetRangeIterState, env);
     true
 }
 
@@ -323,36 +371,642 @@ fn delete<'a>(
     }
 }
 
-/// Return all live keys as a list of binaries.
+// ===========================================================================
+// Yielding NIFs: keys, get_all, get_batch, get_range
+// ===========================================================================
+//
+// ## How yielding works (the `enif_schedule_nif` pattern)
+//
+// These NIFs use Rustler's `NifReturned::Reschedule` (which calls
+// `enif_schedule_nif`) to cooperatively yield back to the BEAM scheduler
+// between chunks of work. This is the standard Erlang/OTP pattern for
+// long-running NIFs.
+//
+// 1. **Entry NIF**: Locks the store Mutex, collects all data (keys or
+//    key-value pairs) into owned Rust Vecs, releases the Mutex, wraps
+//    the data in a `ResourceArc<*IterState>`, then reschedules to the
+//    continuation function with two args: [state_resource, partial_list].
+//
+// 2. **Continuation**: Decodes the state resource and the partial BEAM
+//    list from argv. Encodes up to YIELD_CHUNK_SIZE items into BEAM
+//    terms and prepends them to the partial list. Calls
+//    `consume_timeslice`. If timeslice exhausted and more work remains,
+//    reschedules itself. When done, reverses the list and returns.
+//
+// 3. **Result**: From the caller's perspective: one NIF call, one result.
+//    From the BEAM's perspective: N short slices with other processes
+//    scheduled between them.
+//
+// Terms created via `enif_make_*` in a NIF env survive across reschedules
+// because `enif_schedule_nif` copies the argv terms into the process heap
+// before destroying the old env. The partial list is a proper BEAM list
+// that lives on the process heap.
+//
+// For small result sets (<= YIELD_CHUNK_SIZE items), the entry NIF
+// encodes everything directly without rescheduling, avoiding the overhead
+// of resource allocation and env switching.
+
+/// Encode one key `Vec<u8>` into a BEAM binary term.
+fn encode_key_term<'a>(env: Env<'a>, k: &[u8]) -> Option<Term<'a>> {
+    OwnedBinary::new(k.len()).map(|mut bin| {
+        bin.as_mut_slice().copy_from_slice(k);
+        Binary::from_owned(bin, env).encode(env)
+    })
+}
+
+/// Encode one key-value pair into a BEAM `{key, value}` tuple term.
+fn encode_kv_term<'a>(env: Env<'a>, k: &[u8], v: &[u8]) -> Option<Term<'a>> {
+    let kbin = OwnedBinary::new(k.len()).map(|mut b| {
+        b.as_mut_slice().copy_from_slice(k);
+        b
+    })?;
+    let vbin = OwnedBinary::new(v.len()).map(|mut b| {
+        b.as_mut_slice().copy_from_slice(v);
+        b
+    })?;
+    Some((Binary::from_owned(kbin, env), Binary::from_owned(vbin, env)).encode(env))
+}
+
+/// Encode one `Option<Vec<u8>>` into either a BEAM binary or `:nil` atom.
+fn encode_opt_val_term<'a>(env: Env<'a>, opt: &Option<Vec<u8>>) -> Term<'a> {
+    match opt {
+        Some(v) => {
+            if let Some(mut bin) = OwnedBinary::new(v.len()) {
+                bin.as_mut_slice().copy_from_slice(v);
+                Binary::from_owned(bin, env).encode(env)
+            } else {
+                atoms::nil().encode(env)
+            }
+        }
+        None => atoms::nil().encode(env),
+    }
+}
+
+/// Reverse a BEAM list. Uses `enif_make_reverse_list` under the hood via
+/// Rustler's `Term::list_reverse`.
+fn reverse_list<'a>(env: Env<'a>, list: Term<'a>) -> Term<'a> {
+    list.list_reverse()
+        .unwrap_or_else(|_| Vec::<Term>::new().encode(env))
+}
+
+// ---------------------------------------------------------------------------
+// Yielding NIF: keys()
+// ---------------------------------------------------------------------------
+
+/// Continuation for `keys()`. Args: [state_resource, partial_list].
 ///
-/// ## Scheduler contract
+/// # Safety
 ///
-/// Runs on a Normal BEAM scheduler. Iterates the in-memory keydir (no disk
-/// I/O). Uses `enif_consume_timeslice` to report progress to the BEAM
-/// scheduler every 100 keys, allowing the scheduler to remain aware of how
-/// much work is being done. Full cooperative yielding via `enif_schedule_nif`
-/// is not used because Rustler does not expose it and saving/restoring the
-/// iteration state across NIF re-entries would require complex continuation
-/// state management (the keydir iterator, partial result list, and Mutex
-/// guard would all need to be preserved across yield points).
-#[rustler::nif(schedule = "Normal")]
-#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn keys(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
-    let store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
-    let raw_keys = store.keys();
-    let total = raw_keys.len();
-    let mut all_keys = Vec::with_capacity(total);
-    for (i, k) in raw_keys.into_iter().enumerate() {
-        let mut bin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
-        bin.as_mut_slice().copy_from_slice(&k);
-        all_keys.push(Binary::from_owned(bin, env).encode(env));
-        // Report progress to BEAM scheduler every 100 keys
-        if i % 100 == 99 && total > 0 {
-            let pct = ((i + 1) as f64 / total as f64 * 100.0) as i32;
-            let _ = consume_timeslice(env, pct.clamp(1, 100));
+/// Raw NIF callback invoked by BEAM via `enif_schedule_nif`.
+unsafe extern "C" fn keys_continue(
+    nif_env: rustler::codegen_runtime::NIF_ENV,
+    argc: rustler::codegen_runtime::c_int,
+    argv: *const rustler::codegen_runtime::NIF_TERM,
+) -> rustler::codegen_runtime::NIF_TERM {
+    let lifetime = ();
+    let env = Env::new(&lifetime, nif_env);
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let state_term = Term::new(env, args[0]);
+    let partial_list = Term::new(env, args[1]);
+
+    let state: ResourceArc<KeysIterState> = match state_term.decode() {
+        Ok(s) => s,
+        Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+    };
+
+    let mut idx = state.index.lock().unwrap();
+    let total = state.keys.len();
+    let chunk_end = (*idx + YIELD_CHUNK_SIZE).min(total);
+
+    // Build up the list by consing new elements onto the front.
+    // We iterate in reverse so the final reversed list is in the original order.
+    let mut acc = partial_list;
+    for k in &state.keys[*idx..chunk_end] {
+        if let Some(term) = encode_key_term(env, k) {
+            acc = acc.list_prepend(term);
+        } else {
+            return rustler::codegen_runtime::NifReturned::BadArg.apply(env);
         }
     }
-    Ok(all_keys.encode(env))
+    *idx = chunk_end;
+
+    if *idx < total {
+        let pct = ((*idx as f64 / total as f64) * 100.0) as i32;
+        let _ = consume_timeslice(env, pct.clamp(1, 100));
+        drop(idx);
+
+        let new_state_term = state_term.as_c_arg();
+        let new_list = acc.as_c_arg();
+        return rustler::codegen_runtime::NifReturned::Reschedule {
+            fun_name: std::ffi::CString::new("keys").unwrap(),
+            flags: rustler::SchedulerFlags::Normal,
+            fun: keys_continue,
+            args: vec![new_state_term, new_list],
+        }
+        .apply(env);
+    }
+
+    // Done — consume full timeslice, reverse, and return.
+    let _ = consume_timeslice(env, 100);
+    drop(idx);
+    let result = reverse_list(env, acc);
+    rustler::codegen_runtime::NifReturned::Term(result.as_c_arg()).apply(env)
+}
+
+rustler::codegen_runtime::inventory::submit! {
+    rustler::Nif {
+        name: "keys\0".as_ptr() as *const rustler::codegen_runtime::c_char,
+        arity: 1,
+        flags: rustler::SchedulerFlags::Normal as rustler::codegen_runtime::c_uint,
+        raw_func: {
+            /// Entry NIF for `keys/1`.
+            ///
+            /// # Safety
+            ///
+            /// Raw NIF callback. BEAM guarantees valid env/argc/argv.
+            unsafe extern "C" fn keys_entry(
+                nif_env: rustler::codegen_runtime::NIF_ENV,
+                argc: rustler::codegen_runtime::c_int,
+                argv: *const rustler::codegen_runtime::NIF_TERM,
+            ) -> rustler::codegen_runtime::NIF_TERM {
+                let lifetime = ();
+                let env = Env::new(&lifetime, nif_env);
+                let args = std::slice::from_raw_parts(argv, argc as usize);
+                let store_term = Term::new(env, args[0]);
+
+                let resource: ResourceArc<StoreResource> = match store_term.decode() {
+                    Ok(r) => r,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+
+                let store = match resource.store.lock() {
+                    Ok(s) => s,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+                let raw_keys = store.keys();
+                drop(store);
+
+                // Small result: encode directly, no yielding overhead.
+                if raw_keys.len() <= YIELD_CHUNK_SIZE {
+                    let all_keys: Vec<Term> = raw_keys
+                        .iter()
+                        .filter_map(|k| encode_key_term(env, k))
+                        .collect();
+                    return rustler::codegen_runtime::NifReturned::Term(
+                        all_keys.encode(env).as_c_arg(),
+                    )
+                    .apply(env);
+                }
+
+                let state = ResourceArc::new(KeysIterState {
+                    keys: raw_keys,
+                    index: Mutex::new(0),
+                });
+                let state_c = state.encode(env).as_c_arg();
+                let empty_list = Vec::<Term>::new().encode(env).as_c_arg();
+
+                rustler::codegen_runtime::NifReturned::Reschedule {
+                    fun_name: std::ffi::CString::new("keys").unwrap(),
+                    flags: rustler::SchedulerFlags::Normal,
+                    fun: keys_continue,
+                    args: vec![state_c, empty_list],
+                }
+                .apply(env)
+            }
+            keys_entry
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Yielding NIF: get_all()
+// ---------------------------------------------------------------------------
+
+/// Continuation for `get_all()`. Args: [state_resource, partial_list].
+///
+/// # Safety
+///
+/// Raw NIF callback invoked by BEAM via `enif_schedule_nif`.
+unsafe extern "C" fn get_all_continue(
+    nif_env: rustler::codegen_runtime::NIF_ENV,
+    argc: rustler::codegen_runtime::c_int,
+    argv: *const rustler::codegen_runtime::NIF_TERM,
+) -> rustler::codegen_runtime::NIF_TERM {
+    let lifetime = ();
+    let env = Env::new(&lifetime, nif_env);
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let state_term = Term::new(env, args[0]);
+    let partial_list = Term::new(env, args[1]);
+
+    let state: ResourceArc<GetAllIterState> = match state_term.decode() {
+        Ok(s) => s,
+        Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+    };
+
+    let mut idx = state.index.lock().unwrap();
+    let total = state.pairs.len();
+    let chunk_end = (*idx + YIELD_CHUNK_SIZE).min(total);
+
+    let mut acc = partial_list;
+    for (k, v) in &state.pairs[*idx..chunk_end] {
+        if let Some(term) = encode_kv_term(env, k, v) {
+            acc = acc.list_prepend(term);
+        } else {
+            return rustler::codegen_runtime::NifReturned::BadArg.apply(env);
+        }
+    }
+    *idx = chunk_end;
+
+    if *idx < total {
+        let pct = ((*idx as f64 / total as f64) * 100.0) as i32;
+        let _ = consume_timeslice(env, pct.clamp(1, 100));
+        drop(idx);
+
+        let new_state = state_term.as_c_arg();
+        let new_list = acc.as_c_arg();
+        return rustler::codegen_runtime::NifReturned::Reschedule {
+            fun_name: std::ffi::CString::new("get_all").unwrap(),
+            flags: rustler::SchedulerFlags::Normal,
+            fun: get_all_continue,
+            args: vec![new_state, new_list],
+        }
+        .apply(env);
+    }
+
+    let _ = consume_timeslice(env, 100);
+    drop(idx);
+    let result = reverse_list(env, acc);
+    rustler::codegen_runtime::NifReturned::Term((atoms::ok(), result).encode(env).as_c_arg())
+        .apply(env)
+}
+
+rustler::codegen_runtime::inventory::submit! {
+    rustler::Nif {
+        name: "get_all\0".as_ptr() as *const rustler::codegen_runtime::c_char,
+        arity: 1,
+        flags: rustler::SchedulerFlags::Normal as rustler::codegen_runtime::c_uint,
+        raw_func: {
+            /// Entry NIF for `get_all/1`.
+            ///
+            /// # Safety
+            ///
+            /// Raw NIF callback.
+            unsafe extern "C" fn get_all_entry(
+                nif_env: rustler::codegen_runtime::NIF_ENV,
+                argc: rustler::codegen_runtime::c_int,
+                argv: *const rustler::codegen_runtime::NIF_TERM,
+            ) -> rustler::codegen_runtime::NIF_TERM {
+                let lifetime = ();
+                let env = Env::new(&lifetime, nif_env);
+                let args = std::slice::from_raw_parts(argv, argc as usize);
+                let store_term = Term::new(env, args[0]);
+
+                let resource: ResourceArc<StoreResource> = match store_term.decode() {
+                    Ok(r) => r,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+
+                let mut store = match resource.store.lock() {
+                    Ok(s) => s,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+
+                let pairs = match store.get_all() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        drop(store);
+                        return rustler::codegen_runtime::NifReturned::Term(
+                            (atoms::error(), e.to_string()).encode(env).as_c_arg(),
+                        )
+                        .apply(env);
+                    }
+                };
+                drop(store);
+
+                if pairs.len() <= YIELD_CHUNK_SIZE {
+                    let terms: Vec<Term> = pairs
+                        .iter()
+                        .filter_map(|(k, v)| encode_kv_term(env, k, v))
+                        .collect();
+                    return rustler::codegen_runtime::NifReturned::Term(
+                        (atoms::ok(), terms).encode(env).as_c_arg(),
+                    )
+                    .apply(env);
+                }
+
+                let state = ResourceArc::new(GetAllIterState {
+                    pairs,
+                    index: Mutex::new(0),
+                });
+                let state_c = state.encode(env).as_c_arg();
+                let empty_list = Vec::<Term>::new().encode(env).as_c_arg();
+
+                rustler::codegen_runtime::NifReturned::Reschedule {
+                    fun_name: std::ffi::CString::new("get_all").unwrap(),
+                    flags: rustler::SchedulerFlags::Normal,
+                    fun: get_all_continue,
+                    args: vec![state_c, empty_list],
+                }
+                .apply(env)
+            }
+            get_all_entry
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Yielding NIF: get_batch()
+// ---------------------------------------------------------------------------
+
+/// Continuation for `get_batch()`. Args: [state_resource, partial_list].
+///
+/// # Safety
+///
+/// Raw NIF callback invoked by BEAM via `enif_schedule_nif`.
+unsafe extern "C" fn get_batch_continue(
+    nif_env: rustler::codegen_runtime::NIF_ENV,
+    argc: rustler::codegen_runtime::c_int,
+    argv: *const rustler::codegen_runtime::NIF_TERM,
+) -> rustler::codegen_runtime::NIF_TERM {
+    let lifetime = ();
+    let env = Env::new(&lifetime, nif_env);
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let state_term = Term::new(env, args[0]);
+    let partial_list = Term::new(env, args[1]);
+
+    let state: ResourceArc<GetBatchIterState> = match state_term.decode() {
+        Ok(s) => s,
+        Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+    };
+
+    let mut idx = state.index.lock().unwrap();
+    let total = state.results.len();
+    let chunk_end = (*idx + YIELD_CHUNK_SIZE).min(total);
+
+    let mut acc = partial_list;
+    for opt in &state.results[*idx..chunk_end] {
+        let term = encode_opt_val_term(env, opt);
+        acc = acc.list_prepend(term);
+    }
+    *idx = chunk_end;
+
+    if *idx < total {
+        let pct = ((*idx as f64 / total as f64) * 100.0) as i32;
+        let _ = consume_timeslice(env, pct.clamp(1, 100));
+        drop(idx);
+
+        let new_state = state_term.as_c_arg();
+        let new_list = acc.as_c_arg();
+        return rustler::codegen_runtime::NifReturned::Reschedule {
+            fun_name: std::ffi::CString::new("get_batch").unwrap(),
+            flags: rustler::SchedulerFlags::Normal,
+            fun: get_batch_continue,
+            args: vec![new_state, new_list],
+        }
+        .apply(env);
+    }
+
+    let _ = consume_timeslice(env, 100);
+    drop(idx);
+    let result = reverse_list(env, acc);
+    rustler::codegen_runtime::NifReturned::Term((atoms::ok(), result).encode(env).as_c_arg())
+        .apply(env)
+}
+
+rustler::codegen_runtime::inventory::submit! {
+    rustler::Nif {
+        name: "get_batch\0".as_ptr() as *const rustler::codegen_runtime::c_char,
+        arity: 2,
+        flags: rustler::SchedulerFlags::Normal as rustler::codegen_runtime::c_uint,
+        raw_func: {
+            /// Entry NIF for `get_batch/2`.
+            ///
+            /// # Safety
+            ///
+            /// Raw NIF callback.
+            unsafe extern "C" fn get_batch_entry(
+                nif_env: rustler::codegen_runtime::NIF_ENV,
+                argc: rustler::codegen_runtime::c_int,
+                argv: *const rustler::codegen_runtime::NIF_TERM,
+            ) -> rustler::codegen_runtime::NIF_TERM {
+                let lifetime = ();
+                let env = Env::new(&lifetime, nif_env);
+                let args = std::slice::from_raw_parts(argv, argc as usize);
+                let store_term = Term::new(env, args[0]);
+                let keys_term = Term::new(env, args[1]);
+
+                let resource: ResourceArc<StoreResource> = match store_term.decode() {
+                    Ok(r) => r,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+
+                let key_binaries: Vec<Binary> = match keys_term.decode() {
+                    Ok(k) => k,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+                let key_slices: Vec<&[u8]> = key_binaries.iter().map(Binary::as_slice).collect();
+
+                let mut store = match resource.store.lock() {
+                    Ok(s) => s,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+
+                let results = match store.get_batch(&key_slices) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        drop(store);
+                        return rustler::codegen_runtime::NifReturned::Term(
+                            (atoms::error(), e.to_string()).encode(env).as_c_arg(),
+                        )
+                        .apply(env);
+                    }
+                };
+                drop(store);
+
+                if results.len() <= YIELD_CHUNK_SIZE {
+                    let terms: Vec<Term> = results
+                        .iter()
+                        .map(|opt| encode_opt_val_term(env, opt))
+                        .collect();
+                    return rustler::codegen_runtime::NifReturned::Term(
+                        (atoms::ok(), terms).encode(env).as_c_arg(),
+                    )
+                    .apply(env);
+                }
+
+                let state = ResourceArc::new(GetBatchIterState {
+                    results,
+                    index: Mutex::new(0),
+                });
+                let state_c = state.encode(env).as_c_arg();
+                let empty_list = Vec::<Term>::new().encode(env).as_c_arg();
+
+                rustler::codegen_runtime::NifReturned::Reschedule {
+                    fun_name: std::ffi::CString::new("get_batch").unwrap(),
+                    flags: rustler::SchedulerFlags::Normal,
+                    fun: get_batch_continue,
+                    args: vec![state_c, empty_list],
+                }
+                .apply(env)
+            }
+            get_batch_entry
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Yielding NIF: get_range()
+// ---------------------------------------------------------------------------
+
+/// Continuation for `get_range()`. Args: [state_resource, partial_list].
+///
+/// # Safety
+///
+/// Raw NIF callback invoked by BEAM via `enif_schedule_nif`.
+unsafe extern "C" fn get_range_continue(
+    nif_env: rustler::codegen_runtime::NIF_ENV,
+    argc: rustler::codegen_runtime::c_int,
+    argv: *const rustler::codegen_runtime::NIF_TERM,
+) -> rustler::codegen_runtime::NIF_TERM {
+    let lifetime = ();
+    let env = Env::new(&lifetime, nif_env);
+    let args = std::slice::from_raw_parts(argv, argc as usize);
+    let state_term = Term::new(env, args[0]);
+    let partial_list = Term::new(env, args[1]);
+
+    let state: ResourceArc<GetRangeIterState> = match state_term.decode() {
+        Ok(s) => s,
+        Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+    };
+
+    let mut idx = state.index.lock().unwrap();
+    let total = state.pairs.len();
+    let chunk_end = (*idx + YIELD_CHUNK_SIZE).min(total);
+
+    let mut acc = partial_list;
+    for (k, v) in &state.pairs[*idx..chunk_end] {
+        if let Some(term) = encode_kv_term(env, k, v) {
+            acc = acc.list_prepend(term);
+        } else {
+            return rustler::codegen_runtime::NifReturned::BadArg.apply(env);
+        }
+    }
+    *idx = chunk_end;
+
+    if *idx < total {
+        let pct = ((*idx as f64 / total as f64) * 100.0) as i32;
+        let _ = consume_timeslice(env, pct.clamp(1, 100));
+        drop(idx);
+
+        let new_state = state_term.as_c_arg();
+        let new_list = acc.as_c_arg();
+        return rustler::codegen_runtime::NifReturned::Reschedule {
+            fun_name: std::ffi::CString::new("get_range").unwrap(),
+            flags: rustler::SchedulerFlags::Normal,
+            fun: get_range_continue,
+            args: vec![new_state, new_list],
+        }
+        .apply(env);
+    }
+
+    let _ = consume_timeslice(env, 100);
+    drop(idx);
+    let result = reverse_list(env, acc);
+    rustler::codegen_runtime::NifReturned::Term((atoms::ok(), result).encode(env).as_c_arg())
+        .apply(env)
+}
+
+rustler::codegen_runtime::inventory::submit! {
+    rustler::Nif {
+        name: "get_range\0".as_ptr() as *const rustler::codegen_runtime::c_char,
+        arity: 4,
+        flags: rustler::SchedulerFlags::Normal as rustler::codegen_runtime::c_uint,
+        raw_func: {
+            /// Entry NIF for `get_range/4`.
+            ///
+            /// # Safety
+            ///
+            /// Raw NIF callback.
+            unsafe extern "C" fn get_range_entry(
+                nif_env: rustler::codegen_runtime::NIF_ENV,
+                argc: rustler::codegen_runtime::c_int,
+                argv: *const rustler::codegen_runtime::NIF_TERM,
+            ) -> rustler::codegen_runtime::NIF_TERM {
+                let lifetime = ();
+                let env = Env::new(&lifetime, nif_env);
+                let args = std::slice::from_raw_parts(argv, argc as usize);
+                let store_term = Term::new(env, args[0]);
+                let min_key_term = Term::new(env, args[1]);
+                let max_key_term = Term::new(env, args[2]);
+                let max_count_term = Term::new(env, args[3]);
+
+                let resource: ResourceArc<StoreResource> = match store_term.decode() {
+                    Ok(r) => r,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+                let min_key: Binary = match min_key_term.decode() {
+                    Ok(b) => b,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+                let max_key: Binary = match max_key_term.decode() {
+                    Ok(b) => b,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+                let max_count: u64 = match max_count_term.decode() {
+                    Ok(c) => c,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+
+                let mut store = match resource.store.lock() {
+                    Ok(s) => s,
+                    Err(_) => return rustler::codegen_runtime::NifReturned::BadArg.apply(env),
+                };
+
+                let pairs = match store.get_range(
+                    min_key.as_slice(),
+                    max_key.as_slice(),
+                    max_count as usize,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        drop(store);
+                        return rustler::codegen_runtime::NifReturned::Term(
+                            (atoms::error(), e.to_string()).encode(env).as_c_arg(),
+                        )
+                        .apply(env);
+                    }
+                };
+                drop(store);
+
+                if pairs.len() <= YIELD_CHUNK_SIZE {
+                    let terms: Vec<Term> = pairs
+                        .iter()
+                        .filter_map(|(k, v)| encode_kv_term(env, k, v))
+                        .collect();
+                    return rustler::codegen_runtime::NifReturned::Term(
+                        (atoms::ok(), terms).encode(env).as_c_arg(),
+                    )
+                    .apply(env);
+                }
+
+                let state = ResourceArc::new(GetRangeIterState {
+                    pairs,
+                    index: Mutex::new(0),
+                });
+                let state_c = state.encode(env).as_c_arg();
+                let empty_list = Vec::<Term>::new().encode(env).as_c_arg();
+
+                rustler::codegen_runtime::NifReturned::Reschedule {
+                    fun_name: std::ffi::CString::new("get_range").unwrap(),
+                    flags: rustler::SchedulerFlags::Normal,
+                    fun: get_range_continue,
+                    args: vec![state_c, empty_list],
+                }
+                .apply(env)
+            }
+            get_range_entry
+        },
+    }
 }
 
 /// Write a hint file for the active data file.
@@ -386,125 +1040,6 @@ fn purge_expired(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Te
     let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
     match store.purge_expired() {
         Ok(count) => Ok((atoms::ok(), count as u64).encode(env)),
-        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Extended NIF functions
-// ---------------------------------------------------------------------------
-
-/// ## Scheduler contract
-///
-/// Runs on a Normal BEAM scheduler. Iterates all keys doing one pread per
-/// entry. Uses `enif_consume_timeslice` to report progress to the BEAM
-/// scheduler every 100 entries. Full cooperative yielding via
-/// `enif_schedule_nif` is not used because the iteration holds a Mutex guard
-/// and opens file readers per entry -- saving/restoring this state across
-/// yield points is not feasible without restructuring the Store API.
-#[rustler::nif(schedule = "Normal")]
-#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn get_all(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
-    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
-    match store.get_all() {
-        Ok(pairs) => {
-            let total = pairs.len();
-            let mut terms = Vec::with_capacity(total);
-            for (i, (k, v)) in pairs.into_iter().enumerate() {
-                let mut kbin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
-                kbin.as_mut_slice().copy_from_slice(&k);
-                let mut vbin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
-                vbin.as_mut_slice().copy_from_slice(&v);
-                terms.push(
-                    (Binary::from_owned(kbin, env), Binary::from_owned(vbin, env)).encode(env),
-                );
-                if i % 100 == 99 && total > 0 {
-                    let pct = ((i + 1) as f64 / total as f64 * 100.0) as i32;
-                    let _ = consume_timeslice(env, pct.clamp(1, 100));
-                }
-            }
-            Ok((atoms::ok(), terms).encode(env))
-        }
-        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
-    }
-}
-
-/// ## Scheduler contract
-///
-/// Runs on a Normal BEAM scheduler. Batch reads are serialized by the shard
-/// GenServer. Uses `enif_consume_timeslice` to report progress every 100
-/// entries. Full yielding via `enif_schedule_nif` is not used because the
-/// batch holds a Mutex guard and the per-key file reads make
-/// save/restore across yield points impractical.
-#[rustler::nif(schedule = "Normal")]
-#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn get_batch<'a>(
-    env: Env<'a>,
-    resource: ResourceArc<StoreResource>,
-    keys: Vec<Binary<'a>>,
-) -> NifResult<Term<'a>> {
-    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
-    let key_slices: Vec<&[u8]> = keys.iter().map(Binary::as_slice).collect();
-    match store.get_batch(&key_slices) {
-        Ok(results) => {
-            let total = results.len();
-            let mut terms = Vec::with_capacity(total);
-            for (i, opt) in results.into_iter().enumerate() {
-                match opt {
-                    Some(v) => {
-                        let mut bin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
-                        bin.as_mut_slice().copy_from_slice(&v);
-                        terms.push(Binary::from_owned(bin, env).encode(env));
-                    }
-                    None => terms.push(atoms::nil().encode(env)),
-                }
-                if i % 100 == 99 && total > 0 {
-                    let pct = ((i + 1) as f64 / total as f64 * 100.0) as i32;
-                    let _ = consume_timeslice(env, pct.clamp(1, 100));
-                }
-            }
-            Ok((atoms::ok(), terms).encode(env))
-        }
-        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
-    }
-}
-
-/// ## Scheduler contract
-///
-/// Runs on a Normal BEAM scheduler. Range scans iterate the sorted keydir and
-/// do one pread per matching key. Uses `enif_consume_timeslice` to report
-/// progress every 100 entries. Full yielding via `enif_schedule_nif` is not
-/// used because the range iteration holds a Mutex guard and opens file readers
-/// per entry -- save/restore across yield points is not feasible.
-#[rustler::nif(schedule = "Normal")]
-#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn get_range<'a>(
-    env: Env<'a>,
-    resource: ResourceArc<StoreResource>,
-    min_key: Binary<'a>,
-    max_key: Binary<'a>,
-    max_count: u64,
-) -> NifResult<Term<'a>> {
-    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
-    match store.get_range(min_key.as_slice(), max_key.as_slice(), max_count as usize) {
-        Ok(pairs) => {
-            let total = pairs.len();
-            let mut terms = Vec::with_capacity(total);
-            for (i, (k, v)) in pairs.into_iter().enumerate() {
-                let mut kbin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
-                kbin.as_mut_slice().copy_from_slice(&k);
-                let mut vbin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
-                vbin.as_mut_slice().copy_from_slice(&v);
-                terms.push(
-                    (Binary::from_owned(kbin, env), Binary::from_owned(vbin, env)).encode(env),
-                );
-                if i % 100 == 99 && total > 0 {
-                    let pct = ((i + 1) as f64 / total as f64 * 100.0) as i32;
-                    let _ = consume_timeslice(env, pct.clamp(1, 100));
-                }
-            }
-            Ok((atoms::ok(), terms).encode(env))
-        }
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
 }
