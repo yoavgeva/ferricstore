@@ -19,10 +19,14 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 **Current impl:** ra ~> 2.14.
 **Question:** Should we use latest 2.x or is there a 3.x branch?
 
-## Q4: NIF Yielding for Large Operations
-**Spec says:** get_all with millions of keys should not block the BEAM scheduler.
-**Current impl:** DirtyIo scheduling for all disk I/O NIFs.
-**Question:** Should we implement chunked/yielding NIFs for get_all/get_range or is DirtyIo sufficient? User wants Normal scheduling with yielding.
+## Q4: NIF Architecture — CRITICAL SPEC VIOLATION
+**Spec says (section 2B.5):** "FerricStore uses zero dirty schedulers — neither dirty CPU nor dirty IO. All NIFs are either pure RAM (normal scheduler), async IO via Tokio (returns immediately), or yielding CPU NIFs."
+**Current impl:** All NIFs except put_batch_async use `schedule = "DirtyIo"`.
+**Status:** Must be migrated to:
+- Pattern 1 (Async Tokio): `get`, `put`, `put_batch`, `delete`, `write_hint`, `purge_expired`, `run_compaction` — submit to Tokio, return immediately, result via BEAM message
+- Pattern 2 (Yielding): `get_all`, `get_batch`, `get_range`, `keys`, `shard_stats`, `file_sizes` — yield between chunks via `enif_consume_timeslice` + `enif_schedule_nif`
+- Pattern 3 (Normal): `read_modify_write` (single key, fast) — runs on normal scheduler
+**Impact:** Major Rust NIF refactor + Elixir shard GenServer changes to handle async responses. The current DirtyIo approach works but violates the spec's zero-dirty-scheduler constraint and can exhaust the dirty-IO pool under load.
 
 ## Q5: Cross-Shard 2PC Transactions
 **Spec says:** Cross-shard transactions use 2PC protocol.
