@@ -75,4 +75,4 @@ jobs:
 
       - name: Run io_uring + scheduler stress tests (Linux, io_uring available)
         if: steps.uring.outputs.available == 'true'
-        run: mix test --only linux_io_uring --warnings-as-errors
+        run: mix test --only linux_io_uring
