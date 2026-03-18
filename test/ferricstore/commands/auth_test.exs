@@ -323,8 +323,12 @@ defmodule Ferricstore.Commands.AuthTest do
   # ---------------------------------------------------------------------------
 
   describe "ACL LOG" do
-    test "ACL LOG returns empty list", %{port: port} do
+    test "ACL LOG returns empty list after reset", %{port: port} do
       sock = connect_and_hello(port)
+
+      # Reset first to clear any entries from prior tests
+      send_cmd(sock, ["ACL", "LOG", "RESET"])
+      recv_response(sock)
 
       send_cmd(sock, ["ACL", "LOG"])
       assert recv_response(sock) == []
@@ -341,8 +345,12 @@ defmodule Ferricstore.Commands.AuthTest do
       :gen_tcp.close(sock)
     end
 
-    test "ACL LOG with count returns empty list", %{port: port} do
+    test "ACL LOG with count returns empty list after reset", %{port: port} do
       sock = connect_and_hello(port)
+
+      # Reset first to clear any entries from prior tests
+      send_cmd(sock, ["ACL", "LOG", "RESET"])
+      recv_response(sock)
 
       send_cmd(sock, ["ACL", "LOG", "10"])
       assert recv_response(sock) == []
