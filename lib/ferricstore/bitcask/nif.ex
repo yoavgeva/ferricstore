@@ -27,28 +27,4 @@ defmodule Ferricstore.Bitcask.NIF do
 
   @doc "Purge all expired keys, writing tombstones. Returns {:ok, count}."
   def purge_expired(_store), do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc """
-  Returns shard statistics for the merge scheduler.
-
-  Returns `{:ok, {total_disk_bytes, live_bytes, dead_bytes, file_count, key_count, fragmentation_ratio}}`.
-  """
-  def shard_stats(_store), do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc """
-  Returns `{:ok, [{file_id, size_bytes}, ...]}` for all log files, sorted by file_id.
-  """
-  def file_sizes(_store), do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc """
-  Runs compaction on the specified file_ids, merging them into a single new file.
-
-  Returns `{:ok, {records_written, records_dropped, bytes_reclaimed}}` or `{:error, reason}`.
-  """
-  def run_compaction(_store, _file_ids), do: :erlang.nif_error(:nif_not_loaded)
-
-  @doc """
-  Returns `{:ok, available_bytes}` for the filesystem containing the store's data directory.
-  """
-  def available_disk_space(_store), do: :erlang.nif_error(:nif_not_loaded)
 end
