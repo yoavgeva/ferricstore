@@ -28,7 +28,227 @@ defmodule Ferricstore.Test.MockStore do
       exists?: fn key -> Agent.get(pid, &key_alive?(&1, key)) end,
       keys: fn -> Agent.get(pid, &live_keys/1) end,
       flush: fn -> Agent.update(pid, fn _ -> %{} end) end,
-      dbsize: fn -> Agent.get(pid, &live_count/1) end
+      dbsize: fn -> Agent.get(pid, &live_count/1) end,
+      compound_get: fn _redis_key, compound_key ->
+        Agent.get(pid, fn state ->
+          case Map.get(state, compound_key) do
+            nil -> nil
+            {value, 0} -> value
+            {value, exp} -> if Ferricstore.Test.MockStore.alive?(exp), do: value, else: nil
+          end
+        end)
+      end,
+      compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
+        Agent.update(pid, &Map.put(&1, compound_key, {value, expire_at_ms}))
+        :ok
+      end,
+      compound_delete: fn _redis_key, compound_key ->
+        Agent.update(pid, &Map.delete(&1, compound_key))
+        :ok
+      end,
+      compound_scan: fn _redis_key, prefix ->
+        Agent.get(pid, fn state ->
+          now = System.os_time(:millisecond)
+          state
+          |> Enum.filter(fn {k, {_, exp}} ->
+            is_binary(k) and String.starts_with?(k, prefix) and (exp == 0 or exp > now)
+          end)
+          |> Enum.map(fn {k, {v, _}} ->
+            # Extract field name after the null byte separator
+            case :binary.split(k, <<0>>) do
+              [_prefix, field] -> {field, v}
+              _ -> {k, v}
+            end
+          end)
+          |> Enum.sort_by(fn {field, _} -> field end)
+        end)
+      end,
+      compound_count: fn _redis_key, prefix ->
+        Agent.get(pid, fn state ->
+          now = System.os_time(:millisecond)
+          Enum.count(state, fn {k, {_, exp}} ->
+            is_binary(k) and String.starts_with?(k, prefix) and (exp == 0 or exp > now)
+          end)
+        end)
+      end,
+      compound_delete_prefix: fn _redis_key, prefix ->
+        Agent.update(pid, fn state ->
+          Map.reject(state, fn {k, _} ->
+            is_binary(k) and String.starts_with?(k, prefix)
+          end)
+        end)
+        :ok
+      end,
+      list_op: fn key, operation ->
+        Agent.get_and_update(pid, fn state ->
+          do_list_op(state, key, operation)
+        end)
+      end,
+      incr: fn key, delta ->
+        Agent.get_and_update(pid, fn state ->
+          case Map.get(state, key) do
+            nil ->
+              new_val = delta
+              new_state = Map.put(state, key, {Integer.to_string(new_val), 0})
+              {{:ok, new_val}, new_state}
+
+            {value, exp} ->
+              if exp != 0 and not Ferricstore.Test.MockStore.alive?(exp) do
+                new_val = delta
+                new_state = Map.put(state, key, {Integer.to_string(new_val), 0})
+                {{:ok, new_val}, new_state}
+              else
+                case Integer.parse(value) do
+                  {int_val, ""} ->
+                    new_val = int_val + delta
+                    new_state = Map.put(state, key, {Integer.to_string(new_val), exp})
+                    {{:ok, new_val}, new_state}
+
+                  _ ->
+                    {{:error, "ERR value is not an integer or out of range"}, state}
+                end
+              end
+          end
+        end)
+      end,
+      incr_float: fn key, delta ->
+        Agent.get_and_update(pid, fn state ->
+          case Map.get(state, key) do
+            nil ->
+              new_str = Ferricstore.Test.MockStore.fmt_float(delta)
+              new_state = Map.put(state, key, {new_str, 0})
+              {{:ok, new_str}, new_state}
+
+            {value, exp} ->
+              if exp != 0 and not Ferricstore.Test.MockStore.alive?(exp) do
+                new_str = Ferricstore.Test.MockStore.fmt_float(delta)
+                new_state = Map.put(state, key, {new_str, 0})
+                {{:ok, new_str}, new_state}
+              else
+                case Float.parse(value) do
+                  {float_val, ""} ->
+                    new_val = float_val + delta
+                    new_str = Ferricstore.Test.MockStore.fmt_float(new_val)
+                    new_state = Map.put(state, key, {new_str, exp})
+                    {{:ok, new_str}, new_state}
+
+                  _ ->
+                    case Integer.parse(value) do
+                      {int_val, ""} ->
+                        new_val = int_val + delta
+                        new_str = Ferricstore.Test.MockStore.fmt_float(new_val)
+                        new_state = Map.put(state, key, {new_str, exp})
+                        {{:ok, new_str}, new_state}
+
+                      _ ->
+                        {{:error, "ERR value is not a valid float"}, state}
+                    end
+                end
+              end
+          end
+        end)
+      end,
+      append: fn key, suffix ->
+        Agent.get_and_update(pid, fn state ->
+          case Map.get(state, key) do
+            nil ->
+              new_state = Map.put(state, key, {suffix, 0})
+              {{:ok, byte_size(suffix)}, new_state}
+
+            {value, exp} ->
+              if exp != 0 and not Ferricstore.Test.MockStore.alive?(exp) do
+                new_state = Map.put(state, key, {suffix, 0})
+                {{:ok, byte_size(suffix)}, new_state}
+              else
+                new_val = value <> suffix
+                new_state = Map.put(state, key, {new_val, exp})
+                {{:ok, byte_size(new_val)}, new_state}
+              end
+          end
+        end)
+      end,
+      getset: fn key, new_value ->
+        Agent.get_and_update(pid, fn state ->
+          old =
+            case Map.get(state, key) do
+              nil -> nil
+              {v, 0} -> v
+              {v, exp} -> if Ferricstore.Test.MockStore.alive?(exp), do: v, else: nil
+            end
+
+          new_state = Map.put(state, key, {new_value, 0})
+          {old, new_state}
+        end)
+      end,
+      getdel: fn key ->
+        Agent.get_and_update(pid, fn state ->
+          case Map.get(state, key) do
+            nil ->
+              {nil, state}
+
+            {v, 0} ->
+              {v, Map.delete(state, key)}
+
+            {v, exp} ->
+              if Ferricstore.Test.MockStore.alive?(exp) do
+                {v, Map.delete(state, key)}
+              else
+                {nil, Map.delete(state, key)}
+              end
+          end
+        end)
+      end,
+      getex: fn key, new_expire_at_ms ->
+        Agent.get_and_update(pid, fn state ->
+          case Map.get(state, key) do
+            nil ->
+              {nil, state}
+
+            {v, exp} ->
+              if exp != 0 and not Ferricstore.Test.MockStore.alive?(exp) do
+                {nil, Map.delete(state, key)}
+              else
+                new_state = Map.put(state, key, {v, new_expire_at_ms})
+                {v, new_state}
+              end
+          end
+        end)
+      end,
+      setrange: fn key, offset, value ->
+        Agent.get_and_update(pid, fn state ->
+          current =
+            case Map.get(state, key) do
+              nil -> ""
+              {v, 0} -> v
+              {v, exp} -> if Ferricstore.Test.MockStore.alive?(exp), do: v, else: ""
+            end
+
+          exp =
+            case Map.get(state, key) do
+              nil -> 0
+              {_, e} -> e
+            end
+
+          padded =
+            if byte_size(current) < offset do
+              current <> String.duplicate(<<0>>, offset - byte_size(current))
+            else
+              current
+            end
+
+          new_val =
+            binary_part(padded, 0, offset) <>
+              value <>
+              if offset + byte_size(value) < byte_size(padded) do
+                binary_part(padded, offset + byte_size(value), byte_size(padded) - offset - byte_size(value))
+              else
+                ""
+              end
+
+          new_state = Map.put(state, key, {new_val, exp})
+          {{:ok, byte_size(new_val)}, new_state}
+        end)
+      end
     }
   end
 
@@ -38,7 +258,7 @@ defmodule Ferricstore.Test.MockStore do
     case Map.get(state, key) do
       nil -> nil
       {value, 0} -> value
-      {value, exp} -> if alive?(exp), do: value, else: nil
+      {value, exp} -> if Ferricstore.Test.MockStore.alive?(exp), do: value, else: nil
     end
   end
 
@@ -46,7 +266,7 @@ defmodule Ferricstore.Test.MockStore do
     case Map.get(state, key) do
       nil -> nil
       {value, 0} -> {value, 0}
-      {value, exp} -> if alive?(exp), do: {value, exp}, else: nil
+      {value, exp} -> if Ferricstore.Test.MockStore.alive?(exp), do: {value, exp}, else: nil
     end
   end
 
@@ -54,7 +274,7 @@ defmodule Ferricstore.Test.MockStore do
     case Map.get(state, key) do
       nil -> false
       {_, 0} -> true
-      {_, exp} -> alive?(exp)
+      {_, exp} -> Ferricstore.Test.MockStore.alive?(exp)
     end
   end
 
@@ -71,5 +291,82 @@ defmodule Ferricstore.Test.MockStore do
     Enum.count(state, fn {_, {_, exp}} -> exp == 0 or exp > now end)
   end
 
-  defp alive?(exp), do: exp > System.os_time(:millisecond)
+  # --- List operation helpers ---
+
+  defp do_list_op(state, key, {:lmove, destination, from_dir, to_dir}) do
+    alias Ferricstore.Store.ListOps
+
+    src_get_fn = fn -> raw_value(state, key) end
+    Process.put(:mock_list_op_state, state)
+
+    dst_get_fn = fn ->
+      s = Process.get(:mock_list_op_state)
+      raw_value(s, destination)
+    end
+
+    src_put_fn = fn encoded ->
+      s = Process.get(:mock_list_op_state)
+      Process.put(:mock_list_op_state, Map.put(s, key, {encoded, 0}))
+      :ok
+    end
+
+    dst_put_fn = fn encoded ->
+      s = Process.get(:mock_list_op_state)
+      Process.put(:mock_list_op_state, Map.put(s, destination, {encoded, 0}))
+      :ok
+    end
+
+    src_delete_fn = fn ->
+      s = Process.get(:mock_list_op_state)
+      Process.put(:mock_list_op_state, Map.delete(s, key))
+      :ok
+    end
+
+    result = ListOps.execute_lmove(src_get_fn, src_put_fn, src_delete_fn, dst_get_fn, dst_put_fn, from_dir, to_dir)
+    new_state = Process.get(:mock_list_op_state)
+    Process.delete(:mock_list_op_state)
+    {result, new_state}
+  end
+
+  defp do_list_op(state, key, operation) do
+    alias Ferricstore.Store.ListOps
+
+    get_fn = fn -> raw_value(state, key) end
+    Process.put(:mock_list_op_state, state)
+
+    put_fn = fn encoded_binary ->
+      s = Process.get(:mock_list_op_state)
+      Process.put(:mock_list_op_state, Map.put(s, key, {encoded_binary, 0}))
+      :ok
+    end
+
+    delete_fn = fn ->
+      s = Process.get(:mock_list_op_state)
+      Process.put(:mock_list_op_state, Map.delete(s, key))
+      :ok
+    end
+
+    result = ListOps.execute(get_fn, put_fn, delete_fn, operation)
+    new_state = Process.get(:mock_list_op_state)
+    Process.delete(:mock_list_op_state)
+    {result, new_state}
+  end
+
+  defp raw_value(state, key) do
+    case Map.get(state, key) do
+      nil -> nil
+      {value, 0} -> value
+      {value, exp} -> if Ferricstore.Test.MockStore.alive?(exp), do: value, else: nil
+    end
+  end
+
+  # Public so anonymous functions passed to Agent can use it.
+  @doc false
+  def alive?(exp), do: exp > System.os_time(:millisecond)
+
+  @doc false
+  def fmt_float(f) when is_float(f),
+    do: :erlang.float_to_binary(f, [:compact, decimals: 17])
+
+  def fmt_float(f) when is_integer(f), do: "#{f}.0"
 end

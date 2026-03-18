@@ -10,11 +10,14 @@ defmodule Ferricstore.ApplicationTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Server.Listener
-  alias Ferricstore.Store.ShardSupervisor
+  alias Ferricstore.Store.{Router, ShardSupervisor}
+  alias Ferricstore.Test.ShardHelpers
 
   # Ensure all 4 shards are alive after every test so that the next test
   # module (which may also manipulate shards) starts from a clean state.
+  # Also flush keys before each test to prevent keydir growth across tests.
   setup do
+    ShardHelpers.flush_all_keys()
     on_exit(fn -> wait_shards_alive(2_000) end)
   end
 
@@ -49,7 +52,7 @@ defmodule Ferricstore.ApplicationTest do
       assert info.restart == :permanent
     end
 
-    test "has exactly two direct children: ShardSupervisor and Ranch listener" do
+    test "has ShardSupervisor and Ranch listener as direct children" do
       children = Supervisor.which_children(Ferricstore.Supervisor)
       ids = Enum.map(children, fn {id, _pid, _type, _mods} -> id end)
 

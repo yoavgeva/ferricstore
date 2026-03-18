@@ -1,8 +1,7 @@
 defmodule FerricstoreTest do
   use ExUnit.Case
-  doctest Ferricstore
 
-  test "greets the world" do
-    assert Ferricstore.hello() == :world
+  test "FerricStore module is available" do
+    assert Code.ensure_loaded?(FerricStore)
   end
 end

@@ -27,8 +27,11 @@ defmodule Ferricstore.Integration.ShardLifecycleTest do
     :ok
   end
 
-  # Ensure all shards are alive after tests that kill them.
+  # Ensure all shards are alive after tests that kill them, and flush all keys
+  # before each test so the keydir stays small — a large keydir makes KEYS/DBSIZE
+  # calls progressively slower and can trigger GenServer call timeouts.
   setup do
+    ShardHelpers.flush_all_keys()
     on_exit(fn -> ShardHelpers.wait_shards_alive() end)
   end
 

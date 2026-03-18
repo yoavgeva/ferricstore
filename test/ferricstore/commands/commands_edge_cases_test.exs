@@ -53,10 +53,10 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
       assert msg =~ "syntax error"
     end
 
-    test "SET with empty string key and value works" do
+    test "SET with empty string key returns error" do
       store = MockStore.make()
-      assert :ok = Strings.handle("SET", ["", ""], store)
-      assert "" == store.get.("")
+      assert {:error, msg} = Strings.handle("SET", ["", ""], store)
+      assert msg =~ "empty"
     end
 
     test "SET with EX float value returns error (must be integer)" do
@@ -108,14 +108,10 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
   # ===========================================================================
 
   describe "GET edge cases (not covered elsewhere)" do
-    test "GET with empty string key returns nil when not set" do
+    test "GET with empty string key returns error" do
       store = MockStore.make()
-      assert nil == Strings.handle("GET", [""], store)
-    end
-
-    test "GET with empty string key returns value when set" do
-      store = MockStore.make(%{"" => {"val", 0}})
-      assert "val" == Strings.handle("GET", [""], store)
+      assert {:error, msg} = Strings.handle("GET", [""], store)
+      assert msg =~ "empty"
     end
 
     test "GET with 3 args returns error" do
@@ -747,14 +743,8 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
 
   describe "Dispatcher FLUSHALL routing" do
     test "FLUSHALL is routed to Server handler" do
-      # FLUSHALL is in @server_cmds but Server.handle/3 has no clause for it.
-      # The dispatcher routes it, but Server.handle will raise FunctionClauseError.
-      # This documents the current behavior.
       store = MockStore.make(%{"a" => {"1", 0}})
-
-      assert_raise FunctionClauseError, fn ->
-        Dispatcher.dispatch("FLUSHALL", [], store)
-      end
+      assert :ok = Dispatcher.dispatch("FLUSHALL", [], store)
     end
   end
 

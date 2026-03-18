@@ -46,6 +46,11 @@ defmodule Ferricstore.Resp.Parser do
       {:ok, [42], ":99\\r"}
   """
 
+  # Reject bulk strings whose declared length exceeds this threshold.
+  # Checked against the `$<len>` prefix before reading any body bytes —
+  # prevents heap exhaustion from oversized or malicious payloads.
+  @max_bulk_bytes 512 * 1024 * 1024
+
   @type parsed_value ::
           {:simple, binary()}
           | {:error, binary()}
@@ -167,6 +172,11 @@ defmodule Ferricstore.Resp.Parser do
   end
 
   # -- Bulk string: $<length>\r\n<data>\r\n or $-1\r\n -----------------------
+  #
+  # The length check happens here — before `read_bulk_data` allocates a binary
+  # of `len` bytes. A client announcing `$999999999999\r\n` would otherwise
+  # cause the connection process to sit waiting for 1 TB of data; with this
+  # check we return an error the moment we see the length header.
 
   defp parse_bulk_string(data) do
     case read_line(data) do
@@ -175,8 +185,14 @@ defmodule Ferricstore.Resp.Parser do
 
       {:ok, len_str, rest} ->
         case Integer.parse(len_str) do
-          {len, ""} when len >= 0 -> read_bulk_data(rest, len)
-          _ -> {:error, {:invalid_bulk_length, len_str}}
+          {len, ""} when len > @max_bulk_bytes ->
+            {:error, {:bulk_too_large, len}}
+
+          {len, ""} when len >= 0 ->
+            read_bulk_data(rest, len)
+
+          _ ->
+            {:error, {:invalid_bulk_length, len_str}}
         end
 
       :incomplete ->

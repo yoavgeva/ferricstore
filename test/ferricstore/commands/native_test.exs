@@ -1,0 +1,429 @@
+defmodule Ferricstore.Commands.NativeTest do
+  @moduledoc """
+  Tests for FerricStore native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD.
+
+  These tests run against the application-supervised shards via the Router,
+  since native commands use atomic GenServer calls.
+  """
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Commands.Native
+  alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
+
+  setup_all do
+    ShardHelpers.wait_shards_alive()
+    :ok
+  end
+
+  # Generates a unique key to prevent cross-test interference.
+  defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
+
+  # Dummy store map — native commands ignore it and call Router directly.
+  defp dummy_store, do: %{}
+
+  # ===========================================================================
+  # CAS — Compare-and-Swap
+  # ===========================================================================
+
+  describe "CAS" do
+    test "CAS on non-existent key returns nil" do
+      key = ukey("cas_miss")
+      assert nil == Native.handle("CAS", [key, "old", "new"], dummy_store())
+    end
+
+    test "CAS with matching expected value returns 1 and sets new value" do
+      key = ukey("cas_match")
+      Router.put(key, "old", 0)
+      assert 1 == Native.handle("CAS", [key, "old", "new"], dummy_store())
+      assert "new" == Router.get(key)
+    end
+
+    test "CAS with non-matching expected returns 0 and does not change value" do
+      key = ukey("cas_mismatch")
+      Router.put(key, "current", 0)
+      assert 0 == Native.handle("CAS", [key, "wrong", "new"], dummy_store())
+      assert "current" == Router.get(key)
+    end
+
+    test "CAS with EX sets TTL" do
+      key = ukey("cas_ex")
+      Router.put(key, "old", 0)
+      assert 1 == Native.handle("CAS", [key, "old", "new", "EX", "60"], dummy_store())
+      assert "new" == Router.get(key)
+      # The key should have a TTL now
+      {_val, expire_at_ms} = Router.get_meta(key)
+      assert expire_at_ms > System.os_time(:millisecond)
+      assert expire_at_ms <= System.os_time(:millisecond) + 61_000
+    end
+
+    test "CAS without EX preserves existing TTL" do
+      key = ukey("cas_keep_ttl")
+      future = System.os_time(:millisecond) + 120_000
+      Router.put(key, "old", future)
+      assert 1 == Native.handle("CAS", [key, "old", "new"], dummy_store())
+      assert "new" == Router.get(key)
+      {_val, expire_at_ms} = Router.get_meta(key)
+      assert expire_at_ms == future
+    end
+
+    test "CAS wrong number of args returns error" do
+      assert {:error, msg} = Native.handle("CAS", ["key"], dummy_store())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "CAS with too many args returns error" do
+      assert {:error, _} = Native.handle("CAS", ["k", "a", "b", "EX"], dummy_store())
+    end
+
+    test "CAS with EX 0 returns error (TTL must be positive)" do
+      key = ukey("cas_ex_zero")
+      Router.put(key, "old", 0)
+      assert {:error, _} = Native.handle("CAS", [key, "old", "new", "EX", "0"], dummy_store())
+    end
+
+    test "CAS with EX non-integer returns error" do
+      key = ukey("cas_ex_bad")
+      Router.put(key, "old", 0)
+      assert {:error, _} = Native.handle("CAS", [key, "old", "new", "EX", "abc"], dummy_store())
+    end
+
+    test "CAS on expired key returns nil" do
+      key = ukey("cas_expired")
+      past = System.os_time(:millisecond) - 1_000
+      Router.put(key, "old", past)
+      # Give ETS time to recognize expiry
+      assert nil == Native.handle("CAS", [key, "old", "new"], dummy_store())
+    end
+  end
+
+  # ===========================================================================
+  # LOCK
+  # ===========================================================================
+
+  describe "LOCK" do
+    test "LOCK on non-existent key acquires lock" do
+      key = ukey("lock_new")
+      assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
+      assert "owner1" == Router.get(key)
+    end
+
+    test "LOCK with same owner returns OK (idempotent)" do
+      key = ukey("lock_idem")
+      assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
+      assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
+      assert "owner1" == Router.get(key)
+    end
+
+    test "LOCK with different owner returns DISTLOCK error" do
+      key = ukey("lock_conflict")
+      assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
+      assert {:error, msg} = Native.handle("LOCK", [key, "owner2", "5000"], dummy_store())
+      assert msg =~ "DISTLOCK"
+      assert msg =~ "held by another owner"
+    end
+
+    test "LOCK on expired lock acquires it" do
+      key = ukey("lock_expired")
+      # Set a lock with a very short TTL
+      past = System.os_time(:millisecond) - 1_000
+      Router.put(key, "old_owner", past)
+      # Wait for it to expire
+      assert :ok = Native.handle("LOCK", [key, "new_owner", "5000"], dummy_store())
+      assert "new_owner" == Router.get(key)
+    end
+
+    test "LOCK sets TTL on the key" do
+      key = ukey("lock_ttl")
+      assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
+      {_val, expire_at_ms} = Router.get_meta(key)
+      assert expire_at_ms > System.os_time(:millisecond)
+      assert expire_at_ms <= System.os_time(:millisecond) + 6_000
+    end
+
+    test "LOCK wrong number of args returns error" do
+      assert {:error, msg} = Native.handle("LOCK", ["key", "owner"], dummy_store())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "LOCK with non-integer ttl returns error" do
+      assert {:error, _} = Native.handle("LOCK", ["key", "owner", "abc"], dummy_store())
+    end
+
+    test "LOCK with zero ttl returns error" do
+      assert {:error, _} = Native.handle("LOCK", ["key", "owner", "0"], dummy_store())
+    end
+  end
+
+  # ===========================================================================
+  # UNLOCK
+  # ===========================================================================
+
+  describe "UNLOCK" do
+    test "UNLOCK with matching owner releases lock" do
+      key = ukey("unlock_match")
+      assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
+      assert 1 == Native.handle("UNLOCK", [key, "owner1"], dummy_store())
+      assert nil == Router.get(key)
+    end
+
+    test "UNLOCK with wrong owner returns error" do
+      key = ukey("unlock_wrong")
+      assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
+      assert {:error, msg} = Native.handle("UNLOCK", [key, "owner2"], dummy_store())
+      assert msg =~ "DISTLOCK"
+      assert msg =~ "not the lock owner"
+    end
+
+    test "UNLOCK on non-existent key returns 1 (already unlocked)" do
+      key = ukey("unlock_none")
+      assert 1 == Native.handle("UNLOCK", [key, "anyone"], dummy_store())
+    end
+
+    test "UNLOCK wrong number of args returns error" do
+      assert {:error, msg} = Native.handle("UNLOCK", ["key"], dummy_store())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "UNLOCK after expiry returns 1 (already unlocked)" do
+      key = ukey("unlock_after_exp")
+      past = System.os_time(:millisecond) - 1_000
+      Router.put(key, "owner1", past)
+      assert 1 == Native.handle("UNLOCK", [key, "owner1"], dummy_store())
+    end
+  end
+
+  # ===========================================================================
+  # EXTEND
+  # ===========================================================================
+
+  describe "EXTEND" do
+    test "EXTEND with matching owner extends TTL" do
+      key = ukey("extend_match")
+      assert :ok = Native.handle("LOCK", [key, "owner1", "1000"], dummy_store())
+      {_val, old_exp} = Router.get_meta(key)
+
+      assert 1 == Native.handle("EXTEND", [key, "owner1", "60000"], dummy_store())
+      {_val, new_exp} = Router.get_meta(key)
+      assert new_exp > old_exp
+    end
+
+    test "EXTEND with wrong owner returns error" do
+      key = ukey("extend_wrong")
+      assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
+
+      assert {:error, msg} = Native.handle("EXTEND", [key, "owner2", "5000"], dummy_store())
+      assert msg =~ "DISTLOCK"
+      assert msg =~ "not the lock owner"
+    end
+
+    test "EXTEND on non-existent key returns error" do
+      key = ukey("extend_none")
+      assert {:error, msg} = Native.handle("EXTEND", [key, "owner1", "5000"], dummy_store())
+      assert msg =~ "DISTLOCK"
+    end
+
+    test "EXTEND on expired key returns error" do
+      key = ukey("extend_expired")
+      past = System.os_time(:millisecond) - 1_000
+      Router.put(key, "owner1", past)
+      assert {:error, msg} = Native.handle("EXTEND", [key, "owner1", "5000"], dummy_store())
+      assert msg =~ "DISTLOCK"
+    end
+
+    test "EXTEND wrong number of args returns error" do
+      assert {:error, msg} = Native.handle("EXTEND", ["key", "owner"], dummy_store())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "EXTEND with non-integer ttl returns error" do
+      assert {:error, _} = Native.handle("EXTEND", ["key", "owner", "abc"], dummy_store())
+    end
+
+    test "EXTEND with zero ttl returns error" do
+      assert {:error, _} = Native.handle("EXTEND", ["key", "owner", "0"], dummy_store())
+    end
+  end
+
+  # ===========================================================================
+  # RATELIMIT.ADD
+  # ===========================================================================
+
+  describe "RATELIMIT.ADD" do
+    test "first request within limit returns allowed" do
+      key = ukey("rl_first")
+      result = Native.handle("RATELIMIT.ADD", [key, "10000", "5"], dummy_store())
+      assert ["allowed", count, remaining, _ms_reset] = result
+      assert count == 1
+      assert remaining == 4
+    end
+
+    test "requests up to max are allowed" do
+      key = ukey("rl_up_to_max")
+
+      for i <- 1..5 do
+        result = Native.handle("RATELIMIT.ADD", [key, "10000", "5"], dummy_store())
+        ["allowed", ^i, remaining, _ms_reset] = result
+        assert remaining == 5 - i
+      end
+    end
+
+    test "request beyond max returns denied" do
+      key = ukey("rl_denied")
+
+      # Fill up the limit
+      for _ <- 1..5 do
+        ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key, "10000", "5"], dummy_store())
+      end
+
+      result = Native.handle("RATELIMIT.ADD", [key, "10000", "5"], dummy_store())
+      assert ["denied", _count, 0, _ms_reset] = result
+    end
+
+    test "window resets after window_ms" do
+      key = ukey("rl_reset")
+
+      # Fill up the limit with a very short window
+      for _ <- 1..3 do
+        ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key, "50", "3"], dummy_store())
+      end
+
+      # Should be denied
+      ["denied" | _] = Native.handle("RATELIMIT.ADD", [key, "50", "3"], dummy_store())
+
+      # Wait for window to expire (2x window to ensure full expiry)
+      Process.sleep(120)
+
+      # Should be allowed again
+      result = Native.handle("RATELIMIT.ADD", [key, "50", "3"], dummy_store())
+      assert ["allowed" | _] = result
+    end
+
+    test "count parameter adds N instead of 1" do
+      key = ukey("rl_count_n")
+
+      result = Native.handle("RATELIMIT.ADD", [key, "10000", "10", "5"], dummy_store())
+      assert ["allowed", 5, 5, _ms_reset] = result
+
+      result = Native.handle("RATELIMIT.ADD", [key, "10000", "10", "3"], dummy_store())
+      assert ["allowed", 8, 2, _ms_reset] = result
+    end
+
+    test "count parameter exceeding remaining returns denied" do
+      key = ukey("rl_count_exceed")
+
+      # Add 8 out of 10
+      ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key, "10000", "10", "8"], dummy_store())
+
+      # Try to add 3 more (would exceed 10)
+      result = Native.handle("RATELIMIT.ADD", [key, "10000", "10", "3"], dummy_store())
+      assert ["denied", _count, _remaining, _ms_reset] = result
+    end
+
+    test "return array format: [status, count, remaining, ms_reset]" do
+      key = ukey("rl_format")
+      result = Native.handle("RATELIMIT.ADD", [key, "10000", "100"], dummy_store())
+      assert [status, count, remaining, ms_reset] = result
+      assert is_binary(status)
+      assert status in ["allowed", "denied"]
+      assert is_integer(count)
+      assert is_integer(remaining)
+      assert is_integer(ms_reset)
+      assert ms_reset >= 0
+    end
+
+    test "wrong number of args returns error" do
+      assert {:error, msg} = Native.handle("RATELIMIT.ADD", ["key"], dummy_store())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "too many args returns error" do
+      assert {:error, _} =
+               Native.handle("RATELIMIT.ADD", ["k", "1000", "5", "1", "extra"], dummy_store())
+    end
+
+    test "non-integer window_ms returns error" do
+      assert {:error, _} = Native.handle("RATELIMIT.ADD", ["k", "abc", "5"], dummy_store())
+    end
+
+    test "non-integer max returns error" do
+      assert {:error, _} = Native.handle("RATELIMIT.ADD", ["k", "1000", "abc"], dummy_store())
+    end
+
+    test "zero window_ms returns error" do
+      assert {:error, _} = Native.handle("RATELIMIT.ADD", ["k", "0", "5"], dummy_store())
+    end
+
+    test "zero max returns error" do
+      assert {:error, _} = Native.handle("RATELIMIT.ADD", ["k", "1000", "0"], dummy_store())
+    end
+  end
+
+  # ===========================================================================
+  # Dispatcher integration
+  # ===========================================================================
+
+  describe "Dispatcher routing for native commands" do
+    alias Ferricstore.Commands.Dispatcher
+
+    test "CAS is routed through dispatcher" do
+      key = ukey("disp_cas")
+      Router.put(key, "old", 0)
+      assert 1 == Dispatcher.dispatch("CAS", [key, "old", "new"], dummy_store())
+      assert "new" == Router.get(key)
+    end
+
+    test "CAS is case-insensitive" do
+      key = ukey("disp_cas_ci")
+      Router.put(key, "old", 0)
+      assert 1 == Dispatcher.dispatch("cas", [key, "old", "new"], dummy_store())
+    end
+
+    test "LOCK is routed through dispatcher" do
+      key = ukey("disp_lock")
+      assert :ok = Dispatcher.dispatch("LOCK", [key, "owner1", "5000"], dummy_store())
+    end
+
+    test "UNLOCK is routed through dispatcher" do
+      key = ukey("disp_unlock")
+      assert 1 == Dispatcher.dispatch("UNLOCK", [key, "nobody"], dummy_store())
+    end
+
+    test "EXTEND is routed through dispatcher" do
+      key = ukey("disp_extend")
+      Router.put(key, "owner1", System.os_time(:millisecond) + 5_000)
+      assert 1 == Dispatcher.dispatch("EXTEND", [key, "owner1", "10000"], dummy_store())
+    end
+
+    test "RATELIMIT.ADD is routed through dispatcher" do
+      key = ukey("disp_rl")
+      result = Dispatcher.dispatch("RATELIMIT.ADD", [key, "10000", "5"], dummy_store())
+      assert ["allowed" | _] = result
+    end
+
+    test "RATELIMIT.ADD is case-insensitive" do
+      key = ukey("disp_rl_ci")
+      result = Dispatcher.dispatch("ratelimit.add", [key, "10000", "5"], dummy_store())
+      assert ["allowed" | _] = result
+    end
+
+    test "MODULE is routed through dispatcher" do
+      assert [] == Dispatcher.dispatch("MODULE", ["LIST"], dummy_store())
+    end
+
+    test "WAITAOF is routed through dispatcher" do
+      assert [0, 0] == Dispatcher.dispatch("WAITAOF", ["0", "0", "100"], dummy_store())
+    end
+
+    test "CLIENT is routed through dispatch_client (not dispatch)" do
+      # CLIENT is handled in connection.ex via dispatch_client/3, not dispatch/3.
+      conn_state = %{client_id: 1, client_name: nil, created_at: 0, peer: nil}
+      {result, _updated} = Dispatcher.dispatch_client(["GETNAME"], conn_state, dummy_store())
+      assert result == nil || is_binary(result)
+    end
+
+    test "DEBUG is routed through dispatcher" do
+      assert :ok = Dispatcher.dispatch("DEBUG", ["RELOAD"], dummy_store())
+    end
+  end
+end

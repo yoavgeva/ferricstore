@@ -21,10 +21,23 @@ defmodule Ferricstore.Test.ShardHelpers do
       name = :"Ferricstore.Store.Shard.#{i}"
 
       case Process.whereis(name) do
-        pid when is_pid(pid) -> GenServer.call(pid, :flush)
+        pid when is_pid(pid) -> GenServer.call(pid, :flush, 10_000)
         nil -> :ok
       end
     end)
+  end
+
+  @doc """
+  Deletes all keys across every shard. Equivalent to FLUSHDB.
+
+  Call this in `setup` callbacks to prevent key accumulation across tests —
+  a growing keydir makes KEYS/DBSIZE calls progressively slower and can cause
+  GenServer timeouts when a test run accumulates thousands of keys.
+  """
+  @spec flush_all_keys() :: :ok
+  def flush_all_keys do
+    alias Ferricstore.Store.Router
+    Enum.each(Router.keys(), &Router.delete/1)
   end
 
   @doc """

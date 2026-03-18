@@ -113,9 +113,9 @@ defmodule Ferricstore.Bitcask.NIFTest do
       assert {:ok, value} == NIF.get(store, "bin_val")
     end
 
-    test "put with empty key", %{store: store} do
-      :ok = NIF.put(store, "", "empty_key_val", 0)
-      assert {:ok, "empty_key_val"} == NIF.get(store, "")
+    test "put with empty key is rejected", %{store: store} do
+      assert {:error, reason} = NIF.put(store, "", "empty_key_val", 0)
+      assert reason =~ "empty"
     end
 
     test "put with empty value is treated as tombstone" do

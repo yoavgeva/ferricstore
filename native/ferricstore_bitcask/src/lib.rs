@@ -335,4 +335,70 @@ fn purge_expired(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Te
     }
 }
 
+/// Return shard statistics for the merge scheduler.
+///
+/// Returns a map with keys:
+///   - `total_disk_bytes`, `live_bytes`, `dead_bytes` (u64)
+///   - `file_count`, `key_count` (u64)
+///   - `fragmentation_ratio` (float, 0.0..1.0)
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn shard_stats(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
+    let store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    let stats = store.shard_stats();
+    Ok((
+        atoms::ok(),
+        (
+            stats.total_disk_bytes,
+            stats.live_bytes,
+            stats.dead_bytes,
+            stats.file_count,
+            stats.key_count,
+            stats.fragmentation_ratio,
+        ),
+    )
+        .encode(env))
+}
+
+/// Return `(file_id, size_bytes)` pairs for all log files, sorted by file_id.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn file_sizes(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
+    let store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    let sizes = store.file_sizes();
+    let list: Vec<(u64, u64)> = sizes;
+    Ok((atoms::ok(), list).encode(env))
+}
+
+/// Run compaction on the given file_ids. Returns `{:ok, {written, dropped, reclaimed}}`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn run_compaction(
+    env: Env,
+    resource: ResourceArc<StoreResource>,
+    file_ids: Vec<u64>,
+) -> NifResult<Term> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    match store.run_compaction(&file_ids) {
+        Ok(result) => Ok((
+            atoms::ok(),
+            (
+                result.records_written,
+                result.records_dropped,
+                result.bytes_reclaimed,
+            ),
+        )
+            .encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Return available disk space in bytes for the store's data directory.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn available_disk_space(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
+    let store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    Ok((atoms::ok(), store.available_disk_space()).encode(env))
+}
+
 rustler::init!("Elixir.Ferricstore.Bitcask.NIF", load = load);

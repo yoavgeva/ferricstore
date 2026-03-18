@@ -63,8 +63,10 @@ defmodule Ferricstore.Store.Shard do
 
   # Timeout for synchronous flush (blocking receive for async completion).
   @sync_flush_timeout_ms 5_000
+  @default_sweep_interval_ms 1_000
+  @default_max_keys_per_sweep 100
 
-  defstruct [:store, :ets, :index, pending: [], flush_in_flight: nil]
+  defstruct [:store, :ets, :index, pending: [], flush_in_flight: nil, write_version: 0]
 
   # -------------------------------------------------------------------
   # Public API
@@ -98,8 +100,21 @@ defmodule Ferricstore.Store.Shard do
     path = Path.join(data_dir, "shard_#{index}")
     File.mkdir_p!(path)
     {:ok, store} = NIF.new(path)
-    ets = :ets.new(:"shard_ets_#{index}", [:set, :public, :named_table])
+
+    ets =
+      case :ets.whereis(:"shard_ets_#{index}") do
+        :undefined -> :ets.new(:"shard_ets_#{index}", [:set, :public, :named_table])
+        _ref -> :"shard_ets_#{index}"
+      end
+
+    # Start the Raft server for this shard if raft is enabled.
+    # The ra system must already be started (done in Application.start).
+    if Application.get_env(:ferricstore, :raft_enabled, true) do
+      Ferricstore.Raft.Cluster.start_shard_server(index, store, ets)
+    end
+
     schedule_flush(flush_ms)
+    schedule_expiry_sweep()
     {:ok, %__MODULE__{store: store, ets: ets, index: index, pending: [],
                        flush_in_flight: nil},
      {:continue, {:flush_interval, flush_ms}}}
@@ -150,7 +165,8 @@ defmodule Ferricstore.Store.Shard do
     # Write to ETS immediately so reads see it right away.
     :ets.insert(state.ets, {key, value, expire_at_ms})
     new_pending = [{key, value, expire_at_ms} | state.pending]
-    new_state = %{state | pending: new_pending}
+    new_version = state.write_version + 1
+    new_state = %{state | pending: new_pending, write_version: new_version}
 
     # Flush immediately when no async flush is in-flight. This ensures every
     # put is submitted to io_uring (and thus kernel-managed) before the call
@@ -162,6 +178,352 @@ defmodule Ferricstore.Store.Shard do
     else
       {:reply, :ok, new_state}
     end
+  end
+
+  # Atomic increment: reads current value, parses as integer, adds delta, writes back.
+  # Returns {:ok, new_integer} or {:error, reason}.
+  def handle_call({:incr, key, delta}, _from, state) do
+    case ets_lookup(state.ets, key) do
+      {:hit, value, expire_at_ms} ->
+        case parse_integer(value) do
+          {:ok, int_val} ->
+            new_val = int_val + delta
+            new_str = Integer.to_string(new_val)
+            :ets.insert(state.ets, {key, new_str, expire_at_ms})
+            new_pending = [{key, new_str, expire_at_ms} | state.pending]
+            new_state = %{state | pending: new_pending}
+
+            new_state =
+              if state.flush_in_flight == nil,
+                do: flush_pending(new_state),
+                else: new_state
+
+            {:reply, {:ok, new_val}, new_state}
+
+          :error ->
+            {:reply, {:error, "ERR value is not an integer or out of range"}, state}
+        end
+
+      :expired ->
+        # Treat as non-existent: set to delta
+        new_str = Integer.to_string(delta)
+        :ets.insert(state.ets, {key, new_str, 0})
+        new_pending = [{key, new_str, 0} | state.pending]
+        new_state = %{state | pending: new_pending}
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: flush_pending(new_state),
+            else: new_state
+
+        {:reply, {:ok, delta}, new_state}
+
+      :miss ->
+        # Check Bitcask
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+
+        case do_get(state, key) do
+          nil ->
+            new_str = Integer.to_string(delta)
+            :ets.insert(state.ets, {key, new_str, 0})
+            new_pending = [{key, new_str, 0} | state.pending]
+            new_state = %{state | pending: new_pending}
+
+            new_state =
+              if state.flush_in_flight == nil,
+                do: flush_pending(new_state),
+                else: new_state
+
+            {:reply, {:ok, delta}, new_state}
+
+          value ->
+            # get the metadata for the expire
+            expire_at_ms =
+              case do_get_meta(state, key) do
+                {_, exp} -> exp
+                nil -> 0
+              end
+
+            case parse_integer(value) do
+              {:ok, int_val} ->
+                new_val = int_val + delta
+                new_str = Integer.to_string(new_val)
+                :ets.insert(state.ets, {key, new_str, expire_at_ms})
+                new_pending = [{key, new_str, expire_at_ms} | state.pending]
+                new_state = %{state | pending: new_pending}
+
+                new_state =
+                  if state.flush_in_flight == nil,
+                    do: flush_pending(new_state),
+                    else: new_state
+
+                {:reply, {:ok, new_val}, new_state}
+
+              :error ->
+                {:reply, {:error, "ERR value is not an integer or out of range"}, state}
+            end
+        end
+    end
+  end
+
+  # Atomic float increment: reads current value, parses as float, adds delta, writes back.
+  # Returns {:ok, new_float_string} or {:error, reason}.
+  def handle_call({:incr_float, key, delta}, _from, state) do
+    case ets_lookup(state.ets, key) do
+      {:hit, value, expire_at_ms} ->
+        case parse_float(value) do
+          {:ok, float_val} ->
+            new_val = float_val + delta
+            new_str = format_float(new_val)
+            :ets.insert(state.ets, {key, new_str, expire_at_ms})
+            new_pending = [{key, new_str, expire_at_ms} | state.pending]
+            new_state = %{state | pending: new_pending}
+
+            new_state =
+              if state.flush_in_flight == nil,
+                do: flush_pending(new_state),
+                else: new_state
+
+            {:reply, {:ok, new_str}, new_state}
+
+          :error ->
+            {:reply, {:error, "ERR value is not a valid float"}, state}
+        end
+
+      :expired ->
+        new_str = format_float(delta)
+        :ets.insert(state.ets, {key, new_str, 0})
+        new_pending = [{key, new_str, 0} | state.pending]
+        new_state = %{state | pending: new_pending}
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: flush_pending(new_state),
+            else: new_state
+
+        {:reply, {:ok, new_str}, new_state}
+
+      :miss ->
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+
+        case do_get(state, key) do
+          nil ->
+            new_str = format_float(delta)
+            :ets.insert(state.ets, {key, new_str, 0})
+            new_pending = [{key, new_str, 0} | state.pending]
+            new_state = %{state | pending: new_pending}
+
+            new_state =
+              if state.flush_in_flight == nil,
+                do: flush_pending(new_state),
+                else: new_state
+
+            {:reply, {:ok, new_str}, new_state}
+
+          value ->
+            expire_at_ms =
+              case do_get_meta(state, key) do
+                {_, exp} -> exp
+                nil -> 0
+              end
+
+            case parse_float(value) do
+              {:ok, float_val} ->
+                new_val = float_val + delta
+                new_str = format_float(new_val)
+                :ets.insert(state.ets, {key, new_str, expire_at_ms})
+                new_pending = [{key, new_str, expire_at_ms} | state.pending]
+                new_state = %{state | pending: new_pending}
+
+                new_state =
+                  if state.flush_in_flight == nil,
+                    do: flush_pending(new_state),
+                    else: new_state
+
+                {:reply, {:ok, new_str}, new_state}
+
+              :error ->
+                {:reply, {:error, "ERR value is not a valid float"}, state}
+            end
+        end
+    end
+  end
+
+  # Atomic append: reads current value (or ""), appends suffix, writes back.
+  # Returns {:ok, new_byte_length}.
+  def handle_call({:append, key, suffix}, _from, state) do
+    case ets_lookup(state.ets, key) do
+      {:hit, value, expire_at_ms} ->
+        new_val = value <> suffix
+        :ets.insert(state.ets, {key, new_val, expire_at_ms})
+        new_pending = [{key, new_val, expire_at_ms} | state.pending]
+        new_state = %{state | pending: new_pending}
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: flush_pending(new_state),
+            else: new_state
+
+        {:reply, {:ok, byte_size(new_val)}, new_state}
+
+      :expired ->
+        :ets.insert(state.ets, {key, suffix, 0})
+        new_pending = [{key, suffix, 0} | state.pending]
+        new_state = %{state | pending: new_pending}
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: flush_pending(new_state),
+            else: new_state
+
+        {:reply, {:ok, byte_size(suffix)}, new_state}
+
+      :miss ->
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+
+        {old_val, expire_at_ms} =
+          case do_get_meta(state, key) do
+            {v, exp} -> {v, exp}
+            nil -> {"", 0}
+          end
+
+        new_val = old_val <> suffix
+        :ets.insert(state.ets, {key, new_val, expire_at_ms})
+        new_pending = [{key, new_val, expire_at_ms} | state.pending]
+        new_state = %{state | pending: new_pending}
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: flush_pending(new_state),
+            else: new_state
+
+        {:reply, {:ok, byte_size(new_val)}, new_state}
+    end
+  end
+
+  # Atomic get-and-set: returns old value (or nil), sets new value.
+  def handle_call({:getset, key, new_value}, _from, state) do
+    old =
+      case ets_lookup(state.ets, key) do
+        {:hit, value, _expire_at_ms} -> value
+        :expired -> nil
+        :miss ->
+          state = await_in_flight(state)
+          state = flush_pending_sync(state)
+          do_get(state, key)
+      end
+
+    :ets.insert(state.ets, {key, new_value, 0})
+    new_pending = [{key, new_value, 0} | state.pending]
+    new_state = %{state | pending: new_pending}
+
+    new_state =
+      if state.flush_in_flight == nil,
+        do: flush_pending(new_state),
+        else: new_state
+
+    {:reply, old, new_state}
+  end
+
+  # Atomic get-and-delete: returns value (or nil), deletes key.
+  def handle_call({:getdel, key}, _from, state) do
+    old =
+      case ets_lookup(state.ets, key) do
+        {:hit, value, _expire_at_ms} -> value
+        :expired -> nil
+        :miss ->
+          state = await_in_flight(state)
+          state = flush_pending_sync(state)
+          do_get(state, key)
+      end
+
+    if old != nil do
+      # Synchronous delete for durability
+      state = await_in_flight(state)
+      state = flush_pending_sync(state)
+      NIF.delete(state.store, key)
+      :ets.delete(state.ets, key)
+      new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == key end)
+      {:reply, old, %{state | pending: new_pending}}
+    else
+      {:reply, nil, state}
+    end
+  end
+
+  # Atomic get-and-update-expiry: returns value, updates TTL.
+  # expire_at_ms = 0 means PERSIST (remove expiry).
+  def handle_call({:getex, key, expire_at_ms}, _from, state) do
+    case ets_lookup(state.ets, key) do
+      {:hit, value, _old_exp} ->
+        :ets.insert(state.ets, {key, value, expire_at_ms})
+        new_pending = [{key, value, expire_at_ms} | state.pending]
+        new_state = %{state | pending: new_pending}
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: flush_pending(new_state),
+            else: new_state
+
+        {:reply, value, new_state}
+
+      :expired ->
+        {:reply, nil, state}
+
+      :miss ->
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+
+        case do_get(state, key) do
+          nil ->
+            {:reply, nil, state}
+
+          value ->
+            :ets.insert(state.ets, {key, value, expire_at_ms})
+            new_pending = [{key, value, expire_at_ms} | state.pending]
+            new_state = %{state | pending: new_pending}
+
+            new_state =
+              if state.flush_in_flight == nil,
+                do: flush_pending(new_state),
+                else: new_state
+
+            {:reply, value, new_state}
+        end
+    end
+  end
+
+  # Atomic set-range: overwrites portion of string at offset with value.
+  # Zero-pads if key doesn't exist or string is shorter than offset.
+  # Returns {:ok, new_byte_length}.
+  def handle_call({:setrange, key, offset, value}, _from, state) do
+    {old_val, expire_at_ms} =
+      case ets_lookup(state.ets, key) do
+        {:hit, v, exp} -> {v, exp}
+        :expired -> {"", 0}
+        :miss ->
+          state = await_in_flight(state)
+          state = flush_pending_sync(state)
+
+          case do_get_meta(state, key) do
+            {v, exp} -> {v, exp}
+            nil -> {"", 0}
+          end
+      end
+
+    new_val = apply_setrange(old_val, offset, value)
+    :ets.insert(state.ets, {key, new_val, expire_at_ms})
+    new_pending = [{key, new_val, expire_at_ms} | state.pending]
+    new_state = %{state | pending: new_pending}
+
+    new_state =
+      if state.flush_in_flight == nil,
+        do: flush_pending(new_state),
+        else: new_state
+
+    {:reply, {:ok, byte_size(new_val)}, new_state}
   end
 
   def handle_call({:delete, key}, _from, state) do
@@ -179,7 +541,187 @@ defmodule Ferricstore.Store.Shard do
     # Remove any pending entry for this key (belt-and-suspenders: flush above
     # already cleared pending, but be explicit).
     new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == key end)
-    {:reply, :ok, %{state | pending: new_pending}}
+    new_version = state.write_version + 1
+    {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
+  end
+
+  # Returns the current write_version for WATCH support.
+  def handle_call({:get_version, _key}, _from, state) do
+    {:reply, state.write_version, state}
+  end
+
+  # --- Native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD ---
+
+  def handle_call({:cas, key, expected, new_value, ttl_ms}, _from, state) do
+    case resolve_for_native(state, key) do
+      {{:hit, ^expected, old_exp}, state} ->
+        expire = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: old_exp
+        :ets.insert(state.ets, {key, new_value, expire})
+        new_pending = [{key, new_value, expire} | state.pending]
+        new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
+        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
+        {:reply, 1, new_state}
+
+      {{:hit, _other, _exp}, state} -> {:reply, 0, state}
+      {:expired, state} -> {:reply, nil, state}
+      {:missing, state} -> {:reply, nil, state}
+    end
+  end
+
+  def handle_call({:lock, key, owner, ttl_ms}, _from, state) do
+    expire = System.os_time(:millisecond) + ttl_ms
+    case resolve_for_native(state, key) do
+      {{:hit, ^owner, _exp}, state} ->
+        :ets.insert(state.ets, {key, owner, expire})
+        new_pending = [{key, owner, expire} | state.pending]
+        new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
+        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
+        {:reply, :ok, new_state}
+
+      {{:hit, _other, _exp}, state} ->
+        {:reply, {:error, "DISTLOCK lock is held by another owner"}, state}
+
+      {_, state} ->
+        :ets.insert(state.ets, {key, owner, expire})
+        new_pending = [{key, owner, expire} | state.pending]
+        new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
+        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
+        {:reply, :ok, new_state}
+    end
+  end
+
+  def handle_call({:unlock, key, owner}, _from, state) do
+    case resolve_for_native(state, key) do
+      {{:hit, ^owner, _exp}, state} ->
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+        NIF.delete(state.store, key)
+        :ets.delete(state.ets, key)
+        {:reply, 1, %{state | write_version: state.write_version + 1}}
+
+      {{:hit, _other, _exp}, state} ->
+        {:reply, {:error, "DISTLOCK caller is not the lock owner"}, state}
+
+      {_, state} -> {:reply, 1, state}
+    end
+  end
+
+  def handle_call({:extend, key, owner, ttl_ms}, _from, state) do
+    new_expire = System.os_time(:millisecond) + ttl_ms
+    case resolve_for_native(state, key) do
+      {{:hit, ^owner, _exp}, state} ->
+        :ets.insert(state.ets, {key, owner, new_expire})
+        new_pending = [{key, owner, new_expire} | state.pending]
+        new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
+        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
+        {:reply, 1, new_state}
+
+      {{:hit, _other, _exp}, state} ->
+        {:reply, {:error, "DISTLOCK caller is not the lock owner"}, state}
+
+      {_, state} ->
+        {:reply, {:error, "DISTLOCK lock does not exist or has expired"}, state}
+    end
+  end
+
+  def handle_call({:ratelimit_add, key, window_ms, max, count}, _from, state) do
+    now = System.os_time(:millisecond)
+
+    {cur_count, cur_start, prv_count} =
+      case ets_lookup(state.ets, key) do
+        {:hit, value, _exp} -> decode_ratelimit(value)
+        _ -> {0, now, 0}
+      end
+
+    # Rotate windows
+    {cur_count, cur_start, prv_count} =
+      cond do
+        now - cur_start >= window_ms * 2 -> {0, now, 0}
+        now - cur_start >= window_ms -> {0, now, cur_count}
+        true -> {cur_count, cur_start, prv_count}
+      end
+
+    # Compute effective count with sliding window approximation
+    elapsed = now - cur_start
+    weight = max(0.0, 1.0 - elapsed / window_ms)
+    effective = cur_count + trunc(Float.round(prv_count * weight))
+    expire_at_ms = cur_start + window_ms * 2
+
+    {status, final_count, remaining, state} =
+      if effective + count > max do
+        value = encode_ratelimit(cur_count, cur_start, prv_count)
+        :ets.insert(state.ets, {key, value, expire_at_ms})
+        new_pending = [{key, value, expire_at_ms} | state.pending]
+        new_state = %{state | pending: new_pending}
+        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
+        {"denied", effective, max(0, max - effective), new_state}
+      else
+        new_cur = cur_count + count
+        new_eff = effective + count
+        value = encode_ratelimit(new_cur, cur_start, prv_count)
+        :ets.insert(state.ets, {key, value, expire_at_ms})
+        new_pending = [{key, value, expire_at_ms} | state.pending]
+        new_state = %{state | pending: new_pending}
+        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
+        {"allowed", new_eff, max(0, max - new_eff), new_state}
+      end
+
+    ms_until_reset = max(0, cur_start + window_ms - now)
+    {:reply, [status, final_count, remaining, ms_until_reset], state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # List operations
+  # ---------------------------------------------------------------------------
+
+  def handle_call({:list_op, key, operation}, _from, state) do
+    state = await_in_flight(state)
+    state = flush_pending_sync(state)
+
+    alias Ferricstore.Store.ListOps
+
+    get_fn = fn -> do_get(state, key) end
+    put_fn = fn encoded_binary ->
+      :ets.insert(state.ets, {key, encoded_binary, 0})
+      NIF.put(state.store, key, encoded_binary, 0)
+      :ok
+    end
+    delete_fn = fn ->
+      NIF.delete(state.store, key)
+      :ets.delete(state.ets, key)
+      :ok
+    end
+
+    result = ListOps.execute(get_fn, put_fn, delete_fn, operation)
+    {:reply, result, state}
+  end
+
+  def handle_call({:list_op_lmove, src_key, dst_key, from_dir, to_dir}, _from, state) do
+    state = await_in_flight(state)
+    state = flush_pending_sync(state)
+
+    alias Ferricstore.Store.ListOps
+
+    src_get_fn = fn -> do_get(state, src_key) end
+    dst_get_fn = fn -> do_get(state, dst_key) end
+    src_put_fn = fn encoded ->
+      :ets.insert(state.ets, {src_key, encoded, 0})
+      NIF.put(state.store, src_key, encoded, 0)
+      :ok
+    end
+    dst_put_fn = fn encoded ->
+      :ets.insert(state.ets, {dst_key, encoded, 0})
+      NIF.put(state.store, dst_key, encoded, 0)
+      :ok
+    end
+    src_delete_fn = fn ->
+      NIF.delete(state.store, src_key)
+      :ets.delete(state.ets, src_key)
+      :ok
+    end
+
+    result = ListOps.execute_lmove(src_get_fn, src_put_fn, src_delete_fn, dst_get_fn, dst_put_fn, from_dir, to_dir)
+    {:reply, result, state}
   end
 
   def handle_call({:exists, key}, _from, state) do
@@ -216,6 +758,26 @@ defmodule Ferricstore.Store.Shard do
   def handle_info(:flush, state) do
     state = flush_pending(state)
     schedule_flush(Process.get(:flush_interval_ms, @flush_interval_ms))
+    {:noreply, state}
+  end
+
+  # Active expiry sweep: scan ETS for expired keys and delete them.
+  def handle_info(:expiry_sweep, state) do
+    now = System.os_time(:millisecond)
+    max_keys = Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
+    expired_keys = scan_expired(state.ets, now, max_keys)
+
+    count = length(expired_keys)
+
+    if count > 0 do
+      Enum.each(expired_keys, fn key -> :ets.delete(state.ets, key) end)
+      NIF.purge_expired(state.store)
+
+      require Logger
+      Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")
+    end
+
+    schedule_expiry_sweep()
     {:noreply, state}
   end
 
@@ -409,6 +971,139 @@ defmodule Ferricstore.Store.Shard do
       [{_, _, 0}] -> true
       [{_, _, exp}] -> exp > now
       [] -> true
+    end
+  end
+
+  # -------------------------------------------------------------------
+  # Private: integer / float parsing
+  # -------------------------------------------------------------------
+
+  defp parse_integer(str) when is_binary(str) do
+    case Integer.parse(str) do
+      {val, ""} -> {:ok, val}
+      _ -> :error
+    end
+  end
+
+  defp parse_float(str) when is_binary(str) do
+    # Try integer first (Redis considers "10" valid for INCRBYFLOAT)
+    case Integer.parse(str) do
+      {val, ""} ->
+        {:ok, val * 1.0}
+
+      _ ->
+        case Float.parse(str) do
+          {val, ""} ->
+            if val in [:infinity, :neg_infinity, :nan] do
+              :error
+            else
+              {:ok, val}
+            end
+
+          _ ->
+            :error
+        end
+    end
+  end
+
+  defp format_float(val) when is_float(val) do
+    # Redis formats floats with up to 17 significant digits, removing trailing zeros.
+    # We use Erlang's ~.17g format and strip trailing zeros after decimal point.
+    formatted = :erlang.float_to_binary(val, [:compact, {:decimals, 17}])
+
+    # If result has a decimal point, strip trailing zeros but keep at least one digit after dot
+    if String.contains?(formatted, ".") do
+      formatted
+      |> String.trim_trailing("0")
+      |> String.trim_trailing(".")
+      |> then(fn
+        # If we trimmed everything after dot, re-check: Redis doesn't strip the decimal point
+        # for values that had fractional parts. But for integer-like floats, Redis drops it.
+        s -> s
+      end)
+    else
+      formatted
+    end
+  end
+
+  # Applies SETRANGE logic: overwrites bytes at `offset` with `value`,
+  # zero-padding if the original string is shorter than offset.
+  defp apply_setrange(old, offset, value) do
+    old_len = byte_size(old)
+    val_len = byte_size(value)
+
+    cond do
+      val_len == 0 ->
+        # Empty value -- just pad up to offset if needed
+        if offset > old_len do
+          old <> :binary.copy(<<0>>, offset - old_len)
+        else
+          old
+        end
+
+      offset >= old_len ->
+        # Need to pad between end of old and start of overwrite
+        padding = :binary.copy(<<0>>, offset - old_len)
+        old <> padding <> value
+
+      offset + val_len >= old_len ->
+        # Overwrite extends past end of old string
+        binary_part(old, 0, offset) <> value
+
+      true ->
+        # Overwrite in the middle of the string
+        binary_part(old, 0, offset) <>
+          value <>
+          binary_part(old, offset + val_len, old_len - offset - val_len)
+    end
+  end
+
+  # -------------------------------------------------------------------
+  # Private: active expiry sweep
+  # -------------------------------------------------------------------
+
+  defp scan_expired(ets, now, limit) do
+    match_spec = [
+      {{:"$1", :_, :"$3"},
+       [{:andalso, {:>, :"$3", 0}, {:"=<", :"$3", now}}],
+       [:"$1"]}
+    ]
+
+    case :ets.select(ets, match_spec, limit) do
+      {keys, _continuation} -> keys
+      :"$end_of_table" -> []
+    end
+  end
+
+  defp schedule_expiry_sweep do
+    interval = Application.get_env(:ferricstore, :expiry_sweep_interval_ms, @default_sweep_interval_ms)
+    Process.send_after(self(), :expiry_sweep, interval)
+  end
+
+  # --- Native command helpers ---
+
+  defp resolve_for_native(state, key) do
+    case ets_lookup(state.ets, key) do
+      {:hit, value, exp} -> {{:hit, value, exp}, state}
+      :expired -> {:expired, state}
+      :miss ->
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+        case do_get_meta(state, key) do
+          nil -> {:missing, state}
+          {value, exp} -> {{:hit, value, exp}, state}
+        end
+    end
+  end
+
+  defp encode_ratelimit(cur, start, prev), do: "#{cur}:#{start}:#{prev}"
+
+  defp decode_ratelimit(value) do
+    case String.split(value, ":") do
+      [cur, start, prev] ->
+        {String.to_integer(cur), String.to_integer(start), String.to_integer(prev)}
+      _ ->
+        {0, System.os_time(:millisecond), 0}
     end
   end
 end

@@ -12,6 +12,18 @@ defmodule Ferricstore.Server.Connection do
   5. Handles `QUIT` (send `+OK`, close) and `RESET` (send `+RESET`, reset state).
   6. Closes cleanly on TCP EOF or any transport error.
 
+  ## Transaction support (MULTI/EXEC/DISCARD/WATCH)
+
+  Transactions are connection-level state. When `MULTI` is issued, the connection
+  enters `:queuing` mode. Subsequent commands (except EXEC, DISCARD, MULTI, WATCH,
+  UNWATCH) are queued instead of executed, returning `+QUEUED` to the client.
+
+  `EXEC` executes all queued commands sequentially and returns an array of results.
+  If `WATCH` was used and any watched key's shard write-version changed, `EXEC`
+  returns nil (transaction aborted).
+
+  `DISCARD` clears the queue and watched keys, returning to normal mode.
+
   ## Ranch protocol contract
 
   Ranch requires the protocol module to export `start_link/3` and the started
@@ -27,16 +39,48 @@ defmodule Ferricstore.Server.Connection do
   @behaviour :ranch_protocol
 
   alias Ferricstore.Commands.Dispatcher
+  alias Ferricstore.KeyspaceNotifications
   alias Ferricstore.Resp.{Encoder, Parser}
+  alias Ferricstore.Stats
+  alias Ferricstore.Store.Router
+
+  alias Ferricstore.PubSub, as: PS
 
   # Connection state
-  defstruct [:socket, :transport, buffer: ""]
+  defstruct [
+    :socket,
+    :transport,
+    :client_id,
+    :client_name,
+    :created_at,
+    :peer,
+    buffer: "",
+    multi_state: :none,
+    multi_queue: [],
+    watched_keys: %{},
+    authenticated: false,
+    sandbox_namespace: nil,
+    pubsub_channels: MapSet.new(),
+    pubsub_patterns: MapSet.new()
+  ]
+
+  @type multi_state :: :none | :queuing
 
   @type t :: %__MODULE__{
           socket: :inet.socket(),
           transport: module(),
-          buffer: binary()
+          buffer: binary(),
+          client_id: pos_integer(),
+          client_name: binary() | nil,
+          created_at: integer(),
+          peer: {:inet.ip_address(), :inet.port_number()} | nil,
+          multi_state: multi_state(),
+          multi_queue: [{binary(), [binary()]}],
+          watched_keys: %{binary() => non_neg_integer()}
         }
+
+  # Commands that are NOT queued during MULTI — they are always executed immediately.
+  @multi_passthrough_cmds ~w(EXEC DISCARD MULTI WATCH UNWATCH)
 
   # ---------------------------------------------------------------------------
   # Ranch protocol entry point
@@ -62,7 +106,24 @@ defmodule Ferricstore.Server.Connection do
   def init(ref, transport, _opts) do
     {:ok, socket} = :ranch.handshake(ref)
     :ok = transport.setopts(socket, active: false)
-    state = %__MODULE__{socket: socket, transport: transport}
+
+    Stats.incr_connections()
+
+    peer =
+      case :inet.peername(socket) do
+        {:ok, addr} -> addr
+        _ -> nil
+      end
+
+    state = %__MODULE__{
+      socket: socket,
+      transport: transport,
+      client_id: generate_client_id(),
+      client_name: nil,
+      created_at: System.monotonic_time(:millisecond),
+      peer: peer
+    }
+
     loop(state)
   end
 
@@ -71,17 +132,21 @@ defmodule Ferricstore.Server.Connection do
   # ---------------------------------------------------------------------------
 
   defp loop(%__MODULE__{socket: socket, transport: transport} = state) do
-    case transport.recv(socket, 0, :infinity) do
-      {:ok, <<>>} ->
-        # Zero-length read: half-close or OS TCP edge case — treat as disconnect.
-        transport.close(socket)
+    if in_pubsub_mode?(state) do
+      pubsub_loop(state)
+    else
+      case transport.recv(socket, 0, :infinity) do
+        {:ok, <<>>} ->
+          cleanup_pubsub(state)
+          transport.close(socket)
 
-      {:ok, data} ->
-        handle_data(state, data)
+        {:ok, data} ->
+          handle_data(state, data)
 
-      {:error, _reason} ->
-        # Client disconnected or transport error — clean up silently
-        transport.close(socket)
+        {:error, _reason} ->
+          cleanup_pubsub(state)
+          transport.close(socket)
+      end
     end
   end
 
@@ -93,7 +158,7 @@ defmodule Ferricstore.Server.Connection do
         loop(%{state | buffer: rest})
 
       {:ok, commands, rest} ->
-        handle_parsed(state, commands, rest)
+        handle_parsed(%{state | buffer: rest}, commands)
 
       {:error, _reason} ->
         send_response(socket, transport, Encoder.encode({:error, "ERR protocol error"}))
@@ -101,10 +166,15 @@ defmodule Ferricstore.Server.Connection do
     end
   end
 
-  defp handle_parsed(%__MODULE__{socket: socket, transport: transport} = state, commands, rest) do
-    case dispatch_commands(commands, socket, transport) do
-      :quit -> transport.close(socket)
-      :continue -> loop(%{state | buffer: rest})
+  defp handle_parsed(%__MODULE__{socket: socket, transport: transport} = state, commands) do
+    case dispatch_commands(commands, state) do
+      {:quit, responses, _state} ->
+        send_responses(socket, transport, responses)
+        transport.close(socket)
+
+      {:continue, responses, new_state} ->
+        send_responses(socket, transport, responses)
+        loop(new_state)
     end
   end
 
@@ -112,28 +182,22 @@ defmodule Ferricstore.Server.Connection do
   # Command dispatch
   # ---------------------------------------------------------------------------
 
-  # Returns `:quit` to signal the loop should stop, or `:continue`.
-  defp dispatch_commands(commands, socket, transport) do
-    responses =
-      Enum.reduce_while(commands, [], fn cmd, acc ->
-        case handle_command(cmd) do
-          {:quit, response} ->
-            {:halt, {:quit, [response | acc]}}
+  # Processes a list of parsed commands, accumulating encoded responses and
+  # threading connection state (for transaction support). Returns
+  # `{:quit | :continue, [iodata()], state}`.
+  defp dispatch_commands(commands, state) do
+    {action, responses, final_state} =
+      Enum.reduce_while(commands, {:continue, [], state}, fn cmd, {_action, acc, st} ->
+        case handle_command(cmd, st) do
+          {:quit, response, new_st} ->
+            {:halt, {:quit, [response | acc], new_st}}
 
-          {:continue, response} ->
-            {:cont, [response | acc]}
+          {:continue, response, new_st} ->
+            {:cont, {:continue, [response | acc], new_st}}
         end
       end)
 
-    case responses do
-      {:quit, acc} ->
-        send_responses(socket, transport, Enum.reverse(acc))
-        :quit
-
-      acc ->
-        send_responses(socket, transport, Enum.reverse(acc))
-        :continue
-    end
+    {action, Enum.reverse(responses), final_state}
   end
 
   # ---------------------------------------------------------------------------
@@ -141,16 +205,29 @@ defmodule Ferricstore.Server.Connection do
   # ---------------------------------------------------------------------------
 
   # Normalise any command form to {name, args} where name is uppercase binary.
-  defp handle_command({:inline, tokens}) do
-    handle_command(tokens)
+  defp handle_command({:inline, tokens}, state) do
+    handle_command(tokens, state)
   end
 
-  defp handle_command([name | args]) when is_binary(name) do
-    dispatch(String.upcase(name), args)
+  @pre_auth_cmds ~w(AUTH HELLO QUIT RESET)
+
+  defp handle_command([name | args], state) when is_binary(name) do
+    cmd = String.upcase(name)
+
+    if requires_auth?(state) and cmd not in @pre_auth_cmds do
+      {:continue, Encoder.encode({:error, "NOAUTH Authentication required."}), state}
+    else
+      Stats.incr_commands()
+      dispatch(cmd, args, state)
+    end
   end
 
-  defp handle_command(_unknown) do
-    {:continue, Encoder.encode({:error, "ERR unknown command format"})}
+  defp requires_auth?(state) do
+    not state.authenticated and Ferricstore.Config.get_value("requirepass") != ""
+  end
+
+  defp handle_command(_unknown, state) do
+    {:continue, Encoder.encode({:error, "ERR unknown command format"}), state}
   end
 
   # ---------------------------------------------------------------------------
@@ -158,44 +235,471 @@ defmodule Ferricstore.Server.Connection do
   # ---------------------------------------------------------------------------
 
   # Protocol-level commands stay in the connection layer.
-  defp dispatch("HELLO", args), do: handle_hello(args)
+  defp dispatch("HELLO", args, state), do: handle_hello(args, state)
   # CLIENT HELLO [version] is the two-token form sent by some Redis clients.
-  defp dispatch("CLIENT", ["HELLO" | args]), do: handle_hello(args)
-  defp dispatch("QUIT", _args), do: {:quit, Encoder.encode(:ok)}
-  defp dispatch("RESET", _args), do: {:continue, Encoder.encode({:simple, "RESET"})}
+  defp dispatch("CLIENT", ["HELLO" | args], state), do: handle_hello(args, state)
+
+  # CLIENT subcommands that need connection state.
+  defp dispatch("CLIENT", args, state) do
+    store = build_store(state.sandbox_namespace)
+
+    conn_state = %{
+      client_id: state.client_id,
+      client_name: state.client_name,
+      created_at: state.created_at,
+      peer: state.peer
+    }
+
+    {result, updated_conn_state} = Dispatcher.dispatch_client(args, conn_state, store)
+
+    updated_state = %{
+      state
+      | client_name: updated_conn_state[:client_name] || state.client_name
+    }
+
+    {:continue, Encoder.encode(result), updated_state}
+  end
+
+  defp dispatch("QUIT", _args, state), do: {:quit, Encoder.encode(:ok), state}
+
+  # AUTH command
+  defp dispatch("AUTH", args, state) do
+    requirepass = Ferricstore.Config.get_value("requirepass")
+
+    case {requirepass, args} do
+      {"", _} ->
+        {:continue, Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}), state}
+
+      {pass, [pass]} ->
+        {:continue, Encoder.encode(:ok), %{state | authenticated: true}}
+
+      {pass, [_user, pass]} ->
+        {:continue, Encoder.encode(:ok), %{state | authenticated: true}}
+
+      {_, [_wrong]} ->
+        {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
+
+      {_, [_user, _wrong]} ->
+        {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
+
+      {_, []} ->
+        {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
+
+      _ ->
+        {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
+    end
+  end
+
+  # ACL subcommands — upcase subcommand for case-insensitive matching
+  defp dispatch("ACL", [subcmd | rest], state) do
+    dispatch_acl(String.upcase(subcmd), rest, state)
+  end
+
+  defp dispatch("ACL", [], state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl' command"}), state}
+  end
+
+  defp dispatch_acl("WHOAMI", _, state) do
+    {:continue, Encoder.encode("default"), state}
+  end
+
+  defp dispatch_acl("LIST", _, state) do
+    {:continue, Encoder.encode(["user default on ~* &* +@all"]), state}
+  end
+
+  defp dispatch_acl("CAT", _, state) do
+    cats = ~w(keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast slow blocking dangerous connection transaction server generic)
+    {:continue, Encoder.encode(cats), state}
+  end
+
+  defp dispatch_acl("LOG", ["RESET" | _], state) do
+    {:continue, Encoder.encode(:ok), state}
+  end
+
+  defp dispatch_acl("LOG", _, state) do
+    {:continue, Encoder.encode([]), state}
+  end
+
+  defp dispatch_acl("GETUSER", ["default" | _], state) do
+    info = ["flags", ["on"], "passwords", [], "commands", "+@all", "keys", "~*", "channels", "&*"]
+    {:continue, Encoder.encode(info), state}
+  end
+
+  defp dispatch_acl("GETUSER", [_user | _], state) do
+    {:continue, Encoder.encode(nil), state}
+  end
+
+  defp dispatch_acl(_, _, state) do
+    {:continue, Encoder.encode({:error, "ERR unknown subcommand or wrong number of arguments for 'acl' command"}), state}
+  end
+
+  defp dispatch("RESET", _args, state) do
+    # RESET clears transaction state and sandbox namespace.
+    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}, sandbox_namespace: nil}
+    {:continue, Encoder.encode({:simple, "RESET"}), new_state}
+  end
+
+  # -- SANDBOX commands -------------------------------------------------------
+
+  defp dispatch("SANDBOX", [subcmd | rest], state) do
+    sandbox_mode = Ferricstore.Config.get_value("sandbox_mode")
+    sandbox_enabled? = sandbox_mode in ["local", "enabled"]
+
+    case String.upcase(subcmd) do
+      "START" when sandbox_enabled? ->
+        ns = "test_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+        {:continue, Encoder.encode(ns), %{state | sandbox_namespace: ns}}
+
+      "JOIN" when sandbox_enabled? ->
+        case rest do
+          [token | _] ->
+            {:continue, Encoder.encode(:ok), %{state | sandbox_namespace: token}}
+
+          [] ->
+            {:continue, Encoder.encode({:error, "ERR SANDBOX JOIN requires a namespace token"}), state}
+        end
+
+      "END" when sandbox_enabled? ->
+        if state.sandbox_namespace do
+          # Flush keys with sandbox prefix
+          ns = state.sandbox_namespace
+          keys = Router.keys()
+          Enum.each(keys, fn k -> if String.starts_with?(k, ns), do: Router.delete(k) end)
+          {:continue, Encoder.encode(:ok), %{state | sandbox_namespace: nil}}
+        else
+          {:continue, Encoder.encode({:error, "ERR no active sandbox session"}), state}
+        end
+
+      "TOKEN" when sandbox_enabled? ->
+        {:continue, Encoder.encode(state.sandbox_namespace), state}
+
+      cmd when cmd in ~w(START JOIN END TOKEN) ->
+        {:continue, Encoder.encode({:error, "ERR SANDBOX commands are not enabled on this server"}), state}
+
+      _ ->
+        {:continue, Encoder.encode({:error, "ERR unknown SANDBOX subcommand"}), state}
+    end
+  end
+
+  defp dispatch("SANDBOX", _args, state) do
+    sandbox_mode = Ferricstore.Config.get_value("sandbox_mode")
+
+    if sandbox_mode in ["local", "enabled"] do
+      {:continue, Encoder.encode({:error, "ERR unknown SANDBOX subcommand"}), state}
+    else
+      {:continue, Encoder.encode({:error, "ERR SANDBOX commands are not enabled on this server"}), state}
+    end
+  end
+
+  # -- Transaction commands --------------------------------------------------
+
+  defp dispatch("MULTI", _args, %{multi_state: :queuing} = state) do
+    {:continue, Encoder.encode({:error, "ERR MULTI calls can not be nested"}), state}
+  end
+
+  defp dispatch("MULTI", _args, state) do
+    new_state = %{state | multi_state: :queuing, multi_queue: []}
+    {:continue, Encoder.encode(:ok), new_state}
+  end
+
+  defp dispatch("EXEC", _args, %{multi_state: :none} = state) do
+    {:continue, Encoder.encode({:error, "ERR EXEC without MULTI"}), state}
+  end
+
+  defp dispatch("EXEC", _args, state) do
+    result = execute_transaction(state)
+    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}}
+    {:continue, Encoder.encode(result), new_state}
+  end
+
+  defp dispatch("DISCARD", _args, %{multi_state: :none} = state) do
+    {:continue, Encoder.encode({:error, "ERR DISCARD without MULTI"}), state}
+  end
+
+  defp dispatch("DISCARD", _args, state) do
+    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}}
+    {:continue, Encoder.encode(:ok), new_state}
+  end
+
+  defp dispatch("WATCH", _args, %{multi_state: :queuing} = state) do
+    {:continue,
+     Encoder.encode({:error, "ERR WATCH inside MULTI is not allowed"}), state}
+  end
+
+  defp dispatch("WATCH", [], state) do
+    {:continue,
+     Encoder.encode({:error, "ERR wrong number of arguments for 'watch' command"}), state}
+  end
+
+  defp dispatch("WATCH", keys, state) do
+    new_watched =
+      Enum.reduce(keys, state.watched_keys, fn key, acc ->
+        version = Router.get_version(key)
+        Map.put(acc, key, version)
+      end)
+
+    {:continue, Encoder.encode(:ok), %{state | watched_keys: new_watched}}
+  end
+
+  defp dispatch("UNWATCH", _args, state) do
+    {:continue, Encoder.encode(:ok), %{state | watched_keys: %{}}}
+  end
+
+  # -- Pub/Sub commands handled in connection layer -------------------------
+
+  defp dispatch("SUBSCRIBE", [], state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'subscribe' command"}), state}
+  end
+
+  defp dispatch("SUBSCRIBE", channels, state) do
+    {responses, new_state} =
+      Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
+        PS.subscribe(ch, self())
+        new_channels = MapSet.put(st.pubsub_channels, ch)
+        new_st = %{st | pubsub_channels: new_channels}
+        count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
+        push = {:push, ["subscribe", ch, count]}
+        {[Encoder.encode(push) | acc], new_st}
+      end)
+
+    # Switch to active:once for receiving pub/sub messages
+    new_state.transport.setopts(new_state.socket, active: :once)
+    {:continue, Enum.reverse(responses), new_state}
+  end
+
+  defp dispatch("UNSUBSCRIBE", [], state) do
+    dispatch("UNSUBSCRIBE", MapSet.to_list(state.pubsub_channels), state)
+  end
+
+  defp dispatch("UNSUBSCRIBE", channels, state) do
+    {responses, new_state} =
+      Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
+        PS.unsubscribe(ch, self())
+        new_channels = MapSet.delete(st.pubsub_channels, ch)
+        new_st = %{st | pubsub_channels: new_channels}
+        count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
+        push = {:push, ["unsubscribe", ch, count]}
+        {[Encoder.encode(push) | acc], new_st}
+      end)
+
+    # Exit pub/sub mode if no subscriptions remain
+    if not in_pubsub_mode?(new_state) do
+      new_state.transport.setopts(new_state.socket, active: false)
+    end
+
+    {:continue, Enum.reverse(responses), new_state}
+  end
+
+  defp dispatch("PSUBSCRIBE", [], state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'psubscribe' command"}), state}
+  end
+
+  defp dispatch("PSUBSCRIBE", patterns, state) do
+    {responses, new_state} =
+      Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
+        PS.psubscribe(pat, self())
+        new_patterns = MapSet.put(st.pubsub_patterns, pat)
+        new_st = %{st | pubsub_patterns: new_patterns}
+        count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
+        push = {:push, ["psubscribe", pat, count]}
+        {[Encoder.encode(push) | acc], new_st}
+      end)
+
+    new_state.transport.setopts(new_state.socket, active: :once)
+    {:continue, Enum.reverse(responses), new_state}
+  end
+
+  defp dispatch("PUNSUBSCRIBE", [], state) do
+    dispatch("PUNSUBSCRIBE", MapSet.to_list(state.pubsub_patterns), state)
+  end
+
+  defp dispatch("PUNSUBSCRIBE", patterns, state) do
+    {responses, new_state} =
+      Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
+        PS.punsubscribe(pat, self())
+        new_patterns = MapSet.delete(st.pubsub_patterns, pat)
+        new_st = %{st | pubsub_patterns: new_patterns}
+        count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
+        push = {:push, ["punsubscribe", pat, count]}
+        {[Encoder.encode(push) | acc], new_st}
+      end)
+
+    if not in_pubsub_mode?(new_state) do
+      new_state.transport.setopts(new_state.socket, active: false)
+    end
+
+    {:continue, Enum.reverse(responses), new_state}
+  end
+
+  # -- Queuing mode: intercept all non-passthrough commands ------------------
+
+  defp dispatch(cmd, args, %{multi_state: :queuing} = state)
+       when cmd not in @multi_passthrough_cmds do
+    # Validate command syntax at queue time. If the dispatcher returns an
+    # error, send it immediately but stay in MULTI mode.
+    store = build_store(state.sandbox_namespace)
+
+    case validate_command(cmd, args, store) do
+      :ok ->
+        new_queue = state.multi_queue ++ [{cmd, args}]
+        {:continue, Encoder.encode({:simple, "QUEUED"}), %{state | multi_queue: new_queue}}
+
+      {:error, _msg} = err ->
+        {:continue, Encoder.encode(err), state}
+    end
+  end
+
+  # -- Blocking list commands (handled in connection layer) ------------------
+
+  defp dispatch("BLPOP", args, state) do
+    result = Ferricstore.Commands.Blocking.handle("BLPOP", args, build_store(state.sandbox_namespace))
+    {:continue, Encoder.encode(result), state}
+  end
+
+  defp dispatch("BRPOP", args, state) do
+    result = Ferricstore.Commands.Blocking.handle("BRPOP", args, build_store(state.sandbox_namespace))
+    {:continue, Encoder.encode(result), state}
+  end
+
+  defp dispatch("BLMOVE", args, state) do
+    result = Ferricstore.Commands.Blocking.handle("BLMOVE", args, build_store(state.sandbox_namespace))
+    {:continue, Encoder.encode(result), state}
+  end
+
+  defp dispatch("BLMPOP", args, state) do
+    result = Ferricstore.Commands.Blocking.handle("BLMPOP", args, build_store(state.sandbox_namespace))
+    {:continue, Encoder.encode(result), state}
+  end
 
   # All other commands go through the Dispatcher with an injected store.
-  defp dispatch(cmd, args) do
-    store = build_store()
-    result = Dispatcher.dispatch(cmd, args, store)
-    {:continue, Encoder.encode(result)}
+  # But first check pub/sub mode restriction (PING is allowed in pub/sub mode).
+  defp dispatch(cmd, args, state) do
+    if in_pubsub_mode?(state) and cmd not in ~w(PING) do
+      {:continue,
+       Encoder.encode({:error, "ERR Can't execute '#{String.downcase(cmd)}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"}),
+       state}
+    else
+      store = build_store(state.sandbox_namespace)
+      result = Dispatcher.dispatch(cmd, args, store)
+      maybe_notify_keyspace(cmd, args, result)
+      {:continue, Encoder.encode(result), state}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Transaction execution
+  # ---------------------------------------------------------------------------
+
+  # Executes the queued commands if WATCH keys are unmodified, or returns nil
+  # (abort) if any watched key's version has changed.
+  defp execute_transaction(%{watched_keys: watched, multi_queue: queue, sandbox_namespace: ns}) do
+    if watches_clean?(watched) do
+      results =
+        Enum.map(queue, fn {cmd, args} ->
+          store = build_store(ns)
+          Dispatcher.dispatch(cmd, args, store)
+        end)
+
+      results
+    else
+      # WATCH detected a conflict — abort and return nil (like Redis).
+      nil
+    end
+  end
+
+  # Returns true if all watched keys still have their original versions.
+  defp watches_clean?(watched) when map_size(watched) == 0, do: true
+
+  defp watches_clean?(watched) do
+    Enum.all?(watched, fn {key, saved_version} ->
+      Router.get_version(key) == saved_version
+    end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Command validation (for queue-time syntax checking)
+  # ---------------------------------------------------------------------------
+
+  # Validates that a command is known and has the correct arity without
+  # executing it. Uses a no-op store so no side effects occur during validation.
+  defp validate_command(cmd, args, _store) do
+    noop_store = build_noop_store()
+
+    case Dispatcher.dispatch(cmd, args, noop_store) do
+      {:error, "ERR unknown command" <> _} = err -> err
+      {:error, "ERR wrong number of arguments" <> _} = err -> err
+      {:error, "ERR syntax error" <> _} = err -> err
+      _ -> :ok
+    end
+  end
+
+  # A store that returns safe no-op values for all operations. Used only for
+  # command validation during MULTI queuing — no data is read or written.
+  defp build_noop_store do
+    %{
+      get: fn _key -> nil end,
+      get_meta: fn _key -> nil end,
+      put: fn _key, _value, _expire_at_ms -> :ok end,
+      delete: fn _key -> :ok end,
+      exists?: fn _key -> false end,
+      keys: fn -> [] end,
+      flush: fn -> :ok end,
+      dbsize: fn -> 0 end,
+      incr: fn _key, _delta -> {:ok, 0} end,
+      incr_float: fn _key, _delta -> {:ok, "0"} end,
+      append: fn _key, _suffix -> {:ok, 0} end,
+      getset: fn _key, _value -> nil end,
+      getdel: fn _key -> nil end,
+      getex: fn _key, _expire -> nil end,
+      setrange: fn _key, _offset, _value -> {:ok, 0} end,
+      cas: fn _key, _exp, _new, _ttl -> nil end,
+      lock: fn _key, _owner, _ttl -> :ok end,
+      unlock: fn _key, _owner -> 1 end,
+      extend: fn _key, _owner, _ttl -> 1 end,
+      ratelimit_add: fn _key, _window, _max, _count -> ["allowed", 0, 0, 0] end,
+      list_op: fn _key, _op -> nil end
+    }
   end
 
   # ---------------------------------------------------------------------------
   # HELLO handler
   # ---------------------------------------------------------------------------
 
-  defp handle_hello(["3" | _rest]) do
-    {:continue, Encoder.encode(greeting_map())}
+  defp handle_hello(["3" | _rest], state) do
+    {:continue, Encoder.encode(greeting_map(state)), state}
   end
 
-  defp handle_hello([version | _rest]) when is_binary(version) do
+  defp handle_hello([version | _rest], state) when is_binary(version) do
     {:continue,
-     Encoder.encode({:error, "NOPROTO this server does not support the requested protocol version"})}
+     Encoder.encode({:error, "NOPROTO this server does not support the requested protocol version"}),
+     state}
   end
 
-  defp handle_hello([]) do
+  defp handle_hello([], state) do
     # HELLO with no version returns current server info (RESP3)
-    {:continue, Encoder.encode(greeting_map())}
+    {:continue, Encoder.encode(greeting_map(state)), state}
   end
 
   # ---------------------------------------------------------------------------
   # Store builder — wraps Router functions into the store map contract
   # ---------------------------------------------------------------------------
 
-  defp build_store do
-    alias Ferricstore.Store.Router
+  defp build_store(nil) do
+    build_raw_store()
+  end
 
+  defp build_store(ns) when is_binary(ns) do
+    raw = build_raw_store()
+    %{raw |
+      get: fn key -> raw.get.(ns <> key) end,
+      get_meta: fn key -> raw.get_meta.(ns <> key) end,
+      put: fn key, val, exp -> raw.put.(ns <> key, val, exp) end,
+      delete: fn key -> raw.delete.(ns <> key) end,
+      exists?: fn key -> raw.exists?.(ns <> key) end
+    }
+  end
+
+  defp build_raw_store do
     %{
       get: &Router.get/1,
       get_meta: &Router.get_meta/1,
@@ -207,7 +711,20 @@ defmodule Ferricstore.Server.Connection do
         Enum.each(Router.keys(), &Router.delete/1)
         :ok
       end,
-      dbsize: &Router.dbsize/0
+      dbsize: &Router.dbsize/0,
+      incr: &Router.incr/2,
+      incr_float: &Router.incr_float/2,
+      append: &Router.append/2,
+      getset: &Router.getset/2,
+      getdel: &Router.getdel/1,
+      getex: &Router.getex/2,
+      setrange: &Router.setrange/3,
+      cas: &Router.cas/4,
+      lock: &Router.lock/3,
+      unlock: &Router.unlock/2,
+      extend: &Router.extend/3,
+      ratelimit_add: &Router.ratelimit_add/4,
+      list_op: &Router.list_op/2
     }
   end
 
@@ -215,12 +732,12 @@ defmodule Ferricstore.Server.Connection do
   # Greeting map
   # ---------------------------------------------------------------------------
 
-  defp greeting_map do
+  defp greeting_map(state) do
     %{
       "server" => "ferricstore",
       "version" => "0.1.0",
       "proto" => 3,
-      "id" => generate_client_id(),
+      "id" => state.client_id,
       "mode" => "standalone",
       "role" => "master",
       "modules" => []
@@ -236,11 +753,108 @@ defmodule Ferricstore.Server.Connection do
   # ---------------------------------------------------------------------------
 
   defp send_responses(socket, transport, responses) do
-    iodata = Enum.map(responses, & &1)
+    iodata = List.flatten(responses)
     :ok = transport.send(socket, iodata)
   end
 
   defp send_response(socket, transport, iodata) do
     :ok = transport.send(socket, iodata)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Pub/Sub mode loop
+  # ---------------------------------------------------------------------------
+
+  defp pubsub_loop(%__MODULE__{socket: socket, transport: transport} = state) do
+    receive do
+      {:tcp, ^socket, data} ->
+        transport.setopts(socket, active: :once)
+        handle_data(state, data)
+
+      {:tcp_closed, ^socket} ->
+        cleanup_pubsub(state)
+
+      {:tcp_error, ^socket, _reason} ->
+        cleanup_pubsub(state)
+        transport.close(socket)
+
+      {:pubsub_message, channel, message} ->
+        push = {:push, ["message", channel, message]}
+        transport.send(socket, Encoder.encode(push))
+        transport.setopts(socket, active: :once)
+        pubsub_loop(state)
+
+      {:pubsub_pmessage, pattern, channel, message} ->
+        push = {:push, ["pmessage", pattern, channel, message]}
+        transport.send(socket, Encoder.encode(push))
+        transport.setopts(socket, active: :once)
+        pubsub_loop(state)
+    end
+  end
+
+  defp in_pubsub_mode?(state) do
+    MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
+  end
+
+  # ---------------------------------------------------------------------------
+  # Keyspace notification helpers
+  # ---------------------------------------------------------------------------
+
+  # Maps command names to their keyspace notification event names.
+  # Only fires on successful results (not errors).
+  @keyspace_events %{
+    "SET" => "set", "SETNX" => "set", "SETEX" => "set", "PSETEX" => "set",
+    "MSET" => "mset", "MSETNX" => "mset",
+    "APPEND" => "append", "GETSET" => "getset", "GETDEL" => "getdel",
+    "SETRANGE" => "setrange",
+    "INCR" => "incr", "DECR" => "decr", "INCRBY" => "incrby",
+    "DECRBY" => "decrby", "INCRBYFLOAT" => "incrbyfloat",
+    "DEL" => "del", "UNLINK" => "del",
+    "EXPIRE" => "expire", "PEXPIRE" => "pexpire",
+    "EXPIREAT" => "expireat", "PEXPIREAT" => "pexpireat",
+    "PERSIST" => "persist",
+    "RENAME" => "rename",
+    "LPUSH" => "lpush", "RPUSH" => "rpush",
+    "LPOP" => "lpop", "RPOP" => "rpop",
+    "LSET" => "lset", "LINSERT" => "linsert", "LTRIM" => "ltrim",
+    "LREM" => "lrem", "LMOVE" => "lmove",
+    "SADD" => "sadd", "SREM" => "srem", "SPOP" => "spop",
+    "HSET" => "hset", "HDEL" => "hdel", "HINCRBY" => "hincrby",
+    "HINCRBYFLOAT" => "hincrbyfloat",
+    "ZADD" => "zadd", "ZREM" => "zrem", "ZINCRBY" => "zincrby",
+    "COPY" => "copy"
+  }
+
+  defp maybe_notify_keyspace(cmd, args, result) do
+    case Map.get(@keyspace_events, cmd) do
+      nil -> :ok
+      event -> do_notify_keyspace(cmd, event, args, result)
+    end
+  end
+
+  # For DEL/UNLINK with multiple keys, notify per key
+  defp do_notify_keyspace(cmd, event, keys, count)
+       when cmd in ~w(DEL UNLINK) and is_integer(count) and count > 0 do
+    Enum.each(keys, fn key -> KeyspaceNotifications.notify(key, event) end)
+  end
+
+  # For MSET, notify per key
+  defp do_notify_keyspace("MSET", event, args, :ok) do
+    args
+    |> Enum.chunk_every(2)
+    |> Enum.each(fn [key, _val] -> KeyspaceNotifications.notify(key, event) end)
+  end
+
+  # Single-key commands: first arg is the key. Skip errors.
+  defp do_notify_keyspace(_cmd, _event, _args, {:error, _}), do: :ok
+  defp do_notify_keyspace(_cmd, _event, [], _result), do: :ok
+
+  defp do_notify_keyspace(_cmd, event, [key | _], _result) do
+    KeyspaceNotifications.notify(key, event)
+  end
+
+  defp cleanup_pubsub(state) do
+    Enum.each(state.pubsub_channels, &PS.unsubscribe(&1, self()))
+    Enum.each(state.pubsub_patterns, &PS.punsubscribe(&1, self()))
   end
 end

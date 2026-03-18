@@ -1,0 +1,286 @@
+defmodule Ferricstore.Commands.HyperLogLogTest do
+  @moduledoc false
+  use ExUnit.Case, async: true
+
+  alias Ferricstore.Commands.HyperLogLog, as: HLLCmd
+  alias Ferricstore.HyperLogLog, as: HLL
+  alias Ferricstore.Test.MockStore
+
+  # ---------------------------------------------------------------------------
+  # PFADD
+  # ---------------------------------------------------------------------------
+
+  describe "PFADD" do
+    test "PFADD to new key creates sketch and returns 1" do
+      store = MockStore.make()
+      assert 1 == HLLCmd.handle("PFADD", ["mykey", "hello"], store)
+
+      # The key now holds a valid HLL sketch
+      sketch = store.get.("mykey")
+      assert HLL.valid_sketch?(sketch)
+    end
+
+    test "PFADD same element twice — second returns 0" do
+      store = MockStore.make()
+      assert 1 == HLLCmd.handle("PFADD", ["mykey", "hello"], store)
+      assert 0 == HLLCmd.handle("PFADD", ["mykey", "hello"], store)
+    end
+
+    test "PFADD multiple elements — returns 1 if any modified sketch" do
+      store = MockStore.make()
+      assert 1 == HLLCmd.handle("PFADD", ["mykey", "a", "b", "c"], store)
+    end
+
+    test "PFADD multiple elements all duplicates — returns 0" do
+      store = MockStore.make()
+      assert 1 == HLLCmd.handle("PFADD", ["mykey", "a", "b"], store)
+      assert 0 == HLLCmd.handle("PFADD", ["mykey", "a", "b"], store)
+    end
+
+    test "PFADD new element to existing sketch returns 1" do
+      store = MockStore.make()
+      assert 1 == HLLCmd.handle("PFADD", ["mykey", "a"], store)
+      assert 1 == HLLCmd.handle("PFADD", ["mykey", "b"], store)
+    end
+
+    test "PFADD with empty string element works" do
+      store = MockStore.make()
+      assert 1 == HLLCmd.handle("PFADD", ["mykey", ""], store)
+
+      sketch = store.get.("mykey")
+      assert HLL.valid_sketch?(sketch)
+      assert HLL.count(sketch) >= 1
+    end
+
+    test "PFADD wrong number of args — error (no key)" do
+      assert {:error, msg} = HLLCmd.handle("PFADD", [], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "PFADD wrong number of args — error (key but no elements)" do
+      assert {:error, msg} = HLLCmd.handle("PFADD", ["mykey"], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "PFADD to key holding non-HLL value returns WRONGTYPE error" do
+      store = MockStore.make(%{"mykey" => {"not-a-sketch", 0}})
+
+      assert {:error, msg} = HLLCmd.handle("PFADD", ["mykey", "elem"], store)
+      assert msg =~ "WRONGTYPE"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # PFCOUNT
+  # ---------------------------------------------------------------------------
+
+  describe "PFCOUNT" do
+    test "PFCOUNT on non-existent key returns 0" do
+      store = MockStore.make()
+      assert 0 == HLLCmd.handle("PFCOUNT", ["nokey"], store)
+    end
+
+    test "PFCOUNT after adding single element returns 1" do
+      store = MockStore.make()
+      HLLCmd.handle("PFADD", ["mykey", "hello"], store)
+      assert 1 == HLLCmd.handle("PFCOUNT", ["mykey"], store)
+    end
+
+    test "PFCOUNT after adding N=100 unique elements — within 10%" do
+      store = MockStore.make()
+      n = 100
+
+      elements = for i <- 1..n, do: "element:#{i}"
+      HLLCmd.handle("PFADD", ["mykey" | elements], store)
+
+      count = HLLCmd.handle("PFCOUNT", ["mykey"], store)
+      assert_in_delta count, n, n * 0.10
+    end
+
+    test "PFCOUNT after adding N=1000 unique elements — within 10%" do
+      store = MockStore.make()
+      n = 1000
+
+      elements = for i <- 1..n, do: "element:#{i}"
+      HLLCmd.handle("PFADD", ["mykey" | elements], store)
+
+      count = HLLCmd.handle("PFCOUNT", ["mykey"], store)
+      assert_in_delta count, n, n * 0.10
+    end
+
+    test "PFCOUNT multiple keys — merges in memory, returns combined estimate" do
+      store = MockStore.make()
+
+      # Add distinct elements to two separate keys
+      HLLCmd.handle("PFADD", ["key1", "a", "b", "c"], store)
+      HLLCmd.handle("PFADD", ["key2", "d", "e", "f"], store)
+
+      count = HLLCmd.handle("PFCOUNT", ["key1", "key2"], store)
+      # Combined cardinality should be approximately 6
+      assert_in_delta count, 6, 3
+    end
+
+    test "PFCOUNT multiple keys with overlap" do
+      store = MockStore.make()
+
+      HLLCmd.handle("PFADD", ["key1", "a", "b", "c"], store)
+      HLLCmd.handle("PFADD", ["key2", "b", "c", "d"], store)
+
+      count = HLLCmd.handle("PFCOUNT", ["key1", "key2"], store)
+      # Combined unique cardinality should be approximately 4 (a, b, c, d)
+      assert_in_delta count, 4, 3
+    end
+
+    test "PFCOUNT multiple keys with non-existent key — treated as empty" do
+      store = MockStore.make()
+      HLLCmd.handle("PFADD", ["key1", "a", "b"], store)
+
+      count = HLLCmd.handle("PFCOUNT", ["key1", "nonexistent"], store)
+      # Should still return approximately 2
+      assert_in_delta count, 2, 2
+    end
+
+    test "PFCOUNT wrong number of args — error" do
+      assert {:error, msg} = HLLCmd.handle("PFCOUNT", [], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "PFCOUNT on key holding non-HLL value returns WRONGTYPE error" do
+      store = MockStore.make(%{"mykey" => {"not-a-sketch", 0}})
+
+      assert {:error, msg} = HLLCmd.handle("PFCOUNT", ["mykey"], store)
+      assert msg =~ "WRONGTYPE"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # PFMERGE
+  # ---------------------------------------------------------------------------
+
+  describe "PFMERGE" do
+    test "PFMERGE creates dest with merged sketch" do
+      store = MockStore.make()
+
+      HLLCmd.handle("PFADD", ["src1", "a", "b"], store)
+      HLLCmd.handle("PFADD", ["src2", "c", "d"], store)
+
+      assert :ok = HLLCmd.handle("PFMERGE", ["dest", "src1", "src2"], store)
+
+      dest_sketch = store.get.("dest")
+      assert HLL.valid_sketch?(dest_sketch)
+
+      count = HLL.count(dest_sketch)
+      assert_in_delta count, 4, 3
+    end
+
+    test "PFMERGE with non-existent source — treated as empty" do
+      store = MockStore.make()
+
+      HLLCmd.handle("PFADD", ["src1", "a"], store)
+
+      assert :ok = HLLCmd.handle("PFMERGE", ["dest", "src1", "nonexistent"], store)
+
+      count = HLLCmd.handle("PFCOUNT", ["dest"], store)
+      assert_in_delta count, 1, 1
+    end
+
+    test "PFMERGE into existing dest — merges with existing" do
+      store = MockStore.make()
+
+      # Populate dest with some elements first
+      HLLCmd.handle("PFADD", ["dest", "x", "y"], store)
+      HLLCmd.handle("PFADD", ["src", "z"], store)
+
+      assert :ok = HLLCmd.handle("PFMERGE", ["dest", "src"], store)
+
+      count = HLLCmd.handle("PFCOUNT", ["dest"], store)
+      # Should contain approximately x, y, z = 3
+      assert_in_delta count, 3, 2
+    end
+
+    test "PFMERGE with all non-existent sources creates empty dest" do
+      store = MockStore.make()
+
+      assert :ok = HLLCmd.handle("PFMERGE", ["dest", "nokey1", "nokey2"], store)
+
+      count = HLLCmd.handle("PFCOUNT", ["dest"], store)
+      assert count == 0
+    end
+
+    test "PFMERGE wrong number of args — error (no args)" do
+      assert {:error, msg} = HLLCmd.handle("PFMERGE", [], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "PFMERGE wrong number of args — error (only destkey)" do
+      assert {:error, msg} = HLLCmd.handle("PFMERGE", ["dest"], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "PFMERGE with source holding non-HLL value returns WRONGTYPE error" do
+      store = MockStore.make(%{"bad" => {"not-a-sketch", 0}})
+
+      assert {:error, msg} = HLLCmd.handle("PFMERGE", ["dest", "bad"], store)
+      assert msg =~ "WRONGTYPE"
+    end
+
+    test "PFMERGE with dest holding non-HLL value returns WRONGTYPE error" do
+      store = MockStore.make(%{"dest" => {"not-a-sketch", 0}})
+
+      HLLCmd.handle("PFADD", ["src", "a"], store)
+
+      assert {:error, msg} = HLLCmd.handle("PFMERGE", ["dest", "src"], store)
+      assert msg =~ "WRONGTYPE"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Accuracy test
+  # ---------------------------------------------------------------------------
+
+  describe "accuracy" do
+    test "PFADD 10,000 unique elements — count within 2%" do
+      store = MockStore.make()
+      n = 10_000
+
+      # Add in batches to avoid creating a huge argument list
+      Enum.chunk_every(1..n, 500)
+      |> Enum.each(fn batch ->
+        elements = Enum.map(batch, &"item:#{&1}")
+        HLLCmd.handle("PFADD", ["bigkey" | elements], store)
+      end)
+
+      count = HLLCmd.handle("PFCOUNT", ["bigkey"], store)
+      assert_in_delta count, n, n * 0.02
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Dispatcher routing
+  # ---------------------------------------------------------------------------
+
+  describe "dispatcher routing" do
+    alias Ferricstore.Commands.Dispatcher
+
+    test "dispatches PFADD via dispatcher" do
+      store = MockStore.make()
+      assert 1 == Dispatcher.dispatch("PFADD", ["k", "v"], store)
+    end
+
+    test "dispatches pfadd via dispatcher (case insensitive)" do
+      store = MockStore.make()
+      assert 1 == Dispatcher.dispatch("pfadd", ["k", "v"], store)
+    end
+
+    test "dispatches PFCOUNT via dispatcher" do
+      store = MockStore.make()
+      assert 0 == Dispatcher.dispatch("PFCOUNT", ["nokey"], store)
+    end
+
+    test "dispatches PFMERGE via dispatcher" do
+      store = MockStore.make()
+      Dispatcher.dispatch("PFADD", ["src", "a"], store)
+      assert :ok = Dispatcher.dispatch("PFMERGE", ["dest", "src"], store)
+    end
+  end
+end

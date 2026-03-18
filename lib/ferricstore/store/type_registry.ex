@@ -1,0 +1,141 @@
+defmodule Ferricstore.Store.TypeRegistry do
+  @moduledoc """
+  Manages type metadata for Redis keys that hold data structures.
+
+  When a key is first used as a hash, list, set, or sorted set, a type
+  metadata entry is written to the same Bitcask shard:
+
+      T:keyname -> "hash" | "list" | "set" | "zset"
+
+  Subsequent commands check this metadata and return a WRONGTYPE error if
+  the command's expected type does not match. String keys do NOT get a type
+  entry -- only data structure keys do. This matches Redis behavior where
+  string operations on a data structure key return WRONGTYPE.
+
+  ## Type Enforcement
+
+  The `check_or_set/3` function either:
+  1. Sets the type if the key has no type yet (first use)
+  2. Returns `:ok` if the key already has the expected type
+  3. Returns `{:error, wrongtype_message}` if the type mismatches
+  """
+
+  alias Ferricstore.Store.CompoundKey
+
+  @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
+
+  @doc """
+  Checks that `redis_key` has the expected `type`, or sets it if the key
+  has no type metadata yet.
+
+  ## Parameters
+
+    - `redis_key` - the Redis key to check
+    - `type` - the expected data type (`:hash`, `:list`, `:set`, `:zset`)
+    - `store` - the injected store map
+
+  ## Returns
+
+    - `:ok` if the type matches or was newly set
+    - `{:error, wrongtype_message}` if the type mismatches
+  """
+  @spec check_or_set(binary(), CompoundKey.data_type(), map()) :: :ok | {:error, binary()}
+  def check_or_set(redis_key, type, store) do
+    type_key = CompoundKey.type_key(redis_key)
+    expected = CompoundKey.encode_type(type)
+
+    case store.compound_get.(redis_key, type_key) do
+      nil ->
+        store.compound_put.(redis_key, type_key, expected, 0)
+        :ok
+
+      ^expected ->
+        :ok
+
+      _other_type ->
+        {:error, @wrongtype_msg}
+    end
+  end
+
+  @doc """
+  Returns the type of a Redis key, or `nil` if no type metadata exists.
+
+  Used by the TYPE command.
+
+  ## Parameters
+
+    - `redis_key` - the Redis key to look up
+    - `store` - the injected store map
+
+  ## Returns
+
+    - `"hash"`, `"list"`, `"set"`, `"zset"`, `"string"`, or `"none"`
+  """
+  @spec get_type(binary(), map()) :: binary()
+  def get_type(redis_key, store) do
+    # Check compound key type registry first (for hash/set/zset)
+    type_key = CompoundKey.type_key(redis_key)
+
+    case store.compound_get.(redis_key, type_key) do
+      nil ->
+        # No type registry entry — check if plain string or serialized list
+        case store.get.(redis_key) do
+          nil -> "none"
+          value when is_binary(value) -> detect_serialized_type(value)
+          _ -> "string"
+        end
+
+      type_str ->
+        type_str
+    end
+  end
+
+  defp detect_serialized_type(value) do
+    try do
+      case :erlang.binary_to_term(value) do
+        {:list, _} -> "list"
+        _ -> "string"
+      end
+    rescue
+      ArgumentError -> "string"
+    end
+  end
+
+  @doc """
+  Removes the type metadata for a Redis key.
+
+  Called when DEL removes a data structure key.
+
+  ## Parameters
+
+    - `redis_key` - the Redis key whose type to remove
+    - `store` - the injected store map
+  """
+  @spec delete_type(binary(), map()) :: :ok
+  def delete_type(redis_key, store) do
+    type_key = CompoundKey.type_key(redis_key)
+    store.compound_delete.(redis_key, type_key)
+  end
+
+  @doc """
+  Checks that a key either does not exist or has the expected type,
+  WITHOUT setting the type if it doesn't exist. Used for read-only
+  operations that should not create keys.
+
+  ## Returns
+
+    - `:ok` if the key doesn't exist or has the expected type
+    - `{:error, wrongtype_message}` if the type mismatches
+  """
+  @spec check_type(binary(), CompoundKey.data_type(), map()) :: :ok | {:error, binary()}
+  def check_type(redis_key, type, store) do
+    type_key = CompoundKey.type_key(redis_key)
+    expected = CompoundKey.encode_type(type)
+
+    case store.compound_get.(redis_key, type_key) do
+      nil -> :ok
+      ^expected -> :ok
+      _other_type -> {:error, @wrongtype_msg}
+    end
+  end
+end

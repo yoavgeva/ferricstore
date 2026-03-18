@@ -92,6 +92,17 @@ defmodule Ferricstore.Integration.CommandsTcpTest do
     %{port: Listener.port()}
   end
 
+  # Flush all keys before each test to keep the keydir small.
+  # A growing keydir makes KEYS/DBSIZE calls progressively slower
+  # and can cause GenServer timeouts in later tests.
+  setup %{port: port} do
+    sock = connect_and_hello(port)
+    send_cmd(sock, ["FLUSHDB"])
+    recv_response(sock)
+    :gen_tcp.close(sock)
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # SET and GET over TCP
   # ---------------------------------------------------------------------------

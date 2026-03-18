@@ -1,0 +1,637 @@
+defmodule Ferricstore.Commands.GenericTest do
+  @moduledoc false
+  use ExUnit.Case, async: true
+
+  alias Ferricstore.Commands.Generic
+  alias Ferricstore.Test.MockStore
+
+  # ---------------------------------------------------------------------------
+  # TYPE
+  # ---------------------------------------------------------------------------
+
+  describe "TYPE" do
+    test "TYPE returns 'string' for existing key" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert {:simple, "string"} == Generic.handle("TYPE", ["k"], store)
+    end
+
+    test "TYPE returns 'none' for missing key" do
+      store = MockStore.make()
+      assert {:simple, "none"} == Generic.handle("TYPE", ["missing"], store)
+    end
+
+    test "TYPE returns 'none' for expired key" do
+      past = System.os_time(:millisecond) - 1000
+      store = MockStore.make(%{"k" => {"v", past}})
+      assert {:simple, "none"} == Generic.handle("TYPE", ["k"], store)
+    end
+
+    test "TYPE with no args returns error" do
+      assert {:error, _} = Generic.handle("TYPE", [], MockStore.make())
+    end
+
+    test "TYPE with too many args returns error" do
+      assert {:error, _} = Generic.handle("TYPE", ["a", "b"], MockStore.make())
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # UNLINK
+  # ---------------------------------------------------------------------------
+
+  describe "UNLINK" do
+    test "UNLINK existing key returns 1" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 1 == Generic.handle("UNLINK", ["k"], store)
+    end
+
+    test "UNLINK missing key returns 0" do
+      store = MockStore.make()
+      assert 0 == Generic.handle("UNLINK", ["missing"], store)
+    end
+
+    test "UNLINK multiple keys returns count of deleted" do
+      store = MockStore.make(%{"a" => {"1", 0}, "b" => {"2", 0}})
+      assert 2 == Generic.handle("UNLINK", ["a", "b", "c"], store)
+    end
+
+    test "UNLINK actually removes the key" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      Generic.handle("UNLINK", ["k"], store)
+      assert nil == store.get.("k")
+    end
+
+    test "UNLINK with no args returns error" do
+      assert {:error, _} = Generic.handle("UNLINK", [], MockStore.make())
+    end
+
+    test "UNLINK returns 0 for expired key" do
+      past = System.os_time(:millisecond) - 1000
+      store = MockStore.make(%{"k" => {"v", past}})
+      assert 0 == Generic.handle("UNLINK", ["k"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # RENAME
+  # ---------------------------------------------------------------------------
+
+  describe "RENAME" do
+    test "RENAME renames key" do
+      store = MockStore.make(%{"old" => {"v", 0}})
+      assert :ok = Generic.handle("RENAME", ["old", "new"], store)
+      assert nil == store.get.("old")
+      assert "v" == store.get.("new")
+    end
+
+    test "RENAME preserves TTL" do
+      future = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"old" => {"v", future}})
+      assert :ok = Generic.handle("RENAME", ["old", "new"], store)
+      {_value, expire_at_ms} = store.get_meta.("new")
+      assert expire_at_ms == future
+    end
+
+    test "RENAME errors when source doesn't exist" do
+      store = MockStore.make()
+      assert {:error, "ERR no such key"} = Generic.handle("RENAME", ["missing", "new"], store)
+    end
+
+    test "RENAME overwrites existing destination" do
+      store = MockStore.make(%{"src" => {"new_val", 0}, "dst" => {"old_val", 0}})
+      assert :ok = Generic.handle("RENAME", ["src", "dst"], store)
+      assert nil == store.get.("src")
+      assert "new_val" == store.get.("dst")
+    end
+
+    test "RENAME same key to itself is a no-op" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert :ok = Generic.handle("RENAME", ["k", "k"], store)
+      assert "v" == store.get.("k")
+    end
+
+    test "RENAME with no args returns error" do
+      assert {:error, _} = Generic.handle("RENAME", [], MockStore.make())
+    end
+
+    test "RENAME with one arg returns error" do
+      assert {:error, _} = Generic.handle("RENAME", ["k"], MockStore.make())
+    end
+
+    test "RENAME with too many args returns error" do
+      assert {:error, _} = Generic.handle("RENAME", ["a", "b", "c"], MockStore.make())
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # RENAMENX
+  # ---------------------------------------------------------------------------
+
+  describe "RENAMENX" do
+    test "RENAMENX returns 1 when destination doesn't exist" do
+      store = MockStore.make(%{"old" => {"v", 0}})
+      assert 1 == Generic.handle("RENAMENX", ["old", "new"], store)
+      assert nil == store.get.("old")
+      assert "v" == store.get.("new")
+    end
+
+    test "RENAMENX returns 0 when destination exists" do
+      store = MockStore.make(%{"old" => {"v1", 0}, "new" => {"v2", 0}})
+      assert 0 == Generic.handle("RENAMENX", ["old", "new"], store)
+      # Source should still exist, destination unchanged
+      assert "v1" == store.get.("old")
+      assert "v2" == store.get.("new")
+    end
+
+    test "RENAMENX preserves TTL when renamed" do
+      future = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"old" => {"v", future}})
+      assert 1 == Generic.handle("RENAMENX", ["old", "new"], store)
+      {_value, expire_at_ms} = store.get_meta.("new")
+      assert expire_at_ms == future
+    end
+
+    test "RENAMENX errors when source doesn't exist" do
+      store = MockStore.make()
+      assert {:error, "ERR no such key"} = Generic.handle("RENAMENX", ["missing", "new"], store)
+    end
+
+    test "RENAMENX same key returns 0" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 0 == Generic.handle("RENAMENX", ["k", "k"], store)
+      assert "v" == store.get.("k")
+    end
+
+    test "RENAMENX with no args returns error" do
+      assert {:error, _} = Generic.handle("RENAMENX", [], MockStore.make())
+    end
+
+    test "RENAMENX with one arg returns error" do
+      assert {:error, _} = Generic.handle("RENAMENX", ["k"], MockStore.make())
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # COPY
+  # ---------------------------------------------------------------------------
+
+  describe "COPY" do
+    test "COPY copies value to new key" do
+      store = MockStore.make(%{"src" => {"v", 0}})
+      assert 1 == Generic.handle("COPY", ["src", "dst"], store)
+      assert "v" == store.get.("src")
+      assert "v" == store.get.("dst")
+    end
+
+    test "COPY preserves TTL" do
+      future = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"src" => {"v", future}})
+      assert 1 == Generic.handle("COPY", ["src", "dst"], store)
+      {_val, src_exp} = store.get_meta.("src")
+      {_val, dst_exp} = store.get_meta.("dst")
+      assert src_exp == dst_exp
+    end
+
+    test "COPY without REPLACE errors if destination exists" do
+      store = MockStore.make(%{"src" => {"v1", 0}, "dst" => {"v2", 0}})
+      assert {:error, _} = Generic.handle("COPY", ["src", "dst"], store)
+      assert "v2" == store.get.("dst")
+    end
+
+    test "COPY with REPLACE overwrites destination" do
+      store = MockStore.make(%{"src" => {"v1", 0}, "dst" => {"v2", 0}})
+      assert 1 == Generic.handle("COPY", ["src", "dst", "REPLACE"], store)
+      assert "v1" == store.get.("dst")
+    end
+
+    test "COPY with lowercase replace option works" do
+      store = MockStore.make(%{"src" => {"v1", 0}, "dst" => {"v2", 0}})
+      assert 1 == Generic.handle("COPY", ["src", "dst", "replace"], store)
+      assert "v1" == store.get.("dst")
+    end
+
+    test "COPY errors when source doesn't exist" do
+      store = MockStore.make()
+      assert {:error, "ERR no such key"} = Generic.handle("COPY", ["missing", "dst"], store)
+    end
+
+    test "COPY source to itself creates identical key (source preserved)" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert {:error, _} = Generic.handle("COPY", ["k", "k"], store)
+    end
+
+    test "COPY source to itself with REPLACE succeeds" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 1 == Generic.handle("COPY", ["k", "k", "REPLACE"], store)
+      assert "v" == store.get.("k")
+    end
+
+    test "COPY with no args returns error" do
+      assert {:error, _} = Generic.handle("COPY", [], MockStore.make())
+    end
+
+    test "COPY with one arg returns error" do
+      assert {:error, _} = Generic.handle("COPY", ["src"], MockStore.make())
+    end
+
+    test "COPY with invalid option returns syntax error" do
+      store = MockStore.make(%{"src" => {"v", 0}})
+      assert {:error, _} = Generic.handle("COPY", ["src", "dst", "BOGUS"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # RANDOMKEY
+  # ---------------------------------------------------------------------------
+
+  describe "RANDOMKEY" do
+    test "RANDOMKEY returns nil when DB is empty" do
+      store = MockStore.make()
+      assert nil == Generic.handle("RANDOMKEY", [], store)
+    end
+
+    test "RANDOMKEY returns a key when DB has keys" do
+      store = MockStore.make(%{"a" => {"1", 0}, "b" => {"2", 0}, "c" => {"3", 0}})
+      key = Generic.handle("RANDOMKEY", [], store)
+      assert key in ["a", "b", "c"]
+    end
+
+    test "RANDOMKEY returns the only key when DB has one key" do
+      store = MockStore.make(%{"only" => {"v", 0}})
+      assert "only" == Generic.handle("RANDOMKEY", [], store)
+    end
+
+    test "RANDOMKEY with args returns error" do
+      assert {:error, _} = Generic.handle("RANDOMKEY", ["extra"], MockStore.make())
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SCAN
+  # ---------------------------------------------------------------------------
+
+  describe "SCAN" do
+    test "SCAN 0 returns all keys when count >= total keys" do
+      store = MockStore.make(%{"a" => {"1", 0}, "b" => {"2", 0}, "c" => {"3", 0}})
+      [next_cursor, keys] = Generic.handle("SCAN", ["0", "COUNT", "100"], store)
+      assert next_cursor == "0"
+      assert Enum.sort(keys) == ["a", "b", "c"]
+    end
+
+    test "SCAN full iteration visits all keys" do
+      data =
+        for i <- 1..25, into: %{} do
+          {"key:#{String.pad_leading(Integer.to_string(i), 2, "0")}", {"v#{i}", 0}}
+        end
+
+      store = MockStore.make(data)
+
+      {all_keys, _} =
+        iterate_scan(store, "0", [], "COUNT", "10")
+
+      assert length(all_keys) == 25
+      assert all_keys == Enum.uniq(all_keys)
+    end
+
+    test "SCAN with MATCH pattern filters keys" do
+      store =
+        MockStore.make(%{
+          "user:1" => {"v", 0},
+          "user:2" => {"v", 0},
+          "order:1" => {"v", 0}
+        })
+
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "MATCH", "user:*", "COUNT", "100"], store)
+      assert Enum.sort(keys) == ["user:1", "user:2"]
+    end
+
+    test "SCAN with MATCH ? matches single character keys" do
+      store = MockStore.make(%{"a" => {"1", 0}, "ab" => {"2", 0}, "b" => {"3", 0}})
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "MATCH", "?", "COUNT", "100"], store)
+      assert Enum.sort(keys) == ["a", "b"]
+    end
+
+    test "SCAN with COUNT hint limits batch size" do
+      data = for i <- 1..20, into: %{}, do: {"k#{String.pad_leading("#{i}", 2, "0")}", {"v", 0}}
+      store = MockStore.make(data)
+      [next_cursor, keys] = Generic.handle("SCAN", ["0", "COUNT", "5"], store)
+      assert length(keys) == 5
+      assert next_cursor != "0"
+    end
+
+    test "SCAN with TYPE string returns all keys (only type supported)" do
+      store = MockStore.make(%{"a" => {"1", 0}, "b" => {"2", 0}})
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "TYPE", "string", "COUNT", "100"], store)
+      assert Enum.sort(keys) == ["a", "b"]
+    end
+
+    test "SCAN with TYPE list returns empty (unsupported type)" do
+      store = MockStore.make(%{"a" => {"1", 0}, "b" => {"2", 0}})
+      [cursor, keys] = Generic.handle("SCAN", ["0", "TYPE", "list", "COUNT", "100"], store)
+      assert keys == []
+      assert cursor == "0"
+    end
+
+    test "SCAN on empty DB returns cursor 0 and empty list" do
+      store = MockStore.make()
+      [cursor, keys] = Generic.handle("SCAN", ["0"], store)
+      assert cursor == "0"
+      assert keys == []
+    end
+
+    test "SCAN with no args returns error" do
+      assert {:error, _} = Generic.handle("SCAN", [], MockStore.make())
+    end
+
+    test "SCAN with invalid COUNT returns error" do
+      store = MockStore.make(%{"a" => {"1", 0}})
+      assert {:error, _} = Generic.handle("SCAN", ["0", "COUNT", "abc"], store)
+    end
+
+    test "SCAN with COUNT 0 returns error" do
+      store = MockStore.make(%{"a" => {"1", 0}})
+      assert {:error, _} = Generic.handle("SCAN", ["0", "COUNT", "0"], store)
+    end
+
+    test "SCAN with negative COUNT returns error" do
+      store = MockStore.make(%{"a" => {"1", 0}})
+      assert {:error, _} = Generic.handle("SCAN", ["0", "COUNT", "-1"], store)
+    end
+
+    test "SCAN with invalid option returns syntax error" do
+      store = MockStore.make(%{"a" => {"1", 0}})
+      assert {:error, _} = Generic.handle("SCAN", ["0", "BOGUS"], store)
+    end
+
+    test "SCAN case-insensitive options" do
+      store = MockStore.make(%{"a" => {"1", 0}, "b" => {"2", 0}})
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "match", "*", "count", "100"], store)
+      assert Enum.sort(keys) == ["a", "b"]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # EXPIRETIME
+  # ---------------------------------------------------------------------------
+
+  describe "EXPIRETIME" do
+    test "EXPIRETIME returns -2 for missing key" do
+      store = MockStore.make()
+      assert -2 == Generic.handle("EXPIRETIME", ["missing"], store)
+    end
+
+    test "EXPIRETIME returns -1 for key with no expiry" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert -1 == Generic.handle("EXPIRETIME", ["k"], store)
+    end
+
+    test "EXPIRETIME returns Unix timestamp in seconds" do
+      expire_at_ms = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"k" => {"v", expire_at_ms}})
+      result = Generic.handle("EXPIRETIME", ["k"], store)
+      expected = div(expire_at_ms, 1_000)
+      assert result == expected
+    end
+
+    test "EXPIRETIME with no args returns error" do
+      assert {:error, _} = Generic.handle("EXPIRETIME", [], MockStore.make())
+    end
+
+    test "EXPIRETIME with too many args returns error" do
+      assert {:error, _} = Generic.handle("EXPIRETIME", ["a", "b"], MockStore.make())
+    end
+
+    test "EXPIRETIME returns -2 for expired key" do
+      past = System.os_time(:millisecond) - 1000
+      store = MockStore.make(%{"k" => {"v", past}})
+      assert -2 == Generic.handle("EXPIRETIME", ["k"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # PEXPIRETIME
+  # ---------------------------------------------------------------------------
+
+  describe "PEXPIRETIME" do
+    test "PEXPIRETIME returns -2 for missing key" do
+      store = MockStore.make()
+      assert -2 == Generic.handle("PEXPIRETIME", ["missing"], store)
+    end
+
+    test "PEXPIRETIME returns -1 for key with no expiry" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert -1 == Generic.handle("PEXPIRETIME", ["k"], store)
+    end
+
+    test "PEXPIRETIME returns Unix timestamp in milliseconds" do
+      expire_at_ms = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"k" => {"v", expire_at_ms}})
+      result = Generic.handle("PEXPIRETIME", ["k"], store)
+      assert result == expire_at_ms
+    end
+
+    test "PEXPIRETIME with no args returns error" do
+      assert {:error, _} = Generic.handle("PEXPIRETIME", [], MockStore.make())
+    end
+
+    test "PEXPIRETIME with too many args returns error" do
+      assert {:error, _} = Generic.handle("PEXPIRETIME", ["a", "b"], MockStore.make())
+    end
+
+    test "PEXPIRETIME returns -2 for expired key" do
+      past = System.os_time(:millisecond) - 1000
+      store = MockStore.make(%{"k" => {"v", past}})
+      assert -2 == Generic.handle("PEXPIRETIME", ["k"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # OBJECT ENCODING
+  # ---------------------------------------------------------------------------
+
+  describe "OBJECT ENCODING" do
+    test "OBJECT ENCODING returns 'raw' for existing key" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert "raw" == Generic.handle("OBJECT", ["ENCODING", "k"], store)
+    end
+
+    test "OBJECT ENCODING returns error for missing key" do
+      store = MockStore.make()
+      assert {:error, "ERR no such key"} = Generic.handle("OBJECT", ["ENCODING", "missing"], store)
+    end
+
+    test "OBJECT encoding is case-insensitive" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert "raw" == Generic.handle("OBJECT", ["encoding", "k"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # OBJECT HELP
+  # ---------------------------------------------------------------------------
+
+  describe "OBJECT HELP" do
+    test "OBJECT HELP returns a list of help strings" do
+      result = Generic.handle("OBJECT", ["HELP"], MockStore.make())
+      assert is_list(result)
+      assert result != []
+      assert Enum.all?(result, &is_binary/1)
+    end
+
+    test "OBJECT HELP mentions all subcommands" do
+      result = Generic.handle("OBJECT", ["HELP"], MockStore.make())
+      text = Enum.join(result, " ")
+      assert text =~ "ENCODING"
+      assert text =~ "FREQ"
+      assert text =~ "HELP"
+      assert text =~ "IDLETIME"
+      assert text =~ "REFCOUNT"
+    end
+
+    test "OBJECT help is case-insensitive" do
+      result = Generic.handle("OBJECT", ["help"], MockStore.make())
+      assert is_list(result)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # OBJECT FREQ
+  # ---------------------------------------------------------------------------
+
+  describe "OBJECT FREQ" do
+    test "OBJECT FREQ returns 0 for existing key (stub)" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 0 == Generic.handle("OBJECT", ["FREQ", "k"], store)
+    end
+
+    test "OBJECT FREQ returns error for missing key" do
+      store = MockStore.make()
+      assert {:error, "ERR no such key"} = Generic.handle("OBJECT", ["FREQ", "missing"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # OBJECT IDLETIME
+  # ---------------------------------------------------------------------------
+
+  describe "OBJECT IDLETIME" do
+    test "OBJECT IDLETIME returns 0 for existing key (stub)" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 0 == Generic.handle("OBJECT", ["IDLETIME", "k"], store)
+    end
+
+    test "OBJECT IDLETIME returns error for missing key" do
+      store = MockStore.make()
+      assert {:error, "ERR no such key"} = Generic.handle("OBJECT", ["IDLETIME", "missing"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # OBJECT REFCOUNT
+  # ---------------------------------------------------------------------------
+
+  describe "OBJECT REFCOUNT" do
+    test "OBJECT REFCOUNT returns 1 for existing key" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 1 == Generic.handle("OBJECT", ["REFCOUNT", "k"], store)
+    end
+
+    test "OBJECT REFCOUNT returns error for missing key" do
+      store = MockStore.make()
+      assert {:error, "ERR no such key"} = Generic.handle("OBJECT", ["REFCOUNT", "missing"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # OBJECT -- error cases
+  # ---------------------------------------------------------------------------
+
+  describe "OBJECT error cases" do
+    test "OBJECT with no subcommand returns error" do
+      assert {:error, _} = Generic.handle("OBJECT", [], MockStore.make())
+    end
+
+    test "OBJECT with unknown subcommand returns error" do
+      assert {:error, msg} = Generic.handle("OBJECT", ["BOGUS", "key"], MockStore.make())
+      assert msg =~ "unknown subcommand"
+      assert msg =~ "bogus"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # WAIT
+  # ---------------------------------------------------------------------------
+
+  describe "WAIT" do
+    test "WAIT returns 0 immediately (no replication)" do
+      store = MockStore.make()
+      assert 0 == Generic.handle("WAIT", ["1", "0"], store)
+    end
+
+    test "WAIT with timeout returns 0" do
+      store = MockStore.make()
+      assert 0 == Generic.handle("WAIT", ["3", "5000"], store)
+    end
+
+    test "WAIT with no args returns error" do
+      assert {:error, _} = Generic.handle("WAIT", [], MockStore.make())
+    end
+
+    test "WAIT with one arg returns error" do
+      assert {:error, _} = Generic.handle("WAIT", ["1"], MockStore.make())
+    end
+
+    test "WAIT with too many args returns error" do
+      assert {:error, _} = Generic.handle("WAIT", ["1", "0", "extra"], MockStore.make())
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Cross-command edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "cross-command edge cases" do
+    test "RENAME then TYPE on old key returns 'none'" do
+      store = MockStore.make(%{"old" => {"v", 0}})
+      Generic.handle("RENAME", ["old", "new"], store)
+      assert {:simple, "none"} == Generic.handle("TYPE", ["old"], store)
+      assert {:simple, "string"} == Generic.handle("TYPE", ["new"], store)
+    end
+
+    test "COPY then UNLINK source preserves destination" do
+      store = MockStore.make(%{"src" => {"v", 0}})
+      Generic.handle("COPY", ["src", "dst"], store)
+      Generic.handle("UNLINK", ["src"], store)
+      assert nil == store.get.("src")
+      assert "v" == store.get.("dst")
+    end
+
+    test "RENAME expired source returns error" do
+      past = System.os_time(:millisecond) - 1000
+      store = MockStore.make(%{"old" => {"v", past}})
+      assert {:error, "ERR no such key"} = Generic.handle("RENAME", ["old", "new"], store)
+    end
+
+    test "COPY expired source returns error" do
+      past = System.os_time(:millisecond) - 1000
+      store = MockStore.make(%{"src" => {"v", past}})
+      assert {:error, "ERR no such key"} = Generic.handle("COPY", ["src", "dst"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private -- SCAN iteration helper
+  # ---------------------------------------------------------------------------
+
+  defp iterate_scan(store, cursor, acc, count_opt, count_val) do
+    [next_cursor, keys] = Generic.handle("SCAN", [cursor, count_opt, count_val], store)
+
+    all_keys = acc ++ keys
+
+    if next_cursor == "0" do
+      {all_keys, next_cursor}
+    else
+      iterate_scan(store, next_cursor, all_keys, count_opt, count_val)
+    end
+  end
+end

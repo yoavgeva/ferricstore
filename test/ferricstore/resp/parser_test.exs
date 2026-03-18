@@ -92,6 +92,17 @@ defmodule Ferricstore.Resp.ParserTest do
       # Header says 5 bytes but payload has no \r\n at position 5
       assert {:error, :bulk_crlf_missing} = Parser.parse("$5\r\nhelloXXXXX")
     end
+
+    test "rejects bulk string whose declared length exceeds 512 MiB" do
+      # 536_870_913 = 512 MiB + 1 byte
+      assert {:error, {:bulk_too_large, 536_870_913}} =
+               Parser.parse("$536870913\r\n")
+    end
+
+    test "accepts bulk string at exactly 512 MiB boundary (incomplete data returns :ok [])" do
+      # 536_870_912 = exactly 512 MiB — allowed; no body bytes present so incomplete
+      assert {:ok, [], _rest} = Parser.parse("$536870912\r\n")
+    end
   end
 
   # ---------------------------------------------------------------------------
