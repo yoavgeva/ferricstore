@@ -8,6 +8,7 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_lossless)]
+#![allow(clippy::cast_precision_loss)]
 #![allow(clippy::items_after_statements)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::doc_link_with_quotes)]
@@ -19,6 +20,7 @@ pub mod keydir;
 pub mod log;
 pub mod store;
 
+use rustler::schedule::consume_timeslice;
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
 use std::sync::Mutex;
 
@@ -326,23 +328,30 @@ fn delete<'a>(
 /// ## Scheduler contract
 ///
 /// Runs on a Normal BEAM scheduler. Iterates the in-memory keydir (no disk
-/// I/O). Even with 50K keys this completes in <200ms. The Mutex is uncontested
-/// because the shard GenServer serializes access. Blocking one Normal scheduler
-/// briefly is acceptable (BEAM has multiple schedulers) and avoids consuming a
-/// DirtyIo thread.
+/// I/O). Uses `enif_consume_timeslice` to report progress to the BEAM
+/// scheduler every 100 keys, allowing the scheduler to remain aware of how
+/// much work is being done. Full cooperative yielding via `enif_schedule_nif`
+/// is not used because Rustler does not expose it and saving/restoring the
+/// iteration state across NIF re-entries would require complex continuation
+/// state management (the keydir iterator, partial result list, and Mutex
+/// guard would all need to be preserved across yield points).
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 fn keys(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
     let store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
-    let all_keys: Vec<Term> = store
-        .keys()
-        .into_iter()
-        .map(|k| {
-            let mut bin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
-            bin.as_mut_slice().copy_from_slice(&k);
-            Ok(Binary::from_owned(bin, env).encode(env))
-        })
-        .collect::<NifResult<Vec<Term>>>()?;
+    let raw_keys = store.keys();
+    let total = raw_keys.len();
+    let mut all_keys = Vec::with_capacity(total);
+    for (i, k) in raw_keys.into_iter().enumerate() {
+        let mut bin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
+        bin.as_mut_slice().copy_from_slice(&k);
+        all_keys.push(Binary::from_owned(bin, env).encode(env));
+        // Report progress to BEAM scheduler every 100 keys
+        if i % 100 == 99 && total > 0 {
+            let pct = ((i + 1) as f64 / total as f64 * 100.0) as i32;
+            let _ = consume_timeslice(env, pct.clamp(1, 100));
+        }
+    }
     Ok(all_keys.encode(env))
 }
 
@@ -388,25 +397,32 @@ fn purge_expired(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Te
 /// ## Scheduler contract
 ///
 /// Runs on a Normal BEAM scheduler. Iterates all keys doing one pread per
-/// entry. With 10K keys this completes in <100ms. The shard GenServer
-/// serializes access so the Mutex is uncontested. Briefly blocking one Normal
-/// scheduler is preferable to consuming a DirtyIo thread.
+/// entry. Uses `enif_consume_timeslice` to report progress to the BEAM
+/// scheduler every 100 entries. Full cooperative yielding via
+/// `enif_schedule_nif` is not used because the iteration holds a Mutex guard
+/// and opens file readers per entry -- saving/restoring this state across
+/// yield points is not feasible without restructuring the Store API.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 fn get_all(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
     let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
     match store.get_all() {
         Ok(pairs) => {
-            let terms: Vec<Term> = pairs
-                .into_iter()
-                .map(|(k, v)| {
-                    let mut kbin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
-                    kbin.as_mut_slice().copy_from_slice(&k);
-                    let mut vbin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
-                    vbin.as_mut_slice().copy_from_slice(&v);
-                    Ok((Binary::from_owned(kbin, env), Binary::from_owned(vbin, env)).encode(env))
-                })
-                .collect::<NifResult<Vec<Term>>>()?;
+            let total = pairs.len();
+            let mut terms = Vec::with_capacity(total);
+            for (i, (k, v)) in pairs.into_iter().enumerate() {
+                let mut kbin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
+                kbin.as_mut_slice().copy_from_slice(&k);
+                let mut vbin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
+                vbin.as_mut_slice().copy_from_slice(&v);
+                terms.push(
+                    (Binary::from_owned(kbin, env), Binary::from_owned(vbin, env)).encode(env),
+                );
+                if i % 100 == 99 && total > 0 {
+                    let pct = ((i + 1) as f64 / total as f64 * 100.0) as i32;
+                    let _ = consume_timeslice(env, pct.clamp(1, 100));
+                }
+            }
             Ok((atoms::ok(), terms).encode(env))
         }
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
@@ -429,17 +445,22 @@ fn get_batch<'a>(
     let key_slices: Vec<&[u8]> = keys.iter().map(Binary::as_slice).collect();
     match store.get_batch(&key_slices) {
         Ok(results) => {
-            let terms: Vec<Term> = results
-                .into_iter()
-                .map(|opt| match opt {
+            let total = results.len();
+            let mut terms = Vec::with_capacity(total);
+            for (i, opt) in results.into_iter().enumerate() {
+                match opt {
                     Some(v) => {
                         let mut bin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
                         bin.as_mut_slice().copy_from_slice(&v);
-                        Ok(Binary::from_owned(bin, env).encode(env))
+                        terms.push(Binary::from_owned(bin, env).encode(env));
                     }
-                    None => Ok(atoms::nil().encode(env)),
-                })
-                .collect::<NifResult<Vec<Term>>>()?;
+                    None => terms.push(atoms::nil().encode(env)),
+                }
+                if i % 100 == 99 && total > 0 {
+                    let pct = ((i + 1) as f64 / total as f64 * 100.0) as i32;
+                    let _ = consume_timeslice(env, pct.clamp(1, 100));
+                }
+            }
             Ok((atoms::ok(), terms).encode(env))
         }
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
@@ -464,16 +485,21 @@ fn get_range<'a>(
     let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
     match store.get_range(min_key.as_slice(), max_key.as_slice(), max_count as usize) {
         Ok(pairs) => {
-            let terms: Vec<Term> = pairs
-                .into_iter()
-                .map(|(k, v)| {
-                    let mut kbin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
-                    kbin.as_mut_slice().copy_from_slice(&k);
-                    let mut vbin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
-                    vbin.as_mut_slice().copy_from_slice(&v);
-                    Ok((Binary::from_owned(kbin, env), Binary::from_owned(vbin, env)).encode(env))
-                })
-                .collect::<NifResult<Vec<Term>>>()?;
+            let total = pairs.len();
+            let mut terms = Vec::with_capacity(total);
+            for (i, (k, v)) in pairs.into_iter().enumerate() {
+                let mut kbin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
+                kbin.as_mut_slice().copy_from_slice(&k);
+                let mut vbin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
+                vbin.as_mut_slice().copy_from_slice(&v);
+                terms.push(
+                    (Binary::from_owned(kbin, env), Binary::from_owned(vbin, env)).encode(env),
+                );
+                if i % 100 == 99 && total > 0 {
+                    let pct = ((i + 1) as f64 / total as f64 * 100.0) as i32;
+                    let _ = consume_timeslice(env, pct.clamp(1, 100));
+                }
+            }
             Ok((atoms::ok(), terms).encode(env))
         }
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
