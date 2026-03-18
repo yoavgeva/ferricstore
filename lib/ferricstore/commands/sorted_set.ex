@@ -1,7 +1,8 @@
 defmodule Ferricstore.Commands.SortedSet do
   @moduledoc """
   Handles Redis sorted set commands: ZADD, ZSCORE, ZRANK, ZRANGE, ZCARD,
-  ZREM, ZINCRBY, ZCOUNT, ZPOPMIN, ZPOPMAX, ZRANGEBYSCORE, ZREVRANGE.
+  ZREM, ZINCRBY, ZCOUNT, ZPOPMIN, ZPOPMAX, ZRANGEBYSCORE, ZREVRANGE,
+  ZSCAN, ZRANDMEMBER, ZMSCORE.
 
   Each sorted set member is stored as a compound key:
 
@@ -265,7 +266,9 @@ defmodule Ferricstore.Commands.SortedSet do
 
           current_score =
             case existing do
-              nil -> 0.0
+              nil ->
+                0.0
+
               score_str ->
                 {score, ""} = Float.parse(score_str)
                 score
@@ -284,7 +287,9 @@ defmodule Ferricstore.Commands.SortedSet do
 
               current_score =
                 case existing do
-                  nil -> 0.0
+                  nil ->
+                    0.0
+
                   score_str ->
                     {score, ""} = Float.parse(score_str)
                     score
@@ -416,6 +421,116 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   # ---------------------------------------------------------------------------
+  # ZSCAN key cursor [MATCH pattern] [COUNT count]
+  # ---------------------------------------------------------------------------
+
+  def handle("ZSCAN", [key, cursor_str | opts], store) do
+    with :ok <- TypeRegistry.check_type(key, :zset, store),
+         {:ok, cursor} <- parse_cursor(cursor_str),
+         {:ok, match_pattern, count} <- parse_zscan_opts(opts) do
+      prefix = CompoundKey.zset_prefix(key)
+      pairs = store.compound_scan.(key, prefix)
+
+      filtered =
+        case match_pattern do
+          nil ->
+            pairs
+
+          pattern ->
+            regex = glob_to_regex(pattern)
+            Enum.filter(pairs, fn {member, _score} -> Regex.match?(regex, member) end)
+        end
+
+      {next_cursor, batch} = paginate(filtered, cursor, count)
+      elements = Enum.flat_map(batch, fn {member, score} -> [member, score] end)
+      [next_cursor, elements]
+    end
+  end
+
+  def handle("ZSCAN", [_key], _store) do
+    {:error, "ERR wrong number of arguments for 'zscan' command"}
+  end
+
+  def handle("ZSCAN", [], _store) do
+    {:error, "ERR wrong number of arguments for 'zscan' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # ZRANDMEMBER key [count [WITHSCORES]]
+  # ---------------------------------------------------------------------------
+
+  def handle("ZRANDMEMBER", [key], store) do
+    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+      prefix = CompoundKey.zset_prefix(key)
+      pairs = store.compound_scan.(key, prefix)
+
+      case pairs do
+        [] -> nil
+        _ ->
+          {member, _score} = Enum.random(pairs)
+          member
+      end
+    end
+  end
+
+  def handle("ZRANDMEMBER", [key, count_str], store) do
+    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+      case Integer.parse(count_str) do
+        {count, ""} ->
+          prefix = CompoundKey.zset_prefix(key)
+          pairs = store.compound_scan.(key, prefix)
+          select_random_zset_members(pairs, count, false)
+
+        _ ->
+          {:error, "ERR value is not an integer or out of range"}
+      end
+    end
+  end
+
+  def handle("ZRANDMEMBER", [key, count_str, withscores_str], store) do
+    if String.upcase(withscores_str) != "WITHSCORES" do
+      {:error, "ERR syntax error"}
+    else
+      with :ok <- TypeRegistry.check_type(key, :zset, store) do
+        case Integer.parse(count_str) do
+          {count, ""} ->
+            prefix = CompoundKey.zset_prefix(key)
+            pairs = store.compound_scan.(key, prefix)
+            select_random_zset_members(pairs, count, true)
+
+          _ ->
+            {:error, "ERR value is not an integer or out of range"}
+        end
+      end
+    end
+  end
+
+  def handle("ZRANDMEMBER", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'zrandmember' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # ZMSCORE key member [member ...]
+  # ---------------------------------------------------------------------------
+
+  def handle("ZMSCORE", [key | members], store) when members != [] do
+    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+      Enum.map(members, fn member ->
+        compound_key = CompoundKey.zset_member(key, member)
+
+        case store.compound_get.(key, compound_key) do
+          nil -> nil
+          score_str -> score_str
+        end
+      end)
+    end
+  end
+
+  def handle("ZMSCORE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'zmscore' command"}
+  end
+
+  # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
@@ -473,7 +588,9 @@ defmodule Ferricstore.Commands.SortedSet do
 
   defp parse_score(str) do
     case Float.parse(str) do
-      {score, ""} -> {:ok, score}
+      {score, ""} ->
+        {:ok, score}
+
       _ ->
         case Integer.parse(str) do
           {int, ""} -> {:ok, int * 1.0}
@@ -510,4 +627,100 @@ defmodule Ferricstore.Commands.SortedSet do
   defp score_lte?(_score, :neg_infinity, _exclusive), do: false
   defp score_lte?(score, bound, true), do: score < bound
   defp score_lte?(score, bound, false), do: score <= bound
+
+  # ---------------------------------------------------------------------------
+  # ZSCAN helpers
+  # ---------------------------------------------------------------------------
+
+  defp parse_cursor(cursor_str) do
+    case Integer.parse(cursor_str) do
+      {cursor, ""} when cursor >= 0 -> {:ok, cursor}
+      _ -> {:error, "ERR invalid cursor"}
+    end
+  end
+
+  defp parse_zscan_opts(opts), do: do_parse_zscan_opts(opts, nil, 10)
+
+  defp do_parse_zscan_opts([], match, count), do: {:ok, match, count}
+
+  defp do_parse_zscan_opts([opt, value | rest], match, count) do
+    case String.upcase(opt) do
+      "MATCH" ->
+        do_parse_zscan_opts(rest, value, count)
+
+      "COUNT" ->
+        case Integer.parse(value) do
+          {n, ""} when n > 0 -> do_parse_zscan_opts(rest, match, n)
+          _ -> {:error, "ERR value is not an integer or out of range"}
+        end
+
+      _ ->
+        {:error, "ERR syntax error"}
+    end
+  end
+
+  defp do_parse_zscan_opts([_ | _], _match, _count) do
+    {:error, "ERR syntax error"}
+  end
+
+  defp paginate(items, cursor, count) do
+    total = length(items)
+
+    if cursor >= total do
+      {"0", []}
+    else
+      batch = Enum.slice(items, cursor, count)
+      next_pos = cursor + length(batch)
+
+      if next_pos >= total do
+        {"0", batch}
+      else
+        {Integer.to_string(next_pos), batch}
+      end
+    end
+  end
+
+  defp glob_to_regex(pattern) do
+    regex_str =
+      pattern
+      |> String.graphemes()
+      |> Enum.map_join(&escape_glob_char/1)
+
+    Regex.compile!("^#{regex_str}$")
+  end
+
+  defp escape_glob_char("*"), do: ".*"
+  defp escape_glob_char("?"), do: "."
+  defp escape_glob_char(char), do: Regex.escape(char)
+
+  defp select_random_zset_members(pairs, count, with_scores) do
+    cond do
+      count == 0 ->
+        []
+
+      count > 0 ->
+        selected = Enum.take_random(pairs, count)
+
+        if with_scores do
+          Enum.flat_map(selected, fn {member, score} -> [member, score] end)
+        else
+          Enum.map(selected, fn {member, _score} -> member end)
+        end
+
+      count < 0 ->
+        abs_count = abs(count)
+
+        if pairs == [] do
+          []
+        else
+          selected = for _ <- 1..abs_count, do: Enum.random(pairs)
+
+          if with_scores do
+            Enum.flat_map(selected, fn {member, score} -> [member, score] end)
+          else
+            Enum.map(selected, fn {member, _score} -> member end)
+          end
+        end
+    end
+  end
 end

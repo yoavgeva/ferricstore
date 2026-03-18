@@ -38,6 +38,15 @@ defmodule Ferricstore.Test.MockStore do
           end
         end)
       end,
+      compound_get_meta: fn _redis_key, compound_key ->
+        Agent.get(pid, fn state ->
+          case Map.get(state, compound_key) do
+            nil -> nil
+            {value, 0} -> {value, 0}
+            {value, exp} -> if Ferricstore.Test.MockStore.alive?(exp), do: {value, exp}, else: nil
+          end
+        end)
+      end,
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
         Agent.update(pid, &Map.put(&1, compound_key, {value, expire_at_ms}))
         :ok

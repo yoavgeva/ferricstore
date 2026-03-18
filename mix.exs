@@ -19,7 +19,7 @@ defmodule Ferricstore.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, :ssl, :public_key],
       mod: {Ferricstore.Application, []}
     ]
   end

@@ -497,6 +497,132 @@ defmodule Ferricstore.Commands.BitmapTest do
   # Cross-command integration
   # ---------------------------------------------------------------------------
 
+  # ---------------------------------------------------------------------------
+  # Edge cases: arity, invalid values, error messages
+  # ---------------------------------------------------------------------------
+
+  describe "SETBIT edge cases" do
+    test "SETBIT with non-0/1 string value returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Bitmap.handle("SETBIT", ["k", "0", "abc"], store)
+      assert msg =~ "bit is not an integer"
+    end
+
+    test "SETBIT with value '2' returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Bitmap.handle("SETBIT", ["k", "0", "2"], store)
+      assert msg =~ "bit is not an integer"
+    end
+
+    test "SETBIT with float offset returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Bitmap.handle("SETBIT", ["k", "1.5", "1"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "SETBIT at very large offset works (creates large binary)" do
+      store = MockStore.make()
+      # Offset 31 -> byte 3 (4 bytes total)
+      assert 0 == Bitmap.handle("SETBIT", ["k", "31", "1"], store)
+      assert byte_size(store.get.("k")) == 4
+    end
+  end
+
+  describe "GETBIT edge cases" do
+    test "GETBIT with non-integer offset returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Bitmap.handle("GETBIT", ["k", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "GETBIT with float offset returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Bitmap.handle("GETBIT", ["k", "1.5"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "GETBIT with extra args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = Bitmap.handle("GETBIT", ["k", "0", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
+
+  describe "BITPOS edge cases" do
+    test "BITPOS with invalid bit value returns error" do
+      store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
+      assert {:error, msg} = Bitmap.handle("BITPOS", ["k", "2"], store)
+      assert msg =~ "bit is not an integer"
+    end
+
+    test "BITPOS with non-integer bit value returns error" do
+      store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
+      assert {:error, msg} = Bitmap.handle("BITPOS", ["k", "abc"], store)
+      assert msg =~ "bit is not an integer"
+    end
+
+    test "BITPOS with non-integer start returns error" do
+      store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
+      assert {:error, msg} = Bitmap.handle("BITPOS", ["k", "1", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "BITPOS with non-integer end returns error" do
+      store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
+      assert {:error, msg} = Bitmap.handle("BITPOS", ["k", "1", "0", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "BITPOS with invalid mode returns error" do
+      store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
+      assert {:error, msg} = Bitmap.handle("BITPOS", ["k", "1", "0", "7", "BOGUS"], store)
+      assert msg =~ "syntax error"
+    end
+  end
+
+  describe "BITCOUNT edge cases" do
+    test "BITCOUNT with invalid mode returns error" do
+      store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
+      assert {:error, msg} = Bitmap.handle("BITCOUNT", ["k", "0", "0", "BOGUS"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "BITCOUNT with non-integer start returns error" do
+      store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
+      assert {:error, msg} = Bitmap.handle("BITCOUNT", ["k", "abc", "0"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "BITCOUNT with non-integer end returns error" do
+      store = MockStore.make(%{"k" => {<<0xFF>>, 0}})
+      assert {:error, msg} = Bitmap.handle("BITCOUNT", ["k", "0", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+  end
+
+  describe "BITOP error message edge cases" do
+    test "BITOP NOT with no source key returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Bitmap.handle("BITOP", ["NOT", "dest"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "BITOP with lowercase operation" do
+      store = MockStore.make(%{
+        "a" => {<<0xFF>>, 0},
+        "b" => {<<0x0F>>, 0}
+      })
+      assert 1 == Bitmap.handle("BITOP", ["xor", "dest", "a", "b"], store)
+      assert <<0xF0>> == store.get.("dest")
+    end
+
+    test "BITOP OR with single key copies it" do
+      store = MockStore.make(%{"a" => {<<0xAB>>, 0}})
+      assert 1 == Bitmap.handle("BITOP", ["OR", "dest", "a"], store)
+      assert <<0xAB>> == store.get.("dest")
+    end
+  end
+
   describe "cross-command integration" do
     test "SETBIT then BITCOUNT" do
       store = MockStore.make()

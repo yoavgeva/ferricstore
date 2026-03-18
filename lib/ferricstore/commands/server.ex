@@ -28,6 +28,7 @@ defmodule Ferricstore.Commands.Server do
     * `DEBUG SLEEP seconds` — sleeps for N seconds (testing only)
   """
 
+  alias Ferricstore.AuditLog
   alias Ferricstore.Commands.Catalog
   alias Ferricstore.Stats
 
@@ -111,6 +112,7 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   def handle("FLUSHDB", args, store) when args in [[], ["ASYNC"], ["SYNC"]] do
+    AuditLog.log(:dangerous_command, %{command: "FLUSHDB", args: args})
     store.flush.()
     :ok
   end
@@ -124,6 +126,7 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   def handle("FLUSHALL", args, store) when args in [[], ["ASYNC"], ["SYNC"]] do
+    AuditLog.log(:dangerous_command, %{command: "FLUSHALL", args: args})
     store.flush.()
     :ok
   end
@@ -252,6 +255,8 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   def handle("DEBUG", ["SLEEP", seconds_str], _store) do
+    AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["SLEEP", seconds_str]})
+
     case Integer.parse(seconds_str) do
       {secs, ""} when secs >= 0 ->
         Process.sleep(secs * 1000)
@@ -267,7 +272,11 @@ defmodule Ferricstore.Commands.Server do
   end
 
   def handle("DEBUG", ["RELOAD"], _store), do: :ok
-  def handle("DEBUG", ["FLUSHALL" | _], store), do: handle("FLUSHALL", [], store)
+
+  def handle("DEBUG", ["FLUSHALL" | _], store) do
+    AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["FLUSHALL"]})
+    handle("FLUSHALL", [], store)
+  end
   def handle("DEBUG", ["SET-ACTIVE-EXPIRE", _flag], _store), do: :ok
   def handle("DEBUG", ["CHANGE-REPL-ID"], _store), do: :ok
   def handle("DEBUG", ["QUICKLIST-PACKED-THRESHOLD" | _], _store), do: :ok
@@ -286,15 +295,15 @@ defmodule Ferricstore.Commands.Server do
   # Private — INFO section builders
   # ---------------------------------------------------------------------------
 
-  defp info_string("all", store) do
-    sections = ["server", "clients", "memory", "keyspace", "stats"]
+  @all_sections ["server", "clients", "memory", "keyspace", "stats", "persistence", "replication", "cpu"]
 
-    sections
-    |> Enum.map(fn section -> build_section(section, store) end)
+  defp info_string(section, store) when section in ["all", "everything"] do
+    @all_sections
+    |> Enum.map(fn s -> build_section(s, store) end)
     |> Enum.join("\r\n")
   end
 
-  defp info_string(section, store) when section in ~w(server clients memory keyspace stats) do
+  defp info_string(section, store) when section in @all_sections do
     build_section(section, store)
   end
 
@@ -305,14 +314,27 @@ defmodule Ferricstore.Commands.Server do
 
   defp build_section("server", _store) do
     port = Application.get_env(:ferricstore, :port, 6379)
+    uptime_seconds = Stats.uptime_seconds()
+    uptime_days = div(uptime_seconds, 86_400)
+
+    {os_family, os_name} = :os.type()
+    {major, minor, patch} = :os.version()
+    os_string = "#{os_family}:#{os_name} #{major}.#{minor}.#{patch}"
 
     fields = [
       {"redis_version", "7.4.0"},
       {"ferricstore_version", "0.1.0"},
+      {"redis_mode", "standalone"},
+      {"os", os_string},
+      {"arch_bits", "64"},
       {"tcp_port", Integer.to_string(port)},
-      {"uptime_in_seconds", Integer.to_string(Stats.uptime_seconds())},
+      {"uptime_in_seconds", Integer.to_string(uptime_seconds)},
+      {"uptime_in_days", Integer.to_string(uptime_days)},
+      {"hz", "10"},
+      {"configured_hz", "10"},
       {"process_id", Integer.to_string(System.pid() |> String.to_integer())},
-      {"run_id", Stats.run_id()}
+      {"run_id", Stats.run_id()},
+      {"ferricstore_git_sha", "dev"}
     ]
 
     format_section("Server", fields)
@@ -326,8 +348,16 @@ defmodule Ferricstore.Commands.Server do
         _ -> 0
       end
 
+    blocked = safe_ets_size(:ferricstore_waiters)
+
+    tracking =
+      safe_ets_size(:ferricstore_tracking_connections)
+
     fields = [
-      {"connected_clients", Integer.to_string(connected)}
+      {"connected_clients", Integer.to_string(connected)},
+      {"blocked_clients", Integer.to_string(blocked)},
+      {"tracking_clients", Integer.to_string(tracking)},
+      {"maxclients", "10000"}
     ]
 
     format_section("Clients", fields)
@@ -335,10 +365,45 @@ defmodule Ferricstore.Commands.Server do
 
   defp build_section("memory", _store) do
     total = :erlang.memory(:total)
+    process_mem = :erlang.memory(:processes)
+    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+
+    # Sum ETS memory across all shard tables (one per shard).
+    # Each shard's ETS table is named :shard_ets_N.
+    keydir_bytes =
+      Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
+        table = :"shard_ets_#{i}"
+
+        try do
+          # :ets.info returns memory in words; multiply by word size to get bytes.
+          words = :ets.info(table, :memory)
+          acc + words * :erlang.system_info(:wordsize)
+        rescue
+          ArgumentError -> acc
+        end
+      end)
+
+    # RSS approximation: best we can do on BEAM is :erlang.memory(:total)
+    used_memory_rss = total
+
+    # Peak: we do not track a high-water mark yet, so report current.
+    used_memory_peak = total
+
+    # Fragmentation ratio (rss / used). With BEAM they are the same, so ~1.0.
+    frag_ratio =
+      if total > 0,
+        do: Float.round(used_memory_rss / total, 2),
+        else: 1.0
 
     fields = [
       {"used_memory", Integer.to_string(total)},
-      {"used_memory_human", format_bytes(total)}
+      {"used_memory_human", format_bytes(total)},
+      {"used_memory_rss", Integer.to_string(used_memory_rss)},
+      {"used_memory_peak", Integer.to_string(used_memory_peak)},
+      {"mem_fragmentation_ratio", format_float_field(frag_ratio)},
+      {"keydir_used_bytes", Integer.to_string(keydir_bytes)},
+      {"hot_cache_used_bytes", Integer.to_string(keydir_bytes)},
+      {"beam_process_memory", Integer.to_string(process_mem)}
     ]
 
     format_section("Memory", fields)
@@ -357,12 +422,50 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("stats", _store) do
+    hot = Stats.total_hot_reads()
+    cold = Stats.total_cold_reads()
+    hot_pct = Stats.hot_read_pct()
+    cold_per_sec = Stats.cold_reads_per_second()
+
     fields = [
       {"total_connections_received", Integer.to_string(Stats.total_connections())},
-      {"total_commands_processed", Integer.to_string(Stats.total_commands())}
+      {"total_commands_processed", Integer.to_string(Stats.total_commands())},
+      {"hot_reads", Integer.to_string(hot)},
+      {"cold_reads", Integer.to_string(cold)},
+      {"hot_read_pct", format_float_field(hot_pct)},
+      {"cold_reads_per_second", format_float_field(cold_per_sec)}
     ]
 
     format_section("Stats", fields)
+  end
+
+  defp build_section("persistence", _store) do
+    fields = [
+      {"loading", "0"},
+      {"rdb_changes_since_last_save", "0"},
+      {"rdb_last_save_time", "0"}
+    ]
+
+    format_section("Persistence", fields)
+  end
+
+  defp build_section("replication", _store) do
+    fields = [
+      {"role", "master"},
+      {"connected_slaves", "0"}
+    ]
+
+    format_section("Replication", fields)
+  end
+
+  defp build_section("cpu", _store) do
+    # Stub: BEAM does not expose per-process CPU counters cheaply.
+    fields = [
+      {"used_cpu_sys", "0.000000"},
+      {"used_cpu_user", "0.000000"}
+    ]
+
+    format_section("CPU", fields)
   end
 
   defp format_section(header, fields) do
@@ -372,6 +475,18 @@ defmodule Ferricstore.Commands.Server do
       |> Enum.join("\r\n")
 
     "# #{header}\r\n#{lines}\r\n"
+  end
+
+  defp safe_ets_size(table) do
+    try do
+      :ets.info(table, :size)
+    rescue
+      ArgumentError -> 0
+    end
+  end
+
+  defp format_float_field(val) do
+    :erlang.float_to_binary(val, [{:decimals, 2}])
   end
 
   defp format_bytes(bytes) when bytes < 1024, do: "#{bytes}B"
@@ -415,12 +530,31 @@ defmodule Ferricstore.Commands.Server do
   defp handle_config("GET", _args), do: {:error, "ERR wrong number of arguments for 'config|get' command"}
 
   defp handle_config("SET", [key, value]) do
-    Ferricstore.Config.set(key, value)
-    :ok
+    old_value = Ferricstore.Config.get_value(key)
+
+    case Ferricstore.Config.set(key, value) do
+      :ok ->
+        AuditLog.log(:config_change, %{
+          parameter: key,
+          old_value: old_value || "",
+          new_value: value
+        })
+
+        :ok
+
+      {:error, _reason} = err ->
+        err
+    end
   end
 
   defp handle_config("SET", _args), do: {:error, "ERR wrong number of arguments for 'config|set' command"}
-  defp handle_config("RESETSTAT", []), do: :ok
+
+  defp handle_config("RESETSTAT", []) do
+    Stats.reset()
+    Ferricstore.SlowLog.reset()
+    :ok
+  end
+
   defp handle_config("RESETSTAT", _), do: {:error, "ERR wrong number of arguments for 'config|resetstat' command"}
   defp handle_config("REWRITE", []), do: :ok
   defp handle_config("REWRITE", _), do: {:error, "ERR wrong number of arguments for 'config|rewrite' command"}

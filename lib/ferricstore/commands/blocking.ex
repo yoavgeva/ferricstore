@@ -186,11 +186,38 @@ defmodule Ferricstore.Commands.Blocking do
 
   def handle("BRPOP", args, store), do: handle("BLPOP", args, store)
 
-  def handle("BLMOVE", _args, _store) do
-    {:error, "ERR BLMOVE not yet fully implemented"}
+  def handle("BLMOVE", args, store) do
+    case parse_blmove_args(args) do
+      {:ok, source, destination, from_dir, to_dir, _timeout_ms} ->
+        alias Ferricstore.Commands.List
+        List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store)
+
+      {:error, _} = err ->
+        err
+    end
   end
 
-  def handle("BLMPOP", _args, _store) do
-    {:error, "ERR BLMPOP not yet fully implemented"}
+  def handle("BLMPOP", args, store) do
+    case parse_blmpop_args(args) do
+      {:ok, keys, direction, count, _timeout_ms} ->
+        alias Ferricstore.Commands.List
+        pop_cmd = if direction == :left, do: "LPOP", else: "RPOP"
+        pop_args_fn = fn key ->
+          if count == 1, do: [key], else: [key, to_string(count)]
+        end
+
+        Enum.find_value(keys, fn key ->
+          case List.handle(pop_cmd, pop_args_fn.(key), store) do
+            nil -> nil
+            {:error, _} -> nil
+            value ->
+              elements = if is_list(value), do: value, else: [value]
+              [key, elements]
+          end
+        end)
+
+      {:error, _} = err ->
+        err
+    end
   end
 end

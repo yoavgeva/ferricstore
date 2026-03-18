@@ -66,7 +66,16 @@ defmodule Ferricstore.Store.Shard do
   @default_sweep_interval_ms 1_000
   @default_max_keys_per_sweep 100
 
-  defstruct [:store, :ets, :index, pending: [], flush_in_flight: nil, write_version: 0]
+  defstruct [
+    :store,
+    :ets,
+    :index,
+    pending: [],
+    flush_in_flight: nil,
+    write_version: 0,
+    sweep_at_ceiling_count: 0,
+    sweep_struggling: false
+  ]
 
   # -------------------------------------------------------------------
   # Public API
@@ -103,8 +112,15 @@ defmodule Ferricstore.Store.Shard do
 
     ets =
       case :ets.whereis(:"shard_ets_#{index}") do
-        :undefined -> :ets.new(:"shard_ets_#{index}", [:set, :public, :named_table])
-        _ref -> :"shard_ets_#{index}"
+        :undefined ->
+          :ets.new(:"shard_ets_#{index}", [:set, :public, :named_table])
+
+        _ref ->
+          # Clear stale data from previous incarnation (e.g. after supervisor
+          # restart or test-induced crash). The Bitcask log is the source of
+          # truth — the keydir is rebuilt from hint files, not from ETS.
+          :ets.delete_all_objects(:"shard_ets_#{index}")
+          :"shard_ets_#{index}"
       end
 
     # Start the Raft server for this shard if raft is enabled.
@@ -159,6 +175,73 @@ defmodule Ferricstore.Store.Shard do
         state = flush_pending_sync(state)
         {:reply, do_get_meta(state, key), state}
     end
+  end
+
+  # Compound key scan: returns all live entries matching a prefix.
+  # Used by HSCAN, SSCAN, ZSCAN via the compound_scan store callback.
+  def handle_call({:scan_prefix, prefix}, _from, state) do
+    now = System.os_time(:millisecond)
+
+    results =
+      :ets.foldl(
+        fn {key, value, exp}, acc ->
+          if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+            # Extract sub-key after the null byte separator
+            field =
+              case :binary.split(key, <<0>>) do
+                [_prefix_part, sub] -> sub
+                _ -> key
+              end
+
+            [{field, value} | acc]
+          else
+            acc
+          end
+        end,
+        [],
+        state.ets
+      )
+
+    {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
+  end
+
+  # Count entries matching a compound key prefix.
+  def handle_call({:count_prefix, prefix}, _from, state) do
+    now = System.os_time(:millisecond)
+
+    count =
+      :ets.foldl(
+        fn {key, _value, exp}, acc ->
+          if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+            acc + 1
+          else
+            acc
+          end
+        end,
+        0,
+        state.ets
+      )
+
+    {:reply, count, state}
+  end
+
+  # Delete all entries matching a compound key prefix.
+  def handle_call({:delete_prefix, prefix}, _from, state) do
+    keys_to_delete =
+      :ets.foldl(
+        fn {key, _value, _exp}, acc ->
+          if is_binary(key) and String.starts_with?(key, prefix) do
+            [key | acc]
+          else
+            acc
+          end
+        end,
+        [],
+        state.ets
+      )
+
+    Enum.each(keys_to_delete, fn key -> :ets.delete(state.ets, key) end)
+    {:reply, :ok, state}
   end
 
   def handle_call({:put, key, value, expire_at_ms}, _from, state) do
@@ -747,6 +830,30 @@ defmodule Ferricstore.Store.Shard do
     {:reply, live_keys(state), state}
   end
 
+  # Merge-related calls: delegate to NIF and return results directly.
+
+  def handle_call(:shard_stats, _from, state) do
+    state = await_in_flight(state)
+    state = flush_pending_sync(state)
+    {:reply, NIF.shard_stats(state.store), state}
+  end
+
+  def handle_call(:file_sizes, _from, state) do
+    state = await_in_flight(state)
+    state = flush_pending_sync(state)
+    {:reply, NIF.file_sizes(state.store), state}
+  end
+
+  def handle_call({:run_compaction, file_ids}, _from, state) do
+    state = await_in_flight(state)
+    state = flush_pending_sync(state)
+    {:reply, NIF.run_compaction(state.store, file_ids), state}
+  end
+
+  def handle_call(:available_disk_space, _from, state) do
+    {:reply, NIF.available_disk_space(state.store), state}
+  end
+
   # Synchronous flush — used by tests and by delete to ensure durability.
   def handle_call(:flush, _from, state) do
     state = await_in_flight(state)
@@ -761,22 +868,16 @@ defmodule Ferricstore.Store.Shard do
     {:noreply, state}
   end
 
+  # Synchronous expiry sweep — used by tests to trigger a sweep and wait for
+  # completion before making assertions.
+  def handle_call(:expiry_sweep, _from, state) do
+    state = do_expiry_sweep(state)
+    {:reply, :ok, state}
+  end
+
   # Active expiry sweep: scan ETS for expired keys and delete them.
   def handle_info(:expiry_sweep, state) do
-    now = System.os_time(:millisecond)
-    max_keys = Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
-    expired_keys = scan_expired(state.ets, now, max_keys)
-
-    count = length(expired_keys)
-
-    if count > 0 do
-      Enum.each(expired_keys, fn key -> :ets.delete(state.ets, key) end)
-      NIF.purge_expired(state.store)
-
-      require Logger
-      Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")
-    end
-
+    state = do_expiry_sweep(state)
     schedule_expiry_sweep()
     {:noreply, state}
   end
@@ -1061,6 +1162,62 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
   # Private: active expiry sweep
   # -------------------------------------------------------------------
+
+  # Number of consecutive ceiling-hit sweeps before emitting the
+  # :expiry_struggling telemetry event.
+  @struggling_threshold 3
+
+  # Performs a single expiry sweep pass: scans ETS for up to `max_keys`
+  # expired entries, deletes them from ETS, and purges expired entries
+  # from the Bitcask store. Tracks consecutive ceiling-hit sweeps and
+  # emits telemetry when the sweep is struggling or recovers.
+  defp do_expiry_sweep(state) do
+    now = System.os_time(:millisecond)
+    max_keys = Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
+    expired_keys = scan_expired(state.ets, now, max_keys)
+
+    count = length(expired_keys)
+
+    if count > 0 do
+      Enum.each(expired_keys, fn key -> :ets.delete(state.ets, key) end)
+      NIF.purge_expired(state.store)
+
+      require Logger
+      Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")
+    end
+
+    # Track whether the sweep hit the ceiling (removed exactly max_keys).
+    hit_ceiling = count >= max_keys and count > 0
+
+    {new_ceiling_count, new_struggling} =
+      if hit_ceiling do
+        new_count = state.sweep_at_ceiling_count + 1
+
+        if new_count >= @struggling_threshold and not state.sweep_struggling do
+          :telemetry.execute(
+            [:ferricstore, :expiry, :struggling],
+            %{shard_index: state.index, consecutive_ceiling_sweeps: new_count, max_keys_per_sweep: max_keys},
+            %{}
+          )
+
+          {new_count, true}
+        else
+          {new_count, state.sweep_struggling}
+        end
+      else
+        if state.sweep_struggling do
+          :telemetry.execute(
+            [:ferricstore, :expiry, :recovered],
+            %{shard_index: state.index, previous_ceiling_sweeps: state.sweep_at_ceiling_count},
+            %{}
+          )
+        end
+
+        {0, false}
+      end
+
+    %{state | sweep_at_ceiling_count: new_ceiling_count, sweep_struggling: new_struggling}
+  end
 
   defp scan_expired(ets, now, limit) do
     match_spec = [

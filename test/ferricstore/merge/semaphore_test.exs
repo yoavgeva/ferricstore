@@ -1,6 +1,5 @@
 defmodule Ferricstore.Merge.SemaphoreTest do
   use ExUnit.Case, async: true
-  @moduletag :pending_nif_rebuild
 
   alias Ferricstore.Merge.Semaphore
 

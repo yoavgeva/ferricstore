@@ -125,7 +125,9 @@ defmodule Ferricstore.Commands.Strings do
           end
 
         type_str ->
-          # Data structure key -- delete compound sub-keys, then type metadata
+          # Data structure key -- delete compound sub-keys, then type metadata.
+          # Lists store data as serialized Erlang terms in the plain key store,
+          # so we must also delete the plain key for list types.
           prefix =
             case type_str do
               "hash" -> CompoundKey.hash_prefix(key)
@@ -135,6 +137,7 @@ defmodule Ferricstore.Commands.Strings do
             end
 
           store.compound_delete_prefix.(key, prefix)
+          if type_str == "list", do: store.delete.(key)
           TypeRegistry.delete_type(key, store)
           true
       end

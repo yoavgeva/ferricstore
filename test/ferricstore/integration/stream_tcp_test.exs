@@ -89,8 +89,10 @@ defmodule Ferricstore.Integration.StreamTcpTest do
   # Clean ETS tables for stream metadata between tests.
   setup do
     for table <- [Ferricstore.Stream.Meta, Ferricstore.Stream.Groups] do
-      if :ets.whereis(table) != :undefined do
+      try do
         :ets.delete_all_objects(table)
+      rescue
+        ArgumentError -> :ok
       end
     end
 

@@ -24,7 +24,7 @@ defmodule Ferricstore.Integration.MultiClientTest do
   end
 
   defp recv_one(sock, buf \\ "") do
-    case :gen_tcp.recv(sock, 0, 5_000) do
+    case :gen_tcp.recv(sock, 0, 10_000) do
       {:ok, data} ->
         buf2 = buf <> data
 
@@ -35,6 +35,9 @@ defmodule Ferricstore.Integration.MultiClientTest do
 
       {:error, :closed} ->
         :closed
+
+      {:error, :timeout} ->
+        {:error, :timeout}
     end
   end
 

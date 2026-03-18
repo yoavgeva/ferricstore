@@ -43,6 +43,16 @@ jobs:
           key: mix-deps-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
           restore-keys: mix-deps-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
 
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/ferricstore_bitcask/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('native/ferricstore_bitcask/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
       - name: Install dependencies
         run: mix deps.get
 
@@ -51,6 +61,9 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --manifest-path native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path native/ferricstore_bitcask/Cargo.toml
 
       - name: Build NIF (release)
         run: |
@@ -63,6 +76,12 @@ jobs:
 
       - name: Run tests
         run: mix test --trace --timeout 30000
+
+      - name: Run performance tests
+        run: mix test --only perf --timeout 60000
+
+      - name: Run large allocation tests
+        run: mix test --only large_alloc --timeout 60000
 
       - name: Check io_uring availability
         id: uring

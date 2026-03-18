@@ -32,6 +32,11 @@ defmodule Ferricstore.MemoryGuard do
       the pressure (85%) or reject (95%) threshold. Measurements include
       `%{shard_index: integer, bytes: integer, max_bytes: integer, ratio: float}`.
 
+    * `[:ferricstore, :memory, :recovered]` -- emitted once when pressure drops
+      back to `:ok` from `:pressure` or `:reject`. Measurements include
+      `%{total_bytes: integer, max_bytes: integer, ratio: float}`. Metadata
+      includes `%{previous_level: :pressure | :reject}`.
+
   ## Configuration
 
   MemoryGuard reads its configuration from the application environment:
@@ -194,8 +199,14 @@ defmodule Ferricstore.MemoryGuard do
     # Log and emit additional telemetry for pressure transitions
     case stats.pressure_level do
       :ok ->
-        if state.last_pressure_level != :ok do
+        if state.last_pressure_level in [:pressure, :reject] do
           Logger.info("MemoryGuard: memory pressure resolved (#{format_ratio(stats.ratio)})")
+
+          :telemetry.execute(
+            [:ferricstore, :memory, :recovered],
+            %{total_bytes: stats.total_bytes, max_bytes: stats.max_bytes, ratio: stats.ratio},
+            %{previous_level: state.last_pressure_level}
+          )
         end
 
       :warning ->

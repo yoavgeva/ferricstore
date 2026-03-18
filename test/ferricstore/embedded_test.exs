@@ -455,4 +455,575 @@ defmodule Ferricstore.EmbeddedTest do
       assert FerricStore.sandbox_key("mykey") == namespace <> "mykey"
     end
   end
+
+  # ===========================================================================
+  # LPUSH / RPUSH — list push operations
+  # ===========================================================================
+
+  describe "lpush/2" do
+    test "creates a new list and pushes elements to the left" do
+      assert {:ok, 3} = FerricStore.lpush("list:lpush", ["a", "b", "c"])
+    end
+
+    test "pushes to an existing list" do
+      FerricStore.lpush("list:lpush2", ["a"])
+      assert {:ok, 3} = FerricStore.lpush("list:lpush2", ["b", "c"])
+    end
+
+    test "elements are pushed in Redis LPUSH order (last arg becomes leftmost)" do
+      FerricStore.lpush("list:order", ["a", "b", "c"])
+      assert {:ok, ["c", "b", "a"]} = FerricStore.lrange("list:order", 0, -1)
+    end
+
+    test "lpush with single element" do
+      assert {:ok, 1} = FerricStore.lpush("list:single", ["x"])
+    end
+  end
+
+  describe "rpush/2" do
+    test "creates a new list and pushes elements to the right" do
+      assert {:ok, 3} = FerricStore.rpush("list:rpush", ["a", "b", "c"])
+    end
+
+    test "pushes to an existing list" do
+      FerricStore.rpush("list:rpush2", ["a"])
+      assert {:ok, 3} = FerricStore.rpush("list:rpush2", ["b", "c"])
+    end
+
+    test "elements are pushed in order (first arg is leftmost)" do
+      FerricStore.rpush("list:rorder", ["a", "b", "c"])
+      assert {:ok, ["a", "b", "c"]} = FerricStore.lrange("list:rorder", 0, -1)
+    end
+  end
+
+  # ===========================================================================
+  # LPOP / RPOP — list pop operations
+  # ===========================================================================
+
+  describe "lpop/2" do
+    test "pops single element from the left" do
+      FerricStore.rpush("list:lpop", ["a", "b", "c"])
+      assert {:ok, "a"} = FerricStore.lpop("list:lpop")
+    end
+
+    test "pops multiple elements from the left" do
+      FerricStore.rpush("list:lpop2", ["a", "b", "c", "d"])
+      assert {:ok, ["a", "b"]} = FerricStore.lpop("list:lpop2", 2)
+    end
+
+    test "lpop on nonexistent key returns {:ok, nil}" do
+      assert {:ok, nil} = FerricStore.lpop("list:nonexistent")
+    end
+
+    test "lpop count exceeding list length returns all elements" do
+      FerricStore.rpush("list:lpop3", ["a", "b"])
+      assert {:ok, ["a", "b"]} = FerricStore.lpop("list:lpop3", 5)
+    end
+
+    test "lpop empties the list and subsequent lpop returns nil" do
+      FerricStore.rpush("list:lpop4", ["a"])
+      assert {:ok, "a"} = FerricStore.lpop("list:lpop4")
+      assert {:ok, nil} = FerricStore.lpop("list:lpop4")
+    end
+  end
+
+  describe "rpop/2" do
+    test "pops single element from the right" do
+      FerricStore.rpush("list:rpop", ["a", "b", "c"])
+      assert {:ok, "c"} = FerricStore.rpop("list:rpop")
+    end
+
+    test "pops multiple elements from the right" do
+      FerricStore.rpush("list:rpop2", ["a", "b", "c", "d"])
+      assert {:ok, ["d", "c"]} = FerricStore.rpop("list:rpop2", 2)
+    end
+
+    test "rpop on nonexistent key returns {:ok, nil}" do
+      assert {:ok, nil} = FerricStore.rpop("list:nonexistent")
+    end
+  end
+
+  # ===========================================================================
+  # LRANGE — list range
+  # ===========================================================================
+
+  describe "lrange/3" do
+    test "returns full list with 0..-1" do
+      FerricStore.rpush("list:range", ["a", "b", "c", "d"])
+      assert {:ok, ["a", "b", "c", "d"]} = FerricStore.lrange("list:range", 0, -1)
+    end
+
+    test "returns a sub-range" do
+      FerricStore.rpush("list:range2", ["a", "b", "c", "d"])
+      assert {:ok, ["b", "c"]} = FerricStore.lrange("list:range2", 1, 2)
+    end
+
+    test "returns empty list for out-of-range" do
+      FerricStore.rpush("list:range3", ["a"])
+      assert {:ok, []} = FerricStore.lrange("list:range3", 5, 10)
+    end
+
+    test "returns empty list for nonexistent key" do
+      assert {:ok, []} = FerricStore.lrange("list:noexist", 0, -1)
+    end
+
+    test "negative indices work correctly" do
+      FerricStore.rpush("list:range4", ["a", "b", "c", "d"])
+      assert {:ok, ["c", "d"]} = FerricStore.lrange("list:range4", -2, -1)
+    end
+  end
+
+  # ===========================================================================
+  # LLEN — list length
+  # ===========================================================================
+
+  describe "llen/1" do
+    test "returns the length of a list" do
+      FerricStore.rpush("list:len", ["a", "b", "c"])
+      assert {:ok, 3} = FerricStore.llen("list:len")
+    end
+
+    test "returns 0 for nonexistent key" do
+      assert {:ok, 0} = FerricStore.llen("list:noexist")
+    end
+
+    test "returns 0 after all elements are popped" do
+      FerricStore.rpush("list:len2", ["a"])
+      FerricStore.lpop("list:len2")
+      assert {:ok, 0} = FerricStore.llen("list:len2")
+    end
+  end
+
+  # ===========================================================================
+  # SADD — set add
+  # ===========================================================================
+
+  describe "sadd/2" do
+    test "adds new members and returns count" do
+      assert {:ok, 3} = FerricStore.sadd("set:add", ["a", "b", "c"])
+    end
+
+    test "ignores duplicate members" do
+      FerricStore.sadd("set:dup", ["a", "b"])
+      assert {:ok, 1} = FerricStore.sadd("set:dup", ["b", "c"])
+    end
+
+    test "all duplicates returns 0" do
+      FerricStore.sadd("set:alldup", ["a"])
+      assert {:ok, 0} = FerricStore.sadd("set:alldup", ["a"])
+    end
+  end
+
+  # ===========================================================================
+  # SREM — set remove
+  # ===========================================================================
+
+  describe "srem/2" do
+    test "removes existing members" do
+      FerricStore.sadd("set:rem", ["a", "b", "c"])
+      assert {:ok, 2} = FerricStore.srem("set:rem", ["a", "c"])
+    end
+
+    test "ignores nonexistent members" do
+      FerricStore.sadd("set:rem2", ["a"])
+      assert {:ok, 0} = FerricStore.srem("set:rem2", ["z"])
+    end
+
+    test "removing from nonexistent set returns 0" do
+      assert {:ok, 0} = FerricStore.srem("set:noexist", ["a"])
+    end
+  end
+
+  # ===========================================================================
+  # SMEMBERS — set members
+  # ===========================================================================
+
+  describe "smembers/1" do
+    test "returns all members of a set" do
+      FerricStore.sadd("set:members", ["a", "b", "c"])
+      {:ok, members} = FerricStore.smembers("set:members")
+      assert Enum.sort(members) == ["a", "b", "c"]
+    end
+
+    test "returns empty list for nonexistent set" do
+      assert {:ok, []} = FerricStore.smembers("set:noexist")
+    end
+
+    test "returns correct members after add and remove" do
+      FerricStore.sadd("set:addrem", ["a", "b", "c"])
+      FerricStore.srem("set:addrem", ["b"])
+      {:ok, members} = FerricStore.smembers("set:addrem")
+      assert Enum.sort(members) == ["a", "c"]
+    end
+  end
+
+  # ===========================================================================
+  # SISMEMBER — set membership check
+  # ===========================================================================
+
+  describe "sismember/2" do
+    test "returns true for existing member" do
+      FerricStore.sadd("set:ism", ["a", "b"])
+      assert FerricStore.sismember("set:ism", "a") == true
+    end
+
+    test "returns false for missing member" do
+      FerricStore.sadd("set:ism2", ["a"])
+      assert FerricStore.sismember("set:ism2", "z") == false
+    end
+
+    test "returns false for nonexistent key" do
+      assert FerricStore.sismember("set:noexist", "a") == false
+    end
+  end
+
+  # ===========================================================================
+  # SCARD — set cardinality
+  # ===========================================================================
+
+  describe "scard/1" do
+    test "returns the number of members" do
+      FerricStore.sadd("set:card", ["a", "b", "c"])
+      assert {:ok, 3} = FerricStore.scard("set:card")
+    end
+
+    test "returns 0 for nonexistent set" do
+      assert {:ok, 0} = FerricStore.scard("set:noexist")
+    end
+  end
+
+  # ===========================================================================
+  # ZADD — sorted set add
+  # ===========================================================================
+
+  describe "zadd/2" do
+    test "adds new members with scores" do
+      assert {:ok, 2} = FerricStore.zadd("zset:add", [{1.0, "a"}, {2.0, "b"}])
+    end
+
+    test "updating existing member score does not count as new" do
+      FerricStore.zadd("zset:upd", [{1.0, "a"}])
+      assert {:ok, 0} = FerricStore.zadd("zset:upd", [{5.0, "a"}])
+    end
+
+    test "mixed add and update" do
+      FerricStore.zadd("zset:mix", [{1.0, "a"}])
+      assert {:ok, 1} = FerricStore.zadd("zset:mix", [{2.0, "a"}, {3.0, "b"}])
+    end
+  end
+
+  # ===========================================================================
+  # ZRANGE — sorted set range
+  # ===========================================================================
+
+  describe "zrange/4" do
+    test "returns members in score order" do
+      FerricStore.zadd("zset:range", [{3.0, "c"}, {1.0, "a"}, {2.0, "b"}])
+      assert {:ok, ["a", "b", "c"]} = FerricStore.zrange("zset:range", 0, -1)
+    end
+
+    test "returns sub-range" do
+      FerricStore.zadd("zset:range2", [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}])
+      assert {:ok, ["b"]} = FerricStore.zrange("zset:range2", 1, 1)
+    end
+
+    test "returns empty list for nonexistent key" do
+      assert {:ok, []} = FerricStore.zrange("zset:noexist", 0, -1)
+    end
+
+    test "withscores option returns member-score tuples" do
+      FerricStore.zadd("zset:ws", [{1.0, "a"}, {2.0, "b"}])
+      {:ok, pairs} = FerricStore.zrange("zset:ws", 0, -1, withscores: true)
+      assert length(pairs) == 2
+      assert {first_member, first_score} = hd(pairs)
+      assert first_member == "a"
+      assert first_score == 1.0
+    end
+
+    test "returns empty list for out-of-range indices" do
+      FerricStore.zadd("zset:oor", [{1.0, "a"}])
+      assert {:ok, []} = FerricStore.zrange("zset:oor", 5, 10)
+    end
+  end
+
+  # ===========================================================================
+  # ZSCORE — sorted set score lookup
+  # ===========================================================================
+
+  describe "zscore/2" do
+    test "returns the score of an existing member" do
+      FerricStore.zadd("zset:score", [{42.5, "alice"}])
+      assert {:ok, 42.5} = FerricStore.zscore("zset:score", "alice")
+    end
+
+    test "returns nil for missing member" do
+      FerricStore.zadd("zset:score2", [{1.0, "a"}])
+      assert {:ok, nil} = FerricStore.zscore("zset:score2", "z")
+    end
+
+    test "returns nil for nonexistent key" do
+      assert {:ok, nil} = FerricStore.zscore("zset:noexist", "a")
+    end
+
+    test "score updates are reflected" do
+      FerricStore.zadd("zset:score3", [{1.0, "a"}])
+      FerricStore.zadd("zset:score3", [{99.0, "a"}])
+      assert {:ok, 99.0} = FerricStore.zscore("zset:score3", "a")
+    end
+  end
+
+  # ===========================================================================
+  # ZCARD — sorted set cardinality
+  # ===========================================================================
+
+  describe "zcard/1" do
+    test "returns the number of members" do
+      FerricStore.zadd("zset:card", [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}])
+      assert {:ok, 3} = FerricStore.zcard("zset:card")
+    end
+
+    test "returns 0 for nonexistent key" do
+      assert {:ok, 0} = FerricStore.zcard("zset:noexist")
+    end
+  end
+
+  # ===========================================================================
+  # ZREM — sorted set remove
+  # ===========================================================================
+
+  describe "zrem/2" do
+    test "removes existing members" do
+      FerricStore.zadd("zset:rem", [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}])
+      assert {:ok, 2} = FerricStore.zrem("zset:rem", ["a", "c"])
+    end
+
+    test "ignores nonexistent members" do
+      FerricStore.zadd("zset:rem2", [{1.0, "a"}])
+      assert {:ok, 0} = FerricStore.zrem("zset:rem2", ["z"])
+    end
+
+    test "removing from nonexistent key returns 0" do
+      assert {:ok, 0} = FerricStore.zrem("zset:noexist", ["a"])
+    end
+
+    test "zrange reflects removal" do
+      FerricStore.zadd("zset:rem3", [{1.0, "a"}, {2.0, "b"}, {3.0, "c"}])
+      FerricStore.zrem("zset:rem3", ["b"])
+      assert {:ok, ["a", "c"]} = FerricStore.zrange("zset:rem3", 0, -1)
+    end
+  end
+
+  # ===========================================================================
+  # CAS — compare-and-swap
+  # ===========================================================================
+
+  describe "cas/4" do
+    test "swaps when value matches" do
+      FerricStore.set("cas:key", "old")
+      assert {:ok, true} = FerricStore.cas("cas:key", "old", "new")
+      assert {:ok, "new"} = FerricStore.get("cas:key")
+    end
+
+    test "does not swap when value does not match" do
+      FerricStore.set("cas:key2", "current")
+      assert {:ok, false} = FerricStore.cas("cas:key2", "wrong", "new")
+      assert {:ok, "current"} = FerricStore.get("cas:key2")
+    end
+
+    test "returns nil when key does not exist" do
+      assert {:ok, nil} = FerricStore.cas("cas:noexist", "expected", "new")
+    end
+
+    test "cas with TTL option" do
+      FerricStore.set("cas:ttl", "old")
+      assert {:ok, true} = FerricStore.cas("cas:ttl", "old", "new", ttl: :timer.hours(1))
+      assert {:ok, "new"} = FerricStore.get("cas:ttl")
+    end
+  end
+
+  # ===========================================================================
+  # EXISTS — key existence check
+  # ===========================================================================
+
+  describe "exists/1" do
+    test "returns true for existing key" do
+      FerricStore.set("exists:key", "value")
+      assert FerricStore.exists("exists:key") == true
+    end
+
+    test "returns false for nonexistent key" do
+      assert FerricStore.exists("exists:noexist") == false
+    end
+
+    test "returns false after deletion" do
+      FerricStore.set("exists:del", "value")
+      FerricStore.del("exists:del")
+      assert FerricStore.exists("exists:del") == false
+    end
+  end
+
+  # ===========================================================================
+  # KEYS — key listing
+  # ===========================================================================
+
+  describe "keys/1" do
+    test "returns all keys with wildcard pattern" do
+      FerricStore.set("keys:a", "1")
+      FerricStore.set("keys:b", "2")
+      {:ok, result} = FerricStore.keys("keys:*")
+      assert "keys:a" in result
+      assert "keys:b" in result
+    end
+
+    test "returns empty list when no keys match" do
+      {:ok, result} = FerricStore.keys("nomatch:*")
+      assert result == []
+    end
+
+    test "default pattern returns all keys" do
+      FerricStore.set("kall:x", "1")
+      {:ok, result} = FerricStore.keys()
+      assert "kall:x" in result
+    end
+  end
+
+  # ===========================================================================
+  # DBSIZE — key count
+  # ===========================================================================
+
+  describe "dbsize/0" do
+    test "returns the number of keys" do
+      FerricStore.set("db:a", "1")
+      FerricStore.set("db:b", "2")
+      {:ok, size} = FerricStore.dbsize()
+      assert size >= 2
+    end
+  end
+
+  # ===========================================================================
+  # FLUSHDB — delete all keys
+  # ===========================================================================
+
+  describe "flushdb/0" do
+    test "deletes all keys in the sandbox" do
+      FerricStore.set("flush:a", "1")
+      FerricStore.set("flush:b", "2")
+      assert :ok = FerricStore.flushdb()
+
+      # Keys should be gone
+      assert {:ok, nil} = FerricStore.get("flush:a")
+      assert {:ok, nil} = FerricStore.get("flush:b")
+    end
+  end
+
+  # ===========================================================================
+  # Pipeline — new commands
+  # ===========================================================================
+
+  describe "pipeline with new commands" do
+    test "pipeline with LPUSH and RPUSH" do
+      assert {:ok, results} =
+               FerricStore.pipeline(fn pipe ->
+                 pipe
+                 |> FerricStore.Pipe.rpush("pipe_list", ["a", "b"])
+                 |> FerricStore.Pipe.lpush("pipe_list", ["c"])
+               end)
+
+      assert [{:ok, 2}, {:ok, 3}] = results
+    end
+
+    test "pipeline with SADD" do
+      assert {:ok, results} =
+               FerricStore.pipeline(fn pipe ->
+                 pipe
+                 |> FerricStore.Pipe.sadd("pipe_set", ["a", "b", "c"])
+               end)
+
+      assert [{:ok, 3}] = results
+    end
+
+    test "pipeline with ZADD" do
+      assert {:ok, results} =
+               FerricStore.pipeline(fn pipe ->
+                 pipe
+                 |> FerricStore.Pipe.zadd("pipe_zset", [{1.0, "a"}, {2.0, "b"}])
+               end)
+
+      assert [{:ok, 2}] = results
+    end
+
+    test "pipeline with EXPIRE" do
+      FerricStore.set("pipe_expire", "value")
+
+      assert {:ok, results} =
+               FerricStore.pipeline(fn pipe ->
+                 pipe
+                 |> FerricStore.Pipe.expire("pipe_expire", :timer.hours(1))
+               end)
+
+      assert [{:ok, true}] = results
+    end
+
+    test "pipeline with mixed new and old commands" do
+      assert {:ok, results} =
+               FerricStore.pipeline(fn pipe ->
+                 pipe
+                 |> FerricStore.Pipe.set("mixed:key", "val")
+                 |> FerricStore.Pipe.rpush("mixed:list", ["a"])
+                 |> FerricStore.Pipe.sadd("mixed:set", ["x"])
+                 |> FerricStore.Pipe.get("mixed:key")
+               end)
+
+      assert [:ok, {:ok, 1}, {:ok, 1}, {:ok, "val"}] = results
+    end
+  end
+
+  # ===========================================================================
+  # Integration — combined data type operations
+  # ===========================================================================
+
+  describe "combined operations" do
+    test "list push-pop cycle preserves FIFO ordering" do
+      FerricStore.rpush("fifo", ["first", "second", "third"])
+      assert {:ok, "first"} = FerricStore.lpop("fifo")
+      assert {:ok, "second"} = FerricStore.lpop("fifo")
+      assert {:ok, "third"} = FerricStore.lpop("fifo")
+      assert {:ok, nil} = FerricStore.lpop("fifo")
+    end
+
+    test "list push-pop cycle preserves LIFO ordering" do
+      FerricStore.rpush("lifo", ["first", "second", "third"])
+      assert {:ok, "third"} = FerricStore.rpop("lifo")
+      assert {:ok, "second"} = FerricStore.rpop("lifo")
+      assert {:ok, "first"} = FerricStore.rpop("lifo")
+    end
+
+    test "sorted set maintains score ordering across operations" do
+      FerricStore.zadd("zorder", [{10.0, "ten"}, {1.0, "one"}, {5.0, "five"}])
+      assert {:ok, ["one", "five", "ten"]} = FerricStore.zrange("zorder", 0, -1)
+
+      # Update a score to reorder
+      FerricStore.zadd("zorder", [{100.0, "one"}])
+      assert {:ok, ["five", "ten", "one"]} = FerricStore.zrange("zorder", 0, -1)
+    end
+
+    test "set operations are idempotent for adds" do
+      FerricStore.sadd("idem", ["a"])
+      FerricStore.sadd("idem", ["a"])
+      assert {:ok, 1} = FerricStore.scard("idem")
+    end
+
+    test "different data types can coexist with different keys" do
+      FerricStore.set("coexist:str", "hello")
+      FerricStore.rpush("coexist:list", ["a"])
+      FerricStore.sadd("coexist:set", ["x"])
+      FerricStore.zadd("coexist:zset", [{1.0, "m"}])
+
+      assert {:ok, "hello"} = FerricStore.get("coexist:str")
+      assert {:ok, ["a"]} = FerricStore.lrange("coexist:list", 0, -1)
+      {:ok, members} = FerricStore.smembers("coexist:set")
+      assert members == ["x"]
+      assert {:ok, ["m"]} = FerricStore.zrange("coexist:zset", 0, -1)
+    end
+  end
 end

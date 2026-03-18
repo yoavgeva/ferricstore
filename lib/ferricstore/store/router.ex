@@ -64,18 +64,34 @@ defmodule Ferricstore.Store.Router do
   Hot path: reads directly from ETS (no GenServer roundtrip for cached keys).
   Falls back to a GenServer call for cache misses or when the ETS table is
   temporarily unavailable (e.g. during a shard restart).
+
+  Each successful read is recorded as either *hot* (ETS hit) or *cold*
+  (Bitcask fallback) in `Ferricstore.Stats` for the `FERRICSTORE.HOTNESS`
+  command and the `INFO stats` hot/cold fields.
   """
   @spec get(binary()) :: binary() | nil
   def get(key) do
+    alias Ferricstore.Stats
+
     idx = shard_for(key)
     ets = :"shard_ets_#{idx}"
     now = System.os_time(:millisecond)
 
     case ets_get(ets, key, now) do
-      {:hit, value, _exp} -> value
-      :expired -> nil
-      :miss -> GenServer.call(shard_name(idx), {:get, key})
-      :no_table -> GenServer.call(shard_name(idx), {:get, key})
+      {:hit, value, _exp} ->
+        Stats.record_hot_read(key)
+        value
+
+      :expired ->
+        nil
+
+      :miss ->
+        Stats.record_cold_read(key)
+        GenServer.call(shard_name(idx), {:get, key})
+
+      :no_table ->
+        Stats.record_cold_read(key)
+        GenServer.call(shard_name(idx), {:get, key})
     end
   end
 
@@ -83,19 +99,32 @@ defmodule Ferricstore.Store.Router do
   Returns `{value, expire_at_ms}` for a live key, or `nil` if the key does
   not exist or is expired.
 
-  Hot path: reads directly from ETS for cached keys.
+  Hot path: reads directly from ETS for cached keys. Each read is recorded
+  as hot or cold in `Ferricstore.Stats`.
   """
   @spec get_meta(binary()) :: {binary(), non_neg_integer()} | nil
   def get_meta(key) do
+    alias Ferricstore.Stats
+
     idx = shard_for(key)
     ets = :"shard_ets_#{idx}"
     now = System.os_time(:millisecond)
 
     case ets_get(ets, key, now) do
-      {:hit, value, exp} -> {value, exp}
-      :expired -> nil
-      :miss -> GenServer.call(shard_name(idx), {:get_meta, key})
-      :no_table -> GenServer.call(shard_name(idx), {:get_meta, key})
+      {:hit, value, exp} ->
+        Stats.record_hot_read(key)
+        {value, exp}
+
+      :expired ->
+        nil
+
+      :miss ->
+        Stats.record_cold_read(key)
+        GenServer.call(shard_name(idx), {:get_meta, key})
+
+      :no_table ->
+        Stats.record_cold_read(key)
+        GenServer.call(shard_name(idx), {:get_meta, key})
     end
   end
 
@@ -130,8 +159,20 @@ defmodule Ferricstore.Store.Router do
   timestamp in milliseconds; pass `0` for no expiry.
   """
   @spec put(binary(), binary(), non_neg_integer()) :: :ok
+  @max_key_size 65_535
+  @max_value_size 512 * 1024 * 1024
+
   def put(key, value, expire_at_ms \\ 0) do
-    GenServer.call(shard_name(shard_for(key)), {:put, key, value, expire_at_ms})
+    cond do
+      byte_size(key) > @max_key_size ->
+        {:error, "ERR key too large (max #{@max_key_size} bytes)"}
+
+      byte_size(value) > @max_value_size ->
+        {:error, "ERR value too large (max #{@max_value_size} bytes)"}
+
+      true ->
+        GenServer.call(shard_name(shard_for(key)), {:put, key, value, expire_at_ms})
+    end
   end
 
   @doc "Deletes `key`. Returns `:ok` whether or not the key existed."

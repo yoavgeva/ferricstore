@@ -6,30 +6,62 @@ defmodule Ferricstore.Stats do
 
     * `total_connections_received` — number of TCP connections accepted since startup
     * `total_commands_processed` — number of commands dispatched since startup
+    * `hot_reads` — number of reads served from the ETS hot cache
+    * `cold_reads` — number of reads that fell through to Bitcask on disk
 
   Also stores the server start time and a random run ID (hex string) generated at
   startup.
 
+  ## Hot/cold read tracking
+
+  Every read through `Router.get/1` is classified as either *hot* (served from
+  ETS) or *cold* (required a Bitcask disk read). Counts are tracked at two
+  levels:
+
+  1. **Global** — via atomic counters (slots 3 and 4), used for `INFO stats`.
+  2. **Per-prefix** — via the `:ferricstore_hotness` ETS table, used by the
+     `FERRICSTORE.HOTNESS` command. The prefix is the first colon-delimited
+     component of the key, or `"_root"` when no colon is present.
+
+  The per-prefix table is capped at `@max_tracked_prefixes` (1000). Once the
+  cap is reached, new prefixes that would exceed it are bucketed under the
+  `"_other"` pseudo-prefix to bound memory usage.
+
   ## Architecture
 
-  Uses a single `:counters` reference with two slots for the hot-path counters.
-  The start time and run ID are stored via `:persistent_term` for zero-cost reads
-  from any process.
+  Uses a single `:counters` reference with four slots for the hot-path
+  counters. The start time and run ID are stored via `:persistent_term` for
+  zero-cost reads from any process. The hotness ETS table is a public
+  `:set` table allowing concurrent writers from any process.
 
   ## Usage
 
       Ferricstore.Stats.incr_connections()
       Ferricstore.Stats.incr_commands()
-      Ferricstore.Stats.total_connections()
-      Ferricstore.Stats.total_commands()
-      Ferricstore.Stats.uptime_seconds()
-      Ferricstore.Stats.run_id()
+      Ferricstore.Stats.record_hot_read("user:42")
+      Ferricstore.Stats.record_cold_read("user:42")
+      Ferricstore.Stats.total_hot_reads()
+      Ferricstore.Stats.total_cold_reads()
+      Ferricstore.Stats.hotness_top(5)
   """
 
   use GenServer
 
   @counter_connections 1
   @counter_commands 2
+  @counter_hot_reads 3
+  @counter_cold_reads 4
+  @counter_active_connections 5
+
+  @hotness_table :ferricstore_hotness
+  @max_tracked_prefixes 1000
+
+  # ---------------------------------------------------------------------------
+  # Types
+  # ---------------------------------------------------------------------------
+
+  @typedoc "A prefix hotness entry: `{prefix, hot_count, cold_count, cold_pct}`."
+  @type hotness_entry :: {binary(), non_neg_integer(), non_neg_integer(), float()}
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -41,11 +73,54 @@ defmodule Ferricstore.Stats do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Increments the total connections received counter by 1."
+  @doc """
+  Increments the total connections received counter by 1 and the active
+  connection counter by 1.
+
+  Also checks the current active connection count against `maxclients` and
+  emits a `[:ferricstore, :connection, :threshold]` telemetry event when
+  the count crosses the 80% or 95% thresholds.
+  """
   @spec incr_connections() :: :ok
   def incr_connections do
-    :counters.add(counter_ref(), @counter_connections, 1)
+    ref = counter_ref()
+    :counters.add(ref, @counter_connections, 1)
+
+    try do
+      :counters.add(ref, @counter_active_connections, 1)
+      check_connection_threshold()
+    rescue
+      ArgumentError -> :ok
+    end
+
     :ok
+  end
+
+  @doc """
+  Decrements the active connection counter by 1.
+
+  Called when a connection closes. The total_connections counter is not
+  decremented (it tracks lifetime connections accepted).
+  """
+  @spec decr_connections() :: :ok
+  def decr_connections do
+    try do
+      :counters.add(counter_ref(), @counter_active_connections, -1)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    :ok
+  end
+
+  @doc "Returns the current number of active connections."
+  @spec active_connections() :: non_neg_integer()
+  def active_connections do
+    try do
+      max(0, :counters.get(counter_ref(), @counter_active_connections))
+    rescue
+      ArgumentError -> 0
+    end
   end
 
   @doc "Increments the total commands processed counter by 1."
@@ -67,6 +142,140 @@ defmodule Ferricstore.Stats do
     :counters.get(counter_ref(), @counter_commands)
   end
 
+  @doc """
+  Records a hot read (ETS cache hit) for the given key.
+
+  Increments both the global hot-read counter and the per-prefix hot counter
+  in the hotness ETS table.
+
+  ## Parameters
+
+    * `key` — the key that was read from ETS
+  """
+  @spec record_hot_read(binary()) :: :ok
+  def record_hot_read(key) when is_binary(key) do
+    :counters.add(counter_ref(), @counter_hot_reads, 1)
+    prefix = extract_prefix(key)
+    resolved = resolve_prefix(prefix)
+    update_hotness(resolved, :hot)
+    :ok
+  end
+
+  @doc """
+  Records a cold read (Bitcask disk fallback) for the given key.
+
+  Increments both the global cold-read counter and the per-prefix cold counter
+  in the hotness ETS table.
+
+  ## Parameters
+
+    * `key` — the key that required a Bitcask read
+  """
+  @spec record_cold_read(binary()) :: :ok
+  def record_cold_read(key) when is_binary(key) do
+    :counters.add(counter_ref(), @counter_cold_reads, 1)
+    prefix = extract_prefix(key)
+    resolved = resolve_prefix(prefix)
+    update_hotness(resolved, :cold)
+    :ok
+  end
+
+  @doc "Returns the total number of hot reads (ETS cache hits) since startup."
+  @spec total_hot_reads() :: non_neg_integer()
+  def total_hot_reads do
+    :counters.get(counter_ref(), @counter_hot_reads)
+  end
+
+  @doc "Returns the total number of cold reads (Bitcask fallbacks) since startup."
+  @spec total_cold_reads() :: non_neg_integer()
+  def total_cold_reads do
+    :counters.get(counter_ref(), @counter_cold_reads)
+  end
+
+  @doc """
+  Returns the hot read percentage as a float between 0.0 and 100.0.
+
+  Returns 0.0 when no reads have been recorded.
+  """
+  @spec hot_read_pct() :: float()
+  def hot_read_pct do
+    hot = total_hot_reads()
+    cold = total_cold_reads()
+    total = hot + cold
+
+    if total == 0 do
+      0.0
+    else
+      Float.round(hot / total * 100.0, 2)
+    end
+  end
+
+  @doc """
+  Returns approximate cold reads per second since server startup.
+
+  Uses `uptime_seconds/0` as the denominator. Returns 0.0 when uptime is 0.
+  """
+  @spec cold_reads_per_second() :: float()
+  def cold_reads_per_second do
+    uptime = uptime_seconds()
+
+    if uptime == 0 do
+      0.0
+    else
+      Float.round(total_cold_reads() / uptime, 2)
+    end
+  end
+
+  @doc """
+  Returns the top `n` prefixes sorted by cold read count (descending).
+
+  Each entry is a tuple `{prefix, hot_count, cold_count, cold_pct}` where
+  `cold_pct` is the percentage of reads for that prefix that were cold.
+
+  ## Parameters
+
+    * `n` — maximum number of entries to return (default: 10)
+
+  ## Examples
+
+      iex> Ferricstore.Stats.hotness_top(5)
+      [{"user", 1000, 50, 4.76}, {"session", 500, 200, 28.57}]
+  """
+  @spec hotness_top(pos_integer()) :: [hotness_entry()]
+  def hotness_top(n \\ 10) do
+    try do
+      :ets.tab2list(@hotness_table)
+      |> Enum.map(fn {prefix, hot, cold} ->
+        total = hot + cold
+        pct = if total == 0, do: 0.0, else: Float.round(cold / total * 100.0, 2)
+        {prefix, hot, cold, pct}
+      end)
+      |> Enum.sort_by(fn {_prefix, _hot, cold, _pct} -> cold end, :desc)
+      |> Enum.take(n)
+    rescue
+      ArgumentError -> []
+    end
+  end
+
+  @doc """
+  Resets all hotness counters (both global and per-prefix).
+
+  Useful for tests and for the `FERRICSTORE.HOTNESS RESET` subcommand.
+  """
+  @spec reset_hotness() :: :ok
+  def reset_hotness do
+    :counters.put(counter_ref(), @counter_hot_reads, 0)
+    :counters.put(counter_ref(), @counter_cold_reads, 0)
+
+    try do
+      :ets.delete_all_objects(@hotness_table)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    :ok
+  end
+
   @doc "Returns the server uptime in seconds."
   @spec uptime_seconds() :: non_neg_integer()
   def uptime_seconds do
@@ -86,19 +295,81 @@ defmodule Ferricstore.Stats do
     :persistent_term.get({__MODULE__, :start_time})
   end
 
+  @doc """
+  Resets all Stats counters to zero: connections, commands, hot reads,
+  and cold reads.
+
+  Also clears the per-prefix hotness table. The run ID and start time
+  are **not** reset.
+
+  Used by `CONFIG RESETSTAT` to clear accumulated statistics.
+  """
+  @spec reset() :: :ok
+  def reset do
+    ref = counter_ref()
+    :counters.put(ref, @counter_connections, 0)
+    :counters.put(ref, @counter_commands, 0)
+    :counters.put(ref, @counter_hot_reads, 0)
+    :counters.put(ref, @counter_cold_reads, 0)
+
+    try do
+      :ets.delete_all_objects(@hotness_table)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
+  Extracts the prefix from a key by splitting on the first colon.
+
+  Returns the portion before the first `":"`, or `"_root"` when the key
+  contains no colon.
+
+  ## Examples
+
+      iex> Ferricstore.Stats.extract_prefix("user:42")
+      "user"
+
+      iex> Ferricstore.Stats.extract_prefix("plain_key")
+      "_root"
+
+      iex> Ferricstore.Stats.extract_prefix("a:b:c")
+      "a"
+  """
+  @spec extract_prefix(binary()) :: binary()
+  def extract_prefix(key) when is_binary(key) do
+    case :binary.split(key, ":") do
+      [^key] -> "_root"
+      [prefix, _rest] -> prefix
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # GenServer callbacks
   # ---------------------------------------------------------------------------
 
   @impl true
   def init(_opts) do
-    ref = :counters.new(2, [:atomics])
+    ref = :counters.new(5, [:atomics])
     run_id = :crypto.strong_rand_bytes(20) |> Base.encode16(case: :lower)
     start_time = System.monotonic_time(:millisecond)
 
     :persistent_term.put({__MODULE__, :counter_ref}, ref)
     :persistent_term.put({__MODULE__, :run_id}, run_id)
     :persistent_term.put({__MODULE__, :start_time}, start_time)
+
+    # Create the per-prefix hotness table if it does not already exist.
+    # The table is :public so any process (Router, Shard) can write to it
+    # without going through this GenServer.
+    case :ets.whereis(@hotness_table) do
+      :undefined ->
+        :ets.new(@hotness_table, [:set, :public, :named_table, {:write_concurrency, true}])
+
+      _ref ->
+        :ets.delete_all_objects(@hotness_table)
+    end
 
     {:ok, %{}}
   end
@@ -109,5 +380,84 @@ defmodule Ferricstore.Stats do
 
   defp counter_ref do
     :persistent_term.get({__MODULE__, :counter_ref})
+  end
+
+  # Resolves the prefix to track: if the hotness table already has this prefix
+  # or the table has room, use the prefix as-is. Otherwise bucket into "_other".
+  @spec resolve_prefix(binary()) :: binary()
+  defp resolve_prefix(prefix) do
+    try do
+      case :ets.lookup(@hotness_table, prefix) do
+        [{^prefix, _, _}] ->
+          # Already tracked — use it directly.
+          prefix
+
+        [] ->
+          # New prefix. Check if we have room.
+          size = :ets.info(@hotness_table, :size)
+
+          if size < @max_tracked_prefixes do
+            prefix
+          else
+            "_other"
+          end
+      end
+    rescue
+      ArgumentError -> "_other"
+    end
+  end
+
+  # Atomically increments either the hot or cold counter for a prefix.
+  # Uses :ets.update_counter with a default for atomic upsert.
+  @spec update_hotness(binary(), :hot | :cold) :: :ok
+  defp update_hotness(prefix, :hot) do
+    try do
+      :ets.update_counter(@hotness_table, prefix, {2, 1}, {prefix, 0, 0})
+    rescue
+      ArgumentError -> :ok
+    end
+
+    :ok
+  end
+
+  defp update_hotness(prefix, :cold) do
+    try do
+      :ets.update_counter(@hotness_table, prefix, {3, 1}, {prefix, 0, 0})
+    rescue
+      ArgumentError -> :ok
+    end
+
+    :ok
+  end
+
+  # Checks if the current active connection count crosses the 80% or 95%
+  # thresholds of maxclients and emits a telemetry event if so.
+  # Uses the atomic counter for a lock-free, non-blocking check.
+  @connection_warn_threshold 0.80
+  @connection_critical_threshold 0.95
+
+  defp check_connection_threshold do
+    maxclients = Application.get_env(:ferricstore, :maxclients, 10_000)
+    active = active_connections()
+    ratio = if maxclients > 0, do: active / maxclients, else: 0.0
+
+    cond do
+      ratio >= @connection_critical_threshold ->
+        :telemetry.execute(
+          [:ferricstore, :connection, :threshold],
+          %{active: active, max: maxclients, ratio: ratio},
+          %{level: :critical}
+        )
+
+      ratio >= @connection_warn_threshold ->
+        :telemetry.execute(
+          [:ferricstore, :connection, :threshold],
+          %{active: active, max: maxclients, ratio: ratio},
+          %{level: :warning}
+        )
+
+      true ->
+        :ok
+    end
   end
 end

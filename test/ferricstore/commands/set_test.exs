@@ -224,6 +224,318 @@ defmodule Ferricstore.Commands.SetTest do
   end
 
   # ---------------------------------------------------------------------------
+  # SSCAN
+  # ---------------------------------------------------------------------------
+
+  describe "SSCAN" do
+    test "SSCAN with cursor 0 returns all members when count >= size" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b", "c"], store)
+      [cursor, elements] = Set.handle("SSCAN", ["myset", "0"], store)
+      assert cursor == "0"
+      assert Enum.sort(elements) == ["a", "b", "c"]
+    end
+
+    test "SSCAN with COUNT limits batch size" do
+      store = MockStore.make()
+
+      for i <- 1..20 do
+        Set.handle("SADD", ["myset", "member#{String.pad_leading(Integer.to_string(i), 2, "0")}"], store)
+      end
+
+      [cursor, elements] = Set.handle("SSCAN", ["myset", "0", "COUNT", "5"], store)
+      assert cursor != "0"
+      assert length(elements) == 5
+    end
+
+    test "SSCAN full iteration collects all members exactly once" do
+      store = MockStore.make()
+      expected = for i <- 1..15, do: "m#{String.pad_leading(Integer.to_string(i), 2, "0")}"
+
+      for m <- expected do
+        Set.handle("SADD", ["myset", m], store)
+      end
+
+      all_members = collect_sscan_members(store, "myset", "0", 4)
+      assert Enum.sort(all_members) == Enum.sort(expected)
+    end
+
+    test "SSCAN with MATCH filters members" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "apple", "banana", "avocado", "blueberry"], store)
+      [cursor, elements] = Set.handle("SSCAN", ["myset", "0", "MATCH", "a*"], store)
+      assert cursor == "0"
+      assert Enum.sort(elements) == ["apple", "avocado"]
+    end
+
+    test "SSCAN on nonexistent key returns cursor 0 and empty list" do
+      store = MockStore.make()
+      [cursor, elements] = Set.handle("SSCAN", ["nonexistent", "0"], store)
+      assert cursor == "0"
+      assert elements == []
+    end
+
+    test "SSCAN with invalid cursor returns error" do
+      store = MockStore.make()
+      assert {:error, _} = Set.handle("SSCAN", ["myset", "notanumber"], store)
+    end
+
+    test "SSCAN with wrong number of arguments returns error" do
+      store = MockStore.make()
+      assert {:error, _} = Set.handle("SSCAN", ["key"], store)
+      assert {:error, _} = Set.handle("SSCAN", [], store)
+    end
+
+    test "SSCAN on wrong type returns WRONGTYPE" do
+      store = MockStore.make()
+      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SSCAN", ["mykey", "0"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SRANDMEMBER
+  # ---------------------------------------------------------------------------
+
+  describe "SRANDMEMBER" do
+    test "SRANDMEMBER returns a single random member" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b", "c"], store)
+      result = Set.handle("SRANDMEMBER", ["myset"], store)
+      assert result in ["a", "b", "c"]
+    end
+
+    test "SRANDMEMBER with positive count returns unique members" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b", "c", "d", "e"], store)
+      result = Set.handle("SRANDMEMBER", ["myset", "3"], store)
+      assert is_list(result)
+      assert length(result) == 3
+      assert length(Enum.uniq(result)) == 3
+      assert Enum.all?(result, &(&1 in ["a", "b", "c", "d", "e"]))
+    end
+
+    test "SRANDMEMBER with count > set size returns all members" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b"], store)
+      result = Set.handle("SRANDMEMBER", ["myset", "10"], store)
+      assert Enum.sort(result) == ["a", "b"]
+    end
+
+    test "SRANDMEMBER with negative count allows duplicates" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "x"], store)
+      result = Set.handle("SRANDMEMBER", ["myset", "-5"], store)
+      assert is_list(result)
+      assert length(result) == 5
+      assert Enum.all?(result, &(&1 == "x"))
+    end
+
+    test "SRANDMEMBER with count 0 returns empty list" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      result = Set.handle("SRANDMEMBER", ["myset", "0"], store)
+      assert result == []
+    end
+
+    test "SRANDMEMBER does not remove members" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b", "c"], store)
+      Set.handle("SRANDMEMBER", ["myset", "2"], store)
+      assert 3 == Set.handle("SCARD", ["myset"], store)
+    end
+
+    test "SRANDMEMBER on nonexistent key returns nil" do
+      store = MockStore.make()
+      result = Set.handle("SRANDMEMBER", ["nonexistent"], store)
+      assert result == nil
+    end
+
+    test "SRANDMEMBER with count on nonexistent key returns empty list" do
+      store = MockStore.make()
+      result = Set.handle("SRANDMEMBER", ["nonexistent", "5"], store)
+      assert result == []
+    end
+
+    test "SRANDMEMBER with non-integer count returns error" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      assert {:error, _} = Set.handle("SRANDMEMBER", ["myset", "abc"], store)
+    end
+
+    test "SRANDMEMBER with wrong arity returns error" do
+      store = MockStore.make()
+      assert {:error, _} = Set.handle("SRANDMEMBER", [], store)
+    end
+
+    test "SRANDMEMBER on wrong type returns WRONGTYPE" do
+      store = MockStore.make()
+      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SRANDMEMBER", ["mykey"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SPOP
+  # ---------------------------------------------------------------------------
+
+  describe "SPOP" do
+    test "SPOP removes and returns a random member" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b", "c"], store)
+      result = Set.handle("SPOP", ["myset"], store)
+      assert result in ["a", "b", "c"]
+      assert 2 == Set.handle("SCARD", ["myset"], store)
+    end
+
+    test "SPOP with count removes and returns multiple members" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b", "c", "d", "e"], store)
+      result = Set.handle("SPOP", ["myset", "3"], store)
+      assert is_list(result)
+      assert length(result) == 3
+      assert length(Enum.uniq(result)) == 3
+      assert 2 == Set.handle("SCARD", ["myset"], store)
+    end
+
+    test "SPOP with count > set size returns all members and empties set" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b"], store)
+      result = Set.handle("SPOP", ["myset", "10"], store)
+      assert Enum.sort(result) == ["a", "b"]
+      assert 0 == Set.handle("SCARD", ["myset"], store)
+    end
+
+    test "SPOP with count 0 returns empty list" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      result = Set.handle("SPOP", ["myset", "0"], store)
+      assert result == []
+      assert 1 == Set.handle("SCARD", ["myset"], store)
+    end
+
+    test "SPOP cleans up type metadata when set becomes empty" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "only"], store)
+      Set.handle("SPOP", ["myset"], store)
+      assert nil == store.compound_get.("myset", "T:myset")
+    end
+
+    test "SPOP on nonexistent key returns nil" do
+      store = MockStore.make()
+      result = Set.handle("SPOP", ["nonexistent"], store)
+      assert result == nil
+    end
+
+    test "SPOP with count on nonexistent key returns empty list" do
+      store = MockStore.make()
+      result = Set.handle("SPOP", ["nonexistent", "5"], store)
+      assert result == []
+    end
+
+    test "SPOP with non-integer count returns error" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      assert {:error, _} = Set.handle("SPOP", ["myset", "abc"], store)
+    end
+
+    test "SPOP with negative count returns error" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      assert {:error, _} = Set.handle("SPOP", ["myset", "-1"], store)
+    end
+
+    test "SPOP with wrong arity returns error" do
+      store = MockStore.make()
+      assert {:error, _} = Set.handle("SPOP", [], store)
+    end
+
+    test "SPOP on wrong type returns WRONGTYPE" do
+      store = MockStore.make()
+      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SPOP", ["mykey"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SMOVE
+  # ---------------------------------------------------------------------------
+
+  describe "SMOVE" do
+    test "SMOVE moves member from source to destination" do
+      store = MockStore.make()
+      Set.handle("SADD", ["src", "a", "b", "c"], store)
+      Set.handle("SADD", ["dst", "x", "y"], store)
+      assert 1 == Set.handle("SMOVE", ["src", "dst", "b"], store)
+      # b should be removed from src
+      assert 0 == Set.handle("SISMEMBER", ["src", "b"], store)
+      # b should be in dst
+      assert 1 == Set.handle("SISMEMBER", ["dst", "b"], store)
+      # cardinalities should reflect the move
+      assert 2 == Set.handle("SCARD", ["src"], store)
+      assert 3 == Set.handle("SCARD", ["dst"], store)
+    end
+
+    test "SMOVE returns 0 when member not in source" do
+      store = MockStore.make()
+      Set.handle("SADD", ["src", "a"], store)
+      Set.handle("SADD", ["dst", "x"], store)
+      assert 0 == Set.handle("SMOVE", ["src", "dst", "missing"], store)
+    end
+
+    test "SMOVE to nonexistent destination creates it" do
+      store = MockStore.make()
+      Set.handle("SADD", ["src", "a", "b"], store)
+      assert 1 == Set.handle("SMOVE", ["src", "dst", "a"], store)
+      assert 1 == Set.handle("SISMEMBER", ["dst", "a"], store)
+    end
+
+    test "SMOVE from nonexistent source returns 0" do
+      store = MockStore.make()
+      assert 0 == Set.handle("SMOVE", ["nonexistent", "dst", "a"], store)
+    end
+
+    test "SMOVE cleans up source type metadata when source becomes empty" do
+      store = MockStore.make()
+      Set.handle("SADD", ["src", "only"], store)
+      Set.handle("SADD", ["dst", "x"], store)
+      Set.handle("SMOVE", ["src", "dst", "only"], store)
+      assert nil == store.compound_get.("src", "T:src")
+    end
+
+    test "SMOVE member already in destination is a no-op for destination" do
+      store = MockStore.make()
+      Set.handle("SADD", ["src", "a", "b"], store)
+      Set.handle("SADD", ["dst", "a", "x"], store)
+      assert 1 == Set.handle("SMOVE", ["src", "dst", "a"], store)
+      # a should be removed from src
+      assert 0 == Set.handle("SISMEMBER", ["src", "a"], store)
+      # dst cardinality should not increase (a was already there)
+      assert 2 == Set.handle("SCARD", ["dst"], store)
+    end
+
+    test "SMOVE with wrong number of arguments returns error" do
+      store = MockStore.make()
+      assert {:error, _} = Set.handle("SMOVE", ["src", "dst"], store)
+      assert {:error, _} = Set.handle("SMOVE", ["src"], store)
+      assert {:error, _} = Set.handle("SMOVE", [], store)
+    end
+
+    test "SMOVE on wrong type source returns WRONGTYPE" do
+      store = MockStore.make()
+      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SMOVE", ["mykey", "dst", "a"], store)
+    end
+
+    test "SMOVE on wrong type destination returns WRONGTYPE" do
+      store = MockStore.make()
+      Set.handle("SADD", ["src", "a"], store)
+      store.compound_put.("dst", "T:dst", "hash", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SMOVE", ["src", "dst", "a"], store)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Type enforcement
   # ---------------------------------------------------------------------------
 
@@ -251,6 +563,184 @@ defmodule Ferricstore.Commands.SetTest do
       Set.handle("SADD", ["myset", "elixir"], store)
       # The compound key should have the member name and value "1"
       assert "1" == store.compound_get.("myset", <<"S:myset", 0, "elixir">>)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private test helpers
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Edge cases: arity, WRONGTYPE for multi-set ops, SSCAN cursor
+  # ---------------------------------------------------------------------------
+
+  describe "arity edge cases" do
+    test "SCARD with no args returns error" do
+      assert {:error, msg} = Set.handle("SCARD", [], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SCARD with extra args returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Set.handle("SCARD", ["set", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SINTER with no args returns error" do
+      assert {:error, msg} = Set.handle("SINTER", [], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SUNION with no args returns error" do
+      assert {:error, msg} = Set.handle("SUNION", [], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SDIFF with no args returns error" do
+      assert {:error, msg} = Set.handle("SDIFF", [], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SMOVE with only key returns error" do
+      assert {:error, msg} = Set.handle("SMOVE", ["src"], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SPOP with extra args returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Set.handle("SPOP", ["set", "1", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SRANDMEMBER with extra args returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Set.handle("SRANDMEMBER", ["set", "1", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SISMEMBER with no args returns error" do
+      assert {:error, msg} = Set.handle("SISMEMBER", [], MockStore.make())
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SISMEMBER with extra args returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Set.handle("SISMEMBER", ["set", "member", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "SMEMBERS with extra args returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Set.handle("SMEMBERS", ["set", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
+
+  describe "WRONGTYPE enforcement for multi-set operations" do
+    test "SINTER with one key being wrong type returns WRONGTYPE" do
+      store = MockStore.make()
+      Set.handle("SADD", ["s1", "a", "b"], store)
+      store.compound_put.("s2", "T:s2", "hash", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SINTER", ["s1", "s2"], store)
+    end
+
+    test "SUNION with one key being wrong type returns WRONGTYPE" do
+      store = MockStore.make()
+      Set.handle("SADD", ["s1", "a", "b"], store)
+      store.compound_put.("s2", "T:s2", "list", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SUNION", ["s1", "s2"], store)
+    end
+
+    test "SDIFF with one key being wrong type returns WRONGTYPE" do
+      store = MockStore.make()
+      Set.handle("SADD", ["s1", "a", "b"], store)
+      store.compound_put.("s2", "T:s2", "zset", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SDIFF", ["s1", "s2"], store)
+    end
+
+    test "SCARD on wrong type returns WRONGTYPE" do
+      store = MockStore.make()
+      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SCARD", ["mykey"], store)
+    end
+
+    test "SISMEMBER on wrong type returns WRONGTYPE" do
+      store = MockStore.make()
+      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SISMEMBER", ["mykey", "m"], store)
+    end
+
+    test "SREM on wrong type returns WRONGTYPE" do
+      store = MockStore.make()
+      store.compound_put.("mykey", "T:mykey", "hash", 0)
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SREM", ["mykey", "m"], store)
+    end
+  end
+
+  describe "SSCAN cursor edge cases" do
+    test "SSCAN with negative cursor returns error" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      assert {:error, "ERR invalid cursor"} = Set.handle("SSCAN", ["myset", "-1"], store)
+    end
+
+    test "SSCAN with very large cursor returns cursor 0 and empty list" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      [cursor, elements] = Set.handle("SSCAN", ["myset", "999999"], store)
+      assert cursor == "0"
+      assert elements == []
+    end
+
+    test "SSCAN with unknown option returns error" do
+      store = MockStore.make()
+      assert {:error, "ERR syntax error"} = Set.handle("SSCAN", ["myset", "0", "BOGUS", "val"], store)
+    end
+
+    test "SSCAN with odd trailing option returns error" do
+      store = MockStore.make()
+      assert {:error, "ERR syntax error"} = Set.handle("SSCAN", ["myset", "0", "MATCH"], store)
+    end
+
+    test "SSCAN with COUNT 0 returns error" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      assert {:error, _} = Set.handle("SSCAN", ["myset", "0", "COUNT", "0"], store)
+    end
+
+    test "SSCAN with negative COUNT returns error" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+      assert {:error, _} = Set.handle("SSCAN", ["myset", "0", "COUNT", "-1"], store)
+    end
+  end
+
+  describe "empty member handling" do
+    test "SADD with empty string member works" do
+      store = MockStore.make()
+      assert 1 == Set.handle("SADD", ["myset", ""], store)
+      assert 1 == Set.handle("SISMEMBER", ["myset", ""], store)
+    end
+
+    test "SRANDMEMBER with negative count on empty set returns empty list" do
+      store = MockStore.make()
+      result = Set.handle("SRANDMEMBER", ["myset", "-5"], store)
+      assert result == []
+    end
+  end
+
+  defp collect_sscan_members(store, key, cursor, count) do
+    collect_sscan_members(store, key, cursor, count, [])
+  end
+
+  defp collect_sscan_members(store, key, cursor, count, acc) do
+    [next_cursor, elements] = Set.handle("SSCAN", [key, cursor, "COUNT", Integer.to_string(count)], store)
+    new_acc = acc ++ elements
+
+    if next_cursor == "0" do
+      new_acc
+    else
+      collect_sscan_members(store, key, next_cursor, count, new_acc)
     end
   end
 end

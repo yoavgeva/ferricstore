@@ -15,5 +15,5 @@ config :ferricstore, :max_memory_bytes, 1_073_741_824
 config :ferricstore, :eviction_policy, :volatile_lru
 config :ferricstore, :memory_guard_interval_ms, 5_000
 
-# Raft: disable by default in test (Raft tests manage their own ra lifecycle)
+# Raft: disabled in test to avoid ra election hanging in worktree.
 config :ferricstore, :raft_enabled, false

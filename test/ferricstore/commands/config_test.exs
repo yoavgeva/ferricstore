@@ -4,47 +4,161 @@ defmodule Ferricstore.Commands.ConfigTest do
 
   alias Ferricstore.Commands.Server
   alias Ferricstore.Config
+  alias Ferricstore.Stats
   alias Ferricstore.Test.MockStore
 
   # Reset config to defaults after each test to avoid cross-test contamination.
+  # Also restore any Application env values that side-effects may have changed.
   setup do
-    defaults = Config.defaults()
-    on_exit(fn -> Enum.each(defaults, fn {k, v} -> Config.set(k, v) end) end)
+    # Capture original Application env values that CONFIG SET may alter
+    orig_eviction = Application.get_env(:ferricstore, :eviction_policy)
+    orig_slowlog_us = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
+    orig_slowlog_max = Application.get_env(:ferricstore, :slowlog_max_len)
+
+    on_exit(fn ->
+      # Re-init Config GenServer state by setting all known params back
+      defaults = Config.defaults()
+      Enum.each(defaults, fn {k, v} ->
+        # Use direct GenServer call to bypass validation for read-only params
+        try do
+          Config.set(k, v)
+        rescue
+          _ -> :ok
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      # Restore Application env
+      if orig_eviction, do: Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
+      if orig_slowlog_us, do: Application.put_env(:ferricstore, :slowlog_log_slower_than_us, orig_slowlog_us)
+      if orig_slowlog_max, do: Application.put_env(:ferricstore, :slowlog_max_len, orig_slowlog_max)
+    end)
+
     :ok
   end
 
   # ---------------------------------------------------------------------------
-  # CONFIG GET
+  # CONFIG GET -- read-only parameters
   # ---------------------------------------------------------------------------
 
-  describe "CONFIG GET" do
-    test "CONFIG GET * returns all default config params" do
+  describe "CONFIG GET read-only parameters" do
+    test "CONFIG GET maxmemory returns integer string from Application env" do
+      result = Server.handle("CONFIG", ["GET", "maxmemory"], MockStore.make())
+      assert ["maxmemory", value] = result
+      # The value should be a string representation of an integer
+      assert {_n, ""} = Integer.parse(value)
+    end
+
+    test "CONFIG GET maxclients returns integer string" do
+      result = Server.handle("CONFIG", ["GET", "maxclients"], MockStore.make())
+      assert ["maxclients", value] = result
+      assert {n, ""} = Integer.parse(value)
+      assert n > 0
+    end
+
+    test "CONFIG GET tcp-port returns the configured port" do
+      result = Server.handle("CONFIG", ["GET", "tcp-port"], MockStore.make())
+      assert ["tcp-port", value] = result
+      assert {_n, ""} = Integer.parse(value)
+    end
+
+    test "CONFIG GET data-dir returns the configured data directory" do
+      result = Server.handle("CONFIG", ["GET", "data-dir"], MockStore.make())
+      assert ["data-dir", value] = result
+      assert is_binary(value)
+      assert String.length(value) > 0
+    end
+
+    test "CONFIG GET raft-enabled returns true or false" do
+      result = Server.handle("CONFIG", ["GET", "raft-enabled"], MockStore.make())
+      assert ["raft-enabled", value] = result
+      assert value in ["true", "false"]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # CONFIG GET -- read-write parameters
+  # ---------------------------------------------------------------------------
+
+  describe "CONFIG GET read-write parameters" do
+    test "CONFIG GET maxmemory-policy returns string policy name" do
+      result = Server.handle("CONFIG", ["GET", "maxmemory-policy"], MockStore.make())
+      assert ["maxmemory-policy", value] = result
+      assert value in ["volatile-lru", "allkeys-lru", "volatile-ttl", "noeviction"]
+    end
+
+    test "CONFIG GET notify-keyspace-events returns string" do
+      result = Server.handle("CONFIG", ["GET", "notify-keyspace-events"], MockStore.make())
+      assert ["notify-keyspace-events", value] = result
+      assert is_binary(value)
+    end
+
+    test "CONFIG GET slowlog-log-slower-than returns integer string" do
+      result = Server.handle("CONFIG", ["GET", "slowlog-log-slower-than"], MockStore.make())
+      assert ["slowlog-log-slower-than", value] = result
+      assert {_n, ""} = Integer.parse(value)
+    end
+
+    test "CONFIG GET slowlog-max-len returns integer string" do
+      result = Server.handle("CONFIG", ["GET", "slowlog-max-len"], MockStore.make())
+      assert ["slowlog-max-len", value] = result
+      assert {n, ""} = Integer.parse(value)
+      assert n > 0
+    end
+
+    test "CONFIG GET hz returns integer string" do
+      result = Server.handle("CONFIG", ["GET", "hz"], MockStore.make())
+      assert ["hz", "10"] = result
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # CONFIG GET * -- all parameters
+  # ---------------------------------------------------------------------------
+
+  describe "CONFIG GET *" do
+    test "CONFIG GET * returns all parameters as flat key-value list" do
       result = Server.handle("CONFIG", ["GET", "*"], MockStore.make())
       assert is_list(result)
       # Result is a flat list [key, value, key, value, ...]
       assert rem(length(result), 2) == 0
-      # Should contain known defaults
-      assert "maxmemory" in result
-      assert "hz" in result
-      assert "requirepass" in result
-    end
 
-    test "CONFIG GET with exact key returns that key-value pair" do
-      result = Server.handle("CONFIG", ["GET", "hz"], MockStore.make())
-      assert result == ["hz", "10"]
-    end
+      # Extract keys (every even-indexed element)
+      keys = every_other(result, 0)
 
+      # All spec-required parameters should be present
+      assert "maxmemory" in keys
+      assert "maxclients" in keys
+      assert "tcp-port" in keys
+      assert "data-dir" in keys
+      assert "raft-enabled" in keys
+      assert "maxmemory-policy" in keys
+      assert "notify-keyspace-events" in keys
+      assert "slowlog-log-slower-than" in keys
+      assert "slowlog-max-len" in keys
+      assert "hz" in keys
+
+      # Legacy params should also be present
+      assert "requirepass" in keys
+      assert "bind" in keys
+      assert "timeout" in keys
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # CONFIG GET -- pattern matching
+  # ---------------------------------------------------------------------------
+
+  describe "CONFIG GET pattern matching" do
     test "CONFIG GET with pattern filters results" do
       result = Server.handle("CONFIG", ["GET", "max*"], MockStore.make())
       assert is_list(result)
-      # Should include maxmemory, maxmemory-policy, maxclients
       keys = every_other(result, 0)
       assert "maxmemory" in keys
       assert "maxmemory-policy" in keys
       assert "maxclients" in keys
-      # Should not include non-max keys
       refute "hz" in keys
-      refute "port" in keys
     end
 
     test "CONFIG GET with non-matching pattern returns empty list" do
@@ -62,27 +176,153 @@ defmodule Ferricstore.Commands.ConfigTest do
       result = Server.handle("CONFIG", ["GET"], MockStore.make())
       assert {:error, _} = result
     end
+
+    test "CONFIG GET slowlog-* returns both slowlog parameters" do
+      result = Server.handle("CONFIG", ["GET", "slowlog-*"], MockStore.make())
+      keys = every_other(result, 0)
+      assert "slowlog-log-slower-than" in keys
+      assert "slowlog-max-len" in keys
+    end
   end
 
   # ---------------------------------------------------------------------------
-  # CONFIG SET
+  # CONFIG SET -- read-write parameters
   # ---------------------------------------------------------------------------
 
-  describe "CONFIG SET" do
-    test "CONFIG SET changes value and GET reflects it" do
-      assert :ok = Server.handle("CONFIG", ["SET", "hz", "20"], MockStore.make())
+  describe "CONFIG SET read-write parameters" do
+    test "CONFIG SET maxmemory-policy volatile-ttl then GET returns new value" do
+      assert :ok = Server.handle("CONFIG", ["SET", "maxmemory-policy", "volatile-ttl"], MockStore.make())
+      result = Server.handle("CONFIG", ["GET", "maxmemory-policy"], MockStore.make())
+      assert ["maxmemory-policy", "volatile-ttl"] = result
+    end
 
+    test "CONFIG SET maxmemory-policy updates Application env" do
+      Server.handle("CONFIG", ["SET", "maxmemory-policy", "allkeys-lru"], MockStore.make())
+      assert :allkeys_lru == Application.get_env(:ferricstore, :eviction_policy)
+    end
+
+    test "CONFIG SET maxmemory-policy with invalid value returns error" do
+      result = Server.handle("CONFIG", ["SET", "maxmemory-policy", "invalid-policy"], MockStore.make())
+      assert {:error, msg} = result
+      assert msg =~ "Invalid argument"
+    end
+
+    test "CONFIG SET slowlog-log-slower-than updates threshold" do
+      assert :ok = Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "5000"], MockStore.make())
+      result = Server.handle("CONFIG", ["GET", "slowlog-log-slower-than"], MockStore.make())
+      assert ["slowlog-log-slower-than", "5000"] = result
+      # Verify Application env was updated (SlowLog reads from here)
+      assert 5000 == Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
+    end
+
+    test "CONFIG SET slowlog-log-slower-than with -1 disables slowlog" do
+      assert :ok = Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "-1"], MockStore.make())
+      result = Server.handle("CONFIG", ["GET", "slowlog-log-slower-than"], MockStore.make())
+      assert ["slowlog-log-slower-than", "-1"] = result
+    end
+
+    test "CONFIG SET slowlog-log-slower-than with non-integer returns error" do
+      result = Server.handle("CONFIG", ["SET", "slowlog-log-slower-than", "abc"], MockStore.make())
+      assert {:error, msg} = result
+      assert msg =~ "Invalid argument"
+    end
+
+    test "CONFIG SET slowlog-max-len updates max entries" do
+      assert :ok = Server.handle("CONFIG", ["SET", "slowlog-max-len", "256"], MockStore.make())
+      result = Server.handle("CONFIG", ["GET", "slowlog-max-len"], MockStore.make())
+      assert ["slowlog-max-len", "256"] = result
+      assert 256 == Application.get_env(:ferricstore, :slowlog_max_len)
+    end
+
+    test "CONFIG SET slowlog-max-len with negative returns error" do
+      result = Server.handle("CONFIG", ["SET", "slowlog-max-len", "-1"], MockStore.make())
+      assert {:error, msg} = result
+      assert msg =~ "Invalid argument"
+    end
+
+    test "CONFIG SET hz accepts valid values" do
+      assert :ok = Server.handle("CONFIG", ["SET", "hz", "100"], MockStore.make())
       result = Server.handle("CONFIG", ["GET", "hz"], MockStore.make())
-      assert result == ["hz", "20"]
+      assert ["hz", "100"] = result
     end
 
-    test "CONFIG SET with new key adds it" do
-      assert :ok = Server.handle("CONFIG", ["SET", "custom-param", "hello"], MockStore.make())
-
-      result = Server.handle("CONFIG", ["GET", "custom-param"], MockStore.make())
-      assert result == ["custom-param", "hello"]
+    test "CONFIG SET hz with invalid value returns error" do
+      result = Server.handle("CONFIG", ["SET", "hz", "0"], MockStore.make())
+      assert {:error, _} = result
     end
 
+    test "CONFIG SET notify-keyspace-events accepts flag strings" do
+      assert :ok = Server.handle("CONFIG", ["SET", "notify-keyspace-events", "KEA"], MockStore.make())
+      result = Server.handle("CONFIG", ["GET", "notify-keyspace-events"], MockStore.make())
+      assert ["notify-keyspace-events", "KEA"] = result
+    end
+
+    test "CONFIG SET notify-keyspace-events accepts empty string to disable" do
+      Server.handle("CONFIG", ["SET", "notify-keyspace-events", "KEA"], MockStore.make())
+      assert :ok = Server.handle("CONFIG", ["SET", "notify-keyspace-events", ""], MockStore.make())
+      result = Server.handle("CONFIG", ["GET", "notify-keyspace-events"], MockStore.make())
+      assert ["notify-keyspace-events", ""] = result
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # CONFIG SET -- read-only parameters
+  # ---------------------------------------------------------------------------
+
+  describe "CONFIG SET read-only parameters" do
+    test "CONFIG SET maxmemory returns error" do
+      result = Server.handle("CONFIG", ["SET", "maxmemory", "999"], MockStore.make())
+      assert {:error, msg} = result
+      assert msg =~ "read-only"
+    end
+
+    test "CONFIG SET tcp-port returns error" do
+      result = Server.handle("CONFIG", ["SET", "tcp-port", "9999"], MockStore.make())
+      assert {:error, msg} = result
+      assert msg =~ "read-only"
+    end
+
+    test "CONFIG SET data-dir returns error" do
+      result = Server.handle("CONFIG", ["SET", "data-dir", "/tmp/new"], MockStore.make())
+      assert {:error, msg} = result
+      assert msg =~ "read-only"
+    end
+
+    test "CONFIG SET raft-enabled returns error" do
+      result = Server.handle("CONFIG", ["SET", "raft-enabled", "true"], MockStore.make())
+      assert {:error, msg} = result
+      assert msg =~ "read-only"
+    end
+
+    test "CONFIG SET maxclients returns error" do
+      result = Server.handle("CONFIG", ["SET", "maxclients", "5000"], MockStore.make())
+      assert {:error, msg} = result
+      assert msg =~ "read-only"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # CONFIG SET -- unknown parameters
+  # ---------------------------------------------------------------------------
+
+  describe "CONFIG SET unknown parameter" do
+    test "CONFIG SET unknown-param returns error" do
+      result = Server.handle("CONFIG", ["SET", "unknown-param", "value"], MockStore.make())
+      assert {:error, msg} = result
+      assert msg =~ "Unsupported CONFIG parameter"
+    end
+
+    test "CONFIG SET totally-bogus returns error" do
+      result = Server.handle("CONFIG", ["SET", "totally-bogus-param", "123"], MockStore.make())
+      assert {:error, _} = result
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # CONFIG SET -- argument validation
+  # ---------------------------------------------------------------------------
+
+  describe "CONFIG SET argument errors" do
     test "CONFIG SET with no args returns error" do
       result = Server.handle("CONFIG", ["SET"], MockStore.make())
       assert {:error, _} = result
@@ -95,12 +335,75 @@ defmodule Ferricstore.Commands.ConfigTest do
   end
 
   # ---------------------------------------------------------------------------
+  # CONFIG SET -- telemetry
+  # ---------------------------------------------------------------------------
+
+  describe "CONFIG SET telemetry" do
+    test "CONFIG SET emits [:ferricstore, :config, :changed] telemetry event" do
+      ref = make_ref()
+      test_pid = self()
+
+      handler_id = "config-changed-test-#{inspect(ref)}"
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :config, :changed],
+        fn _event, _measurements, metadata, _config ->
+          send(test_pid, {:config_changed, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Server.handle("CONFIG", ["SET", "hz", "50"], MockStore.make())
+
+      assert_receive {:config_changed, metadata}, 1_000
+      assert metadata.param == "hz"
+      assert metadata.value == "50"
+      assert is_binary(metadata.old_value)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # CONFIG RESETSTAT
   # ---------------------------------------------------------------------------
 
   describe "CONFIG RESETSTAT" do
     test "CONFIG RESETSTAT returns OK" do
       assert :ok = Server.handle("CONFIG", ["RESETSTAT"], MockStore.make())
+    end
+
+    test "CONFIG RESETSTAT resets Stats counters" do
+      # Increment some counters
+      Stats.incr_connections()
+      Stats.incr_connections()
+      Stats.incr_commands()
+
+      assert Stats.total_connections() > 0 or Stats.total_commands() > 0
+
+      Server.handle("CONFIG", ["RESETSTAT"], MockStore.make())
+
+      assert Stats.total_connections() == 0
+      assert Stats.total_commands() == 0
+    end
+
+    test "CONFIG RESETSTAT resets slowlog" do
+      # Add a slow log entry via cast, then send a synchronous :ping to the
+      # GenServer to guarantee the preceding cast has been processed.
+      Ferricstore.SlowLog.maybe_log(["SET", "key", "val"], 999_999_999)
+      GenServer.call(Ferricstore.SlowLog, :ping)
+
+      assert Ferricstore.SlowLog.len() > 0
+
+      Server.handle("CONFIG", ["RESETSTAT"], MockStore.make())
+
+      assert Ferricstore.SlowLog.len() == 0
+    end
+
+    test "CONFIG RESETSTAT with args returns error" do
+      result = Server.handle("CONFIG", ["RESETSTAT", "extra"], MockStore.make())
+      assert {:error, _} = result
     end
   end
 
@@ -109,8 +412,13 @@ defmodule Ferricstore.Commands.ConfigTest do
   # ---------------------------------------------------------------------------
 
   describe "CONFIG REWRITE" do
-    test "CONFIG REWRITE returns OK" do
+    test "CONFIG REWRITE returns OK (stub)" do
       assert :ok = Server.handle("CONFIG", ["REWRITE"], MockStore.make())
+    end
+
+    test "CONFIG REWRITE with args returns error" do
+      result = Server.handle("CONFIG", ["REWRITE", "extra"], MockStore.make())
+      assert {:error, _} = result
     end
   end
 
@@ -141,17 +449,47 @@ defmodule Ferricstore.Commands.ConfigTest do
       assert pairs == [{"hz", "10"}]
     end
 
-    test "set/2 updates a value" do
+    test "set/2 updates a read-write value" do
       assert :ok = Config.set("hz", "50")
       assert [{"hz", "50"}] = Config.get("hz")
     end
 
+    test "set/2 returns error for read-only param" do
+      assert {:error, _} = Config.set("maxmemory", "999")
+    end
+
+    test "set/2 returns error for unknown param" do
+      assert {:error, _} = Config.set("totally_unknown_key", "val")
+    end
+
     test "get_value/1 returns single value" do
-      assert "10" = Config.get_value("hz")
+      [{"hz", hz_val}] = Config.get("hz")
+      assert hz_val == Config.get_value("hz")
     end
 
     test "get_value/1 returns nil for unknown key" do
       assert nil == Config.get_value("totally_unknown_key")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Read-only parameter values reflect Application env
+  # ---------------------------------------------------------------------------
+
+  describe "read-only params reflect Application env" do
+    test "maxmemory reflects :max_memory_bytes Application env" do
+      expected = Application.get_env(:ferricstore, :max_memory_bytes, 0) |> to_string()
+      assert [{"maxmemory", ^expected}] = Config.get("maxmemory")
+    end
+
+    test "raft-enabled reflects :raft_enabled Application env" do
+      expected =
+        case Application.get_env(:ferricstore, :raft_enabled, true) do
+          true -> "true"
+          false -> "false"
+        end
+
+      assert [{"raft-enabled", ^expected}] = Config.get("raft-enabled")
     end
   end
 

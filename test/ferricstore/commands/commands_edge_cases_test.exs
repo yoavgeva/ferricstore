@@ -802,4 +802,568 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
       assert 0 == Dispatcher.dispatch("DBSIZE", [], store)
     end
   end
+
+  # ===========================================================================
+  # WRONGTYPE enforcement — string commands on data structure keys
+  # ===========================================================================
+
+  describe "WRONGTYPE enforcement: string commands on hash keys" do
+    setup do
+      store = MockStore.make()
+      # Simulate a hash key by registering it as type "hash" in compound storage
+      # The type registry stores T:key -> "hash"
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "hash", 0)
+      {:ok, store: store}
+    end
+
+    test "GET on hash key returns WRONGTYPE", %{store: _store} do
+      # GET internally checks the serialized value. When the stored value is
+      # an Erlang-encoded {:hash, _} tuple, GET detects this and returns
+      # WRONGTYPE. Test at the Strings handler level.
+      hash_val = :erlang.term_to_binary({:hash, %{"f" => "v"}})
+      store_with_hash = MockStore.make(%{"mykey" => {hash_val, 0}})
+      result = Strings.handle("GET", ["mykey"], store_with_hash)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "GET on list key returns WRONGTYPE" do
+      list_val = :erlang.term_to_binary({:list, ["a", "b"]})
+      store = MockStore.make(%{"mylist" => {list_val, 0}})
+      result = Strings.handle("GET", ["mylist"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "GET on set key returns WRONGTYPE" do
+      set_val = :erlang.term_to_binary({:set, MapSet.new(["a"])})
+      store = MockStore.make(%{"myset" => {set_val, 0}})
+      result = Strings.handle("GET", ["myset"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "GET on zset key returns WRONGTYPE" do
+      zset_val = :erlang.term_to_binary({:zset, %{"a" => 1.0}})
+      store = MockStore.make(%{"myzset" => {zset_val, 0}})
+      result = Strings.handle("GET", ["myzset"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "GET on key with Erlang-encoded but non-struct binary returns value as-is" do
+      # A value that starts with <<131>> (ETF marker) but is not a known type
+      # should be returned as the raw binary.
+      other_val = :erlang.term_to_binary({:something_else, 42})
+      store = MockStore.make(%{"other" => {other_val, 0}})
+      result = Strings.handle("GET", ["other"], store)
+      assert result == other_val
+    end
+  end
+
+  describe "WRONGTYPE enforcement: HSET on string key" do
+    test "HSET on a key already holding a set returns WRONGTYPE" do
+      alias Ferricstore.Commands.Hash
+
+      store = MockStore.make()
+      # Register the key as a set
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "set", 0)
+
+      result = Hash.handle("HSET", ["mykey", "field", "value"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "HSET on a key already holding a list returns WRONGTYPE" do
+      alias Ferricstore.Commands.Hash
+
+      store = MockStore.make()
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "list", 0)
+
+      result = Hash.handle("HSET", ["mykey", "field", "value"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "HSET on a key already holding a zset returns WRONGTYPE" do
+      alias Ferricstore.Commands.Hash
+
+      store = MockStore.make()
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "zset", 0)
+
+      result = Hash.handle("HSET", ["mykey", "field", "value"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+  end
+
+  describe "WRONGTYPE: after DEL, key can be reused as any type" do
+    test "DEL hash key then SET as string succeeds" do
+      alias Ferricstore.Commands.Hash
+
+      store = MockStore.make()
+      # Create as hash
+      Hash.handle("HSET", ["reuse", "f1", "v1"], store)
+      # Delete via Strings DEL
+      Strings.handle("DEL", ["reuse"], store)
+      # Reuse as string
+      assert :ok = Strings.handle("SET", ["reuse", "now_a_string"], store)
+      assert "now_a_string" == store.get.("reuse")
+    end
+
+    test "DEL set key then HSET as hash succeeds" do
+      alias Ferricstore.Commands.{Hash, Set}
+
+      store = MockStore.make()
+      # Create as set
+      Set.handle("SADD", ["reuse", "member1"], store)
+      # Delete via Strings DEL
+      Strings.handle("DEL", ["reuse"], store)
+      # Reuse as hash
+      result = Hash.handle("HSET", ["reuse", "field1", "val1"], store)
+      assert result == 1
+    end
+  end
+
+  # ===========================================================================
+  # WRONGTYPE across all data structure boundaries
+  # ===========================================================================
+
+  describe "WRONGTYPE across data structure boundaries" do
+    test "LPUSH on hash key returns WRONGTYPE" do
+      alias Ferricstore.Commands.List
+
+      store = MockStore.make()
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "hash", 0)
+
+      result = List.handle("LPUSH", ["mykey", "elem"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "SADD on hash key returns WRONGTYPE" do
+      alias Ferricstore.Commands.Set
+
+      store = MockStore.make()
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "hash", 0)
+
+      result = Set.handle("SADD", ["mykey", "member"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "ZADD on hash key returns WRONGTYPE" do
+      alias Ferricstore.Commands.SortedSet
+
+      store = MockStore.make()
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "hash", 0)
+
+      result = SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "HSET on list key returns WRONGTYPE" do
+      alias Ferricstore.Commands.Hash
+
+      store = MockStore.make()
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "list", 0)
+
+      result = Hash.handle("HSET", ["mykey", "f", "v"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "SADD on zset key returns WRONGTYPE" do
+      alias Ferricstore.Commands.Set
+
+      store = MockStore.make()
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "zset", 0)
+
+      result = Set.handle("SADD", ["mykey", "member"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "ZADD on set key returns WRONGTYPE" do
+      alias Ferricstore.Commands.SortedSet
+
+      store = MockStore.make()
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "set", 0)
+
+      result = SortedSet.handle("ZADD", ["mykey", "1.0", "member"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+
+    test "LPUSH on set key returns WRONGTYPE" do
+      alias Ferricstore.Commands.List
+
+      store = MockStore.make()
+      type_key = "T:mykey"
+      store.compound_put.("mykey", type_key, "set", 0)
+
+      result = List.handle("LPUSH", ["mykey", "elem"], store)
+      assert {:error, "WRONGTYPE" <> _} = result
+    end
+  end
+
+  # ===========================================================================
+  # TTL edge cases — spec-required behavior
+  # ===========================================================================
+
+  describe "TTL spec-required edge cases" do
+    test "PERSIST removes TTL and key becomes permanent" do
+      future = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"k" => {"v", future}})
+
+      # Key has a TTL
+      ttl = Expiry.handle("TTL", ["k"], store)
+      assert ttl > 0
+
+      # PERSIST removes it
+      assert 1 == Expiry.handle("PERSIST", ["k"], store)
+
+      # Now TTL returns -1 (no expiry)
+      assert -1 == Expiry.handle("TTL", ["k"], store)
+
+      # Value is still accessible
+      assert "v" == store.get.("k")
+    end
+
+    test "EXPIRE with 0 expires the key immediately" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 1 == Expiry.handle("EXPIRE", ["k", "0"], store)
+      # Key should be expired now (TTL returns -2 for non-existent)
+      assert -2 == Expiry.handle("TTL", ["k"], store)
+    end
+
+    test "EXPIRE with negative value returns error" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      result = Expiry.handle("EXPIRE", ["k", "-1"], store)
+      assert {:error, _} = result
+    end
+
+    test "PEXPIRE with millisecond precision" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      # Set PEXPIRE to 500ms
+      assert 1 == Expiry.handle("PEXPIRE", ["k", "500"], store)
+      pttl = Expiry.handle("PTTL", ["k"], store)
+      # PTTL should be within 500ms (allowing some execution time)
+      assert pttl > 0 and pttl <= 500
+    end
+
+    test "TTL on non-existent key returns -2" do
+      store = MockStore.make()
+      assert -2 == Expiry.handle("TTL", ["no_such_key"], store)
+    end
+
+    test "PTTL on non-existent key returns -2" do
+      store = MockStore.make()
+      assert -2 == Expiry.handle("PTTL", ["no_such_key"], store)
+    end
+
+    test "TTL on key without expiry returns -1" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert -1 == Expiry.handle("TTL", ["k"], store)
+    end
+
+    test "PTTL on key without expiry returns -1" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert -1 == Expiry.handle("PTTL", ["k"], store)
+    end
+
+    test "SET with EX option sets TTL correctly" do
+      store = MockStore.make()
+      assert :ok = Strings.handle("SET", ["k", "v", "EX", "60"], store)
+      ttl = Expiry.handle("TTL", ["k"], store)
+      assert ttl > 0 and ttl <= 60
+    end
+
+    test "SET with PX option sets TTL in milliseconds correctly" do
+      store = MockStore.make()
+      assert :ok = Strings.handle("SET", ["k", "v", "PX", "5000"], store)
+      pttl = Expiry.handle("PTTL", ["k"], store)
+      assert pttl > 0 and pttl <= 5000
+    end
+
+    test "SET with NX flag only sets if key does not exist" do
+      store = MockStore.make()
+      # Key does not exist, NX should succeed
+      assert :ok = Strings.handle("SET", ["k", "first", "NX"], store)
+      assert "first" == store.get.("k")
+      # Key now exists, NX should fail (return nil)
+      assert nil == Strings.handle("SET", ["k", "second", "NX"], store)
+      assert "first" == store.get.("k")
+    end
+
+    test "SET with XX flag only sets if key already exists" do
+      store = MockStore.make()
+      # Key does not exist, XX should fail
+      assert nil == Strings.handle("SET", ["k", "v", "XX"], store)
+      assert nil == store.get.("k")
+      # Create the key
+      assert :ok = Strings.handle("SET", ["k", "v"], store)
+      # Now XX should succeed
+      assert :ok = Strings.handle("SET", ["k", "updated", "XX"], store)
+      assert "updated" == store.get.("k")
+    end
+  end
+
+  # ===========================================================================
+  # Integer overflow edge cases
+  # ===========================================================================
+
+  describe "integer overflow edge cases" do
+    test "INCR on max int64 value continues without overflow in Elixir (bignum)" do
+      # In Redis, INCR on max int64 returns an error. In Elixir, integers are
+      # arbitrary precision, so this will succeed with a value beyond int64.
+      # The MockStore uses Elixir integers, so it does not enforce int64 bounds.
+      max_int64 = 9_223_372_036_854_775_807
+      store = MockStore.make(%{"k" => {Integer.to_string(max_int64), 0}})
+      result = Strings.handle("INCR", ["k"], store)
+      assert {:ok, value} = result
+      assert value == max_int64 + 1
+    end
+
+    test "DECRBY with large negative amount on zero" do
+      store = MockStore.make(%{"k" => {"0", 0}})
+      large_amount = 9_223_372_036_854_775_807
+      result = Strings.handle("DECRBY", ["k", Integer.to_string(large_amount)], store)
+      assert {:ok, value} = result
+      assert value == -large_amount
+    end
+
+    test "INCRBY with max int64 on max int64 value" do
+      max_int64 = 9_223_372_036_854_775_807
+      store = MockStore.make(%{"k" => {Integer.to_string(max_int64), 0}})
+      result = Strings.handle("INCRBY", ["k", Integer.to_string(max_int64)], store)
+      assert {:ok, value} = result
+      assert value == max_int64 * 2
+    end
+
+    test "INCRBYFLOAT precision with very small increment" do
+      store = MockStore.make(%{"k" => {"0", 0}})
+      result = Strings.handle("INCRBYFLOAT", ["k", "0.000000001"], store)
+      assert is_binary(result)
+      {val, ""} = Float.parse(result)
+      assert_in_delta val, 1.0e-9, 1.0e-20
+    end
+
+    test "INCRBYFLOAT precision with large and small values" do
+      store = MockStore.make(%{"k" => {"1000000000", 0}})
+      result = Strings.handle("INCRBYFLOAT", ["k", "0.001"], store)
+      assert is_binary(result)
+      {val, ""} = Float.parse(result)
+      assert_in_delta val, 1_000_000_000.001, 1.0e-6
+    end
+
+    test "INCR on negative max int64 value increments to -max+1" do
+      min_int64 = -9_223_372_036_854_775_808
+      store = MockStore.make(%{"k" => {Integer.to_string(min_int64), 0}})
+      assert {:ok, value} = Strings.handle("INCR", ["k"], store)
+      assert value == min_int64 + 1
+    end
+
+    test "DECR on min int64 value decrements past the boundary" do
+      min_int64 = -9_223_372_036_854_775_808
+      store = MockStore.make(%{"k" => {Integer.to_string(min_int64), 0}})
+      assert {:ok, value} = Strings.handle("DECR", ["k"], store)
+      assert value == min_int64 - 1
+    end
+  end
+
+  # ===========================================================================
+  # Binary safety — keys and values with special characters
+  # ===========================================================================
+
+  describe "binary safety" do
+    test "keys and values with null bytes round-trip via SET/GET" do
+      store = MockStore.make()
+      key = "key\x00with\x00nulls"
+      value = "val\x00with\x00nulls"
+      assert :ok = Strings.handle("SET", [key, value], store)
+      assert value == Strings.handle("GET", [key], store)
+    end
+
+    test "keys and values with unicode round-trip via SET/GET" do
+      store = MockStore.make()
+      key = "clé_ünïcödë_日本語"
+      value = "valeur_émojis_🦀🔥✅"
+      assert :ok = Strings.handle("SET", [key, value], store)
+      assert value == Strings.handle("GET", [key], store)
+    end
+
+    test "empty string value round-trips via SET/GET" do
+      store = MockStore.make()
+      assert :ok = Strings.handle("SET", ["k", ""], store)
+      assert "" == Strings.handle("GET", ["k"], store)
+    end
+
+    test "STRLEN on empty string value returns 0" do
+      store = MockStore.make(%{"k" => {"", 0}})
+      assert 0 == Strings.handle("STRLEN", ["k"], store)
+    end
+
+    test "STRLEN on unicode value returns byte size not char count" do
+      # Japanese characters are 3 bytes each in UTF-8
+      store = MockStore.make(%{"k" => {"日本語", 0}})
+      assert 9 == Strings.handle("STRLEN", ["k"], store)
+    end
+
+    test "APPEND with null bytes concatenates correctly" do
+      store = MockStore.make(%{"k" => {"before\x00", 0}})
+      new_len = Strings.handle("APPEND", ["k", "\x00after"], store)
+      assert new_len == 13
+      assert "before\x00\x00after" == store.get.("k")
+    end
+
+    test "very long keys (> 512 bytes) work with SET/GET" do
+      store = MockStore.make()
+      long_key = String.duplicate("k", 1024)
+      assert :ok = Strings.handle("SET", [long_key, "value"], store)
+      assert "value" == Strings.handle("GET", [long_key], store)
+    end
+
+    test "very long keys (> 512 bytes) work with EXISTS" do
+      store = MockStore.make()
+      long_key = String.duplicate("k", 1024)
+      assert :ok = Strings.handle("SET", [long_key, "value"], store)
+      assert 1 == Strings.handle("EXISTS", [long_key], store)
+    end
+
+    test "MSET and MGET with unicode keys and values" do
+      store = MockStore.make()
+
+      assert :ok =
+               Strings.handle(
+                 "MSET",
+                 ["キー1", "値1", "キー2", "値2"],
+                 store
+               )
+
+      assert ["値1", "値2"] ==
+               Strings.handle("MGET", ["キー1", "キー2"], store)
+    end
+
+    test "value containing RESP-like sequences is treated as opaque binary" do
+      store = MockStore.make()
+      resp_like = "+OK\r\n-ERR\r\n$5\r\nhello\r\n*2\r\n"
+      assert :ok = Strings.handle("SET", ["k", resp_like], store)
+      assert resp_like == Strings.handle("GET", ["k"], store)
+    end
+
+    test "key with all 256 byte values round-trips" do
+      store = MockStore.make()
+      # Build a key from all possible byte values
+      key = Enum.into(0..255, <<>>, fn b -> <<b>> end)
+      value = "all_bytes_key_value"
+      assert :ok = Strings.handle("SET", [key, value], store)
+      assert value == Strings.handle("GET", [key], store)
+    end
+  end
+
+  # ===========================================================================
+  # OOM / MemoryGuard error codes
+  # ===========================================================================
+
+  describe "MemoryGuard reject_writes? check" do
+    test "MemoryGuard.reject_writes? returns boolean" do
+      # Verify the API contract works — under normal conditions it returns false
+      result = Ferricstore.MemoryGuard.reject_writes?()
+      assert is_boolean(result)
+    end
+
+    test "MemoryGuard.stats returns expected fields" do
+      stats = Ferricstore.MemoryGuard.stats()
+      assert is_map(stats)
+      assert Map.has_key?(stats, :total_bytes)
+      assert Map.has_key?(stats, :max_bytes)
+      assert Map.has_key?(stats, :ratio)
+      assert Map.has_key?(stats, :pressure_level)
+      assert Map.has_key?(stats, :eviction_policy)
+      assert stats.pressure_level in [:ok, :warning, :pressure, :reject]
+    end
+
+    test "MemoryGuard.eviction_policy returns an atom" do
+      policy = Ferricstore.MemoryGuard.eviction_policy()
+      assert is_atom(policy)
+      assert policy in [:volatile_lru, :allkeys_lru, :volatile_ttl, :noeviction]
+    end
+  end
+
+  # ===========================================================================
+  # SET with GET flag (returns old value)
+  # ===========================================================================
+
+  describe "SET with combined flags" do
+    test "SET with NX and EX sets key with expiry when key does not exist" do
+      store = MockStore.make()
+      assert :ok = Strings.handle("SET", ["k", "v", "NX", "EX", "60"], store)
+      assert "v" == store.get.("k")
+      ttl = Expiry.handle("TTL", ["k"], store)
+      assert ttl > 0 and ttl <= 60
+    end
+
+    test "SET with XX and EX updates existing key with new expiry" do
+      store = MockStore.make(%{"k" => {"old", 0}})
+      assert :ok = Strings.handle("SET", ["k", "new", "XX", "EX", "30"], store)
+      assert "new" == store.get.("k")
+      ttl = Expiry.handle("TTL", ["k"], store)
+      assert ttl > 0 and ttl <= 30
+    end
+
+    test "SET with NX and XX both set: XX takes precedence over NX semantics" do
+      # Both NX and XX at the same time: NX requires key not exist, XX requires
+      # key exist. This is contradictory — Redis rejects with syntax error or
+      # the last one wins. In our impl, both flags are set, so XX=true means
+      # key must exist AND NX=true means key must not exist — neither condition
+      # is satisfiable if both are true.
+      store = MockStore.make(%{"k" => {"old", 0}})
+      # With existing key: NX=true checks "not exists?" which is false -> nil
+      result = Strings.handle("SET", ["k", "new", "NX", "XX"], store)
+      assert result == nil
+    end
+
+    test "SET with NX on non-existing key and PX sets millisecond expiry" do
+      store = MockStore.make()
+      assert :ok = Strings.handle("SET", ["k", "v", "NX", "PX", "5000"], store)
+      pttl = Expiry.handle("PTTL", ["k"], store)
+      assert pttl > 0 and pttl <= 5000
+    end
+  end
+
+  # ===========================================================================
+  # Additional EXPIRE/TTL round-trip correctness
+  # ===========================================================================
+
+  describe "EXPIRE then TTL round-trip" do
+    test "EXPIRE 10 then TTL returns value between 0 and 10" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 1 == Expiry.handle("EXPIRE", ["k", "10"], store)
+      ttl = Expiry.handle("TTL", ["k"], store)
+      assert ttl >= 0 and ttl <= 10
+    end
+
+    test "PEXPIRE 5000 then PTTL returns value between 0 and 5000" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 1 == Expiry.handle("PEXPIRE", ["k", "5000"], store)
+      pttl = Expiry.handle("PTTL", ["k"], store)
+      assert pttl >= 0 and pttl <= 5000
+    end
+
+    test "EXPIRE replaces existing TTL" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 1 == Expiry.handle("EXPIRE", ["k", "100"], store)
+      assert 1 == Expiry.handle("EXPIRE", ["k", "5"], store)
+      ttl = Expiry.handle("TTL", ["k"], store)
+      assert ttl >= 0 and ttl <= 5
+    end
+
+    test "PERSIST after EXPIRE returns -1 TTL" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert 1 == Expiry.handle("EXPIRE", ["k", "60"], store)
+      assert 1 == Expiry.handle("PERSIST", ["k"], store)
+      assert -1 == Expiry.handle("TTL", ["k"], store)
+      # Value is still there
+      assert "v" == store.get.("k")
+    end
+  end
 end

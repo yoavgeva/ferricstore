@@ -1,6 +1,5 @@
 defmodule Ferricstore.Merge.SchedulerTest do
   use ExUnit.Case
-  @moduletag :pending_nif_rebuild
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Merge.{Manifest, Scheduler, Semaphore}
@@ -22,6 +21,9 @@ defmodule Ferricstore.Merge.SchedulerTest do
   describe "NIF.shard_stats/1" do
     test "returns stats for an empty store" do
       dir = temp_dir()
+      # Ensure directory is truly empty (no leftover data files)
+      File.rm_rf!(dir)
+      File.mkdir_p!(dir)
       {:ok, store} = NIF.new(dir)
       {:ok, {total, live, dead, file_count, key_count, frag}} = NIF.shard_stats(store)
 

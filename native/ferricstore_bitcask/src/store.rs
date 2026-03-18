@@ -399,6 +399,312 @@ impl Store {
         Ok(())
     }
 
+    /// Return all live (non-tombstone, non-expired) key-value pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if any data file cannot be read.
+    pub fn get_all(&mut self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let now = now_ms();
+        let entries: Vec<(Vec<u8>, crate::keydir::KeyEntry)> = self
+            .keydir
+            .iter()
+            .filter(|(_, e)| e.expire_at_ms == 0 || e.expire_at_ms > now)
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect();
+        let mut result = Vec::with_capacity(entries.len());
+        for (key, entry) in entries {
+            let log_file = log_path(&self.data_dir, entry.file_id);
+            let mut reader = LogReader::open(&log_file)?;
+            if let Some(record) = reader.read_at(entry.offset)? {
+                if let Some(value) = record.value {
+                    result.push((key, value));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Look up multiple keys at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if any data file cannot be read.
+    pub fn get_batch(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        let now = now_ms();
+        let mut results = Vec::with_capacity(keys.len());
+        for &key in keys {
+            let entry = if let Some(e) = self.keydir.get(key) {
+                e.clone()
+            } else {
+                results.push(None);
+                continue;
+            };
+            if entry.expire_at_ms != 0 && entry.expire_at_ms <= now {
+                results.push(None);
+                continue;
+            }
+            let log_file = log_path(&self.data_dir, entry.file_id);
+            let mut reader = LogReader::open(&log_file)?;
+            let val = reader.read_at(entry.offset)?.and_then(|r| r.value);
+            results.push(val);
+        }
+        Ok(results)
+    }
+
+    /// Range scan: sorted key-value pairs in `[min_key, max_key]`, up to `max_count`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if any data file cannot be read.
+    pub fn get_range(
+        &mut self,
+        min_key: &[u8],
+        max_key: &[u8],
+        max_count: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if max_count == 0 || min_key > max_key {
+            return Ok(Vec::new());
+        }
+        let now = now_ms();
+        let mut matching: Vec<(Vec<u8>, crate::keydir::KeyEntry)> = self
+            .keydir
+            .iter()
+            .filter(|(k, e)| {
+                let ks = k.as_slice();
+                ks >= min_key && ks <= max_key && (e.expire_at_ms == 0 || e.expire_at_ms > now)
+            })
+            .map(|(k, e)| (k.clone(), e.clone()))
+            .collect();
+        matching.sort_by(|a, b| a.0.cmp(&b.0));
+        matching.truncate(max_count);
+        let mut result = Vec::with_capacity(matching.len());
+        for (key, entry) in matching {
+            let log_file = log_path(&self.data_dir, entry.file_id);
+            let mut reader = LogReader::open(&log_file)?;
+            if let Some(record) = reader.read_at(entry.offset)? {
+                if let Some(value) = record.value {
+                    result.push((key, value));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Atomic read-modify-write.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if the operation fails.
+    pub fn read_modify_write(&mut self, key: &[u8], op: &RmwOp) -> Result<Vec<u8>> {
+        let now = now_ms();
+        let (current, expire_at_ms) = match self.keydir.get(key) {
+            Some(e) if e.expire_at_ms != 0 && e.expire_at_ms <= now => (Vec::new(), 0),
+            Some(e) => {
+                let entry = e.clone();
+                let log_file = log_path(&self.data_dir, entry.file_id);
+                let mut reader = LogReader::open(&log_file)?;
+                let val = reader
+                    .read_at(entry.offset)?
+                    .and_then(|r| r.value)
+                    .unwrap_or_default();
+                (val, entry.expire_at_ms)
+            }
+            None => (Vec::new(), 0),
+        };
+        let new_value = match *op {
+            RmwOp::SetRange(offset, ref bytes) => {
+                const MAX_SETRANGE_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
+                let needed = offset + bytes.len() as u64;
+                if needed > MAX_SETRANGE_SIZE {
+                    return Err(StoreError(format!(
+                        "SETRANGE would create value of {needed} bytes (max {MAX_SETRANGE_SIZE})"
+                    )));
+                }
+                let offset = offset as usize;
+                let needed = needed as usize;
+                let mut buf = current;
+                if buf.len() < needed {
+                    buf.resize(needed, 0);
+                }
+                buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+                buf
+            }
+            RmwOp::SetBit(bit_offset, bit_value) => {
+                let byte_index = (bit_offset / 8) as usize;
+                let bit_index = 7 - (bit_offset % 8) as usize;
+                let mut buf = current;
+                if buf.len() <= byte_index {
+                    buf.resize(byte_index + 1, 0);
+                }
+                if bit_value != 0 {
+                    buf[byte_index] |= 1 << bit_index;
+                } else {
+                    buf[byte_index] &= !(1 << bit_index);
+                }
+                buf
+            }
+            RmwOp::Append(ref data) => {
+                let mut buf = current;
+                buf.extend_from_slice(data);
+                buf
+            }
+            RmwOp::IncrBy(delta) => {
+                let current_str = std::str::from_utf8(&current)
+                    .map_err(|_| StoreError("not an integer".into()))?;
+                let current_int: i64 = if current_str.is_empty() {
+                    0
+                } else {
+                    current_str
+                        .parse()
+                        .map_err(|_| StoreError("not an integer".into()))?
+                };
+                (current_int + delta).to_string().into_bytes()
+            }
+            RmwOp::IncrByFloat(delta) => {
+                let current_str = std::str::from_utf8(&current)
+                    .map_err(|_| StoreError("not a valid float".into()))?;
+                let current_float: f64 = if current_str.is_empty() {
+                    0.0
+                } else {
+                    current_str
+                        .parse()
+                        .map_err(|_| StoreError("not a valid float".into()))?
+                };
+                format_float(current_float + delta).into_bytes()
+            }
+        };
+        self.put(key, &new_value, expire_at_ms)?;
+        Ok(new_value)
+    }
+
+    /// Compute shard-level statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if file metadata cannot be read.
+    pub fn shard_stats(&self) -> Result<(u64, u64, u64, u64, u64, f64)> {
+        let file_ids = collect_file_ids(&self.data_dir)?;
+        let mut total_bytes: u64 = 0;
+        for &fid in &file_ids {
+            let path = log_path(&self.data_dir, fid);
+            if path.exists() {
+                total_bytes += fs::metadata(&path)?.len();
+            }
+        }
+        let now = now_ms();
+        let mut live_bytes: u64 = 0;
+        let mut key_count: u64 = 0;
+        for (key, entry) in self.keydir.iter() {
+            if entry.expire_at_ms == 0 || entry.expire_at_ms > now {
+                live_bytes += HEADER_SIZE as u64 + key.len() as u64 + u64::from(entry.value_size);
+                key_count += 1;
+            }
+        }
+        let dead_bytes = total_bytes.saturating_sub(live_bytes);
+        #[allow(clippy::cast_precision_loss)]
+        let frag_ratio = if total_bytes > 0 {
+            dead_bytes as f64 / total_bytes as f64
+        } else {
+            0.0
+        };
+        Ok((
+            total_bytes,
+            live_bytes,
+            dead_bytes,
+            file_ids.len() as u64,
+            key_count,
+            frag_ratio,
+        ))
+    }
+
+    /// List all data files and their sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if the directory cannot be read.
+    pub fn file_sizes(&self) -> Result<Vec<(u64, u64)>> {
+        let file_ids = collect_file_ids(&self.data_dir)?;
+        let mut result = Vec::with_capacity(file_ids.len());
+        for fid in file_ids {
+            let path = log_path(&self.data_dir, fid);
+            if path.exists() {
+                result.push((fid, fs::metadata(&path)?.len()));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Run compaction on specified file IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if compaction fails.
+    pub fn run_compaction(&mut self, file_ids: &[u64]) -> Result<(u64, u64, u64)> {
+        if file_ids.is_empty() {
+            return Ok((0, 0, 0));
+        }
+        let mut bytes_before: u64 = 0;
+        for &fid in file_ids {
+            let path = log_path(&self.data_dir, fid);
+            if path.exists() {
+                bytes_before += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        let max_input = file_ids.iter().copied().max().unwrap_or(0);
+        let new_file_id = std::cmp::max(max_input, self.active_file_id) + 1;
+        let now = now_ms();
+        let output =
+            crate::compaction::compact(&self.data_dir, file_ids, &self.keydir, new_file_id, now)
+                .map_err(|e| StoreError(e.to_string()))?;
+        let mut new_kd = crate::keydir::KeyDir::new();
+        let hp = hint_path(&self.data_dir, new_file_id);
+        if hp.exists() {
+            let mut hr =
+                crate::hint::HintReader::open(&hp).map_err(|e| StoreError(e.to_string()))?;
+            hr.load_into(&mut new_kd)
+                .map_err(|e| StoreError(e.to_string()))?;
+        }
+        let compacted_set: std::collections::HashSet<u64> = file_ids.iter().copied().collect();
+        let keys_in_old: Vec<Vec<u8>> = self
+            .keydir
+            .iter()
+            .filter(|(_, e)| compacted_set.contains(&e.file_id))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &keys_in_old {
+            self.keydir.delete(key);
+        }
+        for (key, entry) in new_kd.iter() {
+            self.keydir.put(key.clone(), entry.clone());
+        }
+        crate::compaction::remove_old_files(&self.data_dir, file_ids)
+            .map_err(|e| StoreError(e.to_string()))?;
+        if compacted_set.contains(&self.active_file_id) {
+            self.active_file_id = new_file_id;
+            self.writer = LogWriter::open(&log_path(&self.data_dir, new_file_id), new_file_id)?;
+        }
+        let mut bytes_after: u64 = 0;
+        let new_path = log_path(&self.data_dir, new_file_id);
+        if new_path.exists() {
+            bytes_after = fs::metadata(&new_path).map(|m| m.len()).unwrap_or(0);
+        }
+        Ok((
+            output.records_written as u64,
+            output.records_dropped as u64,
+            bytes_before.saturating_sub(bytes_after),
+        ))
+    }
+
+    /// Return available disk space for the data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if the statvfs call fails.
+    pub fn available_disk_space(&self) -> Result<u64> {
+        available_disk_space_for_path(&self.data_dir)
+    }
+
     /// Proactively purge all logically-expired keys from the keydir.
     ///
     /// For each expired key a tombstone is appended to the log so that the key
@@ -417,16 +723,73 @@ impl Store {
         let now = now_ms();
         let expired = self.keydir.expired_keys(now);
         let count = expired.len();
+        // Write all tombstones first, then fsync, then update keydir.
+        // This ordering ensures that on crash between write and keydir update,
+        // the tombstones are durable on disk. On reopen, log replay will see
+        // them and correctly remove the keys. The previous ordering (keydir
+        // delete before fsync) could cause keys to resurrect after a crash.
         for key in &expired {
             self.writer
                 .write_tombstone(key)
                 .map_err(|e| StoreError(e.to_string()))?;
-            self.keydir.delete(key);
         }
         if count > 0 {
             self.writer.sync().map_err(|e| StoreError(e.to_string()))?;
         }
+        for key in &expired {
+            self.keydir.delete(key);
+        }
         Ok(count)
+    }
+}
+
+/// Read-modify-write operation variants.
+pub enum RmwOp {
+    SetRange(u64, Vec<u8>),
+    SetBit(u64, u8),
+    Append(Vec<u8>),
+    IncrBy(i64),
+    IncrByFloat(f64),
+}
+
+fn format_float(val: f64) -> String {
+    let s = format!("{val:.17}");
+    if let Some(dot_pos) = s.find('.') {
+        let trimmed = s.trim_end_matches('0');
+        if trimmed.len() == dot_pos + 1 {
+            trimmed[..dot_pos].to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        s
+    }
+}
+
+fn available_disk_space_for_path(path: &Path) -> Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path =
+            CString::new(path.as_os_str().as_bytes()).map_err(|e| StoreError(e.to_string()))?;
+        #[allow(unsafe_code)]
+        unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            let ret = libc::statvfs(c_path.as_ptr(), &mut stat);
+            if ret != 0 {
+                return Err(StoreError(format!(
+                    "statvfs failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(stat.f_bavail as u64 * stat.f_frsize)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(u64::MAX)
     }
 }
 

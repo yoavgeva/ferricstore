@@ -39,6 +39,11 @@ mod atoms {
         false_ = "false",
         pending,
         io_complete,
+        set_range,
+        set_bit,
+        append,
+        incr_by,
+        incr_by_float,
     }
 }
 
@@ -139,6 +144,9 @@ fn put<'a>(
     value: Binary<'a>,
     expire_at_ms: u64,
 ) -> NifResult<Term<'a>> {
+    if let Err(msg) = crate::log::validate_kv_sizes(key.as_slice(), value.as_slice()) {
+        return Ok((atoms::error(), msg).encode(env));
+    }
     let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
     match store.put(key.as_slice(), value.as_slice(), expire_at_ms) {
         Ok(()) => Ok(atoms::ok().encode(env)),
@@ -198,25 +206,22 @@ fn put_batch<'a>(
 /// preemption, no thread-pool dispatch, ~1–2µs overhead instead of ~10–20µs.
 ///
 /// On the **fallback path** (macOS / no `io_uring`) this NIF calls
-/// `store.put_batch` which DOES block on fsync. Because we've declared
-/// `"Normal"`, that blocking call would freeze a scheduler thread. The
-/// fallback is therefore wrapped in a `spawn_blocking`-style approach: it
-/// calls the synchronous path directly, which is acceptable because the
-/// fallback is only used in development/test (macOS). For a production Linux
-/// build the async path is always taken.
+/// `store.put_batch` which DOES block on fsync. Using `"DirtyIo"` ensures
+/// the blocking fallback doesn't freeze a normal scheduler thread.
+/// On Linux with io_uring the async path is still fast — the ~10-20µs
+/// DirtyIo dispatch overhead is negligible compared to the batch operation.
 ///
 /// ## Linux with `io_uring`
 ///
 /// 1. Encodes records and updates the keydir optimistically.
 /// 2. Submits write SQEs + one fsync SQE to an `AsyncUringBackend` (non-blocking).
-/// 3. Returns `{:pending, op_id}` immediately — no dirty thread occupied.
+/// 3. Returns `{:pending, op_id}` immediately.
 /// 4. A background Rust thread drains the fsync CQE and sends
 ///    `{:io_complete, op_id, :ok | {:error, reason}}` to the calling process.
 ///
 /// ## Fallback (macOS / no `io_uring`)
 ///
 /// Falls back to synchronous `put_batch`, returning `:ok` directly.
-/// On macOS this is development-only; production deployments run on Linux.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 fn put_batch_async<'a>(
@@ -304,11 +309,11 @@ fn keys(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
         .keys()
         .into_iter()
         .map(|k| {
-            let mut bin = OwnedBinary::new(k.len()).unwrap();
+            let mut bin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
             bin.as_mut_slice().copy_from_slice(&k);
-            Binary::from_owned(bin, env).encode(env)
+            Ok(Binary::from_owned(bin, env).encode(env))
         })
-        .collect();
+        .collect::<NifResult<Vec<Term>>>()?;
     Ok(all_keys.encode(env))
 }
 
@@ -331,6 +336,202 @@ fn purge_expired(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Te
     let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
     match store.purge_expired() {
         Ok(count) => Ok((atoms::ok(), count as u64).encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extended NIF functions
+// ---------------------------------------------------------------------------
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn get_all(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    match store.get_all() {
+        Ok(pairs) => {
+            let terms: Vec<Term> = pairs
+                .into_iter()
+                .map(|(k, v)| {
+                    let mut kbin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
+                    kbin.as_mut_slice().copy_from_slice(&k);
+                    let mut vbin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
+                    vbin.as_mut_slice().copy_from_slice(&v);
+                    Ok((Binary::from_owned(kbin, env), Binary::from_owned(vbin, env)).encode(env))
+                })
+                .collect::<NifResult<Vec<Term>>>()?;
+            Ok((atoms::ok(), terms).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn get_batch<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    keys: Vec<Binary<'a>>,
+) -> NifResult<Term<'a>> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    let key_slices: Vec<&[u8]> = keys.iter().map(Binary::as_slice).collect();
+    match store.get_batch(&key_slices) {
+        Ok(results) => {
+            let terms: Vec<Term> = results
+                .into_iter()
+                .map(|opt| match opt {
+                    Some(v) => {
+                        let mut bin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
+                        bin.as_mut_slice().copy_from_slice(&v);
+                        Ok(Binary::from_owned(bin, env).encode(env))
+                    }
+                    None => Ok(atoms::nil().encode(env)),
+                })
+                .collect::<NifResult<Vec<Term>>>()?;
+            Ok((atoms::ok(), terms).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn get_range<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    min_key: Binary<'a>,
+    max_key: Binary<'a>,
+    max_count: u64,
+) -> NifResult<Term<'a>> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    match store.get_range(min_key.as_slice(), max_key.as_slice(), max_count as usize) {
+        Ok(pairs) => {
+            let terms: Vec<Term> = pairs
+                .into_iter()
+                .map(|(k, v)| {
+                    let mut kbin = OwnedBinary::new(k.len()).ok_or(rustler::Error::BadArg)?;
+                    kbin.as_mut_slice().copy_from_slice(&k);
+                    let mut vbin = OwnedBinary::new(v.len()).ok_or(rustler::Error::BadArg)?;
+                    vbin.as_mut_slice().copy_from_slice(&v);
+                    Ok((Binary::from_owned(kbin, env), Binary::from_owned(vbin, env)).encode(env))
+                })
+                .collect::<NifResult<Vec<Term>>>()?;
+            Ok((atoms::ok(), terms).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn read_modify_write<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    key: Binary<'a>,
+    operation: Term<'a>,
+) -> NifResult<Term<'a>> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    let op = decode_rmw_op(operation)?;
+    match store.read_modify_write(key.as_slice(), &op) {
+        Ok(value) => {
+            let mut bin = OwnedBinary::new(value.len()).ok_or(rustler::Error::BadArg)?;
+            bin.as_mut_slice().copy_from_slice(&value);
+            Ok((atoms::ok(), Binary::from_owned(bin, env)).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+fn decode_rmw_op(term: Term) -> NifResult<store::RmwOp> {
+    use rustler::types::tuple::get_tuple;
+    let tuple = get_tuple(term).map_err(|_| rustler::Error::BadArg)?;
+    if tuple.is_empty() {
+        return Err(rustler::Error::BadArg);
+    }
+    let tag: rustler::types::atom::Atom = tuple[0].decode().map_err(|_| rustler::Error::BadArg)?;
+    if tag == atoms::set_range() {
+        if tuple.len() != 3 {
+            return Err(rustler::Error::BadArg);
+        }
+        let offset: u64 = tuple[1].decode().map_err(|_| rustler::Error::BadArg)?;
+        let bytes: Binary = tuple[2].decode().map_err(|_| rustler::Error::BadArg)?;
+        Ok(store::RmwOp::SetRange(offset, bytes.as_slice().to_vec()))
+    } else if tag == atoms::set_bit() {
+        if tuple.len() != 3 {
+            return Err(rustler::Error::BadArg);
+        }
+        let bit_offset: u64 = tuple[1].decode().map_err(|_| rustler::Error::BadArg)?;
+        let bit_value: u64 = tuple[2].decode().map_err(|_| rustler::Error::BadArg)?;
+        Ok(store::RmwOp::SetBit(bit_offset, bit_value as u8))
+    } else if tag == atoms::append() {
+        if tuple.len() != 2 {
+            return Err(rustler::Error::BadArg);
+        }
+        let data: Binary = tuple[1].decode().map_err(|_| rustler::Error::BadArg)?;
+        Ok(store::RmwOp::Append(data.as_slice().to_vec()))
+    } else if tag == atoms::incr_by() {
+        if tuple.len() != 2 {
+            return Err(rustler::Error::BadArg);
+        }
+        let delta: i64 = tuple[1].decode().map_err(|_| rustler::Error::BadArg)?;
+        Ok(store::RmwOp::IncrBy(delta))
+    } else if tag == atoms::incr_by_float() {
+        if tuple.len() != 2 {
+            return Err(rustler::Error::BadArg);
+        }
+        let delta: f64 = tuple[1].decode().map_err(|_| rustler::Error::BadArg)?;
+        Ok(store::RmwOp::IncrByFloat(delta))
+    } else {
+        Err(rustler::Error::BadArg)
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn shard_stats(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
+    let store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    match store.shard_stats() {
+        Ok((total, live, dead, file_count, key_count, frag)) => Ok((
+            atoms::ok(),
+            (total, live, dead, file_count, key_count, frag),
+        )
+            .encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn file_sizes(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
+    let store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    match store.file_sizes() {
+        Ok(sizes) => Ok((atoms::ok(), sizes).encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn run_compaction(
+    env: Env,
+    resource: ResourceArc<StoreResource>,
+    file_ids: Vec<u64>,
+) -> NifResult<Term> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    match store.run_compaction(&file_ids) {
+        Ok((written, dropped, reclaimed)) => {
+            Ok((atoms::ok(), (written, dropped, reclaimed)).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn available_disk_space(env: Env, resource: ResourceArc<StoreResource>) -> NifResult<Term> {
+    let store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    match store.available_disk_space() {
+        Ok(space) => Ok((atoms::ok(), space).encode(env)),
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
 }

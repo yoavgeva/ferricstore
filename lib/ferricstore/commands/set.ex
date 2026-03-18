@@ -1,7 +1,7 @@
 defmodule Ferricstore.Commands.Set do
   @moduledoc """
   Handles Redis set commands: SADD, SREM, SMEMBERS, SISMEMBER, SCARD,
-  SINTER, SUNION, SDIFF, SRANDMEMBER, SPOP.
+  SINTER, SUNION, SDIFF, SRANDMEMBER, SPOP, SMOVE, SSCAN.
 
   Each set member is stored as a compound key:
 
@@ -74,15 +74,7 @@ defmodule Ferricstore.Commands.Set do
           end
         end)
 
-      # Clean up type metadata if the set is now empty
-      if removed > 0 do
-        prefix = CompoundKey.set_prefix(key)
-
-        if store.compound_count.(key, prefix) == 0 do
-          TypeRegistry.delete_type(key, store)
-        end
-      end
-
+      maybe_cleanup_empty_set(key, removed, store)
       removed
     end
   end
@@ -198,6 +190,155 @@ defmodule Ferricstore.Commands.Set do
   end
 
   # ---------------------------------------------------------------------------
+  # SSCAN key cursor [MATCH pattern] [COUNT count]
+  # ---------------------------------------------------------------------------
+
+  def handle("SSCAN", [key, cursor_str | opts], store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store),
+         {:ok, cursor} <- parse_cursor(cursor_str),
+         {:ok, match_pattern, count} <- parse_sscan_opts(opts) do
+      prefix = CompoundKey.set_prefix(key)
+      pairs = store.compound_scan.(key, prefix)
+      members = Enum.map(pairs, fn {member, _} -> member end)
+
+      filtered =
+        case match_pattern do
+          nil ->
+            members
+
+          pattern ->
+            regex = glob_to_regex(pattern)
+            Enum.filter(members, fn m -> Regex.match?(regex, m) end)
+        end
+
+      {next_cursor, batch} = paginate(filtered, cursor, count)
+      [next_cursor, batch]
+    end
+  end
+
+  def handle("SSCAN", [_key], _store) do
+    {:error, "ERR wrong number of arguments for 'sscan' command"}
+  end
+
+  def handle("SSCAN", [], _store) do
+    {:error, "ERR wrong number of arguments for 'sscan' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # SRANDMEMBER key [count]
+  # ---------------------------------------------------------------------------
+
+  def handle("SRANDMEMBER", [key], store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      members = get_members_list(key, store)
+
+      case members do
+        [] -> nil
+        _ -> Enum.random(members)
+      end
+    end
+  end
+
+  def handle("SRANDMEMBER", [key, count_str], store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      case Integer.parse(count_str) do
+        {count, ""} ->
+          members = get_members_list(key, store)
+          select_random_members(members, count)
+
+        _ ->
+          {:error, "ERR value is not an integer or out of range"}
+      end
+    end
+  end
+
+  def handle("SRANDMEMBER", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'srandmember' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # SPOP key [count]
+  # ---------------------------------------------------------------------------
+
+  def handle("SPOP", [key], store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      members = get_members_list(key, store)
+
+      case members do
+        [] ->
+          nil
+
+        _ ->
+          member = Enum.random(members)
+          compound_key = CompoundKey.set_member(key, member)
+          store.compound_delete.(key, compound_key)
+          maybe_cleanup_empty_set(key, 1, store)
+          member
+      end
+    end
+  end
+
+  def handle("SPOP", [key, count_str], store) do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      case Integer.parse(count_str) do
+        {count, ""} when count >= 0 ->
+          members = get_members_list(key, store)
+          selected = Enum.take_random(members, count)
+
+          Enum.each(selected, fn member ->
+            compound_key = CompoundKey.set_member(key, member)
+            store.compound_delete.(key, compound_key)
+          end)
+
+          if selected != [] do
+            maybe_cleanup_empty_set(key, length(selected), store)
+          end
+
+          selected
+
+        {_count, ""} ->
+          {:error, "ERR value is not an integer or out of range"}
+
+        _ ->
+          {:error, "ERR value is not an integer or out of range"}
+      end
+    end
+  end
+
+  def handle("SPOP", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'spop' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # SMOVE source destination member
+  # ---------------------------------------------------------------------------
+
+  def handle("SMOVE", [source, destination, member], store) do
+    with :ok <- TypeRegistry.check_type(source, :set, store),
+         :ok <- TypeRegistry.check_type(destination, :set, store) do
+      compound_key = CompoundKey.set_member(source, member)
+
+      if store.compound_get.(source, compound_key) == nil do
+        0
+      else
+        # Remove from source
+        store.compound_delete.(source, compound_key)
+        maybe_cleanup_empty_set(source, 1, store)
+
+        # Add to destination (check_or_set for destination since it may not exist)
+        TypeRegistry.check_or_set(destination, :set, store)
+        dst_key = CompoundKey.set_member(destination, member)
+        store.compound_put.(destination, dst_key, @presence_marker, 0)
+        1
+      end
+    end
+  end
+
+  def handle("SMOVE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'smove' command"}
+  end
+
+  # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
@@ -205,6 +346,12 @@ defmodule Ferricstore.Commands.Set do
     prefix = CompoundKey.set_prefix(key)
     pairs = store.compound_scan.(key, prefix)
     MapSet.new(pairs, fn {member, _} -> member end)
+  end
+
+  defp get_members_list(key, store) do
+    prefix = CompoundKey.set_prefix(key)
+    pairs = store.compound_scan.(key, prefix)
+    Enum.map(pairs, fn {member, _} -> member end)
   end
 
   defp check_all_types(keys, store) do
@@ -215,4 +362,98 @@ defmodule Ferricstore.Commands.Set do
       end
     end)
   end
+
+  defp maybe_cleanup_empty_set(_key, 0, _store), do: :ok
+
+  defp maybe_cleanup_empty_set(key, _removed, store) do
+    prefix = CompoundKey.set_prefix(key)
+
+    if store.compound_count.(key, prefix) == 0 do
+      TypeRegistry.delete_type(key, store)
+    end
+  end
+
+  defp select_random_members(members, count) do
+    cond do
+      count == 0 ->
+        []
+
+      count > 0 ->
+        Enum.take_random(members, count)
+
+      count < 0 ->
+        abs_count = abs(count)
+
+        if members == [] do
+          []
+        else
+          for _ <- 1..abs_count, do: Enum.random(members)
+        end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SSCAN helpers
+  # ---------------------------------------------------------------------------
+
+  defp parse_cursor(cursor_str) do
+    case Integer.parse(cursor_str) do
+      {cursor, ""} when cursor >= 0 -> {:ok, cursor}
+      _ -> {:error, "ERR invalid cursor"}
+    end
+  end
+
+  defp parse_sscan_opts(opts), do: do_parse_sscan_opts(opts, nil, 10)
+
+  defp do_parse_sscan_opts([], match, count), do: {:ok, match, count}
+
+  defp do_parse_sscan_opts([opt, value | rest], match, count) do
+    case String.upcase(opt) do
+      "MATCH" ->
+        do_parse_sscan_opts(rest, value, count)
+
+      "COUNT" ->
+        case Integer.parse(value) do
+          {n, ""} when n > 0 -> do_parse_sscan_opts(rest, match, n)
+          _ -> {:error, "ERR value is not an integer or out of range"}
+        end
+
+      _ ->
+        {:error, "ERR syntax error"}
+    end
+  end
+
+  defp do_parse_sscan_opts([_ | _], _match, _count) do
+    {:error, "ERR syntax error"}
+  end
+
+  defp paginate(items, cursor, count) do
+    total = length(items)
+
+    if cursor >= total do
+      {"0", []}
+    else
+      batch = Enum.slice(items, cursor, count)
+      next_pos = cursor + length(batch)
+
+      if next_pos >= total do
+        {"0", batch}
+      else
+        {Integer.to_string(next_pos), batch}
+      end
+    end
+  end
+
+  defp glob_to_regex(pattern) do
+    regex_str =
+      pattern
+      |> String.graphemes()
+      |> Enum.map_join(&escape_glob_char/1)
+
+    Regex.compile!("^#{regex_str}$")
+  end
+
+  defp escape_glob_char("*"), do: ".*"
+  defp escape_glob_char("?"), do: "."
+  defp escape_glob_char(char), do: Regex.escape(char)
 end

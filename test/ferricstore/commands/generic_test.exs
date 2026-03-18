@@ -623,6 +623,97 @@ defmodule Ferricstore.Commands.GenericTest do
   # Private -- SCAN iteration helper
   # ---------------------------------------------------------------------------
 
+  # ---------------------------------------------------------------------------
+  # Edge cases: SCAN non-zero cursor, OBJECT arity, COPY edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "SCAN cursor edge cases" do
+    test "SCAN with non-zero initial cursor starts from that position" do
+      data = for i <- 1..20, into: %{}, do: {"k#{String.pad_leading("#{i}", 2, "0")}", {"v", 0}}
+      store = MockStore.make(data)
+      # First scan
+      [cursor1, keys1] = Generic.handle("SCAN", ["0", "COUNT", "5"], store)
+      assert length(keys1) == 5
+      # Continue from cursor
+      [_cursor2, keys2] = Generic.handle("SCAN", [cursor1, "COUNT", "5"], store)
+      assert length(keys2) == 5
+      # No overlap between batches
+      assert MapSet.disjoint?(MapSet.new(keys1), MapSet.new(keys2))
+    end
+
+    test "SCAN with MATCH and COUNT combined works" do
+      data = %{
+        "user:1" => {"v", 0}, "user:2" => {"v", 0}, "user:3" => {"v", 0},
+        "order:1" => {"v", 0}, "order:2" => {"v", 0}
+      }
+      store = MockStore.make(data)
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "MATCH", "order:*", "COUNT", "100"], store)
+      assert Enum.sort(keys) == ["order:1", "order:2"]
+    end
+  end
+
+  describe "OBJECT arity edge cases" do
+    test "OBJECT ENCODING with no key returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Generic.handle("OBJECT", ["ENCODING"], store)
+      assert msg =~ "unknown subcommand or wrong number"
+    end
+
+    test "OBJECT FREQ with no key returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Generic.handle("OBJECT", ["FREQ"], store)
+      assert msg =~ "unknown subcommand or wrong number"
+    end
+
+    test "OBJECT IDLETIME with no key returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Generic.handle("OBJECT", ["IDLETIME"], store)
+      assert msg =~ "unknown subcommand or wrong number"
+    end
+
+    test "OBJECT REFCOUNT with no key returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Generic.handle("OBJECT", ["REFCOUNT"], store)
+      assert msg =~ "unknown subcommand or wrong number"
+    end
+  end
+
+  describe "COPY edge cases" do
+    test "COPY with extra args after REPLACE returns syntax error" do
+      store = MockStore.make(%{"src" => {"v", 0}})
+      assert {:error, msg} = Generic.handle("COPY", ["src", "dst", "REPLACE", "extra"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "COPY with two extra args returns syntax error" do
+      store = MockStore.make(%{"src" => {"v", 0}})
+      assert {:error, msg} = Generic.handle("COPY", ["src", "dst", "a", "b"], store)
+      assert msg =~ "syntax error"
+    end
+  end
+
+  describe "RENAME arity edge cases" do
+    test "RENAME with extra args returns error" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert {:error, msg} = Generic.handle("RENAME", ["old", "new", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "RENAMENX with extra args returns error" do
+      store = MockStore.make(%{"k" => {"v", 0}})
+      assert {:error, msg} = Generic.handle("RENAMENX", ["old", "new", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
+
+  describe "WAIT arity edge cases" do
+    test "WAIT accepts string args that represent non-integer but still returns 0" do
+      # WAIT doesn't validate its args because no replication - just returns 0
+      store = MockStore.make()
+      assert 0 == Generic.handle("WAIT", ["abc", "xyz"], store)
+    end
+  end
+
   defp iterate_scan(store, cursor, acc, count_opt, count_val) do
     [next_cursor, keys] = Generic.handle("SCAN", [cursor, count_opt, count_val], store)
 

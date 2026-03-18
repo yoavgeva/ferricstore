@@ -135,14 +135,12 @@ defmodule Ferricstore.Commands.DataStructuresTest do
       assert {:error, "WRONGTYPE" <> _} = List.handle("RPUSH", ["key", "elem"], store)
     end
 
-    @tag :pending_cross_type_wrongtype
     test "ZADD on list key returns WRONGTYPE" do
       store = MockStore.make()
       List.handle("RPUSH", ["key", "elem"], store)
       assert {:error, "WRONGTYPE" <> _} = SortedSet.handle("ZADD", ["key", "1.0", "m"], store)
     end
 
-    @tag :pending_cross_type_wrongtype
     test "read-only commands on wrong type also return WRONGTYPE" do
       store = MockStore.make()
       Hash.handle("HSET", ["key", "f", "v"], store)

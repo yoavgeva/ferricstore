@@ -8,7 +8,8 @@ defmodule Ferricstore.Application do
   Ferricstore.Supervisor
   ├── Ferricstore.Stats                   (global counters & run metadata)
   ├── Ferricstore.Store.ShardSupervisor   (one_for_one over N Shard GenServers)
-  └── Ranch listener (Ferricstore.Server.Listener)
+  ├── Ranch listener (Ferricstore.Server.Listener)
+  └── Ranch TLS listener (Ferricstore.Server.TlsListener) [optional]
   ```
 
   `Stats` starts first so counters are available before any connection arrives.
@@ -17,8 +18,13 @@ defmodule Ferricstore.Application do
 
   ## Configuration (application env)
 
-    * `:port`     - TCP port to bind (default: `6379`; test env uses `0` for ephemeral)
-    * `:data_dir` - Bitcask data directory (default: `"data"`)
+    * `:port`             - TCP port to bind (default: `6379`; test env uses `0` for ephemeral)
+    * `:data_dir`         - Bitcask data directory (default: `"data"`)
+    * `:tls_port`         - TLS port to bind (default: `nil`; not started unless configured)
+    * `:tls_cert_file`    - path to PEM certificate file
+    * `:tls_key_file`     - path to PEM private key file
+    * `:tls_ca_cert_file` - path to CA certificate bundle (optional)
+    * `:require_tls`      - when `true`, reject plaintext connections (default: `false`)
   """
 
   use Application
@@ -59,6 +65,7 @@ defmodule Ferricstore.Application do
       [
         Ferricstore.Stats,
         Ferricstore.SlowLog,
+        Ferricstore.AuditLog,
         Ferricstore.Config,
         {Ferricstore.Store.ShardSupervisor, data_dir: data_dir}
       ] ++
@@ -68,15 +75,57 @@ defmodule Ferricstore.Application do
           Ferricstore.FetchOrCompute,
           {Ferricstore.MemoryGuard, memory_guard_opts()},
           ranch_listener_spec(port)
-        ]
+        ] ++
+        tls_listener_children()
 
     opts = [strategy: :one_for_one, name: Ferricstore.Supervisor]
-    Supervisor.start_link(children, opts)
+    result = Supervisor.start_link(children, opts)
+
+    case result do
+      {:ok, _pid} ->
+        :telemetry.execute(
+          [:ferricstore, :node, :startup_complete],
+          %{duration_ms: System.monotonic_time(:millisecond)},
+          %{shard_count: shard_count, port: port, raft_enabled: raft_enabled?}
+        )
+
+      _ ->
+        :ok
+    end
+
+    result
+  end
+
+  @impl true
+  def prep_stop(state) do
+    :telemetry.execute(
+      [:ferricstore, :node, :shutdown_started],
+      %{uptime_ms: System.monotonic_time(:millisecond)},
+      %{}
+    )
+
+    state
   end
 
   # ---------------------------------------------------------------------------
-  # Ranch child spec
+  # TLS listener children
   # ---------------------------------------------------------------------------
+
+  # Returns a list with the TLS Ranch listener child spec if TLS is configured,
+  # or an empty list otherwise.
+  defp tls_listener_children do
+    tls_opts = [
+      port: Application.get_env(:ferricstore, :tls_port),
+      certfile: Application.get_env(:ferricstore, :tls_cert_file),
+      keyfile: Application.get_env(:ferricstore, :tls_key_file),
+      cacertfile: Application.get_env(:ferricstore, :tls_ca_cert_file)
+    ]
+
+    case Ferricstore.Server.TlsListener.child_spec_if_configured(tls_opts) do
+      nil -> []
+      spec -> [spec]
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # MemoryGuard options

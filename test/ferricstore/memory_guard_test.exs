@@ -82,7 +82,6 @@ defmodule Ferricstore.MemoryGuardTest do
       :telemetry.detach(handler_id)
     end
 
-    @tag :pending_memory_guard_timing
     test "pressure event is emitted when threshold is crossed" do
       test_pid = self()
       handler_id = "test-memory-pressure-#{System.unique_integer([:positive])}"

@@ -6,39 +6,92 @@ defmodule Ferricstore.Config do
   and writing server parameters at runtime. All values are stored as strings
   to match Redis behaviour.
 
-  ## Default values
+  ## Parameter categories
 
-  The following parameters are initialised with sensible defaults matching
-  Redis conventions:
+  **Read-only** (CONFIG GET only -- CONFIG SET returns an error):
 
-    * `"maxmemory"` — `"0"` (unlimited)
-    * `"maxmemory-policy"` — `"noeviction"`
-    * `"hz"` — `"10"`
-    * `"timeout"` — `"0"` (no idle timeout)
-    * `"tcp-keepalive"` — `"300"`
-    * `"databases"` — `"1"`
-    * `"bind"` — `"127.0.0.1"`
-    * `"port"` — `"6379"`
-    * `"requirepass"` — `""` (no password)
-    * `"maxclients"` — `"10000"`
+    * `"maxmemory"` -- max memory budget in bytes from MemoryGuard
+    * `"maxclients"` -- maximum simultaneous client connections
+    * `"tcp-port"` -- TCP port the server is listening on
+    * `"data-dir"` -- Bitcask data directory path
+    * `"raft-enabled"` -- whether Raft consensus is active (`"true"` / `"false"`)
+    * `"tls-port"` -- TLS port the server is listening on (`"0"` if not configured)
+    * `"tls-cert-file"` -- path to PEM certificate file
+    * `"tls-key-file"` -- path to PEM private key file
+    * `"tls-ca-cert-file"` -- path to CA certificate bundle
+    * `"require-tls"` -- whether plaintext connections are rejected (`"true"` / `"false"`)
+
+  **Read-write** (CONFIG GET and CONFIG SET):
+
+    * `"maxmemory-policy"` -- eviction policy (volatile-lru, allkeys-lru,
+      volatile-ttl, noeviction)
+    * `"notify-keyspace-events"` -- keyspace notification flag string
+    * `"slowlog-log-slower-than"` -- slowlog threshold in microseconds
+    * `"slowlog-max-len"` -- maximum slowlog entries
+    * `"hz"` -- server tick frequency (stub, always reports 10)
+
+  Plus legacy parameters: `timeout`, `tcp-keepalive`, `databases`, `bind`,
+  `port`, `save`, `appendonly`, `loglevel`, `requirepass`, `sandbox_mode`.
+
+  ## Telemetry
+
+  On every successful `CONFIG SET`, emits:
+
+      [:ferricstore, :config, :changed]
+
+  with measurements `%{}` and metadata
+  `%{param: key, value: new_value, old_value: previous_value}`.
 
   ## Usage
 
       Ferricstore.Config.get("max*")
-      #=> [{"maxmemory", "0"}, {"maxmemory-policy", "noeviction"}, {"maxclients", "10000"}]
+      #=> [{"maxmemory", "1073741824"}, {"maxclients", "10000"}, {"maxmemory-policy", "volatile-lru"}]
 
-      Ferricstore.Config.set("hz", "20")
+      Ferricstore.Config.set("maxmemory-policy", "allkeys-lru")
       #=> :ok
+
+      Ferricstore.Config.set("maxmemory", "999")
+      #=> {:error, "ERR Unsupported CONFIG parameter: maxmemory (read-only)"}
   """
 
   use GenServer
 
-  @defaults %{
-    "maxmemory" => "0",
-    "maxmemory-policy" => "noeviction",
-    "hz" => "10",
-    "slowlog-log-slower-than" => "10000",
-    "slowlog-max-len" => "128",
+  # Read-only parameters whose values are derived from Application env
+  # or other runtime sources at init time. CONFIG SET on these returns an error.
+  @read_only_params MapSet.new([
+    "maxmemory",
+    "maxclients",
+    "tcp-port",
+    "data-dir",
+    "raft-enabled",
+    "tls-port",
+    "tls-cert-file",
+    "tls-key-file",
+    "tls-ca-cert-file",
+    "require-tls"
+  ])
+
+  # Read-write parameters with validators. Each key maps to a validator
+  # function that returns :ok or {:error, reason}.
+  @read_write_params MapSet.new([
+    "maxmemory-policy",
+    "notify-keyspace-events",
+    "slowlog-log-slower-than",
+    "slowlog-max-len",
+    "hz"
+  ])
+
+  # Valid eviction policy names (string form used by Redis CONFIG SET)
+  @valid_eviction_policies MapSet.new([
+    "volatile-lru",
+    "allkeys-lru",
+    "volatile-ttl",
+    "noeviction"
+  ])
+
+  # Legacy read-write parameters that are stored but do not have special
+  # validation or side-effects beyond updating the config map.
+  @legacy_rw_defaults %{
     "timeout" => "0",
     "tcp-keepalive" => "300",
     "databases" => "1",
@@ -46,12 +99,20 @@ defmodule Ferricstore.Config do
     "port" => "6379",
     "save" => "",
     "appendonly" => "no",
-    "notify-keyspace-events" => "",
     "loglevel" => "notice",
     "requirepass" => "",
-    "maxclients" => "10000",
     "sandbox_mode" => "disabled"
   }
+
+  # -------------------------------------------------------------------
+  # Types
+  # -------------------------------------------------------------------
+
+  @typedoc "Configuration parameter name."
+  @type param_name :: binary()
+
+  @typedoc "Configuration parameter value (always a string)."
+  @type param_value :: binary()
 
   # -------------------------------------------------------------------
   # Public API
@@ -59,10 +120,13 @@ defmodule Ferricstore.Config do
 
   @doc """
   Starts the Config GenServer and registers it under `Ferricstore.Config`.
+
+  Reads initial values for read-only parameters from Application env and
+  MemoryGuard configuration.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(_opts) do
-    GenServer.start_link(__MODULE__, @defaults, name: __MODULE__)
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
   end
 
   @doc """
@@ -72,7 +136,7 @@ defmodule Ferricstore.Config do
 
   ## Parameters
 
-    - `pattern` — glob pattern string (e.g. `"*"`, `"max*"`, `"hz"`)
+    - `pattern` -- glob pattern string (e.g. `"*"`, `"max*"`, `"hz"`)
 
   ## Returns
 
@@ -86,7 +150,7 @@ defmodule Ferricstore.Config do
       iex> Ferricstore.Config.get("nonexistent")
       []
   """
-  @spec get(binary()) :: [{binary(), binary()}]
+  @spec get(binary()) :: [{param_name(), param_value()}]
   def get(pattern) do
     GenServer.call(__MODULE__, {:get, pattern})
   end
@@ -94,16 +158,33 @@ defmodule Ferricstore.Config do
   @doc """
   Sets a runtime configuration parameter.
 
+  Validates the parameter name (must be a known read-write parameter) and
+  the value (type/range checks). Applies side-effects for parameters that
+  affect runtime behaviour (e.g. updating Application env for slowlog
+  thresholds, updating MemoryGuard eviction policy).
+
+  Emits a `[:ferricstore, :config, :changed]` telemetry event on success.
+
   ## Parameters
 
-    - `key` — parameter name (e.g. `"hz"`, `"maxmemory"`)
-    - `value` — new value as a string
+    - `key` -- parameter name (e.g. `"hz"`, `"maxmemory-policy"`)
+    - `value` -- new value as a string
 
   ## Returns
 
-  `:ok`
+    - `:ok` on success
+    - `{:error, reason}` when the parameter is read-only, unknown, or the
+      value fails validation
+
+  ## Examples
+
+      iex> Ferricstore.Config.set("maxmemory-policy", "allkeys-lru")
+      :ok
+
+      iex> Ferricstore.Config.set("maxmemory", "999")
+      {:error, "ERR Unsupported CONFIG parameter: maxmemory (read-only)"}
   """
-  @spec set(binary(), binary()) :: :ok
+  @spec set(binary(), binary()) :: :ok | {:error, binary()}
   def set(key, value) do
     GenServer.call(__MODULE__, {:set, key, value})
   end
@@ -120,21 +201,28 @@ defmodule Ferricstore.Config do
 
   @doc """
   Returns the full map of default configuration values.
+
+  Note: this returns the static defaults only, not the live state which
+  includes values derived from Application env.
   """
-  @spec defaults() :: %{binary() => binary()}
-  def defaults, do: @defaults
+  @spec defaults() :: %{param_name() => param_value()}
+  def defaults do
+    build_initial_state()
+  end
 
   # -------------------------------------------------------------------
   # GenServer callbacks
   # -------------------------------------------------------------------
 
   @impl true
-  def init(defaults) do
-    {:ok, defaults}
+  def init(:ok) do
+    {:ok, build_initial_state()}
   end
 
   @impl true
   def handle_call({:get, pattern}, _from, state) do
+    # Refresh read-only params from live sources before returning
+    state = refresh_read_only(state)
     regex = glob_to_regex(pattern)
 
     result =
@@ -146,15 +234,240 @@ defmodule Ferricstore.Config do
   end
 
   def handle_call({:set, key, value}, _from, state) do
-    {:reply, :ok, Map.put(state, key, value)}
+    cond do
+      MapSet.member?(@read_only_params, key) ->
+        {:reply, {:error, "ERR Unsupported CONFIG parameter: #{key} (read-only)"}, state}
+
+      MapSet.member?(@read_write_params, key) ->
+        case validate_param(key, value) do
+          :ok ->
+            old_value = Map.get(state, key, "")
+            new_state = Map.put(state, key, value)
+            apply_side_effect(key, value)
+            emit_config_changed(key, value, old_value)
+            {:reply, :ok, new_state}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
+        end
+
+      Map.has_key?(@legacy_rw_defaults, key) ->
+        old_value = Map.get(state, key, "")
+        new_state = Map.put(state, key, value)
+        emit_config_changed(key, value, old_value)
+        {:reply, :ok, new_state}
+
+      true ->
+        {:reply, {:error, "ERR Unsupported CONFIG parameter: #{key}"}, state}
+    end
   end
 
   def handle_call({:get_value, key}, _from, state) do
+    state = refresh_read_only(state)
     {:reply, Map.get(state, key), state}
   end
 
   # -------------------------------------------------------------------
-  # Private — glob-to-regex conversion
+  # Private -- initial state
+  # -------------------------------------------------------------------
+
+  defp build_initial_state do
+    read_only = %{
+      "maxmemory" => read_maxmemory(),
+      "maxclients" => read_maxclients(),
+      "tcp-port" => read_tcp_port(),
+      "data-dir" => read_data_dir(),
+      "raft-enabled" => read_raft_enabled(),
+      "tls-port" => read_tls_port(),
+      "tls-cert-file" => read_tls_cert_file(),
+      "tls-key-file" => read_tls_key_file(),
+      "tls-ca-cert-file" => read_tls_ca_cert_file(),
+      "require-tls" => read_require_tls()
+    }
+
+    read_write = %{
+      "maxmemory-policy" => read_eviction_policy(),
+      "notify-keyspace-events" => "",
+      "slowlog-log-slower-than" => read_slowlog_threshold(),
+      "slowlog-max-len" => read_slowlog_max_len(),
+      "hz" => "10"
+    }
+
+    Map.merge(@legacy_rw_defaults, Map.merge(read_only, read_write))
+  end
+
+  defp refresh_read_only(state) do
+    state
+    |> Map.put("maxmemory", read_maxmemory())
+    |> Map.put("maxclients", read_maxclients())
+    |> Map.put("tcp-port", read_tcp_port())
+    |> Map.put("data-dir", read_data_dir())
+    |> Map.put("raft-enabled", read_raft_enabled())
+    |> Map.put("tls-port", read_tls_port())
+    |> Map.put("tls-cert-file", read_tls_cert_file())
+    |> Map.put("tls-key-file", read_tls_key_file())
+    |> Map.put("tls-ca-cert-file", read_tls_ca_cert_file())
+    |> Map.put("require-tls", read_require_tls())
+  end
+
+  # -------------------------------------------------------------------
+  # Private -- read current values from Application env / runtime
+  # -------------------------------------------------------------------
+
+  defp read_maxmemory do
+    Application.get_env(:ferricstore, :max_memory_bytes, 0)
+    |> to_string()
+  end
+
+  defp read_maxclients do
+    Application.get_env(:ferricstore, :maxclients, 10_000)
+    |> to_string()
+  end
+
+  defp read_tcp_port do
+    Application.get_env(:ferricstore, :port, 6379)
+    |> to_string()
+  end
+
+  defp read_data_dir do
+    Application.get_env(:ferricstore, :data_dir, "data")
+  end
+
+  defp read_raft_enabled do
+    case Application.get_env(:ferricstore, :raft_enabled, true) do
+      true -> "true"
+      false -> "false"
+    end
+  end
+
+  defp read_eviction_policy do
+    case Application.get_env(:ferricstore, :eviction_policy, :volatile_lru) do
+      :volatile_lru -> "volatile-lru"
+      :allkeys_lru -> "allkeys-lru"
+      :volatile_ttl -> "volatile-ttl"
+      :noeviction -> "noeviction"
+      other -> to_string(other)
+    end
+  end
+
+  defp read_slowlog_threshold do
+    Application.get_env(:ferricstore, :slowlog_log_slower_than_us, 10_000)
+    |> to_string()
+  end
+
+  defp read_slowlog_max_len do
+    Application.get_env(:ferricstore, :slowlog_max_len, 128)
+    |> to_string()
+  end
+
+  defp read_tls_port do
+    Application.get_env(:ferricstore, :tls_port, 0)
+    |> to_string()
+  end
+
+  defp read_tls_cert_file do
+    Application.get_env(:ferricstore, :tls_cert_file, "")
+  end
+
+  defp read_tls_key_file do
+    Application.get_env(:ferricstore, :tls_key_file, "")
+  end
+
+  defp read_tls_ca_cert_file do
+    Application.get_env(:ferricstore, :tls_ca_cert_file, "")
+  end
+
+  defp read_require_tls do
+    case Application.get_env(:ferricstore, :require_tls, false) do
+      true -> "true"
+      false -> "false"
+    end
+  end
+
+  # -------------------------------------------------------------------
+  # Private -- validation
+  # -------------------------------------------------------------------
+
+  defp validate_param("maxmemory-policy", value) do
+    if MapSet.member?(@valid_eviction_policies, value) do
+      :ok
+    else
+      {:error,
+       "ERR Invalid argument '#{value}' for CONFIG SET 'maxmemory-policy'. " <>
+         "Valid values: volatile-lru, allkeys-lru, volatile-ttl, noeviction"}
+    end
+  end
+
+  defp validate_param("notify-keyspace-events", _value) do
+    # Any string of flags is accepted (K, E, g, $, x, A, or empty to disable).
+    :ok
+  end
+
+  defp validate_param("slowlog-log-slower-than", value) do
+    case Integer.parse(value) do
+      {n, ""} when n >= -1 -> :ok
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'slowlog-log-slower-than'"}
+    end
+  end
+
+  defp validate_param("slowlog-max-len", value) do
+    case Integer.parse(value) do
+      {n, ""} when n >= 0 -> :ok
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'slowlog-max-len'"}
+    end
+  end
+
+  defp validate_param("hz", value) do
+    case Integer.parse(value) do
+      {n, ""} when n >= 1 and n <= 500 -> :ok
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'hz'"}
+    end
+  end
+
+  defp validate_param(_key, _value), do: :ok
+
+  # -------------------------------------------------------------------
+  # Private -- side effects (apply config change at runtime)
+  # -------------------------------------------------------------------
+
+  defp apply_side_effect("maxmemory-policy", value) do
+    atom =
+      case value do
+        "volatile-lru" -> :volatile_lru
+        "allkeys-lru" -> :allkeys_lru
+        "volatile-ttl" -> :volatile_ttl
+        "noeviction" -> :noeviction
+      end
+
+    Application.put_env(:ferricstore, :eviction_policy, atom)
+  end
+
+  defp apply_side_effect("slowlog-log-slower-than", value) do
+    {n, ""} = Integer.parse(value)
+    Application.put_env(:ferricstore, :slowlog_log_slower_than_us, n)
+  end
+
+  defp apply_side_effect("slowlog-max-len", value) do
+    {n, ""} = Integer.parse(value)
+    Application.put_env(:ferricstore, :slowlog_max_len, n)
+  end
+
+  defp apply_side_effect(_key, _value), do: :ok
+
+  # -------------------------------------------------------------------
+  # Private -- telemetry
+  # -------------------------------------------------------------------
+
+  defp emit_config_changed(key, value, old_value) do
+    :telemetry.execute(
+      [:ferricstore, :config, :changed],
+      %{},
+      %{param: key, value: value, old_value: old_value}
+    )
+  end
+
+  # -------------------------------------------------------------------
+  # Private -- glob-to-regex conversion
   # -------------------------------------------------------------------
 
   defp glob_to_regex(pattern) do

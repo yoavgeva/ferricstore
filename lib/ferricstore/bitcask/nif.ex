@@ -1,7 +1,7 @@
 defmodule Ferricstore.Bitcask.NIF do
   @moduledoc false
 
-  use Rustler, otp_app: :ferricstore, crate: "ferricstore_bitcask"
+  use Rustler, otp_app: :ferricstore, crate: "ferricstore_bitcask", skip_compilation?: true
 
   # Each function body is the fallback if the NIF fails to load.
   def new(_path), do: :erlang.nif_error(:nif_not_loaded)
@@ -27,4 +27,32 @@ defmodule Ferricstore.Bitcask.NIF do
 
   @doc "Purge all expired keys, writing tombstones. Returns {:ok, count}."
   def purge_expired(_store), do: :erlang.nif_error(:nif_not_loaded)
+
+  # Extended NIF functions
+
+  @doc "Return all live key-value pairs. Returns {:ok, [{key, value}, ...]}."
+  def get_all(_store), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Lookup multiple keys at once. Returns {:ok, [value | nil, ...]}."
+  def get_batch(_store, _keys), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Range scan: returns sorted key-value pairs in [min, max], up to count."
+  def get_range(_store, _min_key, _max_key, _max_count), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Atomic read-modify-write. Returns {:ok, new_value} or {:error, reason}."
+  def read_modify_write(_store, _key, _operation), do: :erlang.nif_error(:nif_not_loaded)
+
+  # Merge NIF functions
+
+  @doc "Returns shard stats: {:ok, {total, live, dead, file_count, key_count, frag_ratio}}."
+  def shard_stats(_store), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Returns file sizes: {:ok, [{file_id, size}, ...]}."
+  def file_sizes(_store), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Run compaction on file_ids. Returns {:ok, {written, dropped, reclaimed}}."
+  def run_compaction(_store, _file_ids), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc "Returns available disk space in bytes: {:ok, bytes}."
+  def available_disk_space(_store), do: :erlang.nif_error(:nif_not_loaded)
 end

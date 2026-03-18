@@ -20,6 +20,9 @@ defmodule Ferricstore.Commands.ServerInfoTest do
       assert result =~ "# Memory"
       assert result =~ "# Keyspace"
       assert result =~ "# Stats"
+      assert result =~ "# Persistence"
+      assert result =~ "# Replication"
+      assert result =~ "# CPU"
     end
 
     test "INFO all returns all sections explicitly" do
@@ -32,6 +35,9 @@ defmodule Ferricstore.Commands.ServerInfoTest do
       assert result =~ "# Memory"
       assert result =~ "# Keyspace"
       assert result =~ "# Stats"
+      assert result =~ "# Persistence"
+      assert result =~ "# Replication"
+      assert result =~ "# CPU"
     end
   end
 
@@ -186,6 +192,247 @@ defmodule Ferricstore.Commands.ServerInfoTest do
     test "INFO Memory (mixed case) returns memory section" do
       result = Server.handle("INFO", ["Memory"], MockStore.make())
       assert result =~ "# Memory"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO persistence
+  # ---------------------------------------------------------------------------
+
+  describe "INFO persistence" do
+    test "returns persistence section header" do
+      result = Server.handle("INFO", ["persistence"], MockStore.make())
+
+      assert is_binary(result)
+      assert result =~ "# Persistence"
+    end
+
+    test "contains loading field set to 0" do
+      result = Server.handle("INFO", ["persistence"], MockStore.make())
+      assert result =~ "loading:0"
+    end
+
+    test "contains rdb_changes_since_last_save stub" do
+      result = Server.handle("INFO", ["persistence"], MockStore.make())
+      assert result =~ "rdb_changes_since_last_save:0"
+    end
+
+    test "contains rdb_last_save_time stub" do
+      result = Server.handle("INFO", ["persistence"], MockStore.make())
+      assert result =~ "rdb_last_save_time:0"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO replication
+  # ---------------------------------------------------------------------------
+
+  describe "INFO replication" do
+    test "returns replication section header" do
+      result = Server.handle("INFO", ["replication"], MockStore.make())
+
+      assert is_binary(result)
+      assert result =~ "# Replication"
+    end
+
+    test "shows role:master" do
+      result = Server.handle("INFO", ["replication"], MockStore.make())
+      assert result =~ "role:master"
+    end
+
+    test "shows connected_slaves:0" do
+      result = Server.handle("INFO", ["replication"], MockStore.make())
+      assert result =~ "connected_slaves:0"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO memory — new fields
+  # ---------------------------------------------------------------------------
+
+  describe "INFO memory (extended fields)" do
+    test "has keydir_used_bytes" do
+      result = Server.handle("INFO", ["memory"], MockStore.make())
+      assert result =~ "keydir_used_bytes:"
+    end
+
+    test "has hot_cache_used_bytes" do
+      result = Server.handle("INFO", ["memory"], MockStore.make())
+      assert result =~ "hot_cache_used_bytes:"
+    end
+
+    test "has used_memory_rss" do
+      result = Server.handle("INFO", ["memory"], MockStore.make())
+      assert result =~ "used_memory_rss:"
+    end
+
+    test "has used_memory_peak" do
+      result = Server.handle("INFO", ["memory"], MockStore.make())
+      assert result =~ "used_memory_peak:"
+    end
+
+    test "has mem_fragmentation_ratio" do
+      result = Server.handle("INFO", ["memory"], MockStore.make())
+      assert result =~ "mem_fragmentation_ratio:"
+    end
+
+    test "has beam_process_memory" do
+      result = Server.handle("INFO", ["memory"], MockStore.make())
+      assert result =~ "beam_process_memory:"
+    end
+
+    test "keydir_used_bytes is a non-negative integer" do
+      result = Server.handle("INFO", ["memory"], MockStore.make())
+      [_header | fields] = String.split(result, "\r\n", trim: true)
+
+      line = Enum.find(fields, &String.starts_with?(&1, "keydir_used_bytes:"))
+      val_str = String.trim_leading(line, "keydir_used_bytes:")
+      {val, ""} = Integer.parse(val_str)
+      assert val >= 0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO clients — new fields
+  # ---------------------------------------------------------------------------
+
+  describe "INFO clients (extended fields)" do
+    test "has blocked_clients" do
+      result = Server.handle("INFO", ["clients"], MockStore.make())
+      assert result =~ "blocked_clients:"
+    end
+
+    test "has tracking_clients" do
+      result = Server.handle("INFO", ["clients"], MockStore.make())
+      assert result =~ "tracking_clients:"
+    end
+
+    test "has maxclients" do
+      result = Server.handle("INFO", ["clients"], MockStore.make())
+      assert result =~ "maxclients:10000"
+    end
+
+    test "blocked_clients is a non-negative integer" do
+      result = Server.handle("INFO", ["clients"], MockStore.make())
+      [_header | fields] = String.split(result, "\r\n", trim: true)
+
+      line = Enum.find(fields, &String.starts_with?(&1, "blocked_clients:"))
+      val_str = String.trim_leading(line, "blocked_clients:")
+      {val, ""} = Integer.parse(val_str)
+      assert val >= 0
+    end
+
+    test "tracking_clients is a non-negative integer" do
+      result = Server.handle("INFO", ["clients"], MockStore.make())
+      [_header | fields] = String.split(result, "\r\n", trim: true)
+
+      line = Enum.find(fields, &String.starts_with?(&1, "tracking_clients:"))
+      val_str = String.trim_leading(line, "tracking_clients:")
+      {val, ""} = Integer.parse(val_str)
+      assert val >= 0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO server — new fields
+  # ---------------------------------------------------------------------------
+
+  describe "INFO server (extended fields)" do
+    test "has redis_mode" do
+      result = Server.handle("INFO", ["server"], MockStore.make())
+      assert result =~ "redis_mode:standalone"
+    end
+
+    test "has os field" do
+      result = Server.handle("INFO", ["server"], MockStore.make())
+      assert result =~ "os:"
+    end
+
+    test "has arch_bits" do
+      result = Server.handle("INFO", ["server"], MockStore.make())
+      assert result =~ "arch_bits:64"
+    end
+
+    test "has uptime_in_days" do
+      result = Server.handle("INFO", ["server"], MockStore.make())
+      assert result =~ "uptime_in_days:"
+    end
+
+    test "has hz and configured_hz" do
+      result = Server.handle("INFO", ["server"], MockStore.make())
+      assert result =~ "hz:10"
+      assert result =~ "configured_hz:10"
+    end
+
+    test "has ferricstore_git_sha" do
+      result = Server.handle("INFO", ["server"], MockStore.make())
+      assert result =~ "ferricstore_git_sha:dev"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO everything — alias for all
+  # ---------------------------------------------------------------------------
+
+  describe "INFO everything" do
+    test "returns all sections same as all" do
+      store = MockStore.make()
+      result = Server.handle("INFO", ["everything"], store)
+
+      assert is_binary(result)
+      assert result =~ "# Server"
+      assert result =~ "# Clients"
+      assert result =~ "# Memory"
+      assert result =~ "# Keyspace"
+      assert result =~ "# Stats"
+      assert result =~ "# Persistence"
+      assert result =~ "# Replication"
+      assert result =~ "# CPU"
+    end
+
+    test "everything matches all output" do
+      store = MockStore.make()
+      result_all = Server.handle("INFO", ["all"], store)
+      result_everything = Server.handle("INFO", ["everything"], store)
+
+      # Both should contain the same section headers (actual values may differ
+      # due to timing, but the structure must match).
+      all_headers =
+        result_all
+        |> String.split("\r\n")
+        |> Enum.filter(&String.starts_with?(&1, "# "))
+        |> Enum.sort()
+
+      everything_headers =
+        result_everything
+        |> String.split("\r\n")
+        |> Enum.filter(&String.starts_with?(&1, "# "))
+        |> Enum.sort()
+
+      assert all_headers == everything_headers
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO cpu
+  # ---------------------------------------------------------------------------
+
+  describe "INFO cpu" do
+    test "returns cpu section header" do
+      result = Server.handle("INFO", ["cpu"], MockStore.make())
+
+      assert is_binary(result)
+      assert result =~ "# CPU"
+    end
+
+    test "contains used_cpu_sys field" do
+      result = Server.handle("INFO", ["cpu"], MockStore.make())
+      assert result =~ "used_cpu_sys:"
+    end
+
+    test "contains used_cpu_user field" do
+      result = Server.handle("INFO", ["cpu"], MockStore.make())
+      assert result =~ "used_cpu_user:"
     end
   end
 

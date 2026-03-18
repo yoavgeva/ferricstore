@@ -803,4 +803,133 @@ defmodule Ferricstore.Commands.ListTest do
       assert 1 == Strings.handle("EXISTS", ["mylist"], store)
     end
   end
+
+  # ===========================================================================
+  # WRONGTYPE enforcement edge cases
+  # ===========================================================================
+
+  describe "WRONGTYPE enforcement for all list commands" do
+    test "LRANGE on string key returns WRONGTYPE" do
+      store = MockStore.make()
+      Strings.handle("SET", ["mykey", "val"], store)
+      assert {:error, msg} = List.handle("LRANGE", ["mykey", "0", "-1"], store)
+      assert msg =~ "WRONGTYPE"
+    end
+
+    test "LINDEX on string key returns WRONGTYPE" do
+      store = MockStore.make()
+      Strings.handle("SET", ["mykey", "val"], store)
+      assert {:error, msg} = List.handle("LINDEX", ["mykey", "0"], store)
+      assert msg =~ "WRONGTYPE"
+    end
+  end
+
+  # ===========================================================================
+  # LPOP/RPOP negative count edge cases
+  # ===========================================================================
+
+  describe "LPOP/RPOP negative count" do
+    test "LPOP with negative count returns error" do
+      store = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a", "b"], store)
+      assert {:error, msg} = List.handle("LPOP", ["mylist", "-1"], store)
+      assert msg =~ "not an integer or out of range"
+    end
+
+    test "RPOP with negative count returns error" do
+      store = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a", "b"], store)
+      assert {:error, msg} = List.handle("RPOP", ["mylist", "-1"], store)
+      assert msg =~ "not an integer or out of range"
+    end
+
+    test "LPOP with three args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = List.handle("LPOP", ["mylist", "1", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "RPOP with three args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = List.handle("RPOP", ["mylist", "1", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
+
+  # ===========================================================================
+  # LMOVE direction edge cases
+  # ===========================================================================
+
+  describe "LMOVE direction edge cases" do
+    test "LMOVE with case-insensitive directions" do
+      store = MockStore.make()
+      List.handle("RPUSH", ["src", "a", "b"], store)
+      assert "a" == List.handle("LMOVE", ["src", "dst", "left", "right"], store)
+      assert ["a"] == List.handle("LRANGE", ["dst", "0", "-1"], store)
+    end
+  end
+
+  # ===========================================================================
+  # LPOS edge cases
+  # ===========================================================================
+
+  describe "LPOS option edge cases" do
+    test "LPOS with unrecognized option returns error" do
+      store = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a"], store)
+      assert {:error, msg} = List.handle("LPOS", ["mylist", "a", "BOGUS"], store)
+      assert msg =~ "not recognized"
+    end
+
+    test "LPOS with non-integer RANK returns error" do
+      store = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a"], store)
+      assert {:error, msg} = List.handle("LPOS", ["mylist", "a", "RANK", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "LPOS with non-integer COUNT returns error" do
+      store = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a"], store)
+      assert {:error, msg} = List.handle("LPOS", ["mylist", "a", "COUNT", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "LPOS with negative COUNT returns error" do
+      store = MockStore.make()
+      List.handle("RPUSH", ["mylist", "a"], store)
+      assert {:error, msg} = List.handle("LPOS", ["mylist", "a", "COUNT", "-1"], store)
+      assert msg =~ "not an integer"
+    end
+  end
+
+  # ===========================================================================
+  # LSET / LREM / LTRIM non-integer index edge cases
+  # ===========================================================================
+
+  describe "integer parsing edge cases" do
+    test "LSET with non-integer index returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = List.handle("LSET", ["mylist", "abc", "val"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "LREM with non-integer count returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = List.handle("LREM", ["mylist", "abc", "a"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "LTRIM with non-integer start returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = List.handle("LTRIM", ["mylist", "abc", "5"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "LTRIM with non-integer stop returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = List.handle("LTRIM", ["mylist", "0", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+  end
 end

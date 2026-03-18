@@ -8,7 +8,6 @@ defmodule Ferricstore.Bitcask.NIFExtendedTest do
   """
 
   use ExUnit.Case, async: false
-  @moduletag :pending_nif_rebuild
 
   alias Ferricstore.Bitcask.NIF
 

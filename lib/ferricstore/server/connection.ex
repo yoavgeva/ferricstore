@@ -39,6 +39,8 @@ defmodule Ferricstore.Server.Connection do
 
   @behaviour :ranch_protocol
 
+  alias Ferricstore.AuditLog
+  alias Ferricstore.ClientTracking
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.KeyspaceNotifications
   alias Ferricstore.Resp.{Encoder, Parser}
@@ -62,7 +64,8 @@ defmodule Ferricstore.Server.Connection do
     authenticated: false,
     sandbox_namespace: nil,
     pubsub_channels: MapSet.new(),
-    pubsub_patterns: MapSet.new()
+    pubsub_patterns: MapSet.new(),
+    tracking: nil
   ]
 
   @type multi_state :: :none | :queuing
@@ -77,7 +80,8 @@ defmodule Ferricstore.Server.Connection do
           peer: {:inet.ip_address(), :inet.port_number()} | nil,
           multi_state: multi_state(),
           multi_queue: [{binary(), [binary()]}],
-          watched_keys: %{binary() => non_neg_integer()}
+          watched_keys: %{binary() => non_neg_integer()},
+          tracking: ClientTracking.tracking_config() | nil
         }
 
   # Commands that are NOT queued during MULTI — they are always executed immediately.
@@ -111,7 +115,7 @@ defmodule Ferricstore.Server.Connection do
     Stats.incr_connections()
 
     peer =
-      case :inet.peername(socket) do
+      case transport.peername(socket) do
         {:ok, addr} -> addr
         _ -> nil
       end
@@ -122,8 +126,14 @@ defmodule Ferricstore.Server.Connection do
       client_id: generate_client_id(),
       client_name: nil,
       created_at: System.monotonic_time(:millisecond),
-      peer: peer
+      peer: peer,
+      tracking: ClientTracking.new_config()
     }
+
+    AuditLog.log(:connection_open, %{
+      client_id: state.client_id,
+      client_ip: format_peer(peer)
+    })
 
     loop(state)
   end
@@ -138,14 +148,14 @@ defmodule Ferricstore.Server.Connection do
     else
       case transport.recv(socket, 0, :infinity) do
         {:ok, <<>>} ->
-          cleanup_pubsub(state)
+          cleanup_connection(state)
           transport.close(socket)
 
         {:ok, data} ->
           handle_data(state, data)
 
         {:error, _reason} ->
-          cleanup_pubsub(state)
+          cleanup_connection(state)
           transport.close(socket)
       end
     end
@@ -163,14 +173,16 @@ defmodule Ferricstore.Server.Connection do
 
       {:error, _reason} ->
         send_response(socket, transport, Encoder.encode({:error, "ERR protocol error"}))
+        cleanup_connection(state)
         transport.close(socket)
     end
   end
 
   defp handle_parsed(%__MODULE__{socket: socket, transport: transport} = state, commands) do
     case dispatch_commands(commands, state) do
-      {:quit, responses, _state} ->
+      {:quit, responses, quit_state} ->
         send_responses(socket, transport, responses)
+        cleanup_connection(quit_state)
         transport.close(socket)
 
       {:continue, responses, new_state} ->
@@ -248,14 +260,17 @@ defmodule Ferricstore.Server.Connection do
       client_id: state.client_id,
       client_name: state.client_name,
       created_at: state.created_at,
-      peer: state.peer
+      peer: state.peer,
+      conn_pid: self(),
+      tracking: state.tracking
     }
 
     {result, updated_conn_state} = Dispatcher.dispatch_client(args, conn_state, store)
 
     updated_state = %{
       state
-      | client_name: updated_conn_state[:client_name] || state.client_name
+      | client_name: updated_conn_state[:client_name] || state.client_name,
+        tracking: updated_conn_state[:tracking] || state.tracking
     }
 
     {:continue, Encoder.encode(result), updated_state}
@@ -266,21 +281,28 @@ defmodule Ferricstore.Server.Connection do
   # AUTH command
   defp dispatch("AUTH", args, state) do
     requirepass = Ferricstore.Config.get_value("requirepass")
+    client_ip = format_peer(state.peer)
 
     case {requirepass, args} do
       {"", _} ->
         {:continue, Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}), state}
 
       {pass, [pass]} ->
+        AuditLog.log(:auth_success, %{username: "default", client_ip: client_ip})
         {:continue, Encoder.encode(:ok), %{state | authenticated: true}}
 
       {pass, [_user, pass]} ->
+        username = List.first(args) || "default"
+        AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
         {:continue, Encoder.encode(:ok), %{state | authenticated: true}}
 
       {_, [_wrong]} ->
+        AuditLog.log(:auth_failure, %{username: "default", client_ip: client_ip})
         {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
 
       {_, [_user, _wrong]} ->
+        username = List.first(args) || "default"
+        AuditLog.log(:auth_failure, %{username: username, client_ip: client_ip})
         {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
 
       {_, []} ->
@@ -314,11 +336,29 @@ defmodule Ferricstore.Server.Connection do
   end
 
   defp dispatch_acl("LOG", ["RESET" | _], state) do
+    AuditLog.reset()
     {:continue, Encoder.encode(:ok), state}
   end
 
+  defp dispatch_acl("LOG", ["COUNT", count_str | _], state) do
+    case Integer.parse(count_str) do
+      {count, ""} when count >= 0 ->
+        entries = AuditLog.get(count) |> AuditLog.format_entries()
+        {:continue, Encoder.encode(entries), state}
+
+      _ ->
+        {:continue, Encoder.encode({:error, "ERR value is not an integer or out of range"}), state}
+    end
+  end
+
+  defp dispatch_acl("LOG", [], state) do
+    entries = AuditLog.get() |> AuditLog.format_entries()
+    {:continue, Encoder.encode(entries), state}
+  end
+
   defp dispatch_acl("LOG", _, state) do
-    {:continue, Encoder.encode([]), state}
+    entries = AuditLog.get() |> AuditLog.format_entries()
+    {:continue, Encoder.encode(entries), state}
   end
 
   defp dispatch_acl("GETUSER", ["default" | _], state) do
@@ -335,8 +375,9 @@ defmodule Ferricstore.Server.Connection do
   end
 
   defp dispatch("RESET", _args, state) do
-    # RESET clears transaction state and sandbox namespace.
-    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}, sandbox_namespace: nil}
+    # RESET clears transaction state, sandbox namespace, and tracking state.
+    ClientTracking.cleanup(self())
+    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}, sandbox_namespace: nil, tracking: ClientTracking.new_config()}
     {:continue, Encoder.encode({:simple, "RESET"}), new_state}
   end
 
@@ -551,24 +592,216 @@ defmodule Ferricstore.Server.Connection do
   end
 
   # -- Blocking list commands (handled in connection layer) ------------------
+  # These commands try an immediate pop; if the list is empty and timeout > 0,
+  # the connection process registers as a waiter and enters a `receive` block.
+  # Passive socket mode ensures no TCP data arrives during the block.
 
   defp dispatch("BLPOP", args, state) do
-    result = Ferricstore.Commands.Blocking.handle("BLPOP", args, build_store(state.sandbox_namespace))
-    {:continue, Encoder.encode(result), state}
+    dispatch_blocking(:blpop, args, state)
   end
 
   defp dispatch("BRPOP", args, state) do
-    result = Ferricstore.Commands.Blocking.handle("BRPOP", args, build_store(state.sandbox_namespace))
-    {:continue, Encoder.encode(result), state}
+    dispatch_blocking(:brpop, args, state)
   end
 
   defp dispatch("BLMOVE", args, state) do
-    result = Ferricstore.Commands.Blocking.handle("BLMOVE", args, build_store(state.sandbox_namespace))
-    {:continue, Encoder.encode(result), state}
+    dispatch_blmove(args, state)
   end
 
   defp dispatch("BLMPOP", args, state) do
-    result = Ferricstore.Commands.Blocking.handle("BLMPOP", args, build_store(state.sandbox_namespace))
+    dispatch_blmpop(args, state)
+  end
+
+  defp dispatch_blocking(pop_dir, args, state) do
+    alias Ferricstore.Commands.{Blocking, List}
+    alias Ferricstore.Waiters
+
+    case Blocking.parse_blpop_args(args) do
+      {:ok, keys, timeout_ms} ->
+        store = build_store(state.sandbox_namespace)
+        pop_cmd = if pop_dir == :blpop, do: "LPOP", else: "RPOP"
+
+        # Try immediate pop on each key (first non-empty wins)
+        immediate =
+          Enum.find_value(keys, fn key ->
+            case List.handle(pop_cmd, [key], store) do
+              nil -> nil
+              {:error, _} -> nil
+              value -> [key, value]
+            end
+          end)
+
+        if immediate do
+          {:continue, Encoder.encode(immediate), state}
+        else
+          if timeout_ms == 0 do
+            # timeout=0 means block forever (Redis semantics), but we cap at 5 min
+            do_block_wait(keys, 300_000, pop_cmd, store, state)
+          else
+            do_block_wait(keys, timeout_ms, pop_cmd, store, state)
+          end
+        end
+
+      {:error, _} = err ->
+        {:continue, Encoder.encode(err), state}
+    end
+  end
+
+  defp do_block_wait(keys, timeout_ms, pop_cmd, store, state) do
+    alias Ferricstore.Commands.List
+    alias Ferricstore.Waiters
+
+    # Register as waiter for all watched keys
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
+
+    # Enter receive block — passive socket means no TCP data arrives
+    result =
+      receive do
+        {:waiter_notify, notified_key} ->
+          # A push happened on one of our keys — try to pop
+          case List.handle(pop_cmd, [notified_key], store) do
+            nil -> nil
+            {:error, _} -> nil
+            value -> [notified_key, value]
+          end
+      after
+        timeout_ms ->
+          nil
+      end
+
+    # Cleanup: unregister from all keys
+    Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
+
+    {:continue, Encoder.encode(result), state}
+  end
+
+  # -- BLMOVE blocking dispatch ------------------------------------------------
+
+  defp dispatch_blmove(args, state) do
+    alias Ferricstore.Commands.{Blocking, List}
+
+    case Blocking.parse_blmove_args(args) do
+      {:ok, source, destination, from_dir, to_dir, timeout_ms} ->
+        store = build_store(state.sandbox_namespace)
+
+        # Try immediate LMOVE
+        case List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store) do
+          nil ->
+            # Source is empty — block if timeout allows
+            if timeout_ms == 0 do
+              do_blmove_wait([source], 300_000, source, destination, from_dir, to_dir, store, state)
+            else
+              do_blmove_wait([source], timeout_ms, source, destination, from_dir, to_dir, store, state)
+            end
+
+          {:error, _} = err ->
+            {:continue, Encoder.encode(err), state}
+
+          value ->
+            {:continue, Encoder.encode(value), state}
+        end
+
+      {:error, _} = err ->
+        {:continue, Encoder.encode(err), state}
+    end
+  end
+
+  defp do_blmove_wait(keys, timeout_ms, source, destination, from_dir, to_dir, store, state) do
+    alias Ferricstore.Commands.List
+    alias Ferricstore.Waiters
+
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
+
+    result =
+      receive do
+        {:waiter_notify, _notified_key} ->
+          # Source got a push — try LMOVE
+          case List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store) do
+            nil -> nil
+            {:error, _} -> nil
+            value -> value
+          end
+      after
+        timeout_ms ->
+          nil
+      end
+
+    Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
+
+    {:continue, Encoder.encode(result), state}
+  end
+
+  # -- BLMPOP blocking dispatch ------------------------------------------------
+
+  defp dispatch_blmpop(args, state) do
+    alias Ferricstore.Commands.{Blocking, List}
+
+    case Blocking.parse_blmpop_args(args) do
+      {:ok, keys, direction, count, timeout_ms} ->
+        store = build_store(state.sandbox_namespace)
+        pop_cmd = if direction == :left, do: "LPOP", else: "RPOP"
+
+        # Build the count arg list: omit count arg when count == 1
+        # to get a single-element return (not wrapped in a list)
+        pop_args_fn = fn key ->
+          if count == 1, do: [key], else: [key, to_string(count)]
+        end
+
+        # Try immediate pop on each key (first non-empty wins)
+        immediate =
+          Enum.find_value(keys, fn key ->
+            case List.handle(pop_cmd, pop_args_fn.(key), store) do
+              nil -> nil
+              {:error, _} -> nil
+              value -> {key, value}
+            end
+          end)
+
+        case immediate do
+          {key, value} ->
+            # Wrap single value into a list for consistent BLMPOP format
+            elements = if is_list(value), do: value, else: [value]
+            {:continue, Encoder.encode([key, elements]), state}
+
+          nil ->
+            if timeout_ms == 0 do
+              do_blmpop_wait(keys, 300_000, pop_cmd, pop_args_fn, store, state)
+            else
+              do_blmpop_wait(keys, timeout_ms, pop_cmd, pop_args_fn, store, state)
+            end
+        end
+
+      {:error, _} = err ->
+        {:continue, Encoder.encode(err), state}
+    end
+  end
+
+  defp do_blmpop_wait(keys, timeout_ms, pop_cmd, pop_args_fn, store, state) do
+    alias Ferricstore.Commands.List
+    alias Ferricstore.Waiters
+
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
+
+    result =
+      receive do
+        {:waiter_notify, notified_key} ->
+          case List.handle(pop_cmd, pop_args_fn.(notified_key), store) do
+            nil -> nil
+            {:error, _} -> nil
+            value ->
+              elements = if is_list(value), do: value, else: [value]
+              [notified_key, elements]
+          end
+      after
+        timeout_ms ->
+          nil
+      end
+
+    Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
+
     {:continue, Encoder.encode(result), state}
   end
 
@@ -725,7 +958,35 @@ defmodule Ferricstore.Server.Connection do
       unlock: &Router.unlock/2,
       extend: &Router.extend/3,
       ratelimit_add: &Router.ratelimit_add/4,
-      list_op: &Router.list_op/2
+      list_op: &Router.list_op/2,
+      compound_get: fn redis_key, compound_key ->
+        shard = Router.shard_name(Router.shard_for(redis_key))
+        GenServer.call(shard, {:get, compound_key})
+      end,
+      compound_get_meta: fn redis_key, compound_key ->
+        shard = Router.shard_name(Router.shard_for(redis_key))
+        GenServer.call(shard, {:get_meta, compound_key})
+      end,
+      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+        shard = Router.shard_name(Router.shard_for(redis_key))
+        GenServer.call(shard, {:put, compound_key, value, expire_at_ms})
+      end,
+      compound_delete: fn redis_key, compound_key ->
+        shard = Router.shard_name(Router.shard_for(redis_key))
+        GenServer.call(shard, {:delete, compound_key})
+      end,
+      compound_scan: fn redis_key, prefix ->
+        shard = Router.shard_name(Router.shard_for(redis_key))
+        GenServer.call(shard, {:scan_prefix, prefix})
+      end,
+      compound_count: fn redis_key, prefix ->
+        shard = Router.shard_name(Router.shard_for(redis_key))
+        GenServer.call(shard, {:count_prefix, prefix})
+      end,
+      compound_delete_prefix: fn redis_key, prefix ->
+        shard = Router.shard_name(Router.shard_for(redis_key))
+        GenServer.call(shard, {:delete_prefix, prefix})
+      end
     }
   end
 
@@ -768,17 +1029,33 @@ defmodule Ferricstore.Server.Connection do
 
   defp pubsub_loop(%__MODULE__{socket: socket, transport: transport} = state) do
     receive do
+      # TCP active-mode data
       {:tcp, ^socket, data} ->
         transport.setopts(socket, active: :once)
         handle_data(state, data)
 
+      # TLS active-mode data
+      {:ssl, ^socket, data} ->
+        transport.setopts(socket, active: :once)
+        handle_data(state, data)
+
+      # TCP close / error
       {:tcp_closed, ^socket} ->
-        cleanup_pubsub(state)
+        cleanup_connection(state)
 
       {:tcp_error, ^socket, _reason} ->
-        cleanup_pubsub(state)
+        cleanup_connection(state)
         transport.close(socket)
 
+      # TLS close / error
+      {:ssl_closed, ^socket} ->
+        cleanup_connection(state)
+
+      {:ssl_error, ^socket, _reason} ->
+        cleanup_connection(state)
+        transport.close(socket)
+
+      # Pub/Sub messages from the internal PubSub engine
       {:pubsub_message, channel, message} ->
         push = {:push, ["message", channel, message]}
         transport.send(socket, Encoder.encode(push))
@@ -854,8 +1131,26 @@ defmodule Ferricstore.Server.Connection do
     KeyspaceNotifications.notify(key, event)
   end
 
+  defp cleanup_connection(state) do
+    duration_ms = System.monotonic_time(:millisecond) - state.created_at
+
+    AuditLog.log(:connection_close, %{
+      client_id: state.client_id,
+      client_ip: format_peer(state.peer),
+      duration_ms: duration_ms
+    })
+
+    cleanup_pubsub(state)
+    ClientTracking.cleanup(self())
+    Stats.decr_connections()
+  end
+
   defp cleanup_pubsub(state) do
     Enum.each(state.pubsub_channels, &PS.unsubscribe(&1, self()))
     Enum.each(state.pubsub_patterns, &PS.punsubscribe(&1, self()))
   end
+
+  # Formats a peer tuple `{ip, port}` into a human-readable string.
+  defp format_peer(nil), do: "unknown"
+  defp format_peer({ip, port}), do: "#{:inet.ntoa(ip)}:#{port}"
 end

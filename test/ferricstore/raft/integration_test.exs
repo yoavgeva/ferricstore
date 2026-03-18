@@ -10,10 +10,12 @@ defmodule Ferricstore.Raft.IntegrationTest do
   - Persisted to Bitcask (cold path)
   - Durable across shard restarts
   - Consistent across all layers
+
+  The ra lifecycle is managed entirely within this test module so the tests
+  run regardless of the global `:raft_enabled` config setting.
   """
 
   use ExUnit.Case, async: false
-  @moduletag :pending_raft_startup
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.Cluster
@@ -22,6 +24,33 @@ defmodule Ferricstore.Raft.IntegrationTest do
 
   setup_all do
     ShardHelpers.wait_shards_alive()
+
+    # Start the ra system (idempotent if already started)
+    data_dir = Application.fetch_env!(:ferricstore, :data_dir)
+    Cluster.start_system(data_dir)
+
+    # Clean up any stale ra server registrations from previous runs, then
+    # start fresh ra servers for each shard using the live shard state.
+    for i <- 0..3 do
+      server_id = Cluster.shard_server_id(i)
+      _ = :ra.stop_server(Cluster.system_name(), server_id)
+      _ = :ra.force_delete_server(Cluster.system_name(), server_id)
+
+      shard_name = Router.shard_name(i)
+      pid = Process.whereis(shard_name)
+      state = :sys.get_state(pid)
+      Cluster.start_shard_server(i, state.store, state.ets)
+    end
+
+    on_exit(fn ->
+      # Stop ra servers
+      for i <- 0..3 do
+        Cluster.stop_shard_server(i)
+      end
+
+      ShardHelpers.wait_shards_alive()
+    end)
+
     :ok
   end
 
@@ -227,8 +256,14 @@ defmodule Ferricstore.Raft.IntegrationTest do
       pid = shard_pid_for(k)
       :ok = GenServer.call(pid, :flush)
 
+      shard_index = Router.shard_for(k)
+      shard_name = Router.shard_name(shard_index)
+
+      # Stop the ra server for this shard before killing it so it doesn't
+      # hold stale references after the shard is restarted by the supervisor.
+      Cluster.stop_shard_server(shard_index)
+
       # Kill the shard (simulates crash)
-      shard_name = Router.shard_name(Router.shard_for(k))
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 2_000
@@ -252,19 +287,22 @@ defmodule Ferricstore.Raft.IntegrationTest do
 
       # Data should be recoverable from Bitcask
       assert "survives_crash" == Router.get(k)
+
+      # Re-start the ra server for the restarted shard so other tests can use it.
+      # Force-delete first to clear stale ra directory registration.
+      server_id = Cluster.shard_server_id(shard_index)
+      _ = :ra.force_delete_server(Cluster.system_name(), server_id)
+      new_state = :sys.get_state(new_pid)
+      Cluster.start_shard_server(shard_index, new_state.store, new_state.ets)
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Application-level Raft configuration
+  # Ra system lifecycle
   # ---------------------------------------------------------------------------
 
-  describe "application-level Raft configuration" do
-    test "raft_enabled is true in test environment" do
-      assert Application.get_env(:ferricstore, :raft_enabled, true) == true
-    end
-
-    test "ra system is started" do
+  describe "ra system lifecycle" do
+    test "ra system is started and accessible" do
       config = :ra_system.fetch(Cluster.system_name())
       assert config != :undefined
       assert config.name == Cluster.system_name()

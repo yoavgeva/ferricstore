@@ -338,4 +338,167 @@ defmodule Ferricstore.Commands.StringsTest do
       assert 1 == Strings.handle("DEL", ["k", "k"], store)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Edge cases: arity validation, empty key, key too large, error messages
+  # ---------------------------------------------------------------------------
+
+  describe "arity and key validation edge cases" do
+    test "GET with empty key returns ERR empty key" do
+      store = MockStore.make()
+      assert {:error, "ERR empty key"} = Strings.handle("GET", [""], store)
+    end
+
+    test "GET with key exceeding 65535 bytes returns ERR key too large" do
+      store = MockStore.make()
+      huge_key = String.duplicate("x", 65_536)
+      assert {:error, "ERR key too large"} = Strings.handle("GET", [huge_key], store)
+    end
+
+    test "SET with empty key returns ERR empty key" do
+      store = MockStore.make()
+      assert {:error, "ERR empty key"} = Strings.handle("SET", ["", "val"], store)
+    end
+
+    test "SET with key exceeding 65535 bytes returns ERR key too large" do
+      store = MockStore.make()
+      huge_key = String.duplicate("x", 65_536)
+      assert {:error, "ERR key too large"} = Strings.handle("SET", [huge_key, "val"], store)
+    end
+
+    test "MSET with empty key in one of the pairs returns error" do
+      store = MockStore.make()
+      assert {:error, _} = Strings.handle("MSET", ["good", "v1", "", "v2"], store)
+    end
+
+    test "MSET with single arg (odd count) returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("MSET", ["only_key"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Edge cases: INCRBYFLOAT with inf/nan/edge floats
+  # ---------------------------------------------------------------------------
+
+  describe "INCRBYFLOAT edge cases" do
+    test "INCRBYFLOAT with 'inf' string returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("INCRBYFLOAT", ["k", "inf"], store)
+      assert msg =~ "not a valid float"
+    end
+
+    test "INCRBYFLOAT with '-inf' string returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("INCRBYFLOAT", ["k", "-inf"], store)
+      assert msg =~ "not a valid float"
+    end
+
+    test "INCRBYFLOAT with 'nan' string returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("INCRBYFLOAT", ["k", "nan"], store)
+      assert msg =~ "not a valid float"
+    end
+
+    test "INCRBYFLOAT with extra args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("INCRBYFLOAT", ["k", "1.0", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Edge cases: INCRBY / DECRBY with extra args
+  # ---------------------------------------------------------------------------
+
+  describe "INCRBY/DECRBY arity edge cases" do
+    test "INCRBY with extra args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("INCRBY", ["k", "5", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "DECRBY with extra args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("DECRBY", ["k", "5", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "INCRBY with float delta string returns ERR not an integer" do
+      store = MockStore.make(%{"k" => {"10", 0}})
+      assert {:error, msg} = Strings.handle("INCRBY", ["k", "1.5"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "DECRBY with float delta string returns ERR not an integer" do
+      store = MockStore.make(%{"k" => {"10", 0}})
+      assert {:error, msg} = Strings.handle("DECRBY", ["k", "1.5"], store)
+      assert msg =~ "not an integer"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Edge cases: SETEX/PSETEX with extra or missing args
+  # ---------------------------------------------------------------------------
+
+  describe "SETEX/PSETEX arity edge cases" do
+    test "SETEX with extra args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("SETEX", ["k", "10", "val", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+
+    test "PSETEX with extra args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("PSETEX", ["k", "5000", "val", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Edge cases: MSETNX with extra args
+  # ---------------------------------------------------------------------------
+
+  describe "MSETNX edge cases" do
+    test "MSETNX with single arg (odd) returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("MSETNX", ["k"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Edge cases: GETRANGE boundary conditions
+  # ---------------------------------------------------------------------------
+
+  describe "GETRANGE boundary edge cases" do
+    test "GETRANGE with start=0 end=0 on single-byte string returns the byte" do
+      store = MockStore.make(%{"k" => {"X", 0}})
+      assert "X" = Strings.handle("GETRANGE", ["k", "0", "0"], store)
+    end
+
+    test "GETRANGE on empty string value returns empty string" do
+      store = MockStore.make(%{"k" => {"", 0}})
+      assert "" = Strings.handle("GETRANGE", ["k", "0", "-1"], store)
+    end
+
+    test "GETRANGE with extra args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("GETRANGE", ["k", "0", "5", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Edge cases: SETRANGE boundary conditions
+  # ---------------------------------------------------------------------------
+
+  describe "SETRANGE boundary edge cases" do
+    test "SETRANGE with extra args returns arity error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("SETRANGE", ["k", "0", "val", "extra"], store)
+      assert msg =~ "wrong number of arguments"
+    end
+  end
 end

@@ -7,7 +7,7 @@
 # :large_alloc — tests that allocate ≥ 512 MiB in-process to verify the size
 #   guard fires. Excluded by default to avoid OOM on CI runners with < 2 GB RAM.
 #   Run locally with `mix test --include large_alloc`.
-ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :pending_nif_rebuild, :pending_memory_guard_timing, :pending_cross_type_wrongtype, :pending_raft_startup])
+ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc])
 
 # Clean up the test data directory after the suite finishes.
 # Each run uses a unique dir (ferricstore_test_<pid>) so parallel runs don't

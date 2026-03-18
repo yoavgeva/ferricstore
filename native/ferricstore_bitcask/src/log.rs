@@ -238,6 +238,30 @@ impl LogReader {
 // Encoding helpers
 // ---------------------------------------------------------------------------
 
+/// Validates key and value sizes before encoding. Returns Ok(()) or an error
+/// message if either exceeds the on-disk format limits (key: u16, value: u32).
+pub(crate) fn validate_kv_sizes(key: &[u8], value: &[u8]) -> std::result::Result<(), String> {
+    let max_key = usize::from(u16::MAX);
+    // Spec section 2G.4: max_value_size_bytes defaults to 512 MiB.
+    // The on-disk format supports u32 (4 GiB) but we enforce a tighter
+    // default to prevent accidental large-value writes that would
+    // degrade cache performance.
+    const MAX_VALUE_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
+    if key.len() > max_key {
+        return Err(format!(
+            "key too large: {} bytes (max {max_key})",
+            key.len()
+        ));
+    }
+    if value.len() > MAX_VALUE_SIZE {
+        return Err(format!(
+            "value too large: {} bytes (max {MAX_VALUE_SIZE})",
+            value.len()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_record(key: &[u8], value: &[u8], expire_at_ms: u64) -> Vec<u8> {
     let now_ms = now_ms();
     #[allow(clippy::cast_possible_truncation)]

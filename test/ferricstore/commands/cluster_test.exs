@@ -120,24 +120,42 @@ defmodule Ferricstore.Commands.ClusterTest do
   # ---------------------------------------------------------------------------
 
   describe "FERRICSTORE.HOTNESS" do
-    test "returns a list of key-value pairs" do
-      store = MockStore.make()
-      result = Dispatcher.dispatch("FERRICSTORE.HOTNESS", [], store)
-
-      assert is_list(result)
-      assert "total_keys" in result
-      assert "total_memory_bytes" in result
-      assert "hot_cache_entries" in result
-      assert "shard_count" in result
+    setup do
+      Ferricstore.Stats.reset_hotness()
+      :ok
     end
 
-    test "includes per-shard data" do
+    test "returns a list of key-value pairs with header fields" do
       store = MockStore.make()
       result = Dispatcher.dispatch("FERRICSTORE.HOTNESS", [], store)
 
       assert is_list(result)
-      assert "shard_0_keys" in result
-      assert "shard_0_memory_bytes" in result
+      assert "hot_reads" in result
+      assert "cold_reads" in result
+      assert "hot_read_pct" in result
+      assert "cold_reads_per_second" in result
+      assert "top_n" in result
+    end
+
+    test "includes per-prefix data after reads" do
+      Ferricstore.Stats.record_hot_read("user:1")
+      Ferricstore.Stats.record_cold_read("session:1")
+
+      store = MockStore.make()
+      result = Dispatcher.dispatch("FERRICSTORE.HOTNESS", [], store)
+
+      assert is_list(result)
+      assert "prefix" in result
+
+      prefix_indices =
+        result
+        |> Enum.with_index()
+        |> Enum.filter(fn {val, _} -> val == "prefix" end)
+        |> Enum.map(fn {_, idx} -> idx end)
+
+      prefix_names = Enum.map(prefix_indices, fn idx -> Enum.at(result, idx + 1) end)
+      assert "user" in prefix_names
+      assert "session" in prefix_names
     end
 
     test "accepts TOP argument" do
@@ -158,20 +176,23 @@ defmodule Ferricstore.Commands.ClusterTest do
 
       assert is_list(result)
       # Should still return data even with WINDOW specified
-      assert "total_keys" in result
+      assert "hot_reads" in result
     end
 
-    test "reflects stored data" do
-      Router.put("hotness_test_key", "value", 0)
+    test "reflects recorded reads in hot_reads count" do
+      Ferricstore.Stats.record_hot_read("hotness_test:key")
+      Ferricstore.Stats.record_cold_read("hotness_test:key2")
 
       store = MockStore.make()
       result = Dispatcher.dispatch("FERRICSTORE.HOTNESS", [], store)
 
-      idx = Enum.find_index(result, &(&1 == "total_keys"))
-      total = String.to_integer(Enum.at(result, idx + 1))
-      assert total >= 1
+      idx = Enum.find_index(result, &(&1 == "hot_reads"))
+      hot_val = String.to_integer(Enum.at(result, idx + 1))
+      assert hot_val >= 1
 
-      Router.delete("hotness_test_key")
+      cold_idx = Enum.find_index(result, &(&1 == "cold_reads"))
+      cold_val = String.to_integer(Enum.at(result, cold_idx + 1))
+      assert cold_val >= 1
     end
   end
 end

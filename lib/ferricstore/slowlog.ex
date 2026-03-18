@@ -141,6 +141,7 @@ defmodule Ferricstore.SlowLog do
     # Evict oldest entries if we exceed max_len.
     state = %{state | next_id: id + 1}
     evict_if_needed(state)
+    check_near_full(state)
     {:noreply, state}
   end
 
@@ -149,6 +150,9 @@ defmodule Ferricstore.SlowLog do
     :ets.delete_all_objects(@table)
     {:reply, :ok, %{state | next_id: 0}}
   end
+
+  @impl true
+  def handle_call(:ping, _from, state), do: {:reply, :pong, state}
 
   # -------------------------------------------------------------------------
   # Private
@@ -167,6 +171,24 @@ defmodule Ferricstore.SlowLog do
       |> Enum.sort_by(fn {id, _, _, _} -> id end)
       |> Enum.take(to_remove)
       |> Enum.each(fn {id, _, _, _} -> :ets.delete(@table, id) end)
+    end
+  end
+
+  @near_full_threshold 0.90
+
+  # Emits a telemetry event when the slowlog ring buffer is at or above 90%
+  # of its capacity. Only fires after eviction has run, so `size` reflects
+  # the post-eviction count.
+  defp check_near_full(_state) do
+    max = max_len()
+    size = :ets.info(@table, :size)
+
+    if max > 0 and size / max >= @near_full_threshold do
+      :telemetry.execute(
+        [:ferricstore, :slow_log, :near_full],
+        %{size: size, max: max, ratio: size / max},
+        %{}
+      )
     end
   end
 end

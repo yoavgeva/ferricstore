@@ -41,6 +41,38 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   @doc """
+  Resets shared mutable state that can leak between tests: waiters registry,
+  client tracking tables, and slow log. Call in `setup` for any test that
+  cares about a clean global environment.
+  """
+  @spec flush_global_state() :: :ok
+  def flush_global_state do
+    # Waiters
+    if :ets.whereis(:ferricstore_waiters) != :undefined do
+      :ets.delete_all_objects(:ferricstore_waiters)
+    end
+
+    # Client tracking
+    for table <- [:ferricstore_tracking, :ferricstore_tracking_connections] do
+      if :ets.whereis(table) != :undefined do
+        :ets.delete_all_objects(table)
+      end
+    end
+
+    # Slow log
+    if :ets.whereis(:ferricstore_slowlog) != :undefined do
+      :ets.delete_all_objects(:ferricstore_slowlog)
+    end
+
+    # Audit log
+    if :ets.whereis(:ferricstore_audit_log) != :undefined do
+      :ets.delete_all_objects(:ferricstore_audit_log)
+    end
+
+    :ok
+  end
+
+  @doc """
   Waits until all 4 application-supervised shards (0–3) are alive.
 
   Polls every 20ms up to `timeout_ms`. Raises if any shard hasn't restarted

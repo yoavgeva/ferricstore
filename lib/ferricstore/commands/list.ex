@@ -15,7 +15,8 @@ defmodule Ferricstore.Commands.List do
   plain string or hash returns WRONGTYPE.
   """
 
-  alias Ferricstore.Store.ListOps
+  alias Ferricstore.Store.{ListOps, TypeRegistry}
+  alias Ferricstore.Waiters
 
   @doc """
   Handles a list command.
@@ -38,9 +39,11 @@ defmodule Ferricstore.Commands.List do
   # ---------------------------------------------------------------------------
 
   def handle("LPUSH", [key | elements], store) when elements != [] do
-    with :ok <- check_not_wrong_type(key, store) do
+    with :ok <- TypeRegistry.check_or_set(key, :list, store) do
       {get_fn, put_fn, delete_fn} = store_fns(key, store)
-      ListOps.execute(get_fn, put_fn, delete_fn, {:lpush, elements})
+      result = ListOps.execute(get_fn, put_fn, delete_fn, {:lpush, elements})
+      if is_integer(result) and result > 0, do: Waiters.notify_push(key)
+      result
     end
   end
 
@@ -53,9 +56,11 @@ defmodule Ferricstore.Commands.List do
   # ---------------------------------------------------------------------------
 
   def handle("RPUSH", [key | elements], store) when elements != [] do
-    with :ok <- check_not_wrong_type(key, store) do
+    with :ok <- TypeRegistry.check_or_set(key, :list, store) do
       {get_fn, put_fn, delete_fn} = store_fns(key, store)
-      ListOps.execute(get_fn, put_fn, delete_fn, {:rpush, elements})
+      result = ListOps.execute(get_fn, put_fn, delete_fn, {:rpush, elements})
+      if is_integer(result) and result > 0, do: Waiters.notify_push(key)
+      result
     end
   end
 
@@ -68,30 +73,34 @@ defmodule Ferricstore.Commands.List do
   # ---------------------------------------------------------------------------
 
   def handle("LPOP", [key], store) do
-    {get_fn, put_fn, delete_fn} = store_fns(key, store)
-    ListOps.execute(get_fn, put_fn, delete_fn, {:lpop, 1})
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      {get_fn, put_fn, delete_fn} = store_fns(key, store)
+      ListOps.execute(get_fn, put_fn, delete_fn, {:lpop, 1})
+    end
   end
 
   def handle("LPOP", [key, count_str], store) do
-    case Integer.parse(count_str) do
-      {count, ""} when count >= 0 ->
-        {get_fn, put_fn, delete_fn} = store_fns(key, store)
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      case Integer.parse(count_str) do
+        {count, ""} when count >= 0 ->
+          {get_fn, put_fn, delete_fn} = store_fns(key, store)
 
-        if count == 0 do
-          # Redis returns empty list for LPOP key 0 when key exists,
-          # nil when key doesn't exist.
-          case ListOps.decode_stored(get_fn.()) do
-            {:ok, _elements} -> []
-            :not_found -> nil
-            {:error, :wrongtype} ->
-              {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+          if count == 0 do
+            # Redis returns empty list for LPOP key 0 when key exists,
+            # nil when key doesn't exist.
+            case ListOps.decode_stored(get_fn.()) do
+              {:ok, _elements} -> []
+              :not_found -> nil
+              {:error, :wrongtype} ->
+                {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+            end
+          else
+            ListOps.execute(get_fn, put_fn, delete_fn, {:lpop, count})
           end
-        else
-          ListOps.execute(get_fn, put_fn, delete_fn, {:lpop, count})
-        end
 
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+        _ ->
+          {:error, "ERR value is not an integer or out of range"}
+      end
     end
   end
 
@@ -104,28 +113,32 @@ defmodule Ferricstore.Commands.List do
   # ---------------------------------------------------------------------------
 
   def handle("RPOP", [key], store) do
-    {get_fn, put_fn, delete_fn} = store_fns(key, store)
-    ListOps.execute(get_fn, put_fn, delete_fn, {:rpop, 1})
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      {get_fn, put_fn, delete_fn} = store_fns(key, store)
+      ListOps.execute(get_fn, put_fn, delete_fn, {:rpop, 1})
+    end
   end
 
   def handle("RPOP", [key, count_str], store) do
-    case Integer.parse(count_str) do
-      {count, ""} when count >= 0 ->
-        {get_fn, put_fn, delete_fn} = store_fns(key, store)
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      case Integer.parse(count_str) do
+        {count, ""} when count >= 0 ->
+          {get_fn, put_fn, delete_fn} = store_fns(key, store)
 
-        if count == 0 do
-          case ListOps.decode_stored(get_fn.()) do
-            {:ok, _elements} -> []
-            :not_found -> nil
-            {:error, :wrongtype} ->
-              {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+          if count == 0 do
+            case ListOps.decode_stored(get_fn.()) do
+              {:ok, _elements} -> []
+              :not_found -> nil
+              {:error, :wrongtype} ->
+                {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+            end
+          else
+            ListOps.execute(get_fn, put_fn, delete_fn, {:rpop, count})
           end
-        else
-          ListOps.execute(get_fn, put_fn, delete_fn, {:rpop, count})
-        end
 
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+        _ ->
+          {:error, "ERR value is not an integer or out of range"}
+      end
     end
   end
 
@@ -138,7 +151,7 @@ defmodule Ferricstore.Commands.List do
   # ---------------------------------------------------------------------------
 
   def handle("LRANGE", [key, start_str, stop_str], store) do
-    with :ok <- check_not_wrong_type(key, store) do
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
       case {Integer.parse(start_str), Integer.parse(stop_str)} do
         {{start, ""}, {stop, ""}} ->
           {get_fn, put_fn, delete_fn} = store_fns(key, store)
@@ -159,8 +172,10 @@ defmodule Ferricstore.Commands.List do
   # ---------------------------------------------------------------------------
 
   def handle("LLEN", [key], store) do
-    {get_fn, put_fn, delete_fn} = store_fns(key, store)
-    ListOps.execute(get_fn, put_fn, delete_fn, :llen)
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      {get_fn, put_fn, delete_fn} = store_fns(key, store)
+      ListOps.execute(get_fn, put_fn, delete_fn, :llen)
+    end
   end
 
   def handle("LLEN", _args, _store) do
@@ -172,13 +187,15 @@ defmodule Ferricstore.Commands.List do
   # ---------------------------------------------------------------------------
 
   def handle("LINDEX", [key, index_str], store) do
-    case Integer.parse(index_str) do
-      {index, ""} ->
-        {get_fn, put_fn, delete_fn} = store_fns(key, store)
-        ListOps.execute(get_fn, put_fn, delete_fn, {:lindex, index})
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      case Integer.parse(index_str) do
+        {index, ""} ->
+          {get_fn, put_fn, delete_fn} = store_fns(key, store)
+          ListOps.execute(get_fn, put_fn, delete_fn, {:lindex, index})
 
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+        _ ->
+          {:error, "ERR value is not an integer or out of range"}
+      end
     end
   end
 
@@ -338,19 +355,6 @@ defmodule Ferricstore.Commands.List do
     {get_fn, put_fn, delete_fn}
   end
 
-  # Check if the key has a non-list type in the compound key type registry
-  defp check_not_wrong_type(key, store) do
-    if Map.has_key?(store, :compound_get) do
-      type_key = "T:#{key}"
-      case store.compound_get.(key, type_key) do
-        nil -> :ok
-        "list" -> :ok
-        _ -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-      end
-    else
-      :ok
-    end
-  end
 
   # Parses LPOS optional arguments: RANK, COUNT, MAXLEN.
   defp parse_lpos_opts(opts), do: parse_lpos_opts(opts, 1, nil, 0)

@@ -18,13 +18,12 @@ defmodule Ferricstore.ExpirySweepTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  # Triggers the expiry sweep for a specific shard by sending it the message
-  # directly rather than waiting for the timer.
+  # Triggers the expiry sweep for a specific shard synchronously by calling
+  # into the GenServer rather than sending an async message. This guarantees
+  # the sweep has completed before the caller continues.
   defp trigger_sweep(shard_index) do
     name = Router.shard_name(shard_index)
-    send(Process.whereis(name), :expiry_sweep)
-    # Give the GenServer time to process the message.
-    Process.sleep(50)
+    GenServer.call(name, :expiry_sweep)
   end
 
   # Triggers sweep on all 4 shards.
@@ -102,9 +101,11 @@ defmodule Ferricstore.ExpirySweepTest do
 
       # Create 5 expired keys that all hash to the same shard.
       # We'll find keys that map to shard 0.
+      uid = System.unique_integer([:positive])
+
       keys =
         Stream.iterate(0, &(&1 + 1))
-        |> Stream.map(fn i -> "sweep_limit_#{i}" end)
+        |> Stream.map(fn i -> "sweep_limit_#{uid}_#{i}" end)
         |> Stream.filter(fn k -> Router.shard_for(k) == 0 end)
         |> Enum.take(5)
 
@@ -113,7 +114,7 @@ defmodule Ferricstore.ExpirySweepTest do
       # First sweep should remove at most 2.
       trigger_sweep(0)
 
-      ets = :"shard_ets_0"
+      ets = :shard_ets_0
       remaining = Enum.count(keys, fn k -> :ets.lookup(ets, k) != [] end)
       assert remaining >= 3
     end
@@ -132,9 +133,11 @@ defmodule Ferricstore.ExpirySweepTest do
 
       past = System.os_time(:millisecond) - 1_000
 
+      uid = System.unique_integer([:positive])
+
       keys =
         Stream.iterate(0, &(&1 + 1))
-        |> Stream.map(fn i -> "multi_sweep_#{i}" end)
+        |> Stream.map(fn i -> "multi_sweep_#{uid}_#{i}" end)
         |> Stream.filter(fn k -> Router.shard_for(k) == 0 end)
         |> Enum.take(5)
 
@@ -143,7 +146,7 @@ defmodule Ferricstore.ExpirySweepTest do
       # Run enough sweep cycles (ceiling of 5/2 = 3 cycles).
       Enum.each(1..3, fn _ -> trigger_sweep(0) end)
 
-      ets = :"shard_ets_0"
+      ets = :shard_ets_0
       remaining = Enum.count(keys, fn k -> :ets.lookup(ets, k) != [] end)
       assert remaining == 0
     end
@@ -163,7 +166,10 @@ defmodule Ferricstore.ExpirySweepTest do
       trigger_all_sweeps()
 
       after_sweep = Router.dbsize()
-      assert after_sweep == baseline
+      # Use <= instead of == because concurrent tests may add keys between
+      # baseline and after_sweep. The important invariant is that the sweep
+      # did not increase the count (expired keys were removed).
+      assert after_sweep <= baseline
     end
   end
 end

@@ -1104,6 +1104,73 @@ defmodule Ferricstore.Commands.StreamTest do
       assert entries == []
     end
 
+    test "XRANGE with invalid start ID returns error" do
+      store = MockStore.make()
+      key = ustream()
+      Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+      assert {:error, msg} = Stream.handle("XRANGE", [key, "abc", "+"], store)
+      assert msg =~ "Invalid stream ID"
+    end
+
+    test "XRANGE with invalid end ID returns error" do
+      store = MockStore.make()
+      key = ustream()
+      Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+      assert {:error, msg} = Stream.handle("XRANGE", [key, "-", "abc"], store)
+      assert msg =~ "Invalid stream ID"
+    end
+
+    test "XRANGE with invalid COUNT value returns error" do
+      store = MockStore.make()
+      key = ustream()
+      Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+      assert {:error, msg} = Stream.handle("XRANGE", [key, "-", "+", "COUNT", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "XRANGE with invalid COUNT option returns error" do
+      store = MockStore.make()
+      key = ustream()
+      Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+      assert {:error, msg} = Stream.handle("XRANGE", [key, "-", "+", "BOGUS"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "XREVRANGE wrong number of arguments" do
+      store = MockStore.make()
+      assert {:error, _} = Stream.handle("XREVRANGE", ["key", "+"], store)
+      assert {:error, _} = Stream.handle("XREVRANGE", ["key"], store)
+      assert {:error, _} = Stream.handle("XREVRANGE", [], store)
+    end
+
+    test "XREAD without STREAMS keyword returns error" do
+      store = MockStore.make()
+      result = Stream.handle("XREAD", ["key1", "0"], store)
+      assert {:error, msg} = result
+      assert msg =~ "syntax error"
+    end
+
+    test "XREAD with no args returns error" do
+      store = MockStore.make()
+      result = Stream.handle("XREAD", [], store)
+      assert {:error, msg} = result
+      assert msg =~ "syntax error"
+    end
+
+    test "XREADGROUP without GROUP prefix returns error" do
+      store = MockStore.make()
+      result = Stream.handle("XREADGROUP", ["STREAMS", "key", ">"], store)
+      assert {:error, msg} = result
+      assert msg =~ "syntax error"
+    end
+
+    test "XTRIM with invalid strategy returns error" do
+      store = MockStore.make()
+      key = ustream()
+      Stream.handle("XADD", [key, "1-0", "f", "v"], store)
+      assert {:error, _} = Stream.handle("XTRIM", [key, "BOGUS", "5"], store)
+    end
+
     test "XADD sequence number wraps correctly within same millisecond" do
       store = MockStore.make()
       key = ustream()

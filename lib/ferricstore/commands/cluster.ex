@@ -82,32 +82,41 @@ defmodule Ferricstore.Commands.Cluster do
     {:error, "ERR wrong number of arguments for 'cluster.stats' command"}
   end
 
+  # FERRICSTORE.HOTNESS — returns per-prefix hot/cold read statistics.
+  # Accepts optional TOP n and WINDOW seconds arguments.
+  # Response is a flat list of key-value string pairs:
+  #   ["hot_reads", "1200", "cold_reads", "45", ..., "prefix", "user", ...]
   def handle("FERRICSTORE.HOTNESS", args, _store) do
-    top_n = parse_top_n(args, @shard_count)
-    shard_data = collect_shard_info()
+    alias Ferricstore.Stats
 
-    total_keys = Enum.reduce(shard_data, 0, fn {_, info}, acc -> acc + info.keys end)
-    total_memory = Enum.reduce(shard_data, 0, fn {_, info}, acc -> acc + info.memory_bytes end)
+    {top_n, _window} = parse_hotness_args(args)
+    entries = Stats.hotness_top(top_n)
 
-    result = [
-      "total_keys", Integer.to_string(total_keys),
-      "total_memory_bytes", Integer.to_string(total_memory),
-      "hot_cache_entries", Integer.to_string(total_keys),
-      "shard_count", Integer.to_string(@shard_count),
+    header = [
+      "hot_reads", Integer.to_string(Stats.total_hot_reads()),
+      "cold_reads", Integer.to_string(Stats.total_cold_reads()),
+      "hot_read_pct", format_pct(Stats.hot_read_pct()),
+      "cold_reads_per_second", format_pct(Stats.cold_reads_per_second()),
       "top_n", Integer.to_string(top_n)
     ]
 
-    shard_entries =
-      shard_data
-      |> Enum.take(top_n)
-      |> Enum.flat_map(fn {index, info} ->
+    prefix_entries =
+      Enum.flat_map(entries, fn {prefix, hot, cold, cold_pct} ->
         [
-          "shard_#{index}_keys", Integer.to_string(info.keys),
-          "shard_#{index}_memory_bytes", Integer.to_string(info.memory_bytes)
+          "prefix", prefix,
+          "hot", Integer.to_string(hot),
+          "cold", Integer.to_string(cold),
+          "cold_pct", format_pct(cold_pct)
         ]
       end)
 
-    result ++ shard_entries
+    header ++ prefix_entries
+  end
+
+  defp parse_hotness_args(args) do
+    top_n = parse_top_n(args, 10)
+    window = parse_window(args, 0)
+    {top_n, window}
   end
 
   defp parse_top_n([], default), do: default
@@ -118,6 +127,19 @@ defmodule Ferricstore.Commands.Cluster do
     end
   end
   defp parse_top_n([_ | rest], default), do: parse_top_n(rest, default)
+
+  defp parse_window([], default), do: default
+  defp parse_window(["WINDOW", s_str | _], default) do
+    case Integer.parse(s_str) do
+      {s, ""} when s > 0 -> s
+      _ -> default
+    end
+  end
+  defp parse_window([_ | rest], default), do: parse_window(rest, default)
+
+  defp format_pct(val) when is_float(val) do
+    :erlang.float_to_binary(val, [{:decimals, 2}])
+  end
 
   # -------------------------------------------------------------------
   # Private
