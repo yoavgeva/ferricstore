@@ -94,7 +94,7 @@ impl LogWriter {
     ///
     /// Returns a `LogError` if the record cannot be encoded or written to disk.
     pub fn write(&mut self, key: &[u8], value: &[u8], expire_at_ms: u64) -> Result<u64> {
-        let record = encode_record(key, value, expire_at_ms)?;
+        let record = encode_record(key, value, expire_at_ms);
         let start = self
             .backend
             .append(&record)
@@ -109,7 +109,7 @@ impl LogWriter {
     ///
     /// Returns a `LogError` if the tombstone record cannot be written to disk.
     pub fn write_tombstone(&mut self, key: &[u8]) -> Result<u64> {
-        let record = encode_tombstone(key)?;
+        let record = encode_tombstone(key);
         let start = self
             .backend
             .append(&record)
@@ -153,7 +153,7 @@ impl LogWriter {
         let encoded: Vec<Vec<u8>> = entries
             .iter()
             .map(|(key, value, expire_at_ms)| encode_record(key, value, *expire_at_ms))
-            .collect::<Result<Vec<Vec<u8>>>>()?;
+            .collect();
 
         let buf_refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
 
@@ -238,34 +238,11 @@ impl LogReader {
 // Encoding helpers
 // ---------------------------------------------------------------------------
 
-/// Maximum key size enforced at the record level (u16 field in the header).
-pub const MAX_KEY_SIZE: usize = u16::MAX as usize; // 65 535 bytes
-
-/// Maximum value size enforced at the record level (u32 field in the header).
-/// Capped well below `u32::MAX` to keep allocations sane.
-pub const MAX_VALUE_SIZE: usize = 512 * 1024 * 1024; // 512 MiB
-
-pub(crate) fn encode_record(key: &[u8], value: &[u8], expire_at_ms: u64) -> Result<Vec<u8>> {
-    if key.is_empty() {
-        return Err(LogError("key must not be empty".to_string()));
-    }
-    if key.len() > MAX_KEY_SIZE {
-        return Err(LogError(format!(
-            "key too large: {} bytes (max {} bytes)",
-            key.len(),
-            MAX_KEY_SIZE
-        )));
-    }
-    if value.len() > MAX_VALUE_SIZE {
-        return Err(LogError(format!(
-            "value too large: {} bytes (max {} bytes)",
-            value.len(),
-            MAX_VALUE_SIZE
-        )));
-    }
-
+pub(crate) fn encode_record(key: &[u8], value: &[u8], expire_at_ms: u64) -> Vec<u8> {
     let now_ms = now_ms();
+    #[allow(clippy::cast_possible_truncation)]
     let key_size = key.len() as u16;
+    #[allow(clippy::cast_possible_truncation)]
     let value_size = value.len() as u32;
 
     let mut body = Vec::with_capacity(HEADER_SIZE - 4 + key.len() + value.len());
@@ -280,10 +257,10 @@ pub(crate) fn encode_record(key: &[u8], value: &[u8], expire_at_ms: u64) -> Resu
     let mut record = Vec::with_capacity(4 + body.len());
     record.extend_from_slice(&crc.to_le_bytes());
     record.extend_from_slice(&body);
-    Ok(record)
+    record
 }
 
-fn encode_tombstone(key: &[u8]) -> Result<Vec<u8>> {
+fn encode_tombstone(key: &[u8]) -> Vec<u8> {
     encode_record(key, &[], 0)
 }
 
@@ -382,7 +359,7 @@ mod tests {
     fn encode_decode_live_record() {
         let key = b"hello";
         let value = b"world";
-        let encoded = encode_record(key, value, 0).unwrap();
+        let encoded = encode_record(key, value, 0);
 
         let mut cursor = io::Cursor::new(&encoded);
         let record = read_next_record(&mut cursor).unwrap().unwrap();
@@ -395,7 +372,7 @@ mod tests {
     #[test]
     fn encode_decode_tombstone() {
         let key = b"dead";
-        let encoded = encode_tombstone(key).unwrap();
+        let encoded = encode_tombstone(key);
 
         let mut cursor = io::Cursor::new(&encoded);
         let record = read_next_record(&mut cursor).unwrap().unwrap();
@@ -406,7 +383,7 @@ mod tests {
 
     #[test]
     fn encode_decode_with_expiry() {
-        let encoded = encode_record(b"ttl", b"val", 99_999).unwrap();
+        let encoded = encode_record(b"ttl", b"val", 99_999);
         let mut cursor = io::Cursor::new(&encoded);
         let record = read_next_record(&mut cursor).unwrap().unwrap();
         assert_eq!(record.expire_at_ms, 99_999);
@@ -414,7 +391,7 @@ mod tests {
 
     #[test]
     fn crc_mismatch_returns_error() {
-        let mut encoded = encode_record(b"k", b"v", 0).unwrap();
+        let mut encoded = encode_record(b"k", b"v", 0);
         // flip a byte in the value area
         let last = encoded.len() - 1;
         encoded[last] ^= 0xFF;
@@ -541,12 +518,12 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn zero_length_key_is_rejected() {
-        // Empty key is now rejected by the size guard.
-        assert!(
-            encode_record(b"", b"value", 0).is_err(),
-            "empty key must be rejected"
-        );
+    fn zero_length_key_roundtrips() {
+        let encoded = encode_record(b"", b"value", 0);
+        let mut cursor = io::Cursor::new(&encoded);
+        let r = read_next_record(&mut cursor).unwrap().unwrap();
+        assert!(r.key.is_empty());
+        assert_eq!(r.value, Some(b"value".to_vec()));
     }
 
     #[test]
@@ -554,7 +531,7 @@ mod tests {
         // value_size=0 is the tombstone sentinel — but encode_record with empty
         // value produces value_size=0, which IS decoded as a tombstone.
         // This is by design: callers must use write_tombstone for deletes.
-        let encoded = encode_record(b"k", b"", 0).unwrap();
+        let encoded = encode_record(b"k", b"", 0);
         let mut cursor = io::Cursor::new(&encoded);
         let r = read_next_record(&mut cursor).unwrap().unwrap();
         // Empty value decodes as tombstone (value_size==0 is the sentinel)
@@ -565,7 +542,7 @@ mod tests {
     fn large_value_roundtrips() {
         let key = b"bigkey";
         let value = vec![0xABu8; 64 * 1024]; // 64 KiB
-        let encoded = encode_record(key, &value, 0).unwrap();
+        let encoded = encode_record(key, &value, 0);
         let mut cursor = io::Cursor::new(&encoded);
         let r = read_next_record(&mut cursor).unwrap().unwrap();
         assert_eq!(r.key, key);
@@ -576,7 +553,7 @@ mod tests {
     fn non_utf8_key_and_value_roundtrip() {
         let key = vec![0xFF, 0x00, 0xFE];
         let value = vec![0x01, 0x02, 0x03];
-        let encoded = encode_record(&key, &value, 12345).unwrap();
+        let encoded = encode_record(&key, &value, 12345);
         let mut cursor = io::Cursor::new(&encoded);
         let r = read_next_record(&mut cursor).unwrap().unwrap();
         assert_eq!(r.key, key);
@@ -652,7 +629,7 @@ mod tests {
 
     #[test]
     fn crc_corruption_in_key_area_detected() {
-        let mut encoded = encode_record(b"hello", b"world", 0).unwrap();
+        let mut encoded = encode_record(b"hello", b"world", 0);
         // Flip a byte in the key area (after the 26-byte header)
         encoded[HEADER_SIZE] ^= 0xFF;
         let mut cursor = io::Cursor::new(encoded);
@@ -824,7 +801,7 @@ mod tests {
         let key = b"roundtrip_key";
         let value = b"roundtrip_value";
         let expire_at = 987_654_321u64;
-        let encoded = encode_record(key, value, expire_at).unwrap();
+        let encoded = encode_record(key, value, expire_at);
 
         let mut cursor = io::Cursor::new(&encoded);
         let record = read_next_record(&mut cursor).unwrap().unwrap();
@@ -842,7 +819,7 @@ mod tests {
     fn encode_tombstone_value_size_is_zero() {
         // encode_tombstone calls encode_record with empty value — value_size on disk is 0.
         let key = b"tomb_key";
-        let encoded = encode_tombstone(key).unwrap();
+        let encoded = encode_tombstone(key);
         // The value_size field lives at bytes 22..26 in the encoded record.
         let value_size = u32::from_le_bytes(encoded[22..26].try_into().unwrap());
         assert_eq!(value_size, 0, "tombstone must encode value_size=0");
@@ -850,7 +827,7 @@ mod tests {
 
     #[test]
     fn decode_truncated_record_returns_error() {
-        let encoded = encode_record(b"key_trunc", b"val_trunc", 0).unwrap();
+        let encoded = encode_record(b"key_trunc", b"val_trunc", 0);
         // Truncate by 1 byte from the end.
         let truncated = &encoded[..encoded.len() - 1];
         let mut cursor = io::Cursor::new(truncated);
@@ -874,7 +851,7 @@ mod tests {
 
     #[test]
     fn decode_record_with_flipped_crc_field_returns_error() {
-        let mut encoded = encode_record(b"flip_crc", b"val", 0).unwrap();
+        let mut encoded = encode_record(b"flip_crc", b"val", 0);
         // Flip byte 0 — this is the first byte of the stored CRC field.
         encoded[0] ^= 0xFF;
         let mut cursor = io::Cursor::new(&encoded);
