@@ -267,7 +267,8 @@ impl Store {
         let encoded: Vec<Vec<u8>> = entries
             .iter()
             .map(|(key, value, expire_at_ms)| encode_record(key, value, *expire_at_ms))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::LogError)?;
 
         let mut offsets = Vec::with_capacity(encoded.len());
         let mut running = self.writer.offset;
