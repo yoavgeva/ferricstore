@@ -479,9 +479,11 @@ defmodule Ferricstore.Commands.Server do
 
     entries = NamespaceConfig.get_all()
     count = length(entries)
+    all_default = if count == 0, do: "1", else: "0"
 
     default_fields = [
       {"namespace_config_count", Integer.to_string(count)},
+      {"namespace_config_all_default", all_default},
       {"default_window_ms", Integer.to_string(NamespaceConfig.default_window_ms())},
       {"default_durability", Atom.to_string(NamespaceConfig.default_durability())}
     ]
@@ -544,11 +546,15 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   def handle("CONFIG", [subcmd | rest], _store) do
-    handle_config(String.upcase(subcmd), rest)
+    handle_config(String.upcase(subcmd), upcase_local_modifier(rest))
   end
 
   def handle("CONFIG", [], _store) do
     {:error, "ERR wrong number of arguments for 'config' command"}
+  end
+
+  defp handle_config("GET", ["LOCAL" | rest]) do
+    handle_config_get_local(rest)
   end
 
   defp handle_config("GET", [pattern]) do
@@ -557,6 +563,10 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp handle_config("GET", _args), do: {:error, "ERR wrong number of arguments for 'config|get' command"}
+
+  defp handle_config("SET", ["LOCAL" | rest]) do
+    handle_config_set_local(rest)
+  end
 
   defp handle_config("SET", [key, value]) do
     old_value = Ferricstore.Config.get_value(key)
@@ -578,6 +588,29 @@ defmodule Ferricstore.Commands.Server do
 
   defp handle_config("SET", _args), do: {:error, "ERR wrong number of arguments for 'config|set' command"}
 
+  # -- CONFIG SET LOCAL key value -------------------------------------------------
+
+  defp handle_config_set_local([key, value]) do
+    Ferricstore.Config.Local.set(String.downcase(key), value)
+  end
+
+  defp handle_config_set_local(_args) do
+    {:error, "ERR wrong number of arguments for 'config|set|local' command"}
+  end
+
+  # -- CONFIG GET LOCAL key ------------------------------------------------------
+
+  defp handle_config_get_local([key]) do
+    case Ferricstore.Config.Local.get(String.downcase(key)) do
+      {:ok, value} -> [String.downcase(key), value]
+      {:error, _} = err -> err
+    end
+  end
+
+  defp handle_config_get_local(_args) do
+    {:error, "ERR wrong number of arguments for 'config|get|local' command"}
+  end
+
   defp handle_config("RESETSTAT", []) do
     Stats.reset()
     Ferricstore.SlowLog.reset()
@@ -593,6 +626,19 @@ defmodule Ferricstore.Commands.Server do
   defp handle_config(subcmd, _) do
     {:error, "ERR unknown subcommand '#{String.downcase(subcmd)}' for 'config' command"}
   end
+
+  # When the first arg to CONFIG GET/SET is "local" (any case), upcase it so
+  # the pattern match `["LOCAL" | rest]` works regardless of client casing.
+  defp upcase_local_modifier(["local" | rest]), do: ["LOCAL" | rest]
+  defp upcase_local_modifier(["Local" | rest]), do: ["LOCAL" | rest]
+  defp upcase_local_modifier([first | rest]) when is_binary(first) do
+    if String.upcase(first) == "LOCAL" do
+      ["LOCAL" | rest]
+    else
+      [first | rest]
+    end
+  end
+  defp upcase_local_modifier(args), do: args
 
   # ---------------------------------------------------------------------------
   # MODULE stubs

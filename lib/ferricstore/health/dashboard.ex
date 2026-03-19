@@ -8,7 +8,7 @@ defmodule Ferricstore.Health.Dashboard do
 
   ## Sections
 
-  The dashboard renders seven sections matching the spec:
+  The dashboard renders eight sections matching the spec:
 
   1. **Overview** -- uptime, total keys, memory usage, active connections
   2. **Per-shard status** -- process status, key count, ETS memory
@@ -17,6 +17,7 @@ defmodule Ferricstore.Health.Dashboard do
   5. **Connections** -- active count, blocked clients, tracking clients
   6. **Slowlog** -- recent slow commands with duration
   7. **Merge status** -- per-shard scheduler status, last merge time, bytes reclaimed
+  8. **Namespace Config** -- per-namespace overrides for window_ms and durability
 
   ## Architecture
 
@@ -36,7 +37,7 @@ defmodule Ferricstore.Health.Dashboard do
       html = Ferricstore.Health.Dashboard.render(data)
   """
 
-  alias Ferricstore.{Health, MemoryGuard, SlowLog, Stats}
+  alias Ferricstore.{Health, MemoryGuard, NamespaceConfig, SlowLog, Stats}
   alias Ferricstore.Merge.Scheduler, as: MergeScheduler
 
   @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
@@ -53,7 +54,8 @@ defmodule Ferricstore.Health.Dashboard do
           memory: memory_data(),
           connections: connections_data(),
           slowlog: [slowlog_entry()],
-          merge: [merge_status()]
+          merge: [merge_status()],
+          namespace_config: [NamespaceConfig.ns_entry()]
         }
 
   @typedoc "Overview section data."
@@ -149,7 +151,8 @@ defmodule Ferricstore.Health.Dashboard do
       memory: collect_memory(),
       connections: collect_connections(),
       slowlog: collect_slowlog(),
-      merge: collect_merge()
+      merge: collect_merge(),
+      namespace_config: NamespaceConfig.get_all()
     }
   end
 
@@ -224,6 +227,7 @@ defmodule Ferricstore.Health.Dashboard do
       render_connections(data.connections) <>
       render_slowlog(data.slowlog) <>
       render_merge(data.merge) <>
+      render_namespace_config(data.namespace_config) <>
       """
         <div class="footer">
           Auto-refresh every 2s &middot; Run ID: #{escape(data.overview.run_id)}
@@ -677,6 +681,67 @@ defmodule Ferricstore.Health.Dashboard do
         #{rows}
       </tbody>
     </table>
+    """
+  end
+
+  @spec render_namespace_config([NamespaceConfig.ns_entry()]) :: binary()
+  defp render_namespace_config(entries) do
+    {badge_class, badge_label} =
+      case entries do
+        [] -> {"badge-warning", "all defaults"}
+        _ -> {"badge-ok", "configured"}
+      end
+
+    body =
+      case entries do
+        [] ->
+          """
+          <p style="color:#8b949e; margin: 8px 0;">All namespaces using built-in defaults (1ms, quorum)</p>
+          """
+
+        _ ->
+          rows =
+            Enum.map_join(entries, "\n", fn entry ->
+              durability_str = Atom.to_string(entry.durability)
+
+              durability_class =
+                if entry.durability == :async, do: "status-warning", else: ""
+
+              changed_at_str =
+                if entry.changed_at == 0 do
+                  "default"
+                else
+                  entry.changed_at
+                  |> DateTime.from_unix!()
+                  |> Calendar.strftime("%Y-%m-%d %H:%M:%S")
+                end
+
+              """
+              <tr>
+                <td class="mono">#{escape(entry.prefix)}</td>
+                <td>#{entry.window_ms}</td>
+                <td class="#{durability_class}">#{escape(durability_str)}</td>
+                <td>#{changed_at_str}</td>
+                <td>#{escape(entry.changed_by)}</td>
+              </tr>
+              """
+            end)
+
+          """
+          <table>
+            <thead>
+              <tr><th>Prefix</th><th>Window (ms)</th><th>Durability</th><th>Changed At</th><th>Changed By</th></tr>
+            </thead>
+            <tbody>
+              #{rows}
+            </tbody>
+          </table>
+          """
+      end
+
+    """
+    <h2>Namespace Config <span class="badge #{badge_class}">#{badge_label}</span></h2>
+    #{body}
     """
   end
 

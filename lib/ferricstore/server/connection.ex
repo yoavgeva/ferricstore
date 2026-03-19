@@ -1408,6 +1408,106 @@ defmodule Ferricstore.Server.Connection do
     end
   end
 
+  # -- XREAD BLOCK dispatch -----------------------------------------------------
+  # XREAD with BLOCK option needs connection-level blocking similar to BLPOP.
+  # The Stream handler returns {:block, timeout_ms, stream_ids, count} when
+  # no data is immediately available and BLOCK was specified.
+
+  defp dispatch("XREAD", args, state) do
+    store = build_store(state.sandbox_namespace)
+
+    result =
+      try do
+        Dispatcher.dispatch("XREAD", args, store)
+      catch
+        :exit, {:noproc, _} ->
+          {:error, "ERR server not ready, shard process unavailable"}
+
+        :exit, {reason, _} ->
+          {:error, "ERR internal error: #{inspect(reason)}"}
+      end
+
+    case result do
+      {:block, timeout_ms, stream_ids, count} ->
+        dispatch_xread_block(timeout_ms, stream_ids, count, store, state)
+
+      other ->
+        maybe_notify_keyspace("XREAD", args, other)
+        new_state = maybe_track_read("XREAD", args, other, state)
+        maybe_notify_tracking("XREAD", args, other, state)
+        {:continue, Encoder.encode(other), new_state}
+    end
+  end
+
+  defp dispatch_xread_block(timeout_ms, stream_ids, count, store, state) do
+    alias Ferricstore.Commands.Stream, as: StreamCmd
+
+    keys = Enum.map(stream_ids, fn {key, _id} -> key end)
+
+    # Register as waiter for all watched stream keys.
+    Enum.each(stream_ids, fn {key, id_str} ->
+      StreamCmd.register_stream_waiter(key, self(), id_str)
+    end)
+
+    # Cap timeout=0 (block forever) at 5 minutes.
+    effective_timeout = if timeout_ms == 0, do: 300_000, else: timeout_ms
+
+    # Re-arm active: :once so we can detect client disconnect during the block.
+    state.transport.setopts(state.socket, active: :once)
+
+    result =
+      receive do
+        {:stream_waiter_notify, _notified_key} ->
+          # A new entry was added to one of our watched streams -- re-read.
+          read_result =
+            try do
+              StreamCmd.handle("XREAD", build_xread_args(stream_ids, count), store)
+            catch
+              _, _ -> []
+            end
+
+          case read_result do
+            {:block, _, _, _} -> nil
+            other when is_list(other) and other != [] -> {:ok, other}
+            _ -> nil
+          end
+
+        {:tcp_closed, _socket} ->
+          :client_closed
+
+        {:tcp_error, _socket, _reason} ->
+          :client_closed
+      after
+        effective_timeout ->
+          nil
+      end
+
+    # Cleanup: unregister from all stream keys.
+    Enum.each(keys, fn key -> StreamCmd.unregister_stream_waiter(key, self()) end)
+
+    case result do
+      :client_closed ->
+        cleanup_connection(state)
+        state.transport.close(state.socket)
+        {:quit, Encoder.encode(nil), state}
+
+      {:ok, value} ->
+        {:continue, Encoder.encode(value), state}
+
+      nil ->
+        {:continue, Encoder.encode(nil), state}
+    end
+  end
+
+  # Builds XREAD args from stream_ids and count for re-read after notification.
+  defp build_xread_args(stream_ids, count) do
+    keys = Enum.map(stream_ids, fn {key, _id} -> key end)
+    ids = Enum.map(stream_ids, fn {_key, id} -> id end)
+
+    count_args = if count == :infinity, do: [], else: ["COUNT", Integer.to_string(count)]
+    count_args ++ ["STREAMS"] ++ keys ++ ids
+  end
+
   # All other commands go through the Dispatcher with an injected store.
   # But first check pub/sub mode restriction (PING is allowed in pub/sub mode).
   defp dispatch(cmd, args, state) do
@@ -1897,6 +1997,7 @@ defmodule Ferricstore.Server.Connection do
 
     cleanup_pubsub(state)
     ClientTracking.cleanup(self())
+    Ferricstore.Commands.Stream.cleanup_stream_waiters(self())
     Stats.decr_connections()
   end
 

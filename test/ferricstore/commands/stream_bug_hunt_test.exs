@@ -272,48 +272,51 @@ defmodule Ferricstore.Commands.StreamBugHuntTest do
   end
 
   # ===========================================================================
-  # 7. XREAD BLOCK 0 — blocks forever (test with short timeout)
+  # 7. XREAD BLOCK — now implemented
   #
-  # BLOCK is not implemented. The parser ignores BLOCK entirely which means
-  # the token gets mis-parsed. We verify the current behaviour.
+  # BLOCK is parsed by the stream command handler. When data is immediately
+  # available, it returns the result directly. When no data is available,
+  # it returns {:block, timeout_ms, stream_ids, count} so the connection
+  # layer can handle actual blocking.
   # ===========================================================================
 
   describe "XREAD BLOCK" do
-    @tag :bug
-    test "BLOCK option is not implemented — should error or block, currently mis-parses" do
+    test "BLOCK with data available returns entries immediately" do
       store = MockStore.make()
       key = ustream()
 
       Stream.handle("XADD", [key, "1-0", "f", "v"], store)
 
-      # XREAD BLOCK 0 STREAMS key 0
-      # "BLOCK" is not a recognized token — split_at_streams sees
-      # ["BLOCK", "0", "STREAMS", key, "0"], STREAMS at index 2,
-      # after_streams = [key, "0"], half = 1, keys=[key], ids=["0"].
-      # So it accidentally "works" but BLOCK is silently ignored.
+      # XREAD BLOCK 0 STREAMS key 0 — data exists, should return immediately.
       result = Stream.handle("XREAD", ["BLOCK", "0", "STREAMS", key, "0"], store)
 
-      # Document current (broken) behaviour: BLOCK is silently ignored,
-      # entries are returned immediately.
-      # Correct Redis behaviour: BLOCK 0 should block indefinitely until
-      # new data arrives.
-      assert is_list(result),
-             "BLOCK is silently ignored — query succeeds immediately instead of blocking"
+      assert is_list(result)
+      assert length(result) == 1
+      [[^key, entries]] = result
+      assert length(entries) == 1
     end
 
-    @tag :bug
-    test "XREAD BLOCK with timeout is not recognized" do
+    test "BLOCK with timeout and data returns entries immediately" do
       store = MockStore.make()
       key = ustream()
 
       Stream.handle("XADD", [key, "1-0", "f", "v"], store)
 
-      # XREAD BLOCK 5000 STREAMS key 0
-      # Same silent-ignore behaviour.
+      # XREAD BLOCK 5000 STREAMS key 0 — data exists, should return immediately.
       result = Stream.handle("XREAD", ["BLOCK", "5000", "STREAMS", key, "0"], store)
 
-      assert is_list(result),
-             "BLOCK 5000 silently ignored — should block for up to 5 seconds"
+      assert is_list(result)
+      assert length(result) == 1
+    end
+
+    test "BLOCK with no data signals blocking to connection layer" do
+      store = MockStore.make()
+      key = ustream()
+
+      # No data in this stream — should return {:block, ...} tuple.
+      result = Stream.handle("XREAD", ["BLOCK", "100", "STREAMS", key, "0"], store)
+
+      assert {:block, 100, [{^key, "0"}], :infinity} = result
     end
   end
 

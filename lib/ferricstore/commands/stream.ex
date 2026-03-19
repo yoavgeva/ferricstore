@@ -42,6 +42,7 @@ defmodule Ferricstore.Commands.Stream do
 
   @meta_table Ferricstore.Stream.Meta
   @groups_table Ferricstore.Stream.Groups
+  @stream_waiters_table :ferricstore_stream_waiters
 
   # Null byte separator between stream key and entry ID in compound keys.
   @sep <<0>>
@@ -140,13 +141,24 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   # -------------------------------------------------------------------------
-  # XREAD [COUNT count] STREAMS key [key ...] id [id ...]
+  # XREAD [COUNT count] [BLOCK timeout] STREAMS key [key ...] id [id ...]
   # -------------------------------------------------------------------------
 
   def handle("XREAD", args, store) do
     case parse_xread_args(args) do
-      {:ok, count, stream_ids} ->
+      {:ok, count, :no_block, stream_ids} ->
         do_xread(stream_ids, count, store)
+
+      {:ok, count, {:block, timeout_ms}, stream_ids} ->
+        # Try an immediate read first. If data is available, return it.
+        result = do_xread(stream_ids, count, store)
+
+        if result == [] do
+          # No data available -- signal the connection layer to block.
+          {:block, timeout_ms, stream_ids, count}
+        else
+          result
+        end
 
       {:error, _} = err ->
         err
@@ -271,7 +283,92 @@ defmodule Ferricstore.Commands.Stream do
         :ok
     end
 
+    case :ets.whereis(@stream_waiters_table) do
+      :undefined ->
+        try do
+          :ets.new(@stream_waiters_table, [:duplicate_bag, :public, :named_table])
+        rescue
+          ArgumentError -> :ok
+        end
+
+      _ref ->
+        :ok
+    end
+
     :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Stream waiter management (for XREAD BLOCK)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Registers `pid` as a waiter for new entries on `stream_key`.
+
+  When XADD inserts a new entry into this stream, all registered waiters
+  receive `{:stream_waiter_notify, stream_key}`.
+
+  ## Parameters
+
+    - `stream_key` -- the Redis key of the stream
+    - `pid` -- the process to notify
+    - `last_seen_id` -- the last ID the caller has seen (for future filtering)
+  """
+  @spec register_stream_waiter(binary(), pid(), binary()) :: :ok
+  def register_stream_waiter(stream_key, pid, last_seen_id) do
+    ensure_meta_table()
+    registered_at = System.monotonic_time(:microsecond)
+    :ets.insert(@stream_waiters_table, {stream_key, pid, last_seen_id, registered_at})
+    :ok
+  end
+
+  @doc """
+  Unregisters `pid` as a waiter for `stream_key`.
+  """
+  @spec unregister_stream_waiter(binary(), pid()) :: :ok
+  def unregister_stream_waiter(stream_key, pid) do
+    :ets.match_delete(@stream_waiters_table, {stream_key, pid, :_, :_})
+    :ok
+  end
+
+  @doc """
+  Removes all stream waiters registered by `pid` across all keys.
+
+  Called when a client disconnects.
+  """
+  @spec cleanup_stream_waiters(pid()) :: :ok
+  def cleanup_stream_waiters(pid) do
+    :ets.match_delete(@stream_waiters_table, {:_, pid, :_, :_})
+    :ok
+  end
+
+  @doc """
+  Returns the number of stream waiters for `stream_key`.
+  """
+  @spec stream_waiter_count(binary()) :: non_neg_integer()
+  def stream_waiter_count(stream_key) do
+    ensure_meta_table()
+    :ets.match(@stream_waiters_table, {stream_key, :_, :_, :_}) |> length()
+  end
+
+  @doc false
+  @spec notify_stream_waiters(binary()) :: :ok
+  def notify_stream_waiters(stream_key) do
+    case :ets.whereis(@stream_waiters_table) do
+      :undefined ->
+        :ok
+
+      _ref ->
+        entries = :ets.lookup(@stream_waiters_table, stream_key)
+
+        Enum.each(entries, fn {_key, pid, _last_id, _reg_at} ->
+          send(pid, {:stream_waiter_notify, stream_key})
+        end)
+
+        # Remove all notified waiters.
+        :ets.match_delete(@stream_waiters_table, {stream_key, :_, :_, :_})
+        :ok
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -318,6 +415,9 @@ defmodule Ferricstore.Commands.Stream do
 
         # Apply trim if requested.
         maybe_trim(key, trim_opts, store)
+
+        # Notify any XREAD BLOCK waiters watching this stream.
+        notify_stream_waiters(key)
 
         id_str
 
@@ -379,8 +479,19 @@ defmodule Ferricstore.Commands.Stream do
 
     results =
       Enum.map(stream_ids, fn {key, id_str} ->
+        # Handle "$" -- resolve to current last ID of the stream.
+        resolved_id =
+          if id_str == "$" do
+            case :ets.lookup(@meta_table, key) do
+              [{^key, _len, _first, last, _ms, _seq}] -> last
+              [] -> "0-0"
+            end
+          else
+            id_str
+          end
+
         # For XREAD, the start is exclusive (entries > id).
-        start_id = parse_exclusive_start(id_str)
+        start_id = parse_exclusive_start(resolved_id)
 
         case start_id do
           {:ok, excl_start} ->
@@ -993,12 +1104,24 @@ defmodule Ferricstore.Commands.Stream do
   defp parse_count_opt(_), do: {:error, "ERR syntax error"}
 
   defp parse_xread_args(args) do
+    # COUNT and BLOCK can appear in either order before STREAMS.
     {count, rest} = parse_xread_count(args)
+    {block, rest} = parse_xread_block(rest)
+    # Handle BLOCK before COUNT: XREAD BLOCK 100 COUNT 2 STREAMS ...
+    {count, rest} =
+      if count == :infinity do
+        case parse_xread_count(rest) do
+          {:infinity, _} -> {count, rest}
+          {n, rest2} -> {n, rest2}
+        end
+      else
+        {count, rest}
+      end
 
     case split_at_streams(rest) do
       {:ok, keys, ids} when length(keys) == length(ids) and keys != [] ->
         stream_ids = Enum.zip(keys, ids)
-        {:ok, count, stream_ids}
+        {:ok, count, block, stream_ids}
 
       {:ok, _, _} ->
         {:error, "ERR Unbalanced XREAD list of streams: for each stream key an ID must be specified"}
@@ -1016,6 +1139,15 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp parse_xread_count(rest), do: {:infinity, rest}
+
+  defp parse_xread_block(["BLOCK", timeout_str | rest]) do
+    case Integer.parse(timeout_str) do
+      {n, ""} when n >= 0 -> {{:block, n}, rest}
+      _ -> {:no_block, ["BLOCK", timeout_str | rest]}
+    end
+  end
+
+  defp parse_xread_block(rest), do: {:no_block, rest}
 
   defp split_at_streams(args) do
     case Enum.find_index(args, &(String.upcase(&1) == "STREAMS")) do

@@ -423,6 +423,50 @@ defmodule Ferricstore.NamespaceConfigTest do
   end
 
   # ===========================================================================
+  # INFO namespace_config — namespace_config_all_default flag
+  # ===========================================================================
+
+  describe "INFO namespace_config_all_default flag" do
+    test "reports namespace_config_all_default:1 when no namespaces have custom config" do
+      store = MockStore.make()
+      result = Server.handle("INFO", ["namespace_config"], store)
+      assert result =~ "namespace_config_all_default:1"
+    end
+
+    test "reports namespace_config_all_default:0 when namespaces have custom config" do
+      NamespaceConfig.set("rate", "window_ms", "10")
+
+      store = MockStore.make()
+      result = Server.handle("INFO", ["namespace_config"], store)
+      assert result =~ "namespace_config_all_default:0"
+    end
+
+    test "reports namespace_config_all_default:1 after resetting all custom config" do
+      NamespaceConfig.set("rate", "window_ms", "10")
+      NamespaceConfig.reset_all()
+
+      store = MockStore.make()
+      result = Server.handle("INFO", ["namespace_config"], store)
+      assert result =~ "namespace_config_all_default:1"
+    end
+
+    test "reports namespace_config_all_default:0 with multiple custom namespaces" do
+      NamespaceConfig.set("rate", "window_ms", "10")
+      NamespaceConfig.set("session", "durability", "async")
+
+      store = MockStore.make()
+      result = Server.handle("INFO", ["namespace_config"], store)
+      assert result =~ "namespace_config_all_default:0"
+    end
+
+    test "namespace_config_all_default flag is included in INFO all" do
+      store = MockStore.make()
+      result = Server.handle("INFO", ["all"], store)
+      assert result =~ "namespace_config_all_default:1"
+    end
+  end
+
+  # ===========================================================================
   # CONFIG REWRITE
   # ===========================================================================
 

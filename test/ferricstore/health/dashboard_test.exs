@@ -15,6 +15,7 @@ defmodule Ferricstore.Health.DashboardTest do
 
   alias Ferricstore.Health.Dashboard
   alias Ferricstore.Health.Endpoint, as: HealthEndpoint
+  alias Ferricstore.NamespaceConfig
   alias Ferricstore.Test.ShardHelpers
 
   setup do
@@ -368,6 +369,203 @@ defmodule Ferricstore.Health.DashboardTest do
       configured = Application.get_env(:ferricstore, :eviction_policy, :volatile_lru)
 
       assert data.memory.eviction_policy == configured
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Namespace Config section (Dashboard Page 9)
+  # ---------------------------------------------------------------------------
+
+  describe "collect/0 namespace_config" do
+    test "includes namespace_config key in collected data" do
+      data = Dashboard.collect()
+
+      assert Map.has_key?(data, :namespace_config)
+      assert is_list(data.namespace_config)
+    end
+
+    test "returns empty list when no overrides are configured" do
+      NamespaceConfig.reset_all()
+      data = Dashboard.collect()
+
+      assert data.namespace_config == []
+    end
+
+    test "returns configured namespaces after set" do
+      NamespaceConfig.reset_all()
+      :ok = NamespaceConfig.set("rate", "window_ms", "10")
+      :ok = NamespaceConfig.set("rate", "durability", "async")
+
+      data = Dashboard.collect()
+
+      assert length(data.namespace_config) == 1
+      [entry] = data.namespace_config
+      assert entry.prefix == "rate"
+      assert entry.window_ms == 10
+      assert entry.durability == :async
+      assert is_integer(entry.changed_at)
+      assert is_binary(entry.changed_by)
+
+      NamespaceConfig.reset_all()
+    end
+
+    test "returns multiple configured namespaces sorted by prefix" do
+      NamespaceConfig.reset_all()
+      :ok = NamespaceConfig.set("zeta", "window_ms", "50")
+      :ok = NamespaceConfig.set("alpha", "window_ms", "20")
+
+      data = Dashboard.collect()
+
+      assert length(data.namespace_config) == 2
+      prefixes = Enum.map(data.namespace_config, & &1.prefix)
+      assert prefixes == ["alpha", "zeta"]
+
+      NamespaceConfig.reset_all()
+    end
+  end
+
+  describe "render/1 namespace config section" do
+    test "HTML contains Namespace Config heading" do
+      data = Dashboard.collect()
+      html = Dashboard.render(data)
+
+      assert String.contains?(html, "Namespace Config")
+    end
+
+    test "shows built-in defaults message when no namespaces configured" do
+      NamespaceConfig.reset_all()
+      data = Dashboard.collect()
+      html = Dashboard.render(data)
+
+      assert String.contains?(html, "All namespaces using built-in defaults (1ms, quorum)")
+    end
+
+    test "shows table with prefix, window, durability when namespaces configured" do
+      NamespaceConfig.reset_all()
+      :ok = NamespaceConfig.set("session", "window_ms", "5")
+      :ok = NamespaceConfig.set("session", "durability", "quorum")
+
+      data = Dashboard.collect()
+      html = Dashboard.render(data)
+
+      assert String.contains?(html, "session")
+      assert String.contains?(html, "5")
+      assert String.contains?(html, "quorum")
+      # Table headers
+      assert String.contains?(html, "Prefix")
+      assert String.contains?(html, "Window (ms)")
+      assert String.contains?(html, "Durability")
+      assert String.contains?(html, "Changed At")
+      assert String.contains?(html, "Changed By")
+
+      NamespaceConfig.reset_all()
+    end
+
+    test "highlights async durability with warning color" do
+      NamespaceConfig.reset_all()
+      :ok = NamespaceConfig.set("ephemeral", "durability", "async")
+
+      data = Dashboard.collect()
+      html = Dashboard.render(data)
+
+      assert String.contains?(html, "status-warning")
+      assert String.contains?(html, "async")
+
+      NamespaceConfig.reset_all()
+    end
+
+    test "does not apply warning color to quorum durability" do
+      NamespaceConfig.reset_all()
+      :ok = NamespaceConfig.set("safe", "window_ms", "2")
+
+      data = Dashboard.collect()
+      html = Dashboard.render(data)
+
+      # The durability cell for "safe" should not have warning class
+      # Extract the table rows area to check
+      assert String.contains?(html, "quorum")
+      # quorum cells should not have status-warning on them
+      # We verify by checking there is no status-warning in the namespace config
+      # section at all (since the only namespace is quorum)
+      [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
+      # Take until the next section or end of body
+      ns_html =
+        case String.split(ns_section, "<h2>", parts: 2) do
+          [section, _rest] -> section
+          [section] -> section
+        end
+
+      refute String.contains?(ns_html, "status-warning")
+
+      NamespaceConfig.reset_all()
+    end
+
+    test "shows config status badge as green when namespaces are configured" do
+      NamespaceConfig.reset_all()
+      :ok = NamespaceConfig.set("metrics", "window_ms", "100")
+
+      data = Dashboard.collect()
+      html = Dashboard.render(data)
+
+      [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
+
+      ns_html =
+        case String.split(ns_section, "<h2>", parts: 2) do
+          [section, _rest] -> section
+          [section] -> section
+        end
+
+      assert String.contains?(ns_html, "badge-ok")
+
+      NamespaceConfig.reset_all()
+    end
+
+    test "shows config status badge as amber when all defaults" do
+      NamespaceConfig.reset_all()
+
+      data = Dashboard.collect()
+      html = Dashboard.render(data)
+
+      [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
+
+      ns_html =
+        case String.split(ns_section, "<h2>", parts: 2) do
+          [section, _rest] -> section
+          [section] -> section
+        end
+
+      assert String.contains?(ns_html, "badge-warning")
+
+      NamespaceConfig.reset_all()
+    end
+
+    test "namespace config section appears after merge status section" do
+      data = Dashboard.collect()
+      html = Dashboard.render(data)
+
+      merge_pos = :binary.match(html, "Merge Status") |> elem(0)
+      ns_pos = :binary.match(html, "Namespace Config") |> elem(0)
+
+      assert ns_pos > merge_pos
+    end
+  end
+
+  describe "GET /dashboard includes namespace config" do
+    test "HTTP response body contains Namespace Config section" do
+      port = HealthEndpoint.port()
+      response = http_get(port, "/dashboard")
+      body = extract_body(response)
+
+      assert String.contains?(body, "Namespace Config")
+    end
+
+    test "HTTP response shows built-in defaults when no overrides exist" do
+      NamespaceConfig.reset_all()
+      port = HealthEndpoint.port()
+      response = http_get(port, "/dashboard")
+      body = extract_body(response)
+
+      assert String.contains?(body, "built-in defaults")
     end
   end
 end
