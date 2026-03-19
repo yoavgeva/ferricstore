@@ -14,6 +14,7 @@ defmodule Ferricstore.ShutdownTest do
 
   use ExUnit.Case, async: false
 
+  alias Ferricstore.DataDir
   alias Ferricstore.Store.Router
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Test.ShardHelpers
@@ -81,7 +82,7 @@ defmodule Ferricstore.ShutdownTest do
       :ok = GenServer.call(shard_name, :flush)
 
       # Verify the shard's data directory exists and has files.
-      shard_dir = Path.join(data_dir, "shard_#{shard_idx}")
+      shard_dir = DataDir.shard_data_path(data_dir, shard_idx)
       assert File.dir?(shard_dir), "Shard data directory should exist: #{shard_dir}"
 
       files = File.ls!(shard_dir)
@@ -113,7 +114,7 @@ defmodule Ferricstore.ShutdownTest do
       # Verify each key is recoverable from its shard's Bitcask directory.
       for {k, v} <- keys_and_values do
         shard_idx = Router.shard_for(k)
-        shard_dir = Path.join(data_dir, "shard_#{shard_idx}")
+        shard_dir = DataDir.shard_data_path(data_dir, shard_idx)
         {:ok, store} = NIF.new(shard_dir)
         {:ok, recovered} = NIF.get(store, k)
         assert recovered == v, "Key #{k} should be recoverable from Bitcask"
@@ -138,7 +139,7 @@ defmodule Ferricstore.ShutdownTest do
       ShardHelpers.flush_all_shards()
 
       for i <- 0..3 do
-        shard_dir = Path.join(data_dir, "shard_#{i}")
+        shard_dir = DataDir.shard_data_path(data_dir, i)
         assert File.dir?(shard_dir), "Shard #{i} data directory should exist"
 
         files = File.ls!(shard_dir)
@@ -174,7 +175,7 @@ defmodule Ferricstore.ShutdownTest do
       refute Process.alive?(pid)
 
       # Verify data is on disk.
-      shard_dir = Path.join(tmp_dir, "shard_99")
+      shard_dir = DataDir.shard_data_path(tmp_dir, 99)
       assert File.dir?(shard_dir)
 
       {:ok, store} = NIF.new(shard_dir)

@@ -106,7 +106,7 @@ defmodule Ferricstore.Store.Shard do
     index = Keyword.fetch!(opts, :index)
     data_dir = Keyword.fetch!(opts, :data_dir)
     flush_ms = Keyword.get(opts, :flush_interval_ms, @flush_interval_ms)
-    path = Path.join(data_dir, "shard_#{index}")
+    path = Ferricstore.DataDir.shard_data_path(data_dir, index)
     File.mkdir_p!(path)
     {:ok, store} = NIF.new(path)
 

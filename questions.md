@@ -114,3 +114,13 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 **Spec says:** Optional AES-256-GCM encryption for Bitcask data files.
 **Current impl:** Not implemented. Data files are plaintext.
 **Status:** Deferred. Requires Rust NIF changes to encrypt/decrypt in the write/read path.
+
+## Q8: Two-Table ETS Split — Implementation Blocked
+**Spec says (2.4):** Separate keydir (metadata only: file_id, offset, value_size, expire_at_ms, type_byte) and hot_cache (key→value, LRU evicted).
+**Current impl:** Single `shard_ets_N` stores `{key, value, expire_at_ms}`. ETS IS the primary read source, not a cache over Bitcask.
+**Blocker:** The current architecture uses ETS as the source of truth for reads. The spec requires ETS keydir to store only Bitcask pointers (file_id, offset) with hot_cache as an optional value cache. This requires:
+1. Changing the read path to always go through Bitcask (or hot cache on top)
+2. The keydir entry needs file_id/offset which are currently only in the Rust NIF keydir
+3. 39 ETS insert locations, 15 test files affected
+4. Estimated 4-6 weeks of careful refactoring
+**Decision needed:** Is this a v1 or v2 change? The single-table approach works correctly for all workloads.

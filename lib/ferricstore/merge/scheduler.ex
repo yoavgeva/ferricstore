@@ -153,7 +153,7 @@ defmodule Ferricstore.Merge.Scheduler do
     semaphore = Keyword.get(opts, :semaphore, Semaphore)
 
     config = build_config(merge_config)
-    shard_data_dir = Path.join(data_dir, "shard_#{index}")
+    shard_data_dir = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
     state = %__MODULE__{
       shard_index: index,

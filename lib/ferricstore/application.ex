@@ -40,6 +40,10 @@ defmodule Ferricstore.Application do
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
     raft_enabled? = Application.get_env(:ferricstore, :raft_enabled, true)
 
+    # Create the on-disk directory layout (spec 2B.4) before any process
+    # tries to open shard directories or Raft WALs.
+    Ferricstore.DataDir.ensure_layout!(data_dir, shard_count)
+
     # Initialize waiter registry ETS for blocking commands
     Ferricstore.Waiters.init()
     # Initialize client tracking ETS tables

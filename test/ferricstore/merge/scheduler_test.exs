@@ -410,7 +410,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
   describe "manifest written and cleaned up" do
     test "scheduler writes manifest before merge and cleans up after" do
       data_dir = Application.get_env(:ferricstore, :data_dir)
-      shard_data_dir = Path.join(data_dir, "shard_0")
+      shard_data_dir = Ferricstore.DataDir.shard_data_path(data_dir, 0)
 
       Manifest.delete(shard_data_dir)
       refute Manifest.exists?(shard_data_dir)

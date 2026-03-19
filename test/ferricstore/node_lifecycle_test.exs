@@ -16,6 +16,7 @@ defmodule Ferricstore.NodeLifecycleTest do
 
   use ExUnit.Case, async: false
 
+  alias Ferricstore.DataDir
   alias Ferricstore.Store.{Router, ShardSupervisor}
   alias Ferricstore.Resp.{Encoder, Parser}
   alias Ferricstore.Server.Listener
@@ -313,7 +314,7 @@ defmodule Ferricstore.NodeLifecycleTest do
       refute Process.alive?(pid)
 
       # Verify data is on disk by opening a fresh NIF store.
-      shard_dir = Path.join(tmp_dir, "shard_98")
+      shard_dir = DataDir.shard_data_path(tmp_dir, 98)
       {:ok, store} = Ferricstore.Bitcask.NIF.new(shard_dir)
 
       for i <- 1..10 do
