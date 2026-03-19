@@ -26,17 +26,32 @@ defmodule Ferricstore.Raft.StateMachine do
     of the apply return tuple.
   - In single-node mode, the shard's Raft group has one member (self quorum),
     so every write commits immediately after local log append + fsync.
+
+  ## Log compaction (spec 2E.5)
+
+  The Raft log grows unbounded unless compacted. Every
+  `:release_cursor_interval` applied commands (default: 1000), `apply/3`
+  emits a `{:release_cursor, ra_index, state}` effect. This tells ra that
+  all log entries up to `ra_index` are fully reflected in the given state
+  snapshot and can be safely truncated.
+
+  The interval is stored in the machine state at init time (from the config
+  map or application env) so that `apply/3` remains deterministic -- it never
+  reads runtime configuration.
   """
 
   @behaviour :ra_machine
 
   alias Ferricstore.Bitcask.NIF
 
+  @default_release_cursor_interval 1_000
+
   @type shard_state :: %{
           shard_index: non_neg_integer(),
           store: reference(),
           ets: atom(),
-          applied_count: non_neg_integer()
+          applied_count: non_neg_integer(),
+          release_cursor_interval: pos_integer()
         }
 
   # ---------------------------------------------------------------------------
@@ -52,16 +67,28 @@ defmodule Ferricstore.Raft.StateMachine do
     * `:store` -- Bitcask NIF reference (already opened)
     * `:ets` -- ETS table name (already created)
 
+  Optional:
+
+    * `:release_cursor_interval` -- number of applies between release_cursor
+      effects (default: #{@default_release_cursor_interval}). Can also be set
+      via `Application.get_env(:ferricstore, :release_cursor_interval)`.
+
   Returns the initial machine state.
   """
   @impl true
   @spec init(map()) :: shard_state()
   def init(config) do
+    interval =
+      Map.get_lazy(config, :release_cursor_interval, fn ->
+        Application.get_env(:ferricstore, :release_cursor_interval, @default_release_cursor_interval)
+      end)
+
     %{
       shard_index: config.shard_index,
       store: config.store,
       ets: config.ets,
-      applied_count: 0
+      applied_count: 0,
+      release_cursor_interval: interval
     }
   end
 
@@ -81,27 +108,31 @@ defmodule Ferricstore.Raft.StateMachine do
   Returns `{new_state, result}` or `{new_state, result, effects}`.
   """
   @impl true
-  def apply(_meta, {:put, key, value, expire_at_ms}, state) do
+  def apply(meta, {:put, key, value, expire_at_ms}, state) do
     result = do_put(state, key, value, expire_at_ms)
-    new_state = %{state | applied_count: state.applied_count + 1}
-    {new_state, result}
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
   end
 
-  def apply(_meta, {:delete, key}, state) do
+  def apply(meta, {:delete, key}, state) do
     result = do_delete(state, key)
-    new_state = %{state | applied_count: state.applied_count + 1}
-    {new_state, result}
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
   end
 
-  def apply(_meta, {:batch, commands}, state) do
+  def apply(meta, {:batch, commands}, state) do
+    old_count = state.applied_count
+
     {results, new_count} =
-      Enum.map_reduce(commands, state.applied_count, fn cmd, count ->
+      Enum.map_reduce(commands, old_count, fn cmd, count ->
         result = apply_single(state, cmd)
         {result, count + 1}
       end)
 
     new_state = %{state | applied_count: new_count}
-    {new_state, {:ok, results}}
+    maybe_release_cursor(meta, old_count, new_state, {:ok, results})
   end
 
   @doc """
@@ -164,7 +195,8 @@ defmodule Ferricstore.Raft.StateMachine do
   @doc """
   Returns a summary map for debugging and monitoring.
 
-  Includes the shard index, ETS keydir size, and total applied command count.
+  Includes the shard index, ETS keydir size, total applied command count,
+  and the release_cursor interval.
   """
   @impl true
   def overview(state) do
@@ -178,8 +210,45 @@ defmodule Ferricstore.Raft.StateMachine do
     %{
       shard_index: state.shard_index,
       keydir_size: ets_size,
-      applied_count: state.applied_count
+      applied_count: state.applied_count,
+      release_cursor_interval: state.release_cursor_interval
     }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: release_cursor compaction
+  # ---------------------------------------------------------------------------
+
+  # Checks whether the applied_count crossed an interval boundary AND the
+  # ra meta contains a valid index. If both conditions are met, emits a
+  # `{:release_cursor, ra_index, state}` effect so ra can compact the log
+  # up to this point.
+  #
+  # For single commands (put/delete), old_count + 1 == new applied_count,
+  # so `div(old, interval) != div(new, interval)` is equivalent to
+  # `rem(new, interval) == 0`.
+  #
+  # For batches, the applied_count may jump by N, potentially crossing one
+  # or more interval boundaries. We emit a single release_cursor at the
+  # batch's ra index when any boundary was crossed.
+  #
+  # When meta has no :index (e.g. unit tests calling apply/3 directly with
+  # an empty map), the 2-tuple `{state, result}` is returned and no effect
+  # is emitted.
+  @spec maybe_release_cursor(map(), non_neg_integer(), shard_state(), term()) ::
+          {shard_state(), term()} | {shard_state(), term(), list()}
+  defp maybe_release_cursor(%{index: ra_index}, old_count, state, result) do
+    interval = state.release_cursor_interval
+
+    if div(old_count, interval) != div(state.applied_count, interval) do
+      {state, result, [{:release_cursor, ra_index, state}]}
+    else
+      {state, result}
+    end
+  end
+
+  defp maybe_release_cursor(_meta, _old_count, state, result) do
+    {state, result}
   end
 
   # ---------------------------------------------------------------------------

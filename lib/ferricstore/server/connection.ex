@@ -70,6 +70,7 @@ defmodule Ferricstore.Server.Connection do
     multi_queue: [],
     watched_keys: %{},
     authenticated: false,
+    username: "default",
     sandbox_namespace: nil,
     pubsub_channels: MapSet.new(),
     pubsub_patterns: MapSet.new(),
@@ -605,37 +606,76 @@ defmodule Ferricstore.Server.Connection do
   defp dispatch("QUIT", _args, state), do: {:quit, Encoder.encode(:ok), state}
 
   # AUTH command
+  #
+  # Authentication flow:
+  # 1. If no requirepass AND no ACL user has a password set, AUTH is rejected
+  #    ("no password is set").
+  # 2. Otherwise, resolve the username and password from args and delegate
+  #    to `Ferricstore.Acl.authenticate/2`.
+  # 3. Backwards compat: when requirepass is set and the ACL default user
+  #    has no password, authenticate against requirepass for the default user.
+  defp dispatch("AUTH", [], state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
+  end
+
+  defp dispatch("AUTH", args, state) when length(args) > 2 do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
+  end
+
   defp dispatch("AUTH", args, state) do
+    {username, password} =
+      case args do
+        [pass] -> {"default", pass}
+        [user, pass] -> {user, pass}
+      end
+
     requirepass = Ferricstore.Config.get_value("requirepass")
+    acl_user = Ferricstore.Acl.get_user(username)
     client_ip = format_peer(state.peer)
 
-    case {requirepass, args} do
-      {"", _} ->
+    # Determine whether any auth source is configured for this user.
+    has_acl_password = acl_user != nil and acl_user.password != nil
+    has_requirepass = requirepass != nil and requirepass != ""
+
+    cond do
+      # No authentication source configured at all.
+      not has_acl_password and not has_requirepass ->
         {:continue, Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}), state}
 
-      {pass, [pass]} ->
-        AuditLog.log(:auth_success, %{username: "default", client_ip: client_ip})
-        {:continue, Encoder.encode(:ok), %{state | authenticated: true}}
+      # ACL user has a password -- always use ACL auth.
+      has_acl_password ->
+        do_acl_auth(username, password, client_ip, state)
 
-      {pass, [_user, pass]} ->
-        username = List.first(args) || "default"
+      # Backwards compat: requirepass is set, default user has no ACL password.
+      has_requirepass and username == "default" ->
+        if password == requirepass do
+          AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
+          {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: username}}
+        else
+          AuditLog.log(:auth_failure, %{username: username, client_ip: client_ip})
+          {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
+        end
+
+      # Non-default user with no ACL password, requirepass is set.
+      # Fall through to ACL auth (which accepts any password for nopass users).
+      has_requirepass ->
+        do_acl_auth(username, password, client_ip, state)
+
+      # Catch-all (should not happen with the above conditions).
+      true ->
+        {:continue, Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}), state}
+    end
+  end
+
+  defp do_acl_auth(username, password, client_ip, state) do
+    case Ferricstore.Acl.authenticate(username, password) do
+      {:ok, ^username} ->
         AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
-        {:continue, Encoder.encode(:ok), %{state | authenticated: true}}
+        {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: username}}
 
-      {_, [_wrong]} ->
-        AuditLog.log(:auth_failure, %{username: "default", client_ip: client_ip})
-        {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
-
-      {_, [_user, _wrong]} ->
-        username = List.first(args) || "default"
+      {:error, reason} ->
         AuditLog.log(:auth_failure, %{username: username, client_ip: client_ip})
-        {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
-
-      {_, []} ->
-        {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
-
-      _ ->
-        {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
+        {:continue, Encoder.encode({:error, reason}), state}
     end
   end
 
@@ -649,11 +689,44 @@ defmodule Ferricstore.Server.Connection do
   end
 
   defp dispatch_acl("WHOAMI", _, state) do
-    {:continue, Encoder.encode("default"), state}
+    {:continue, Encoder.encode(state.username), state}
   end
 
   defp dispatch_acl("LIST", _, state) do
-    {:continue, Encoder.encode(["user default on ~* &* +@all"]), state}
+    {:continue, Encoder.encode(Ferricstore.Acl.list_users()), state}
+  end
+
+  defp dispatch_acl("SETUSER", [], state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|setuser' command"}), state}
+  end
+
+  defp dispatch_acl("SETUSER", [username | rules], state) do
+    case Ferricstore.Acl.set_user(username, rules) do
+      :ok ->
+        {:continue, Encoder.encode(:ok), state}
+
+      {:error, reason} ->
+        {:continue, Encoder.encode({:error, reason}), state}
+    end
+  end
+
+  defp dispatch_acl("DELUSER", [], state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|deluser' command"}), state}
+  end
+
+  defp dispatch_acl("DELUSER", usernames, state) do
+    results =
+      Enum.map(usernames, fn username ->
+        Ferricstore.Acl.del_user(username)
+      end)
+
+    case Enum.find(results, fn r -> match?({:error, _}, r) end) do
+      nil ->
+        {:continue, Encoder.encode(:ok), state}
+
+      {:error, reason} ->
+        {:continue, Encoder.encode({:error, reason}), state}
+    end
   end
 
   defp dispatch_acl("CAT", _, state) do
@@ -687,13 +760,18 @@ defmodule Ferricstore.Server.Connection do
     {:continue, Encoder.encode(entries), state}
   end
 
-  defp dispatch_acl("GETUSER", ["default" | _], state) do
-    info = ["flags", ["on"], "passwords", [], "commands", "+@all", "keys", "~*", "channels", "&*"]
-    {:continue, Encoder.encode(info), state}
+  defp dispatch_acl("GETUSER", [username | _], state) do
+    case Ferricstore.Acl.get_user_info(username) do
+      nil ->
+        {:continue, Encoder.encode(nil), state}
+
+      info ->
+        {:continue, Encoder.encode(info), state}
+    end
   end
 
-  defp dispatch_acl("GETUSER", [_user | _], state) do
-    {:continue, Encoder.encode(nil), state}
+  defp dispatch_acl("GETUSER", [], state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|getuser' command"}), state}
   end
 
   defp dispatch_acl(_, _, state) do
@@ -1310,31 +1388,31 @@ defmodule Ferricstore.Server.Connection do
       list_op: &Router.list_op/2,
       compound_get: fn redis_key, compound_key ->
         shard = Router.shard_name(Router.shard_for(redis_key))
-        GenServer.call(shard, {:get, compound_key})
+        GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
         shard = Router.shard_name(Router.shard_for(redis_key))
-        GenServer.call(shard, {:get_meta, compound_key})
+        GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
         shard = Router.shard_name(Router.shard_for(redis_key))
-        GenServer.call(shard, {:put, compound_key, value, expire_at_ms})
+        GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
         shard = Router.shard_name(Router.shard_for(redis_key))
-        GenServer.call(shard, {:delete, compound_key})
+        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
         shard = Router.shard_name(Router.shard_for(redis_key))
-        GenServer.call(shard, {:scan_prefix, prefix})
+        GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
         shard = Router.shard_name(Router.shard_for(redis_key))
-        GenServer.call(shard, {:count_prefix, prefix})
+        GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
         shard = Router.shard_name(Router.shard_for(redis_key))
-        GenServer.call(shard, {:delete_prefix, prefix})
+        GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }
   end

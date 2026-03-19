@@ -8,18 +8,26 @@ defmodule Ferricstore.Application do
   Ferricstore.Supervisor
   ├── Ferricstore.Stats                   (global counters & run metadata)
   ├── Ferricstore.Store.ShardSupervisor   (one_for_one over N Shard GenServers)
+  ├── Ferricstore.Merge.Supervisor        (Semaphore + N Scheduler GenServers)
   ├── Ranch listener (Ferricstore.Server.Listener)
-  └── Ranch TLS listener (Ferricstore.Server.TlsListener) [optional]
+  ├── Ranch TLS listener (Ferricstore.Server.TlsListener) [optional]
+  └── Health HTTP endpoint (Ferricstore.Health.Endpoint)
   ```
 
   `Stats` starts first so counters are available before any connection arrives.
   The `ShardSupervisor` must start **before** the Ranch listener so that the
   key-value store is ready before any client connection can arrive.
+  The `Merge.Supervisor` starts after `ShardSupervisor` so that shards are
+  available when schedulers attempt their initial fragmentation check.
+
+  The health endpoint starts last. It returns 503 until `Health.set_ready(true)`
+  is called after the supervision tree is fully started (spec 2C.1 Phase 3).
 
   ## Configuration (application env)
 
     * `:port`             - TCP port to bind (default: `6379`; test env uses `0` for ephemeral)
     * `:data_dir`         - Bitcask data directory (default: `"data"`)
+    * `:health_port`      - HTTP health check port (default: `9090`; test env uses `0`)
     * `:tls_port`         - TLS port to bind (default: `nil`; not started unless configured)
     * `:tls_cert_file`    - path to PEM certificate file
     * `:tls_key_file`     - path to PEM private key file
@@ -69,28 +77,41 @@ defmodule Ferricstore.Application do
         []
       end
 
+    health_port = Application.get_env(:ferricstore, :health_port, 9090)
+
     children =
       [
         Ferricstore.Stats,
         Ferricstore.SlowLog,
         Ferricstore.AuditLog,
         Ferricstore.Config,
+        Ferricstore.Acl,
         {Ferricstore.Store.ShardSupervisor, data_dir: data_dir}
       ] ++
         batcher_children ++
         [
+          {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
           Ferricstore.PubSub,
           Ferricstore.FetchOrCompute,
           {Ferricstore.MemoryGuard, memory_guard_opts()},
           ranch_listener_spec(port)
         ] ++
-        tls_listener_children()
+        tls_listener_children() ++
+        [
+          Ferricstore.Health.Endpoint.child_spec(health_port)
+        ]
 
     opts = [strategy: :one_for_one, name: Ferricstore.Supervisor]
     result = Supervisor.start_link(children, opts)
 
     case result do
       {:ok, _pid} ->
+        # Mark the node as ready for Kubernetes readiness probes (spec 2C.1).
+        # This must happen after the supervision tree is fully started so
+        # that the /health/ready endpoint returns 200 only when all shards
+        # and the TCP listener are operational.
+        Ferricstore.Health.set_ready(true)
+
         :telemetry.execute(
           [:ferricstore, :node, :startup_complete],
           %{duration_ms: System.monotonic_time(:millisecond)},
@@ -113,6 +134,10 @@ defmodule Ferricstore.Application do
 
   @impl true
   def prep_stop(state) do
+    # Mark the node as not ready so Kubernetes stops routing traffic
+    # before the supervision tree begins shutting down.
+    Ferricstore.Health.set_ready(false)
+
     :telemetry.execute(
       [:ferricstore, :node, :shutdown_started],
       %{uptime_ms: System.monotonic_time(:millisecond)},

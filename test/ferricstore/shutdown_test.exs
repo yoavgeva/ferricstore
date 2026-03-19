@@ -183,4 +183,114 @@ defmodule Ferricstore.ShutdownTest do
       assert recovered == "iso_val", "Data should survive shard stop"
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Spec 2C.6: Graceful shutdown lifecycle
+  #
+  # terminate/2 must: flush pending writes, write hint file, emit telemetry.
+  # OTP invokes terminate/2 when the supervisor stops children in reverse
+  # order during application shutdown.
+  # ---------------------------------------------------------------------------
+
+  describe "terminate/2 flushes pending writes" do
+    @tag :capture_log
+    test "after shutdown signal, pending writes are flushed" do
+      # Start an isolated shard so we can stop it without affecting the
+      # application supervisor tree.
+      tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_flush_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(tmp_dir)
+      on_exit(fn -> File.rm_rf(tmp_dir) end)
+
+      opts = [index: 100, data_dir: tmp_dir, flush_interval_ms: 100]
+      {:ok, pid} = GenServer.start_link(Ferricstore.Store.Shard, opts)
+
+      # Write several keys but do NOT call :flush. These remain in the
+      # pending list. terminate/2 must flush them to disk.
+      for i <- 1..10 do
+        :ok = GenServer.call(pid, {:put, "term_key_#{i}", "term_val_#{i}", 0})
+      end
+
+      # Graceful stop triggers terminate/2.
+      GenServer.stop(pid, :normal, 5_000)
+      refute Process.alive?(pid)
+
+      # Open a fresh Bitcask at the shard path and verify all keys survived.
+      shard_dir = DataDir.shard_data_path(tmp_dir, 100)
+      {:ok, fresh_store} = NIF.new(shard_dir)
+
+      for i <- 1..10 do
+        {:ok, recovered} = NIF.get(fresh_store, "term_key_#{i}")
+
+        assert recovered == "term_val_#{i}",
+               "Key term_key_#{i} should survive graceful shutdown"
+      end
+    end
+  end
+
+  describe "terminate/2 writes hint files" do
+    @tag :capture_log
+    test "after shutdown, hint files exist on disk" do
+      tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_hint_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(tmp_dir)
+      on_exit(fn -> File.rm_rf(tmp_dir) end)
+
+      opts = [index: 101, data_dir: tmp_dir, flush_interval_ms: 100]
+      {:ok, pid} = GenServer.start_link(Ferricstore.Store.Shard, opts)
+
+      # Write data so the Bitcask log has entries to reference in the hint.
+      :ok = GenServer.call(pid, {:put, "hint_key", "hint_val", 0})
+
+      # Graceful stop triggers terminate/2 which must call NIF.write_hint.
+      GenServer.stop(pid, :normal, 5_000)
+
+      # The shard data directory should contain at least one .hint file.
+      shard_dir = DataDir.shard_data_path(tmp_dir, 101)
+      files = File.ls!(shard_dir)
+      hint_files = Enum.filter(files, &String.ends_with?(&1, ".hint"))
+
+      assert length(hint_files) > 0,
+             "Shard directory should contain .hint file(s) after graceful shutdown, " <>
+               "got: #{inspect(files)}"
+    end
+  end
+
+  describe "terminate/2 emits shutdown telemetry" do
+    @tag :capture_log
+    test "shard terminate/2 emits [:ferricstore, :shard, :shutdown] telemetry" do
+      tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_telem_#{:rand.uniform(9_999_999)}")
+      File.mkdir_p!(tmp_dir)
+      on_exit(fn -> File.rm_rf(tmp_dir) end)
+
+      # Attach a telemetry handler to capture the shutdown event.
+      test_pid = self()
+      handler_id = "shutdown_test_#{:rand.uniform(9_999_999)}"
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :shard, :shutdown],
+        fn event_name, measurements, metadata, _config ->
+          send(test_pid, {:telemetry_event, event_name, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      opts = [index: 102, data_dir: tmp_dir, flush_interval_ms: 100]
+      {:ok, pid} = GenServer.start_link(Ferricstore.Store.Shard, opts)
+
+      :ok = GenServer.call(pid, {:put, "telem_key", "telem_val", 0})
+      GenServer.stop(pid, :normal, 5_000)
+
+      assert_receive {:telemetry_event, [:ferricstore, :shard, :shutdown], measurements,
+                       metadata},
+                     1_000
+
+      assert is_integer(measurements.flush_duration_us)
+      assert measurements.flush_duration_us >= 0
+      assert is_integer(measurements.hint_duration_us)
+      assert measurements.hint_duration_us >= 0
+      assert metadata.shard_index == 102
+    end
+  end
 end

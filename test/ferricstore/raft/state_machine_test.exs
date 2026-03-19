@@ -283,4 +283,251 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert StateMachine.overview(s3).keydir_size == 3
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # release_cursor for Raft log compaction (spec 2E.5)
+  # ---------------------------------------------------------------------------
+
+  describe "release_cursor log compaction" do
+    test "init/1 stores release_cursor_interval from config", %{store: store, ets: ets} do
+      state = StateMachine.init(%{shard_index: 0, store: store, ets: ets})
+      assert is_integer(state.release_cursor_interval)
+      assert state.release_cursor_interval > 0
+    end
+
+    test "init/1 accepts custom release_cursor_interval", %{store: store, ets: ets} do
+      state =
+        StateMachine.init(%{
+          shard_index: 0,
+          store: store,
+          ets: ets,
+          release_cursor_interval: 500
+        })
+
+      assert state.release_cursor_interval == 500
+    end
+
+    test "no release_cursor emitted before interval is reached", %{store: store, ets: ets} do
+      state =
+        StateMachine.init(%{
+          shard_index: 0,
+          store: store,
+          ets: ets,
+          release_cursor_interval: 5
+        })
+
+      # Apply 4 commands (below interval of 5) -- none should emit release_cursor
+      result =
+        Enum.reduce(1..4, state, fn i, acc ->
+          meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
+          apply_result = StateMachine.apply(meta, {:put, "rc_key_#{i}", "v#{i}", 0}, acc)
+
+          case apply_result do
+            {new_state, :ok} ->
+              new_state
+
+            {_new_state, :ok, _effects} ->
+              flunk("release_cursor emitted before interval reached at apply #{i}")
+          end
+        end)
+
+      assert result.applied_count == 4
+    end
+
+    test "release_cursor emitted exactly at interval boundary for put", %{store: store, ets: ets} do
+      interval = 5
+
+      state =
+        StateMachine.init(%{
+          shard_index: 0,
+          store: store,
+          ets: ets,
+          release_cursor_interval: interval
+        })
+
+      # Apply (interval - 1) commands without release_cursor
+      state_before =
+        Enum.reduce(1..(interval - 1), state, fn i, acc ->
+          meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
+          {new_state, :ok} = StateMachine.apply(meta, {:put, "rc_#{i}", "v#{i}", 0}, acc)
+          new_state
+        end)
+
+      assert state_before.applied_count == interval - 1
+
+      # The N-th apply (index = interval) should emit release_cursor
+      meta = %{index: interval, term: 1, system_time: System.os_time(:millisecond)}
+
+      {new_state, :ok, effects} =
+        StateMachine.apply(meta, {:put, "rc_#{interval}", "v#{interval}", 0}, state_before)
+
+      assert new_state.applied_count == interval
+
+      # Verify the release_cursor effect
+      assert [{:release_cursor, ra_index, cursor_state}] = effects
+      assert ra_index == interval
+      assert cursor_state.shard_index == 0
+      assert cursor_state.applied_count == interval
+    end
+
+    test "release_cursor emitted at every interval multiple", %{store: store, ets: ets} do
+      interval = 3
+
+      state =
+        StateMachine.init(%{
+          shard_index: 0,
+          store: store,
+          ets: ets,
+          release_cursor_interval: interval
+        })
+
+      # Apply 9 commands, expect release_cursor at positions 3, 6, 9
+      {_final_state, cursor_indices} =
+        Enum.reduce(1..9, {state, []}, fn i, {acc, cursors} ->
+          meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
+          apply_result = StateMachine.apply(meta, {:put, "mc_#{i}", "v#{i}", 0}, acc)
+
+          case apply_result do
+            {new_state, :ok} ->
+              {new_state, cursors}
+
+            {new_state, :ok, [{:release_cursor, idx, _snap_state}]} ->
+              {new_state, cursors ++ [idx]}
+          end
+        end)
+
+      assert cursor_indices == [3, 6, 9]
+    end
+
+    test "release_cursor emitted for delete at interval boundary", %{store: store, ets: ets} do
+      interval = 3
+
+      state =
+        StateMachine.init(%{
+          shard_index: 0,
+          store: store,
+          ets: ets,
+          release_cursor_interval: interval
+        })
+
+      # Put two keys (applied_count = 2), then delete at the 3rd apply
+      meta1 = %{index: 10, term: 1, system_time: System.os_time(:millisecond)}
+      {s1, :ok} = StateMachine.apply(meta1, {:put, "del_rc_a", "va", 0}, state)
+
+      meta2 = %{index: 11, term: 1, system_time: System.os_time(:millisecond)}
+      {s2, :ok} = StateMachine.apply(meta2, {:put, "del_rc_b", "vb", 0}, s1)
+
+      # 3rd command is a delete -- should trigger release_cursor
+      meta3 = %{index: 12, term: 1, system_time: System.os_time(:millisecond)}
+      {_s3, :ok, effects} = StateMachine.apply(meta3, {:delete, "del_rc_a"}, s2)
+
+      assert [{:release_cursor, 12, _cursor_state}] = effects
+    end
+
+    test "release_cursor emitted for batch that crosses interval boundary", %{
+      store: store,
+      ets: ets
+    } do
+      interval = 5
+
+      state =
+        StateMachine.init(%{
+          shard_index: 0,
+          store: store,
+          ets: ets,
+          release_cursor_interval: interval
+        })
+
+      # Apply 3 single commands (applied_count = 3)
+      state_before =
+        Enum.reduce(1..3, state, fn i, acc ->
+          meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
+          {new_state, :ok} = StateMachine.apply(meta, {:put, "pre_#{i}", "v#{i}", 0}, acc)
+          new_state
+        end)
+
+      assert state_before.applied_count == 3
+
+      # Batch of 3 commands takes applied_count from 3 to 6 -- crosses interval at 5
+      batch = [
+        {:put, "batch_1", "bv1", 0},
+        {:put, "batch_2", "bv2", 0},
+        {:put, "batch_3", "bv3", 0}
+      ]
+
+      meta = %{index: 4, term: 1, system_time: System.os_time(:millisecond)}
+      result = StateMachine.apply(meta, {:batch, batch}, state_before)
+
+      case result do
+        {new_state, {:ok, results}, effects} ->
+          assert results == [:ok, :ok, :ok]
+          assert new_state.applied_count == 6
+          assert [{:release_cursor, 4, _cursor_state}] = effects
+
+        {new_state, {:ok, results}} ->
+          # If batch doesn't cross, that's a bug -- fail
+          flunk(
+            "Expected release_cursor for batch crossing interval. " <>
+              "applied_count=#{new_state.applied_count}, results=#{inspect(results)}"
+          )
+      end
+    end
+
+    test "release_cursor not emitted when meta has no index", %{state: state} do
+      # Use default interval (1000). Even if we manually set applied_count to 999,
+      # without an index in meta, release_cursor should not be emitted.
+      state_near = %{state | applied_count: 999, release_cursor_interval: 1000}
+
+      # No :index in meta -- simulates unit test / non-ra context
+      result = StateMachine.apply(%{}, {:put, "no_idx", "val", 0}, state_near)
+
+      case result do
+        {new_state, :ok} ->
+          assert new_state.applied_count == 1000
+
+        {_new_state, :ok, _effects} ->
+          flunk("release_cursor should not be emitted when meta has no :index key")
+      end
+    end
+
+    test "release_cursor state snapshot contains correct machine state", %{
+      store: store,
+      ets: ets
+    } do
+      interval = 3
+
+      state =
+        StateMachine.init(%{
+          shard_index: 2,
+          store: store,
+          ets: ets,
+          release_cursor_interval: interval
+        })
+
+      # Apply 3 commands to trigger release_cursor
+      state_after =
+        Enum.reduce(1..2, state, fn i, acc ->
+          meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
+          {new_state, :ok} = StateMachine.apply(meta, {:put, "snap_#{i}", "v#{i}", 0}, acc)
+          new_state
+        end)
+
+      meta = %{index: 3, term: 1, system_time: System.os_time(:millisecond)}
+      {_new_state, :ok, [{:release_cursor, 3, cursor_state}]} =
+        StateMachine.apply(meta, {:put, "snap_3", "v3", 0}, state_after)
+
+      # The snapshot state should reflect the current state
+      assert cursor_state.shard_index == 2
+      assert cursor_state.applied_count == 3
+      assert cursor_state.store == store
+      assert cursor_state.ets == ets
+      assert cursor_state.release_cursor_interval == interval
+    end
+
+    test "overview/1 includes release_cursor_interval", %{state: state} do
+      overview = StateMachine.overview(state)
+      assert Map.has_key?(overview, :release_cursor_interval)
+      assert is_integer(overview.release_cursor_interval)
+    end
+  end
 end

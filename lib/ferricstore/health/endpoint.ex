@@ -1,0 +1,200 @@
+defmodule Ferricstore.Health.Endpoint do
+  @moduledoc """
+  Minimal HTTP/1.1 health endpoint for Kubernetes readiness probes.
+
+  Runs a Ranch TCP listener on a configurable port (default: `9090`, or `0`
+  for ephemeral in tests) that speaks just enough HTTP/1.1 to serve:
+
+    * `GET /health/ready` -- 200 when ready, 503 during startup
+    * All other paths      -- 404
+
+  ## Architecture
+
+  This intentionally avoids adding Cowboy or Plug as dependencies. The HTTP
+  parsing is minimal: we read the first line to extract the method and path,
+  then consume remaining headers until we see the blank line (`\\r\\n\\r\\n`).
+  Only `GET` requests are supported -- all others return 405.
+
+  Each accepted connection is a short-lived Ranch protocol process that sends
+  a single response and closes. There is no keep-alive or pipelining.
+
+  ## Configuration
+
+      config :ferricstore, :health_port, 9090
+
+  Set to `0` in test to use an ephemeral port (see `port/0`).
+
+  ## Kubernetes integration
+
+      readinessProbe:
+        httpGet:
+          path: /health/ready
+          port: 9090
+        initialDelaySeconds: 2
+        periodSeconds: 5
+  """
+
+  @behaviour :ranch_protocol
+
+  @listener_ref :"#{__MODULE__}"
+
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Returns the actual TCP port the health endpoint is bound to.
+
+  Works for both fixed ports and ephemeral (port 0) bindings. Raises if the
+  listener is not running.
+  """
+  @spec port() :: :inet.port_number()
+  def port do
+    :ranch.get_port(@listener_ref)
+  end
+
+  @doc """
+  Returns the Ranch listener reference atom for this endpoint.
+  """
+  @spec ref() :: atom()
+  def ref, do: @listener_ref
+
+  @doc """
+  Returns a Ranch child spec suitable for embedding in a supervisor.
+
+  ## Parameters
+
+    * `port` - TCP port to bind (0 for ephemeral)
+  """
+  @spec child_spec(port :: :inet.port_number()) :: Supervisor.child_spec()
+  def child_spec(port) do
+    transport_opts = %{
+      socket_opts: [port: port],
+      num_acceptors: 2,
+      max_connections: 64
+    }
+
+    :ranch.child_spec(
+      @listener_ref,
+      :ranch_tcp,
+      transport_opts,
+      __MODULE__,
+      %{}
+    )
+  end
+
+  # ---------------------------------------------------------------------------
+  # Ranch protocol callbacks
+  # ---------------------------------------------------------------------------
+
+  @doc false
+  @spec start_link(ref :: atom(), transport :: module(), opts :: map()) :: {:ok, pid()}
+  def start_link(ref, transport, opts) do
+    pid = spawn_link(__MODULE__, :init, [ref, transport, opts])
+    {:ok, pid}
+  end
+
+  @doc false
+  @spec init(ref :: atom(), transport :: module(), opts :: map()) :: :ok
+  def init(ref, transport, _opts) do
+    {:ok, socket} = :ranch.handshake(ref)
+    :ok = transport.setopts(socket, active: false)
+
+    case read_request(socket, transport) do
+      {:ok, method, path} ->
+        handle_request(socket, transport, method, path)
+
+      :error ->
+        send_response(socket, transport, 400, "Bad Request", ~s({"error":"bad request"}))
+    end
+
+    transport.close(socket)
+    :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # HTTP request parsing (minimal)
+  # ---------------------------------------------------------------------------
+
+  # Reads the HTTP request line and consumes headers. Returns {method, path}.
+  @spec read_request(:inet.socket(), module()) :: {:ok, String.t(), String.t()} | :error
+  defp read_request(socket, transport) do
+    case transport.recv(socket, 0, 5_000) do
+      {:ok, data} ->
+        parse_request_line(data)
+
+      {:error, _reason} ->
+        :error
+    end
+  end
+
+  @spec parse_request_line(binary()) :: {:ok, String.t(), String.t()} | :error
+  defp parse_request_line(data) do
+    case String.split(data, "\r\n", parts: 2) do
+      [request_line, _rest] ->
+        case String.split(request_line, " ", parts: 3) do
+          [method, path, _version] -> {:ok, method, path}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Request routing
+  # ---------------------------------------------------------------------------
+
+  @spec handle_request(:inet.socket(), module(), String.t(), String.t()) :: :ok
+  defp handle_request(socket, transport, "GET", "/health/ready") do
+    health = Ferricstore.Health.check()
+
+    body =
+      Jason.encode!(%{
+        status: Atom.to_string(health.status),
+        shard_count: health.shard_count,
+        shards:
+          Enum.map(health.shards, fn shard ->
+            %{index: shard.index, status: shard.status, keys: shard.keys}
+          end),
+        uptime_seconds: health.uptime_seconds
+      })
+
+    case health.status do
+      :ok ->
+        send_response(socket, transport, 200, "OK", body)
+
+      :starting ->
+        send_response(socket, transport, 503, "Service Unavailable", body)
+    end
+  end
+
+  defp handle_request(socket, transport, "GET", _path) do
+    send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
+  end
+
+  defp handle_request(socket, transport, _method, _path) do
+    send_response(socket, transport, 405, "Method Not Allowed", ~s({"error":"method not allowed"}))
+  end
+
+  # ---------------------------------------------------------------------------
+  # HTTP response writing
+  # ---------------------------------------------------------------------------
+
+  @spec send_response(:inet.socket(), module(), pos_integer(), String.t(), String.t()) :: :ok
+  defp send_response(socket, transport, status_code, status_text, body) do
+    content_length = byte_size(body)
+
+    response =
+      "HTTP/1.1 #{status_code} #{status_text}\r\n" <>
+        "Content-Type: application/json\r\n" <>
+        "Content-Length: #{content_length}\r\n" <>
+        "Connection: close\r\n" <>
+        "\r\n" <>
+        body
+
+    transport.send(socket, response)
+    :ok
+  end
+end

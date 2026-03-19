@@ -272,4 +272,128 @@ defmodule Ferricstore.HealthTest do
       assert uptime >= 0
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # /health/ready HTTP endpoint (spec 2C.1 Phase 3)
+  # ---------------------------------------------------------------------------
+
+  describe "/health/ready HTTP endpoint" do
+    test "returns 200 with status ok after app start" do
+      port = Ferricstore.Health.Endpoint.port()
+      assert is_integer(port) and port > 0
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /health/ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      assert response =~ "HTTP/1.1 200 OK"
+      assert response =~ "application/json"
+      assert response =~ ~s("status":"ok")
+    end
+
+    test "returns shard count in health response" do
+      port = Ferricstore.Health.Endpoint.port()
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /health/ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      # Extract the JSON body (after the blank line separating headers from body)
+      [_headers, body] = String.split(response, "\r\n\r\n", parts: 2)
+      {:ok, decoded} = Jason.decode(body)
+
+      shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+      assert decoded["shard_count"] == shard_count
+      assert is_list(decoded["shards"])
+      assert length(decoded["shards"]) == shard_count
+    end
+
+    test "returns shard status for each shard" do
+      port = Ferricstore.Health.Endpoint.port()
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /health/ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      [_headers, body] = String.split(response, "\r\n\r\n", parts: 2)
+      {:ok, decoded} = Jason.decode(body)
+
+      for shard <- decoded["shards"] do
+        assert Map.has_key?(shard, "index")
+        assert Map.has_key?(shard, "status")
+        assert shard["status"] in ["ok", "down"]
+      end
+    end
+
+    test "returns uptime_seconds in health response" do
+      port = Ferricstore.Health.Endpoint.port()
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /health/ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      [_headers, body] = String.split(response, "\r\n\r\n", parts: 2)
+      {:ok, decoded} = Jason.decode(body)
+
+      assert is_integer(decoded["uptime_seconds"])
+      assert decoded["uptime_seconds"] >= 0
+    end
+
+    test "returns 503 when not ready" do
+      # Temporarily mark the health as not ready, then restore.
+      Ferricstore.Health.set_ready(false)
+
+      port = Ferricstore.Health.Endpoint.port()
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /health/ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      assert response =~ "HTTP/1.1 503 Service Unavailable"
+      assert response =~ ~s("status":"starting")
+
+      # Restore ready state for subsequent tests.
+      Ferricstore.Health.set_ready(true)
+    end
+
+    test "returns 404 for unknown paths" do
+      port = Ferricstore.Health.Endpoint.port()
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      assert response =~ "HTTP/1.1 404 Not Found"
+    end
+
+    test "Health.ready? returns true after app start" do
+      assert Ferricstore.Health.ready?() == true
+    end
+
+    test "Health.check returns map with status and shards" do
+      result = Ferricstore.Health.check()
+      assert result.status == :ok
+      assert is_list(result.shards)
+      assert is_integer(result.shard_count)
+      assert is_integer(result.uptime_seconds)
+    end
+  end
 end

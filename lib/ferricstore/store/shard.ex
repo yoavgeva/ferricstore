@@ -70,11 +70,13 @@ defmodule Ferricstore.Store.Shard do
     :store,
     :ets,
     :index,
+    :data_dir,
     pending: [],
     flush_in_flight: nil,
     write_version: 0,
     sweep_at_ceiling_count: 0,
-    sweep_struggling: false
+    sweep_struggling: false,
+    promoted_instances: %{}
   ]
 
   # -------------------------------------------------------------------
@@ -129,10 +131,15 @@ defmodule Ferricstore.Store.Shard do
       Ferricstore.Raft.Cluster.start_shard_server(index, store, ets)
     end
 
+    # Recover any promoted collection instances from the shared Bitcask.
+    promoted =
+      Ferricstore.Store.Promotion.recover_promoted(store, ets, data_dir, index)
+
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
-    {:ok, %__MODULE__{store: store, ets: ets, index: index, pending: [],
-                       flush_in_flight: nil},
+    {:ok, %__MODULE__{store: store, ets: ets, index: index, data_dir: data_dir,
+                       pending: [], flush_in_flight: nil,
+                       promoted_instances: promoted},
      {:continue, {:flush_interval, flush_ms}}}
   end
 
@@ -244,6 +251,293 @@ defmodule Ferricstore.Store.Shard do
     {:reply, :ok, state}
   end
 
+  # -------------------------------------------------------------------
+  # Promotion-aware compound operations
+  #
+  # These handlers route to either the shared Bitcask or a dedicated
+  # promoted Bitcask based on whether the redis_key has been promoted.
+  # They also trigger promotion checks after writes.
+  # -------------------------------------------------------------------
+
+  def handle_call({:compound_get, redis_key, compound_key}, _from, state) do
+    case promoted_store(state, redis_key) do
+      nil ->
+        # Not promoted -- use ETS/shared Bitcask (same as {:get, compound_key})
+        case ets_lookup(state.ets, compound_key) do
+          {:hit, value, _exp} -> {:reply, value, state}
+          :expired -> {:reply, nil, state}
+          :miss ->
+            state = await_in_flight(state)
+            state = flush_pending_sync(state)
+            {:reply, warm_from_store(state, compound_key), state}
+        end
+
+      dedicated ->
+        # Promoted -- read from ETS first, then dedicated Bitcask
+        case ets_lookup(state.ets, compound_key) do
+          {:hit, value, _exp} -> {:reply, value, state}
+          :expired -> {:reply, nil, state}
+          :miss ->
+            case NIF.get(dedicated, compound_key) do
+              {:ok, nil} -> {:reply, nil, state}
+              {:ok, value} ->
+                :ets.insert(state.ets, {compound_key, value, 0})
+                {:reply, value, state}
+              _error -> {:reply, nil, state}
+            end
+        end
+    end
+  end
+
+  def handle_call({:compound_get_meta, redis_key, compound_key}, _from, state) do
+    case promoted_store(state, redis_key) do
+      nil ->
+        case ets_lookup(state.ets, compound_key) do
+          {:hit, value, expire_at_ms} -> {:reply, {value, expire_at_ms}, state}
+          :expired -> {:reply, nil, state}
+          :miss ->
+            state = await_in_flight(state)
+            state = flush_pending_sync(state)
+            {:reply, warm_meta_from_store(state, compound_key), state}
+        end
+
+      dedicated ->
+        case ets_lookup(state.ets, compound_key) do
+          {:hit, value, expire_at_ms} -> {:reply, {value, expire_at_ms}, state}
+          :expired -> {:reply, nil, state}
+          :miss ->
+            case NIF.get(dedicated, compound_key) do
+              {:ok, nil} -> {:reply, nil, state}
+              {:ok, value} ->
+                :ets.insert(state.ets, {compound_key, value, 0})
+                {:reply, {value, 0}, state}
+              _error -> {:reply, nil, state}
+            end
+        end
+    end
+  end
+
+  def handle_call({:compound_put, redis_key, compound_key, value, expire_at_ms}, _from, state) do
+    case promoted_store(state, redis_key) do
+      nil ->
+        # Not promoted -- write to ETS + shared pending batch
+        :ets.insert(state.ets, {compound_key, value, expire_at_ms})
+        new_pending = [{compound_key, value, expire_at_ms} | state.pending]
+        new_version = state.write_version + 1
+        new_state = %{state | pending: new_pending, write_version: new_version}
+
+        new_state =
+          if state.flush_in_flight == nil,
+            do: flush_pending(new_state),
+            else: new_state
+
+        # Check if this key should be promoted
+        new_state = maybe_promote(new_state, redis_key, compound_key)
+
+        {:reply, :ok, new_state}
+
+      dedicated ->
+        # Promoted -- write to ETS + dedicated Bitcask directly
+        :ets.insert(state.ets, {compound_key, value, expire_at_ms})
+        NIF.put(dedicated, compound_key, value, expire_at_ms)
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:compound_delete, redis_key, compound_key}, _from, state) do
+    case promoted_store(state, redis_key) do
+      nil ->
+        # Not promoted -- synchronous delete from shared Bitcask
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+        NIF.delete(state.store, compound_key)
+        :ets.delete(state.ets, compound_key)
+        new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == compound_key end)
+        new_version = state.write_version + 1
+        {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
+
+      dedicated ->
+        # Promoted -- delete from dedicated Bitcask
+        NIF.delete(dedicated, compound_key)
+        :ets.delete(state.ets, compound_key)
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:compound_scan, redis_key, prefix}, _from, state) do
+    case promoted_store(state, redis_key) do
+      nil ->
+        # Not promoted -- scan ETS (same as {:scan_prefix, prefix})
+        now = System.os_time(:millisecond)
+
+        results =
+          :ets.foldl(
+            fn {key, value, exp}, acc ->
+              if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+                field =
+                  case :binary.split(key, <<0>>) do
+                    [_prefix_part, sub] -> sub
+                    _ -> key
+                  end
+
+                [{field, value} | acc]
+              else
+                acc
+              end
+            end,
+            [],
+            state.ets
+          )
+
+        {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
+
+      dedicated ->
+        # Promoted -- scan dedicated Bitcask via get_all, filter by prefix
+        now = System.os_time(:millisecond)
+
+        # First check ETS for warm entries
+        ets_results =
+          :ets.foldl(
+            fn {key, value, exp}, acc ->
+              if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+                field =
+                  case :binary.split(key, <<0>>) do
+                    [_prefix_part, sub] -> sub
+                    _ -> key
+                  end
+
+                [{field, value} | acc]
+              else
+                acc
+              end
+            end,
+            [],
+            state.ets
+          )
+
+        # Also get from dedicated Bitcask for entries not yet in ETS
+        bitcask_results =
+          case NIF.get_all(dedicated) do
+            {:ok, pairs} ->
+              ets_keys = MapSet.new(ets_results, fn {field, _} -> field end)
+
+              pairs
+              |> Enum.filter(fn {k, _v} -> String.starts_with?(k, prefix) end)
+              |> Enum.map(fn {k, v} ->
+                field =
+                  case :binary.split(k, <<0>>) do
+                    [_prefix_part, sub] -> sub
+                    _ -> k
+                  end
+
+                {field, v}
+              end)
+              |> Enum.reject(fn {field, _v} -> MapSet.member?(ets_keys, field) end)
+
+            _ ->
+              []
+          end
+
+        all_results = ets_results ++ bitcask_results
+        {:reply, Enum.sort_by(all_results, fn {field, _} -> field end), state}
+    end
+  end
+
+  def handle_call({:compound_count, redis_key, prefix}, _from, state) do
+    case promoted_store(state, redis_key) do
+      nil ->
+        # Not promoted -- count in ETS (same as {:count_prefix, prefix})
+        now = System.os_time(:millisecond)
+
+        count =
+          :ets.foldl(
+            fn {key, _value, exp}, acc ->
+              if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+                acc + 1
+              else
+                acc
+              end
+            end,
+            0,
+            state.ets
+          )
+
+        {:reply, count, state}
+
+      dedicated ->
+        # Promoted -- count from dedicated Bitcask
+        count =
+          case NIF.keys(dedicated) do
+            keys when is_list(keys) ->
+              Enum.count(keys, &String.starts_with?(&1, prefix))
+
+            _ ->
+              0
+          end
+
+        {:reply, count, state}
+    end
+  end
+
+  def handle_call({:compound_delete_prefix, redis_key, prefix}, _from, state) do
+    case promoted_store(state, redis_key) do
+      nil ->
+        # Not promoted -- delete from ETS (same as {:delete_prefix, prefix})
+        keys_to_delete =
+          :ets.foldl(
+            fn {key, _value, _exp}, acc ->
+              if is_binary(key) and String.starts_with?(key, prefix) do
+                [key | acc]
+              else
+                acc
+              end
+            end,
+            [],
+            state.ets
+          )
+
+        Enum.each(keys_to_delete, fn key -> :ets.delete(state.ets, key) end)
+        {:reply, :ok, state}
+
+      _dedicated ->
+        # Promoted -- clean up the dedicated Bitcask entirely
+        alias Ferricstore.Store.Promotion
+
+        # Delete compound keys from ETS
+        keys_to_delete =
+          :ets.foldl(
+            fn {key, _value, _exp}, acc ->
+              if is_binary(key) and String.starts_with?(key, prefix) do
+                [key | acc]
+              else
+                acc
+              end
+            end,
+            [],
+            state.ets
+          )
+
+        Enum.each(keys_to_delete, fn key -> :ets.delete(state.ets, key) end)
+
+        # Clean up the dedicated instance and remove from state
+        Promotion.cleanup_promoted!(
+          redis_key,
+          state.store,
+          state.ets,
+          state.data_dir,
+          state.index
+        )
+
+        new_promoted = Map.delete(state.promoted_instances, redis_key)
+        {:reply, :ok, %{state | promoted_instances: new_promoted}}
+    end
+  end
+
+  # Check if a redis_key is promoted.
+  def handle_call({:promoted?, redis_key}, _from, state) do
+    {:reply, Map.has_key?(state.promoted_instances, redis_key), state}
+  end
+
   def handle_call({:put, key, value, expire_at_ms}, _from, state) do
     # Reject new-key writes when the keydir is at capacity (spec 2.4).
     # Updates to existing keys are always allowed regardless of memory pressure.
@@ -252,21 +546,32 @@ defmodule Ferricstore.Store.Shard do
     if is_new and Ferricstore.MemoryGuard.reject_writes?() do
       {:reply, {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}, state}
     else
-      # Write to ETS immediately so reads see it right away.
-      :ets.insert(state.ets, {key, value, expire_at_ms})
-      new_pending = [{key, value, expire_at_ms} | state.pending]
-      new_version = state.write_version + 1
-      new_state = %{state | pending: new_pending, write_version: new_version}
-
-      # Flush immediately when no async flush is in-flight. This ensures every
-      # put is submitted to io_uring (and thus kernel-managed) before the call
-      # returns, providing crash durability even if the process is killed before
-      # the timer fires. Multiple puts arriving while a flush is in-flight are
-      # batched together and flushed on the next timer tick after the CQE.
-      if state.flush_in_flight == nil do
-        {:reply, :ok, flush_pending(new_state)}
+      if raft_enabled?() do
+        # Raft path: route through Batcher -> ra -> StateMachine.apply
+        # StateMachine.apply writes to ETS + Bitcask synchronously.
+        # Batcher.write blocks until the Raft commit completes.
+        alias Ferricstore.Raft.Batcher
+        result = Batcher.write(state.index, {:put, key, value, expire_at_ms})
+        new_version = state.write_version + 1
+        {:reply, result, %{state | write_version: new_version}}
       else
-        {:reply, :ok, new_state}
+        # Direct path (no Raft): write to ETS immediately so reads see it
+        # right away, then queue for async Bitcask flush.
+        :ets.insert(state.ets, {key, value, expire_at_ms})
+        new_pending = [{key, value, expire_at_ms} | state.pending]
+        new_version = state.write_version + 1
+        new_state = %{state | pending: new_pending, write_version: new_version}
+
+        # Flush immediately when no async flush is in-flight. This ensures every
+        # put is submitted to io_uring (and thus kernel-managed) before the call
+        # returns, providing crash durability even if the process is killed before
+        # the timer fires. Multiple puts arriving while a flush is in-flight are
+        # batched together and flushed on the next timer tick after the CQE.
+        if state.flush_in_flight == nil do
+          {:reply, :ok, flush_pending(new_state)}
+        else
+          {:reply, :ok, new_state}
+        end
       end
     end
   end
@@ -274,6 +579,59 @@ defmodule Ferricstore.Store.Shard do
   # Atomic increment: reads current value, parses as integer, adds delta, writes back.
   # Returns {:ok, new_integer} or {:error, reason}.
   def handle_call({:incr, key, delta}, _from, state) do
+    if raft_enabled?() do
+      handle_incr_raft(key, delta, state)
+    else
+      handle_incr_direct(key, delta, state)
+    end
+  end
+
+  # Raft path for INCR: reads the current value from ETS/Bitcask (local read),
+  # computes the new value, then routes the resulting put through the Raft
+  # Batcher so the write is replicated and committed before replying.
+  defp handle_incr_raft(key, delta, state) do
+    alias Ferricstore.Raft.Batcher
+
+    {current_value, expire_at_ms} =
+      case ets_lookup(state.ets, key) do
+        {:hit, value, exp} -> {value, exp}
+        :expired -> {nil, 0}
+        :miss -> {do_get(state, key), 0}
+      end
+
+    case current_value do
+      nil ->
+        new_str = Integer.to_string(delta)
+        result = Batcher.write(state.index, {:put, key, new_str, 0})
+        new_version = state.write_version + 1
+
+        case result do
+          :ok -> {:reply, {:ok, delta}, %{state | write_version: new_version}}
+          {:error, _} = err -> {:reply, err, state}
+        end
+
+      value ->
+        case parse_integer(value) do
+          {:ok, int_val} ->
+            new_val = int_val + delta
+            new_str = Integer.to_string(new_val)
+            result = Batcher.write(state.index, {:put, key, new_str, expire_at_ms})
+            new_version = state.write_version + 1
+
+            case result do
+              :ok -> {:reply, {:ok, new_val}, %{state | write_version: new_version}}
+              {:error, _} = err -> {:reply, err, state}
+            end
+
+          :error ->
+            {:reply, {:error, "ERR value is not an integer or out of range"}, state}
+        end
+    end
+  end
+
+  # Direct path for INCR (no Raft): reads current value, computes new value,
+  # writes to ETS + pending batch for async Bitcask flush.
+  defp handle_incr_direct(key, delta, state) do
     case ets_lookup(state.ets, key) do
       {:hit, value, expire_at_ms} ->
         case parse_integer(value) do
@@ -282,7 +640,8 @@ defmodule Ferricstore.Store.Shard do
             new_str = Integer.to_string(new_val)
             :ets.insert(state.ets, {key, new_str, expire_at_ms})
             new_pending = [{key, new_str, expire_at_ms} | state.pending]
-            new_state = %{state | pending: new_pending}
+            new_version = state.write_version + 1
+            new_state = %{state | pending: new_pending, write_version: new_version}
 
             new_state =
               if state.flush_in_flight == nil,
@@ -300,7 +659,8 @@ defmodule Ferricstore.Store.Shard do
         new_str = Integer.to_string(delta)
         :ets.insert(state.ets, {key, new_str, 0})
         new_pending = [{key, new_str, 0} | state.pending]
-        new_state = %{state | pending: new_pending}
+        new_version = state.write_version + 1
+        new_state = %{state | pending: new_pending, write_version: new_version}
 
         new_state =
           if state.flush_in_flight == nil,
@@ -319,7 +679,8 @@ defmodule Ferricstore.Store.Shard do
             new_str = Integer.to_string(delta)
             :ets.insert(state.ets, {key, new_str, 0})
             new_pending = [{key, new_str, 0} | state.pending]
-            new_state = %{state | pending: new_pending}
+            new_version = state.write_version + 1
+            new_state = %{state | pending: new_pending, write_version: new_version}
 
             new_state =
               if state.flush_in_flight == nil,
@@ -342,7 +703,8 @@ defmodule Ferricstore.Store.Shard do
                 new_str = Integer.to_string(new_val)
                 :ets.insert(state.ets, {key, new_str, expire_at_ms})
                 new_pending = [{key, new_str, expire_at_ms} | state.pending]
-                new_state = %{state | pending: new_pending}
+                new_version = state.write_version + 1
+                new_state = %{state | pending: new_pending, write_version: new_version}
 
                 new_state =
                   if state.flush_in_flight == nil,
@@ -618,22 +980,31 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:delete, key}, _from, state) do
-    # Delete is always synchronous — tombstones must be durable immediately
-    # so a crash doesn't resurrect the key.
-    #
-    # 1. Wait for any in-flight async flush to complete.
-    # 2. Flush remaining pending writes synchronously.
-    # 3. Write the tombstone.
-    # 4. Remove the deleted key from pending to prevent resurrection.
-    state = await_in_flight(state)
-    state = flush_pending_sync(state)
-    NIF.delete(state.store, key)
-    :ets.delete(state.ets, key)
-    # Remove any pending entry for this key (belt-and-suspenders: flush above
-    # already cleared pending, but be explicit).
-    new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == key end)
-    new_version = state.write_version + 1
-    {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
+    if raft_enabled?() do
+      # Raft path: route through Batcher -> ra -> StateMachine.apply
+      # StateMachine.apply writes tombstone to Bitcask and removes from ETS.
+      alias Ferricstore.Raft.Batcher
+      result = Batcher.write(state.index, {:delete, key})
+      new_version = state.write_version + 1
+      {:reply, result, %{state | write_version: new_version}}
+    else
+      # Direct path: delete is always synchronous — tombstones must be durable
+      # immediately so a crash doesn't resurrect the key.
+      #
+      # 1. Wait for any in-flight async flush to complete.
+      # 2. Flush remaining pending writes synchronously.
+      # 3. Write the tombstone.
+      # 4. Remove the deleted key from pending to prevent resurrection.
+      state = await_in_flight(state)
+      state = flush_pending_sync(state)
+      NIF.delete(state.store, key)
+      :ets.delete(state.ets, key)
+      # Remove any pending entry for this key (belt-and-suspenders: flush above
+      # already cleared pending, but be explicit).
+      new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == key end)
+      new_version = state.write_version + 1
+      {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
+    end
   end
 
   # Returns the current write_version for WATCH support.
@@ -912,6 +1283,62 @@ defmodule Ferricstore.Store.Shard do
       # Stale or unknown op_id — ignore.
       {:noreply, state}
     end
+  end
+
+  # -------------------------------------------------------------------
+  # Graceful shutdown (spec 2C.6, step 8)
+  #
+  # OTP calls terminate/2 when the supervisor stops this child during
+  # application shutdown (children are stopped in reverse start order).
+  # We flush pending writes, write the Bitcask hint file, and emit
+  # telemetry so operators can observe shutdown timing.
+  # -------------------------------------------------------------------
+
+  @impl true
+  def terminate(_reason, state) do
+    t0 = System.monotonic_time(:microsecond)
+
+    # Step 1: drain any in-flight async flush and flush remaining pending
+    # writes synchronously to guarantee all data hits disk before exit.
+    state = await_in_flight(state)
+    state = flush_pending_sync(state)
+
+    t_flush = System.monotonic_time(:microsecond)
+
+    # Step 2: write the Bitcask hint file so the next startup can rebuild
+    # the keydir from hints (seconds) instead of replaying the full log
+    # (minutes for large datasets).
+    hint_result = NIF.write_hint(state.store)
+
+    case hint_result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Shard #{state.index}: failed to write hint file during shutdown: #{inspect(reason)}"
+        )
+    end
+
+    t_hint = System.monotonic_time(:microsecond)
+
+    # Step 3: emit shutdown telemetry for operator visibility.
+    :telemetry.execute(
+      [:ferricstore, :shard, :shutdown],
+      %{
+        flush_duration_us: t_flush - t0,
+        hint_duration_us: t_hint - t_flush,
+        total_duration_us: t_hint - t0
+      },
+      %{shard_index: state.index}
+    )
+
+    Logger.info(
+      "Shard #{state.index}: shutdown complete " <>
+        "(flush=#{t_flush - t0}us, hint=#{t_hint - t_flush}us)"
+    )
+
+    :ok
   end
 
   # -------------------------------------------------------------------
@@ -1270,5 +1697,111 @@ defmodule Ferricstore.Store.Shard do
       _ ->
         {0, System.os_time(:millisecond), 0}
     end
+  end
+
+  # -------------------------------------------------------------------
+  # Private: collection promotion helpers
+  # -------------------------------------------------------------------
+
+  # Returns the dedicated NIF store ref for a promoted key, or nil.
+  defp promoted_store(state, redis_key) do
+    Map.get(state.promoted_instances, redis_key)
+  end
+
+  # After a compound_put to the shared Bitcask, checks whether the
+  # collection should be promoted. Triggers for hash (H:), set (S:),
+  # and sorted set (Z:) compound keys when the entry count exceeds the
+  # threshold.
+  #
+  # Lists are NOT promoted because they store all elements in a single
+  # Bitcask entry (serialized Erlang term) rather than compound keys.
+  # A list with 1000 elements is still one Bitcask entry, so promotion
+  # would provide no benefit.
+  defp maybe_promote(state, redis_key, compound_key) do
+    alias Ferricstore.Store.{CompoundKey, Promotion}
+
+    threshold = Promotion.threshold()
+
+    # Disabled if threshold is 0, or already promoted
+    if threshold == 0 or Map.has_key?(state.promoted_instances, redis_key) do
+      state
+    else
+      # Detect the collection type from the compound key prefix
+      case detect_compound_type(redis_key, compound_key) do
+        nil ->
+          # Not a promotable compound key (e.g. list, type metadata)
+          state
+
+        {type, prefix} ->
+          # Count entries for this collection
+          now = System.os_time(:millisecond)
+
+          count =
+            :ets.foldl(
+              fn {key, _value, exp}, acc ->
+                if is_binary(key) and String.starts_with?(key, prefix) and
+                     (exp == 0 or exp > now) do
+                  acc + 1
+                else
+                  acc
+                end
+              end,
+              0,
+              state.ets
+            )
+
+          if count > threshold do
+            # Flush pending writes so the shared Bitcask has all data
+            state = await_in_flight(state)
+            state = flush_pending_sync(state)
+
+            case Promotion.promote_collection!(
+                   type,
+                   redis_key,
+                   state.store,
+                   state.ets,
+                   state.data_dir,
+                   state.index
+                 ) do
+              {:ok, dedicated_store} ->
+                new_promoted = Map.put(state.promoted_instances, redis_key, dedicated_store)
+                %{state | promoted_instances: new_promoted}
+
+              {:error, _reason} ->
+                # Promotion failed -- continue using shared Bitcask
+                state
+            end
+          else
+            state
+          end
+      end
+    end
+  end
+
+  # Detects the compound key type from its prefix and returns
+  # `{type_atom, scan_prefix}` or `nil` if not a promotable type.
+  defp detect_compound_type(redis_key, compound_key) do
+    alias Ferricstore.Store.CompoundKey
+
+    cond do
+      String.starts_with?(compound_key, CompoundKey.hash_prefix(redis_key)) ->
+        {:hash, CompoundKey.hash_prefix(redis_key)}
+
+      String.starts_with?(compound_key, CompoundKey.set_prefix(redis_key)) ->
+        {:set, CompoundKey.set_prefix(redis_key)}
+
+      String.starts_with?(compound_key, CompoundKey.zset_prefix(redis_key)) ->
+        {:zset, CompoundKey.zset_prefix(redis_key)}
+
+      true ->
+        nil
+    end
+  end
+
+  # Returns whether Raft consensus is enabled for write durability.
+  # Reads the application env at runtime so tests can disable Raft without
+  # recompiling.
+  defp raft_enabled? do
+    Application.get_env(:ferricstore, :raft_enabled, true)
   end
 end
