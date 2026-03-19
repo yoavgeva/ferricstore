@@ -432,7 +432,7 @@ defmodule Ferricstore.Commands.RedisCompatTest do
 
       result = Expiry.handle("EXPIRE", ["mykey", "0"], store)
       # Redis 7+: EXPIRE 0 means key expires now
-      assert result == 1 or result == {:error, _} = result
+      assert result == 1 or match?({:error, _}, result)
     end
 
     test "PEXPIRE 0 on a key should succeed" do
