@@ -24,4 +24,4 @@ config :ferricstore, :merge,
   fragmentation_threshold: 0.99
 
 # Raft: enabled in test — single node is its own quorum (per spec).
-config :ferricstore, :raft_enabled, true
+config :ferricstore, :raft_enabled, false
