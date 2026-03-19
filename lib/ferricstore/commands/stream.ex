@@ -484,7 +484,15 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp update_meta_after_trim(key, []) do
-    :ets.delete(@meta_table, key)
+    # Preserve metadata with length=0 instead of deleting, so that
+    # the stream's last_id is kept for future XADD ordering.
+    case :ets.lookup(@meta_table, key) do
+      [{^key, _len, _first, last, ms, seq}] ->
+        :ets.insert(@meta_table, {key, 0, "0-0", last, ms, seq})
+
+      [] ->
+        :ok
+    end
   end
 
   defp update_meta_after_trim(key, remaining_ids) do
@@ -1002,7 +1010,7 @@ defmodule Ferricstore.Commands.Stream do
 
   defp parse_xread_count(["COUNT", n_str | rest]) do
     case Integer.parse(n_str) do
-      {n, ""} when n > 0 -> {n, rest}
+      {n, ""} when n >= 0 -> {n, rest}
       _ -> {:infinity, rest}
     end
   end

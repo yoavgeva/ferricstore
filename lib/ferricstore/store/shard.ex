@@ -69,6 +69,8 @@ defmodule Ferricstore.Store.Shard do
   defstruct [
     :store,
     :ets,
+    :keydir,
+    :hot_cache,
     :index,
     :data_dir,
     pending: [],
@@ -112,18 +114,30 @@ defmodule Ferricstore.Store.Shard do
     File.mkdir_p!(path)
     {:ok, store} = NIF.new(path)
 
-    ets =
-      case :ets.whereis(:"shard_ets_#{index}") do
+    keydir =
+      case :ets.whereis(:"keydir_#{index}") do
         :undefined ->
-          :ets.new(:"shard_ets_#{index}", [:set, :public, :named_table])
+          :ets.new(:"keydir_#{index}", [:set, :public, :named_table])
 
         _ref ->
-          # Clear stale data from previous incarnation (e.g. after supervisor
-          # restart or test-induced crash). The Bitcask log is the source of
-          # truth — the keydir is rebuilt from hint files, not from ETS.
-          :ets.delete_all_objects(:"shard_ets_#{index}")
-          :"shard_ets_#{index}"
+          :ets.delete_all_objects(:"keydir_#{index}")
+          :"keydir_#{index}"
       end
+
+    hot_cache =
+      case :ets.whereis(:"hot_cache_#{index}") do
+        :undefined ->
+          :ets.new(:"hot_cache_#{index}", [:set, :public, :named_table])
+
+        _ref ->
+          :ets.delete_all_objects(:"hot_cache_#{index}")
+          :"hot_cache_#{index}"
+      end
+
+    # Backward compat: ets points to keydir (used by Raft and Promotion APIs
+    # that still receive a single ets atom). Those callers will be updated in
+    # later steps; until then they at least have the keydir table.
+    ets = keydir
 
     # Start the Raft server and Batcher for this shard if raft is enabled.
     # The ra system must already be started (done in Application.start).
@@ -151,7 +165,8 @@ defmodule Ferricstore.Store.Shard do
 
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
-    {:ok, %__MODULE__{store: store, ets: ets, index: index, data_dir: data_dir,
+    {:ok, %__MODULE__{store: store, ets: keydir, keydir: keydir, hot_cache: hot_cache,
+                       index: index, data_dir: data_dir,
                        pending: [], flush_in_flight: nil,
                        promoted_instances: promoted},
      {:continue, {:flush_interval, flush_ms}}}
@@ -167,7 +182,7 @@ defmodule Ferricstore.Store.Shard do
   @impl true
   def handle_call({:get, key}, _from, state) do
     # Fast path: ETS hit — no need to wait for in-flight writes.
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, value, _expire_at_ms} ->
         {:reply, value, state}
 
@@ -184,7 +199,7 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:get_meta, key}, _from, state) do
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, value, expire_at_ms} ->
         {:reply, {value, expire_at_ms}, state}
 
@@ -205,22 +220,27 @@ defmodule Ferricstore.Store.Shard do
 
     results =
       :ets.foldl(
-        fn {key, value, exp}, acc ->
+        fn {key, exp}, acc ->
           if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-            # Extract sub-key after the null byte separator
-            field =
-              case :binary.split(key, <<0>>) do
-                [_prefix_part, sub] -> sub
-                _ -> key
-              end
+            case :ets.lookup(state.hot_cache, key) do
+              [{^key, value}] ->
+                field =
+                  case :binary.split(key, <<0>>) do
+                    [_prefix_part, sub] -> sub
+                    _ -> key
+                  end
 
-            [{field, value} | acc]
+                [{field, value} | acc]
+
+              [] ->
+                acc
+            end
           else
             acc
           end
         end,
         [],
-        state.ets
+        state.keydir
       )
 
     {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
@@ -232,7 +252,7 @@ defmodule Ferricstore.Store.Shard do
 
     count =
       :ets.foldl(
-        fn {key, _value, exp}, acc ->
+        fn {key, exp}, acc ->
           if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
             acc + 1
           else
@@ -240,7 +260,7 @@ defmodule Ferricstore.Store.Shard do
           end
         end,
         0,
-        state.ets
+        state.keydir
       )
 
     {:reply, count, state}
@@ -253,7 +273,7 @@ defmodule Ferricstore.Store.Shard do
 
       keys_to_delete =
         :ets.foldl(
-          fn {key, _value, _exp}, acc ->
+          fn {key, _exp}, acc ->
             if is_binary(key) and String.starts_with?(key, prefix) do
               [key | acc]
             else
@@ -261,7 +281,7 @@ defmodule Ferricstore.Store.Shard do
             end
           end,
           [],
-          state.ets
+          state.keydir
         )
 
       Enum.each(keys_to_delete, fn key ->
@@ -273,7 +293,7 @@ defmodule Ferricstore.Store.Shard do
     else
       keys_to_delete =
         :ets.foldl(
-          fn {key, _value, _exp}, acc ->
+          fn {key, _exp}, acc ->
             if is_binary(key) and String.starts_with?(key, prefix) do
               [key | acc]
             else
@@ -281,10 +301,10 @@ defmodule Ferricstore.Store.Shard do
             end
           end,
           [],
-          state.ets
+          state.keydir
         )
 
-      Enum.each(keys_to_delete, fn key -> :ets.delete(state.ets, key) end)
+      Enum.each(keys_to_delete, fn key -> ets_delete_key(state, key) end)
       {:reply, :ok, state}
     end
   end
@@ -301,7 +321,7 @@ defmodule Ferricstore.Store.Shard do
     case promoted_store(state, redis_key) do
       nil ->
         # Not promoted -- use ETS/shared Bitcask (same as {:get, compound_key})
-        case ets_lookup(state.ets, compound_key) do
+        case ets_lookup(state, compound_key) do
           {:hit, value, _exp} -> {:reply, value, state}
           :expired -> {:reply, nil, state}
           :miss ->
@@ -312,14 +332,14 @@ defmodule Ferricstore.Store.Shard do
 
       dedicated ->
         # Promoted -- read from ETS first, then dedicated Bitcask
-        case ets_lookup(state.ets, compound_key) do
+        case ets_lookup(state, compound_key) do
           {:hit, value, _exp} -> {:reply, value, state}
           :expired -> {:reply, nil, state}
           :miss ->
             case NIF.get(dedicated, compound_key) do
               {:ok, nil} -> {:reply, nil, state}
               {:ok, value} ->
-                :ets.insert(state.ets, {compound_key, value, 0})
+                ets_insert(state, compound_key, value, 0)
                 {:reply, value, state}
               _error -> {:reply, nil, state}
             end
@@ -330,7 +350,7 @@ defmodule Ferricstore.Store.Shard do
   def handle_call({:compound_get_meta, redis_key, compound_key}, _from, state) do
     case promoted_store(state, redis_key) do
       nil ->
-        case ets_lookup(state.ets, compound_key) do
+        case ets_lookup(state, compound_key) do
           {:hit, value, expire_at_ms} -> {:reply, {value, expire_at_ms}, state}
           :expired -> {:reply, nil, state}
           :miss ->
@@ -340,14 +360,14 @@ defmodule Ferricstore.Store.Shard do
         end
 
       dedicated ->
-        case ets_lookup(state.ets, compound_key) do
+        case ets_lookup(state, compound_key) do
           {:hit, value, expire_at_ms} -> {:reply, {value, expire_at_ms}, state}
           :expired -> {:reply, nil, state}
           :miss ->
             case NIF.get(dedicated, compound_key) do
               {:ok, nil} -> {:reply, nil, state}
               {:ok, value} ->
-                :ets.insert(state.ets, {compound_key, value, 0})
+                ets_insert(state, compound_key, value, 0)
                 {:reply, {value, 0}, state}
               _error -> {:reply, nil, state}
             end
@@ -387,7 +407,7 @@ defmodule Ferricstore.Store.Shard do
 
       dedicated ->
         # Promoted -- write to ETS + dedicated Bitcask directly
-        :ets.insert(state.ets, {compound_key, value, expire_at_ms})
+        ets_insert(state, compound_key, value, expire_at_ms)
         NIF.put(dedicated, compound_key, value, expire_at_ms)
         {:reply, :ok, state}
     end
@@ -398,7 +418,7 @@ defmodule Ferricstore.Store.Shard do
     case promoted_store(state, redis_key) do
       nil ->
         # Not promoted -- write to ETS + shared pending batch
-        :ets.insert(state.ets, {compound_key, value, expire_at_ms})
+        ets_insert(state, compound_key, value, expire_at_ms)
         new_pending = [{compound_key, value, expire_at_ms} | state.pending]
         new_version = state.write_version + 1
         new_state = %{state | pending: new_pending, write_version: new_version}
@@ -415,7 +435,7 @@ defmodule Ferricstore.Store.Shard do
 
       dedicated ->
         # Promoted -- write to ETS + dedicated Bitcask directly
-        :ets.insert(state.ets, {compound_key, value, expire_at_ms})
+        ets_insert(state, compound_key, value, expire_at_ms)
         NIF.put(dedicated, compound_key, value, expire_at_ms)
         {:reply, :ok, state}
     end
@@ -447,7 +467,7 @@ defmodule Ferricstore.Store.Shard do
       dedicated ->
         # Promoted -- delete from dedicated Bitcask directly
         NIF.delete(dedicated, compound_key)
-        :ets.delete(state.ets, compound_key)
+        ets_delete_key(state, compound_key)
         {:reply, :ok, state}
     end
   end
@@ -460,7 +480,7 @@ defmodule Ferricstore.Store.Shard do
         state = await_in_flight(state)
         state = flush_pending_sync(state)
         NIF.delete(state.store, compound_key)
-        :ets.delete(state.ets, compound_key)
+        ets_delete_key(state, compound_key)
         new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == compound_key end)
         new_version = state.write_version + 1
         {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
@@ -468,7 +488,7 @@ defmodule Ferricstore.Store.Shard do
       dedicated ->
         # Promoted -- delete from dedicated Bitcask
         NIF.delete(dedicated, compound_key)
-        :ets.delete(state.ets, compound_key)
+        ets_delete_key(state, compound_key)
         {:reply, :ok, state}
     end
   end
@@ -481,21 +501,27 @@ defmodule Ferricstore.Store.Shard do
 
         results =
           :ets.foldl(
-            fn {key, value, exp}, acc ->
+            fn {key, exp}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-                field =
-                  case :binary.split(key, <<0>>) do
-                    [_prefix_part, sub] -> sub
-                    _ -> key
-                  end
+                case :ets.lookup(state.hot_cache, key) do
+                  [{^key, value}] ->
+                    field =
+                      case :binary.split(key, <<0>>) do
+                        [_prefix_part, sub] -> sub
+                        _ -> key
+                      end
 
-                [{field, value} | acc]
+                    [{field, value} | acc]
+
+                  [] ->
+                    acc
+                end
               else
                 acc
               end
             end,
             [],
-            state.ets
+            state.keydir
           )
 
         {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
@@ -507,21 +533,27 @@ defmodule Ferricstore.Store.Shard do
         # First check ETS for warm entries
         ets_results =
           :ets.foldl(
-            fn {key, value, exp}, acc ->
+            fn {key, exp}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-                field =
-                  case :binary.split(key, <<0>>) do
-                    [_prefix_part, sub] -> sub
-                    _ -> key
-                  end
+                case :ets.lookup(state.hot_cache, key) do
+                  [{^key, value}] ->
+                    field =
+                      case :binary.split(key, <<0>>) do
+                        [_prefix_part, sub] -> sub
+                        _ -> key
+                      end
 
-                [{field, value} | acc]
+                    [{field, value} | acc]
+
+                  [] ->
+                    acc
+                end
               else
                 acc
               end
             end,
             [],
-            state.ets
+            state.keydir
           )
 
         # Also get from dedicated Bitcask for entries not yet in ETS
@@ -560,7 +592,7 @@ defmodule Ferricstore.Store.Shard do
 
         count =
           :ets.foldl(
-            fn {key, _value, exp}, acc ->
+            fn {key, exp}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
                 acc + 1
               else
@@ -568,7 +600,7 @@ defmodule Ferricstore.Store.Shard do
               end
             end,
             0,
-            state.ets
+            state.keydir
           )
 
         {:reply, count, state}
@@ -606,7 +638,7 @@ defmodule Ferricstore.Store.Shard do
         # Not promoted -- route deletes through Raft
         keys_to_delete =
           :ets.foldl(
-            fn {key, _value, _exp}, acc ->
+            fn {key, _exp}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) do
                 [key | acc]
               else
@@ -614,7 +646,7 @@ defmodule Ferricstore.Store.Shard do
               end
             end,
             [],
-            state.ets
+            state.keydir
           )
 
         Enum.each(keys_to_delete, fn key ->
@@ -631,7 +663,7 @@ defmodule Ferricstore.Store.Shard do
         # Delete compound keys from ETS
         keys_to_delete =
           :ets.foldl(
-            fn {key, _value, _exp}, acc ->
+            fn {key, _exp}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) do
                 [key | acc]
               else
@@ -639,10 +671,10 @@ defmodule Ferricstore.Store.Shard do
               end
             end,
             [],
-            state.ets
+            state.keydir
           )
 
-        Enum.each(keys_to_delete, fn key -> :ets.delete(state.ets, key) end)
+        Enum.each(keys_to_delete, fn key -> ets_delete_key(state, key) end)
 
         # Clean up the dedicated instance and remove from state
         Promotion.cleanup_promoted!(
@@ -665,7 +697,7 @@ defmodule Ferricstore.Store.Shard do
         # Not promoted -- delete from ETS (same as {:delete_prefix, prefix})
         keys_to_delete =
           :ets.foldl(
-            fn {key, _value, _exp}, acc ->
+            fn {key, _exp}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) do
                 [key | acc]
               else
@@ -673,10 +705,10 @@ defmodule Ferricstore.Store.Shard do
               end
             end,
             [],
-            state.ets
+            state.keydir
           )
 
-        Enum.each(keys_to_delete, fn key -> :ets.delete(state.ets, key) end)
+        Enum.each(keys_to_delete, fn key -> ets_delete_key(state, key) end)
         {:reply, :ok, state}
 
       _dedicated ->
@@ -686,7 +718,7 @@ defmodule Ferricstore.Store.Shard do
         # Delete compound keys from ETS
         keys_to_delete =
           :ets.foldl(
-            fn {key, _value, _exp}, acc ->
+            fn {key, _exp}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) do
                 [key | acc]
               else
@@ -694,10 +726,10 @@ defmodule Ferricstore.Store.Shard do
               end
             end,
             [],
-            state.ets
+            state.keydir
           )
 
-        Enum.each(keys_to_delete, fn key -> :ets.delete(state.ets, key) end)
+        Enum.each(keys_to_delete, fn key -> ets_delete_key(state, key) end)
 
         # Clean up the dedicated instance and remove from state
         Promotion.cleanup_promoted!(
@@ -721,7 +753,7 @@ defmodule Ferricstore.Store.Shard do
   def handle_call({:put, key, value, expire_at_ms}, _from, state) do
     # Reject new-key writes when the keydir is at capacity (spec 2.4).
     # Updates to existing keys are always allowed regardless of memory pressure.
-    is_new = :ets.lookup(state.ets, key) == []
+    is_new = :ets.lookup(state.keydir, key) == []
 
     if is_new and Ferricstore.MemoryGuard.reject_writes?() do
       {:reply, {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}, state}
@@ -737,7 +769,7 @@ defmodule Ferricstore.Store.Shard do
       else
         # Direct path (no Raft): write to ETS immediately so reads see it
         # right away, then queue for async Bitcask flush.
-        :ets.insert(state.ets, {key, value, expire_at_ms})
+        ets_insert(state, key, value, expire_at_ms)
         new_pending = [{key, value, expire_at_ms} | state.pending]
         new_version = state.write_version + 1
         new_state = %{state | pending: new_pending, write_version: new_version}
@@ -773,7 +805,7 @@ defmodule Ferricstore.Store.Shard do
     alias Ferricstore.Raft.Batcher
 
     {current_value, expire_at_ms} =
-      case ets_lookup(state.ets, key) do
+      case ets_lookup(state, key) do
         {:hit, value, exp} -> {value, exp}
         :expired -> {nil, 0}
         :miss -> {do_get(state, key), 0}
@@ -812,13 +844,13 @@ defmodule Ferricstore.Store.Shard do
   # Direct path for INCR (no Raft): reads current value, computes new value,
   # writes to ETS + pending batch for async Bitcask flush.
   defp handle_incr_direct(key, delta, state) do
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, value, expire_at_ms} ->
         case parse_integer(value) do
           {:ok, int_val} ->
             new_val = int_val + delta
             new_str = Integer.to_string(new_val)
-            :ets.insert(state.ets, {key, new_str, expire_at_ms})
+            ets_insert(state, key, new_str, expire_at_ms)
             new_pending = [{key, new_str, expire_at_ms} | state.pending]
             new_version = state.write_version + 1
             new_state = %{state | pending: new_pending, write_version: new_version}
@@ -837,7 +869,7 @@ defmodule Ferricstore.Store.Shard do
       :expired ->
         # Treat as non-existent: set to delta
         new_str = Integer.to_string(delta)
-        :ets.insert(state.ets, {key, new_str, 0})
+        ets_insert(state, key, new_str, 0)
         new_pending = [{key, new_str, 0} | state.pending]
         new_version = state.write_version + 1
         new_state = %{state | pending: new_pending, write_version: new_version}
@@ -857,7 +889,7 @@ defmodule Ferricstore.Store.Shard do
         case do_get(state, key) do
           nil ->
             new_str = Integer.to_string(delta)
-            :ets.insert(state.ets, {key, new_str, 0})
+            ets_insert(state, key, new_str, 0)
             new_pending = [{key, new_str, 0} | state.pending]
             new_version = state.write_version + 1
             new_state = %{state | pending: new_pending, write_version: new_version}
@@ -881,7 +913,7 @@ defmodule Ferricstore.Store.Shard do
               {:ok, int_val} ->
                 new_val = int_val + delta
                 new_str = Integer.to_string(new_val)
-                :ets.insert(state.ets, {key, new_str, expire_at_ms})
+                ets_insert(state, key, new_str, expire_at_ms)
                 new_pending = [{key, new_str, expire_at_ms} | state.pending]
                 new_version = state.write_version + 1
                 new_state = %{state | pending: new_pending, write_version: new_version}
@@ -926,13 +958,13 @@ defmodule Ferricstore.Store.Shard do
 
   # Direct path for INCRBYFLOAT (no Raft).
   defp handle_incr_float_direct(key, delta, state) do
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, value, expire_at_ms} ->
         case parse_float(value) do
           {:ok, float_val} ->
             new_val = float_val + delta
             new_str = format_float(new_val)
-            :ets.insert(state.ets, {key, new_str, expire_at_ms})
+            ets_insert(state, key, new_str, expire_at_ms)
             new_pending = [{key, new_str, expire_at_ms} | state.pending]
             new_state = %{state | pending: new_pending}
 
@@ -949,7 +981,7 @@ defmodule Ferricstore.Store.Shard do
 
       :expired ->
         new_str = format_float(delta)
-        :ets.insert(state.ets, {key, new_str, 0})
+        ets_insert(state, key, new_str, 0)
         new_pending = [{key, new_str, 0} | state.pending]
         new_state = %{state | pending: new_pending}
 
@@ -967,7 +999,7 @@ defmodule Ferricstore.Store.Shard do
         case do_get(state, key) do
           nil ->
             new_str = format_float(delta)
-            :ets.insert(state.ets, {key, new_str, 0})
+            ets_insert(state, key, new_str, 0)
             new_pending = [{key, new_str, 0} | state.pending]
             new_state = %{state | pending: new_pending}
 
@@ -989,7 +1021,7 @@ defmodule Ferricstore.Store.Shard do
               {:ok, float_val} ->
                 new_val = float_val + delta
                 new_str = format_float(new_val)
-                :ets.insert(state.ets, {key, new_str, expire_at_ms})
+                ets_insert(state, key, new_str, expire_at_ms)
                 new_pending = [{key, new_str, expire_at_ms} | state.pending]
                 new_state = %{state | pending: new_pending}
 
@@ -1033,10 +1065,10 @@ defmodule Ferricstore.Store.Shard do
 
   # Direct path for APPEND (no Raft).
   defp handle_append_direct(key, suffix, state) do
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, value, expire_at_ms} ->
         new_val = value <> suffix
-        :ets.insert(state.ets, {key, new_val, expire_at_ms})
+        ets_insert(state, key, new_val, expire_at_ms)
         new_pending = [{key, new_val, expire_at_ms} | state.pending]
         new_state = %{state | pending: new_pending}
 
@@ -1048,7 +1080,7 @@ defmodule Ferricstore.Store.Shard do
         {:reply, {:ok, byte_size(new_val)}, new_state}
 
       :expired ->
-        :ets.insert(state.ets, {key, suffix, 0})
+        ets_insert(state, key, suffix, 0)
         new_pending = [{key, suffix, 0} | state.pending]
         new_state = %{state | pending: new_pending}
 
@@ -1070,7 +1102,7 @@ defmodule Ferricstore.Store.Shard do
           end
 
         new_val = old_val <> suffix
-        :ets.insert(state.ets, {key, new_val, expire_at_ms})
+        ets_insert(state, key, new_val, expire_at_ms)
         new_pending = [{key, new_val, expire_at_ms} | state.pending]
         new_state = %{state | pending: new_pending}
 
@@ -1109,7 +1141,7 @@ defmodule Ferricstore.Store.Shard do
   # Direct path for GETSET (no Raft).
   defp handle_getset_direct(key, new_value, state) do
     old =
-      case ets_lookup(state.ets, key) do
+      case ets_lookup(state, key) do
         {:hit, value, _expire_at_ms} -> value
         :expired -> nil
         :miss ->
@@ -1118,7 +1150,7 @@ defmodule Ferricstore.Store.Shard do
           do_get(state, key)
       end
 
-    :ets.insert(state.ets, {key, new_value, 0})
+    ets_insert(state, key, new_value, 0)
     new_pending = [{key, new_value, 0} | state.pending]
     new_state = %{state | pending: new_pending}
 
@@ -1156,7 +1188,7 @@ defmodule Ferricstore.Store.Shard do
   # Direct path for GETDEL (no Raft).
   defp handle_getdel_direct(key, state) do
     old =
-      case ets_lookup(state.ets, key) do
+      case ets_lookup(state, key) do
         {:hit, value, _expire_at_ms} -> value
         :expired -> nil
         :miss ->
@@ -1170,7 +1202,7 @@ defmodule Ferricstore.Store.Shard do
       state = await_in_flight(state)
       state = flush_pending_sync(state)
       NIF.delete(state.store, key)
-      :ets.delete(state.ets, key)
+      ets_delete_key(state, key)
       new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == key end)
       {:reply, old, %{state | pending: new_pending}}
     else
@@ -1204,9 +1236,9 @@ defmodule Ferricstore.Store.Shard do
 
   # Direct path for GETEX (no Raft).
   defp handle_getex_direct(key, expire_at_ms, state) do
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, value, _old_exp} ->
-        :ets.insert(state.ets, {key, value, expire_at_ms})
+        ets_insert(state, key, value, expire_at_ms)
         new_pending = [{key, value, expire_at_ms} | state.pending]
         new_state = %{state | pending: new_pending}
 
@@ -1229,7 +1261,7 @@ defmodule Ferricstore.Store.Shard do
             {:reply, nil, state}
 
           value ->
-            :ets.insert(state.ets, {key, value, expire_at_ms})
+            ets_insert(state, key, value, expire_at_ms)
             new_pending = [{key, value, expire_at_ms} | state.pending]
             new_state = %{state | pending: new_pending}
 
@@ -1271,7 +1303,7 @@ defmodule Ferricstore.Store.Shard do
   # Direct path for SETRANGE (no Raft).
   defp handle_setrange_direct(key, offset, value, state) do
     {old_val, expire_at_ms} =
-      case ets_lookup(state.ets, key) do
+      case ets_lookup(state, key) do
         {:hit, v, exp} -> {v, exp}
         :expired -> {"", 0}
         :miss ->
@@ -1285,7 +1317,7 @@ defmodule Ferricstore.Store.Shard do
       end
 
     new_val = apply_setrange(old_val, offset, value)
-    :ets.insert(state.ets, {key, new_val, expire_at_ms})
+    ets_insert(state, key, new_val, expire_at_ms)
     new_pending = [{key, new_val, expire_at_ms} | state.pending]
     new_state = %{state | pending: new_pending}
 
@@ -1316,7 +1348,7 @@ defmodule Ferricstore.Store.Shard do
       state = await_in_flight(state)
       state = flush_pending_sync(state)
       NIF.delete(state.store, key)
-      :ets.delete(state.ets, key)
+      ets_delete_key(state, key)
       # Remove any pending entry for this key (belt-and-suspenders: flush above
       # already cleared pending, but be explicit).
       new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == key end)
@@ -1362,7 +1394,7 @@ defmodule Ferricstore.Store.Shard do
     case resolve_for_native(state, key) do
       {{:hit, ^expected, old_exp}, state} ->
         expire = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: old_exp
-        :ets.insert(state.ets, {key, new_value, expire})
+        ets_insert(state, key, new_value, expire)
         new_pending = [{key, new_value, expire} | state.pending]
         new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
         new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
@@ -1404,7 +1436,7 @@ defmodule Ferricstore.Store.Shard do
 
     case resolve_for_native(state, key) do
       {{:hit, ^owner, _exp}, state} ->
-        :ets.insert(state.ets, {key, owner, expire})
+        ets_insert(state, key, owner, expire)
         new_pending = [{key, owner, expire} | state.pending]
         new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
         new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
@@ -1414,7 +1446,7 @@ defmodule Ferricstore.Store.Shard do
         {:reply, {:error, "DISTLOCK lock is held by another owner"}, state}
 
       {_, state} ->
-        :ets.insert(state.ets, {key, owner, expire})
+        ets_insert(state, key, owner, expire)
         new_pending = [{key, owner, expire} | state.pending]
         new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
         new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
@@ -1453,7 +1485,7 @@ defmodule Ferricstore.Store.Shard do
         state = await_in_flight(state)
         state = flush_pending_sync(state)
         NIF.delete(state.store, key)
-        :ets.delete(state.ets, key)
+        ets_delete_key(state, key)
         {:reply, 1, %{state | write_version: state.write_version + 1}}
 
       {{:hit, _other, _exp}, state} ->
@@ -1493,7 +1525,7 @@ defmodule Ferricstore.Store.Shard do
 
     case resolve_for_native(state, key) do
       {{:hit, ^owner, _exp}, state} ->
-        :ets.insert(state.ets, {key, owner, new_expire})
+        ets_insert(state, key, owner, new_expire)
         new_pending = [{key, owner, new_expire} | state.pending]
         new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
         new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
@@ -1537,7 +1569,7 @@ defmodule Ferricstore.Store.Shard do
     now = System.os_time(:millisecond)
 
     {cur_count, cur_start, prv_count} =
-      case ets_lookup(state.ets, key) do
+      case ets_lookup(state, key) do
         {:hit, value, _exp} -> decode_ratelimit(value)
         _ -> {0, now, 0}
       end
@@ -1559,7 +1591,7 @@ defmodule Ferricstore.Store.Shard do
     {status, final_count, remaining, state} =
       if effective + count > max do
         value = encode_ratelimit(cur_count, cur_start, prv_count)
-        :ets.insert(state.ets, {key, value, expire_at_ms})
+        ets_insert(state, key, value, expire_at_ms)
         new_pending = [{key, value, expire_at_ms} | state.pending]
         new_state = %{state | pending: new_pending}
         new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
@@ -1568,7 +1600,7 @@ defmodule Ferricstore.Store.Shard do
         new_cur = cur_count + count
         new_eff = effective + count
         value = encode_ratelimit(new_cur, cur_start, prv_count)
-        :ets.insert(state.ets, {key, value, expire_at_ms})
+        ets_insert(state, key, value, expire_at_ms)
         new_pending = [{key, value, expire_at_ms} | state.pending]
         new_state = %{state | pending: new_pending}
         new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
@@ -1618,13 +1650,13 @@ defmodule Ferricstore.Store.Shard do
 
     get_fn = fn -> do_get(state, key) end
     put_fn = fn encoded_binary ->
-      :ets.insert(state.ets, {key, encoded_binary, 0})
+      ets_insert(state, key, encoded_binary, 0)
       NIF.put(state.store, key, encoded_binary, 0)
       :ok
     end
     delete_fn = fn ->
       NIF.delete(state.store, key)
-      :ets.delete(state.ets, key)
+      ets_delete_key(state, key)
       :ok
     end
 
@@ -1672,18 +1704,18 @@ defmodule Ferricstore.Store.Shard do
     src_get_fn = fn -> do_get(state, src_key) end
     dst_get_fn = fn -> do_get(state, dst_key) end
     src_put_fn = fn encoded ->
-      :ets.insert(state.ets, {src_key, encoded, 0})
+      ets_insert(state, src_key, encoded, 0)
       NIF.put(state.store, src_key, encoded, 0)
       :ok
     end
     dst_put_fn = fn encoded ->
-      :ets.insert(state.ets, {dst_key, encoded, 0})
+      ets_insert(state, dst_key, encoded, 0)
       NIF.put(state.store, dst_key, encoded, 0)
       :ok
     end
     src_delete_fn = fn ->
       NIF.delete(state.store, src_key)
-      :ets.delete(state.ets, src_key)
+      ets_delete_key(state, src_key)
       :ok
     end
 
@@ -1693,7 +1725,7 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:exists, key}, _from, state) do
     # For ETS misses we need Bitcask to be up to date — flush first.
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, _value, _expire_at_ms} ->
         {:reply, true, state}
 
@@ -1935,7 +1967,7 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   defp do_get(state, key) do
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, value, _expire_at_ms} -> value
       :expired -> nil
       :miss -> warm_from_store(state, key)
@@ -1943,27 +1975,50 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp do_get_meta(state, key) do
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, value, expire_at_ms} -> {value, expire_at_ms}
       :expired -> nil
       :miss -> warm_meta_from_store(state, key)
     end
   end
 
+  # -------------------------------------------------------------------
+  # Private: two-table ETS helpers
+  # -------------------------------------------------------------------
+
+  # Inserts a key/value/expiry into both the keydir and hot_cache tables.
+  defp ets_insert(state, key, value, expire_at_ms) do
+    :ets.insert(state.keydir, {key, expire_at_ms})
+    :ets.insert(state.hot_cache, {key, value})
+  end
+
+  # Deletes a key from both the keydir and hot_cache tables.
+  defp ets_delete_key(state, key) do
+    :ets.delete(state.keydir, key)
+    :ets.delete(state.hot_cache, key)
+  end
+
   # Classifies an ETS lookup as a cache hit, expired entry, or miss.
-  # Expired entries are evicted immediately.
-  defp ets_lookup(ets, key) do
+  # Expired entries are evicted immediately from both keydir and hot_cache.
+  defp ets_lookup(%{keydir: keydir, hot_cache: hot_cache}, key) do
     now = System.os_time(:millisecond)
 
-    case :ets.lookup(ets, key) do
-      [{^key, value, 0}] ->
-        {:hit, value, 0}
+    case :ets.lookup(keydir, key) do
+      [{^key, 0}] ->
+        case :ets.lookup(hot_cache, key) do
+          [{^key, value}] -> {:hit, value, 0}
+          [] -> :miss
+        end
 
-      [{^key, value, exp}] when exp > now ->
-        {:hit, value, exp}
+      [{^key, exp}] when exp > now ->
+        case :ets.lookup(hot_cache, key) do
+          [{^key, value}] -> {:hit, value, exp}
+          [] -> :miss
+        end
 
-      [{^key, _value, _exp}] ->
-        :ets.delete(ets, key)
+      [{^key, _exp}] ->
+        :ets.delete(keydir, key)
+        :ets.delete(hot_cache, key)
         :expired
 
       [] ->
@@ -1977,7 +2032,7 @@ defmodule Ferricstore.Store.Shard do
         nil
 
       {:ok, value} ->
-        :ets.insert(state.ets, {key, value, 0})
+        ets_insert(state, key, value, 0)
         value
 
       _error ->
@@ -1991,7 +2046,7 @@ defmodule Ferricstore.Store.Shard do
         nil
 
       {:ok, value} ->
-        :ets.insert(state.ets, {key, value, 0})
+        ets_insert(state, key, value, 0)
         {value, 0}
 
       _error ->
@@ -2004,13 +2059,13 @@ defmodule Ferricstore.Store.Shard do
 
     state.store
     |> NIF.keys()
-    |> Enum.filter(fn key -> key_alive?(state.ets, key, now) end)
+    |> Enum.filter(fn key -> key_alive?(state.keydir, key, now) end)
   end
 
-  defp key_alive?(ets, key, now) do
-    case :ets.lookup(ets, key) do
-      [{_, _, 0}] -> true
-      [{_, _, exp}] -> exp > now
+  defp key_alive?(keydir, key, now) do
+    case :ets.lookup(keydir, key) do
+      [{_, 0}] -> true
+      [{_, exp}] -> exp > now
       [] -> true
     end
   end
@@ -2114,12 +2169,12 @@ defmodule Ferricstore.Store.Shard do
   defp do_expiry_sweep(state) do
     now = System.os_time(:millisecond)
     max_keys = Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
-    expired_keys = scan_expired(state.ets, now, max_keys)
+    expired_keys = scan_expired(state.keydir, now, max_keys)
 
     count = length(expired_keys)
 
     if count > 0 do
-      Enum.each(expired_keys, fn key -> :ets.delete(state.ets, key) end)
+      Enum.each(expired_keys, fn key -> ets_delete_key(state, key) end)
       NIF.purge_expired(state.store)
 
       require Logger
@@ -2159,14 +2214,14 @@ defmodule Ferricstore.Store.Shard do
     %{state | sweep_at_ceiling_count: new_ceiling_count, sweep_struggling: new_struggling}
   end
 
-  defp scan_expired(ets, now, limit) do
+  defp scan_expired(keydir, now, limit) do
     match_spec = [
-      {{:"$1", :_, :"$3"},
-       [{:andalso, {:>, :"$3", 0}, {:"=<", :"$3", now}}],
+      {{:"$1", :"$2"},
+       [{:andalso, {:>, :"$2", 0}, {:"=<", :"$2", now}}],
        [:"$1"]}
     ]
 
-    case :ets.select(ets, match_spec, limit) do
+    case :ets.select(keydir, match_spec, limit) do
       {keys, _continuation} -> keys
       :"$end_of_table" -> []
     end
@@ -2180,7 +2235,7 @@ defmodule Ferricstore.Store.Shard do
   # --- Native command helpers ---
 
   defp resolve_for_native(state, key) do
-    case ets_lookup(state.ets, key) do
+    case ets_lookup(state, key) do
       {:hit, value, exp} -> {{:hit, value, exp}, state}
       :expired -> {:expired, state}
       :miss ->
@@ -2243,7 +2298,7 @@ defmodule Ferricstore.Store.Shard do
 
           count =
             :ets.foldl(
-              fn {key, _value, exp}, acc ->
+              fn {key, exp}, acc ->
                 if is_binary(key) and String.starts_with?(key, prefix) and
                      (exp == 0 or exp > now) do
                   acc + 1
@@ -2252,7 +2307,7 @@ defmodule Ferricstore.Store.Shard do
                 end
               end,
               0,
-              state.ets
+              state.keydir
             )
 
           if count > threshold do

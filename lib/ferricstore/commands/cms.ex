@@ -74,7 +74,7 @@ defmodule Ferricstore.Commands.CMS do
          {:ok, prob} <- parse_prob_float(prob_str, "probability"),
          :ok <- check_not_exists(store, key) do
       width = ceil(:math.exp(1) / error)
-      depth = ceil(:math.log(1.0 / (1.0 - prob)))
+      depth = ceil(:math.log(1.0 / prob))
       sketch = new_sketch(width, depth)
       store.put.(key, {:cms, sketch}, 0)
       :ok

@@ -828,9 +828,22 @@ defmodule Ferricstore.Server.Connection do
   end
 
   defp dispatch("RESET", _args, state) do
-    # RESET clears transaction state, sandbox namespace, read mode, and tracking state.
+    # RESET clears transaction state, sandbox namespace, read mode, tracking state,
+    # auth state, and pub/sub subscriptions.
+    cleanup_pubsub(state)
     ClientTracking.cleanup(self())
-    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}, sandbox_namespace: nil, tracking: ClientTracking.new_config(), read_mode: :consistent}
+    new_state = %{state |
+      multi_state: :none,
+      multi_queue: [],
+      watched_keys: %{},
+      sandbox_namespace: nil,
+      tracking: ClientTracking.new_config(),
+      read_mode: :consistent,
+      authenticated: false,
+      username: "default",
+      pubsub_channels: MapSet.new(),
+      pubsub_patterns: MapSet.new()
+    }
     {:continue, Encoder.encode({:simple, "RESET"}), new_state}
   end
 
@@ -1583,7 +1596,10 @@ defmodule Ferricstore.Server.Connection do
   # ---------------------------------------------------------------------------
 
   defp send_response(socket, transport, iodata) do
-    :ok = transport.send(socket, iodata)
+    case transport.send(socket, iodata) do
+      :ok -> :ok
+      {:error, _} -> :ok
+    end
   end
 
   # ---------------------------------------------------------------------------

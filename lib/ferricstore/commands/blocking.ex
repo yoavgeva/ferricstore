@@ -158,10 +158,14 @@ defmodule Ferricstore.Commands.Blocking do
 
   defp parse_blmpop_count([]), do: {:ok, 1}
 
-  defp parse_blmpop_count(["COUNT", count_str]) do
-    case Integer.parse(count_str) do
-      {count, ""} when count > 0 -> {:ok, count}
-      _ -> {:error, "ERR value is not an integer or out of range"}
+  defp parse_blmpop_count([keyword, count_str]) when is_binary(keyword) do
+    if String.upcase(keyword) != "COUNT" do
+      {:error, "ERR syntax error"}
+    else
+      case Integer.parse(count_str) do
+        {count, ""} when count > 0 -> {:ok, count}
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
     end
   end
 

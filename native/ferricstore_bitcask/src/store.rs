@@ -115,8 +115,22 @@ impl Store {
                     .and_then(|mut r| r.load_into(&mut staging))
                     .is_ok();
                 if hint_ok {
+                    // Compute the end-of-hint offset: the byte just past the last
+                    // record described by the hint file.  Any records appended to
+                    // the log after the hint was written (e.g. new puts before a
+                    // crash) live beyond this offset and must be replayed.
+                    let hint_end_offset = staging.iter().map(|(key, entry)| {
+                        entry.offset + HEADER_SIZE as u64 + key.len() as u64 + u64::from(entry.value_size)
+                    }).max().unwrap_or(0);
+
                     for (key, entry) in staging.iter() {
                         keydir.put(key.clone(), entry.clone());
+                    }
+
+                    // Replay log tail past the hint's last known offset to pick
+                    // up any writes that happened after the hint was generated.
+                    if fid_log_path.exists() {
+                        replay_log_from(&fid_log_path, fid, hint_end_offset, &mut keydir)?;
                     }
                 } else {
                     // Hint file corrupt — fall back to full log replay.
@@ -149,6 +163,13 @@ impl Store {
     ///
     /// Returns a `StoreError` if the record cannot be written or synced to disk.
     pub fn put(&mut self, key: &[u8], value: &[u8], expire_at_ms: u64) -> Result<()> {
+        if value.is_empty() {
+            // Empty value is equivalent to a tombstone — treat as delete.
+            self.writer.write_tombstone(key)?;
+            self.writer.sync()?;
+            self.keydir.delete(key);
+            return Ok(());
+        }
         let offset = self.writer.write(key, value, expire_at_ms)?;
         self.writer.sync()?;
         #[allow(clippy::cast_possible_truncation)]
@@ -559,7 +580,10 @@ impl Store {
                         .parse()
                         .map_err(|_| StoreError("not an integer".into()))?
                 };
-                (current_int + delta).to_string().into_bytes()
+                let result = current_int.checked_add(delta).ok_or_else(|| {
+                    StoreError("increment or decrement would overflow".into())
+                })?;
+                result.to_string().into_bytes()
             }
             RmwOp::IncrByFloat(delta) => {
                 let current_str = std::str::from_utf8(&current)
@@ -571,7 +595,17 @@ impl Store {
                         .parse()
                         .map_err(|_| StoreError("not a valid float".into()))?
                 };
-                format_float(current_float + delta).into_bytes()
+                if !current_float.is_finite() {
+                    return Err(StoreError("increment would produce NaN or Infinity".into()));
+                }
+                if !delta.is_finite() {
+                    return Err(StoreError("increment would produce NaN or Infinity".into()));
+                }
+                let result = current_float + delta;
+                if !result.is_finite() {
+                    return Err(StoreError("increment would produce NaN or Infinity".into()));
+                }
+                format_float(result).into_bytes()
             }
         };
         self.put(key, &new_value, expire_at_ms)?;
@@ -822,6 +856,40 @@ fn collect_file_ids(data_dir: &Path) -> Result<Vec<u64>> {
         }
     }
     Ok(ids)
+}
+
+/// Replay a raw log file from a given offset into the keydir.
+/// Used after loading a hint file to pick up any writes appended after the hint was generated.
+fn replay_log_from(log_path: &Path, file_id: u64, start_offset: u64, keydir: &mut KeyDir) -> Result<()> {
+    let mut reader = LogReader::open(log_path).map_err(|e| StoreError(e.to_string()))?;
+    reader.seek_to(start_offset).map_err(|e| StoreError(e.to_string()))?;
+    let mut offset = start_offset;
+
+    // Use tolerant iteration: stop silently at truncated/corrupt tail records.
+    while let Ok(Some(record)) = reader.read_next() {
+        let record_len =
+            (HEADER_SIZE + record.key.len() + record.value.as_ref().map_or(0, Vec::len)) as u64;
+
+        if let Some(value) = record.value {
+            keydir.put(
+                record.key.clone(),
+                KeyEntry {
+                    file_id,
+                    offset,
+                    #[allow(clippy::cast_possible_truncation)]
+                    value_size: value.len() as u32,
+                    expire_at_ms: record.expire_at_ms,
+                    ref_bit: false,
+                },
+            );
+        } else {
+            keydir.delete(&record.key);
+        }
+
+        offset += record_len;
+    }
+
+    Ok(())
 }
 
 /// Replay a raw log file into the keydir (used when no hint file exists).

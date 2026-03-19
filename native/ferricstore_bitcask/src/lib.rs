@@ -244,6 +244,12 @@ fn put_batch<'a>(
     resource: ResourceArc<StoreResource>,
     batch: Vec<(Binary<'a>, Binary<'a>, u64)>,
 ) -> NifResult<Term<'a>> {
+    // Validate key/value sizes before acquiring the lock.
+    for (k, v, _) in &batch {
+        if let Err(msg) = crate::log::validate_kv_sizes(k.as_slice(), v.as_slice()) {
+            return Ok((atoms::error(), msg).encode(env));
+        }
+    }
     let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
     let entries: Vec<(&[u8], &[u8], u64)> = batch
         .iter()

@@ -269,12 +269,19 @@ defmodule Ferricstore.Store.ListOps do
 
   defp do_execute(elements, _put_fn, _delete_fn, {:lindex, index}) do
     len = length(elements)
-    norm = normalize_index(index, len)
 
-    if norm >= 0 and norm < len do
-      Enum.at(elements, norm)
-    else
+    # Guard against negative underflow: if the negative index is beyond the list
+    # start, return nil before normalize_index clamps it to 0.
+    if index < 0 and len + index < 0 do
       nil
+    else
+      norm = normalize_index(index, len)
+
+      if norm >= 0 and norm < len do
+        Enum.at(elements, norm)
+      else
+        nil
+      end
     end
   end
 

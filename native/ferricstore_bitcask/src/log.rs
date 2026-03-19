@@ -210,6 +210,25 @@ impl LogReader {
         Ok(records)
     }
 
+    /// Seek to the given offset in the log file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `LogError` if the seek fails.
+    pub fn seek_to(&mut self, offset: u64) -> Result<()> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        Ok(())
+    }
+
+    /// Read the next record at the current file position. Returns `None` at EOF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `LogError` if the record is malformed.
+    pub fn read_next(&mut self) -> Result<Option<Record>> {
+        read_next_record(&mut self.file)
+    }
+
     /// Iterate records tolerating a truncated tail (crash-recovery mode).
     ///
     /// Like `iter_from_start`, but stops silently at the first CRC error or

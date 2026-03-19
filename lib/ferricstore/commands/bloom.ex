@@ -314,6 +314,7 @@ defmodule Ferricstore.Commands.Bloom do
     case store.get.(key) do
       nil -> nil
       encoded when is_binary(encoded) -> deserialize_filter(encoded)
+      _ -> nil
     end
   end
 
