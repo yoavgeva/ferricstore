@@ -42,28 +42,24 @@ defmodule Ferricstore.Integration.StreamTcpTest do
   end
 
   defp recv_n(sock, n) do
-    recv_n(sock, n, "", [])
+    do_recv_n(sock, n, "", [])
   end
 
-  defp recv_n(_sock, 0, _buf, acc), do: Enum.reverse(acc)
+  defp do_recv_n(_sock, 0, _buf, acc), do: acc
 
-  defp recv_n(sock, n, buf, acc) do
+  defp do_recv_n(sock, remaining, buf, acc) when remaining > 0 do
     {:ok, data} = :gen_tcp.recv(sock, 0, 5000)
     buf2 = buf <> data
 
     case Parser.parse(buf2) do
       {:ok, [_ | _] = vals, rest} ->
-        new_acc = acc ++ vals
-        remaining = n - length(vals)
-
-        if remaining <= 0 do
-          Enum.take(new_acc, n)
-        else
-          recv_n(sock, remaining, rest, new_acc)
-        end
+        taken = Enum.take(vals, remaining)
+        new_acc = acc ++ taken
+        new_remaining = remaining - length(taken)
+        do_recv_n(sock, new_remaining, rest, new_acc)
 
       {:ok, [], _} ->
-        recv_n(sock, n, buf2, acc)
+        do_recv_n(sock, remaining, buf2, acc)
     end
   end
 

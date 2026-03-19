@@ -20,7 +20,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   Unknown commands return `{:error, "ERR unknown command ..."}`.
   """
 
-  alias Ferricstore.Commands.{Bitmap, Bloom, Client, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Native, PubSub, Server, Set, SortedSet, Stream, Strings}
+  alias Ferricstore.Commands.{Bitmap, Bloom, Client, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Native, PubSub, Server, Set, SortedSet, Stream, Strings, Vector}
   alias Ferricstore.Commands.CMS
   alias Ferricstore.Commands.TopK
 
@@ -41,6 +41,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @cuckoo_cmds ~w(CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO)
   @cms_cmds ~w(CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO)
   @topk_cmds ~w(TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.INFO)
+  @vector_cmds ~w(VCREATE VADD VGET VDEL VSEARCH VINFO VLIST VEVICT)
   @pubsub_cmds ~w(PUBLISH PUBSUB)
   @server_cmds ~w(PING ECHO DBSIZE KEYS FLUSHDB FLUSHALL INFO COMMAND SELECT LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF)
 
@@ -90,6 +91,7 @@ defmodule Ferricstore.Commands.Dispatcher do
         cmd in @cms_cmds -> CMS.handle(cmd, args, store)
         cmd in @topk_cmds -> TopK.handle(cmd, args, store)
         cmd in @native_cmds -> Native.handle(cmd, args, store)
+        cmd in @vector_cmds -> Vector.handle(cmd, args, store)
         cmd == "RATELIMIT.ADD" -> Native.handle("RATELIMIT.ADD", args, store)
         cmd == "CLUSTER.HEALTH" -> Cluster.handle(cmd, args, store)
         cmd == "CLUSTER.STATS" -> Cluster.handle(cmd, args, store)

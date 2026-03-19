@@ -340,5 +340,7 @@ defmodule Ferricstore.Store.CompoundKey do
   def internal_key?(<<"S:", _rest::binary>>), do: true
   def internal_key?(<<"Z:", _rest::binary>>), do: true
   def internal_key?(<<"T:", _rest::binary>>), do: true
+  def internal_key?(<<"V:", _rest::binary>>), do: true
+  def internal_key?(<<"VM:", _rest::binary>>), do: true
   def internal_key?(_), do: false
 end

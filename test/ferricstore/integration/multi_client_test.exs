@@ -41,31 +41,27 @@ defmodule Ferricstore.Integration.MultiClientTest do
     end
   end
 
-  defp recv_n_responses(sock, n), do: recv_n_responses(sock, n, "", [])
-  defp recv_n_responses(_sock, 0, _buf, acc), do: Enum.reverse(acc)
+  defp recv_n_responses(sock, n), do: do_recv_n_responses(sock, n, "", [])
+  defp do_recv_n_responses(_sock, 0, _buf, acc), do: acc
 
-  defp recv_n_responses(sock, n, buf, acc) do
+  defp do_recv_n_responses(sock, remaining, buf, acc) when remaining > 0 do
     case :gen_tcp.recv(sock, 0, 5_000) do
       {:ok, data} ->
         buf2 = buf <> data
 
         case Parser.parse(buf2) do
           {:ok, vals, rest} when vals != [] ->
-            new_acc = acc ++ vals
-            rem = n - length(vals)
-
-            if rem <= 0 do
-              Enum.take(new_acc, n)
-            else
-              recv_n_responses(sock, rem, rest, new_acc)
-            end
+            taken = Enum.take(vals, remaining)
+            new_acc = acc ++ taken
+            new_remaining = remaining - length(taken)
+            do_recv_n_responses(sock, new_remaining, rest, new_acc)
 
           {:ok, [], _} ->
-            recv_n_responses(sock, n, buf2, acc)
+            do_recv_n_responses(sock, remaining, buf2, acc)
         end
 
       {:error, :closed} ->
-        Enum.reverse(acc)
+        acc
     end
   end
 

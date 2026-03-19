@@ -8,8 +8,16 @@ defmodule Ferricstore.Server.Connection do
   1. Performs the `CLIENT HELLO 3` handshake (RESP3-only; rejects RESP2).
   2. Enters a receive loop, accumulating TCP chunks into a binary buffer.
   3. Parses all complete RESP3 frames from the buffer via `Ferricstore.Resp.Parser`.
-  4. Dispatches each parsed command, accumulates responses (iodata), and sends
-     them in one `:gen_tcp.send/2` call per receive (pipelining).
+  4. Dispatches commands using a **sliding window pipeline** (spec section 2C.2):
+     - All "pure" commands (those that don't mutate connection state) in a
+       pipeline batch are dispatched concurrently as `Task`s.
+     - Responses are sent over the socket in-order: response N is sent as
+       soon as responses 0..N are all complete. This means fast commands
+       before a slow command get their responses delivered immediately,
+       without waiting for the slow command to finish.
+     - Stateful commands (MULTI, AUTH, SUBSCRIBE, blocking ops, etc.) act
+       as barriers: all prior concurrent tasks are awaited and flushed
+       before the stateful command executes synchronously.
   5. Handles `QUIT` (send `+OK`, close) and `RESET` (send `+RESET`, reset state).
   6. Closes cleanly on TCP EOF or any transport error.
 
@@ -182,39 +190,357 @@ defmodule Ferricstore.Server.Connection do
   end
 
   defp handle_parsed(%__MODULE__{socket: socket, transport: transport} = state, commands) do
-    case dispatch_commands(commands, state) do
-      {:quit, responses, quit_state} ->
-        send_responses(socket, transport, responses)
+    case pipeline_dispatch(commands, state) do
+      {:quit, quit_state} ->
         cleanup_connection(quit_state)
         transport.close(socket)
 
-      {:continue, responses, new_state} ->
-        send_responses(socket, transport, responses)
+      {:continue, new_state} ->
         loop(new_state)
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Command dispatch
+  # Sliding window pipeline dispatch (spec section 2C.2)
   # ---------------------------------------------------------------------------
 
-  # Processes a list of parsed commands, accumulating encoded responses and
-  # threading connection state (for transaction support). Returns
-  # `{:quit | :continue, [iodata()], state}`.
-  defp dispatch_commands(commands, state) do
-    {action, responses, final_state} =
-      Enum.reduce_while(commands, {:continue, [], state}, fn cmd, {_action, acc, st} ->
-        case handle_command(cmd, st) do
-          {:quit, response, new_st} ->
-            {:halt, {:quit, [response | acc], new_st}}
+  # Commands that must be executed synchronously because they read or mutate
+  # connection-level state (transaction mode, pub/sub subscriptions, auth,
+  # sandbox, blocking ops, etc.).
+  @stateful_cmds ~w(
+    HELLO CLIENT QUIT AUTH ACL RESET READMODE SANDBOX
+    MULTI EXEC DISCARD WATCH UNWATCH
+    SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
+    BLPOP BRPOP BLMOVE BLMPOP
+  )
 
-          {:continue, response, new_st} ->
-            {:cont, {:continue, [response | acc], new_st}}
+  # Normalises a parsed command into `{uppercase_name, args}` for classification.
+  # Returns `:unknown` for un-parsable forms.
+  defp normalise_cmd({:inline, [name | args]}) when is_binary(name),
+    do: {String.upcase(name), args}
+
+  defp normalise_cmd({:inline, []}), do: :unknown
+
+  defp normalise_cmd([name | args]) when is_binary(name),
+    do: {String.upcase(name), args}
+
+  defp normalise_cmd(_other), do: :unknown
+
+  # Returns true if the command must be handled sequentially (it reads or
+  # mutates connection state, or we are in a mode where all commands are
+  # stateful -- e.g. MULTI queuing, pub/sub, pre-auth).
+  defp stateful_command?(cmd, state) do
+    case normalise_cmd(cmd) do
+      :unknown ->
+        true
+
+      {name, _args} ->
+        # In MULTI queuing mode, every command is stateful (queued or passthrough).
+        state.multi_state == :queuing or
+          in_pubsub_mode?(state) or
+          requires_auth?(state) or
+          name in @stateful_cmds or
+          # CLIENT subcommand form: "CLIENT" is already in @stateful_cmds,
+          # but two-word forms like ["CLIENT", "HELLO", ...] need to match
+          # on the first token.
+          String.starts_with?(name, "CLIENT")
+    end
+  end
+
+  # Dispatches a pipeline of commands using a sliding window.
+  #
+  # For a single command, falls through to sequential dispatch (no benefit from
+  # async). For multiple commands, groups consecutive "pure" commands and
+  # dispatches them concurrently as Tasks. Responses are sent over the socket
+  # in-order as soon as the leading contiguous completed responses are available.
+  #
+  # Stateful commands (MULTI, AUTH, SUBSCRIBE, blocking ops, etc.) act as
+  # barriers: all prior pure-command Tasks are awaited and flushed before the
+  # stateful command executes synchronously.
+  defp pipeline_dispatch([single_cmd], state) do
+    # Single command -- no pipeline, no sliding window needed.
+    case handle_command(single_cmd, state) do
+      {:quit, response, quit_state} ->
+        send_response(state.socket, state.transport, response)
+        {:quit, quit_state}
+
+      {:continue, response, new_state} ->
+        send_response(state.socket, state.transport, response)
+        {:continue, new_state}
+    end
+  end
+
+  defp pipeline_dispatch(commands, state) do
+    sliding_window_dispatch(commands, state)
+  end
+
+  # Walks through the command list, building groups of consecutive pure commands
+  # that can be dispatched concurrently. When a stateful command is encountered
+  # (or the list ends), the current pure group is flushed via the sliding window
+  # and the stateful command is executed synchronously.
+  defp sliding_window_dispatch(commands, state) do
+    # Accumulate consecutive pure commands into a buffer
+    do_sliding_window(commands, [], state)
+  end
+
+  # Base case: no more commands, flush any remaining pure group.
+  defp do_sliding_window([], pure_acc, state) do
+    case flush_pure_group(Enum.reverse(pure_acc), state) do
+      {:quit, _quit_state} = quit -> quit
+      {:continue, new_state} -> {:continue, new_state}
+    end
+  end
+
+  # Classify current command and either accumulate it (pure) or flush + execute
+  # (stateful or barrier).
+  defp do_sliding_window([cmd | rest], pure_acc, state) do
+    cond do
+      stateful_command?(cmd, state) ->
+        # Stateful: flush pure group, execute synchronously, may change state.
+        case flush_pure_group(Enum.reverse(pure_acc), state) do
+          {:quit, _quit_state} = quit ->
+            quit
+
+          {:continue, flushed_state} ->
+            case handle_command(cmd, flushed_state) do
+              {:quit, response, quit_state} ->
+                send_response(quit_state.socket, quit_state.transport, response)
+                {:quit, quit_state}
+
+              {:continue, response, new_state} ->
+                send_response(new_state.socket, new_state.transport, response)
+                # After a stateful command, re-classify the remaining commands
+                # because state may have changed (e.g. entered MULTI mode).
+                do_sliding_window(rest, [], new_state)
+            end
         end
+
+      barrier_command?(cmd) ->
+        # Barrier: flush pure group (so all prior commands complete first),
+        # then include this barrier command as the start of a new pure group.
+        # The barrier command itself is safe to dispatch concurrently with
+        # SUBSEQUENT commands on different shards.
+        case flush_pure_group(Enum.reverse(pure_acc), state) do
+          {:quit, _quit_state} = quit ->
+            quit
+
+          {:continue, flushed_state} ->
+            # Start a new pure group with the barrier command.
+            do_sliding_window(rest, [cmd], flushed_state)
+        end
+
+      true ->
+        # Pure command -- accumulate for concurrent dispatch.
+        do_sliding_window(rest, [cmd | pure_acc], state)
+    end
+  end
+
+  # Flushes a group of pure commands by dispatching them concurrently as Tasks,
+  # then sending responses in order via the sliding window.
+  #
+  # **Shard-aware ordering**: commands that target the same shard are executed
+  # sequentially (preserving causal order), while commands targeting different
+  # shards execute concurrently. Each Task waits for its predecessor on the
+  # same shard to complete before executing, using a lightweight ref-based
+  # signalling mechanism.
+  #
+  # An empty group is a no-op.
+  # A single-command group skips Task overhead and dispatches inline.
+  defp flush_pure_group([], state), do: {:continue, state}
+
+  defp flush_pure_group([single_cmd], state) do
+    case handle_command(single_cmd, state) do
+      {:quit, response, quit_state} ->
+        send_response(quit_state.socket, quit_state.transport, response)
+        {:quit, quit_state}
+
+      {:continue, response, new_state} ->
+        send_response(new_state.socket, new_state.transport, response)
+        {:continue, new_state}
+    end
+  end
+
+  defp flush_pure_group(commands, state) do
+    store = build_store(state.sandbox_namespace)
+
+    # Shard-aware concurrent dispatch with sliding-window response delivery.
+    #
+    # Commands are grouped by shard lane. Each lane gets its own Task that
+    # executes that lane's commands sequentially (preserving per-key causal
+    # order). Lanes targeting different shards run concurrently, reducing
+    # total wall-clock time when a pipeline spans multiple shards.
+    #
+    # Each lane Task sends `{:lane_result, original_index, result}` messages
+    # to the connection process as each command completes, enabling the
+    # sliding window to send response N as soon as responses 0..N are ready.
+
+    # Step 1: Assign each command an index and shard lane.
+    indexed_cmds =
+      commands
+      |> Enum.with_index()
+      |> Enum.map(fn {cmd, idx} -> {cmd, idx, command_shard_key(cmd)} end)
+
+    # Step 2: Group by shard lane (preserving original order within each lane).
+    lanes = Enum.group_by(indexed_cmds, fn {_cmd, _idx, shard_key} -> shard_key end)
+
+    total = length(commands)
+    conn_pid = self()
+
+    # Step 3: Spawn one Task per shard lane. Each task executes its commands
+    # sequentially and sends results back to the connection process.
+    lane_tasks =
+      Enum.map(lanes, fn {_shard_key, lane_cmds} ->
+        Task.async(fn ->
+          Enum.each(lane_cmds, fn {cmd, idx, _shard_key} ->
+            result = dispatch_pure_command(cmd, store, state)
+            send(conn_pid, {:lane_result, idx, result})
+          end)
+        end)
       end)
 
-    {action, Enum.reverse(responses), final_state}
+    # Step 4: Sliding window -- receive results and send responses in order.
+    # We maintain a cursor (next index to send) and a buffer for out-of-order
+    # arrivals. Response N is sent as soon as responses 0..N are all available.
+    result = sliding_window_collect(state, 0, total, %{})
+
+    # Step 5: Ensure all lane tasks have completed (they should be done by
+    # now since we've collected all results, but await to clean up refs).
+    Enum.each(lane_tasks, fn task ->
+      Task.await(task, :infinity)
+    end)
+
+    result
   end
+
+  # Collects results from lane tasks and sends responses in sliding-window order.
+  # `cursor` is the next index to send. `buffer` holds results that arrived
+  # out of order (index > cursor).
+  defp sliding_window_collect(state, cursor, total, _buffer) when cursor >= total do
+    {:continue, state}
+  end
+
+  defp sliding_window_collect(state, cursor, total, buffer) do
+    # Check if the next response is already buffered.
+    case Map.pop(buffer, cursor) do
+      {{action, response}, new_buffer} ->
+        case action do
+          :quit ->
+            send_response(state.socket, state.transport, response)
+            {:quit, state}
+
+          :continue ->
+            send_response(state.socket, state.transport, response)
+            sliding_window_collect(state, cursor + 1, total, new_buffer)
+        end
+
+      {nil, _buffer} ->
+        # Not buffered yet -- wait for any lane result message.
+        receive do
+          {:lane_result, ^cursor, {action, response}} ->
+            # It's the one we need -- send immediately.
+            case action do
+              :quit ->
+                send_response(state.socket, state.transport, response)
+                {:quit, state}
+
+              :continue ->
+                send_response(state.socket, state.transport, response)
+                sliding_window_collect(state, cursor + 1, total, buffer)
+            end
+
+          {:lane_result, idx, result} when idx > cursor ->
+            # Arrived out of order -- buffer it and keep waiting.
+            new_buffer = Map.put(buffer, idx, result)
+            sliding_window_collect(state, cursor, total, new_buffer)
+        end
+    end
+  end
+
+  # Commands that ALWAYS span multiple shards regardless of arg count. They
+  # act as pipeline barriers: the sliding window flushes all preceding
+  # commands before allowing a barrier command to execute, ensuring that
+  # prior writes are visible.
+  @always_multi_cmds ~w(MGET MSET MSETNX BITOP PFCOUNT PFMERGE
+    SDIFF SINTER SUNION SDIFFSTORE SINTERSTORE SUNIONSTORE SINTERCARD)
+
+  # Commands that take a variable number of keys. With a single key they can
+  # be routed to that key's shard. With multiple keys, they become a barrier.
+  @variadic_key_cmds ~w(DEL UNLINK EXISTS)
+
+  # Server-level commands that span all shards and must act as barriers.
+  @barrier_server_cmds ~w(DBSIZE FLUSHDB FLUSHALL KEYS SCAN RANDOMKEY)
+
+  # Returns true if the command is a cross-shard barrier that must wait
+  # for all preceding pipeline commands to complete before executing.
+  defp barrier_command?(cmd) do
+    case normalise_cmd(cmd) do
+      :unknown -> false
+      {name, args} ->
+        name in @always_multi_cmds or
+          name in @barrier_server_cmds or
+          (name in @variadic_key_cmds and length(args) > 1)
+    end
+  end
+
+  # Server-level commands that don't target a specific key.
+  @server_cmds_no_key ~w(PING ECHO DBSIZE FLUSHDB FLUSHALL KEYS INFO COMMAND
+    SELECT LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF
+    MEMORY RANDOMKEY SCAN OBJECT WAIT
+    CLUSTER.HEALTH CLUSTER.STATS FERRICSTORE.HOTNESS FERRICSTORE.METRICS)
+
+  # Determines the shard lane for a command. Returns:
+  #   - `{:shard, index}` for single-key commands
+  #   - `:barrier` for multi-key/multi-shard commands (global ordering barrier)
+  #   - `:server` for server-level commands with no key
+  defp command_shard_key(cmd) do
+    case normalise_cmd(cmd) do
+      :unknown ->
+        :server
+
+      {name, args} ->
+        cond do
+          name in @always_multi_cmds ->
+            :barrier
+
+          name in @variadic_key_cmds ->
+            case args do
+              # Single key: route to that key's shard lane.
+              [single_key] -> {:shard, Router.shard_for(single_key)}
+              # Multiple keys: global barrier.
+              _ -> :barrier
+            end
+
+          name in @server_cmds_no_key ->
+            :server
+
+          # Single-key commands: first arg is the key
+          args != [] ->
+            {:shard, Router.shard_for(hd(args))}
+
+          # No args
+          true ->
+            :server
+        end
+    end
+  end
+
+  # Dispatches a single pure command inside a Task. Returns {action, encoded_response}.
+  # Pure commands don't modify connection state, so we don't thread state through.
+  defp dispatch_pure_command(cmd, store, _state) do
+    case normalise_cmd(cmd) do
+      :unknown ->
+        {:continue, Encoder.encode({:error, "ERR unknown command format"})}
+
+      {name, args} ->
+        Stats.incr_commands()
+        result = Dispatcher.dispatch(name, args, store)
+        maybe_notify_keyspace(name, args, result)
+        {:continue, Encoder.encode(result)}
+    end
+  end
+
+  # (dispatch_commands/2 was removed -- sliding window pipeline dispatch above
+  #  replaces the old sequential reduce-while approach.)
 
   # ---------------------------------------------------------------------------
   # Individual command handlers
@@ -1039,11 +1365,6 @@ defmodule Ferricstore.Server.Connection do
   # ---------------------------------------------------------------------------
   # Response sending
   # ---------------------------------------------------------------------------
-
-  defp send_responses(socket, transport, responses) do
-    iodata = List.flatten(responses)
-    :ok = transport.send(socket, iodata)
-  end
 
   defp send_response(socket, transport, iodata) do
     :ok = transport.send(socket, iodata)

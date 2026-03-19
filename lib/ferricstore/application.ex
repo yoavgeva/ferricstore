@@ -29,6 +29,10 @@ defmodule Ferricstore.Application do
 
   use Application
 
+  require Logger
+
+  @default_large_value_warning_bytes 512 * 1024
+
   @impl true
   def start(_type, _args) do
     port = Application.get_env(:ferricstore, :port, 6379)
@@ -89,6 +93,13 @@ defmodule Ferricstore.Application do
           %{shard_count: shard_count, port: port, raft_enabled: raft_enabled?}
         )
 
+        # Step 6 - Embedded large value check (embedded mode only):
+        # Scan keydir for values exceeding the configured threshold.
+        # Pure RAM scan -- keydir already holds value_size per entry, no disk reads.
+        # Non-blocking: fires before any traffic is served so operator sees the
+        # warning immediately.
+        check_large_values(shard_count)
+
       _ ->
         :ok
     end
@@ -105,6 +116,89 @@ defmodule Ferricstore.Application do
     )
 
     state
+  end
+
+  # ---------------------------------------------------------------------------
+  # Large value check (Step 6)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Scans all shard ETS tables for values exceeding the configured threshold.
+
+  Returns `{count, largest_key, largest_size}` where `count` is the number of
+  entries whose value exceeds `threshold_bytes`, `largest_key` is the key with
+  the largest value, and `largest_size` is its size in bytes.
+
+  Returns `{0, nil, 0}` when no large values are found.
+
+  This is a pure RAM scan -- ETS already holds the full value per entry, so no
+  disk reads are needed.
+
+  ## Parameters
+
+    * `shard_count` -- number of shards to scan
+    * `threshold_bytes` -- values larger than this are flagged (default:
+      `Application.get_env(:ferricstore, :embedded_large_value_warning_bytes, 512 * 1024)`)
+
+  """
+  @spec scan_large_values(non_neg_integer(), non_neg_integer()) ::
+          {non_neg_integer(), binary() | nil, non_neg_integer()}
+  def scan_large_values(shard_count, threshold_bytes \\ nil) do
+    threshold =
+      threshold_bytes ||
+        Application.get_env(
+          :ferricstore,
+          :embedded_large_value_warning_bytes,
+          @default_large_value_warning_bytes
+        )
+
+    Enum.reduce(0..(shard_count - 1), {0, nil, 0}, fn i, {count, largest_key, largest_size} ->
+      ets = :"shard_ets_#{i}"
+
+      try do
+        :ets.foldl(
+          fn {key, value, _expire_at_ms}, {c, lk, ls} ->
+            size = byte_size(value)
+
+            if size > threshold do
+              if size > ls do
+                {c + 1, key, size}
+              else
+                {c + 1, lk, ls}
+              end
+            else
+              {c, lk, ls}
+            end
+          end,
+          {count, largest_key, largest_size},
+          ets
+        )
+      rescue
+        ArgumentError ->
+          # ETS table does not exist (shard may be restarting).
+          {count, largest_key, largest_size}
+      end
+    end)
+  end
+
+  # Runs the large value check and emits a warning + telemetry if any are found.
+  defp check_large_values(shard_count) do
+    case scan_large_values(shard_count) do
+      {0, _key, _size} ->
+        :ok
+
+      {count, largest_key, largest_size} ->
+        Logger.warning(
+          "Embedded large value check: #{count} value(s) exceed threshold; " <>
+            "largest key=#{inspect(largest_key)} (#{largest_size} bytes)"
+        )
+
+        :telemetry.execute(
+          [:ferricstore, :embedded, :large_values_detected],
+          %{count: count, largest_size: largest_size},
+          %{largest_key: largest_key}
+        )
+    end
   end
 
   # ---------------------------------------------------------------------------

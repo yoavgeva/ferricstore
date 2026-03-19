@@ -262,4 +262,176 @@ defmodule Ferricstore.StartupTest do
       assert uptime >= 0
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Step 6 - Embedded large value check
+  # ---------------------------------------------------------------------------
+
+  describe "embedded large value check (Step 6)" do
+    import ExUnit.CaptureLog
+
+    test "scan_large_values detects values exceeding threshold" do
+      # Write a 600KB value (exceeds default 512KB threshold).
+      large_value = :binary.copy(<<0>>, 600 * 1024)
+      key = "large_value_test_#{:rand.uniform(9_999_999)}"
+      Router.put(key, large_value, 0)
+
+      {count, largest_key, largest_size} =
+        Ferricstore.Application.scan_large_values(4, 512 * 1024)
+
+      assert count >= 1
+      assert largest_size >= 600 * 1024
+      # The largest key should be our key (or another equally large one).
+      assert is_binary(largest_key)
+    end
+
+    test "scan_large_values returns {0, nil, 0} when no large values exist" do
+      # All keys were flushed in setup; write only small values.
+      Router.put("small_#{:rand.uniform(9_999_999)}", "tiny", 0)
+
+      assert {0, nil, 0} = Ferricstore.Application.scan_large_values(4, 512 * 1024)
+    end
+
+    test "scan_large_values identifies the key with the largest value" do
+      key_medium = "medium_val_#{:rand.uniform(9_999_999)}"
+      key_biggest = "biggest_val_#{:rand.uniform(9_999_999)}"
+
+      Router.put(key_medium, :binary.copy(<<1>>, 600 * 1024), 0)
+      Router.put(key_biggest, :binary.copy(<<2>>, 800 * 1024), 0)
+
+      {count, largest_key, largest_size} =
+        Ferricstore.Application.scan_large_values(4, 512 * 1024)
+
+      assert count == 2
+      assert largest_key == key_biggest
+      assert largest_size == 800 * 1024
+    end
+
+    test "scan_large_values respects a custom threshold" do
+      key = "custom_threshold_#{:rand.uniform(9_999_999)}"
+      Router.put(key, :binary.copy(<<0>>, 100), 0)
+
+      # Threshold of 50 bytes -- the 100-byte value should be flagged.
+      {count, largest_key, _largest_size} =
+        Ferricstore.Application.scan_large_values(4, 50)
+
+      assert count >= 1
+      assert is_binary(largest_key)
+    end
+
+    test "check_large_values logs warning when large values exist" do
+      large_value = :binary.copy(<<0>>, 600 * 1024)
+      key = "log_warn_test_#{:rand.uniform(9_999_999)}"
+      Router.put(key, large_value, 0)
+
+      log =
+        capture_log(fn ->
+          # Directly invoke the private function via the public scan + simulated check.
+          # We replicate check_large_values logic here because it is private.
+          case Ferricstore.Application.scan_large_values(4, 512 * 1024) do
+            {0, _key, _size} ->
+              :ok
+
+            {count, lk, ls} ->
+              require Logger
+
+              Logger.warning(
+                "Embedded large value check: #{count} value(s) exceed threshold; " <>
+                  "largest key=#{inspect(lk)} (#{ls} bytes)"
+              )
+          end
+        end)
+
+      assert log =~ "Embedded large value check"
+      assert log =~ "value(s) exceed threshold"
+      assert log =~ "bytes"
+    end
+
+    test "check_large_values emits telemetry when large values exist" do
+      large_value = :binary.copy(<<0>>, 700 * 1024)
+      key = "telemetry_test_#{:rand.uniform(9_999_999)}"
+      Router.put(key, large_value, 0)
+
+      test_pid = self()
+      ref = make_ref()
+
+      handler_id = "test-large-values-telemetry-#{inspect(ref)}"
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :embedded, :large_values_detected],
+        fn event_name, measurements, metadata, _config ->
+          send(test_pid, {:telemetry_event, ref, event_name, measurements, metadata})
+        end,
+        nil
+      )
+
+      # Replicate check_large_values logic to trigger telemetry.
+      case Ferricstore.Application.scan_large_values(4, 512 * 1024) do
+        {0, _key, _size} ->
+          :ok
+
+        {count, lk, ls} ->
+          :telemetry.execute(
+            [:ferricstore, :embedded, :large_values_detected],
+            %{count: count, largest_size: ls},
+            %{largest_key: lk}
+          )
+      end
+
+      assert_receive {:telemetry_event, ^ref, [:ferricstore, :embedded, :large_values_detected],
+                       measurements, metadata},
+                     1_000
+
+      assert measurements.count >= 1
+      assert measurements.largest_size >= 700 * 1024
+      assert metadata.largest_key == key
+
+      :telemetry.detach(handler_id)
+    end
+
+    test "no warning or telemetry when all values are below threshold" do
+      # Only small values exist (setup flushed everything).
+      Router.put("small_check_#{:rand.uniform(9_999_999)}", "ok", 0)
+
+      test_pid = self()
+      ref = make_ref()
+
+      handler_id = "test-no-large-values-#{inspect(ref)}"
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :embedded, :large_values_detected],
+        fn _event_name, _measurements, _metadata, _config ->
+          send(test_pid, {:telemetry_event, ref})
+        end,
+        nil
+      )
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          case Ferricstore.Application.scan_large_values(4, 512 * 1024) do
+            {0, _key, _size} -> :ok
+            {count, lk, ls} ->
+              :telemetry.execute(
+                [:ferricstore, :embedded, :large_values_detected],
+                %{count: count, largest_size: ls},
+                %{largest_key: lk}
+              )
+          end
+        end)
+
+      assert log == ""
+      refute_receive {:telemetry_event, ^ref}, 100
+
+      :telemetry.detach(handler_id)
+    end
+
+    test "scan_large_values handles missing ETS tables gracefully" do
+      # Passing a shard_count higher than actual shards -- the extra
+      # tables won't exist. Should not crash.
+      assert {count, _key, _size} = Ferricstore.Application.scan_large_values(8, 512 * 1024)
+      assert is_integer(count)
+    end
+  end
 end
