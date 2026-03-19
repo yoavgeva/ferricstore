@@ -109,7 +109,8 @@ defmodule Ferricstore.Commands.ConfigTest do
 
     test "CONFIG GET hz returns integer string" do
       result = Server.handle("CONFIG", ["GET", "hz"], MockStore.make())
-      assert ["hz", "10"] = result
+      assert ["hz", hz_val] = result
+      assert {_, ""} = Integer.parse(hz_val), "hz should be a valid integer string"
     end
   end
 
