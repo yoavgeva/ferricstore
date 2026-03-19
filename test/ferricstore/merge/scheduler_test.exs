@@ -38,6 +38,9 @@ defmodule Ferricstore.Merge.SchedulerTest do
 
     test "returns non-zero stats after writes" do
       dir = temp_dir()
+      # Ensure a clean directory with no leftover data from previous runs
+      File.rm_rf!(dir)
+      File.mkdir_p!(dir)
       {:ok, store} = NIF.new(dir)
 
       for i <- 1..100 do

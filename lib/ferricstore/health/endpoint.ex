@@ -1,11 +1,13 @@
 defmodule Ferricstore.Health.Endpoint do
   @moduledoc """
-  Minimal HTTP/1.1 health endpoint for Kubernetes readiness probes.
+  Minimal HTTP/1.1 health endpoint for Kubernetes readiness probes and the
+  built-in observability dashboard (spec 7.3).
 
   Runs a Ranch TCP listener on a configurable port (default: `9090`, or `0`
   for ephemeral in tests) that speaks just enough HTTP/1.1 to serve:
 
     * `GET /health/ready` -- 200 when ready, 503 during startup
+    * `GET /dashboard`    -- HTML dashboard with auto-refresh (spec 7.3)
     * All other paths      -- 404
 
   ## Architecture
@@ -170,6 +172,12 @@ defmodule Ferricstore.Health.Endpoint do
     end
   end
 
+  defp handle_request(socket, transport, "GET", "/dashboard") do
+    data = Ferricstore.Health.Dashboard.collect()
+    body = Ferricstore.Health.Dashboard.render(data)
+    send_html_response(socket, transport, 200, "OK", body)
+  end
+
   defp handle_request(socket, transport, "GET", _path) do
     send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
   end
@@ -184,11 +192,28 @@ defmodule Ferricstore.Health.Endpoint do
 
   @spec send_response(:inet.socket(), module(), pos_integer(), String.t(), String.t()) :: :ok
   defp send_response(socket, transport, status_code, status_text, body) do
+    send_response(socket, transport, status_code, status_text, "application/json", body)
+  end
+
+  @spec send_html_response(:inet.socket(), module(), pos_integer(), String.t(), String.t()) :: :ok
+  defp send_html_response(socket, transport, status_code, status_text, body) do
+    send_response(socket, transport, status_code, status_text, "text/html; charset=utf-8", body)
+  end
+
+  @spec send_response(
+          :inet.socket(),
+          module(),
+          pos_integer(),
+          String.t(),
+          String.t(),
+          String.t()
+        ) :: :ok
+  defp send_response(socket, transport, status_code, status_text, content_type, body) do
     content_length = byte_size(body)
 
     response =
       "HTTP/1.1 #{status_code} #{status_text}\r\n" <>
-        "Content-Type: application/json\r\n" <>
+        "Content-Type: #{content_type}\r\n" <>
         "Content-Length: #{content_length}\r\n" <>
         "Connection: close\r\n" <>
         "\r\n" <>

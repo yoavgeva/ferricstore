@@ -38,11 +38,20 @@ defmodule Ferricstore.Server.Connection do
   Ranch requires the protocol module to export `start_link/3` and the started
   process to call `:ranch.handshake/1` before reading from the socket.
 
-  ## BEAM scheduler notes
+  ## BEAM scheduler notes (active: :once mode)
 
-  All I/O uses `active: false` (passive mode) so the receive loop blocks on
-  `:gen_tcp.recv/3`. This keeps the process off the scheduler while waiting
-  for data and avoids mailbox flooding on bursty clients.
+  The socket operates in `active: :once` mode (spec section 2C.2): the kernel
+  delivers exactly one `{:tcp, socket, data}` message to the process, then
+  automatically switches the socket to passive. The process re-arms via
+  `transport.setopts(socket, active: :once)` after handling each data message.
+
+  This is superior to the older `active: false` / blocking `recv` approach:
+  - The process can handle OTHER messages (waiter notifications, pub/sub pushes,
+    client tracking invalidations) between TCP reads.
+  - The BEAM scheduler can schedule other processes while waiting for TCP data.
+  - Sliding window responses can be sent incrementally.
+  - No risk of mailbox flooding (unlike `active: true`) since only one message
+    is delivered at a time.
   """
 
   @behaviour :ranch_protocol
@@ -122,7 +131,7 @@ defmodule Ferricstore.Server.Connection do
   @spec init(ref :: atom(), transport :: module(), opts :: map()) :: :ok
   def init(ref, transport, _opts) do
     {:ok, socket} = :ranch.handshake(ref)
-    :ok = transport.setopts(socket, active: false)
+    :ok = transport.setopts(socket, active: :once)
 
     Stats.incr_connections()
 
@@ -151,22 +160,42 @@ defmodule Ferricstore.Server.Connection do
   end
 
   # ---------------------------------------------------------------------------
-  # Receive loop
+  # Receive loop (active: :once, event-driven)
   # ---------------------------------------------------------------------------
 
   defp loop(%__MODULE__{socket: socket, transport: transport} = state) do
     if in_pubsub_mode?(state) do
       pubsub_loop(state)
     else
-      case transport.recv(socket, 0, :infinity) do
-        {:ok, <<>>} ->
+      # Re-arm active: :once so the kernel delivers exactly one more data message.
+      # This is idempotent — safe to call even if already in :once mode (e.g. on
+      # first entry from init/3).
+      transport.setopts(socket, active: :once)
+
+      receive do
+        # TCP active-mode data — the kernel delivered exactly one chunk
+        {:tcp, ^socket, data} ->
+          state
+          |> handle_data(data)
+
+        # TLS active-mode data
+        {:ssl, ^socket, data} ->
+          state
+          |> handle_data(data)
+
+        # TCP close / error
+        {:tcp_closed, ^socket} ->
+          cleanup_connection(state)
+
+        {:tcp_error, ^socket, _reason} ->
           cleanup_connection(state)
           transport.close(socket)
 
-        {:ok, data} ->
-          handle_data(state, data)
+        # TLS close / error
+        {:ssl_closed, ^socket} ->
+          cleanup_connection(state)
 
-        {:error, _reason} ->
+        {:ssl_error, ^socket, _reason} ->
           cleanup_connection(state)
           transport.close(socket)
       end
@@ -963,8 +992,8 @@ defmodule Ferricstore.Server.Connection do
         {[Encoder.encode(push) | acc], new_st}
       end)
 
-    # Switch to active:once for receiving pub/sub messages
-    new_state.transport.setopts(new_state.socket, active: :once)
+    # No need to switch socket mode — already in active: :once from the main loop.
+    # The pubsub_loop will re-arm after handling each message.
     {:continue, Enum.reverse(responses), new_state}
   end
 
@@ -983,11 +1012,7 @@ defmodule Ferricstore.Server.Connection do
         {[Encoder.encode(push) | acc], new_st}
       end)
 
-    # Exit pub/sub mode if no subscriptions remain
-    if not in_pubsub_mode?(new_state) do
-      new_state.transport.setopts(new_state.socket, active: false)
-    end
-
+    # No socket mode switch needed — the main loop handles re-arming active: :once.
     {:continue, Enum.reverse(responses), new_state}
   end
 
@@ -1006,7 +1031,7 @@ defmodule Ferricstore.Server.Connection do
         {[Encoder.encode(push) | acc], new_st}
       end)
 
-    new_state.transport.setopts(new_state.socket, active: :once)
+    # No socket mode switch needed — already in active: :once.
     {:continue, Enum.reverse(responses), new_state}
   end
 
@@ -1025,10 +1050,7 @@ defmodule Ferricstore.Server.Connection do
         {[Encoder.encode(push) | acc], new_st}
       end)
 
-    if not in_pubsub_mode?(new_state) do
-      new_state.transport.setopts(new_state.socket, active: false)
-    end
-
+    # No socket mode switch needed — the main loop handles re-arming active: :once.
     {:continue, Enum.reverse(responses), new_state}
   end
 
@@ -1053,7 +1075,8 @@ defmodule Ferricstore.Server.Connection do
   # -- Blocking list commands (handled in connection layer) ------------------
   # These commands try an immediate pop; if the list is empty and timeout > 0,
   # the connection process registers as a waiter and enters a `receive` block.
-  # Passive socket mode ensures no TCP data arrives during the block.
+  # During the block, `active: :once` is re-armed so we can detect client
+  # disconnect ({:tcp_closed, ...}) while waiting for waiter notifications.
 
   defp dispatch("BLPOP", args, state) do
     dispatch_blocking(:blpop, args, state)
@@ -1114,7 +1137,11 @@ defmodule Ferricstore.Server.Connection do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
 
-    # Enter receive block — passive socket means no TCP data arrives
+    # Re-arm active: :once so we can detect client disconnect during the block.
+    # The client should not send commands while blocked, but if the connection
+    # is closed we need to know.
+    state.transport.setopts(state.socket, active: :once)
+
     result =
       receive do
         {:waiter_notify, notified_key} ->
@@ -1122,8 +1149,15 @@ defmodule Ferricstore.Server.Connection do
           case List.handle(pop_cmd, [notified_key], store) do
             nil -> nil
             {:error, _} -> nil
-            value -> [notified_key, value]
+            value -> {:ok, [notified_key, value]}
           end
+
+        # Client disconnected while blocked — clean up and stop.
+        {:tcp_closed, _socket} ->
+          :client_closed
+
+        {:tcp_error, _socket, _reason} ->
+          :client_closed
       after
         timeout_ms ->
           nil
@@ -1132,7 +1166,18 @@ defmodule Ferricstore.Server.Connection do
     # Cleanup: unregister from all keys
     Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
 
-    {:continue, Encoder.encode(result), state}
+    case result do
+      :client_closed ->
+        cleanup_connection(state)
+        state.transport.close(state.socket)
+        {:quit, Encoder.encode(nil), state}
+
+      {:ok, value} ->
+        {:continue, Encoder.encode(value), state}
+
+      nil ->
+        {:continue, Encoder.encode(nil), state}
+    end
   end
 
   # -- BLMOVE blocking dispatch ------------------------------------------------
@@ -1173,6 +1218,9 @@ defmodule Ferricstore.Server.Connection do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
 
+    # Re-arm active: :once so we can detect client disconnect during the block.
+    state.transport.setopts(state.socket, active: :once)
+
     result =
       receive do
         {:waiter_notify, _notified_key} ->
@@ -1180,8 +1228,14 @@ defmodule Ferricstore.Server.Connection do
           case List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store) do
             nil -> nil
             {:error, _} -> nil
-            value -> value
+            value -> {:ok, value}
           end
+
+        {:tcp_closed, _socket} ->
+          :client_closed
+
+        {:tcp_error, _socket, _reason} ->
+          :client_closed
       after
         timeout_ms ->
           nil
@@ -1189,7 +1243,18 @@ defmodule Ferricstore.Server.Connection do
 
     Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
 
-    {:continue, Encoder.encode(result), state}
+    case result do
+      :client_closed ->
+        cleanup_connection(state)
+        state.transport.close(state.socket)
+        {:quit, Encoder.encode(nil), state}
+
+      {:ok, value} ->
+        {:continue, Encoder.encode(value), state}
+
+      nil ->
+        {:continue, Encoder.encode(nil), state}
+    end
   end
 
   # -- BLMPOP blocking dispatch ------------------------------------------------
@@ -1244,6 +1309,9 @@ defmodule Ferricstore.Server.Connection do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
 
+    # Re-arm active: :once so we can detect client disconnect during the block.
+    state.transport.setopts(state.socket, active: :once)
+
     result =
       receive do
         {:waiter_notify, notified_key} ->
@@ -1252,8 +1320,14 @@ defmodule Ferricstore.Server.Connection do
             {:error, _} -> nil
             value ->
               elements = if is_list(value), do: value, else: [value]
-              [notified_key, elements]
+              {:ok, [notified_key, elements]}
           end
+
+        {:tcp_closed, _socket} ->
+          :client_closed
+
+        {:tcp_error, _socket, _reason} ->
+          :client_closed
       after
         timeout_ms ->
           nil
@@ -1261,7 +1335,18 @@ defmodule Ferricstore.Server.Connection do
 
     Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
 
-    {:continue, Encoder.encode(result), state}
+    case result do
+      :client_closed ->
+        cleanup_connection(state)
+        state.transport.close(state.socket)
+        {:quit, Encoder.encode(nil), state}
+
+      {:ok, value} ->
+        {:continue, Encoder.encode(value), state}
+
+      nil ->
+        {:continue, Encoder.encode(nil), state}
+    end
   end
 
   # All other commands go through the Dispatcher with an injected store.
@@ -1506,15 +1591,19 @@ defmodule Ferricstore.Server.Connection do
   # ---------------------------------------------------------------------------
 
   defp pubsub_loop(%__MODULE__{socket: socket, transport: transport} = state) do
+    # Re-arm active: :once — needed both for the next TCP chunk and so that
+    # the kernel can deliver :tcp_closed while we wait for pub/sub pushes.
+    transport.setopts(socket, active: :once)
+
     receive do
-      # TCP active-mode data
+      # TCP active-mode data — client sent a command while in pub/sub mode
+      # (only SUBSCRIBE/UNSUBSCRIBE/PING/QUIT/RESET are allowed).
+      # handle_data flows back through loop -> pubsub_loop, which re-arms.
       {:tcp, ^socket, data} ->
-        transport.setopts(socket, active: :once)
         handle_data(state, data)
 
       # TLS active-mode data
       {:ssl, ^socket, data} ->
-        transport.setopts(socket, active: :once)
         handle_data(state, data)
 
       # TCP close / error
@@ -1537,13 +1626,11 @@ defmodule Ferricstore.Server.Connection do
       {:pubsub_message, channel, message} ->
         push = {:push, ["message", channel, message]}
         transport.send(socket, Encoder.encode(push))
-        transport.setopts(socket, active: :once)
         pubsub_loop(state)
 
       {:pubsub_pmessage, pattern, channel, message} ->
         push = {:push, ["pmessage", pattern, channel, message]}
         transport.send(socket, Encoder.encode(push))
-        transport.setopts(socket, active: :once)
         pubsub_loop(state)
     end
   end
