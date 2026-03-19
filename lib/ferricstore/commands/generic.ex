@@ -353,9 +353,12 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_scan(cursor_str, match_pattern, count, type_filter, store) do
+    alias Ferricstore.Store.CompoundKey
+
     all_keys =
       store.keys.()
-      |> filter_by_type(type_filter)
+      |> Enum.reject(&CompoundKey.internal_key?/1)
+      |> filter_by_type(type_filter, store)
       |> filter_by_match(match_pattern)
       |> Enum.sort()
 
@@ -390,11 +393,15 @@ defmodule Ferricstore.Commands.Generic do
     [next_cursor, batch]
   end
 
-  defp filter_by_type(keys, nil), do: keys
+  defp filter_by_type(keys, nil, _store), do: keys
 
-  defp filter_by_type(keys, "string"), do: keys
+  defp filter_by_type(keys, type_filter, store) do
+    alias Ferricstore.Store.TypeRegistry
 
-  defp filter_by_type(_keys, _other_type), do: []
+    Enum.filter(keys, fn key ->
+      TypeRegistry.get_type(key, store) == type_filter
+    end)
+  end
 
   defp filter_by_match(keys, nil), do: keys
 

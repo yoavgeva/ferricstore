@@ -319,13 +319,13 @@ defmodule Ferricstore.Commands.GenericTest do
       assert next_cursor != "0"
     end
 
-    test "SCAN with TYPE string returns all keys (only type supported)" do
+    test "SCAN with TYPE string returns only string keys" do
       store = MockStore.make(%{"a" => {"1", 0}, "b" => {"2", 0}})
       [_cursor, keys] = Generic.handle("SCAN", ["0", "TYPE", "string", "COUNT", "100"], store)
       assert Enum.sort(keys) == ["a", "b"]
     end
 
-    test "SCAN with TYPE list returns empty (unsupported type)" do
+    test "SCAN with TYPE list returns empty when no list keys exist" do
       store = MockStore.make(%{"a" => {"1", 0}, "b" => {"2", 0}})
       [cursor, keys] = Generic.handle("SCAN", ["0", "TYPE", "list", "COUNT", "100"], store)
       assert keys == []

@@ -90,6 +90,36 @@ defmodule Ferricstore.Server.Connection do
   @type multi_state :: :none | :queuing
   @type read_mode :: :consistent | :stale
 
+  # Commands that read keys and should trigger client tracking registration.
+  @read_cmds ~w(GET MGET GETRANGE STRLEN GETEX GETDEL GETSET
+    HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN
+    LRANGE LLEN LINDEX LPOS
+    SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER
+    ZSCORE ZRANK ZREVRANK ZRANGE ZCARD ZCOUNT ZRANDMEMBER ZMSCORE
+    TYPE EXISTS TTL PTTL EXPIRETIME PEXPIRETIME
+    GETBIT BITCOUNT BITPOS PFCOUNT
+    OBJECT SUBSTR
+    GEOHASH GEOPOS GEODIST GEOSEARCH
+    XLEN XRANGE XREVRANGE XREAD XINFO
+    JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET)
+
+  # Commands that write keys and should trigger client tracking invalidation.
+  @write_cmds ~w(SET SETNX SETEX PSETEX MSET MSETNX APPEND SETRANGE
+    INCR DECR INCRBY DECRBY INCRBYFLOAT
+    DEL UNLINK
+    EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
+    RENAME RENAMENX COPY
+    HSET HDEL HINCRBY HINCRBYFLOAT HSETNX
+    LPUSH RPUSH LPOP RPOP LSET LINSERT LTRIM LREM LMOVE LPUSHX RPUSHX
+    SADD SREM SPOP SMOVE SDIFFSTORE SINTERSTORE SUNIONSTORE
+    ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX
+    SETBIT BITOP PFADD PFMERGE
+    GEOADD GEOSEARCHSTORE
+    XADD XTRIM XDEL
+    JSON.SET JSON.DEL JSON.NUMINCRBY JSON.TOGGLE JSON.CLEAR JSON.ARRAPPEND
+    GETSET GETDEL
+    CAS LOCK UNLOCK EXTEND)
+
   @type t :: %__MODULE__{
           socket: :inet.socket(),
           transport: module(),
@@ -131,32 +161,40 @@ defmodule Ferricstore.Server.Connection do
   @spec init(ref :: atom(), transport :: module(), opts :: map()) :: :ok
   def init(ref, transport, _opts) do
     {:ok, socket} = :ranch.handshake(ref)
-    :ok = transport.setopts(socket, active: :once)
 
-    Stats.incr_connections()
+    # Enforce require-tls: reject plaintext connections when TLS is required.
+    if transport == :ranch_tcp and require_tls?() do
+      error_msg = Encoder.encode({:error, "ERR TLS required: plaintext connections are not permitted"})
+      transport.send(socket, IO.iodata_to_binary(error_msg))
+      transport.close(socket)
+    else
+      :ok = transport.setopts(socket, active: :once)
 
-    peer =
-      case transport.peername(socket) do
-        {:ok, addr} -> addr
-        _ -> nil
-      end
+      Stats.incr_connections()
 
-    state = %__MODULE__{
-      socket: socket,
-      transport: transport,
-      client_id: generate_client_id(),
-      client_name: nil,
-      created_at: System.monotonic_time(:millisecond),
-      peer: peer,
-      tracking: ClientTracking.new_config()
-    }
+      peer =
+        case transport.peername(socket) do
+          {:ok, addr} -> addr
+          _ -> nil
+        end
 
-    AuditLog.log(:connection_open, %{
-      client_id: state.client_id,
-      client_ip: format_peer(peer)
-    })
+      state = %__MODULE__{
+        socket: socket,
+        transport: transport,
+        client_id: generate_client_id(),
+        client_name: nil,
+        created_at: System.monotonic_time(:millisecond),
+        peer: peer,
+        tracking: ClientTracking.new_config()
+      }
 
-    loop(state)
+      AuditLog.log(:connection_open, %{
+        client_id: state.client_id,
+        client_ip: format_peer(peer)
+      })
+
+      loop(state)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -198,6 +236,12 @@ defmodule Ferricstore.Server.Connection do
         {:ssl_error, ^socket, _reason} ->
           cleanup_connection(state)
           transport.close(socket)
+
+        # Client tracking invalidation push — sent by notify_key_modified when
+        # another connection writes a key this connection is tracking.
+        {:tracking_invalidation, iodata} ->
+          transport.send(socket, iodata)
+          loop(state)
       end
     end
   end
@@ -556,7 +600,7 @@ defmodule Ferricstore.Server.Connection do
 
   # Dispatches a single pure command inside a Task. Returns {action, encoded_response}.
   # Pure commands don't modify connection state, so we don't thread state through.
-  defp dispatch_pure_command(cmd, store, _state) do
+  defp dispatch_pure_command(cmd, store, state) do
     case normalise_cmd(cmd) do
       :unknown ->
         {:continue, Encoder.encode({:error, "ERR unknown command format"})}
@@ -576,6 +620,8 @@ defmodule Ferricstore.Server.Connection do
           end
 
         maybe_notify_keyspace(name, args, result)
+        # Client tracking: notify writes from pipelined commands
+        maybe_notify_tracking(name, args, result, state)
         {:continue, Encoder.encode(result)}
     end
   end
@@ -1384,7 +1430,12 @@ defmodule Ferricstore.Server.Connection do
         end
 
       maybe_notify_keyspace(cmd, args, result)
-      {:continue, Encoder.encode(result), state}
+
+      # Client tracking: track reads and notify writes
+      new_state = maybe_track_read(cmd, args, result, state)
+      maybe_notify_tracking(cmd, args, result, state)
+
+      {:continue, Encoder.encode(result), new_state}
     end
   end
 
@@ -1648,6 +1699,11 @@ defmodule Ferricstore.Server.Connection do
         push = {:push, ["pmessage", pattern, channel, message]}
         transport.send(socket, Encoder.encode(push))
         pubsub_loop(state)
+
+      # Client tracking invalidation push — can arrive while in pub/sub mode
+      {:tracking_invalidation, iodata} ->
+        transport.send(socket, iodata)
+        pubsub_loop(state)
     end
   end
 
@@ -1712,6 +1768,124 @@ defmodule Ferricstore.Server.Connection do
     KeyspaceNotifications.notify(key, event)
   end
 
+  # ---------------------------------------------------------------------------
+  # Client tracking helpers
+  # ---------------------------------------------------------------------------
+
+  # The socket_sender callback passed to ClientTracking.notify_key_modified/3.
+  # Sends a message to the target connection process, which will write the
+  # invalidation push to its socket in its main loop.
+  @spec tracking_socket_sender() :: (pid(), iodata() -> :ok)
+  defp tracking_socket_sender do
+    fn target_pid, iodata ->
+      send(target_pid, {:tracking_invalidation, iodata})
+      :ok
+    end
+  end
+
+  # After a successful read command, register the read key(s) for tracking.
+  # Only called when tracking is enabled on the connection.
+  # Returns the (potentially updated) connection state.
+  @spec maybe_track_read(binary(), [binary()], term(), t()) :: t()
+  defp maybe_track_read(_cmd, _args, _result, %{tracking: %{enabled: false}} = state), do: state
+  defp maybe_track_read(_cmd, _args, _result, %{tracking: nil} = state), do: state
+  defp maybe_track_read(_cmd, _args, {:error, _}, state), do: state
+
+  defp maybe_track_read(cmd, args, _result, state) when cmd in @read_cmds do
+    conn_pid = self()
+
+    case cmd do
+      "MGET" ->
+        new_tracking = ClientTracking.track_keys(conn_pid, args, state.tracking)
+        %{state | tracking: new_tracking}
+
+      "HMGET" ->
+        # HMGET key field [field ...] — track the top-level key
+        case args do
+          [key | _] ->
+            new_tracking = ClientTracking.track_key(conn_pid, key, state.tracking)
+            %{state | tracking: new_tracking}
+
+          _ ->
+            state
+        end
+
+      "JSON.MGET" ->
+        # JSON.MGET key [key ...] path — track all keys (last arg is the path)
+        keys = Enum.drop(args, -1)
+        new_tracking = ClientTracking.track_keys(conn_pid, keys, state.tracking)
+        %{state | tracking: new_tracking}
+
+      _ ->
+        # Single-key commands: first arg is the key
+        case args do
+          [key | _] ->
+            new_tracking = ClientTracking.track_key(conn_pid, key, state.tracking)
+            %{state | tracking: new_tracking}
+
+          _ ->
+            state
+        end
+    end
+  end
+
+  defp maybe_track_read(_cmd, _args, _result, state), do: state
+
+  # After a successful write command, notify all tracking connections.
+  # This can be called from any process (connection process or Task).
+  @spec maybe_notify_tracking(binary(), [binary()], term(), t()) :: :ok
+  defp maybe_notify_tracking(_cmd, _args, {:error, _}, _state), do: :ok
+
+  defp maybe_notify_tracking(cmd, args, _result, _state) when cmd in @write_cmds do
+    writer_pid = self()
+    sender = tracking_socket_sender()
+
+    case cmd do
+      c when c in ~w(MSET MSETNX) ->
+        keys =
+          args
+          |> Enum.chunk_every(2)
+          |> Enum.map(fn [key | _] -> key end)
+
+        ClientTracking.notify_keys_modified(keys, writer_pid, sender)
+
+      c when c in ~w(DEL UNLINK) ->
+        ClientTracking.notify_keys_modified(args, writer_pid, sender)
+
+      "RENAME" ->
+        # RENAME source destination — both keys are affected
+        case args do
+          [src, dst | _] ->
+            ClientTracking.notify_keys_modified([src, dst], writer_pid, sender)
+
+          _ ->
+            :ok
+        end
+
+      "COPY" ->
+        # COPY source destination — destination is modified
+        case args do
+          [_src, dst | _] ->
+            ClientTracking.notify_key_modified(dst, writer_pid, sender)
+
+          _ ->
+            :ok
+        end
+
+      _ ->
+        # Single-key commands: first arg is the key
+        case args do
+          [key | _] ->
+            ClientTracking.notify_key_modified(key, writer_pid, sender)
+
+          _ ->
+            :ok
+        end
+    end
+  end
+
+  defp maybe_notify_tracking(_cmd, _args, _result, _state), do: :ok
+
   defp cleanup_connection(state) do
     duration_ms = System.monotonic_time(:millisecond) - state.created_at
 
@@ -1734,4 +1908,9 @@ defmodule Ferricstore.Server.Connection do
   # Formats a peer tuple `{ip, port}` into a human-readable string.
   defp format_peer(nil), do: "unknown"
   defp format_peer({ip, port}), do: "#{:inet.ntoa(ip)}:#{port}"
+
+  # Returns true when the require-tls configuration flag is set.
+  defp require_tls? do
+    Application.get_env(:ferricstore, :require_tls, false) == true
+  end
 end
