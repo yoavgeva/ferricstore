@@ -20,47 +20,48 @@ defmodule Ferricstore.Raft.BatcherTest do
   setup_all do
     ShardHelpers.wait_shards_alive()
 
-    # Start the ra system (idempotent if already started)
-    data_dir = Application.fetch_env!(:ferricstore, :data_dir)
-    Cluster.start_system(data_dir)
+    # When raft_enabled is true (default), the application already started
+    # the ra system, ra servers, and batchers for shards 0-3. Reuse them.
+    # When raft_enabled is false, set up our own ra lifecycle.
+    if Application.get_env(:ferricstore, :raft_enabled, true) do
+      :ok
+    else
+      data_dir = Application.fetch_env!(:ferricstore, :data_dir)
+      Cluster.start_system(data_dir)
 
-    # Clean up any stale ra server registrations from previous runs, then
-    # start fresh ra servers for each shard using the live shard state.
-    for i <- 0..3 do
-      server_id = Cluster.shard_server_id(i)
-      _ = :ra.stop_server(Cluster.system_name(), server_id)
-      _ = :ra.force_delete_server(Cluster.system_name(), server_id)
+      for i <- 0..3 do
+        server_id = Cluster.shard_server_id(i)
+        _ = :ra.stop_server(Cluster.system_name(), server_id)
+        _ = :ra.force_delete_server(Cluster.system_name(), server_id)
 
-      shard_name = Router.shard_name(i)
-      pid = Process.whereis(shard_name)
-      state = :sys.get_state(pid)
-      Cluster.start_shard_server(i, state.store, state.ets)
+        shard_name = Router.shard_name(i)
+        pid = Process.whereis(shard_name)
+        state = :sys.get_state(pid)
+        Cluster.start_shard_server(i, state.store, state.ets)
+      end
+
+      batcher_pids =
+        for i <- 0..3 do
+          shard_id = Cluster.shard_server_id(i)
+
+          {:ok, pid} =
+            Batcher.start_link(shard_index: i, shard_id: shard_id)
+
+          {i, pid}
+        end
+
+      on_exit(fn ->
+        for {_i, pid} <- batcher_pids do
+          if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
+        end
+
+        for i <- 0..3 do
+          Cluster.stop_shard_server(i)
+        end
+      end)
+
+      :ok
     end
-
-    # Start batchers (not supervised -- we manage them here)
-    batcher_pids =
-      for i <- 0..3 do
-        shard_id = Cluster.shard_server_id(i)
-
-        {:ok, pid} =
-          Batcher.start_link(shard_index: i, shard_id: shard_id)
-
-        {i, pid}
-      end
-
-    on_exit(fn ->
-      # Stop batchers
-      for {_i, pid} <- batcher_pids do
-        if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
-      end
-
-      # Stop ra servers
-      for i <- 0..3 do
-        Cluster.stop_shard_server(i)
-      end
-    end)
-
-    :ok
   end
 
   setup do

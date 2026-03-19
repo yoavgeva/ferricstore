@@ -17,6 +17,14 @@ defmodule Ferricstore.Store.ConcurrencyTest do
 
   @task_timeout 30_000
 
+  setup do
+    # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+    original = Application.get_env(:ferricstore, :raft_enabled)
+    Application.put_env(:ferricstore, :raft_enabled, false)
+    on_exit(fn -> Application.put_env(:ferricstore, :raft_enabled, original) end)
+    :ok
+  end
+
   # -------------------------------------------------------------------
   # Helpers
   # -------------------------------------------------------------------

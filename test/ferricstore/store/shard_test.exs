@@ -4,6 +4,10 @@ defmodule Ferricstore.Store.ShardTest do
   alias Ferricstore.Store.Shard
 
   setup do
+    # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+    original = Application.get_env(:ferricstore, :raft_enabled)
+    Application.put_env(:ferricstore, :raft_enabled, false)
+
     dir = Path.join(System.tmp_dir!(), "shard_test_#{:rand.uniform(999_999)}")
     File.mkdir_p!(dir)
 
@@ -12,6 +16,7 @@ defmodule Ferricstore.Store.ShardTest do
     {:ok, pid} = Shard.start_link(index: index, data_dir: dir)
 
     on_exit(fn ->
+      Application.put_env(:ferricstore, :raft_enabled, original)
       if Process.alive?(pid), do: GenServer.stop(pid)
       File.rm_rf!(dir)
     end)

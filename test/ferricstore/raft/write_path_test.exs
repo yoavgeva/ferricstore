@@ -22,67 +22,64 @@ defmodule Ferricstore.Raft.WritePathTest do
   setup_all do
     ShardHelpers.wait_shards_alive()
 
-    # Start the ra system (idempotent if already started)
-    data_dir = Application.fetch_env!(:ferricstore, :data_dir)
-    Cluster.start_system(data_dir)
+    # When raft_enabled is true (default), the application already started
+    # the ra system, ra servers, and batchers for shards 0-3. Reuse them.
+    if Application.get_env(:ferricstore, :raft_enabled, true) do
+      # Ensure raft_enabled stays true for these tests
+      :ok
+    else
+      data_dir = Application.fetch_env!(:ferricstore, :data_dir)
+      Cluster.start_system(data_dir)
 
-    # Clean up any stale ra server registrations from previous runs, then
-    # start fresh ra servers for each shard using the live shard state.
-    for i <- 0..3 do
-      server_id = Cluster.shard_server_id(i)
-      _ = :ra.stop_server(Cluster.system_name(), server_id)
-      _ = :ra.force_delete_server(Cluster.system_name(), server_id)
+      for i <- 0..3 do
+        server_id = Cluster.shard_server_id(i)
+        _ = :ra.stop_server(Cluster.system_name(), server_id)
+        _ = :ra.force_delete_server(Cluster.system_name(), server_id)
 
-      shard_name = Router.shard_name(i)
-      pid = Process.whereis(shard_name)
-      state = :sys.get_state(pid)
-      Cluster.start_shard_server(i, state.store, state.ets)
+        shard_name = Router.shard_name(i)
+        pid = Process.whereis(shard_name)
+        state = :sys.get_state(pid)
+        Cluster.start_shard_server(i, state.store, state.ets)
+      end
+
+      batcher_pids =
+        for i <- 0..3 do
+          shard_id = Cluster.shard_server_id(i)
+          batcher_name = Batcher.batcher_name(i)
+
+          case Process.whereis(batcher_name) do
+            pid when is_pid(pid) ->
+              {i, pid, :reused}
+
+            nil ->
+              {:ok, pid} =
+                Batcher.start_link(shard_index: i, shard_id: shard_id)
+
+              {i, pid, :started}
+          end
+        end
+
+      original_raft = Application.get_env(:ferricstore, :raft_enabled, true)
+      Application.put_env(:ferricstore, :raft_enabled, true)
+
+      on_exit(fn ->
+        Application.put_env(:ferricstore, :raft_enabled, original_raft)
+
+        for {_i, pid, ownership} <- batcher_pids do
+          if ownership == :started and Process.alive?(pid) do
+            GenServer.stop(pid, :normal, 5_000)
+          end
+        end
+
+        for i <- 0..3 do
+          Cluster.stop_shard_server(i)
+        end
+
+        ShardHelpers.wait_shards_alive()
+      end)
+
+      :ok
     end
-
-    # Start batchers (not supervised -- we manage them here).
-    # If the batcher is already started (e.g., application supervises them
-    # when raft_enabled is true in test config), reuse the existing process.
-    batcher_pids =
-      for i <- 0..3 do
-        shard_id = Cluster.shard_server_id(i)
-        batcher_name = Batcher.batcher_name(i)
-
-        case Process.whereis(batcher_name) do
-          pid when is_pid(pid) ->
-            {i, pid, :reused}
-
-          nil ->
-            {:ok, pid} =
-              Batcher.start_link(shard_index: i, shard_id: shard_id)
-
-            {i, pid, :started}
-        end
-      end
-
-    # Enable raft for the duration of these tests
-    original_raft = Application.get_env(:ferricstore, :raft_enabled, true)
-    Application.put_env(:ferricstore, :raft_enabled, true)
-
-    on_exit(fn ->
-      # Restore original raft_enabled setting
-      Application.put_env(:ferricstore, :raft_enabled, original_raft)
-
-      # Stop batchers we started (don't stop reused ones)
-      for {_i, pid, ownership} <- batcher_pids do
-        if ownership == :started and Process.alive?(pid) do
-          GenServer.stop(pid, :normal, 5_000)
-        end
-      end
-
-      # Stop ra servers
-      for i <- 0..3 do
-        Cluster.stop_shard_server(i)
-      end
-
-      ShardHelpers.wait_shards_alive()
-    end)
-
-    :ok
   end
 
   setup do
@@ -1497,6 +1494,304 @@ defmodule Ferricstore.Raft.WritePathTest do
       {value, expire_at_ms} = Router.get_meta(k)
       assert value == "XYcdef"
       assert expire_at_ms == future
+    end
+  end
+
+  # ===========================================================================
+  # SET edge cases through Raft
+  # ===========================================================================
+
+  describe "SET edge cases through Raft" do
+    test "SET with EX (TTL) — value expires after TTL elapses" do
+      k = ukey("set_ex_expire")
+      # Set a very short TTL so we can observe expiry
+      short_ttl_ms = 50
+      expire_at = System.os_time(:millisecond) + short_ttl_ms
+
+      :ok = Router.put(k, "ephemeral", expire_at)
+      # Immediately after SET the value should be present
+      assert "ephemeral" == Router.get(k)
+
+      # Wait for TTL to expire
+      Process.sleep(short_ttl_ms + 20)
+
+      # After expiry, GET should return nil
+      assert nil == Router.get(k)
+    end
+
+    test "SET with NX on existing key — returns nil, does not overwrite" do
+      k = ukey("set_nx_existing")
+
+      :ok = Router.put(k, "original", 0)
+      assert "original" == Router.get(k)
+
+      # Simulate SET ... NX: only set if key does NOT exist.
+      # NX is implemented at the Strings command layer via exists? check
+      # before put. We replicate the semantics through Router here.
+      assert Router.exists?(k) == true
+
+      # The NX guard prevents the write; the original value remains.
+      result =
+        if Router.exists?(k), do: nil, else: Router.put(k, "should_not_appear", 0)
+
+      assert result == nil
+      assert "original" == Router.get(k)
+    end
+
+    test "SET with XX on missing key — returns nil" do
+      k = ukey("set_xx_missing")
+
+      # Key does not exist. XX means "only set if key exists".
+      assert Router.exists?(k) == false
+
+      result =
+        if Router.exists?(k), do: Router.put(k, "should_not_appear", 0), else: nil
+
+      assert result == nil
+      assert nil == Router.get(k)
+    end
+
+    test "SET with GET flag — returns old value (via GETSET)" do
+      k = ukey("set_get_flag")
+
+      :ok = Router.put(k, "old_value", 0)
+      assert "old_value" == Router.get(k)
+
+      # SET ... GET semantics: atomically set new value and return old.
+      # In Ferricstore, GETSET provides this exact behaviour through Raft.
+      old = Router.getset(k, "new_value")
+      assert old == "old_value"
+      assert "new_value" == Router.get(k)
+    end
+  end
+
+  # ===========================================================================
+  # INCR edge cases through Raft
+  # ===========================================================================
+
+  describe "INCR edge cases through Raft" do
+    test "INCR on value 'not_a_number' — returns error" do
+      k = ukey("incr_nan")
+
+      :ok = Router.put(k, "not_a_number", 0)
+      assert {:error, "ERR value is not an integer or out of range"} = Router.incr(k, 1)
+      # Original value should be unchanged
+      assert "not_a_number" == Router.get(k)
+    end
+
+    test "INCR on max int64 — handles overflow (bignum)" do
+      k = ukey("incr_overflow")
+      max_int64 = 9_223_372_036_854_775_807
+      expected = max_int64 + 1
+
+      :ok = Router.put(k, Integer.to_string(max_int64), 0)
+      assert {:ok, ^expected} = Router.incr(k, 1)
+      assert Integer.to_string(expected) == Router.get(k)
+    end
+
+    test "DECRBY with negative delta through Raft — effectively increments" do
+      k = ukey("decrby_neg")
+
+      :ok = Router.put(k, "10", 0)
+      # DECRBY key -5 is equivalent to INCRBY key 5 (the Strings layer
+      # negates the delta for DECRBY, so passing a negative delta to
+      # Router.incr directly simulates DECRBY with a negative argument).
+      # DECRBY -5 => incr(key, -(-5)) => incr(key, 5)
+      assert {:ok, 15} = Router.incr(k, 5)
+      assert "15" == Router.get(k)
+    end
+
+    test "INCR then GET in same Raft batch — consistent" do
+      k = ukey("incr_get_batch")
+
+      :ok = Router.put(k, "0", 0)
+
+      # Issue INCR; the Raft batcher ensures the write is committed
+      # before the reply, so a subsequent GET sees the new value.
+      {:ok, 1} = Router.incr(k, 1)
+      assert "1" == Router.get(k)
+
+      {:ok, 2} = Router.incr(k, 1)
+      assert "2" == Router.get(k)
+
+      {:ok, 12} = Router.incr(k, 10)
+      assert "12" == Router.get(k)
+    end
+  end
+
+  # ===========================================================================
+  # INCRBYFLOAT edge cases through Raft
+  # ===========================================================================
+
+  describe "INCRBYFLOAT edge cases through Raft" do
+    test "INCRBYFLOAT on integer string '10' — returns float result" do
+      k = ukey("incrbyfloat_int_str")
+
+      :ok = Router.put(k, "10", 0)
+      assert {:ok, result} = Router.incr_float(k, 0.5)
+      assert result == "10.5"
+      assert "10.5" == Router.get(k)
+    end
+
+    test "INCRBYFLOAT negative delta" do
+      k = ukey("incrbyfloat_neg")
+
+      :ok = Router.put(k, "10.5", 0)
+      assert {:ok, result} = Router.incr_float(k, -0.5)
+      # 10.5 - 0.5 = 10.0, which formats as "10" (trailing .0 stripped)
+      assert result == "10"
+      assert "10" == Router.get(k)
+    end
+
+    test "INCRBYFLOAT on 'not_a_number' — returns error" do
+      k = ukey("incrbyfloat_nan")
+
+      :ok = Router.put(k, "not_a_number", 0)
+      assert {:error, "ERR value is not a valid float"} = Router.incr_float(k, 1.0)
+      # Original value should be unchanged
+      assert "not_a_number" == Router.get(k)
+    end
+
+    test "INCRBYFLOAT preserves existing TTL" do
+      k = ukey("incrbyfloat_ttl_preserve")
+      future = System.os_time(:millisecond) + 120_000
+
+      :ok = Router.put(k, "5.0", future)
+      {:ok, _} = Router.incr_float(k, 2.5)
+
+      {value, expire_at_ms} = Router.get_meta(k)
+      assert value == "7.5"
+      assert expire_at_ms == future
+    end
+  end
+
+  # ===========================================================================
+  # APPEND edge cases through Raft
+  # ===========================================================================
+
+  describe "APPEND edge cases through Raft" do
+    test "APPEND to non-existent key creates it" do
+      k = ukey("append_create")
+
+      # Key does not exist; APPEND should create it with the given value.
+      assert {:ok, 5} = Router.append(k, "hello")
+      assert "hello" == Router.get(k)
+    end
+
+    test "APPEND preserves existing TTL" do
+      k = ukey("append_ttl_preserve")
+      future = System.os_time(:millisecond) + 120_000
+
+      :ok = Router.put(k, "base", future)
+      {:ok, 10} = Router.append(k, "_added")
+
+      {value, expire_at_ms} = Router.get_meta(k)
+      assert value == "base_added"
+      assert expire_at_ms == future
+    end
+
+    test "APPEND with empty string — no change to value, returns existing length" do
+      k = ukey("append_empty")
+
+      :ok = Router.put(k, "existing", 0)
+      {:ok, len} = Router.append(k, "")
+      assert len == byte_size("existing")
+      assert "existing" == Router.get(k)
+    end
+  end
+
+  # ===========================================================================
+  # GETSET / GETDEL / GETEX edge cases through Raft
+  # ===========================================================================
+
+  describe "GETSET edge cases through Raft" do
+    test "GETSET on non-existent key returns nil, creates key" do
+      k = ukey("getset_nonexistent")
+
+      old = Router.getset(k, "fresh_value")
+      assert old == nil
+      assert "fresh_value" == Router.get(k)
+    end
+  end
+
+  describe "GETDEL edge cases through Raft" do
+    test "GETDEL on non-existent key returns nil" do
+      k = ukey("getdel_nonexistent")
+
+      result = Router.getdel(k)
+      assert result == nil
+      # Key should still not exist
+      assert nil == Router.get(k)
+    end
+  end
+
+  describe "GETEX edge cases through Raft" do
+    test "GETEX with PERSIST removes TTL" do
+      k = ukey("getex_persist_edge")
+      future = System.os_time(:millisecond) + 120_000
+
+      :ok = Router.put(k, "will_persist", future)
+
+      # Verify TTL is set
+      {_, expire_before} = Router.get_meta(k)
+      assert expire_before == future
+
+      # PERSIST = expire_at_ms of 0
+      value = Router.getex(k, 0)
+      assert value == "will_persist"
+
+      {stored_val, expire_at_ms} = Router.get_meta(k)
+      assert stored_val == "will_persist"
+      assert expire_at_ms == 0
+    end
+
+    test "GETEX on expired key returns nil" do
+      k = ukey("getex_expired")
+      past = System.os_time(:millisecond) - 1_000
+
+      :ok = Router.put(k, "expired_val", past)
+
+      # Key is expired; GETEX should return nil
+      result = Router.getex(k, System.os_time(:millisecond) + 60_000)
+      assert result == nil
+    end
+  end
+
+  # ===========================================================================
+  # SETRANGE edge cases through Raft
+  # ===========================================================================
+
+  describe "SETRANGE edge cases through Raft" do
+    test "SETRANGE beyond current length zero-pads" do
+      k = ukey("setrange_zeropad")
+
+      :ok = Router.put(k, "Hi", 0)
+      # Offset 5 is beyond "Hi" (length 2), so bytes 2..4 are zero-padded
+      assert {:ok, 8} = Router.setrange(k, 5, "abc")
+
+      value = Router.get(k)
+      assert byte_size(value) == 8
+      # "Hi" + 3 zero bytes + "abc"
+      assert value == <<"Hi", 0, 0, 0, "abc">>
+    end
+
+    test "SETRANGE at offset 0 replaces start" do
+      k = ukey("setrange_offset0")
+
+      :ok = Router.put(k, "Hello World", 0)
+      assert {:ok, 11} = Router.setrange(k, 0, "Yo")
+      # "Yo" replaces the first 2 bytes: "He" -> "Yo", rest unchanged
+      assert "Yollo World" == Router.get(k)
+    end
+
+    test "SETRANGE on non-existent key creates zero-padded value" do
+      k = ukey("setrange_nonexistent")
+
+      assert {:ok, 8} = Router.setrange(k, 5, "abc")
+      value = Router.get(k)
+      assert byte_size(value) == 8
+      # 5 zero bytes followed by "abc"
+      assert value == <<0, 0, 0, 0, 0, "abc">>
     end
   end
 end

@@ -34,6 +34,14 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
   @moduletag :linux_io_uring
   @moduletag timeout: 120_000
 
+  setup do
+    # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+    original = Application.get_env(:ferricstore, :raft_enabled)
+    Application.put_env(:ferricstore, :raft_enabled, false)
+    on_exit(fn -> Application.put_env(:ferricstore, :raft_enabled, original) end)
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------

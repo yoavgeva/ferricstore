@@ -289,6 +289,10 @@ defmodule Ferricstore.NodeLifecycleTest do
   describe "graceful shard shutdown preserves data" do
     @tag :capture_log
     test "isolated shard: write, stop gracefully, verify data on disk" do
+      # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+      original = Application.get_env(:ferricstore, :raft_enabled)
+      Application.put_env(:ferricstore, :raft_enabled, false)
+
       tmp_dir =
         Path.join(
           System.tmp_dir!(),
@@ -296,7 +300,10 @@ defmodule Ferricstore.NodeLifecycleTest do
         )
 
       File.mkdir_p!(tmp_dir)
-      on_exit(fn -> File.rm_rf(tmp_dir) end)
+      on_exit(fn ->
+        Application.put_env(:ferricstore, :raft_enabled, original)
+        File.rm_rf(tmp_dir)
+      end)
 
       # Start isolated shard (index 98 to avoid conflicts).
       opts = [index: 98, data_dir: tmp_dir, flush_interval_ms: 1]

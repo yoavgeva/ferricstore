@@ -25,33 +25,35 @@ defmodule Ferricstore.Raft.IntegrationTest do
   setup_all do
     ShardHelpers.wait_shards_alive()
 
-    # Start the ra system (idempotent if already started)
-    data_dir = Application.fetch_env!(:ferricstore, :data_dir)
-    Cluster.start_system(data_dir)
+    # When raft_enabled is true (default), the application already started
+    # the ra system and ra servers for shards 0-3. Reuse them.
+    if Application.get_env(:ferricstore, :raft_enabled, true) do
+      :ok
+    else
+      data_dir = Application.fetch_env!(:ferricstore, :data_dir)
+      Cluster.start_system(data_dir)
 
-    # Clean up any stale ra server registrations from previous runs, then
-    # start fresh ra servers for each shard using the live shard state.
-    for i <- 0..3 do
-      server_id = Cluster.shard_server_id(i)
-      _ = :ra.stop_server(Cluster.system_name(), server_id)
-      _ = :ra.force_delete_server(Cluster.system_name(), server_id)
-
-      shard_name = Router.shard_name(i)
-      pid = Process.whereis(shard_name)
-      state = :sys.get_state(pid)
-      Cluster.start_shard_server(i, state.store, state.ets)
-    end
-
-    on_exit(fn ->
-      # Stop ra servers
       for i <- 0..3 do
-        Cluster.stop_shard_server(i)
+        server_id = Cluster.shard_server_id(i)
+        _ = :ra.stop_server(Cluster.system_name(), server_id)
+        _ = :ra.force_delete_server(Cluster.system_name(), server_id)
+
+        shard_name = Router.shard_name(i)
+        pid = Process.whereis(shard_name)
+        state = :sys.get_state(pid)
+        Cluster.start_shard_server(i, state.store, state.ets)
       end
 
-      ShardHelpers.wait_shards_alive()
-    end)
+      on_exit(fn ->
+        for i <- 0..3 do
+          Cluster.stop_shard_server(i)
+        end
 
-    :ok
+        ShardHelpers.wait_shards_alive()
+      end)
+
+      :ok
+    end
   end
 
   setup do
@@ -251,6 +253,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
   # ---------------------------------------------------------------------------
 
   describe "durability through shard restart" do
+    @tag :capture_log
     test "data survives shard crash and restart" do
       k = ukey("durable")
       Router.put(k, "survives_crash", 0)
@@ -263,41 +266,20 @@ defmodule Ferricstore.Raft.IntegrationTest do
       shard_index = Router.shard_for(k)
       shard_name = Router.shard_name(shard_index)
 
-      # Stop the ra server for this shard before killing it so it doesn't
-      # hold stale references after the shard is restarted by the supervisor.
-      Cluster.stop_shard_server(shard_index)
-
       # Kill the shard (simulates crash)
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 2_000
 
       # Wait for supervisor to restart the shard
-      deadline = System.monotonic_time(:millisecond) + 3_000
+      ShardHelpers.wait_shards_alive()
 
-      new_pid =
-        Enum.find_value(Stream.repeatedly(fn -> Process.sleep(50) end), fn _ ->
-          p = Process.whereis(shard_name)
-
-          if is_pid(p) and p != pid and Process.alive?(p),
-            do: p,
-            else:
-              (System.monotonic_time(:millisecond) > deadline && throw(:timeout)
-               nil)
-        end)
-
+      new_pid = Process.whereis(shard_name)
       assert is_pid(new_pid)
       assert new_pid != pid
 
       # Data should be recoverable from Bitcask
       assert "survives_crash" == Router.get(k)
-
-      # Re-start the ra server for the restarted shard so other tests can use it.
-      # Force-delete first to clear stale ra directory registration.
-      server_id = Cluster.shard_server_id(shard_index)
-      _ = :ra.force_delete_server(Cluster.system_name(), server_id)
-      new_state = :sys.get_state(new_pid)
-      Cluster.start_shard_server(shard_index, new_state.store, new_state.ets)
     end
   end
 

@@ -14,6 +14,14 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
   alias Ferricstore.Store.Shard
 
+  setup do
+    # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
+    original = Application.get_env(:ferricstore, :raft_enabled)
+    Application.put_env(:ferricstore, :raft_enabled, false)
+    on_exit(fn -> Application.put_env(:ferricstore, :raft_enabled, original) end)
+    :ok
+  end
+
   # Start an isolated shard (not the app-supervised ones) for each test.
   defp start_shard do
     dir = Path.join(System.tmp_dir!(), "shard_async_#{:rand.uniform(9_999_999)}")
