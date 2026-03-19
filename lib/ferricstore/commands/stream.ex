@@ -23,9 +23,11 @@ defmodule Ferricstore.Commands.Stream do
 
   Stream IDs follow the Redis format `{milliseconds}-{sequence}`. When the
   client sends `*`, the server auto-generates a monotonically increasing ID
-  using `System.os_time(:millisecond)` as the milliseconds component and
-  an incrementing sequence number when multiple entries arrive in the same
-  millisecond.
+  using `Ferricstore.HLC.now_ms/0` (Hybrid Logical Clock, spec 2G.6) as the
+  milliseconds component and an incrementing sequence number when multiple
+  entries arrive in the same millisecond. The HLC ensures monotonicity even
+  when the wall clock jumps backward and, in multi-node mode, tracks the
+  cluster-wide max physical time via Raft heartbeat piggyback.
 
   Explicit IDs must be strictly greater than the last entry's ID.
   """
@@ -725,6 +727,7 @@ defmodule Ferricstore.Commands.Stream do
     ensure_meta_table()
 
     stream_exists? = :ets.lookup(@meta_table, key) != []
+    group_exists? = :ets.lookup(@groups_table, {key, group}) != []
 
     cond do
       not stream_exists? and not mkstream ->
@@ -737,6 +740,9 @@ defmodule Ferricstore.Commands.Stream do
         :ets.insert(@meta_table, {key, 0, "0-0", "0-0", 0, 0})
         create_group(key, group, id_str)
         :ok
+
+      group_exists? ->
+        {:error, "BUSYGROUP Consumer Group name already exists"}
 
       true ->
         create_group(key, group, id_str)
@@ -796,10 +802,10 @@ defmodule Ferricstore.Commands.Stream do
 
                       new_pending =
                         Enum.reduce(entries, pending, fn [id | _], acc ->
-                          Map.put(acc, id, {consumer, System.os_time(:millisecond)})
+                          Map.put(acc, id, {consumer, Ferricstore.HLC.now_ms()})
                         end)
 
-                      new_consumers = Map.put(consumers, consumer, System.os_time(:millisecond))
+                      new_consumers = Map.put(consumers, consumer, Ferricstore.HLC.now_ms())
 
                       :ets.insert(
                         @groups_table,
@@ -891,12 +897,16 @@ defmodule Ferricstore.Commands.Stream do
   # ---------------------------------------------------------------------------
 
   defp resolve_id(:auto, last_ms, last_seq) do
-    now = System.os_time(:millisecond)
+    # Use the Hybrid Logical Clock for the millisecond component (spec 2G.6).
+    # HLC guarantees monotonicity even when the wall clock jumps backward,
+    # and in multi-node mode the physical component tracks the cluster-wide
+    # max via Raft heartbeat piggyback.
+    now = Ferricstore.HLC.now_ms()
 
     cond do
       now > last_ms -> {:ok, {now, 0}}
       now == last_ms -> {:ok, {now, last_seq + 1}}
-      # Clock went backwards -- use last_ms with incremented seq to maintain monotonicity.
+      # HLC physical behind last_ms — keep last_ms with incremented seq.
       true -> {:ok, {last_ms, last_seq + 1}}
     end
   end

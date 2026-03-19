@@ -190,6 +190,11 @@ defmodule Ferricstore.Health.Endpoint do
     send_html_response(socket, transport, 200, "OK", body)
   end
 
+  defp handle_request(socket, transport, "GET", "/metrics") do
+    body = Ferricstore.Metrics.scrape()
+    send_text_response(socket, transport, 200, "OK", body)
+  end
+
   defp handle_request(socket, transport, "GET", _path) do
     send_response(socket, transport, 404, "Not Found", ~s({"error":"not found"}))
   end
@@ -210,6 +215,11 @@ defmodule Ferricstore.Health.Endpoint do
   @spec send_html_response(:inet.socket(), module(), pos_integer(), String.t(), String.t()) :: :ok
   defp send_html_response(socket, transport, status_code, status_text, body) do
     send_response(socket, transport, status_code, status_text, "text/html; charset=utf-8", body)
+  end
+
+  @spec send_text_response(:inet.socket(), module(), pos_integer(), String.t(), String.t()) :: :ok
+  defp send_text_response(socket, transport, status_code, status_text, body) do
+    send_response(socket, transport, status_code, status_text, "text/plain; charset=utf-8", body)
   end
 
   @spec send_response(
