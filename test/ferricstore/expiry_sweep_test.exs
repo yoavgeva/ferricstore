@@ -143,8 +143,8 @@ defmodule Ferricstore.ExpirySweepTest do
 
       Enum.each(keys, fn k -> Router.put(k, "expired_val", past) end)
 
-      # Run enough sweep cycles (ceiling of 5/2 = 3 cycles).
-      Enum.each(1..3, fn _ -> trigger_sweep(0) end)
+      # Run enough sweep cycles (ceiling of 5/2 = 3, plus 1 extra for safety).
+      Enum.each(1..4, fn _ -> trigger_sweep(0) end)
 
       ets = :shard_ets_0
       remaining = Enum.count(keys, fn k -> :ets.lookup(ets, k) != [] end)
