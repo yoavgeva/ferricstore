@@ -539,9 +539,6 @@ defmodule Ferricstore.Server.Connection do
     end
   end
 
-  # (dispatch_commands/2 was removed -- sliding window pipeline dispatch above
-  #  replaces the old sequential reduce-while approach.)
-
   # ---------------------------------------------------------------------------
   # Individual command handlers
   # ---------------------------------------------------------------------------

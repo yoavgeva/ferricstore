@@ -307,8 +307,8 @@ defmodule Ferricstore.Integration.SlidingWindowTest do
       :gen_tcp.close(sock)
     end
 
-    test "multiple fast commands before slow command all arrive early", %{port: port} do
     @tag :perf
+    test "multiple fast commands before slow command all arrive early", %{port: port} do
       sock = connect_and_hello(port)
       k1 = ukey("multi_fast_a")
       k2 = ukey("multi_fast_b")
@@ -349,9 +349,9 @@ defmodule Ferricstore.Integration.SlidingWindowTest do
       :gen_tcp.close(sock)
     end
 
+    @tag :perf
     test "fast commands AFTER a slow command are blocked until slow completes", %{port: port} do
       sock = connect_and_hello(port)
-    @tag :perf
 
       # Pipeline: DEBUG SLEEP 1 (slow), PING (fast)
       # PING response must wait for SLEEP (pipeline ordering)
