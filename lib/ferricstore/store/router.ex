@@ -158,7 +158,7 @@ defmodule Ferricstore.Store.Router do
   Stores `key` with `value`. `expire_at_ms` is an absolute Unix-epoch
   timestamp in milliseconds; pass `0` for no expiry.
   """
-  @spec put(binary(), binary(), non_neg_integer()) :: :ok
+  @spec put(binary(), binary(), non_neg_integer()) :: :ok | {:error, binary()}
   @max_key_size 65_535
   @max_value_size 512 * 1024 * 1024
 

@@ -65,10 +65,12 @@ defmodule Ferricstore.Server.Connection do
     sandbox_namespace: nil,
     pubsub_channels: MapSet.new(),
     pubsub_patterns: MapSet.new(),
-    tracking: nil
+    tracking: nil,
+    read_mode: :consistent
   ]
 
   @type multi_state :: :none | :queuing
+  @type read_mode :: :consistent | :stale
 
   @type t :: %__MODULE__{
           socket: :inet.socket(),
@@ -81,7 +83,8 @@ defmodule Ferricstore.Server.Connection do
           multi_state: multi_state(),
           multi_queue: [{binary(), [binary()]}],
           watched_keys: %{binary() => non_neg_integer()},
-          tracking: ClientTracking.tracking_config() | nil
+          tracking: ClientTracking.tracking_config() | nil,
+          read_mode: read_mode()
         }
 
   # Commands that are NOT queued during MULTI — they are always executed immediately.
@@ -375,10 +378,33 @@ defmodule Ferricstore.Server.Connection do
   end
 
   defp dispatch("RESET", _args, state) do
-    # RESET clears transaction state, sandbox namespace, and tracking state.
+    # RESET clears transaction state, sandbox namespace, read mode, and tracking state.
     ClientTracking.cleanup(self())
-    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}, sandbox_namespace: nil, tracking: ClientTracking.new_config()}
+    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}, sandbox_namespace: nil, tracking: ClientTracking.new_config(), read_mode: :consistent}
     {:continue, Encoder.encode({:simple, "RESET"}), new_state}
+  end
+
+  # -- READMODE command (spec section 5.4) ------------------------------------
+
+  defp dispatch("READMODE", [mode], state) do
+    case String.upcase(mode) do
+      "STALE" ->
+        {:continue, Encoder.encode(:ok), %{state | read_mode: :stale}}
+
+      "CONSISTENT" ->
+        {:continue, Encoder.encode(:ok), %{state | read_mode: :consistent}}
+
+      other ->
+        {:continue,
+         Encoder.encode({:error, "ERR unknown read mode '#{other}', use STALE or CONSISTENT"}),
+         state}
+    end
+  end
+
+  defp dispatch("READMODE", _args, state) do
+    {:continue,
+     Encoder.encode({:error, "ERR wrong number of arguments for 'readmode' command"}),
+     state}
   end
 
   # -- SANDBOX commands -------------------------------------------------------

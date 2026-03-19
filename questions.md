@@ -100,3 +100,17 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 - 193 excluded (perf benchmarks, linux_io_uring, large_alloc — intentional)
 
 *Only add questions here if the spec does not provide a clear answer.*
+
+## Q6: Two-Table ETS Architecture (Section 2.4)
+**Spec says:** Separate `:ferricstore_keydir` (key→offset, never evicted) and `:ferricstore_hot_cache` (key→value, LRU evicted) tables with independent budgets.
+**Current impl:** Single `shard_ets_N` table per shard stores both key metadata and values.
+**Status:** Structural deviation. Current approach works correctly but doesn't support independent eviction policies. The keydir entries and hot cache values share the same memory pool. Splitting into two tables per shard would enable:
+- KEYDIR_FULL rejection (reject new keys when keydir full, without evicting cache)
+- Independent LRU eviction on hot cache only
+- More accurate memory accounting per pool
+**Impact:** Medium. Correctness is unaffected. Performance optimization deferred.
+
+## Q7: Encryption at Rest (Section 6.5)
+**Spec says:** Optional AES-256-GCM encryption for Bitcask data files.
+**Current impl:** Not implemented. Data files are plaintext.
+**Status:** Deferred. Requires Rust NIF changes to encrypt/decrypt in the write/read path.

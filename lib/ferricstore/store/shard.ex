@@ -245,21 +245,29 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:put, key, value, expire_at_ms}, _from, state) do
-    # Write to ETS immediately so reads see it right away.
-    :ets.insert(state.ets, {key, value, expire_at_ms})
-    new_pending = [{key, value, expire_at_ms} | state.pending]
-    new_version = state.write_version + 1
-    new_state = %{state | pending: new_pending, write_version: new_version}
+    # Reject new-key writes when the keydir is at capacity (spec 2.4).
+    # Updates to existing keys are always allowed regardless of memory pressure.
+    is_new = :ets.lookup(state.ets, key) == []
 
-    # Flush immediately when no async flush is in-flight. This ensures every
-    # put is submitted to io_uring (and thus kernel-managed) before the call
-    # returns, providing crash durability even if the process is killed before
-    # the timer fires. Multiple puts arriving while a flush is in-flight are
-    # batched together and flushed on the next timer tick after the CQE.
-    if state.flush_in_flight == nil do
-      {:reply, :ok, flush_pending(new_state)}
+    if is_new and Ferricstore.MemoryGuard.reject_writes?() do
+      {:reply, {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}, state}
     else
-      {:reply, :ok, new_state}
+      # Write to ETS immediately so reads see it right away.
+      :ets.insert(state.ets, {key, value, expire_at_ms})
+      new_pending = [{key, value, expire_at_ms} | state.pending]
+      new_version = state.write_version + 1
+      new_state = %{state | pending: new_pending, write_version: new_version}
+
+      # Flush immediately when no async flush is in-flight. This ensures every
+      # put is submitted to io_uring (and thus kernel-managed) before the call
+      # returns, providing crash durability even if the process is killed before
+      # the timer fires. Multiple puts arriving while a flush is in-flight are
+      # batched together and flushed on the next timer tick after the CQE.
+      if state.flush_in_flight == nil do
+        {:reply, :ok, flush_pending(new_state)}
+      else
+        {:reply, :ok, new_state}
+      end
     end
   end
 
