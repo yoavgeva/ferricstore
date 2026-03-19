@@ -118,27 +118,58 @@ defmodule Ferricstore.Raft.Cluster do
         # references to the old (now-dead) Bitcask store and ETS table.
         #
         # Strategy: stop the old ra server, force-delete its state (since the
-        # machine state references are stale), and start fresh. The Bitcask
-        # data on disk is intact and will be reopened by the new Shard init.
+        # machine state references are stale), and start fresh with a unique
+        # UID so the WAL entries from the old incarnation are ignored.
         _ = :ra.stop_server(@ra_system, server_id)
         _ = :ra.force_delete_server(@ra_system, server_id)
 
-        case :ra.start_server(@ra_system, server_config) do
+        # Allow the WAL to settle after force-delete before starting the new
+        # incarnation. Without this, ra can encounter stale WAL entries that
+        # reference the deleted server's UID, leading to corrupt_log errors.
+        Process.sleep(50)
+
+        restart_uid = shard_uid(shard_index) <> "_#{System.unique_integer([:positive])}"
+
+        restart_config = %{
+          server_config
+          | uid: restart_uid,
+            log_init_args: %{uid: restart_uid}
+        }
+
+        start_with_retry(@ra_system, server_id, restart_config, shard_index)
+
+      {:error, reason} ->
+        # Any other error (e.g. :not_new, :shutdown from corrupt log,
+        # {:corrupt_log, ...}). Force-delete and start fresh with a unique
+        # UID to avoid WAL entry conflicts from previous incarnations.
+        Logger.warning(
+          "ra server for shard #{shard_index} failed with #{inspect(reason)}, " <>
+            "attempting fresh start with unique UID"
+        )
+
+        _ = :ra.stop_server(@ra_system, server_id)
+        _ = :ra.force_delete_server(@ra_system, server_id)
+
+        restart_uid = shard_uid(shard_index) <> "_#{System.unique_integer([:positive])}"
+
+        restart_config = %{
+          server_config
+          | uid: restart_uid,
+            log_init_args: %{uid: restart_uid}
+        }
+
+        case :ra.start_server(@ra_system, restart_config) do
           :ok ->
             :ra.trigger_election(server_id)
             wait_for_leader(server_id)
 
-          {:error, reason} = err ->
+          {:error, retry_reason} = err ->
             Logger.error(
-              "Failed to restart ra server for shard #{shard_index}: #{inspect(reason)}"
+              "Failed to start ra server (recovery) for shard #{shard_index}: #{inspect(retry_reason)}"
             )
 
             err
         end
-
-      {:error, reason} = err ->
-        Logger.error("Failed to start ra server for shard #{shard_index}: #{inspect(reason)}")
-        err
     end
   end
 
@@ -180,6 +211,46 @@ defmodule Ferricstore.Raft.Cluster do
   # ---------------------------------------------------------------------------
   # Private
   # ---------------------------------------------------------------------------
+
+  # Starts a ra server with retries. On corrupt_log errors (stale WAL entries
+  # after force_delete), force-delete again and retry with a fresh UID.
+  defp start_with_retry(system, server_id, config, shard_index, attempts \\ 3)
+
+  defp start_with_retry(_system, _server_id, _config, shard_index, 0) do
+    Logger.error("Failed to start ra server for shard #{shard_index} after retries")
+    {:error, :start_failed_after_retries}
+  end
+
+  defp start_with_retry(system, server_id, config, shard_index, attempts) do
+    case :ra.start_server(system, config) do
+      :ok ->
+        :ra.trigger_election(server_id)
+        wait_for_leader(server_id)
+
+      {:error, {:already_started, _pid}} ->
+        # Another process started it concurrently
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "ra server start for shard #{shard_index} failed (#{inspect(reason)}), " <>
+            "retrying (#{attempts - 1} left)"
+        )
+
+        _ = :ra.force_delete_server(system, server_id)
+        Process.sleep(100)
+
+        retry_uid = shard_uid(shard_index) <> "_#{System.unique_integer([:positive])}"
+
+        retry_config = %{
+          config
+          | uid: retry_uid,
+            log_init_args: %{uid: retry_uid}
+        }
+
+        start_with_retry(system, server_id, retry_config, shard_index, attempts - 1)
+    end
+  end
 
   defp shard_uid(shard_index) do
     "ferricstore_shard_#{shard_index}"

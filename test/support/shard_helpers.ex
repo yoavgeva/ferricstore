@@ -79,7 +79,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   in time. Call this in `on_exit` callbacks after tests that kill shards.
   """
   @spec wait_shards_alive(non_neg_integer()) :: :ok
-  def wait_shards_alive(timeout_ms \\ 3_000) do
+  def wait_shards_alive(timeout_ms \\ 5_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
 
     Enum.each(0..3, fn i ->
@@ -105,6 +105,34 @@ defmodule Ferricstore.Test.ShardHelpers do
         :ok -> :ok
         {:timeout, name} -> raise "Shard #{inspect(name)} did not restart within #{timeout_ms}ms"
       end
+    end)
+
+    # When Raft is enabled, also wait for each shard's ra server to have
+    # an elected leader. Without a leader, Batcher.write calls will fail.
+    if Application.get_env(:ferricstore, :raft_enabled, true) do
+      wait_raft_leaders(deadline)
+    end
+  end
+
+  # Polls ra.members/1 for each shard until all 4 ra servers report a leader.
+  defp wait_raft_leaders(deadline) do
+    alias Ferricstore.Raft.Cluster
+
+    Enum.each(0..3, fn i ->
+      server_id = Cluster.shard_server_id(i)
+
+      Enum.reduce_while(Stream.repeatedly(fn -> Process.sleep(20) end), :waiting, fn _, _ ->
+        cond do
+          System.monotonic_time(:millisecond) > deadline ->
+            {:halt, :ok}
+
+          true ->
+            case :ra.members(server_id) do
+              {:ok, _members, _leader} -> {:halt, :ok}
+              _ -> {:cont, :waiting}
+            end
+        end
+      end)
     end)
   end
 end
