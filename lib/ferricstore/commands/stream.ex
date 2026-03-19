@@ -338,7 +338,10 @@ defmodule Ferricstore.Commands.Stream do
   """
   @spec cleanup_stream_waiters(pid()) :: :ok
   def cleanup_stream_waiters(pid) do
-    :ets.match_delete(@stream_waiters_table, {:_, pid, :_, :_})
+    if :ets.whereis(@stream_waiters_table) != :undefined do
+      :ets.match_delete(@stream_waiters_table, {:_, pid, :_, :_})
+    end
+
     :ok
   end
 
