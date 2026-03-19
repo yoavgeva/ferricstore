@@ -474,19 +474,30 @@ defmodule Ferricstore.Raft.StateMachine do
     # Synchronous Bitcask write -- deterministic, called on every node.
     # put_batch is used for a single entry to match the existing NIF API
     # which handles fsync internally.
-    case NIF.put_batch(state.store, [{key, value, expire_at_ms}]) do
-      :ok ->
-        :ets.insert(state.ets, {key, value, expire_at_ms})
-        :ok
+    try do
+      case NIF.put_batch(state.store, [{key, value, expire_at_ms}]) do
+        :ok ->
+          :ets.insert(state.ets, {key, value, expire_at_ms})
+          :ok
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
+    rescue
+      # ETS table or NIF store may be stale after a shard crash/restart.
+      # The supervisor will restart the shard with fresh references.
+      ArgumentError -> :ok
     end
   end
 
   defp do_delete(state, key) do
-    NIF.delete(state.store, key)
-    :ets.delete(state.ets, key)
+    try do
+      NIF.delete(state.store, key)
+      :ets.delete(state.ets, key)
+    rescue
+      ArgumentError -> :ok
+    end
+
     :ok
   end
 
@@ -808,30 +819,35 @@ defmodule Ferricstore.Raft.StateMachine do
   defp ets_lookup(state, key) do
     now = System.os_time(:millisecond)
 
-    case :ets.lookup(state.ets, key) do
-      [{^key, value, 0}] ->
-        {:hit, value, 0}
+    try do
+      case :ets.lookup(state.ets, key) do
+        [{^key, value, 0}] ->
+          {:hit, value, 0}
 
-      [{^key, value, exp}] when exp > now ->
-        {:hit, value, exp}
+        [{^key, value, exp}] when exp > now ->
+          {:hit, value, exp}
 
-      [{^key, _value, _exp}] ->
-        :ets.delete(state.ets, key)
-        :expired
+        [{^key, _value, _exp}] ->
+          :ets.delete(state.ets, key)
+          :expired
 
-      [] ->
-        # ETS miss -- try Bitcask for cold keys
-        case NIF.get(state.store, key) do
-          {:ok, nil} ->
-            :miss
+        [] ->
+          # ETS miss -- try Bitcask for cold keys
+          case NIF.get(state.store, key) do
+            {:ok, nil} ->
+              :miss
 
-          {:ok, value} ->
-            :ets.insert(state.ets, {key, value, 0})
-            {:hit, value, 0}
+            {:ok, value} ->
+              :ets.insert(state.ets, {key, value, 0})
+              {:hit, value, 0}
 
-          _error ->
-            :miss
-        end
+            _error ->
+              :miss
+          end
+      end
+    rescue
+      # ETS table may be stale after a shard crash/restart
+      ArgumentError -> :miss
     end
   end
 
@@ -866,17 +882,21 @@ defmodule Ferricstore.Raft.StateMachine do
   # remove all compound fields belonging to a data structure.
   defp do_delete_prefix(state, prefix) do
     keys_to_delete =
-      :ets.foldl(
-        fn {key, _value, _exp}, acc ->
-          if is_binary(key) and String.starts_with?(key, prefix) do
-            [key | acc]
-          else
-            acc
-          end
-        end,
-        [],
-        state.ets
-      )
+      try do
+        :ets.foldl(
+          fn {key, _value, _exp}, acc ->
+            if is_binary(key) and String.starts_with?(key, prefix) do
+              [key | acc]
+            else
+              acc
+            end
+          end,
+          [],
+          state.ets
+        )
+      rescue
+        ArgumentError -> []
+      end
 
     Enum.each(keys_to_delete, fn key ->
       do_delete(state, key)
@@ -895,31 +915,35 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_get(state, key) do
     now = System.os_time(:millisecond)
 
-    case :ets.lookup(state.ets, key) do
-      [{^key, value, 0}] ->
-        value
+    try do
+      case :ets.lookup(state.ets, key) do
+        [{^key, value, 0}] ->
+          value
 
-      [{^key, value, exp}] when exp > now ->
-        value
+        [{^key, value, exp}] when exp > now ->
+          value
 
-      [{^key, _value, _exp}] ->
-        # Expired -- evict and treat as missing
-        :ets.delete(state.ets, key)
-        nil
+        [{^key, _value, _exp}] ->
+          # Expired -- evict and treat as missing
+          :ets.delete(state.ets, key)
+          nil
 
-      [] ->
-        # ETS miss -- try Bitcask
-        case NIF.get(state.store, key) do
-          {:ok, nil} ->
-            nil
+        [] ->
+          # ETS miss -- try Bitcask
+          case NIF.get(state.store, key) do
+            {:ok, nil} ->
+              nil
 
-          {:ok, value} ->
-            :ets.insert(state.ets, {key, value, 0})
-            value
+            {:ok, value} ->
+              :ets.insert(state.ets, {key, value, 0})
+              value
 
-          _error ->
-            nil
-        end
+            _error ->
+              nil
+          end
+      end
+    rescue
+      ArgumentError -> nil
     end
   end
 
@@ -929,29 +953,33 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_get_meta(state, key) do
     now = System.os_time(:millisecond)
 
-    case :ets.lookup(state.ets, key) do
-      [{^key, value, 0}] ->
-        {value, 0}
+    try do
+      case :ets.lookup(state.ets, key) do
+        [{^key, value, 0}] ->
+          {value, 0}
 
-      [{^key, value, exp}] when exp > now ->
-        {value, exp}
+        [{^key, value, exp}] when exp > now ->
+          {value, exp}
 
-      [{^key, _value, _exp}] ->
-        :ets.delete(state.ets, key)
-        nil
+        [{^key, _value, _exp}] ->
+          :ets.delete(state.ets, key)
+          nil
 
-      [] ->
-        case NIF.get(state.store, key) do
-          {:ok, nil} ->
-            nil
+        [] ->
+          case NIF.get(state.store, key) do
+            {:ok, nil} ->
+              nil
 
-          {:ok, value} ->
-            :ets.insert(state.ets, {key, value, 0})
-            {value, 0}
+            {:ok, value} ->
+              :ets.insert(state.ets, {key, value, 0})
+              {value, 0}
 
-          _error ->
-            nil
-        end
+            _error ->
+              nil
+          end
+      end
+    rescue
+      ArgumentError -> nil
     end
   end
 end

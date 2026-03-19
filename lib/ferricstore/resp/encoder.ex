@@ -96,6 +96,12 @@ defmodule Ferricstore.Resp.Encoder do
     ["-", msg, @crlf]
   end
 
+  # Handle non-binary error reasons (e.g. atoms like :noproc from GenServer exits)
+  def encode({:error, reason}) when is_atom(reason) do
+    msg = "ERR #{Atom.to_string(reason)}"
+    ["-", msg, @crlf]
+  end
+
   def encode({:blob_error, msg}) when is_binary(msg) do
     ["!", Integer.to_string(byte_size(msg)), @crlf, msg, @crlf]
   end

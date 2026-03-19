@@ -534,7 +534,18 @@ defmodule Ferricstore.Server.Connection do
 
       {name, args} ->
         Stats.incr_commands()
-        result = Dispatcher.dispatch(name, args, store)
+
+        result =
+          try do
+            Dispatcher.dispatch(name, args, store)
+          catch
+            :exit, {:noproc, _} ->
+              {:error, "ERR server not ready, shard process unavailable"}
+
+            :exit, {reason, _} ->
+              {:error, "ERR internal error: #{inspect(reason)}"}
+          end
+
         maybe_notify_keyspace(name, args, result)
         {:continue, Encoder.encode(result)}
     end
@@ -592,7 +603,16 @@ defmodule Ferricstore.Server.Connection do
       tracking: state.tracking
     }
 
-    {result, updated_conn_state} = Dispatcher.dispatch_client(args, conn_state, store)
+    {result, updated_conn_state} =
+      try do
+        Dispatcher.dispatch_client(args, conn_state, store)
+      catch
+        :exit, {:noproc, _} ->
+          {{:error, "ERR server not ready, shard process unavailable"}, conn_state}
+
+        :exit, {reason, _} ->
+          {{:error, "ERR internal error: #{inspect(reason)}"}, conn_state}
+      end
 
     updated_state = %{
       state
@@ -832,8 +852,14 @@ defmodule Ferricstore.Server.Connection do
         if state.sandbox_namespace do
           # Flush keys with sandbox prefix
           ns = state.sandbox_namespace
-          keys = Router.keys()
-          Enum.each(keys, fn k -> if String.starts_with?(k, ns), do: Router.delete(k) end)
+
+          try do
+            keys = Router.keys()
+            Enum.each(keys, fn k -> if String.starts_with?(k, ns), do: Router.delete(k) end)
+          catch
+            :exit, _ -> :ok
+          end
+
           {:continue, Encoder.encode(:ok), %{state | sandbox_namespace: nil}}
         else
           {:continue, Encoder.encode({:error, "ERR no active sandbox session"}), state}
@@ -901,13 +927,19 @@ defmodule Ferricstore.Server.Connection do
   end
 
   defp dispatch("WATCH", keys, state) do
-    new_watched =
-      Enum.reduce(keys, state.watched_keys, fn key, acc ->
-        version = Router.get_version(key)
-        Map.put(acc, key, version)
-      end)
+    try do
+      new_watched =
+        Enum.reduce(keys, state.watched_keys, fn key, acc ->
+          version = Router.get_version(key)
+          Map.put(acc, key, version)
+        end)
 
-    {:continue, Encoder.encode(:ok), %{state | watched_keys: new_watched}}
+      {:continue, Encoder.encode(:ok), %{state | watched_keys: new_watched}}
+    catch
+      :exit, {reason, _} ->
+        {:continue,
+         Encoder.encode({:error, "ERR server not ready: #{inspect(reason)}"}), state}
+    end
   end
 
   defp dispatch("UNWATCH", _args, state) do
@@ -1241,7 +1273,18 @@ defmodule Ferricstore.Server.Connection do
        state}
     else
       store = build_store(state.sandbox_namespace)
-      result = Dispatcher.dispatch(cmd, args, store)
+
+      result =
+        try do
+          Dispatcher.dispatch(cmd, args, store)
+        catch
+          :exit, {:noproc, _} ->
+            {:error, "ERR server not ready, shard process unavailable"}
+
+          :exit, {reason, _} ->
+            {:error, "ERR internal error: #{inspect(reason)}"}
+        end
+
       maybe_notify_keyspace(cmd, args, result)
       {:continue, Encoder.encode(result), state}
     end
@@ -1258,7 +1301,16 @@ defmodule Ferricstore.Server.Connection do
       results =
         Enum.map(queue, fn {cmd, args} ->
           store = build_store(ns)
-          Dispatcher.dispatch(cmd, args, store)
+
+          try do
+            Dispatcher.dispatch(cmd, args, store)
+          catch
+            :exit, {:noproc, _} ->
+              {:error, "ERR server not ready, shard process unavailable"}
+
+            :exit, {reason, _} ->
+              {:error, "ERR internal error: #{inspect(reason)}"}
+          end
         end)
 
       results
@@ -1273,7 +1325,11 @@ defmodule Ferricstore.Server.Connection do
 
   defp watches_clean?(watched) do
     Enum.all?(watched, fn {key, saved_version} ->
-      Router.get_version(key) == saved_version
+      try do
+        Router.get_version(key) == saved_version
+      catch
+        :exit, _ -> false
+      end
     end)
   end
 
