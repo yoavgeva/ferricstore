@@ -119,9 +119,16 @@ impl Store {
                     // record described by the hint file.  Any records appended to
                     // the log after the hint was written (e.g. new puts before a
                     // crash) live beyond this offset and must be replayed.
-                    let hint_end_offset = staging.iter().map(|(key, entry)| {
-                        entry.offset + HEADER_SIZE as u64 + key.len() as u64 + u64::from(entry.value_size)
-                    }).max().unwrap_or(0);
+                    let hint_end_offset = staging
+                        .iter()
+                        .map(|(key, entry)| {
+                            entry.offset
+                                + HEADER_SIZE as u64
+                                + key.len() as u64
+                                + u64::from(entry.value_size)
+                        })
+                        .max()
+                        .unwrap_or(0);
 
                     for (key, entry) in staging.iter() {
                         keydir.put(key.clone(), entry.clone());
@@ -580,9 +587,9 @@ impl Store {
                         .parse()
                         .map_err(|_| StoreError("not an integer".into()))?
                 };
-                let result = current_int.checked_add(delta).ok_or_else(|| {
-                    StoreError("increment or decrement would overflow".into())
-                })?;
+                let result = current_int
+                    .checked_add(delta)
+                    .ok_or_else(|| StoreError("increment or decrement would overflow".into()))?;
                 result.to_string().into_bytes()
             }
             RmwOp::IncrByFloat(delta) => {
@@ -860,9 +867,16 @@ fn collect_file_ids(data_dir: &Path) -> Result<Vec<u64>> {
 
 /// Replay a raw log file from a given offset into the keydir.
 /// Used after loading a hint file to pick up any writes appended after the hint was generated.
-fn replay_log_from(log_path: &Path, file_id: u64, start_offset: u64, keydir: &mut KeyDir) -> Result<()> {
+fn replay_log_from(
+    log_path: &Path,
+    file_id: u64,
+    start_offset: u64,
+    keydir: &mut KeyDir,
+) -> Result<()> {
     let mut reader = LogReader::open(log_path).map_err(|e| StoreError(e.to_string()))?;
-    reader.seek_to(start_offset).map_err(|e| StoreError(e.to_string()))?;
+    reader
+        .seek_to(start_offset)
+        .map_err(|e| StoreError(e.to_string()))?;
     let mut offset = start_offset;
 
     // Use tolerant iteration: stop silently at truncated/corrupt tail records.
