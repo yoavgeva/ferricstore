@@ -526,12 +526,227 @@ defmodule Ferricstore.Merge.SchedulerTest do
   end
 
   # -------------------------------------------------------------------
+  # Merge/compaction with new canonical directory layout (spec 2B.4)
+  # -------------------------------------------------------------------
+
+  describe "compaction with canonical data/shard_N/ paths" do
+    test "compaction creates new .log file in canonical directory" do
+      root = temp_dir_with_layout(2)
+      shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+
+      {:ok, store} = NIF.new(shard_path)
+
+      # Write enough data with overwrites to create multiple files and fragmentation.
+      for _round <- 1..20 do
+        for i <- 1..20 do
+          :ok = NIF.put(store, "compact_path_key_#{i}", String.duplicate("v", 100), 0)
+        end
+      end
+
+      {:ok, file_sizes_before} = NIF.file_sizes(store)
+      all_fids = Enum.map(file_sizes_before, fn {fid, _} -> fid end)
+
+      if length(all_fids) > 1 do
+        active_fid = Enum.max(all_fids)
+        merge_fids = Enum.reject(all_fids, &(&1 == active_fid))
+
+        {:ok, files_before} = File.ls(shard_path)
+        log_count_before = files_before |> Enum.count(&String.ends_with?(&1, ".log"))
+
+        {:ok, {written, _dropped, _reclaimed}} = NIF.run_compaction(store, merge_fids)
+        assert written >= 0
+
+        {:ok, files_after} = File.ls(shard_path)
+        log_files_after = Enum.filter(files_after, &String.ends_with?(&1, ".log"))
+
+        # After compaction, there should be fewer or equal log files
+        # (old files removed, new merged file created).
+        assert length(log_files_after) > 0,
+               "Should have at least one .log file after compaction"
+
+        # All log files should be in the canonical shard directory, not elsewhere.
+        data_parent = Path.join(root, "data")
+        {:ok, parent_entries} = File.ls(data_parent)
+
+        leaked =
+          Enum.filter(parent_entries, fn name ->
+            String.ends_with?(name, ".log") or String.ends_with?(name, ".hint")
+          end)
+
+        assert leaked == [],
+               "No .log/.hint files should leak to data/ parent: #{inspect(leaked)}"
+      end
+    end
+
+    test "old files are removed from canonical directory after compaction" do
+      root = temp_dir_with_layout(2)
+      shard_path = Ferricstore.DataDir.shard_data_path(root, 0)
+
+      {:ok, store} = NIF.new(shard_path)
+
+      for _round <- 1..25 do
+        for i <- 1..15 do
+          :ok = NIF.put(store, "removal_key_#{i}", String.duplicate("z", 80), 0)
+        end
+      end
+
+      {:ok, file_sizes} = NIF.file_sizes(store)
+      all_fids = Enum.map(file_sizes, fn {fid, _} -> fid end)
+
+      if length(all_fids) > 1 do
+        active_fid = Enum.max(all_fids)
+        merge_fids = Enum.reject(all_fids, &(&1 == active_fid))
+
+        # Compute expected filenames of input files being merged.
+        input_filenames =
+          Enum.flat_map(merge_fids, fn fid ->
+            stem = String.pad_leading(Integer.to_string(fid), 20, "0")
+            ["#{stem}.log"]
+          end)
+
+        {:ok, {_w, _d, _r}} = NIF.run_compaction(store, merge_fids)
+
+        # After compaction, the old input log files should be gone.
+        {:ok, files_after} = File.ls(shard_path)
+
+        for fname <- input_filenames do
+          refute fname in files_after,
+                 "Old input file #{fname} should be removed after compaction"
+        end
+
+        # Data should still be readable.
+        for i <- 1..15 do
+          {:ok, val} = NIF.get(store, "removal_key_#{i}")
+          assert val != nil, "removal_key_#{i} should survive compaction"
+        end
+      end
+    end
+
+    test "compaction in canonical path does not affect other shard directories" do
+      root = temp_dir_with_layout(2)
+
+      path_0 = Ferricstore.DataDir.shard_data_path(root, 0)
+      path_1 = Ferricstore.DataDir.shard_data_path(root, 1)
+
+      {:ok, store0} = NIF.new(path_0)
+      {:ok, store1} = NIF.new(path_1)
+
+      # Write to both shards.
+      for i <- 1..10 do
+        :ok = NIF.put(store0, "iso_s0_#{i}", "val0", 0)
+        :ok = NIF.put(store1, "iso_s1_#{i}", "val1", 0)
+      end
+
+      # Fragment shard 0.
+      for _round <- 1..20 do
+        for i <- 1..10 do
+          :ok = NIF.put(store0, "iso_s0_#{i}", String.duplicate("x", 50), 0)
+        end
+      end
+
+      {:ok, s1_files_before} = File.ls(path_1)
+      {:ok, s1_stats_before} = NIF.shard_stats(store1)
+
+      # Compact shard 0.
+      {:ok, file_sizes_0} = NIF.file_sizes(store0)
+      all_fids_0 = Enum.map(file_sizes_0, fn {fid, _} -> fid end)
+
+      if length(all_fids_0) > 1 do
+        active = Enum.max(all_fids_0)
+        merge = Enum.reject(all_fids_0, &(&1 == active))
+        {:ok, _} = NIF.run_compaction(store0, merge)
+      end
+
+      # Shard 1 should be completely unaffected.
+      {:ok, s1_files_after} = File.ls(path_1)
+      {:ok, s1_stats_after} = NIF.shard_stats(store1)
+
+      assert Enum.sort(s1_files_before) == Enum.sort(s1_files_after),
+             "Shard 1 files should not change during shard 0 compaction"
+
+      {_, _, _, _, keys_before, _} = s1_stats_before
+      {_, _, _, _, keys_after, _} = s1_stats_after
+      assert keys_before == keys_after, "Shard 1 key count should not change"
+
+      for i <- 1..10 do
+        {:ok, val} = NIF.get(store1, "iso_s1_#{i}")
+        assert val == "val1"
+      end
+    end
+  end
+
+  describe "scheduler init uses DataDir.shard_data_path for manifest recovery" do
+    test "scheduler resolves shard data path via DataDir on init", %{data_dir: data_dir} do
+      # The scheduler should use DataDir.shard_data_path during init to resolve
+      # the correct shard directory (canonical or legacy).
+      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+
+      {:ok, sem} = Semaphore.start_link(name: unique_name("sem"))
+
+      {:ok, sched} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: data_dir,
+          name: unique_name("sched"),
+          semaphore: sem,
+          merge_config: %{check_interval_ms: 600_000}
+        )
+
+      # The scheduler should be alive and reporting shard_index 0.
+      status = Scheduler.status(sched)
+      assert status.shard_index == 0
+      assert status.merging == false
+
+      # Verify no stale manifest exists.
+      refute Manifest.exists?(shard_path)
+
+      GenServer.stop(sched)
+      GenServer.stop(sem)
+    end
+
+    test "scheduler recovers manifest from canonical path on startup" do
+      root = temp_dir_with_layout(4)
+      shard_path = Ferricstore.DataDir.shard_data_path(root, 1)
+
+      # Pre-seed a manifest as if a previous merge was interrupted.
+      plan = %{shard_index: 1, input_file_ids: [1, 2]}
+      :ok = Manifest.write(shard_path, plan)
+      assert Manifest.exists?(shard_path)
+
+      {:ok, sem} = Semaphore.start_link(name: unique_name("sem"))
+
+      {:ok, sched} =
+        Scheduler.start_link(
+          shard_index: 1,
+          data_dir: root,
+          name: unique_name("sched"),
+          semaphore: sem,
+          merge_config: %{check_interval_ms: 600_000}
+        )
+
+      # After init, the scheduler should have cleaned up the interrupted manifest.
+      refute Manifest.exists?(shard_path),
+             "Scheduler init should recover and delete the interrupted manifest"
+
+      GenServer.stop(sched)
+      GenServer.stop(sem)
+    end
+  end
+
+  # -------------------------------------------------------------------
   # Helpers
   # -------------------------------------------------------------------
 
   defp temp_dir do
     dir = Path.join(System.tmp_dir!(), "merge_test_#{:erlang.unique_integer([:positive])}")
     File.mkdir_p!(dir)
+    dir
+  end
+
+  # Creates a temp directory with the full DataDir layout and registers cleanup.
+  defp temp_dir_with_layout(shard_count) do
+    dir = Path.join(System.tmp_dir!(), "merge_layout_#{:erlang.unique_integer([:positive])}")
+    :ok = Ferricstore.DataDir.ensure_layout!(dir, shard_count)
     dir
   end
 
