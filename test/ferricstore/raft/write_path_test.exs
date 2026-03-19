@@ -39,15 +39,24 @@ defmodule Ferricstore.Raft.WritePathTest do
       Cluster.start_shard_server(i, state.store, state.ets)
     end
 
-    # Start batchers (not supervised -- we manage them here)
+    # Start batchers (not supervised -- we manage them here).
+    # If the batcher is already started (e.g., application supervises them
+    # when raft_enabled is true in test config), reuse the existing process.
     batcher_pids =
       for i <- 0..3 do
         shard_id = Cluster.shard_server_id(i)
+        batcher_name = Batcher.batcher_name(i)
 
-        {:ok, pid} =
-          Batcher.start_link(shard_index: i, shard_id: shard_id)
+        case Process.whereis(batcher_name) do
+          pid when is_pid(pid) ->
+            {i, pid, :reused}
 
-        {i, pid}
+          nil ->
+            {:ok, pid} =
+              Batcher.start_link(shard_index: i, shard_id: shard_id)
+
+            {i, pid, :started}
+        end
       end
 
     # Enable raft for the duration of these tests
@@ -58,9 +67,11 @@ defmodule Ferricstore.Raft.WritePathTest do
       # Restore original raft_enabled setting
       Application.put_env(:ferricstore, :raft_enabled, original_raft)
 
-      # Stop batchers
-      for {_i, pid} <- batcher_pids do
-        if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
+      # Stop batchers we started (don't stop reused ones)
+      for {_i, pid, ownership} <- batcher_pids do
+        if ownership == :started and Process.alive?(pid) do
+          GenServer.stop(pid, :normal, 5_000)
+        end
       end
 
       # Stop ra servers
@@ -481,6 +492,1011 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       # Version should have increased by at least the number of writes
       assert v_after >= v_before + length(keys)
+    end
+  end
+
+  # ===========================================================================
+  # 11–15. StateMachine apply/3 handlers for list_op, compound_put,
+  #         compound_delete, and compound_delete_prefix
+  #
+  # These tests exercise the StateMachine directly (no Batcher / Router) to
+  # verify that the new command types correctly replicate the shard logic.
+  # ===========================================================================
+
+  # Per-test setup: fresh Bitcask + ETS for isolated StateMachine testing.
+  # These tests do NOT need the full Raft infrastructure from setup_all,
+  # but they are in the same file so they inherit the async: false setting
+  # which avoids flaky interaction with other Raft tests.
+
+  defp fresh_sm_state do
+    dir = Path.join(System.tmp_dir!(), "wp_sm_#{:rand.uniform(9_999_999)}")
+    File.mkdir_p!(dir)
+
+    {:ok, store} = NIF.new(dir)
+    ets_name = :"wp_sm_ets_#{:rand.uniform(9_999_999)}"
+    :ets.new(ets_name, [:set, :public, :named_table])
+
+    state =
+      Ferricstore.Raft.StateMachine.init(%{
+        shard_index: 0,
+        store: store,
+        ets: ets_name
+      })
+
+    {state, ets_name, store, dir}
+  end
+
+  defp cleanup_sm({_state, ets_name, _store, dir}) do
+    try do
+      :ets.delete(ets_name)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    File.rm_rf!(dir)
+  end
+
+  alias Ferricstore.Raft.StateMachine, as: SM
+  alias Ferricstore.Store.ListOps
+
+  # ---------------------------------------------------------------------------
+  # 12. list_op — LPUSH through Raft adds element
+  # ---------------------------------------------------------------------------
+
+  describe "list_op: LPUSH through Raft adds element" do
+    test "LPUSH to a new key creates a list with the pushed elements" do
+      ctx = fresh_sm_state()
+      {state, ets, store, _dir} = ctx
+
+      {new_state, result} =
+        SM.apply(%{}, {:list_op, "mylist", {:lpush, ["a", "b", "c"]}}, state)
+
+      # LPUSH returns the new list length
+      assert result == 3
+      assert new_state.applied_count == 1
+
+      # Verify ETS contains the serialized list
+      [{_, raw, 0}] = :ets.lookup(ets, "mylist")
+      assert {:ok, ["c", "b", "a"]} = ListOps.decode_stored(raw)
+
+      # Verify Bitcask contains the same value
+      assert {:ok, ^raw} = NIF.get(store, "mylist")
+
+      cleanup_sm(ctx)
+    end
+
+    test "LPUSH to existing list prepends elements" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      {state2, 2} =
+        SM.apply(%{}, {:list_op, "mylist", {:lpush, ["a", "b"]}}, state)
+
+      {_state3, 4} =
+        SM.apply(%{}, {:list_op, "mylist", {:lpush, ["c", "d"]}}, state2)
+
+      [{_, raw, 0}] = :ets.lookup(ets, "mylist")
+      assert {:ok, ["d", "c", "b", "a"]} = ListOps.decode_stored(raw)
+
+      cleanup_sm(ctx)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 12. list_op — RPUSH through Raft adds element
+  # ---------------------------------------------------------------------------
+
+  describe "list_op: RPUSH through Raft adds element" do
+    test "RPUSH to a new key creates a list with the pushed elements" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      {_new_state, result} =
+        SM.apply(%{}, {:list_op, "rlist", {:rpush, ["x", "y", "z"]}}, state)
+
+      assert result == 3
+
+      [{_, raw, 0}] = :ets.lookup(ets, "rlist")
+      assert {:ok, ["x", "y", "z"]} = ListOps.decode_stored(raw)
+
+      cleanup_sm(ctx)
+    end
+
+    test "RPUSH to existing list appends elements" do
+      ctx = fresh_sm_state()
+      {state, _ets, _store, _dir} = ctx
+
+      {state2, 2} =
+        SM.apply(%{}, {:list_op, "rlist", {:rpush, ["a", "b"]}}, state)
+
+      {state3, 4} =
+        SM.apply(%{}, {:list_op, "rlist", {:rpush, ["c", "d"]}}, state2)
+
+      # Verify via LRANGE
+      {_state4, elements} =
+        SM.apply(%{}, {:list_op, "rlist", {:lrange, 0, -1}}, state3)
+
+      assert elements == ["a", "b", "c", "d"]
+
+      cleanup_sm(ctx)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 12. list_op — LPOP through Raft removes element
+  # ---------------------------------------------------------------------------
+
+  describe "list_op: LPOP through Raft removes element" do
+    test "LPOP from a list returns and removes the leftmost element" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      # Build a list: [a, b, c]
+      {state2, 3} =
+        SM.apply(%{}, {:list_op, "poplist", {:rpush, ["a", "b", "c"]}}, state)
+
+      # Pop from left
+      {state3, popped} =
+        SM.apply(%{}, {:list_op, "poplist", {:lpop, 1}}, state2)
+
+      assert popped == "a"
+      assert state3.applied_count == 2
+
+      # Remaining list should be [b, c]
+      [{_, raw, 0}] = :ets.lookup(ets, "poplist")
+      assert {:ok, ["b", "c"]} = ListOps.decode_stored(raw)
+
+      cleanup_sm(ctx)
+    end
+
+    test "LPOP from empty / non-existent key returns nil" do
+      ctx = fresh_sm_state()
+      {state, _ets, _store, _dir} = ctx
+
+      {_new_state, result} =
+        SM.apply(%{}, {:list_op, "nokey", {:lpop, 1}}, state)
+
+      assert result == nil
+
+      cleanup_sm(ctx)
+    end
+
+    test "LPOP all elements deletes the key" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      {state2, 1} =
+        SM.apply(%{}, {:list_op, "single", {:rpush, ["only"]}}, state)
+
+      {_state3, "only"} =
+        SM.apply(%{}, {:list_op, "single", {:lpop, 1}}, state2)
+
+      # Key should be gone
+      assert [] == :ets.lookup(ets, "single")
+
+      cleanup_sm(ctx)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 12. list_op — RPOP through Raft removes element
+  # ---------------------------------------------------------------------------
+
+  describe "list_op: RPOP through Raft removes element" do
+    test "RPOP from a list returns and removes the rightmost element" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      {state2, 3} =
+        SM.apply(%{}, {:list_op, "rpoplist", {:rpush, ["a", "b", "c"]}}, state)
+
+      {_state3, popped} =
+        SM.apply(%{}, {:list_op, "rpoplist", {:rpop, 1}}, state2)
+
+      assert popped == "c"
+
+      [{_, raw, 0}] = :ets.lookup(ets, "rpoplist")
+      assert {:ok, ["a", "b"]} = ListOps.decode_stored(raw)
+
+      cleanup_sm(ctx)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 13. compound_put — HSET through Raft writes field
+  # ---------------------------------------------------------------------------
+
+  describe "compound_put: HSET through Raft writes field" do
+    test "compound_put inserts a hash field into ETS and Bitcask" do
+      ctx = fresh_sm_state()
+      {state, ets, store, _dir} = ctx
+
+      compound_key = "myhash\x00field1"
+
+      {new_state, result} =
+        SM.apply(%{}, {:compound_put, compound_key, "value1", 0}, state)
+
+      assert result == :ok
+      assert new_state.applied_count == 1
+
+      # Verify ETS
+      assert [{^compound_key, "value1", 0}] = :ets.lookup(ets, compound_key)
+
+      # Verify Bitcask
+      assert {:ok, "value1"} = NIF.get(store, compound_key)
+
+      cleanup_sm(ctx)
+    end
+
+    test "compound_put overwrites existing field value" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      compound_key = "myhash\x00field1"
+
+      {state2, :ok} =
+        SM.apply(%{}, {:compound_put, compound_key, "v1", 0}, state)
+
+      {_state3, :ok} =
+        SM.apply(%{}, {:compound_put, compound_key, "v2", 0}, state2)
+
+      assert [{^compound_key, "v2", 0}] = :ets.lookup(ets, compound_key)
+
+      cleanup_sm(ctx)
+    end
+
+    test "multiple compound_puts for different fields" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      {state2, :ok} =
+        SM.apply(%{}, {:compound_put, "h\x00f1", "val1", 0}, state)
+
+      {state3, :ok} =
+        SM.apply(%{}, {:compound_put, "h\x00f2", "val2", 0}, state2)
+
+      {_state4, :ok} =
+        SM.apply(%{}, {:compound_put, "h\x00f3", "val3", 0}, state3)
+
+      assert [{_, "val1", 0}] = :ets.lookup(ets, "h\x00f1")
+      assert [{_, "val2", 0}] = :ets.lookup(ets, "h\x00f2")
+      assert [{_, "val3", 0}] = :ets.lookup(ets, "h\x00f3")
+
+      cleanup_sm(ctx)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 14. compound_delete — HDEL through Raft removes field
+  # ---------------------------------------------------------------------------
+
+  describe "compound_delete: HDEL through Raft removes field" do
+    test "compound_delete removes a hash field from ETS and Bitcask" do
+      ctx = fresh_sm_state()
+      {state, ets, store, _dir} = ctx
+
+      compound_key = "myhash\x00field1"
+
+      {state2, :ok} =
+        SM.apply(%{}, {:compound_put, compound_key, "value1", 0}, state)
+
+      {state3, :ok} =
+        SM.apply(%{}, {:compound_delete, compound_key}, state2)
+
+      assert state3.applied_count == 2
+      assert [] == :ets.lookup(ets, compound_key)
+      assert {:ok, nil} = NIF.get(store, compound_key)
+
+      cleanup_sm(ctx)
+    end
+
+    test "compound_delete on non-existent key returns :ok" do
+      ctx = fresh_sm_state()
+      {state, _ets, _store, _dir} = ctx
+
+      {_new_state, result} =
+        SM.apply(%{}, {:compound_delete, "nonexistent\x00field"}, state)
+
+      assert result == :ok
+
+      cleanup_sm(ctx)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 13. compound_put — SADD through Raft adds member
+  # ---------------------------------------------------------------------------
+
+  describe "compound_put: SADD through Raft adds member" do
+    test "compound_put adds a set member (presence marker)" do
+      ctx = fresh_sm_state()
+      {state, ets, store, _dir} = ctx
+
+      # Sets use a presence marker as the value
+      compound_key = "myset\x00member1"
+      presence = "1"
+
+      {new_state, :ok} =
+        SM.apply(%{}, {:compound_put, compound_key, presence, 0}, state)
+
+      assert new_state.applied_count == 1
+      assert [{^compound_key, ^presence, 0}] = :ets.lookup(ets, compound_key)
+      assert {:ok, ^presence} = NIF.get(store, compound_key)
+
+      cleanup_sm(ctx)
+    end
+
+    test "multiple set members via compound_put" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      {state2, :ok} =
+        SM.apply(%{}, {:compound_put, "myset\x00m1", "1", 0}, state)
+
+      {state3, :ok} =
+        SM.apply(%{}, {:compound_put, "myset\x00m2", "1", 0}, state2)
+
+      {_state4, :ok} =
+        SM.apply(%{}, {:compound_put, "myset\x00m3", "1", 0}, state3)
+
+      assert [{_, "1", 0}] = :ets.lookup(ets, "myset\x00m1")
+      assert [{_, "1", 0}] = :ets.lookup(ets, "myset\x00m2")
+      assert [{_, "1", 0}] = :ets.lookup(ets, "myset\x00m3")
+
+      cleanup_sm(ctx)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 15. compound_delete_prefix — DEL on hash through Raft cleans up all fields
+  # ---------------------------------------------------------------------------
+
+  describe "compound_delete_prefix: DEL on hash through Raft cleans up all fields" do
+    test "deletes all compound keys matching prefix" do
+      ctx = fresh_sm_state()
+      {state, ets, store, _dir} = ctx
+
+      # Insert several fields for a hash "myhash"
+      prefix = "myhash\x00"
+
+      {state2, :ok} =
+        SM.apply(%{}, {:compound_put, "myhash\x00f1", "v1", 0}, state)
+
+      {state3, :ok} =
+        SM.apply(%{}, {:compound_put, "myhash\x00f2", "v2", 0}, state2)
+
+      {state4, :ok} =
+        SM.apply(%{}, {:compound_put, "myhash\x00f3", "v3", 0}, state3)
+
+      # Also insert a key with a different prefix to ensure it is NOT deleted
+      {state5, :ok} =
+        SM.apply(%{}, {:compound_put, "otherhash\x00x", "ox", 0}, state4)
+
+      # Verify all 4 keys exist in ETS
+      assert :ets.info(ets, :size) == 4
+
+      # Now delete all keys with the "myhash\0" prefix
+      {state6, :ok} =
+        SM.apply(%{}, {:compound_delete_prefix, prefix}, state5)
+
+      assert state6.applied_count == 5
+
+      # All "myhash" fields should be gone
+      assert [] == :ets.lookup(ets, "myhash\x00f1")
+      assert [] == :ets.lookup(ets, "myhash\x00f2")
+      assert [] == :ets.lookup(ets, "myhash\x00f3")
+
+      # Bitcask should also have them deleted
+      assert {:ok, nil} = NIF.get(store, "myhash\x00f1")
+      assert {:ok, nil} = NIF.get(store, "myhash\x00f2")
+      assert {:ok, nil} = NIF.get(store, "myhash\x00f3")
+
+      # The "otherhash" key should still exist
+      assert [{_, "ox", 0}] = :ets.lookup(ets, "otherhash\x00x")
+      assert {:ok, "ox"} = NIF.get(store, "otherhash\x00x")
+
+      cleanup_sm(ctx)
+    end
+
+    test "deletes all set members when DEL is called on the set key" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      prefix = "myset\x00"
+
+      {state2, :ok} =
+        SM.apply(%{}, {:compound_put, "myset\x00m1", "1", 0}, state)
+
+      {state3, :ok} =
+        SM.apply(%{}, {:compound_put, "myset\x00m2", "1", 0}, state2)
+
+      {state4, :ok} =
+        SM.apply(%{}, {:compound_put, "myset\x00m3", "1", 0}, state3)
+
+      {_state5, :ok} =
+        SM.apply(%{}, {:compound_delete_prefix, prefix}, state4)
+
+      assert [] == :ets.lookup(ets, "myset\x00m1")
+      assert [] == :ets.lookup(ets, "myset\x00m2")
+      assert [] == :ets.lookup(ets, "myset\x00m3")
+
+      cleanup_sm(ctx)
+    end
+
+    test "compound_delete_prefix with no matching keys is a no-op" do
+      ctx = fresh_sm_state()
+      {state, _ets, _store, _dir} = ctx
+
+      {new_state, :ok} =
+        SM.apply(%{}, {:compound_delete_prefix, "nonexistent\x00"}, state)
+
+      assert new_state.applied_count == 1
+
+      cleanup_sm(ctx)
+    end
+
+    test "compound_delete_prefix does not affect unrelated keys" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      {state2, :ok} =
+        SM.apply(%{}, {:compound_put, "hash_a\x00f1", "v1", 0}, state)
+
+      {state3, :ok} =
+        SM.apply(%{}, {:compound_put, "hash_b\x00f1", "v2", 0}, state2)
+
+      # Only delete hash_a's fields
+      {_state4, :ok} =
+        SM.apply(%{}, {:compound_delete_prefix, "hash_a\x00"}, state3)
+
+      assert [] == :ets.lookup(ets, "hash_a\x00f1")
+      assert [{_, "v2", 0}] = :ets.lookup(ets, "hash_b\x00f1")
+
+      cleanup_sm(ctx)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Batch with new command types
+  # ---------------------------------------------------------------------------
+
+  describe "batch containing new command types" do
+    test "batch with list_op, compound_put, and compound_delete" do
+      ctx = fresh_sm_state()
+      {state, ets, _store, _dir} = ctx
+
+      commands = [
+        {:list_op, "mylist", {:rpush, ["a", "b"]}},
+        {:compound_put, "myhash\x00f1", "v1", 0},
+        {:compound_put, "myset\x00m1", "1", 0}
+      ]
+
+      {new_state, {:ok, results}} =
+        SM.apply(%{}, {:batch, commands}, state)
+
+      # list_op returns the new length
+      assert [2, :ok, :ok] = results
+      assert new_state.applied_count == 3
+
+      # Verify list
+      [{_, raw, 0}] = :ets.lookup(ets, "mylist")
+      assert {:ok, ["a", "b"]} = ListOps.decode_stored(raw)
+
+      # Verify hash field
+      assert [{_, "v1", 0}] = :ets.lookup(ets, "myhash\x00f1")
+
+      # Verify set member
+      assert [{_, "1", 0}] = :ets.lookup(ets, "myset\x00m1")
+
+      cleanup_sm(ctx)
+    end
+  end
+
+  # ===========================================================================
+  # CAS (compare-and-swap) through Raft
+  # ===========================================================================
+
+  describe "CAS through Raft" do
+    test "match succeeds -- swaps value and returns 1" do
+      k = ukey("cas_match")
+
+      :ok = Router.put(k, "old_val", 0)
+      assert "old_val" == Router.get(k)
+
+      assert 1 = Router.cas(k, "old_val", "new_val", nil)
+      assert "new_val" == Router.get(k)
+    end
+
+    test "mismatch fails -- returns 0 and does not change value" do
+      k = ukey("cas_mismatch")
+
+      :ok = Router.put(k, "current", 0)
+      assert 0 = Router.cas(k, "wrong_expected", "new", nil)
+      assert "current" == Router.get(k)
+    end
+
+    test "missing key returns nil" do
+      k = ukey("cas_missing")
+
+      assert nil == Router.cas(k, "anything", "new", nil)
+      assert nil == Router.get(k)
+    end
+
+    test "CAS with TTL sets expiry on swapped value" do
+      k = ukey("cas_ttl")
+
+      :ok = Router.put(k, "v1", 0)
+      assert 1 = Router.cas(k, "v1", "v2", 60_000)
+
+      {value, expire_at_ms} = Router.get_meta(k)
+      assert value == "v2"
+      assert expire_at_ms > System.os_time(:millisecond)
+      assert expire_at_ms <= System.os_time(:millisecond) + 60_000
+    end
+
+    test "CAS without TTL preserves original expiry" do
+      k = ukey("cas_preserve_ttl")
+      future = System.os_time(:millisecond) + 120_000
+
+      :ok = Router.put(k, "v1", future)
+      assert 1 = Router.cas(k, "v1", "v2", nil)
+
+      {value, expire_at_ms} = Router.get_meta(k)
+      assert value == "v2"
+      assert expire_at_ms == future
+    end
+
+    test "CAS on expired key returns nil" do
+      k = ukey("cas_expired")
+      past = System.os_time(:millisecond) - 1_000
+
+      :ok = Router.put(k, "expired_val", past)
+      assert nil == Router.cas(k, "expired_val", "new", nil)
+    end
+  end
+
+  # ===========================================================================
+  # LOCK through Raft
+  # ===========================================================================
+
+  describe "LOCK through Raft" do
+    test "acquires lock on non-existent key" do
+      k = ukey("lock_acquire")
+
+      assert :ok = Router.lock(k, "owner1", 30_000)
+      assert "owner1" == Router.get(k)
+    end
+
+    test "acquires lock on expired key" do
+      k = ukey("lock_expired")
+      past = System.os_time(:millisecond) - 1_000
+
+      :ok = Router.put(k, "stale_owner", past)
+      assert :ok = Router.lock(k, "new_owner", 30_000)
+      assert "new_owner" == Router.get(k)
+    end
+
+    test "re-acquire by same owner succeeds" do
+      k = ukey("lock_reacquire")
+
+      assert :ok = Router.lock(k, "owner1", 30_000)
+      assert :ok = Router.lock(k, "owner1", 60_000)
+      assert "owner1" == Router.get(k)
+    end
+
+    test "returns error when locked by different owner" do
+      k = ukey("lock_conflict")
+
+      assert :ok = Router.lock(k, "owner1", 30_000)
+      assert {:error, "DISTLOCK lock is held by another owner"} =
+               Router.lock(k, "owner2", 30_000)
+    end
+
+    test "lock sets TTL on the key" do
+      k = ukey("lock_ttl")
+
+      assert :ok = Router.lock(k, "owner1", 30_000)
+      {value, expire_at_ms} = Router.get_meta(k)
+      assert value == "owner1"
+      assert expire_at_ms > System.os_time(:millisecond)
+      assert expire_at_ms <= System.os_time(:millisecond) + 30_000
+    end
+  end
+
+  # ===========================================================================
+  # UNLOCK through Raft
+  # ===========================================================================
+
+  describe "UNLOCK through Raft" do
+    test "releases lock when owner matches" do
+      k = ukey("unlock_match")
+
+      :ok = Router.lock(k, "owner1", 30_000)
+      assert "owner1" == Router.get(k)
+
+      assert 1 = Router.unlock(k, "owner1")
+      assert nil == Router.get(k)
+    end
+
+    test "returns error when caller is not the owner" do
+      k = ukey("unlock_wrong_owner")
+
+      :ok = Router.lock(k, "owner1", 30_000)
+      assert {:error, "DISTLOCK caller is not the lock owner"} =
+               Router.unlock(k, "owner2")
+      # Lock should still be held
+      assert "owner1" == Router.get(k)
+    end
+
+    test "unlocking non-existent key returns 1" do
+      k = ukey("unlock_missing")
+      assert 1 = Router.unlock(k, "anyone")
+    end
+  end
+
+  # ===========================================================================
+  # EXTEND through Raft
+  # ===========================================================================
+
+  describe "EXTEND through Raft" do
+    test "extends TTL when owner matches" do
+      k = ukey("extend_match")
+
+      :ok = Router.lock(k, "owner1", 10_000)
+      {_, expire_before} = Router.get_meta(k)
+
+      # Extend with a longer TTL
+      assert 1 = Router.extend(k, "owner1", 60_000)
+
+      {value, expire_after} = Router.get_meta(k)
+      assert value == "owner1"
+      assert expire_after > expire_before
+    end
+
+    test "returns error when caller is not the owner" do
+      k = ukey("extend_wrong_owner")
+
+      :ok = Router.lock(k, "owner1", 30_000)
+      assert {:error, "DISTLOCK caller is not the lock owner"} =
+               Router.extend(k, "owner2", 60_000)
+    end
+
+    test "returns error when key does not exist" do
+      k = ukey("extend_missing")
+
+      assert {:error, "DISTLOCK lock does not exist or has expired"} =
+               Router.extend(k, "owner1", 60_000)
+    end
+
+    test "returns error when lock has expired" do
+      k = ukey("extend_expired")
+      past = System.os_time(:millisecond) - 1_000
+
+      :ok = Router.put(k, "owner1", past)
+      assert {:error, "DISTLOCK lock does not exist or has expired"} =
+               Router.extend(k, "owner1", 60_000)
+    end
+  end
+
+  # ===========================================================================
+  # RATELIMIT.ADD through Raft
+  # ===========================================================================
+
+  describe "RATELIMIT.ADD through Raft" do
+    test "returns allowed with correct counts on first call" do
+      k = ukey("ratelimit_first")
+      window_ms = 10_000
+      max_requests = 10
+
+      [status, count, remaining, _ttl] =
+        Router.ratelimit_add(k, window_ms, max_requests, 1)
+
+      assert status == "allowed"
+      assert count == 1
+      assert remaining == 9
+    end
+
+    test "increments count on successive calls" do
+      k = ukey("ratelimit_incr")
+      window_ms = 10_000
+      max_requests = 10
+
+      [_, c1, _, _] = Router.ratelimit_add(k, window_ms, max_requests, 1)
+      [_, c2, _, _] = Router.ratelimit_add(k, window_ms, max_requests, 1)
+      [_, c3, _, _] = Router.ratelimit_add(k, window_ms, max_requests, 1)
+
+      assert c1 == 1
+      assert c2 == 2
+      assert c3 == 3
+    end
+
+    test "returns denied when limit is exceeded" do
+      k = ukey("ratelimit_denied")
+      window_ms = 10_000
+      max_requests = 3
+
+      # Use up the limit
+      ["allowed", _, _, _] = Router.ratelimit_add(k, window_ms, max_requests, 3)
+
+      # Next request should be denied
+      [status, count, remaining, _ttl] =
+        Router.ratelimit_add(k, window_ms, max_requests, 1)
+
+      assert status == "denied"
+      assert count == 3
+      assert remaining == 0
+    end
+
+    test "returns ttl_ms as non-negative integer" do
+      k = ukey("ratelimit_ttl")
+      window_ms = 10_000
+      max_requests = 100
+
+      [_, _, _, ttl] = Router.ratelimit_add(k, window_ms, max_requests, 1)
+      assert is_integer(ttl)
+      assert ttl >= 0
+      assert ttl <= window_ms
+    end
+
+    test "multi-count add works correctly" do
+      k = ukey("ratelimit_multi")
+      window_ms = 10_000
+      max_requests = 10
+
+      [status, count, remaining, _ttl] =
+        Router.ratelimit_add(k, window_ms, max_requests, 5)
+
+      assert status == "allowed"
+      assert count == 5
+      assert remaining == 5
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # INCRBYFLOAT through Raft
+  # ---------------------------------------------------------------------------
+
+  describe "INCRBYFLOAT through Raft" do
+    test "returns correct float on non-existent key" do
+      k = ukey("incrbyfloat_new")
+
+      assert {:ok, new_str} = Router.incr_float(k, 1.5)
+      assert new_str == "1.5"
+      assert "1.5" == Router.get(k)
+    end
+
+    test "increments existing float value correctly" do
+      k = ukey("incrbyfloat_existing")
+
+      :ok = Router.put(k, "10", 0)
+      assert {:ok, new_str} = Router.incr_float(k, 2.5)
+      assert new_str == "12.5"
+      assert "12.5" == Router.get(k)
+    end
+
+    test "increments integer string as float" do
+      k = ukey("incrbyfloat_int")
+
+      :ok = Router.put(k, "10", 0)
+      assert {:ok, new_str} = Router.incr_float(k, 1.5)
+      assert new_str == "11.5"
+    end
+
+    test "returns error on non-float value" do
+      k = ukey("incrbyfloat_err")
+
+      :ok = Router.put(k, "not_a_number", 0)
+      assert {:error, "ERR value is not a valid float"} = Router.incr_float(k, 1.0)
+      # Original value should be unchanged
+      assert "not_a_number" == Router.get(k)
+    end
+
+    test "preserves expiry on existing key" do
+      k = ukey("incrbyfloat_ttl")
+      future = System.os_time(:millisecond) + 60_000
+
+      :ok = Router.put(k, "5.0", future)
+      {:ok, _} = Router.incr_float(k, 1.0)
+
+      {value, expire_at_ms} = Router.get_meta(k)
+      assert value == "6"
+      assert expire_at_ms == future
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # APPEND through Raft
+  # ---------------------------------------------------------------------------
+
+  describe "APPEND through Raft" do
+    test "returns new length on non-existent key" do
+      k = ukey("append_new")
+
+      assert {:ok, 5} = Router.append(k, "hello")
+      assert "hello" == Router.get(k)
+    end
+
+    test "appends to existing value and returns new length" do
+      k = ukey("append_existing")
+
+      :ok = Router.put(k, "hello", 0)
+      assert {:ok, 11} = Router.append(k, " world")
+      assert "hello world" == Router.get(k)
+    end
+
+    test "multiple appends produce correct result" do
+      k = ukey("append_multi")
+
+      {:ok, 1} = Router.append(k, "a")
+      {:ok, 2} = Router.append(k, "b")
+      {:ok, 3} = Router.append(k, "c")
+      assert "abc" == Router.get(k)
+    end
+
+    test "preserves expiry on existing key" do
+      k = ukey("append_ttl")
+      future = System.os_time(:millisecond) + 60_000
+
+      :ok = Router.put(k, "hi", future)
+      {:ok, 8} = Router.append(k, " there")
+
+      {value, expire_at_ms} = Router.get_meta(k)
+      assert value == "hi there"
+      assert expire_at_ms == future
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # GETSET through Raft
+  # ---------------------------------------------------------------------------
+
+  describe "GETSET through Raft" do
+    test "returns old value and sets new value" do
+      k = ukey("getset_basic")
+
+      :ok = Router.put(k, "old_value", 0)
+      old = Router.getset(k, "new_value")
+      assert old == "old_value"
+      assert "new_value" == Router.get(k)
+    end
+
+    test "returns nil when key does not exist" do
+      k = ukey("getset_missing")
+
+      old = Router.getset(k, "first_value")
+      assert old == nil
+      assert "first_value" == Router.get(k)
+    end
+
+    test "sets new value with no expiry" do
+      k = ukey("getset_expiry")
+      future = System.os_time(:millisecond) + 60_000
+
+      :ok = Router.put(k, "old", future)
+      _old = Router.getset(k, "new")
+
+      {value, expire_at_ms} = Router.get_meta(k)
+      assert value == "new"
+      # GETSET resets expiry to 0
+      assert expire_at_ms == 0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # GETDEL through Raft
+  # ---------------------------------------------------------------------------
+
+  describe "GETDEL through Raft" do
+    test "returns value and key is gone" do
+      k = ukey("getdel_basic")
+
+      :ok = Router.put(k, "will_vanish", 0)
+      old = Router.getdel(k)
+      assert old == "will_vanish"
+      assert nil == Router.get(k)
+    end
+
+    test "returns nil when key does not exist" do
+      k = ukey("getdel_missing")
+
+      old = Router.getdel(k)
+      assert old == nil
+    end
+
+    test "key is removed from ETS" do
+      k = ukey("getdel_ets")
+
+      :ok = Router.put(k, "in_ets", 0)
+      ets = shard_ets_for(k)
+      assert [{^k, "in_ets", 0}] = :ets.lookup(ets, k)
+
+      _old = Router.getdel(k)
+      assert [] == :ets.lookup(ets, k)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # GETEX through Raft
+  # ---------------------------------------------------------------------------
+
+  describe "GETEX through Raft" do
+    test "updates TTL and returns value" do
+      k = ukey("getex_ttl")
+      future = System.os_time(:millisecond) + 120_000
+
+      :ok = Router.put(k, "my_val", 0)
+      value = Router.getex(k, future)
+      assert value == "my_val"
+
+      {stored_val, expire_at_ms} = Router.get_meta(k)
+      assert stored_val == "my_val"
+      assert expire_at_ms == future
+    end
+
+    test "returns nil when key does not exist" do
+      k = ukey("getex_missing")
+
+      value = Router.getex(k, System.os_time(:millisecond) + 60_000)
+      assert value == nil
+    end
+
+    test "PERSIST removes expiry" do
+      k = ukey("getex_persist")
+      future = System.os_time(:millisecond) + 60_000
+
+      :ok = Router.put(k, "persistent", future)
+      # PERSIST = expire_at_ms of 0
+      value = Router.getex(k, 0)
+      assert value == "persistent"
+
+      {stored_val, expire_at_ms} = Router.get_meta(k)
+      assert stored_val == "persistent"
+      assert expire_at_ms == 0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SETRANGE through Raft
+  # ---------------------------------------------------------------------------
+
+  describe "SETRANGE through Raft" do
+    test "returns new length after overwriting bytes" do
+      k = ukey("setrange_basic")
+
+      :ok = Router.put(k, "Hello World", 0)
+      assert {:ok, 11} = Router.setrange(k, 6, "Redis")
+      assert "Hello Redis" == Router.get(k)
+    end
+
+    test "pads with zero bytes for non-existent key" do
+      k = ukey("setrange_new")
+
+      assert {:ok, 8} = Router.setrange(k, 5, "abc")
+      value = Router.get(k)
+      assert byte_size(value) == 8
+      # First 5 bytes should be zero
+      assert binary_part(value, 0, 5) == <<0, 0, 0, 0, 0>>
+      assert binary_part(value, 5, 3) == "abc"
+    end
+
+    test "extends string when offset + value exceeds length" do
+      k = ukey("setrange_extend")
+
+      :ok = Router.put(k, "Hi", 0)
+      assert {:ok, 7} = Router.setrange(k, 2, "There")
+      assert "HiThere" == Router.get(k)
+    end
+
+    test "preserves expiry on existing key" do
+      k = ukey("setrange_ttl")
+      future = System.os_time(:millisecond) + 60_000
+
+      :ok = Router.put(k, "abcdef", future)
+      {:ok, _len} = Router.setrange(k, 0, "XY")
+
+      {value, expire_at_ms} = Router.get_meta(k)
+      assert value == "XYcdef"
+      assert expire_at_ms == future
     end
   end
 end

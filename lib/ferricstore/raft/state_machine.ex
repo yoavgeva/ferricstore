@@ -43,6 +43,7 @@ defmodule Ferricstore.Raft.StateMachine do
   @behaviour :ra_machine
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.ListOps
 
   @default_release_cursor_interval 1_000
 
@@ -104,6 +105,47 @@ defmodule Ferricstore.Raft.StateMachine do
     * `{:batch, commands}` -- Apply a list of commands atomically. Each command
       in the batch is a tuple matching one of the above forms. Returns
       `{:ok, results}` where results is a list of individual command results.
+    * `{:list_op, key, operation}` -- Execute a list operation (LPUSH, RPUSH,
+      LPOP, RPOP, etc.) as an atomic read-modify-write. Reads the current value
+      from ETS/Bitcask, delegates to `ListOps.execute/4`, and persists the result.
+    * `{:compound_put, compound_key, value, expire_at_ms}` -- Write a hash/set/zset
+      field. Inserts `{compound_key, value, expire_at_ms}` into ETS and Bitcask.
+    * `{:compound_delete, compound_key}` -- Delete a hash/set/zset field. Removes
+      the compound key from ETS and Bitcask.
+    * `{:compound_delete_prefix, prefix}` -- Delete all compound keys matching the
+      given prefix from ETS and Bitcask. Used by DEL on data structures (hashes,
+      sets, sorted sets) to clean up all fields.
+    * `{:incr_float, key, delta}` -- Atomic read-modify-write float increment.
+      Reads the current value, parses as float, adds `delta`, formats the result,
+      and writes back. Returns `{:ok, new_float_string}` or
+      `{:error, "ERR value is not a valid float"}`.
+    * `{:append, key, suffix}` -- Atomic read-modify-write append. Reads the
+      current value (or `""`), concatenates `suffix`, writes back. Returns
+      `{:ok, byte_size(new_value)}`.
+    * `{:getset, key, new_value}` -- Atomic get-and-set. Reads the old value,
+      writes the new value with no expiry, returns the old value (or `nil`).
+    * `{:getdel, key}` -- Atomic get-and-delete. Reads the value, deletes the
+      key, returns the value (or `nil`).
+    * `{:getex, key, expire_at_ms}` -- Atomic get-and-update-expiry. Reads the
+      value, re-writes with the new `expire_at_ms`, returns the value (or `nil`).
+    * `{:setrange, key, offset, value}` -- Atomic set-range. Reads the current
+      value, pads with zero bytes if needed, replaces bytes at `offset`, writes
+      back. Returns `{:ok, byte_size(new_value)}`.
+    * `{:cas, key, expected, new_value, ttl_ms}` -- Compare-and-swap. Reads the
+      current value; if it matches `expected`, writes `new_value` with optional
+      TTL. Returns `1` (swapped), `0` (mismatch), or `nil` (key missing/expired).
+    * `{:lock, key, owner, ttl_ms}` -- Distributed lock acquire. If the key does
+      not exist, is expired, or is already held by the same owner, sets
+      `{owner, ttl}`. Returns `:ok` or `{:error, reason}`.
+    * `{:unlock, key, owner}` -- Distributed lock release. If the key exists and
+      the owner matches, deletes the key. Returns `1` on success,
+      `{:error, reason}` on owner mismatch.
+    * `{:extend, key, owner, ttl_ms}` -- Distributed lock TTL extension. If the
+      key exists and the owner matches, updates the TTL. Returns `1` on success,
+      `{:error, reason}` on owner mismatch or missing key.
+    * `{:ratelimit_add, key, window_ms, max, count}` -- Sliding window rate
+      limiter. Reads counters, rotates windows, computes effective count, and
+      updates. Returns `[status, count, remaining, ttl_ms]`.
 
   Returns `{new_state, result}` or `{new_state, result, effects}`.
   """
@@ -133,6 +175,111 @@ defmodule Ferricstore.Raft.StateMachine do
 
     new_state = %{state | applied_count: new_count}
     maybe_release_cursor(meta, old_count, new_state, {:ok, results})
+  end
+
+  def apply(meta, {:list_op, key, operation}, state) do
+    result = do_list_op(state, key, operation)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:compound_put, compound_key, value, expire_at_ms}, state) do
+    result = do_put(state, compound_key, value, expire_at_ms)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:compound_delete, compound_key}, state) do
+    result = do_delete(state, compound_key)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:compound_delete_prefix, prefix}, state) do
+    result = do_delete_prefix(state, prefix)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:incr_float, key, delta}, state) do
+    result = do_incr_float(state, key, delta)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:append, key, suffix}, state) do
+    result = do_append(state, key, suffix)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:getset, key, new_value}, state) do
+    result = do_getset(state, key, new_value)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:getdel, key}, state) do
+    result = do_getdel(state, key)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:getex, key, expire_at_ms}, state) do
+    result = do_getex(state, key, expire_at_ms)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:setrange, key, offset, value}, state) do
+    result = do_setrange(state, key, offset, value)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:cas, key, expected, new_value, ttl_ms}, state) do
+    result = do_cas(state, key, expected, new_value, ttl_ms)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:lock, key, owner, ttl_ms}, state) do
+    result = do_lock(state, key, owner, ttl_ms)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:unlock, key, owner}, state) do
+    result = do_unlock(state, key, owner)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:extend, key, owner, ttl_ms}, state) do
+    result = do_extend(state, key, owner, ttl_ms)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:ratelimit_add, key, window_ms, max, count}, state) do
+    result = do_ratelimit_add(state, key, window_ms, max, count)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   @doc """
@@ -263,6 +410,66 @@ defmodule Ferricstore.Raft.StateMachine do
     do_delete(state, key)
   end
 
+  defp apply_single(state, {:list_op, key, operation}) do
+    do_list_op(state, key, operation)
+  end
+
+  defp apply_single(state, {:compound_put, compound_key, value, expire_at_ms}) do
+    do_put(state, compound_key, value, expire_at_ms)
+  end
+
+  defp apply_single(state, {:compound_delete, compound_key}) do
+    do_delete(state, compound_key)
+  end
+
+  defp apply_single(state, {:compound_delete_prefix, prefix}) do
+    do_delete_prefix(state, prefix)
+  end
+
+  defp apply_single(state, {:incr_float, key, delta}) do
+    do_incr_float(state, key, delta)
+  end
+
+  defp apply_single(state, {:append, key, suffix}) do
+    do_append(state, key, suffix)
+  end
+
+  defp apply_single(state, {:getset, key, new_value}) do
+    do_getset(state, key, new_value)
+  end
+
+  defp apply_single(state, {:getdel, key}) do
+    do_getdel(state, key)
+  end
+
+  defp apply_single(state, {:getex, key, expire_at_ms}) do
+    do_getex(state, key, expire_at_ms)
+  end
+
+  defp apply_single(state, {:setrange, key, offset, value}) do
+    do_setrange(state, key, offset, value)
+  end
+
+  defp apply_single(state, {:cas, key, expected, new_value, ttl_ms}) do
+    do_cas(state, key, expected, new_value, ttl_ms)
+  end
+
+  defp apply_single(state, {:lock, key, owner, ttl_ms}) do
+    do_lock(state, key, owner, ttl_ms)
+  end
+
+  defp apply_single(state, {:unlock, key, owner}) do
+    do_unlock(state, key, owner)
+  end
+
+  defp apply_single(state, {:extend, key, owner, ttl_ms}) do
+    do_extend(state, key, owner, ttl_ms)
+  end
+
+  defp apply_single(state, {:ratelimit_add, key, window_ms, max, count}) do
+    do_ratelimit_add(state, key, window_ms, max, count)
+  end
+
   defp do_put(state, key, value, expire_at_ms) do
     # Synchronous Bitcask write -- deterministic, called on every node.
     # put_batch is used for a single entry to match the existing NIF API
@@ -281,5 +488,470 @@ defmodule Ferricstore.Raft.StateMachine do
     NIF.delete(state.store, key)
     :ets.delete(state.ets, key)
     :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: string mutation operations
+  # ---------------------------------------------------------------------------
+
+  # Atomic INCRBYFLOAT: reads current value, parses as float, adds delta,
+  # formats result, writes back. Preserves existing expire_at_ms.
+  defp do_incr_float(state, key, delta) do
+    case do_get_meta(state, key) do
+      nil ->
+        new_str = format_float(delta)
+        do_put(state, key, new_str, 0)
+        {:ok, new_str}
+
+      {value, expire_at_ms} ->
+        case parse_float(value) do
+          {:ok, float_val} ->
+            new_val = float_val + delta
+            new_str = format_float(new_val)
+            do_put(state, key, new_str, expire_at_ms)
+            {:ok, new_str}
+
+          :error ->
+            {:error, "ERR value is not a valid float"}
+        end
+    end
+  end
+
+  # Parses a binary as a float. Accepts integer strings ("10") and float
+  # strings ("3.14"). Returns `{:ok, float}` or `:error`. Mirrors shard.ex.
+  defp parse_float(str) when is_binary(str) do
+    case Integer.parse(str) do
+      {val, ""} ->
+        {:ok, val * 1.0}
+
+      _ ->
+        case Float.parse(str) do
+          {val, ""} ->
+            if val in [:infinity, :neg_infinity, :nan] do
+              :error
+            else
+              {:ok, val}
+            end
+
+          _ ->
+            :error
+        end
+    end
+  end
+
+  # Formats a float using Erlang's compact decimal format, stripping trailing
+  # zeros and unnecessary decimal point (matches Redis INCRBYFLOAT output).
+  defp format_float(val) when is_float(val) do
+    formatted = :erlang.float_to_binary(val, [:compact, {:decimals, 17}])
+
+    if String.contains?(formatted, ".") do
+      formatted
+      |> String.trim_trailing("0")
+      |> String.trim_trailing(".")
+      |> then(fn s -> s end)
+    else
+      formatted
+    end
+  end
+
+  # Atomic APPEND: reads current value (or ""), concatenates suffix, writes
+  # back. Preserves the existing expire_at_ms on the key.
+  defp do_append(state, key, suffix) do
+    {old_val, expire_at_ms} =
+      case do_get_meta(state, key) do
+        nil -> {"", 0}
+        {v, exp} -> {v, exp}
+      end
+
+    new_val = old_val <> suffix
+    do_put(state, key, new_val, expire_at_ms)
+    {:ok, byte_size(new_val)}
+  end
+
+  # Atomic GETSET: reads old value, writes new value with no expiry, returns
+  # old value directly (not wrapped in {:ok, ...}).
+  defp do_getset(state, key, new_value) do
+    old = do_get(state, key)
+    do_put(state, key, new_value, 0)
+    old
+  end
+
+  # Atomic GETDEL: reads value, deletes key, returns value directly (not
+  # wrapped in {:ok, ...}). Returns nil if key does not exist.
+  defp do_getdel(state, key) do
+    old = do_get(state, key)
+
+    if old != nil do
+      do_delete(state, key)
+    end
+
+    old
+  end
+
+  # Atomic GETEX: reads value, re-writes with new expire_at_ms, returns value
+  # directly (not wrapped). Returns nil if key does not exist or is expired.
+  defp do_getex(state, key, expire_at_ms) do
+    case do_get_meta(state, key) do
+      nil ->
+        nil
+
+      {value, _old_exp} ->
+        do_put(state, key, value, expire_at_ms)
+        value
+    end
+  end
+
+  # Atomic SETRANGE: reads current value, pads with zero bytes if needed,
+  # replaces bytes at offset, writes back. Preserves expire_at_ms.
+  defp do_setrange(state, key, offset, value) do
+    {old_val, expire_at_ms} =
+      case do_get_meta(state, key) do
+        nil -> {"", 0}
+        {v, exp} -> {v, exp}
+      end
+
+    new_val = sm_apply_setrange(old_val, offset, value)
+    do_put(state, key, new_val, expire_at_ms)
+    {:ok, byte_size(new_val)}
+  end
+
+  # Overwrites bytes at `offset` with `value`, zero-padding if the original
+  # string is shorter than offset. Mirrors shard.ex apply_setrange/3.
+  defp sm_apply_setrange(old, offset, value) do
+    old_len = byte_size(old)
+    val_len = byte_size(value)
+
+    cond do
+      val_len == 0 ->
+        if offset > old_len do
+          old <> :binary.copy(<<0>>, offset - old_len)
+        else
+          old
+        end
+
+      offset >= old_len ->
+        padding = :binary.copy(<<0>>, offset - old_len)
+        old <> padding <> value
+
+      offset + val_len >= old_len ->
+        binary_part(old, 0, offset) <> value
+
+      true ->
+        binary_part(old, 0, offset) <>
+          value <>
+          binary_part(old, offset + val_len, old_len - offset - val_len)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: compare-and-swap
+  # ---------------------------------------------------------------------------
+
+  # Reads the current value from ETS (with Bitcask fallback), compares it
+  # against `expected`. If match, writes `new_value` with optional TTL.
+  # Returns 1 (swapped), 0 (mismatch), or nil (missing/expired).
+  #
+  # Replicates the exact shard.ex handle_cas_direct logic.
+  defp do_cas(state, key, expected, new_value, ttl_ms) do
+    case ets_lookup(state, key) do
+      {:hit, ^expected, old_exp} ->
+        expire = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: old_exp
+        do_put(state, key, new_value, expire)
+        1
+
+      {:hit, _other, _exp} ->
+        0
+
+      :expired ->
+        nil
+
+      :miss ->
+        nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: distributed lock operations
+  # ---------------------------------------------------------------------------
+
+  # Acquires a lock. If the key doesn't exist, is expired, or is already held
+  # by the same owner, sets {owner, ttl}. Returns :ok or {:error, reason}.
+  #
+  # Replicates the exact shard.ex handle_lock_direct logic.
+  defp do_lock(state, key, owner, ttl_ms) do
+    expire = System.os_time(:millisecond) + ttl_ms
+
+    case ets_lookup(state, key) do
+      {:hit, ^owner, _exp} ->
+        # Same owner -- re-acquire (idempotent)
+        do_put(state, key, owner, expire)
+        :ok
+
+      {:hit, _other, _exp} ->
+        {:error, "DISTLOCK lock is held by another owner"}
+
+      _ ->
+        # Missing or expired -- acquire
+        do_put(state, key, owner, expire)
+        :ok
+    end
+  end
+
+  # Releases a lock. If the key exists and the owner matches, deletes the key.
+  # Returns 1 on success, {:error, reason} on owner mismatch.
+  #
+  # Replicates the exact shard.ex handle_unlock_direct logic.
+  defp do_unlock(state, key, owner) do
+    case ets_lookup(state, key) do
+      {:hit, ^owner, _exp} ->
+        do_delete(state, key)
+        1
+
+      {:hit, _other, _exp} ->
+        {:error, "DISTLOCK caller is not the lock owner"}
+
+      _ ->
+        # Missing or expired -- treat as already unlocked
+        1
+    end
+  end
+
+  # Extends a lock's TTL. If the key exists and the owner matches, updates
+  # the TTL. Returns 1 on success, {:error, reason} on mismatch or missing.
+  #
+  # Replicates the exact shard.ex handle_extend_direct logic.
+  defp do_extend(state, key, owner, ttl_ms) do
+    new_expire = System.os_time(:millisecond) + ttl_ms
+
+    case ets_lookup(state, key) do
+      {:hit, ^owner, _exp} ->
+        do_put(state, key, owner, new_expire)
+        1
+
+      {:hit, _other, _exp} ->
+        {:error, "DISTLOCK caller is not the lock owner"}
+
+      _ ->
+        {:error, "DISTLOCK lock does not exist or has expired"}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: sliding window rate limiter
+  # ---------------------------------------------------------------------------
+
+  # Implements a sliding window rate limiter. Reads current counters from ETS,
+  # rotates windows as needed, computes the effective count using a weighted
+  # sliding window approximation, and updates the stored state.
+  # Returns [status, count, remaining, ms_until_reset].
+  #
+  # Replicates the exact shard.ex handle_ratelimit_add_direct logic.
+  defp do_ratelimit_add(state, key, window_ms, max, count) do
+    now = System.os_time(:millisecond)
+
+    {cur_count, cur_start, prv_count} =
+      case ets_lookup(state, key) do
+        {:hit, value, _exp} -> decode_ratelimit(value)
+        _ -> {0, now, 0}
+      end
+
+    # Rotate windows
+    {cur_count, cur_start, prv_count} =
+      cond do
+        now - cur_start >= window_ms * 2 -> {0, now, 0}
+        now - cur_start >= window_ms -> {0, now, cur_count}
+        true -> {cur_count, cur_start, prv_count}
+      end
+
+    # Compute effective count with sliding window approximation
+    elapsed = now - cur_start
+    weight = max(0.0, 1.0 - elapsed / window_ms)
+    effective = cur_count + trunc(Float.round(prv_count * weight))
+    expire_at_ms = cur_start + window_ms * 2
+
+    {status, final_count, remaining, value} =
+      if effective + count > max do
+        value = encode_ratelimit(cur_count, cur_start, prv_count)
+        {"denied", effective, max(0, max - effective), value}
+      else
+        new_cur = cur_count + count
+        new_eff = effective + count
+        value = encode_ratelimit(new_cur, cur_start, prv_count)
+        {"allowed", new_eff, max(0, max - new_eff), value}
+      end
+
+    do_put(state, key, value, expire_at_ms)
+    ms_until_reset = max(0, cur_start + window_ms - now)
+    [status, final_count, remaining, ms_until_reset]
+  end
+
+  defp encode_ratelimit(cur, start, prev), do: "#{cur}:#{start}:#{prev}"
+
+  defp decode_ratelimit(value) do
+    case String.split(value, ":") do
+      [cur, start, prev] ->
+        {String.to_integer(cur), String.to_integer(start), String.to_integer(prev)}
+
+      _ ->
+        {0, System.os_time(:millisecond), 0}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: ETS lookup with expiry checking
+  # ---------------------------------------------------------------------------
+
+  # Reads a key from ETS, checking expiry. Falls back to Bitcask for cold
+  # keys. Returns {:hit, value, expire_at_ms}, :expired, or :miss.
+  # Mirrors the shard's `ets_lookup/2` logic with Bitcask fallback for
+  # keys that may not yet be warmed into ETS.
+  defp ets_lookup(state, key) do
+    now = System.os_time(:millisecond)
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, value, 0}] ->
+        {:hit, value, 0}
+
+      [{^key, value, exp}] when exp > now ->
+        {:hit, value, exp}
+
+      [{^key, _value, _exp}] ->
+        :ets.delete(state.ets, key)
+        :expired
+
+      [] ->
+        # ETS miss -- try Bitcask for cold keys
+        case NIF.get(state.store, key) do
+          {:ok, nil} ->
+            :miss
+
+          {:ok, value} ->
+            :ets.insert(state.ets, {key, value, 0})
+            {:hit, value, 0}
+
+          _error ->
+            :miss
+        end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: list operations (read-modify-write via ListOps)
+  # ---------------------------------------------------------------------------
+
+  # Performs a complete read-modify-write for a list operation within a single
+  # Raft apply. The get/put/delete closures operate directly on ETS and Bitcask
+  # (the same stores available to the state machine) so the entire operation is
+  # atomic from the Raft log's perspective.
+  defp do_list_op(state, key, operation) do
+    get_fn = fn -> do_get(state, key) end
+
+    put_fn = fn encoded_binary ->
+      do_put(state, key, encoded_binary, 0)
+    end
+
+    delete_fn = fn ->
+      do_delete(state, key)
+    end
+
+    ListOps.execute(get_fn, put_fn, delete_fn, operation)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: compound delete prefix (scan + batch delete)
+  # ---------------------------------------------------------------------------
+
+  # Scans ETS for all keys matching the given prefix and deletes each from
+  # both ETS and Bitcask. Used by DEL on hashes, sets, and sorted sets to
+  # remove all compound fields belonging to a data structure.
+  defp do_delete_prefix(state, prefix) do
+    keys_to_delete =
+      :ets.foldl(
+        fn {key, _value, _exp}, acc ->
+          if is_binary(key) and String.starts_with?(key, prefix) do
+            [key | acc]
+          else
+            acc
+          end
+        end,
+        [],
+        state.ets
+      )
+
+    Enum.each(keys_to_delete, fn key ->
+      do_delete(state, key)
+    end)
+
+    :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: read from ETS with Bitcask fallback
+  # ---------------------------------------------------------------------------
+
+  # Reads a value from ETS, falling back to Bitcask for cold keys. Mirrors
+  # the shard's `do_get/2` logic so that list operations can read current
+  # state within the state machine.
+  defp do_get(state, key) do
+    now = System.os_time(:millisecond)
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, value, 0}] ->
+        value
+
+      [{^key, value, exp}] when exp > now ->
+        value
+
+      [{^key, _value, _exp}] ->
+        # Expired -- evict and treat as missing
+        :ets.delete(state.ets, key)
+        nil
+
+      [] ->
+        # ETS miss -- try Bitcask
+        case NIF.get(state.store, key) do
+          {:ok, nil} ->
+            nil
+
+          {:ok, value} ->
+            :ets.insert(state.ets, {key, value, 0})
+            value
+
+          _error ->
+            nil
+        end
+    end
+  end
+
+  # Reads a value + expire_at_ms from ETS, falling back to Bitcask for cold
+  # keys. Returns `{value, expire_at_ms}` or `nil`. Mirrors shard.ex
+  # do_get_meta/2.
+  defp do_get_meta(state, key) do
+    now = System.os_time(:millisecond)
+
+    case :ets.lookup(state.ets, key) do
+      [{^key, value, 0}] ->
+        {value, 0}
+
+      [{^key, value, exp}] when exp > now ->
+        {value, exp}
+
+      [{^key, _value, _exp}] ->
+        :ets.delete(state.ets, key)
+        nil
+
+      [] ->
+        case NIF.get(state.store, key) do
+          {:ok, nil} ->
+            nil
+
+          {:ok, value} ->
+            :ets.insert(state.ets, {key, value, 0})
+            {value, 0}
+
+          _error ->
+            nil
+        end
+    end
   end
 end

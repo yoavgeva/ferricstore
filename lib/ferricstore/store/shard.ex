@@ -363,16 +363,33 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for compound_put: routes put through Raft.
-  defp handle_compound_put_raft(_redis_key, compound_key, value, expire_at_ms, state) do
+  # Raft path for compound_put: routes put through Raft for non-promoted,
+  # or directly to dedicated Bitcask for promoted keys.
+  defp handle_compound_put_raft(redis_key, compound_key, value, expire_at_ms, state) do
     alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:put, compound_key, value, expire_at_ms})
-    new_version = state.write_version + 1
+    case promoted_store(state, redis_key) do
+      nil ->
+        # Not promoted -- route through Raft
+        result = Batcher.write(state.index, {:put, compound_key, value, expire_at_ms})
+        new_version = state.write_version + 1
 
-    case result do
-      :ok -> {:reply, :ok, %{state | write_version: new_version}}
-      {:error, _} = err -> {:reply, err, state}
+        case result do
+          :ok ->
+            new_state = %{state | write_version: new_version}
+            # Check if this key should be promoted (local optimization, not replicated)
+            new_state = maybe_promote(new_state, redis_key, compound_key)
+            {:reply, :ok, new_state}
+
+          {:error, _} = err ->
+            {:reply, err, state}
+        end
+
+      dedicated ->
+        # Promoted -- write to ETS + dedicated Bitcask directly
+        :ets.insert(state.ets, {compound_key, value, expire_at_ms})
+        NIF.put(dedicated, compound_key, value, expire_at_ms)
+        {:reply, :ok, state}
     end
   end
 
@@ -406,22 +423,32 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:compound_delete, redis_key, compound_key}, _from, state) do
     if raft_enabled?() do
-      handle_compound_delete_raft(compound_key, state)
+      handle_compound_delete_raft(redis_key, compound_key, state)
     else
       handle_compound_delete_direct(redis_key, compound_key, state)
     end
   end
 
-  # Raft path for compound_delete: routes delete through Raft.
-  defp handle_compound_delete_raft(compound_key, state) do
+  # Raft path for compound_delete: routes delete through Raft for non-promoted,
+  # or directly to dedicated Bitcask for promoted keys.
+  defp handle_compound_delete_raft(redis_key, compound_key, state) do
     alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:delete, compound_key})
-    new_version = state.write_version + 1
+    case promoted_store(state, redis_key) do
+      nil ->
+        result = Batcher.write(state.index, {:delete, compound_key})
+        new_version = state.write_version + 1
 
-    case result do
-      :ok -> {:reply, :ok, %{state | write_version: new_version}}
-      {:error, _} = err -> {:reply, err, state}
+        case result do
+          :ok -> {:reply, :ok, %{state | write_version: new_version}}
+          {:error, _} = err -> {:reply, err, state}
+        end
+
+      dedicated ->
+        # Promoted -- delete from dedicated Bitcask directly
+        NIF.delete(dedicated, compound_key)
+        :ets.delete(state.ets, compound_key)
+        {:reply, :ok, state}
     end
   end
 
@@ -563,35 +590,72 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call({:compound_delete_prefix, redis_key, prefix}, _from, state) do
     if raft_enabled?() do
-      handle_compound_delete_prefix_raft(prefix, state)
+      handle_compound_delete_prefix_raft(redis_key, prefix, state)
     else
       handle_compound_delete_prefix_direct(redis_key, prefix, state)
     end
   end
 
-  # Raft path for compound_delete_prefix: finds keys locally, routes deletes through Raft.
-  defp handle_compound_delete_prefix_raft(prefix, state) do
+  # Raft path for compound_delete_prefix: routes deletes through Raft for non-promoted,
+  # or directly cleans up dedicated Bitcask for promoted keys.
+  defp handle_compound_delete_prefix_raft(redis_key, prefix, state) do
     alias Ferricstore.Raft.Batcher
 
-    keys_to_delete =
-      :ets.foldl(
-        fn {key, _value, _exp}, acc ->
-          if is_binary(key) and String.starts_with?(key, prefix) do
-            [key | acc]
-          else
-            acc
-          end
-        end,
-        [],
-        state.ets
-      )
+    case promoted_store(state, redis_key) do
+      nil ->
+        # Not promoted -- route deletes through Raft
+        keys_to_delete =
+          :ets.foldl(
+            fn {key, _value, _exp}, acc ->
+              if is_binary(key) and String.starts_with?(key, prefix) do
+                [key | acc]
+              else
+                acc
+              end
+            end,
+            [],
+            state.ets
+          )
 
-    Enum.each(keys_to_delete, fn key ->
-      Batcher.write(state.index, {:delete, key})
-    end)
+        Enum.each(keys_to_delete, fn key ->
+          Batcher.write(state.index, {:delete, key})
+        end)
 
-    new_version = state.write_version + 1
-    {:reply, :ok, %{state | write_version: new_version}}
+        new_version = state.write_version + 1
+        {:reply, :ok, %{state | write_version: new_version}}
+
+      _dedicated ->
+        # Promoted -- clean up the dedicated Bitcask entirely
+        alias Ferricstore.Store.Promotion
+
+        # Delete compound keys from ETS
+        keys_to_delete =
+          :ets.foldl(
+            fn {key, _value, _exp}, acc ->
+              if is_binary(key) and String.starts_with?(key, prefix) do
+                [key | acc]
+              else
+                acc
+              end
+            end,
+            [],
+            state.ets
+          )
+
+        Enum.each(keys_to_delete, fn key -> :ets.delete(state.ets, key) end)
+
+        # Clean up the dedicated instance and remove from state
+        Promotion.cleanup_promoted!(
+          redis_key,
+          state.store,
+          state.ets,
+          state.data_dir,
+          state.index
+        )
+
+        new_promoted = Map.delete(state.promoted_instances, redis_key)
+        {:reply, :ok, %{state | promoted_instances: new_promoted}}
+    end
   end
 
   # Direct path for compound_delete_prefix (no Raft).
@@ -846,44 +910,17 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for INCRBYFLOAT: reads locally, computes new value, routes put through Raft.
+  # Raft path for INCRBYFLOAT: routes compound command through Raft.
+  # The state machine performs the full read-modify-write atomically.
   defp handle_incr_float_raft(key, delta, state) do
     alias Ferricstore.Raft.Batcher
 
-    {current_value, expire_at_ms} =
-      case ets_lookup(state.ets, key) do
-        {:hit, value, exp} -> {value, exp}
-        :expired -> {nil, 0}
-        :miss -> {do_get(state, key), 0}
-      end
+    result = Batcher.write(state.index, {:incr_float, key, delta})
+    new_version = state.write_version + 1
 
-    case current_value do
-      nil ->
-        new_str = format_float(delta)
-        result = Batcher.write(state.index, {:put, key, new_str, 0})
-        new_version = state.write_version + 1
-
-        case result do
-          :ok -> {:reply, {:ok, new_str}, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
-
-      value ->
-        case parse_float(value) do
-          {:ok, float_val} ->
-            new_val = float_val + delta
-            new_str = format_float(new_val)
-            result = Batcher.write(state.index, {:put, key, new_str, expire_at_ms})
-            new_version = state.write_version + 1
-
-            case result do
-              :ok -> {:reply, {:ok, new_str}, %{state | write_version: new_version}}
-              {:error, _} = err -> {:reply, err, state}
-            end
-
-          :error ->
-            {:reply, {:error, "ERR value is not a valid float"}, state}
-        end
+    case result do
+      {:ok, _new_str} = ok -> {:reply, ok, %{state | write_version: new_version}}
+      {:error, _} = err -> {:reply, err, state}
     end
   end
 
@@ -980,27 +1017,16 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for APPEND: reads locally, appends, routes put through Raft.
+  # Raft path for APPEND: routes compound command through Raft.
+  # The state machine performs the full read-modify-write atomically.
   defp handle_append_raft(key, suffix, state) do
     alias Ferricstore.Raft.Batcher
 
-    {old_val, expire_at_ms} =
-      case ets_lookup(state.ets, key) do
-        {:hit, value, exp} -> {value, exp}
-        :expired -> {"", 0}
-        :miss ->
-          case do_get_meta(state, key) do
-            {v, exp} -> {v, exp}
-            nil -> {"", 0}
-          end
-      end
-
-    new_val = old_val <> suffix
-    result = Batcher.write(state.index, {:put, key, new_val, expire_at_ms})
+    result = Batcher.write(state.index, {:append, key, suffix})
     new_version = state.write_version + 1
 
     case result do
-      :ok -> {:reply, {:ok, byte_size(new_val)}, %{state | write_version: new_version}}
+      {:ok, _len} = ok -> {:reply, ok, %{state | write_version: new_version}}
       {:error, _} = err -> {:reply, err, state}
     end
   end
@@ -1066,23 +1092,17 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for GETSET: reads locally, routes put through Raft, returns old value.
+  # Raft path for GETSET: routes compound command through Raft.
+  # The state machine performs the atomic get-and-set.
   defp handle_getset_raft(key, new_value, state) do
     alias Ferricstore.Raft.Batcher
 
-    old =
-      case ets_lookup(state.ets, key) do
-        {:hit, value, _expire_at_ms} -> value
-        :expired -> nil
-        :miss -> do_get(state, key)
-      end
-
-    result = Batcher.write(state.index, {:put, key, new_value, 0})
+    result = Batcher.write(state.index, {:getset, key, new_value})
     new_version = state.write_version + 1
 
     case result do
-      :ok -> {:reply, old, %{state | write_version: new_version}}
       {:error, _} = err -> {:reply, err, state}
+      old -> {:reply, old, %{state | write_version: new_version}}
     end
   end
 
@@ -1119,27 +1139,17 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for GETDEL: reads locally, routes delete through Raft, returns old value.
+  # Raft path for GETDEL: routes compound command through Raft.
+  # The state machine performs the atomic get-and-delete.
   defp handle_getdel_raft(key, state) do
     alias Ferricstore.Raft.Batcher
 
-    old =
-      case ets_lookup(state.ets, key) do
-        {:hit, value, _expire_at_ms} -> value
-        :expired -> nil
-        :miss -> do_get(state, key)
-      end
+    result = Batcher.write(state.index, {:getdel, key})
+    new_version = state.write_version + 1
 
-    if old != nil do
-      result = Batcher.write(state.index, {:delete, key})
-      new_version = state.write_version + 1
-
-      case result do
-        :ok -> {:reply, old, %{state | write_version: new_version}}
-        {:error, _} = err -> {:reply, err, state}
-      end
-    else
-      {:reply, nil, state}
+    case result do
+      {:error, _} = err -> {:reply, err, state}
+      old -> {:reply, old, %{state | write_version: new_version}}
     end
   end
 
@@ -1178,37 +1188,17 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for GETEX: reads locally, routes put (with new expiry) through Raft.
+  # Raft path for GETEX: routes compound command through Raft.
+  # The state machine performs the atomic get-and-update-expiry.
   defp handle_getex_raft(key, expire_at_ms, state) do
     alias Ferricstore.Raft.Batcher
 
-    case ets_lookup(state.ets, key) do
-      {:hit, value, _old_exp} ->
-        result = Batcher.write(state.index, {:put, key, value, expire_at_ms})
-        new_version = state.write_version + 1
+    result = Batcher.write(state.index, {:getex, key, expire_at_ms})
+    new_version = state.write_version + 1
 
-        case result do
-          :ok -> {:reply, value, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
-
-      :expired ->
-        {:reply, nil, state}
-
-      :miss ->
-        case do_get(state, key) do
-          nil ->
-            {:reply, nil, state}
-
-          value ->
-            result = Batcher.write(state.index, {:put, key, value, expire_at_ms})
-            new_version = state.write_version + 1
-
-            case result do
-              :ok -> {:reply, value, %{state | write_version: new_version}}
-              {:error, _} = err -> {:reply, err, state}
-            end
-        end
+    case result do
+      {:error, _} = err -> {:reply, err, state}
+      value -> {:reply, value, %{state | write_version: new_version}}
     end
   end
 
@@ -1264,27 +1254,16 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for SETRANGE: reads locally, computes new value, routes put through Raft.
+  # Raft path for SETRANGE: routes compound command through Raft.
+  # The state machine performs the full read-modify-write atomically.
   defp handle_setrange_raft(key, offset, value, state) do
     alias Ferricstore.Raft.Batcher
 
-    {old_val, expire_at_ms} =
-      case ets_lookup(state.ets, key) do
-        {:hit, v, exp} -> {v, exp}
-        :expired -> {"", 0}
-        :miss ->
-          case do_get_meta(state, key) do
-            {v, exp} -> {v, exp}
-            nil -> {"", 0}
-          end
-      end
-
-    new_val = apply_setrange(old_val, offset, value)
-    result = Batcher.write(state.index, {:put, key, new_val, expire_at_ms})
+    result = Batcher.write(state.index, {:setrange, key, offset, value})
     new_version = state.write_version + 1
 
     case result do
-      :ok -> {:reply, {:ok, byte_size(new_val)}, %{state | write_version: new_version}}
+      {:ok, _len} = ok -> {:reply, ok, %{state | write_version: new_version}}
       {:error, _} = err -> {:reply, err, state}
     end
   end
@@ -1361,24 +1340,20 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for CAS: reads locally, routes put through Raft on match.
+  # Raft path for CAS: sends compound command through Raft so the entire
+  # read-compare-write is atomic within the replicated state machine.
   defp handle_cas_raft(key, expected, new_value, ttl_ms, state) do
     alias Ferricstore.Raft.Batcher
 
-    case resolve_for_native(state, key) do
-      {{:hit, ^expected, old_exp}, state} ->
-        expire = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: old_exp
-        result = Batcher.write(state.index, {:put, key, new_value, expire})
-        new_version = state.write_version + 1
+    result = Batcher.write(state.index, {:cas, key, expected, new_value, ttl_ms})
 
-        case result do
-          :ok -> {:reply, 1, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
+    case result do
+      r when r in [1, 0, nil] ->
+        new_version = if r == 1, do: state.write_version + 1, else: state.write_version
+        {:reply, r, %{state | write_version: new_version}}
 
-      {{:hit, _other, _exp}, state} -> {:reply, 0, state}
-      {:expired, state} -> {:reply, nil, state}
-      {:missing, state} -> {:reply, nil, state}
+      {:error, _} = err ->
+        {:reply, err, state}
     end
   end
 
@@ -1407,32 +1382,19 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for LOCK: reads locally, routes put through Raft if allowed.
+  # Raft path for LOCK: sends compound command through Raft so the entire
+  # check-and-acquire is atomic within the replicated state machine.
   defp handle_lock_raft(key, owner, ttl_ms, state) do
     alias Ferricstore.Raft.Batcher
-    expire = System.os_time(:millisecond) + ttl_ms
 
-    case resolve_for_native(state, key) do
-      {{:hit, ^owner, _exp}, state} ->
-        result = Batcher.write(state.index, {:put, key, owner, expire})
-        new_version = state.write_version + 1
+    result = Batcher.write(state.index, {:lock, key, owner, ttl_ms})
 
-        case result do
-          :ok -> {:reply, :ok, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
+    case result do
+      :ok ->
+        {:reply, :ok, %{state | write_version: state.write_version + 1}}
 
-      {{:hit, _other, _exp}, state} ->
-        {:reply, {:error, "DISTLOCK lock is held by another owner"}, state}
-
-      {_, state} ->
-        result = Batcher.write(state.index, {:put, key, owner, expire})
-        new_version = state.write_version + 1
-
-        case result do
-          :ok -> {:reply, :ok, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
+      {:error, _} = err ->
+        {:reply, err, state}
     end
   end
 
@@ -1468,24 +1430,19 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for UNLOCK: reads locally, routes delete through Raft if owner matches.
+  # Raft path for UNLOCK: sends compound command through Raft so the entire
+  # check-and-delete is atomic within the replicated state machine.
   defp handle_unlock_raft(key, owner, state) do
     alias Ferricstore.Raft.Batcher
 
-    case resolve_for_native(state, key) do
-      {{:hit, ^owner, _exp}, state} ->
-        result = Batcher.write(state.index, {:delete, key})
-        new_version = state.write_version + 1
+    result = Batcher.write(state.index, {:unlock, key, owner})
 
-        case result do
-          :ok -> {:reply, 1, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
+    case result do
+      1 ->
+        {:reply, 1, %{state | write_version: state.write_version + 1}}
 
-      {{:hit, _other, _exp}, state} ->
-        {:reply, {:error, "DISTLOCK caller is not the lock owner"}, state}
-
-      {_, state} -> {:reply, 1, state}
+      {:error, _} = err ->
+        {:reply, err, state}
     end
   end
 
@@ -1514,26 +1471,19 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for EXTEND: reads locally, routes put through Raft if owner matches.
+  # Raft path for EXTEND: sends compound command through Raft so the entire
+  # check-and-update is atomic within the replicated state machine.
   defp handle_extend_raft(key, owner, ttl_ms, state) do
     alias Ferricstore.Raft.Batcher
-    new_expire = System.os_time(:millisecond) + ttl_ms
 
-    case resolve_for_native(state, key) do
-      {{:hit, ^owner, _exp}, state} ->
-        result = Batcher.write(state.index, {:put, key, owner, new_expire})
-        new_version = state.write_version + 1
+    result = Batcher.write(state.index, {:extend, key, owner, ttl_ms})
 
-        case result do
-          :ok -> {:reply, 1, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
+    case result do
+      1 ->
+        {:reply, 1, %{state | write_version: state.write_version + 1}}
 
-      {{:hit, _other, _exp}, state} ->
-        {:reply, {:error, "DISTLOCK caller is not the lock owner"}, state}
-
-      {_, state} ->
-        {:reply, {:error, "DISTLOCK lock does not exist or has expired"}, state}
+      {:error, _} = err ->
+        {:reply, err, state}
     end
   end
 
@@ -1565,49 +1515,17 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for RATELIMIT.ADD: reads locally, computes, routes put through Raft.
+  # Raft path for RATELIMIT.ADD: sends compound command through Raft so the
+  # entire read-compute-write is atomic within the replicated state machine.
   defp handle_ratelimit_add_raft(key, window_ms, max, count, state) do
     alias Ferricstore.Raft.Batcher
-    now = System.os_time(:millisecond)
 
-    {cur_count, cur_start, prv_count} =
-      case ets_lookup(state.ets, key) do
-        {:hit, value, _exp} -> decode_ratelimit(value)
-        _ -> {0, now, 0}
-      end
-
-    # Rotate windows
-    {cur_count, cur_start, prv_count} =
-      cond do
-        now - cur_start >= window_ms * 2 -> {0, now, 0}
-        now - cur_start >= window_ms -> {0, now, cur_count}
-        true -> {cur_count, cur_start, prv_count}
-      end
-
-    # Compute effective count with sliding window approximation
-    elapsed = now - cur_start
-    weight = max(0.0, 1.0 - elapsed / window_ms)
-    effective = cur_count + trunc(Float.round(prv_count * weight))
-    expire_at_ms = cur_start + window_ms * 2
-
-    {status, final_count, remaining, value} =
-      if effective + count > max do
-        value = encode_ratelimit(cur_count, cur_start, prv_count)
-        {"denied", effective, max(0, max - effective), value}
-      else
-        new_cur = cur_count + count
-        new_eff = effective + count
-        value = encode_ratelimit(new_cur, cur_start, prv_count)
-        {"allowed", new_eff, max(0, max - new_eff), value}
-      end
-
-    result = Batcher.write(state.index, {:put, key, value, expire_at_ms})
-    ms_until_reset = max(0, cur_start + window_ms - now)
+    result = Batcher.write(state.index, {:ratelimit_add, key, window_ms, max, count})
 
     case result do
-      :ok ->
+      [_status, _count, _remaining, _ttl] = reply ->
         new_version = state.write_version + 1
-        {:reply, [status, final_count, remaining, ms_until_reset], %{state | write_version: new_version}}
+        {:reply, reply, %{state | write_version: new_version}}
 
       {:error, _} = err ->
         {:reply, err, state}

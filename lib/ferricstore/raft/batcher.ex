@@ -40,6 +40,12 @@ defmodule Ferricstore.Raft.Batcher do
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
           | {:delete, binary()}
+          | {:incr_float, binary(), float()}
+          | {:append, binary(), binary()}
+          | {:getset, binary(), binary()}
+          | {:getdel, binary()}
+          | {:getex, binary(), non_neg_integer()}
+          | {:setrange, binary(), non_neg_integer(), binary()}
 
   defstruct [
     :shard_id,
