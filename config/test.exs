@@ -24,4 +24,5 @@ config :ferricstore, :merge,
   fragmentation_threshold: 0.99
 
 # Raft: disabled in test to avoid ra election hanging in worktree.
+# Raft always enabled per spec — single node is its own quorum.
 config :ferricstore, :raft_enabled, false

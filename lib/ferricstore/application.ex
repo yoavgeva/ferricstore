@@ -85,10 +85,12 @@ defmodule Ferricstore.Application do
         Ferricstore.SlowLog,
         Ferricstore.AuditLog,
         Ferricstore.Config,
-        Ferricstore.Acl,
-        {Ferricstore.Store.ShardSupervisor, data_dir: data_dir}
+        Ferricstore.Acl
       ] ++
         batcher_children ++
+        [
+        {Ferricstore.Store.ShardSupervisor, data_dir: data_dir}
+      ] ++
         [
           {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
           Ferricstore.PubSub,
