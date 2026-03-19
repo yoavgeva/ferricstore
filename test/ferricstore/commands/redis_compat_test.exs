@@ -143,8 +143,8 @@ defmodule Ferricstore.Commands.RedisCompatTest do
       # Redis: APPEND on a non-string type returns WRONGTYPE
       result = Strings.handle("APPEND", ["hkey", "data"], store)
 
-      # Document current behavior
-      assert match?({:ok, _}, result) or match?({:error, "WRONGTYPE" <> _}, result),
+      # Document current behavior: APPEND returns a byte count (integer) or WRONGTYPE error.
+      assert is_integer(result) or match?({:error, "WRONGTYPE" <> _}, result),
              "APPEND on hash key: #{inspect(result)}"
     end
 

@@ -164,8 +164,9 @@ defmodule Ferricstore.MemoryGuardTest do
     test "adding data to ETS increases reported memory" do
       stats_before = MemoryGuard.stats()
 
-      # Write some data to a shard ETS table
-      ets_name = :shard_ets_0
+      # Write some data to shard ETS tables
+      keydir = :keydir_0
+      hot_cache = :hot_cache_0
 
       large_entries =
         for i <- 1..100 do
@@ -174,14 +175,20 @@ defmodule Ferricstore.MemoryGuardTest do
           {key, value, 0}
         end
 
-      Enum.each(large_entries, fn entry -> :ets.insert(ets_name, entry) end)
+      Enum.each(large_entries, fn {key, value, expire} ->
+        :ets.insert(keydir, {key, expire})
+        :ets.insert(hot_cache, {key, value})
+      end)
 
       stats_after = MemoryGuard.stats()
 
       assert stats_after.total_bytes > stats_before.total_bytes
 
       # Clean up
-      Enum.each(large_entries, fn {key, _, _} -> :ets.delete(ets_name, key) end)
+      Enum.each(large_entries, fn {key, _, _} ->
+        :ets.delete(keydir, key)
+        :ets.delete(hot_cache, key)
+      end)
     end
   end
 

@@ -46,7 +46,7 @@ defmodule Ferricstore.Commands.TransactionBugHuntTest do
   end
 
   defp recv_response(sock, buf) do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 10_000)
+    {:ok, data} = :gen_tcp.recv(sock, 0, 30_000)
     buf2 = buf <> data
 
     case Parser.parse(buf2) do

@@ -30,10 +30,17 @@ defmodule Ferricstore.Health.DashboardTest do
     {:ok, conn} =
       :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
 
-    :ok = :gen_tcp.send(conn, "GET #{path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
-    {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+    :ok = :gen_tcp.send(conn, "GET #{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    response = recv_all(conn, "")
     :gen_tcp.close(conn)
     response
+  end
+
+  defp recv_all(conn, acc) do
+    case :gen_tcp.recv(conn, 0, 5_000) do
+      {:ok, data} -> recv_all(conn, acc <> data)
+      {:error, :closed} -> acc
+    end
   end
 
   defp extract_body(response) do

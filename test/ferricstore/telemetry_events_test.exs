@@ -543,8 +543,8 @@ defmodule Ferricstore.TelemetryEventsTest do
       :ok = GenServer.call(shard_name, :flush)
 
       # Remove from ETS to force a cold read.
-      ets = :"shard_ets_#{shard_idx}"
-      :ets.delete(ets, key)
+      :ets.delete(:"keydir_#{shard_idx}", key)
+      :ets.delete(:"hot_cache_#{shard_idx}", key)
 
       Ferricstore.Stats.reset_hotness()
 

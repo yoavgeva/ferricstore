@@ -620,7 +620,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "RPUSH to existing list appends elements" do
       ctx = fresh_sm_state()
-      {state, _ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir, _hc} = ctx
 
       {state2, 2} =
         SM.apply(%{}, {:list_op, "rlist", {:rpush, ["a", "b"]}}, state)
@@ -667,7 +667,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "LPOP from empty / non-existent key returns nil" do
       ctx = fresh_sm_state()
-      {state, _ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir, _hc} = ctx
 
       {_new_state, result} =
         SM.apply(%{}, {:list_op, "nokey", {:lpop, 1}}, state)
@@ -808,7 +808,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "compound_delete on non-existent key returns :ok" do
       ctx = fresh_sm_state()
-      {state, _ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir, _hc} = ctx
 
       {_new_state, result} =
         SM.apply(%{}, {:compound_delete, "nonexistent\x00field"}, state)
@@ -941,7 +941,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "compound_delete_prefix with no matching keys is a no-op" do
       ctx = fresh_sm_state()
-      {state, _ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir, _hc} = ctx
 
       {new_state, :ok} =
         SM.apply(%{}, {:compound_delete_prefix, "nonexistent\x00"}, state)

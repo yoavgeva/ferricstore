@@ -49,42 +49,11 @@ defmodule Ferricstore.Store.Promotion do
 
   @promotion_marker_prefix "PM:"
 
-  @doc """
-  Returns the configurable promotion threshold.
-
-  Collections exceeding this many fields/members are promoted to a
-  dedicated Bitcask. The threshold comparison is **exclusive**: a
-  collection must have *more than* `threshold` entries to trigger
-  promotion.
-
-  Defaults to 100. Set to 0 to disable promotion.
-  """
   @spec threshold() :: non_neg_integer()
   def threshold do
     Application.get_env(:ferricstore, :promotion_threshold, 100)
   end
 
-  @doc """
-  Computes the filesystem path for a dedicated Bitcask instance.
-
-  The path is deterministic based on the data directory, shard index,
-  data type, and a SHA-256 hash of the Redis key. Using a hash avoids
-  filesystem issues with keys containing special characters.
-
-  ## Parameters
-
-    * `data_dir` -- the root data directory
-    * `shard_index` -- zero-based shard index
-    * `type` -- the data type atom (`:hash`, `:set`, `:zset`)
-    * `redis_key` -- the user-facing Redis key
-
-  ## Examples
-
-      iex> path = Ferricstore.Store.Promotion.dedicated_path("/tmp/fs", 0, :hash, "user:123")
-      iex> String.starts_with?(path, "/tmp/fs/dedicated/shard_0/hash:")
-      true
-
-  """
   @spec dedicated_path(binary(), non_neg_integer(), atom(), binary()) :: binary()
   def dedicated_path(data_dir, shard_index, type, redis_key) do
     hash = :crypto.hash(:sha256, redis_key) |> Base.encode16(case: :lower)
@@ -92,37 +61,9 @@ defmodule Ferricstore.Store.Promotion do
     Path.join([data_dir, "dedicated", "shard_#{shard_index}", "#{type_str}:#{hash}"])
   end
 
-  @doc """
-  Builds the promotion marker key for a Redis key.
-
-  This key is stored in the shared Bitcask to persist the promotion
-  status across shard restarts.
-
-  ## Examples
-
-      iex> Ferricstore.Store.Promotion.marker_key("user:123")
-      "PM:user:123"
-
-  """
   @spec marker_key(binary()) :: binary()
   def marker_key(redis_key), do: @promotion_marker_prefix <> redis_key
 
-  @doc """
-  Opens a dedicated Bitcask instance for a promoted key.
-
-  Creates the directory if it does not exist, then opens the NIF store.
-
-  ## Parameters
-
-    * `data_dir` -- the root data directory
-    * `shard_index` -- zero-based shard index
-    * `type` -- the data type atom
-    * `redis_key` -- the user-facing Redis key
-
-  ## Returns
-
-    `{:ok, nif_store_ref}` or `{:error, reason}`
-  """
   @spec open_dedicated(binary(), non_neg_integer(), atom(), binary()) ::
           {:ok, reference()} | {:error, term()}
   def open_dedicated(data_dir, shard_index, type, redis_key) do
@@ -131,94 +72,53 @@ defmodule Ferricstore.Store.Promotion do
     NIF.new(path)
   end
 
-  @doc """
-  Promotes a hash collection from the shared Bitcask to a dedicated instance.
-
-  Delegates to `promote_collection!/6` with type `:hash`.
-
-  See `promote_collection!/6` for full documentation.
-  """
-  @spec promote_hash!(binary(), reference(), atom(), binary(), non_neg_integer()) ::
+  @spec promote_hash!(binary(), reference(), atom(), atom(), binary(), non_neg_integer()) ::
           {:ok, reference()} | {:error, term()}
-  def promote_hash!(redis_key, shared_store, ets, data_dir, shard_index) do
-    promote_collection!(:hash, redis_key, shared_store, ets, data_dir, shard_index)
+  def promote_hash!(redis_key, shared_store, keydir, hot_cache, data_dir, shard_index) do
+    promote_collection!(:hash, redis_key, shared_store, keydir, hot_cache, data_dir, shard_index)
   end
 
-  @doc """
-  Promotes a compound-key collection from the shared Bitcask to a dedicated
-  instance.
-
-  This function:
-
-  1. Opens a new dedicated Bitcask in `dedicated/shard_N/{type}:{sha256}/`.
-  2. Scans the shared ETS table for all compound keys matching the type prefix.
-  3. Batch-writes all entries to the dedicated Bitcask.
-  4. Deletes all compound keys (but NOT the type key) from the shared ETS
-     and Bitcask.
-  5. Writes a promotion marker (`PM:key`) to the shared Bitcask with the
-     type string as its value.
-
-  The type metadata key (`T:key`) remains in the shared Bitcask since the
-  type registry always reads from the shared store.
-
-  Supported types: `:hash`, `:set`, `:zset`. Lists are not promotable
-  because they store all elements in a single Bitcask entry rather than
-  using compound keys.
-
-  ## Parameters
-
-    * `type` -- the data type atom (`:hash`, `:set`, or `:zset`)
-    * `redis_key` -- the Redis key being promoted
-    * `shared_store` -- NIF reference for the shared shard Bitcask
-    * `ets` -- the shard's ETS table
-    * `data_dir` -- root data directory
-    * `shard_index` -- zero-based shard index
-
-  ## Returns
-
-    `{:ok, dedicated_store_ref}` on success, `{:error, reason}` on failure.
-  """
-  @spec promote_collection!(atom(), binary(), reference(), atom(), binary(), non_neg_integer()) ::
+  @spec promote_collection!(atom(), binary(), reference(), atom(), atom(), binary(), non_neg_integer()) ::
           {:ok, reference()} | {:error, term()}
-  def promote_collection!(type, redis_key, shared_store, ets, data_dir, shard_index) do
+  def promote_collection!(type, redis_key, shared_store, keydir, hot_cache, data_dir, shard_index) do
     prefix = compound_prefix_for(type, redis_key)
     type_str = CompoundKey.encode_type(type)
     type_label = type_label(type)
     now = System.os_time(:millisecond)
 
-    # Collect all compound entries from ETS
     entries =
       :ets.foldl(
-        fn {key, value, exp}, acc ->
+        fn {key, exp}, acc ->
           if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-            [{key, value, exp} | acc]
+            case :ets.lookup(hot_cache, key) do
+              [{^key, value}] -> [{key, value, exp} | acc]
+              [] -> acc
+            end
           else
             acc
           end
         end,
         [],
-        ets
+        keydir
       )
 
     case open_dedicated(data_dir, shard_index, type, redis_key) do
       {:ok, dedicated_store} ->
-        # Batch-write all entries to the dedicated Bitcask.
         if entries != [] do
           batch = Enum.map(entries, fn {k, v, exp} -> {k, v, exp} end)
           NIF.put_batch(dedicated_store, batch)
         end
 
-        # Delete compound keys from shared ETS and Bitcask.
-        # The type key (T:key) stays in the shared store.
         Enum.each(entries, fn {key, _value, _exp} ->
-          :ets.delete(ets, key)
+          :ets.delete(keydir, key)
+          :ets.delete(hot_cache, key)
           NIF.delete(shared_store, key)
         end)
 
-        # Write the promotion marker to the shared Bitcask and ETS.
         mk = marker_key(redis_key)
         NIF.put(shared_store, mk, type_str, 0)
-        :ets.insert(ets, {mk, type_str, 0})
+        :ets.insert(keydir, {mk, 0})
+        :ets.insert(hot_cache, {mk, type_str})
 
         Logger.info(
           "Promoted #{type_label} #{inspect(redis_key)} to dedicated Bitcask " <>
@@ -236,47 +136,34 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  @doc """
-  Scans the shared Bitcask for promotion markers and re-opens dedicated
-  instances. Called during shard initialization to restore promoted state.
-
-  ## Parameters
-
-    * `shared_store` -- NIF reference for the shared shard Bitcask
-    * `ets` -- the shard's ETS table
-    * `data_dir` -- root data directory
-    * `shard_index` -- zero-based shard index
-
-  ## Returns
-
-    A map of `%{redis_key => dedicated_store_ref}`.
-  """
-  @spec recover_promoted(reference(), atom(), binary(), non_neg_integer()) :: map()
-  def recover_promoted(shared_store, ets, data_dir, shard_index) do
-    # Scan ETS for promotion markers (PM:key -> type_str)
+  @spec recover_promoted(reference(), atom(), atom(), binary(), non_neg_integer()) :: map()
+  def recover_promoted(shared_store, keydir, hot_cache, data_dir, shard_index) do
     markers =
       :ets.foldl(
-        fn {key, value, _exp}, acc ->
+        fn {key, _exp}, acc ->
           case key do
             <<"PM:", redis_key::binary>> ->
-              [{redis_key, value} | acc]
+              case :ets.lookup(hot_cache, key) do
+                [{^key, type_str}] -> [{redis_key, type_str} | acc]
+                [] -> acc
+              end
 
             _ ->
               acc
           end
         end,
         [],
-        ets
+        keydir
       )
 
-    # Also scan Bitcask keys for markers not yet warmed into ETS
     bitcask_keys = NIF.keys(shared_store)
 
     bitcask_markers =
       Enum.filter(bitcask_keys, &String.starts_with?(&1, @promotion_marker_prefix))
       |> Enum.map(fn <<"PM:", redis_key::binary>> ->
         {:ok, type_str} = NIF.get(shared_store, marker_key(redis_key))
-        :ets.insert(ets, {marker_key(redis_key), type_str, 0})
+        :ets.insert(keydir, {marker_key(redis_key), 0})
+        :ets.insert(hot_cache, {marker_key(redis_key), type_str})
         {redis_key, type_str}
       end)
 
@@ -289,11 +176,11 @@ defmodule Ferricstore.Store.Promotion do
 
       case open_dedicated(data_dir, shard_index, type, redis_key) do
         {:ok, dedicated_store} ->
-          # Warm the dedicated store's entries into ETS
           case NIF.get_all(dedicated_store) do
             {:ok, pairs} ->
               Enum.each(pairs, fn {k, v} ->
-                :ets.insert(ets, {k, v, 0})
+                :ets.insert(keydir, {k, 0})
+                :ets.insert(hot_cache, {k, v})
               end)
 
             _ ->
@@ -312,31 +199,13 @@ defmodule Ferricstore.Store.Promotion do
     end)
   end
 
-  @doc """
-  Cleans up a promoted key's dedicated Bitcask instance.
-
-  Reads the promotion marker to determine the collection type, removes the
-  marker from the shared store, and deletes the dedicated directory from
-  disk.
-
-  ## Parameters
-
-    * `redis_key` -- the Redis key to clean up
-    * `shared_store` -- NIF reference for the shared shard Bitcask
-    * `ets` -- the shard's ETS table
-    * `data_dir` -- root data directory
-    * `shard_index` -- zero-based shard index
-  """
-  @spec cleanup_promoted!(binary(), reference(), atom(), binary(), non_neg_integer()) :: :ok
-  def cleanup_promoted!(redis_key, shared_store, ets, data_dir, shard_index) do
+  @spec cleanup_promoted!(binary(), reference(), atom(), atom(), binary(), non_neg_integer()) :: :ok
+  def cleanup_promoted!(redis_key, shared_store, keydir, hot_cache, data_dir, shard_index) do
     mk = marker_key(redis_key)
 
-    # Resolve the collection type from the promotion marker so we can
-    # compute the correct dedicated path. Fall back to :hash for
-    # backward compatibility if the marker is missing.
     type =
-      case :ets.lookup(ets, mk) do
-        [{^mk, type_str, _exp}] -> CompoundKey.decode_type(type_str)
+      case :ets.lookup(hot_cache, mk) do
+        [{^mk, type_str}] -> CompoundKey.decode_type(type_str)
         [] ->
           case NIF.get(shared_store, mk) do
             {:ok, type_str} when is_binary(type_str) -> CompoundKey.decode_type(type_str)
@@ -346,11 +215,10 @@ defmodule Ferricstore.Store.Promotion do
 
     type_label = type_label(type)
 
-    # Remove promotion marker from shared store
     NIF.delete(shared_store, mk)
-    :ets.delete(ets, mk)
+    :ets.delete(keydir, mk)
+    :ets.delete(hot_cache, mk)
 
-    # Delete the dedicated directory
     path = dedicated_path(data_dir, shard_index, type, redis_key)
 
     if File.dir?(path) do
@@ -364,17 +232,11 @@ defmodule Ferricstore.Store.Promotion do
     :ok
   end
 
-  # -------------------------------------------------------------------
-  # Private helpers
-  # -------------------------------------------------------------------
-
-  # Returns the compound key prefix for the given data type and Redis key.
   @spec compound_prefix_for(atom(), binary()) :: binary()
   defp compound_prefix_for(:hash, redis_key), do: CompoundKey.hash_prefix(redis_key)
   defp compound_prefix_for(:set, redis_key), do: CompoundKey.set_prefix(redis_key)
   defp compound_prefix_for(:zset, redis_key), do: CompoundKey.zset_prefix(redis_key)
 
-  # Returns a human-readable label for log messages.
   @spec type_label(atom()) :: binary()
   defp type_label(:hash), do: "hash"
   defp type_label(:set), do: "set"

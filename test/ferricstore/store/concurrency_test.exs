@@ -303,12 +303,12 @@ defmodule Ferricstore.Store.ConcurrencyTest do
 
       assert Enum.all?(results, &(&1 == :ok))
 
-      ets = :ets.whereis(:"shard_ets_#{index}")
+      ets = :ets.whereis(:"hot_cache_#{index}")
       entries = :ets.tab2list(ets)
       assert length(entries) == 30
 
       for i <- 0..29 do
-        assert [{"ets_key_#{i}", "ets_val_#{i}", 0}] == :ets.lookup(ets, "ets_key_#{i}")
+        assert [{"ets_key_#{i}", "ets_val_#{i}"}] == :ets.lookup(ets, "ets_key_#{i}")
       end
     end
 
@@ -343,7 +343,7 @@ defmodule Ferricstore.Store.ConcurrencyTest do
 
       assert Enum.all?(results, &(&1 == :ok))
 
-      ets = :ets.whereis(:"shard_ets_#{index}")
+      ets = :ets.whereis(:"hot_cache_#{index}")
 
       for i <- 0..19 do
         assert [] == :ets.lookup(ets, "del_ets_#{i}"),

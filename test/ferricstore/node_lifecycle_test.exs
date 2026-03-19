@@ -200,8 +200,8 @@ defmodule Ferricstore.NodeLifecycleTest do
       assert "ets_test" == Router.get(key)
 
       # Verify ETS has the entry.
-      ets_name = :shard_ets_2
-      assert [{^key, "ets_test", _}] = :ets.lookup(ets_name, key)
+      ets_name = :hot_cache_2
+      assert [{^key, "ets_test"}] = :ets.lookup(ets_name, key)
 
       # Flush and crash shard 2.
       :ok = GenServer.call(Router.shard_name(2), :flush)
@@ -221,7 +221,7 @@ defmodule Ferricstore.NodeLifecycleTest do
       assert "ets_test" == Router.get(key)
 
       # Now it should be back in ETS.
-      assert [{^key, "ets_test", _}] = :ets.lookup(ets_name, key)
+      assert [{^key, "ets_test"}] = :ets.lookup(ets_name, key)
     end
   end
 
@@ -343,7 +343,7 @@ defmodule Ferricstore.NodeLifecycleTest do
         pid = Process.whereis(name)
         assert is_pid(pid) and Process.alive?(pid)
 
-        ets = :"shard_ets_#{i}"
+        ets = :"keydir_#{i}"
         refute :ets.whereis(ets) == :undefined
       end
 

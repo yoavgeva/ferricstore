@@ -70,8 +70,8 @@ defmodule Ferricstore.StartupTest do
       :ok = GenServer.call(shard_name, :flush)
 
       # Clear the ETS cache entry to force a Bitcask read.
-      ets_name = :"shard_ets_#{shard_idx}"
-      :ets.delete(ets_name, key)
+      :ets.delete(:"keydir_#{shard_idx}", key)
+      :ets.delete(:"hot_cache_#{shard_idx}", key)
 
       # The get must warm from Bitcask -- keydir must be valid.
       assert "persisted_value" == Router.get(key)
@@ -83,37 +83,43 @@ defmodule Ferricstore.StartupTest do
   # ---------------------------------------------------------------------------
 
   describe "ETS tables created for each shard" do
-    test "shard_ets_0 through shard_ets_3 exist" do
+    test "keydir_0 through keydir_3 and hot_cache_0 through hot_cache_3 exist" do
       for i <- 0..3 do
-        ets_name = :"shard_ets_#{i}"
-        ref = :ets.whereis(ets_name)
+        for prefix <- [:keydir, :hot_cache] do
+          ets_name = :"#{prefix}_#{i}"
+          ref = :ets.whereis(ets_name)
 
-        refute ref == :undefined,
-               "ETS table #{ets_name} should exist after startup"
+          refute ref == :undefined,
+                 "ETS table #{ets_name} should exist after startup"
+        end
       end
     end
 
     test "shard ETS tables are public and named" do
       for i <- 0..3 do
-        ets_name = :"shard_ets_#{i}"
-        info = :ets.info(ets_name)
-        assert info != :undefined, "ETS table #{ets_name} should exist"
+        for prefix <- [:keydir, :hot_cache] do
+          ets_name = :"#{prefix}_#{i}"
+          info = :ets.info(ets_name)
+          assert info != :undefined, "ETS table #{ets_name} should exist"
 
-        # Verify it is public (readable from any process)
-        protection = :ets.info(ets_name, :protection)
-        assert protection == :public, "ETS table #{ets_name} should be public"
+          # Verify it is public (readable from any process)
+          protection = :ets.info(ets_name, :protection)
+          assert protection == :public, "ETS table #{ets_name} should be public"
 
-        # Verify it is a named table
-        named = :ets.info(ets_name, :named_table)
-        assert named == true, "ETS table #{ets_name} should be a named table"
+          # Verify it is a named table
+          named = :ets.info(ets_name, :named_table)
+          assert named == true, "ETS table #{ets_name} should be a named table"
+        end
       end
     end
 
     test "shard ETS tables are :set type" do
       for i <- 0..3 do
-        ets_name = :"shard_ets_#{i}"
-        type = :ets.info(ets_name, :type)
-        assert type == :set, "ETS table #{ets_name} should be a :set"
+        for prefix <- [:keydir, :hot_cache] do
+          ets_name = :"#{prefix}_#{i}"
+          type = :ets.info(ets_name, :type)
+          assert type == :set, "ETS table #{ets_name} should be a :set"
+        end
       end
     end
   end

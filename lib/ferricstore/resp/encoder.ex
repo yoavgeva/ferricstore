@@ -86,6 +86,9 @@ defmodule Ferricstore.Resp.Encoder do
   @spec encode(encodable()) :: iodata()
   def encode(:ok), do: ["+OK", @crlf]
 
+  # Unwrap {:ok, value} tuples (e.g. from INCR, APPEND) — encode the inner value.
+  def encode({:ok, value}), do: encode(value)
+
   def encode({:simple, str}) when is_binary(str) do
     validate_no_crlf!(str, :simple_string)
     ["+", str, @crlf]

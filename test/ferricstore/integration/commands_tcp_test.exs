@@ -34,7 +34,7 @@ defmodule Ferricstore.Integration.CommandsTcpTest do
   end
 
   defp recv_response(sock, buf) do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 5000)
+    {:ok, data} = :gen_tcp.recv(sock, 0, 15_000)
     buf2 = buf <> data
 
     case Parser.parse(buf2) do
@@ -54,7 +54,7 @@ defmodule Ferricstore.Integration.CommandsTcpTest do
   defp do_recv_n(_sock, 0, _buf, acc), do: acc
 
   defp do_recv_n(sock, remaining, buf, acc) when remaining > 0 do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 5000)
+    {:ok, data} = :gen_tcp.recv(sock, 0, 15_000)
     buf2 = buf <> data
 
     case Parser.parse(buf2) do

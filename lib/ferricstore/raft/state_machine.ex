@@ -51,6 +51,7 @@ defmodule Ferricstore.Raft.StateMachine do
           shard_index: non_neg_integer(),
           store: reference(),
           ets: atom(),
+          hot_cache: atom(),
           applied_count: non_neg_integer(),
           release_cursor_interval: pos_integer()
         }
@@ -88,6 +89,7 @@ defmodule Ferricstore.Raft.StateMachine do
       shard_index: config.shard_index,
       store: config.store,
       ets: config.ets,
+      hot_cache: Map.get(config, :hot_cache, :"hot_cache_#{config.shard_index}"),
       applied_count: 0,
       release_cursor_interval: interval
     }
@@ -476,7 +478,8 @@ defmodule Ferricstore.Raft.StateMachine do
     # which handles fsync internally.
     case NIF.put_batch(state.store, [{key, value, expire_at_ms}]) do
       :ok ->
-        :ets.insert(state.ets, {key, value, expire_at_ms})
+        :ets.insert(state.ets, {key, expire_at_ms})
+        :ets.insert(state.hot_cache, {key, value})
         :ok
 
       {:error, reason} ->
@@ -487,6 +490,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_delete(state, key) do
     NIF.delete(state.store, key)
     :ets.delete(state.ets, key)
+    :ets.delete(state.hot_cache, key)
     :ok
   end
 
@@ -809,14 +813,21 @@ defmodule Ferricstore.Raft.StateMachine do
     now = System.os_time(:millisecond)
 
     case :ets.lookup(state.ets, key) do
-      [{^key, value, 0}] ->
-        {:hit, value, 0}
+      [{^key, 0}] ->
+        case :ets.lookup(state.hot_cache, key) do
+          [{^key, value}] -> {:hit, value, 0}
+          [] -> :miss
+        end
 
-      [{^key, value, exp}] when exp > now ->
-        {:hit, value, exp}
+      [{^key, exp}] when exp > now ->
+        case :ets.lookup(state.hot_cache, key) do
+          [{^key, value}] -> {:hit, value, exp}
+          [] -> :miss
+        end
 
-      [{^key, _value, _exp}] ->
+      [{^key, _exp}] ->
         :ets.delete(state.ets, key)
+        :ets.delete(state.hot_cache, key)
         :expired
 
       [] ->
@@ -826,7 +837,8 @@ defmodule Ferricstore.Raft.StateMachine do
             :miss
 
           {:ok, value} ->
-            :ets.insert(state.ets, {key, value, 0})
+            :ets.insert(state.ets, {key, 0})
+            :ets.insert(state.hot_cache, {key, value})
             {:hit, value, 0}
 
           _error ->
@@ -867,7 +879,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_delete_prefix(state, prefix) do
     keys_to_delete =
       :ets.foldl(
-        fn {key, _value, _exp}, acc ->
+        fn {key, _exp}, acc ->
           if is_binary(key) and String.starts_with?(key, prefix) do
             [key | acc]
           else
@@ -896,25 +908,31 @@ defmodule Ferricstore.Raft.StateMachine do
     now = System.os_time(:millisecond)
 
     case :ets.lookup(state.ets, key) do
-      [{^key, value, 0}] ->
-        value
+      [{^key, 0}] ->
+        case :ets.lookup(state.hot_cache, key) do
+          [{^key, value}] -> value
+          [] -> nil
+        end
 
-      [{^key, value, exp}] when exp > now ->
-        value
+      [{^key, exp}] when exp > now ->
+        case :ets.lookup(state.hot_cache, key) do
+          [{^key, value}] -> value
+          [] -> nil
+        end
 
-      [{^key, _value, _exp}] ->
-        # Expired -- evict and treat as missing
+      [{^key, _exp}] ->
         :ets.delete(state.ets, key)
+        :ets.delete(state.hot_cache, key)
         nil
 
       [] ->
-        # ETS miss -- try Bitcask
         case NIF.get(state.store, key) do
           {:ok, nil} ->
             nil
 
           {:ok, value} ->
-            :ets.insert(state.ets, {key, value, 0})
+            :ets.insert(state.ets, {key, 0})
+            :ets.insert(state.hot_cache, {key, value})
             value
 
           _error ->
@@ -930,14 +948,21 @@ defmodule Ferricstore.Raft.StateMachine do
     now = System.os_time(:millisecond)
 
     case :ets.lookup(state.ets, key) do
-      [{^key, value, 0}] ->
-        {value, 0}
+      [{^key, 0}] ->
+        case :ets.lookup(state.hot_cache, key) do
+          [{^key, value}] -> {value, 0}
+          [] -> nil
+        end
 
-      [{^key, value, exp}] when exp > now ->
-        {value, exp}
+      [{^key, exp}] when exp > now ->
+        case :ets.lookup(state.hot_cache, key) do
+          [{^key, value}] -> {value, exp}
+          [] -> nil
+        end
 
-      [{^key, _value, _exp}] ->
+      [{^key, _exp}] ->
         :ets.delete(state.ets, key)
+        :ets.delete(state.hot_cache, key)
         nil
 
       [] ->
@@ -946,7 +971,8 @@ defmodule Ferricstore.Raft.StateMachine do
             nil
 
           {:ok, value} ->
-            :ets.insert(state.ets, {key, value, 0})
+            :ets.insert(state.ets, {key, 0})
+            :ets.insert(state.hot_cache, {key, value})
             {value, 0}
 
           _error ->

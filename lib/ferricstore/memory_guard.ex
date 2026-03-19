@@ -241,8 +241,7 @@ defmodule Ferricstore.MemoryGuard do
   defp compute_stats(state) do
     shard_stats =
       Enum.reduce(0..(state.shard_count - 1), %{}, fn i, acc ->
-        ets_name = :"shard_ets_#{i}"
-        bytes = safe_ets_memory(ets_name)
+        bytes = safe_ets_memory(:"keydir_#{i}") + safe_ets_memory(:"hot_cache_#{i}")
         per_shard_max = div(state.max_memory_bytes, max(state.shard_count, 1))
 
         ratio =

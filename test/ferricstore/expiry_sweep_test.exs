@@ -47,7 +47,7 @@ defmodule Ferricstore.ExpirySweepTest do
       trigger_sweep(shard_idx)
 
       # After sweep, the key should be gone from ETS.
-      ets = :"shard_ets_#{shard_idx}"
+      ets = :"keydir_#{shard_idx}"
       assert :ets.lookup(ets, key) == []
     end
 
@@ -114,7 +114,7 @@ defmodule Ferricstore.ExpirySweepTest do
       # First sweep should remove at most 2.
       trigger_sweep(0)
 
-      ets = :shard_ets_0
+      ets = :keydir_0
       remaining = Enum.count(keys, fn k -> :ets.lookup(ets, k) != [] end)
       assert remaining >= 3
     end
@@ -146,7 +146,7 @@ defmodule Ferricstore.ExpirySweepTest do
       # Run enough sweep cycles (ceiling of 5/2 = 3, plus 1 extra for safety).
       Enum.each(1..4, fn _ -> trigger_sweep(0) end)
 
-      ets = :shard_ets_0
+      ets = :keydir_0
       remaining = Enum.count(keys, fn k -> :ets.lookup(ets, k) != [] end)
       assert remaining == 0
     end

@@ -178,7 +178,7 @@ defmodule Ferricstore.Store.Router do
       byte_size(key) > @max_key_size ->
         {:error, "ERR key too large (max #{@max_key_size} bytes)"}
 
-      byte_size(value) > @max_value_size ->
+      byte_size(value) >= @max_value_size ->
         {:error, "ERR value too large (max #{@max_value_size} bytes)"}
 
       true ->
