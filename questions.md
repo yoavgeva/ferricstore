@@ -124,3 +124,56 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 3. 39 ETS insert locations, 15 test files affected
 4. Estimated 4-6 weeks of careful refactoring
 **Decision needed:** Is this a v1 or v2 change? The single-table approach works correctly for all workloads.
+
+## Q9: Async Tokio for ALL IO NIFs (Section 2B.5 Pattern 1)
+**Spec says:** "Every Bitcask IO operation submits work to Tokio and returns immediately. The calling BEAM process suspends on a receive."
+**Current impl:** Only `put_batch_async` uses async Tokio (via io_uring on Linux). All other IO NIFs (`get`, `put`, `delete`, `write_hint`, `purge_expired`, `run_compaction`) block the Normal scheduler synchronously.
+**Impact:** Synchronous IO on Normal scheduler blocks one scheduler thread during disk I/O (~50-200µs for reads, ~1-5ms for writes with fsync). With 4+ schedulers this is tolerable for most workloads, but under heavy IO load it can cause latency spikes.
+**Required change:** Convert get/put/delete/write_hint/purge_expired/run_compaction to async pattern:
+1. NIF submits IO to Tokio/io_uring, returns `{:pending, op_id}`
+2. Shard GenServer enters receive for `{:io_complete, op_id, result}`
+3. Returns result to caller
+**Estimated effort:** Major refactor of both Rust NIF layer and Elixir Shard GenServer. The Shard GenServer currently uses synchronous GenServer.call for all operations — async IO requires restructuring to handle pending operations.
+
+## COMPREHENSIVE GAP ANALYSIS (from granular audit)
+
+### CRITICAL GAPS (spec violations affecting correctness/durability)
+
+**Q10: Raft NOT in write path (Section 2C.2)**
+Writes go directly to Shard ETS + Bitcask NIF, bypassing Raft entirely.
+The Batcher and StateMachine exist but are not integrated into the actual
+write path. This means NO durability guarantee — writes are acknowledged
+before Raft commit. Fixing requires routing all writes through Raft.
+
+**Q11: active:false instead of active:once (Section 2C.2)**
+Connection uses passive mode (blocking recv) instead of active:once.
+This prevents the sliding window from working as designed — the connection
+process blocks on recv until data arrives. active:once would allow
+processing messages between TCP reads.
+
+### MEDIUM GAPS (spec features not implemented)
+
+**Q12: Merge Supervisor not started (Section 2E.8)**
+Merge.Supervisor exists but is NOT started in application.ex.
+Merges only happen when explicitly triggered, not automatically.
+
+**Q13: release_cursor not implemented (Section 2E.5)**
+Raft log compaction via release_cursor is not implemented.
+The Raft log grows unbounded.
+
+**Q14: Merge IO Priority (Section 2E.11)**
+No IOPRIO_CLASS_BE for background merge IO.
+
+**Q15: Follower merge gating (Section 2E.4)**
+No leader-only gating — scheduler runs on all nodes.
+
+### MINOR GAPS (operational features, docs-only sections)
+
+**Q16: Health endpoint (Section 2C.1 Phase 3)**
+No dedicated /health/ready HTTP endpoint.
+
+**Q17: Encryption at rest (Section 6.5)**
+Not implemented.
+
+**Q18: Hot cache hint file (Section 2C.6 Step 4)**
+Shutdown doesn't write hot cache hint file for next startup warmup.
