@@ -146,4 +146,119 @@ defmodule Ferricstore.Merge.ManifestTest do
       assert File.exists?(Path.join(dir, "00000000000000000003.log"))
     end
   end
+
+  # -------------------------------------------------------------------
+  # Manifest with new canonical directory layout (spec 2B.4)
+  # -------------------------------------------------------------------
+
+  describe "manifest with canonical data/shard_N/ paths" do
+    test "manifest writes to correct shard data directory under data/" do
+      root = Path.join(System.tmp_dir!(), "manifest_layout_#{:erlang.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(root, 1)
+      assert shard_dir == Path.join([root, "data", "shard_1"])
+
+      plan = %{shard_index: 1, input_file_ids: [10, 20, 30]}
+      assert :ok = Manifest.write(shard_dir, plan)
+
+      # Manifest should exist inside data/shard_1/, not at the root.
+      assert Manifest.exists?(shard_dir)
+      refute File.exists?(Path.join(root, "merge_manifest.bin"))
+
+      {:ok, read_plan} = Manifest.read(shard_dir)
+      assert read_plan.shard_index == 1
+      assert read_plan.input_file_ids == [10, 20, 30]
+    end
+
+    test "manifest does not leak to other shard directories" do
+      root = Path.join(System.tmp_dir!(), "manifest_isolation_#{:erlang.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
+
+      shard0_dir = Ferricstore.DataDir.shard_data_path(root, 0)
+      shard1_dir = Ferricstore.DataDir.shard_data_path(root, 1)
+
+      plan = %{shard_index: 0, input_file_ids: [1, 2]}
+      assert :ok = Manifest.write(shard0_dir, plan)
+
+      # Shard 0 has the manifest; shard 1 does not.
+      assert Manifest.exists?(shard0_dir)
+      refute Manifest.exists?(shard1_dir)
+    end
+
+    test "manifest cleanup works with canonical paths" do
+      root = Path.join(System.tmp_dir!(), "manifest_cleanup_#{:erlang.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(root, 2)
+
+      plan = %{shard_index: 2, input_file_ids: [5, 6]}
+      assert :ok = Manifest.write(shard_dir, plan)
+      assert Manifest.exists?(shard_dir)
+
+      assert :ok = Manifest.delete(shard_dir)
+      refute Manifest.exists?(shard_dir)
+    end
+
+    test "interrupted merge recovery finds manifest in canonical path" do
+      root = Path.join(System.tmp_dir!(), "manifest_recovery_#{:erlang.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(root, 3)
+
+      # Simulate an interrupted merge: write manifest + partial output.
+      File.write!(Path.join(shard_dir, "00000000000000000001.log"), "input_data")
+      File.write!(Path.join(shard_dir, "00000000000000000002.log"), "partial_output")
+      File.write!(Path.join(shard_dir, "00000000000000000002.hint"), "partial_hint")
+
+      plan = %{shard_index: 3, input_file_ids: [1]}
+      assert :ok = Manifest.write(shard_dir, plan)
+
+      # Recovery should clean up.
+      assert :ok = Manifest.recover_if_needed(shard_dir, 3)
+
+      refute Manifest.exists?(shard_dir)
+      # Input file preserved.
+      assert File.exists?(Path.join(shard_dir, "00000000000000000001.log"))
+      # Partial output removed (id=2 > max input id=1).
+      refute File.exists?(Path.join(shard_dir, "00000000000000000002.log"))
+      refute File.exists?(Path.join(shard_dir, "00000000000000000002.hint"))
+    end
+
+    test "manifest write and read with legacy shard path" do
+      root = Path.join(System.tmp_dir!(), "manifest_legacy_#{:erlang.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf!(root) end)
+
+      # Create a legacy directory before layout.
+      legacy = Path.join(root, "shard_0")
+      File.mkdir_p!(legacy)
+
+      :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
+
+      shard_dir = Ferricstore.DataDir.shard_data_path(root, 0)
+      assert shard_dir == legacy, "should resolve to legacy path"
+
+      plan = %{shard_index: 0, input_file_ids: [7, 8]}
+      assert :ok = Manifest.write(shard_dir, plan)
+
+      {:ok, read_plan} = Manifest.read(shard_dir)
+      assert read_plan.input_file_ids == [7, 8]
+
+      assert :ok = Manifest.delete(shard_dir)
+      refute Manifest.exists?(shard_dir)
+    end
+  end
 end
