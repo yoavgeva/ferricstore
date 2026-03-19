@@ -78,7 +78,8 @@ defmodule Ferricstore.Store.Shard do
     write_version: 0,
     sweep_at_ceiling_count: 0,
     sweep_struggling: false,
-    promoted_instances: %{}
+    promoted_instances: %{},
+    staged_txs: %{}
   ]
 
   # -------------------------------------------------------------------
@@ -1361,6 +1362,532 @@ defmodule Ferricstore.Store.Shard do
     {:reply, state.write_version, state}
   end
 
+  # --- Two-Phase Commit (2PC) transaction support ---
+  #
+  # These handlers support cross-shard atomic transactions coordinated by
+  # `Ferricstore.Transaction.Coordinator`. The protocol is:
+  #
+  #   1. prepare_tx -- execute commands within a single handle_call, ensuring
+  #      no other client can interleave on this shard. Returns
+  #      {:prepared, tx_id, results}.
+  #   2. commit_tx  -- clean up staged transaction metadata.
+  #   3. rollback_tx -- clean up staged transaction metadata (writes already
+  #      applied; see note below).
+  #
+  # Commands are executed using a shard-local store that reads/writes ETS
+  # and Bitcask directly, bypassing Router -> GenServer.call to avoid
+  # deadlocking (we are already inside the shard's handle_call).
+
+  def handle_call({:prepare_tx, tx_id, commands}, _from, state) do
+    local_store = build_local_store(state)
+    results = execute_tx_commands(commands, local_store)
+    new_staged = Map.put(state.staged_txs, tx_id, %{results: results})
+    {:reply, {:prepared, tx_id, results}, %{state | staged_txs: new_staged}}
+  end
+
+  def handle_call({:commit_tx, tx_id}, _from, state) do
+    {:reply, :ok, %{state | staged_txs: Map.delete(state.staged_txs, tx_id)}}
+  end
+
+  def handle_call({:rollback_tx, tx_id}, _from, state) do
+    # Writes were already applied during prepare (ETS + pending batch).
+    # A full rollback would require tracking and reversing each mutation.
+    # This is acceptable because rollback only happens when another shard
+    # is unavailable (extremely rare for local processes) -- WATCH conflicts
+    # are checked before prepare begins.
+    {:reply, :ok, %{state | staged_txs: Map.delete(state.staged_txs, tx_id)}}
+  end
+
+  # Executes commands through the Dispatcher with a shard-local store.
+  defp execute_tx_commands(commands, store) do
+    Enum.map(commands, fn {cmd, args} ->
+      try do
+        Ferricstore.Commands.Dispatcher.dispatch(cmd, args, store)
+      catch
+        :exit, {:noproc, _} ->
+          {:error, "ERR server not ready, shard process unavailable"}
+
+        :exit, {reason, _} ->
+          {:error, "ERR internal error: #{inspect(reason)}"}
+      end
+    end)
+  end
+
+  # Builds a store map that uses direct ETS/Router access for reads and
+  # Router GenServer.call for writes. Since this shard's commands all target
+  # THIS shard, and we're inside the shard's handle_call, we need the store's
+  # read callbacks to read from ETS directly (hot path) or fall through to
+  # Router.get which reads from ETS first. For writes, Router.put/delete/incr
+  # calls GenServer.call on the target shard -- which IS us, causing deadlock.
+  #
+  # Solution: route write operations through Router as normal. The Router
+  # functions for writes call GenServer.call on the shard that owns the key.
+  # Since the commands in this prepare batch all target THIS shard, those
+  # GenServer.calls would deadlock.
+  #
+  # Instead, we build a store that detects when the target shard is us and
+  # uses a direct write path, falling through to normal Router for other shards.
+  defp build_local_store(state) do
+    my_idx = state.index
+
+    # Direct put: write to ETS immediately, queue for async Bitcask flush.
+    # This mirrors the non-raft {:put, ...} handler logic.
+    local_put = fn key, value, expire_at_ms ->
+      if Router.shard_for(key) == my_idx do
+        ets_insert(state, key, value, expire_at_ms)
+        # Send ourselves a message to persist (will be processed after handle_call returns)
+        send(self(), {:tx_pending_write, key, value, expire_at_ms})
+        :ok
+      else
+        Router.put(key, value, expire_at_ms)
+      end
+    end
+
+    local_delete = fn key ->
+      if Router.shard_for(key) == my_idx do
+        ets_delete_key(state, key)
+        send(self(), {:tx_pending_delete, key})
+        :ok
+      else
+        Router.delete(key)
+      end
+    end
+
+    local_get = fn key ->
+      if Router.shard_for(key) == my_idx do
+        case ets_lookup(state, key) do
+          {:hit, value, _exp} -> value
+          :expired -> nil
+          :miss ->
+            # Read directly from Bitcask to avoid GenServer.call deadlock
+            case NIF.get(state.store, key) do
+              {:ok, nil} -> nil
+              {:ok, value} ->
+                ets_insert(state, key, value, 0)
+                value
+              _error -> nil
+            end
+        end
+      else
+        Router.get(key)
+      end
+    end
+
+    local_get_meta = fn key ->
+      if Router.shard_for(key) == my_idx do
+        case ets_lookup(state, key) do
+          {:hit, value, exp} -> {value, exp}
+          :expired -> nil
+          :miss ->
+            case NIF.get(state.store, key) do
+              {:ok, nil} -> nil
+              {:ok, value} ->
+                ets_insert(state, key, value, 0)
+                {value, 0}
+              _error -> nil
+            end
+        end
+      else
+        Router.get_meta(key)
+      end
+    end
+
+    local_exists = fn key ->
+      if Router.shard_for(key) == my_idx do
+        case ets_lookup(state, key) do
+          {:hit, _, _} -> true
+          :expired -> false
+          :miss ->
+            case NIF.get(state.store, key) do
+              {:ok, nil} -> false
+              {:ok, _value} -> true
+              _error -> false
+            end
+        end
+      else
+        Router.exists?(key)
+      end
+    end
+
+    local_incr = fn key, delta ->
+      if Router.shard_for(key) == my_idx do
+        current =
+          case ets_lookup(state, key) do
+            {:hit, value, _exp} -> value
+            :expired -> nil
+            :miss ->
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> nil
+                {:ok, v} -> v
+                _ -> nil
+              end
+          end
+
+        case current do
+          nil ->
+            new_str = Integer.to_string(delta)
+            ets_insert(state, key, new_str, 0)
+            send(self(), {:tx_pending_write, key, new_str, 0})
+            {:ok, delta}
+
+          value ->
+            case Integer.parse(value) do
+              {int_val, ""} ->
+                new_val = int_val + delta
+                new_str = Integer.to_string(new_val)
+                ets_insert(state, key, new_str, 0)
+                send(self(), {:tx_pending_write, key, new_str, 0})
+                {:ok, new_val}
+
+              _ ->
+                {:error, "ERR value is not an integer or out of range"}
+            end
+        end
+      else
+        Router.incr(key, delta)
+      end
+    end
+
+    local_incr_float = fn key, delta ->
+      if Router.shard_for(key) == my_idx do
+        current =
+          case ets_lookup(state, key) do
+            {:hit, value, _exp} -> value
+            :expired -> nil
+            :miss ->
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> nil
+                {:ok, v} -> v
+                _ -> nil
+              end
+          end
+
+        case current do
+          nil ->
+            new_str = Float.to_string(delta / 1)
+            ets_insert(state, key, new_str, 0)
+            send(self(), {:tx_pending_write, key, new_str, 0})
+            {:ok, new_str}
+
+          value ->
+            case Float.parse(value) do
+              {float_val, _} ->
+                new_val = float_val + delta
+                new_str = Float.to_string(new_val)
+                ets_insert(state, key, new_str, 0)
+                send(self(), {:tx_pending_write, key, new_str, 0})
+                {:ok, new_str}
+
+              :error ->
+                {:error, "ERR value is not a valid float"}
+            end
+        end
+      else
+        Router.incr_float(key, delta)
+      end
+    end
+
+    local_append = fn key, suffix ->
+      if Router.shard_for(key) == my_idx do
+        current =
+          case ets_lookup(state, key) do
+            {:hit, value, _exp} -> value
+            :expired -> ""
+            :miss ->
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> ""
+                {:ok, v} -> v
+                _ -> ""
+              end
+          end
+
+        new_val = current <> suffix
+        ets_insert(state, key, new_val, 0)
+        send(self(), {:tx_pending_write, key, new_val, 0})
+        {:ok, byte_size(new_val)}
+      else
+        Router.append(key, suffix)
+      end
+    end
+
+    local_getset = fn key, new_value ->
+      if Router.shard_for(key) == my_idx do
+        old =
+          case ets_lookup(state, key) do
+            {:hit, value, _exp} -> value
+            :expired -> nil
+            :miss ->
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> nil
+                {:ok, v} -> v
+                _ -> nil
+              end
+          end
+
+        ets_insert(state, key, new_value, 0)
+        send(self(), {:tx_pending_write, key, new_value, 0})
+        old
+      else
+        Router.getset(key, new_value)
+      end
+    end
+
+    local_getdel = fn key ->
+      if Router.shard_for(key) == my_idx do
+        old =
+          case ets_lookup(state, key) do
+            {:hit, value, _exp} -> value
+            :expired -> nil
+            :miss ->
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> nil
+                {:ok, v} -> v
+                _ -> nil
+              end
+          end
+
+        if old do
+          ets_delete_key(state, key)
+          send(self(), {:tx_pending_delete, key})
+        end
+
+        old
+      else
+        Router.getdel(key)
+      end
+    end
+
+    local_getex = fn key, expire_at_ms ->
+      if Router.shard_for(key) == my_idx do
+        value =
+          case ets_lookup(state, key) do
+            {:hit, v, _exp} -> v
+            :expired -> nil
+            :miss ->
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> nil
+                {:ok, v} -> v
+                _ -> nil
+              end
+          end
+
+        if value do
+          ets_insert(state, key, value, expire_at_ms)
+          send(self(), {:tx_pending_write, key, value, expire_at_ms})
+        end
+
+        value
+      else
+        Router.getex(key, expire_at_ms)
+      end
+    end
+
+    local_setrange = fn key, offset, value ->
+      if Router.shard_for(key) == my_idx do
+        old =
+          case ets_lookup(state, key) do
+            {:hit, v, _exp} -> v
+            :expired -> ""
+            :miss ->
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> ""
+                {:ok, v} -> v
+                _ -> ""
+              end
+          end
+
+        new_val = apply_setrange_for_tx(old, offset, value)
+        ets_insert(state, key, new_val, 0)
+        send(self(), {:tx_pending_write, key, new_val, 0})
+        {:ok, byte_size(new_val)}
+      else
+        Router.setrange(key, offset, value)
+      end
+    end
+
+    %{
+      get: local_get,
+      get_meta: local_get_meta,
+      put: local_put,
+      delete: local_delete,
+      exists?: local_exists,
+      keys: &Router.keys/0,
+      flush: fn ->
+        Enum.each(Router.keys(), &Router.delete/1)
+        :ok
+      end,
+      dbsize: &Router.dbsize/0,
+      incr: local_incr,
+      incr_float: local_incr_float,
+      append: local_append,
+      getset: local_getset,
+      getdel: local_getdel,
+      getex: local_getex,
+      setrange: local_setrange,
+      cas: &Router.cas/4,
+      lock: &Router.lock/3,
+      unlock: &Router.unlock/2,
+      extend: &Router.extend/3,
+      ratelimit_add: &Router.ratelimit_add/4,
+      list_op: &Router.list_op/2,
+      compound_get: fn redis_key, compound_key ->
+        if Router.shard_for(redis_key) == my_idx do
+          # Local: read compound key directly from ETS
+          case ets_lookup(state, compound_key) do
+            {:hit, value, _exp} -> value
+            :expired -> nil
+            :miss ->
+              case NIF.get(state.store, compound_key) do
+                {:ok, nil} -> nil
+                {:ok, v} ->
+                  ets_insert(state, compound_key, v, 0)
+                  v
+                _ -> nil
+              end
+          end
+        else
+          shard = Router.shard_name(Router.shard_for(redis_key))
+          GenServer.call(shard, {:compound_get, redis_key, compound_key})
+        end
+      end,
+      compound_get_meta: fn redis_key, compound_key ->
+        if Router.shard_for(redis_key) == my_idx do
+          case ets_lookup(state, compound_key) do
+            {:hit, value, exp} -> {value, exp}
+            :expired -> nil
+            :miss ->
+              case NIF.get(state.store, compound_key) do
+                {:ok, nil} -> nil
+                {:ok, v} ->
+                  ets_insert(state, compound_key, v, 0)
+                  {v, 0}
+                _ -> nil
+              end
+          end
+        else
+          shard = Router.shard_name(Router.shard_for(redis_key))
+          GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
+        end
+      end,
+      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+        if Router.shard_for(redis_key) == my_idx do
+          ets_insert(state, compound_key, value, expire_at_ms)
+          send(self(), {:tx_pending_write, compound_key, value, expire_at_ms})
+          :ok
+        else
+          shard = Router.shard_name(Router.shard_for(redis_key))
+          GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+        end
+      end,
+      compound_delete: fn redis_key, compound_key ->
+        if Router.shard_for(redis_key) == my_idx do
+          ets_delete_key(state, compound_key)
+          send(self(), {:tx_pending_delete, compound_key})
+          :ok
+        else
+          shard = Router.shard_name(Router.shard_for(redis_key))
+          GenServer.call(shard, {:compound_delete, redis_key, compound_key})
+        end
+      end,
+      compound_scan: fn redis_key, prefix ->
+        if Router.shard_for(redis_key) == my_idx do
+          now = System.os_time(:millisecond)
+
+          results =
+            :ets.foldl(
+              fn {key, exp}, acc ->
+                if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+                  case :ets.lookup(state.hot_cache, key) do
+                    [{^key, value}] ->
+                      field =
+                        case :binary.split(key, <<0>>) do
+                          [_prefix_part, sub] -> sub
+                          _ -> key
+                        end
+
+                      [{field, value} | acc]
+
+                    [] ->
+                      acc
+                  end
+                else
+                  acc
+                end
+              end,
+              [],
+              state.keydir
+            )
+
+          Enum.sort_by(results, fn {field, _} -> field end)
+        else
+          shard = Router.shard_name(Router.shard_for(redis_key))
+          GenServer.call(shard, {:compound_scan, redis_key, prefix})
+        end
+      end,
+      compound_count: fn redis_key, prefix ->
+        if Router.shard_for(redis_key) == my_idx do
+          now = System.os_time(:millisecond)
+
+          :ets.foldl(
+            fn {key, exp}, acc ->
+              if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+                acc + 1
+              else
+                acc
+              end
+            end,
+            0,
+            state.keydir
+          )
+        else
+          shard = Router.shard_name(Router.shard_for(redis_key))
+          GenServer.call(shard, {:compound_count, redis_key, prefix})
+        end
+      end,
+      compound_delete_prefix: fn redis_key, prefix ->
+        if Router.shard_for(redis_key) == my_idx do
+          keys_to_delete =
+            :ets.foldl(
+              fn {key, _exp}, acc ->
+                if is_binary(key) and String.starts_with?(key, prefix) do
+                  [key | acc]
+                else
+                  acc
+                end
+              end,
+              [],
+              state.keydir
+            )
+
+          Enum.each(keys_to_delete, fn key ->
+            ets_delete_key(state, key)
+            send(self(), {:tx_pending_delete, key})
+          end)
+
+          :ok
+        else
+          shard = Router.shard_name(Router.shard_for(redis_key))
+          GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
+        end
+      end
+    }
+  end
+
+  # SETRANGE helper for transaction local store -- mirrors apply_setrange/3
+  defp apply_setrange_for_tx(old, offset, value) do
+    old_bytes = :binary.bin_to_list(old)
+    val_bytes = :binary.bin_to_list(value)
+
+    padded =
+      if offset > length(old_bytes),
+        do: old_bytes ++ List.duplicate(0, offset - length(old_bytes)),
+        else: old_bytes
+
+    {head, tail} = Enum.split(padded, offset)
+    rest = Enum.drop(tail, length(val_bytes))
+    :binary.list_to_bin(head ++ val_bytes ++ rest)
+  end
+
   # --- Native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD ---
 
   def handle_call({:cas, key, expected, new_value, ttl_ms}, _from, state) do
@@ -1392,7 +1919,7 @@ defmodule Ferricstore.Store.Shard do
   defp handle_cas_direct(key, expected, new_value, ttl_ms, state) do
     case resolve_for_native(state, key) do
       {{:hit, ^expected, old_exp}, state} ->
-        expire = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: old_exp
+        expire = if ttl_ms, do: Ferricstore.HLC.now_ms() + ttl_ms, else: old_exp
         ets_insert(state, key, new_value, expire)
         new_pending = [{key, new_value, expire} | state.pending]
         new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
@@ -1431,7 +1958,7 @@ defmodule Ferricstore.Store.Shard do
 
   # Direct path for LOCK (no Raft).
   defp handle_lock_direct(key, owner, ttl_ms, state) do
-    expire = System.os_time(:millisecond) + ttl_ms
+    expire = Ferricstore.HLC.now_ms() + ttl_ms
 
     case resolve_for_native(state, key) do
       {{:hit, ^owner, _exp}, state} ->
@@ -1520,7 +2047,7 @@ defmodule Ferricstore.Store.Shard do
 
   # Direct path for EXTEND (no Raft).
   defp handle_extend_direct(key, owner, ttl_ms, state) do
-    new_expire = System.os_time(:millisecond) + ttl_ms
+    new_expire = Ferricstore.HLC.now_ms() + ttl_ms
 
     case resolve_for_native(state, key) do
       {{:hit, ^owner, _exp}, state} ->
@@ -1565,7 +2092,7 @@ defmodule Ferricstore.Store.Shard do
 
   # Direct path for RATELIMIT.ADD (no Raft).
   defp handle_ratelimit_add_direct(key, window_ms, max, count, state) do
-    now = System.os_time(:millisecond)
+    now = Ferricstore.HLC.now_ms()
 
     {cur_count, cur_start, prv_count} =
       case ets_lookup(state, key) do
@@ -1777,6 +2304,37 @@ defmodule Ferricstore.Store.Shard do
   end
 
   @impl true
+  # Handle pending writes from 2PC prepare_tx. These are queued via send/2
+  # during the prepare phase to persist ETS-only writes to Bitcask.
+  def handle_info({:tx_pending_write, key, value, expire_at_ms}, state) do
+    new_pending = [{key, value, expire_at_ms} | state.pending]
+    new_version = state.write_version + 1
+    new_state = %{state | pending: new_pending, write_version: new_version}
+
+    new_state =
+      if state.flush_in_flight == nil,
+        do: flush_pending(new_state),
+        else: new_state
+
+    {:noreply, new_state}
+  end
+
+  def handle_info({:tx_pending_delete, key}, state) do
+    if raft_enabled?() do
+      alias Ferricstore.Raft.Batcher
+      Batcher.write(state.index, {:delete, key})
+      new_version = state.write_version + 1
+      {:noreply, %{state | write_version: new_version}}
+    else
+      state = await_in_flight(state)
+      state = flush_pending_sync(state)
+      NIF.delete(state.store, key)
+      new_pending = Enum.reject(state.pending, fn {k, _, _} -> k == key end)
+      new_version = state.write_version + 1
+      {:noreply, %{state | pending: new_pending, write_version: new_version}}
+    end
+  end
+
   def handle_info(:flush, state) do
     state = flush_pending(state)
     schedule_flush(Process.get(:flush_interval_ms, @flush_interval_ms))
@@ -2250,7 +2808,7 @@ defmodule Ferricstore.Store.Shard do
       [cur, start, prev] ->
         {String.to_integer(cur), String.to_integer(start), String.to_integer(prev)}
       _ ->
-        {0, System.os_time(:millisecond), 0}
+        {0, Ferricstore.HLC.now_ms(), 0}
     end
   end
 

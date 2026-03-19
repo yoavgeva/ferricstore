@@ -310,7 +310,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("SETEX", [key, secs_str, value], store) do
     case Integer.parse(secs_str) do
       {secs, ""} when secs > 0 ->
-        expire_at_ms = System.os_time(:millisecond) + secs * 1_000
+        expire_at_ms = Ferricstore.HLC.now_ms() + secs * 1_000
         store.put.(key, value, expire_at_ms)
 
       {_secs, ""} ->
@@ -331,7 +331,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("PSETEX", [key, ms_str, value], store) do
     case Integer.parse(ms_str) do
       {ms, ""} when ms > 0 ->
-        expire_at_ms = System.os_time(:millisecond) + ms
+        expire_at_ms = Ferricstore.HLC.now_ms() + ms
         store.put.(key, value, expire_at_ms)
 
       {_ms, ""} ->
@@ -428,7 +428,7 @@ defmodule Ferricstore.Commands.Strings do
   defp parse_getex_opts(["EX", secs_str]) do
     case Integer.parse(secs_str) do
       {secs, ""} when secs > 0 ->
-        {:ok, System.os_time(:millisecond) + secs * 1_000}
+        {:ok, Ferricstore.HLC.now_ms() + secs * 1_000}
 
       {_secs, ""} ->
         {:error, "ERR invalid expire time in 'getex' command"}
@@ -441,7 +441,7 @@ defmodule Ferricstore.Commands.Strings do
   defp parse_getex_opts(["PX", ms_str]) do
     case Integer.parse(ms_str) do
       {ms, ""} when ms > 0 ->
-        {:ok, System.os_time(:millisecond) + ms}
+        {:ok, Ferricstore.HLC.now_ms() + ms}
 
       {_ms, ""} ->
         {:error, "ERR invalid expire time in 'getex' command"}
@@ -560,7 +560,7 @@ defmodule Ferricstore.Commands.Strings do
   defp parse_set_opts(["EX", secs_str | rest], _exp, nx?, xx?) do
     with {secs, ""} <- Integer.parse(secs_str),
          true <- secs > 0 do
-      parse_set_opts(rest, System.os_time(:millisecond) + secs * 1000, nx?, xx?)
+      parse_set_opts(rest, Ferricstore.HLC.now_ms() + secs * 1000, nx?, xx?)
     else
       false -> {:error, "ERR invalid expire time in 'set' command"}
       _ -> {:error, "ERR value is not an integer or out of range"}
@@ -570,7 +570,7 @@ defmodule Ferricstore.Commands.Strings do
   defp parse_set_opts(["PX", ms_str | rest], _exp, nx?, xx?) do
     with {ms, ""} <- Integer.parse(ms_str),
          true <- ms > 0 do
-      parse_set_opts(rest, System.os_time(:millisecond) + ms, nx?, xx?)
+      parse_set_opts(rest, Ferricstore.HLC.now_ms() + ms, nx?, xx?)
     else
       false -> {:error, "ERR invalid expire time in 'set' command"}
       _ -> {:error, "ERR value is not an integer or out of range"}

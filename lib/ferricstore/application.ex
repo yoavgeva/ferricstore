@@ -7,6 +7,7 @@ defmodule Ferricstore.Application do
   ```
   Ferricstore.Supervisor
   ├── Ferricstore.Stats                   (global counters & run metadata)
+  ├── Ferricstore.HLC                     (Hybrid Logical Clock — spec 2G.6)
   ├── Ferricstore.Store.ShardSupervisor   (one_for_one over N Shard GenServers)
   ├── Ferricstore.Merge.Supervisor        (Semaphore + N Scheduler GenServers)
   ├── Ranch listener (Ferricstore.Server.Listener)
@@ -77,6 +78,14 @@ defmodule Ferricstore.Application do
         []
       end
 
+    async_worker_children =
+      Enum.map(0..(shard_count - 1), fn i ->
+        Supervisor.child_spec(
+          {Ferricstore.Raft.AsyncApplyWorker, shard_index: i},
+          id: :"async_apply_worker_#{i}"
+        )
+      end)
+
     health_port = Application.get_env(:ferricstore, :health_port, 4000)
 
     children =
@@ -86,12 +95,14 @@ defmodule Ferricstore.Application do
         Ferricstore.AuditLog,
         Ferricstore.Config,
         Ferricstore.NamespaceConfig,
-        Ferricstore.Acl
+        Ferricstore.Acl,
+        Ferricstore.HLC
       ] ++
         batcher_children ++
         [
         {Ferricstore.Store.ShardSupervisor, data_dir: data_dir}
       ] ++
+        async_worker_children ++
         [
           {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
           Ferricstore.PubSub,

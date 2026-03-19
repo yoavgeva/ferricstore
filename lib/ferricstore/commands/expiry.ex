@@ -82,7 +82,7 @@ defmodule Ferricstore.Commands.Expiry do
   defp set_expiry_seconds(key, secs_str, store) do
     with {secs, ""} <- Integer.parse(secs_str),
          true <- secs >= 0 do
-      apply_expiry(key, System.os_time(:millisecond) + secs * 1_000, store)
+      apply_expiry(key, Ferricstore.HLC.now_ms() + secs * 1_000, store)
     else
       false -> {:error, "ERR invalid expire time in 'expire' command"}
       _ -> {:error, "ERR value is not an integer or out of range"}
@@ -92,7 +92,7 @@ defmodule Ferricstore.Commands.Expiry do
   defp set_expiry_ms(key, ms_str, store) do
     with {ms, ""} <- Integer.parse(ms_str),
          true <- ms >= 0 do
-      apply_expiry(key, System.os_time(:millisecond) + ms, store)
+      apply_expiry(key, Ferricstore.HLC.now_ms() + ms, store)
     else
       false -> {:error, "ERR invalid expire time in 'pexpire' command"}
       _ -> {:error, "ERR value is not an integer or out of range"}
@@ -140,7 +140,7 @@ defmodule Ferricstore.Commands.Expiry do
     case store.get_meta.(key) do
       nil -> -2
       {_, 0} -> -1
-      {_, exp} -> max(0, div(exp - System.os_time(:millisecond), 1_000))
+      {_, exp} -> max(0, div(exp - Ferricstore.HLC.now_ms(), 1_000))
     end
   end
 
@@ -148,7 +148,7 @@ defmodule Ferricstore.Commands.Expiry do
     case store.get_meta.(key) do
       nil -> -2
       {_, 0} -> -1
-      {_, exp} -> max(0, exp - System.os_time(:millisecond))
+      {_, exp} -> max(0, exp - Ferricstore.HLC.now_ms())
     end
   end
 
