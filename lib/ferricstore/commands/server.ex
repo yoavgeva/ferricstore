@@ -295,7 +295,7 @@ defmodule Ferricstore.Commands.Server do
   # Private — INFO section builders
   # ---------------------------------------------------------------------------
 
-  @all_sections ["server", "clients", "memory", "keyspace", "stats", "persistence", "replication", "cpu"]
+  @all_sections ["server", "clients", "memory", "keyspace", "stats", "persistence", "replication", "cpu", "namespace_config"]
 
   defp info_string(section, store) when section in ["all", "everything"] do
     @all_sections
@@ -474,6 +474,29 @@ defmodule Ferricstore.Commands.Server do
     format_section("CPU", fields)
   end
 
+  defp build_section("namespace_config", _store) do
+    alias Ferricstore.NamespaceConfig
+
+    entries = NamespaceConfig.get_all()
+    count = length(entries)
+
+    default_fields = [
+      {"namespace_config_count", Integer.to_string(count)},
+      {"default_window_ms", Integer.to_string(NamespaceConfig.default_window_ms())},
+      {"default_durability", Atom.to_string(NamespaceConfig.default_durability())}
+    ]
+
+    entry_fields =
+      Enum.flat_map(entries, fn %{prefix: prefix, window_ms: w, durability: d} ->
+        [
+          {"ns_#{prefix}_window_ms", Integer.to_string(w)},
+          {"ns_#{prefix}_durability", Atom.to_string(d)}
+        ]
+      end)
+
+    format_section("Namespace_Config", default_fields ++ entry_fields)
+  end
+
   defp format_section(header, fields) do
     lines =
       fields
@@ -562,7 +585,9 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp handle_config("RESETSTAT", _), do: {:error, "ERR wrong number of arguments for 'config|resetstat' command"}
-  defp handle_config("REWRITE", []), do: :ok
+  defp handle_config("REWRITE", []) do
+    Ferricstore.Config.rewrite()
+  end
   defp handle_config("REWRITE", _), do: {:error, "ERR wrong number of arguments for 'config|rewrite' command"}
 
   defp handle_config(subcmd, _) do

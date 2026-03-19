@@ -396,4 +396,61 @@ defmodule Ferricstore.HealthTest do
       assert is_integer(result.uptime_seconds)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # /health/live HTTP endpoint (Kubernetes liveness probe)
+  # ---------------------------------------------------------------------------
+
+  describe "/health/live HTTP endpoint" do
+    test "returns 200 with status alive" do
+      port = Ferricstore.Health.Endpoint.port()
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      assert response =~ "HTTP/1.1 200 OK"
+      assert response =~ "application/json"
+      assert response =~ ~s("status":"alive")
+    end
+
+    test "returns 200 even when readiness is false" do
+      # Liveness should always return 200 regardless of readiness state.
+      Ferricstore.Health.set_ready(false)
+
+      port = Ferricstore.Health.Endpoint.port()
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      assert response =~ "HTTP/1.1 200 OK"
+      assert response =~ ~s("status":"alive")
+
+      # Restore ready state for subsequent tests.
+      Ferricstore.Health.set_ready(true)
+    end
+
+    test "response body is valid JSON with status field" do
+      port = Ferricstore.Health.Endpoint.port()
+
+      {:ok, conn} =
+        :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+
+      :ok = :gen_tcp.send(conn, "GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, response} = :gen_tcp.recv(conn, 0, 5_000)
+      :gen_tcp.close(conn)
+
+      [_headers, body] = String.split(response, "\r\n\r\n", parts: 2)
+      {:ok, decoded} = Jason.decode(body)
+
+      assert decoded == %{"status" => "alive"}
+    end
+  end
 end

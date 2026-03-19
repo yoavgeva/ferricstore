@@ -73,9 +73,15 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 - Sandbox isolation
 
 ### In Progress:
-- CLIENT TRACKING invalidation wiring (module exists, dispatch hooks being added)
-- SCAN TYPE filtering for non-string types
-- TLS require-tls enforcement
+- Section 2F.3: Per-namespace write tuning (FERRICSTORE.CONFIG SET/GET/RESET)
+- Namespace-aware group commit batcher (per-prefix windows + durability)
+- CONFIG REWRITE, CONFIG RESETSTAT
+- INFO namespace_config section
+
+### Recently Completed:
+- CLIENT TRACKING invalidation wiring — DONE
+- SCAN TYPE filtering for non-string types — DONE
+- TLS require-tls enforcement — DONE
 
 ### Deferred (external tooling, not core logic):
 - Encryption at rest (Q7)

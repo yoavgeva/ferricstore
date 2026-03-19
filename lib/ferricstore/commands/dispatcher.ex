@@ -20,7 +20,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   Unknown commands return `{:error, "ERR unknown command ..."}`.
   """
 
-  alias Ferricstore.Commands.{Bitmap, Bloom, Client, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Native, PubSub, Server, Set, SortedSet, Stream, Strings, Vector}
+  alias Ferricstore.Commands.{Bitmap, Bloom, Client, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Namespace, Native, PubSub, Server, Set, SortedSet, Stream, Strings, Vector}
   alias Ferricstore.Commands.CMS
   alias Ferricstore.Commands.TopK
 
@@ -96,6 +96,7 @@ defmodule Ferricstore.Commands.Dispatcher do
         cmd == "CLUSTER.HEALTH" -> Cluster.handle(cmd, args, store)
         cmd == "CLUSTER.STATS" -> Cluster.handle(cmd, args, store)
         cmd == "FERRICSTORE.HOTNESS" -> Cluster.handle(cmd, args, store)
+        cmd == "FERRICSTORE.CONFIG" -> Namespace.handle(cmd, upcase_subcommand_ferricstore(args), store)
         cmd == "FERRICSTORE.METRICS" -> Ferricstore.Metrics.handle(cmd, args)
         cmd in @pubsub_cmds -> PubSub.handle(cmd, args)
         cmd == "MEMORY" ->
@@ -149,4 +150,8 @@ defmodule Ferricstore.Commands.Dispatcher do
   end
 
   defp upcase_subcommand(_cmd, args), do: args
+
+  # FERRICSTORE.* commands: upcase the first arg (subcommand) only.
+  defp upcase_subcommand_ferricstore([subcmd | rest]), do: [String.upcase(subcmd) | rest]
+  defp upcase_subcommand_ferricstore([]), do: []
 end

@@ -24,6 +24,8 @@ defmodule Ferricstore.Metrics do
   | `ferricstore_blocked_clients`            | gauge   | waiters ETS table size        |
   | `ferricstore_tracking_clients`           | gauge   | tracking connections ETS size |
   | `ferricstore_slowlog_entries`            | gauge   | `SlowLog.len/0`              |
+  | `ferricstore_namespace_window_ms`        | gauge   | `NamespaceConfig.get_all/0`   |
+  | `ferricstore_namespace_durability`       | gauge   | `NamespaceConfig.get_all/0`   |
 
   ## Usage
 
@@ -78,8 +80,15 @@ defmodule Ferricstore.Metrics do
   """
   @spec scrape() :: binary()
   def scrape do
-    metrics()
-    |> Enum.map_join("\n", &format_metric/1)
+    base =
+      metrics()
+      |> Enum.map_join("\n", &format_metric/1)
+
+    ns = namespace_metrics_text()
+
+    [base, ns]
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n")
     |> Kernel.<>("\n")
   end
 
@@ -196,5 +205,66 @@ defmodule Ferricstore.Metrics do
     catch
       :exit, _ -> 0
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: namespace metrics
+  # ---------------------------------------------------------------------------
+
+  # Produces the Prometheus text block for the two namespace-aware labeled
+  # gauge families: ferricstore_namespace_window_ms and
+  # ferricstore_namespace_durability.
+  #
+  # Each configured namespace prefix emits one sample line per metric family
+  # with a `prefix` label. The durability gauge encodes the mode as an integer:
+  # 1 for :quorum, 0 for :async.
+  @spec namespace_metrics_text() :: binary()
+  defp namespace_metrics_text do
+    entries = namespace_entries()
+
+    if entries == [] do
+      ""
+    else
+      window_samples =
+        Enum.map_join(entries, "\n", fn {prefix, window_ms, _durability, _ca, _cb} ->
+          "ferricstore_namespace_window_ms{prefix=\"#{escape_label(prefix)}\"} #{window_ms}"
+        end)
+
+      durability_samples =
+        Enum.map_join(entries, "\n", fn {prefix, _window_ms, durability, _ca, _cb} ->
+          mode_str = Atom.to_string(durability)
+
+          "ferricstore_namespace_durability{prefix=\"#{escape_label(prefix)}\",mode=\"#{mode_str}\"} 1"
+        end)
+
+      "# HELP ferricstore_namespace_window_ms Configured commit window in milliseconds per namespace prefix\n" <>
+        "# TYPE ferricstore_namespace_window_ms gauge\n" <>
+        window_samples <>
+        "\n" <>
+        "# HELP ferricstore_namespace_durability Configured durability mode per namespace prefix (1 = active)\n" <>
+        "# TYPE ferricstore_namespace_durability gauge\n" <>
+        durability_samples
+    end
+  end
+
+  # Reads all namespace config entries from ETS. Returns an empty list when
+  # the table does not exist or has no entries.
+  @spec namespace_entries() :: [tuple()]
+  defp namespace_entries do
+    try do
+      :ets.tab2list(:ferricstore_ns_config)
+    rescue
+      ArgumentError -> []
+    end
+  end
+
+  # Escapes label values for Prometheus text format. Backslash, double quote,
+  # and newline must be escaped.
+  @spec escape_label(binary()) :: binary()
+  defp escape_label(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("\"", "\\\"")
+    |> String.replace("\n", "\\n")
   end
 end

@@ -27,7 +27,7 @@ defmodule Ferricstore.Application do
 
     * `:port`             - TCP port to bind (default: `6379`; test env uses `0` for ephemeral)
     * `:data_dir`         - Bitcask data directory (default: `"data"`)
-    * `:health_port`      - HTTP health check port (default: `9090`; test env uses `0`)
+    * `:health_port`      - HTTP health check port (default: `4000`; test env uses `0`)
     * `:tls_port`         - TLS port to bind (default: `nil`; not started unless configured)
     * `:tls_cert_file`    - path to PEM certificate file
     * `:tls_key_file`     - path to PEM private key file
@@ -77,7 +77,7 @@ defmodule Ferricstore.Application do
         []
       end
 
-    health_port = Application.get_env(:ferricstore, :health_port, 9090)
+    health_port = Application.get_env(:ferricstore, :health_port, 4000)
 
     children =
       [
@@ -85,6 +85,7 @@ defmodule Ferricstore.Application do
         Ferricstore.SlowLog,
         Ferricstore.AuditLog,
         Ferricstore.Config,
+        Ferricstore.NamespaceConfig,
         Ferricstore.Acl
       ] ++
         batcher_children ++

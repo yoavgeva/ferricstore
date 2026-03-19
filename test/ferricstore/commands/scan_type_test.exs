@@ -287,5 +287,133 @@ defmodule Ferricstore.Commands.ScanTypeTest do
       refute Enum.any?(keys, &String.starts_with?(&1, "T:"))
       assert Enum.sort(keys) == ["myhash", "str1"]
     end
+
+    test "H: hash compound subkeys with null byte are not returned" do
+      # Simulate a Bitcask keydir containing a hash key with its subkeys.
+      # The store.keys.() returns ALL keys from the keydir, including
+      # internal compound keys like H:myhash\0field1.
+      initial = %{
+        "myhash" => {"", 0},
+        "T:myhash" => {"hash", 0},
+        CompoundKey.hash_field("myhash", "field1") => {"value1", 0},
+        CompoundKey.hash_field("myhash", "field2") => {"value2", 0},
+        "str1" => {"hello", 0}
+      }
+
+      store = MockStore.make(initial)
+
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "COUNT", "100"], store)
+
+      # Only user-visible keys should appear
+      assert Enum.sort(keys) == ["myhash", "str1"]
+    end
+
+    test "S: set compound subkeys with null byte are not returned" do
+      initial = %{
+        "myset" => {"", 0},
+        "T:myset" => {"set", 0},
+        CompoundKey.set_member("myset", "member1") => {"1", 0},
+        CompoundKey.set_member("myset", "member2") => {"1", 0},
+        "str1" => {"hello", 0}
+      }
+
+      store = MockStore.make(initial)
+
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "COUNT", "100"], store)
+
+      assert Enum.sort(keys) == ["myset", "str1"]
+    end
+
+    test "L: list compound subkeys with null byte are not returned" do
+      initial = %{
+        "mylist" => {"", 0},
+        "T:mylist" => {"list", 0},
+        CompoundKey.list_element("mylist", 1000.0) => {"item1", 0},
+        CompoundKey.list_element("mylist", 2000.0) => {"item2", 0},
+        "str1" => {"hello", 0}
+      }
+
+      store = MockStore.make(initial)
+
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "COUNT", "100"], store)
+
+      assert Enum.sort(keys) == ["mylist", "str1"]
+    end
+
+    test "Z: sorted set compound subkeys with null byte are not returned" do
+      initial = %{
+        "myzset" => {"", 0},
+        "T:myzset" => {"zset", 0},
+        CompoundKey.zset_member("myzset", "alice") => {"1.0", 0},
+        CompoundKey.zset_member("myzset", "bob") => {"2.0", 0},
+        "str1" => {"hello", 0}
+      }
+
+      store = MockStore.make(initial)
+
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "COUNT", "100"], store)
+
+      assert Enum.sort(keys) == ["myzset", "str1"]
+    end
+
+    test "V: and VM: vector keys are not returned" do
+      initial = %{
+        "str1" => {"hello", 0},
+        "V:myvec" => {"vector_data", 0},
+        "VM:myvec" => {"vector_meta", 0}
+      }
+
+      store = MockStore.make(initial)
+
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "COUNT", "100"], store)
+
+      assert keys == ["str1"]
+    end
+
+    test "PM: promotion metadata keys are not returned" do
+      initial = %{
+        "str1" => {"hello", 0},
+        "PM:some_promotion" => {"metadata", 0}
+      }
+
+      store = MockStore.make(initial)
+
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "COUNT", "100"], store)
+
+      assert keys == ["str1"]
+    end
+
+    test "mixed compound keys from multiple data types are all excluded" do
+      # A realistic scenario: multiple data structure keys with their subkeys
+      initial = %{
+        # User-visible keys
+        "user:name" => {"alice", 0},
+        "counter" => {"42", 0},
+        "myhash" => {"", 0},
+        "myset" => {"", 0},
+        "mylist" => {"", 0},
+        "myzset" => {"", 0},
+        # Type metadata (internal)
+        "T:myhash" => {"hash", 0},
+        "T:myset" => {"set", 0},
+        "T:mylist" => {"list", 0},
+        "T:myzset" => {"zset", 0},
+        # Hash subkeys (internal)
+        CompoundKey.hash_field("myhash", "f1") => {"v1", 0},
+        CompoundKey.hash_field("myhash", "f2") => {"v2", 0},
+        # Set subkeys (internal)
+        CompoundKey.set_member("myset", "m1") => {"1", 0},
+        # List subkeys (internal)
+        CompoundKey.list_element("mylist", 1000.0) => {"item", 0},
+        # Sorted set subkeys (internal)
+        CompoundKey.zset_member("myzset", "alice") => {"1.0", 0}
+      }
+
+      store = MockStore.make(initial)
+
+      [_cursor, keys] = Generic.handle("SCAN", ["0", "COUNT", "100"], store)
+
+      assert Enum.sort(keys) == ["counter", "myhash", "mylist", "myset", "myzset", "user:name"]
+    end
   end
 end

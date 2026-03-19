@@ -1,20 +1,37 @@
 defmodule Ferricstore.Raft.Batcher do
   @moduledoc """
-  Group commit batcher for a single FerricStore shard.
+  Namespace-aware group commit batcher for a single FerricStore shard.
 
-  Per spec section 2C.5, each shard has its own Batcher GenServer that
-  accumulates write commands for up to `batch_window_ms` (default: 1ms),
-  then submits them as a single `{:batch, commands}` entry to the Raft log
-  via `:ra.process_command/2`.
+  Per spec sections 2C.5 and 2F.3, each shard has its own Batcher GenServer
+  that accumulates write commands into per-namespace buffers, each with its
+  own commit window and durability mode. When a namespace's timer fires, only
+  that namespace's buffer is flushed to Raft via `:ra.process_command/2`.
 
   ## How it works
 
   1. A client calls `write/2` which sends a `GenServer.call` to the batcher.
-  2. The batcher appends the command and caller to an internal accumulator.
-  3. On the **first** write in a new batch window, a timer is started.
-  4. When the timer fires (`:flush`), all accumulated commands are submitted
-     to ra as a single batch command.
-  5. Each caller receives their individual result from the batch.
+  2. The batcher extracts the key's namespace prefix (e.g. `"session"` from
+     `"session:abc123"`, `"_root"` for keys without a colon).
+  3. The namespace config is looked up from the `:ferricstore_ns_config` ETS
+     table to determine `window_ms` and `durability` for this prefix.
+  4. The command and caller are appended to the namespace's buffer slot,
+     identified by `{prefix, durability}`.
+  5. On the first write to an empty slot, a timer is started using the
+     namespace's `window_ms`.
+  6. When the timer fires (`:flush_slot`), only that slot's commands are
+     submitted to ra as a single batch.
+  7. Each caller receives their individual result from the batch.
+
+  ## Namespace configuration
+
+  Per-prefix configuration is read from the `:ferricstore_ns_config` ETS
+  table managed by `Ferricstore.NamespaceConfig`. If no configuration exists
+  for a prefix, the defaults are used: `window_ms = 1`, `durability = :quorum`.
+
+  Both `:quorum` and `:async` durability modes currently route through the
+  standard `:ra.process_command/2` path. The async optimization (leader-only
+  WAL + fdatasync without waiting for followers) is deferred to a future
+  implementation.
 
   ## Why a separate GenServer?
 
@@ -26,7 +43,6 @@ defmodule Ferricstore.Raft.Batcher do
   ## Configuration
 
     * `:shard_id` (required) -- the ra server ID for this shard
-    * `:batch_window_ms` -- max time to accumulate writes (default: 1)
     * `:max_batch_size` -- flush immediately when batch reaches this size (default: 1000)
   """
 
@@ -34,7 +50,8 @@ defmodule Ferricstore.Raft.Batcher do
 
   require Logger
 
-  @default_batch_window_ms 1
+  alias Ferricstore.NamespaceConfig
+
   @default_max_batch_size 1_000
 
   @type command ::
@@ -47,13 +64,29 @@ defmodule Ferricstore.Raft.Batcher do
           | {:getex, binary(), non_neg_integer()}
           | {:setrange, binary(), non_neg_integer(), binary()}
 
+  @typedoc """
+  A slot key identifies a unique batching bucket by namespace prefix and
+  durability mode. Commands with the same prefix but different durability
+  modes (which can happen if config changes mid-flight) are batched
+  separately.
+  """
+  @type slot_key :: {binary(), :quorum | :async}
+
+  @typedoc """
+  A slot holds the accumulated commands and callers for a single namespace
+  buffer, along with the timer reference for that slot's commit window.
+  """
+  @type slot :: %{
+          cmds: [command()],
+          froms: [GenServer.from()],
+          timer_ref: reference() | nil,
+          window_ms: pos_integer()
+        }
+
   defstruct [
     :shard_id,
-    :batch_window_ms,
     :max_batch_size,
-    batch: [],
-    froms: [],
-    timer_ref: nil
+    slots: %{}
   ]
 
   # ---------------------------------------------------------------------------
@@ -67,8 +100,7 @@ defmodule Ferricstore.Raft.Batcher do
 
     * `:shard_id` (required) -- ra server ID `{name, node()}` for this shard
     * `:shard_index` (required) -- zero-based shard index (used for process name)
-    * `:batch_window_ms` -- batch accumulation window in ms (default: #{@default_batch_window_ms})
-    * `:max_batch_size` -- max commands per batch before forced flush (default: #{@default_max_batch_size})
+    * `:max_batch_size` -- max commands per slot before forced flush (default: #{@default_max_batch_size})
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -79,7 +111,10 @@ defmodule Ferricstore.Raft.Batcher do
   @doc """
   Submits a write command to the batcher for the given shard.
 
-  The command is accumulated and submitted to ra in the next batch flush.
+  The command is accumulated into the appropriate namespace buffer and
+  submitted to ra when the namespace's commit window expires or the buffer
+  reaches `max_batch_size`.
+
   This call blocks until the ra command is committed and applied.
 
   ## Parameters
@@ -109,13 +144,44 @@ defmodule Ferricstore.Raft.Batcher do
   def batcher_name(shard_index), do: :"Ferricstore.Raft.Batcher.#{shard_index}"
 
   @doc """
-  Synchronously flushes any pending writes in the batcher.
+  Synchronously flushes all pending writes across all namespace slots.
 
   Used in tests and before shard shutdown to ensure all writes are committed.
   """
   @spec flush(non_neg_integer()) :: :ok
   def flush(shard_index) do
     GenServer.call(batcher_name(shard_index), :flush, 10_000)
+  end
+
+  @doc """
+  Extracts the namespace prefix from a command's key.
+
+  The prefix is the portion of the key before the first colon (`:`).
+  Keys without a colon are assigned to the `"_root"` namespace.
+
+  ## Parameters
+
+    * `command` -- a write command tuple
+
+  ## Examples
+
+      iex> Ferricstore.Raft.Batcher.extract_prefix({:put, "session:abc", "v", 0})
+      "session"
+
+      iex> Ferricstore.Raft.Batcher.extract_prefix({:delete, "nocolon"})
+      "_root"
+
+      iex> Ferricstore.Raft.Batcher.extract_prefix({:put, "ts:sensor:42", "v", 0})
+      "ts"
+  """
+  @spec extract_prefix(command()) :: binary()
+  def extract_prefix(command) when is_tuple(command) do
+    key = elem(command, 1)
+
+    case :binary.split(key, ":") do
+      [^key] -> "_root"
+      [prefix | _rest] -> prefix
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -125,12 +191,10 @@ defmodule Ferricstore.Raft.Batcher do
   @impl true
   def init(opts) do
     shard_id = Keyword.fetch!(opts, :shard_id)
-    batch_window_ms = Keyword.get(opts, :batch_window_ms, @default_batch_window_ms)
     max_batch_size = Keyword.get(opts, :max_batch_size, @default_max_batch_size)
 
     state = %__MODULE__{
       shard_id: shard_id,
-      batch_window_ms: batch_window_ms,
       max_batch_size: max_batch_size
     }
 
@@ -139,66 +203,109 @@ defmodule Ferricstore.Raft.Batcher do
 
   @impl true
   def handle_call({:write, command}, from, state) do
-    new_state = %{
-      state
-      | batch: [command | state.batch],
-        froms: [from | state.froms]
+    prefix = extract_prefix(command)
+    {window_ms, durability} = lookup_ns_config(prefix)
+    slot_key = {prefix, durability}
+
+    slot = Map.get(state.slots, slot_key, new_slot(window_ms))
+
+    updated_slot = %{
+      slot
+      | cmds: [command | slot.cmds],
+        froms: [from | slot.froms],
+        window_ms: window_ms
     }
 
-    # Start timer on first write in window
-    new_state =
-      if new_state.timer_ref == nil do
-        ref = Process.send_after(self(), :flush, state.batch_window_ms)
-        %{new_state | timer_ref: ref}
+    # Start timer on first write to this slot
+    updated_slot =
+      if updated_slot.timer_ref == nil do
+        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
+        %{updated_slot | timer_ref: ref}
       else
-        new_state
+        updated_slot
       end
 
-    # Flush immediately if batch is full
-    if length(new_state.batch) >= state.max_batch_size do
-      do_flush(new_state)
+    new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+
+    # Flush immediately if slot is full
+    if length(updated_slot.cmds) >= state.max_batch_size do
+      do_flush_slot(new_state, slot_key)
     else
       {:noreply, new_state}
     end
   end
 
   def handle_call(:flush, _from, state) do
-    case do_flush(state) do
-      {:noreply, new_state} -> {:reply, :ok, new_state}
-    end
+    new_state = flush_all_slots(state)
+    {:reply, :ok, new_state}
   end
 
   @impl true
+  def handle_info({:flush_slot, slot_key}, state) do
+    case Map.get(state.slots, slot_key) do
+      nil ->
+        {:noreply, state}
+
+      slot ->
+        # Clear the timer ref since the timer has already fired
+        updated_slot = %{slot | timer_ref: nil}
+        state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+
+        case do_flush_slot(state, slot_key) do
+          {:noreply, new_state} -> {:noreply, new_state}
+        end
+    end
+  end
+
+  # Handle legacy :flush messages (e.g. from cancel_timer race conditions)
   def handle_info(:flush, state) do
-    do_flush(%{state | timer_ref: nil})
+    {:noreply, state}
   end
 
   # ---------------------------------------------------------------------------
   # Private: flush logic
   # ---------------------------------------------------------------------------
 
-  defp do_flush(%{batch: []} = state) do
-    cancel_timer(state.timer_ref)
-    {:noreply, %{state | timer_ref: nil}}
+  @spec flush_all_slots(%__MODULE__{}) :: %__MODULE__{}
+  defp flush_all_slots(state) do
+    Enum.reduce(Map.keys(state.slots), state, fn slot_key, acc ->
+      case do_flush_slot(acc, slot_key) do
+        {:noreply, new_state} -> new_state
+      end
+    end)
   end
 
-  defp do_flush(state) do
-    cancel_timer(state.timer_ref)
+  @spec do_flush_slot(%__MODULE__{}, slot_key()) :: {:noreply, %__MODULE__{}}
+  defp do_flush_slot(state, slot_key) do
+    case Map.get(state.slots, slot_key) do
+      nil ->
+        {:noreply, state}
 
-    batch = Enum.reverse(state.batch)
-    froms = Enum.reverse(state.froms)
+      %{cmds: []} = slot ->
+        cancel_timer(slot.timer_ref)
+        new_slots = Map.delete(state.slots, slot_key)
+        {:noreply, %{state | slots: new_slots}}
 
-    # For single commands, submit directly without batch wrapper
-    # For multiple commands, wrap in a batch
-    case batch do
-      [single_cmd] ->
-        submit_single(state.shard_id, single_cmd, froms)
+      slot ->
+        cancel_timer(slot.timer_ref)
 
-      _multiple ->
-        submit_batch(state.shard_id, batch, froms)
+        batch = Enum.reverse(slot.cmds)
+        froms = Enum.reverse(slot.froms)
+
+        # For single commands, submit directly without batch wrapper
+        # For multiple commands, wrap in a batch
+        case batch do
+          [single_cmd] ->
+            submit_single(state.shard_id, single_cmd, froms)
+
+          _multiple ->
+            submit_batch(state.shard_id, batch, froms)
+        end
+
+        # Remove the slot entirely once flushed (clean up empty slots)
+        new_slots = Map.delete(state.slots, slot_key)
+        {:noreply, %{state | slots: new_slots}}
     end
-
-    {:noreply, %{state | batch: [], froms: [], timer_ref: nil}}
   end
 
   defp submit_single(shard_id, command, [from]) do
@@ -240,13 +347,31 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Private: namespace config lookup
+  # ---------------------------------------------------------------------------
+
+  @spec lookup_ns_config(binary()) :: {pos_integer(), :quorum | :async}
+  defp lookup_ns_config(prefix) do
+    {NamespaceConfig.window_for(prefix), NamespaceConfig.durability_for(prefix)}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: slot helpers
+  # ---------------------------------------------------------------------------
+
+  @spec new_slot(pos_integer()) :: slot()
+  defp new_slot(window_ms) do
+    %{cmds: [], froms: [], timer_ref: nil, window_ms: window_ms}
+  end
+
   defp cancel_timer(nil), do: :ok
 
   defp cancel_timer(ref) do
     Process.cancel_timer(ref)
-    # Flush any pending :flush message that might have arrived
+    # Flush any pending :flush_slot message that might have arrived
     receive do
-      :flush -> :ok
+      {:flush_slot, _} -> :ok
     after
       0 -> :ok
     end

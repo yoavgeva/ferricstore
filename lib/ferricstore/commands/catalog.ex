@@ -102,7 +102,11 @@ defmodule Ferricstore.Commands.Catalog do
     %{name: "quit", arity: 1, flags: ["fast"], first_key: 0, last_key: 0, step: 0,
       summary: "Closes the connection."},
     %{name: "reset", arity: 1, flags: ["fast", "stale"], first_key: 0, last_key: 0, step: 0,
-      summary: "Resets the connection."}
+      summary: "Resets the connection."},
+
+    # -- FerricStore-native -------------------------------------------------
+    %{name: "ferricstore.config", arity: -2, flags: ["admin"], first_key: 0, last_key: 0, step: 0,
+      summary: "Manages per-namespace configuration (SET/GET/RESET)."}
   ]
 
   @commands_by_name Map.new(@commands, fn cmd -> {cmd.name, cmd} end)

@@ -1,11 +1,12 @@
 defmodule Ferricstore.Health.Endpoint do
   @moduledoc """
-  Minimal HTTP/1.1 health endpoint for Kubernetes readiness probes and the
-  built-in observability dashboard (spec 7.3).
+  Minimal HTTP/1.1 health endpoint for Kubernetes readiness and liveness
+  probes and the built-in observability dashboard (spec 7.3).
 
-  Runs a Ranch TCP listener on a configurable port (default: `9090`, or `0`
+  Runs a Ranch TCP listener on a configurable port (default: `4000`, or `0`
   for ephemeral in tests) that speaks just enough HTTP/1.1 to serve:
 
+    * `GET /health/live`  -- 200 always (liveness probe: process is alive)
     * `GET /health/ready` -- 200 when ready, 503 during startup
     * `GET /dashboard`    -- HTML dashboard with auto-refresh (spec 7.3)
     * All other paths      -- 404
@@ -22,16 +23,23 @@ defmodule Ferricstore.Health.Endpoint do
 
   ## Configuration
 
-      config :ferricstore, :health_port, 9090
+      config :ferricstore, :health_port, 4000
 
   Set to `0` in test to use an ephemeral port (see `port/0`).
 
   ## Kubernetes integration
 
+      livenessProbe:
+        httpGet:
+          path: /health/live
+          port: 4000
+        initialDelaySeconds: 2
+        periodSeconds: 10
+
       readinessProbe:
         httpGet:
           path: /health/ready
-          port: 9090
+          port: 4000
         initialDelaySeconds: 2
         periodSeconds: 5
   """
@@ -149,6 +157,10 @@ defmodule Ferricstore.Health.Endpoint do
   # ---------------------------------------------------------------------------
 
   @spec handle_request(:inet.socket(), module(), String.t(), String.t()) :: :ok
+  defp handle_request(socket, transport, "GET", "/health/live") do
+    send_response(socket, transport, 200, "OK", ~s({"status":"alive"}))
+  end
+
   defp handle_request(socket, transport, "GET", "/health/ready") do
     health = Ferricstore.Health.check()
 

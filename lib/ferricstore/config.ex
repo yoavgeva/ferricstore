@@ -210,6 +210,33 @@ defmodule Ferricstore.Config do
     build_initial_state()
   end
 
+  @doc """
+  Persists the current runtime configuration to disk.
+
+  Writes all current configuration key-value pairs to a file at
+  `<data_dir>/ferricstore.conf`. Each line is formatted as `key value`.
+
+  ## Returns
+
+    * `:ok` on success
+    * `{:error, reason}` when the file cannot be written
+  """
+  @spec rewrite() :: :ok | {:error, binary()}
+  def rewrite do
+    GenServer.call(__MODULE__, :rewrite)
+  end
+
+  @doc """
+  Returns the path where `CONFIG REWRITE` persists configuration.
+
+  The path is `<data_dir>/ferricstore.conf`.
+  """
+  @spec config_file_path() :: binary()
+  def config_file_path do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    Path.join(data_dir, "ferricstore.conf")
+  end
+
   # -------------------------------------------------------------------
   # GenServer callbacks
   # -------------------------------------------------------------------
@@ -265,6 +292,24 @@ defmodule Ferricstore.Config do
   def handle_call({:get_value, key}, _from, state) do
     state = refresh_read_only(state)
     {:reply, Map.get(state, key), state}
+  end
+
+  def handle_call(:rewrite, _from, state) do
+    state = refresh_read_only(state)
+    path = config_file_path()
+
+    content =
+      state
+      |> Enum.sort_by(fn {k, _v} -> k end)
+      |> Enum.map_join("\n", fn {k, v} -> "#{k} #{v}" end)
+
+    case File.write(path, content <> "\n") do
+      :ok ->
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, "ERR failed to write config file: #{inspect(reason)}"}, state}
+    end
   end
 
   # -------------------------------------------------------------------
