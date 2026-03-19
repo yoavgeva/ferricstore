@@ -140,7 +140,7 @@ defmodule Ferricstore.Health do
   @spec collect_shard_info() :: [shard_info()]
   defp collect_shard_info do
     Enum.map(0..(@shard_count - 1), fn index ->
-      ets = :"shard_ets_#{index}"
+      ets = :"keydir_#{index}"
       name = Router.shard_name(index)
 
       {status, keys} =

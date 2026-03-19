@@ -89,7 +89,8 @@ defmodule Ferricstore.Raft.WritePathTest do
   # Helper to generate unique keys
   defp ukey(base), do: "raft_wp_#{base}_#{:rand.uniform(9_999_999)}"
 
-  defp shard_ets_for(key), do: :"shard_ets_#{Router.shard_for(key)}"
+  defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
+  defp hot_cache_for(key), do: :"hot_cache_#{Router.shard_for(key)}"
 
   defp shard_pid_for(key) do
     name = Router.shard_name(Router.shard_for(key))
@@ -113,8 +114,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "sm_val", 0)
 
-      ets = shard_ets_for(k)
-      assert [{^k, "sm_val", 0}] = :ets.lookup(ets, k)
+      assert [{^k, "sm_val"}] = :ets.lookup(hot_cache_for(k), k)
     end
 
     test "SET with TTL preserves expiry through Raft path" do
@@ -174,11 +174,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("del_ets")
 
       :ok = Router.put(k, "will_vanish", 0)
-      ets = shard_ets_for(k)
-      assert [{^k, "will_vanish", 0}] = :ets.lookup(ets, k)
+      assert [{^k, "will_vanish"}] = :ets.lookup(hot_cache_for(k), k)
 
       :ok = Router.delete(k)
-      assert [] == :ets.lookup(ets, k)
+      assert [] == :ets.lookup(keydir_for(k), k)
     end
 
     test "DEL on non-existent key returns :ok" do
@@ -407,9 +406,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert "tx_val3" == Router.get(k3)
 
       # All should be in ETS (written by StateMachine)
-      assert [{^k1, "tx_val1", 0}] = :ets.lookup(shard_ets_for(k1), k1)
-      assert [{^k2, "tx_val2", 0}] = :ets.lookup(shard_ets_for(k2), k2)
-      assert [{^k3, "tx_val3", 0}] = :ets.lookup(shard_ets_for(k3), k3)
+      assert [{^k1, "tx_val1"}] = :ets.lookup(hot_cache_for(k1), k1)
+      assert [{^k2, "tx_val2"}] = :ets.lookup(hot_cache_for(k2), k2)
+      assert [{^k3, "tx_val3"}] = :ets.lookup(hot_cache_for(k3), k3)
     end
 
     test "mixed SET and DEL in transaction sequence" do
@@ -510,22 +509,42 @@ defmodule Ferricstore.Raft.WritePathTest do
     File.mkdir_p!(dir)
 
     {:ok, store} = NIF.new(dir)
-    ets_name = :"wp_sm_ets_#{:rand.uniform(9_999_999)}"
-    :ets.new(ets_name, [:set, :public, :named_table])
+    suffix = :rand.uniform(9_999_999)
+    keydir_name = :"wp_sm_keydir_#{suffix}"
+    hot_cache_name = :"wp_sm_hot_cache_#{suffix}"
+    :ets.new(keydir_name, [:set, :public, :named_table])
+    :ets.new(hot_cache_name, [:set, :public, :named_table])
 
     state =
       Ferricstore.Raft.StateMachine.init(%{
         shard_index: 0,
         store: store,
-        ets: ets_name
+        ets: keydir_name,
+        hot_cache: hot_cache_name
       })
 
-    {state, ets_name, store, dir}
+    {state, keydir_name, store, dir, hot_cache_name}
   end
 
   defp cleanup_sm({_state, ets_name, _store, dir}) do
     try do
       :ets.delete(ets_name)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    File.rm_rf!(dir)
+  end
+
+  defp cleanup_sm({_state, ets_name, _store, dir, hot_cache_name}) do
+    try do
+      :ets.delete(ets_name)
+    rescue
+      ArgumentError -> :ok
+    end
+
+    try do
+      :ets.delete(hot_cache_name)
     rescue
       ArgumentError -> :ok
     end
@@ -543,7 +562,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: LPUSH through Raft adds element" do
     test "LPUSH to a new key creates a list with the pushed elements" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, store, _dir, hc} = ctx
 
       {new_state, result} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["a", "b", "c"]}}, state)
@@ -553,7 +572,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert new_state.applied_count == 1
 
       # Verify ETS contains the serialized list
-      [{_, raw, 0}] = :ets.lookup(ets, "mylist")
+      [{_, raw}] = :ets.lookup(hc, "mylist")
       assert {:ok, ["c", "b", "a"]} = ListOps.decode_stored(raw)
 
       # Verify Bitcask contains the same value
@@ -564,7 +583,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "LPUSH to existing list prepends elements" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       {state2, 2} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["a", "b"]}}, state)
@@ -572,7 +591,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       {_state3, 4} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["c", "d"]}}, state2)
 
-      [{_, raw, 0}] = :ets.lookup(ets, "mylist")
+      [{_, raw}] = :ets.lookup(hc, "mylist")
       assert {:ok, ["d", "c", "b", "a"]} = ListOps.decode_stored(raw)
 
       cleanup_sm(ctx)
@@ -586,14 +605,14 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: RPUSH through Raft adds element" do
     test "RPUSH to a new key creates a list with the pushed elements" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       {_new_state, result} =
         SM.apply(%{}, {:list_op, "rlist", {:rpush, ["x", "y", "z"]}}, state)
 
       assert result == 3
 
-      [{_, raw, 0}] = :ets.lookup(ets, "rlist")
+      [{_, raw}] = :ets.lookup(hc, "rlist")
       assert {:ok, ["x", "y", "z"]} = ListOps.decode_stored(raw)
 
       cleanup_sm(ctx)
@@ -626,7 +645,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: LPOP through Raft removes element" do
     test "LPOP from a list returns and removes the leftmost element" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       # Build a list: [a, b, c]
       {state2, 3} =
@@ -640,7 +659,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert state3.applied_count == 2
 
       # Remaining list should be [b, c]
-      [{_, raw, 0}] = :ets.lookup(ets, "poplist")
+      [{_, raw}] = :ets.lookup(hc, "poplist")
       assert {:ok, ["b", "c"]} = ListOps.decode_stored(raw)
 
       cleanup_sm(ctx)
@@ -660,7 +679,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "LPOP all elements deletes the key" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       {state2, 1} =
         SM.apply(%{}, {:list_op, "single", {:rpush, ["only"]}}, state)
@@ -682,7 +701,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: RPOP through Raft removes element" do
     test "RPOP from a list returns and removes the rightmost element" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       {state2, 3} =
         SM.apply(%{}, {:list_op, "rpoplist", {:rpush, ["a", "b", "c"]}}, state)
@@ -692,7 +711,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       assert popped == "c"
 
-      [{_, raw, 0}] = :ets.lookup(ets, "rpoplist")
+      [{_, raw}] = :ets.lookup(hc, "rpoplist")
       assert {:ok, ["a", "b"]} = ListOps.decode_stored(raw)
 
       cleanup_sm(ctx)
@@ -706,7 +725,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_put: HSET through Raft writes field" do
     test "compound_put inserts a hash field into ETS and Bitcask" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, store, _dir, hc} = ctx
 
       compound_key = "myhash\x00field1"
 
@@ -717,7 +736,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert new_state.applied_count == 1
 
       # Verify ETS
-      assert [{^compound_key, "value1", 0}] = :ets.lookup(ets, compound_key)
+      assert [{^compound_key, "value1"}] = :ets.lookup(hc, compound_key)
 
       # Verify Bitcask
       assert {:ok, "value1"} = NIF.get(store, compound_key)
@@ -727,7 +746,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "compound_put overwrites existing field value" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       compound_key = "myhash\x00field1"
 
@@ -737,14 +756,14 @@ defmodule Ferricstore.Raft.WritePathTest do
       {_state3, :ok} =
         SM.apply(%{}, {:compound_put, compound_key, "v2", 0}, state2)
 
-      assert [{^compound_key, "v2", 0}] = :ets.lookup(ets, compound_key)
+      assert [{^compound_key, "v2"}] = :ets.lookup(hc, compound_key)
 
       cleanup_sm(ctx)
     end
 
     test "multiple compound_puts for different fields" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       {state2, :ok} =
         SM.apply(%{}, {:compound_put, "h\x00f1", "val1", 0}, state)
@@ -755,9 +774,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       {_state4, :ok} =
         SM.apply(%{}, {:compound_put, "h\x00f3", "val3", 0}, state3)
 
-      assert [{_, "val1", 0}] = :ets.lookup(ets, "h\x00f1")
-      assert [{_, "val2", 0}] = :ets.lookup(ets, "h\x00f2")
-      assert [{_, "val3", 0}] = :ets.lookup(ets, "h\x00f3")
+      assert [{_, "val1"}] = :ets.lookup(hc, "h\x00f1")
+      assert [{_, "val2"}] = :ets.lookup(hc, "h\x00f2")
+      assert [{_, "val3"}] = :ets.lookup(hc, "h\x00f3")
 
       cleanup_sm(ctx)
     end
@@ -770,7 +789,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_delete: HDEL through Raft removes field" do
     test "compound_delete removes a hash field from ETS and Bitcask" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, store, _dir, hc} = ctx
 
       compound_key = "myhash\x00field1"
 
@@ -807,7 +826,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_put: SADD through Raft adds member" do
     test "compound_put adds a set member (presence marker)" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, store, _dir, hc} = ctx
 
       # Sets use a presence marker as the value
       compound_key = "myset\x00member1"
@@ -817,7 +836,7 @@ defmodule Ferricstore.Raft.WritePathTest do
         SM.apply(%{}, {:compound_put, compound_key, presence, 0}, state)
 
       assert new_state.applied_count == 1
-      assert [{^compound_key, ^presence, 0}] = :ets.lookup(ets, compound_key)
+      assert [{^compound_key, ^presence}] = :ets.lookup(hc, compound_key)
       assert {:ok, ^presence} = NIF.get(store, compound_key)
 
       cleanup_sm(ctx)
@@ -825,7 +844,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "multiple set members via compound_put" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       {state2, :ok} =
         SM.apply(%{}, {:compound_put, "myset\x00m1", "1", 0}, state)
@@ -836,9 +855,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       {_state4, :ok} =
         SM.apply(%{}, {:compound_put, "myset\x00m3", "1", 0}, state3)
 
-      assert [{_, "1", 0}] = :ets.lookup(ets, "myset\x00m1")
-      assert [{_, "1", 0}] = :ets.lookup(ets, "myset\x00m2")
-      assert [{_, "1", 0}] = :ets.lookup(ets, "myset\x00m3")
+      assert [{_, "1"}] = :ets.lookup(hc, "myset\x00m1")
+      assert [{_, "1"}] = :ets.lookup(hc, "myset\x00m2")
+      assert [{_, "1"}] = :ets.lookup(hc, "myset\x00m3")
 
       cleanup_sm(ctx)
     end
@@ -851,7 +870,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_delete_prefix: DEL on hash through Raft cleans up all fields" do
     test "deletes all compound keys matching prefix" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, store, _dir, hc} = ctx
 
       # Insert several fields for a hash "myhash"
       prefix = "myhash\x00"
@@ -889,7 +908,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert {:ok, nil} = NIF.get(store, "myhash\x00f3")
 
       # The "otherhash" key should still exist
-      assert [{_, "ox", 0}] = :ets.lookup(ets, "otherhash\x00x")
+      assert [{_, "ox"}] = :ets.lookup(hc, "otherhash\x00x")
       assert {:ok, "ox"} = NIF.get(store, "otherhash\x00x")
 
       cleanup_sm(ctx)
@@ -897,7 +916,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "deletes all set members when DEL is called on the set key" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       prefix = "myset\x00"
 
@@ -934,7 +953,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "compound_delete_prefix does not affect unrelated keys" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       {state2, :ok} =
         SM.apply(%{}, {:compound_put, "hash_a\x00f1", "v1", 0}, state)
@@ -947,7 +966,7 @@ defmodule Ferricstore.Raft.WritePathTest do
         SM.apply(%{}, {:compound_delete_prefix, "hash_a\x00"}, state3)
 
       assert [] == :ets.lookup(ets, "hash_a\x00f1")
-      assert [{_, "v2", 0}] = :ets.lookup(ets, "hash_b\x00f1")
+      assert [{_, "v2"}] = :ets.lookup(hc, "hash_b\x00f1")
 
       cleanup_sm(ctx)
     end
@@ -960,7 +979,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "batch containing new command types" do
     test "batch with list_op, compound_put, and compound_delete" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, ets, _store, _dir, hc} = ctx
 
       commands = [
         {:list_op, "mylist", {:rpush, ["a", "b"]}},
@@ -976,14 +995,14 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert new_state.applied_count == 3
 
       # Verify list
-      [{_, raw, 0}] = :ets.lookup(ets, "mylist")
+      [{_, raw}] = :ets.lookup(hc, "mylist")
       assert {:ok, ["a", "b"]} = ListOps.decode_stored(raw)
 
       # Verify hash field
-      assert [{_, "v1", 0}] = :ets.lookup(ets, "myhash\x00f1")
+      assert [{_, "v1"}] = :ets.lookup(hc, "myhash\x00f1")
 
       # Verify set member
-      assert [{_, "1", 0}] = :ets.lookup(ets, "myset\x00m1")
+      assert [{_, "1"}] = :ets.lookup(hc, "myset\x00m1")
 
       cleanup_sm(ctx)
     end
@@ -1404,11 +1423,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("getdel_ets")
 
       :ok = Router.put(k, "in_ets", 0)
-      ets = shard_ets_for(k)
-      assert [{^k, "in_ets", 0}] = :ets.lookup(ets, k)
+      assert [{^k, "in_ets"}] = :ets.lookup(hot_cache_for(k), k)
 
       _old = Router.getdel(k)
-      assert [] == :ets.lookup(ets, k)
+      assert [] == :ets.lookup(keydir_for(k), k)
     end
   end
 

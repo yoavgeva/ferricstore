@@ -908,7 +908,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
       :ok = GenServer.call(pid, {:put, "del_while_ifl", "v", 0})
       :ok = GenServer.call(pid, {:delete, "del_while_ifl"})
       assert nil == GenServer.call(pid, {:get, "del_while_ifl"})
-      assert [] == :ets.lookup(:"shard_ets_#{idx}", "del_while_ifl")
+      assert [] == :ets.lookup(:"keydir_#{idx}", "del_while_ifl")
     end
 
     test "sibling keys survive when one key is deleted" do
@@ -1196,11 +1196,11 @@ defmodule Ferricstore.Bitcask.IoUringTest do
       on_exit(fn -> if Process.alive?(new_pid), do: GenServer.stop(new_pid) end)
 
       # Fresh shard has empty ETS
-      assert [] == :ets.lookup(:"shard_ets_#{idx}", "warm_me")
+      assert [] == :ets.lookup(:"keydir_#{idx}", "warm_me")
 
       # get warms ETS from Bitcask
       assert "wval" == GenServer.call(new_pid, {:get, "warm_me"})
-      assert [{_, "wval", _}] = :ets.lookup(:"shard_ets_#{idx}", "warm_me")
+      assert [{_, "wval"}] = :ets.lookup(:"hot_cache_#{idx}", "warm_me")
     end
   end
 

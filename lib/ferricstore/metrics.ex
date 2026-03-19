@@ -152,16 +152,22 @@ defmodule Ferricstore.Metrics do
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
     Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
-      table = :"shard_ets_#{i}"
+      keydir = :"keydir_#{i}"
+      hot_cache = :"hot_cache_#{i}"
 
       try do
-        words = :ets.info(table, :memory)
+        keydir_words = :ets.info(keydir, :memory)
+        hot_cache_words = :ets.info(hot_cache, :memory)
 
-        case words do
-          :undefined -> acc
-          n when is_integer(n) -> acc + n * :erlang.system_info(:wordsize)
-          _ -> acc
-        end
+        words =
+          case {keydir_words, hot_cache_words} do
+            {n1, n2} when is_integer(n1) and is_integer(n2) -> n1 + n2
+            {n1, _} when is_integer(n1) -> n1
+            {_, n2} when is_integer(n2) -> n2
+            _ -> 0
+          end
+
+        acc + words * :erlang.system_info(:wordsize)
       rescue
         ArgumentError -> acc
       end

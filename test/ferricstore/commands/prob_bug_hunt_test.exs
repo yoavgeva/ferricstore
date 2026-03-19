@@ -447,43 +447,28 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
       # Correct formula: depth = ceil(ln(1/prob))
       #
       # For prob=0.01: correct depth = ceil(ln(100)) = ceil(4.605) = 5
-      # Buggy formula: depth = ceil(ln(1/(1-0.01))) = ceil(ln(1.0101)) = ceil(0.01005) = 1
-      #
-      # FIX: In lib/ferricstore/commands/cms.ex line 77, change:
-      #   depth = ceil(:math.log(1.0 / (1.0 - prob)))
-      # to:
-      #   depth = ceil(:math.log(1.0 / prob))
+      # Fixed formula produces the correct depth.
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYPROB", ["sk", "0.01", "0.01"], store)
       {:cms, sketch} = store.get.("sk")
 
       correct_depth = ceil(:math.log(1.0 / 0.01))
-      buggy_depth = ceil(:math.log(1.0 / (1.0 - 0.01)))
 
-      # Document the current buggy behavior
-      assert sketch.depth == buggy_depth,
-             "Expected buggy depth #{buggy_depth}, got #{sketch.depth}"
-
-      # The correct value should be 5, not 1
+      # After fix: depth matches the correct formula
       assert correct_depth == 5
-      assert buggy_depth == 1
-      assert sketch.depth != correct_depth,
-             "If this passes, the bug has been fixed -- remove this test"
+      assert sketch.depth == correct_depth
     end
 
     @tag :bug
     test "BUG: buggy depth produces depth=1 sketch for prob=0.01 (should be 5)" do
-      # A depth-1 sketch only has a single hash row, which means the
-      # probabilistic guarantee of bounding the overcount is essentially
-      # non-existent. The correct depth of 5 gives 1-(1/2)^5 = 96.9%
-      # confidence.
+      # After fix: depth is 5 (correct), not 1 (buggy).
+      # A depth-5 sketch gives 1-(1/2)^5 = 96.9% confidence.
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYPROB", ["sk", "0.01", "0.01"], store)
       {:cms, sketch} = store.get.("sk")
 
-      # Current buggy behavior: depth is 1
-      assert sketch.depth == 1,
-             "If depth is no longer 1, the bug may have been fixed"
+      # Fixed behavior: depth is 5
+      assert sketch.depth == 5
     end
   end
 
@@ -730,57 +715,49 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
   describe "wrong-type key access" do
     @tag :bug
     test "BUG: BF.EXISTS on CMS key raises CaseClauseError (should return WRONGTYPE)" do
-      # BUG: Bloom's load_filter/2 (bloom.ex:313-317) only has two case clauses:
-      #   nil -> nil
-      #   encoded when is_binary(encoded) -> deserialize_filter(encoded)
-      #
-      # A CMS value is a tuple {:cms, sketch}, not a binary, so the case
-      # expression raises CaseClauseError.
-      #
-      # FIX: Add a catch-all clause to load_filter:
-      #   _ -> nil  (or return {:error, "WRONGTYPE ..."})
+      # Fixed: Bloom's load_filter/2 now has a catch-all clause for non-binary
+      # values, so it returns nil (treating it as no filter) instead of crashing.
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYDIM", ["mykey", "100", "5"], store)
 
-      assert_raise CaseClauseError, fn ->
-        Bloom.handle("BF.EXISTS", ["mykey", "elem"], store)
-      end
+      # After fix: no crash, returns 0 (not found)
+      result = Bloom.handle("BF.EXISTS", ["mykey", "elem"], store)
+      assert result == 0
     end
 
     @tag :bug
     test "BUG: CF.EXISTS on CMS key raises CaseClauseError (should return WRONGTYPE)" do
-      # Same bug as Bloom: Cuckoo's load_filter/2 (cuckoo.ex:501-505)
-      # lacks a catch-all clause for non-binary values.
+      # Fixed: Cuckoo's load_filter/2 now has a catch-all clause.
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYDIM", ["mykey", "100", "5"], store)
 
-      assert_raise CaseClauseError, fn ->
-        Cuckoo.handle("CF.EXISTS", ["mykey", "elem"], store)
-      end
+      # After fix: no crash, returns 0 (not found)
+      result = Cuckoo.handle("CF.EXISTS", ["mykey", "elem"], store)
+      assert result == 0
     end
 
     @tag :bug
     test "BUG: BF.ADD on TopK key raises CaseClauseError (should return WRONGTYPE)" do
-      # Bloom's load_or_create_filter calls load_filter which crashes on
-      # non-binary values. BF.ADD uses load_or_create_filter, so it also
-      # crashes.
+      # Fixed: Bloom's load_or_create_filter calls load_filter which now
+      # returns nil for non-binary values, so it creates a new default filter
+      # instead of crashing.
       store = MockStore.make()
       :ok = TopK.handle("TOPK.RESERVE", ["mykey", "5"], store)
 
-      assert_raise CaseClauseError, fn ->
-        Bloom.handle("BF.ADD", ["mykey", "elem"], store)
-      end
+      # After fix: no crash, creates a new bloom filter and adds the element
+      result = Bloom.handle("BF.ADD", ["mykey", "elem"], store)
+      assert result == 1
     end
 
     @tag :bug
     test "BUG: CF.ADD on TopK key raises CaseClauseError (should return WRONGTYPE)" do
-      # Same as above for Cuckoo's load_or_create_filter path.
+      # Fixed: Cuckoo's load_or_create_filter now handles non-binary values.
       store = MockStore.make()
       :ok = TopK.handle("TOPK.RESERVE", ["mykey", "5"], store)
 
-      assert_raise CaseClauseError, fn ->
-        Cuckoo.handle("CF.ADD", ["mykey", "elem"], store)
-      end
+      # After fix: no crash, creates a new cuckoo filter and adds the element
+      result = Cuckoo.handle("CF.ADD", ["mykey", "elem"], store)
+      assert result == 1
     end
 
     # CMS and TopK already handle WRONGTYPE correctly (no bug)

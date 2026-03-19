@@ -74,10 +74,11 @@ defmodule Ferricstore.Store.Router do
     alias Ferricstore.Stats
 
     idx = shard_for(key)
-    ets = :"shard_ets_#{idx}"
+    keydir = :"keydir_#{idx}"
+    hot_cache = :"hot_cache_#{idx}"
     now = System.os_time(:millisecond)
 
-    case ets_get(ets, key, now) do
+    case ets_get(keydir, hot_cache, key, now) do
       {:hit, value, _exp} ->
         Stats.record_hot_read(key)
         value
@@ -107,10 +108,11 @@ defmodule Ferricstore.Store.Router do
     alias Ferricstore.Stats
 
     idx = shard_for(key)
-    ets = :"shard_ets_#{idx}"
+    keydir = :"keydir_#{idx}"
+    hot_cache = :"hot_cache_#{idx}"
     now = System.os_time(:millisecond)
 
-    case ets_get(ets, key, now) do
+    case ets_get(keydir, hot_cache, key, now) do
       {:hit, value, exp} ->
         Stats.record_hot_read(key)
         {value, exp}
@@ -128,22 +130,31 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  # ETS fast-path lookup. Returns:
+  # ETS fast-path lookup using the two-table split.
+  # Checks keydir for expiry, then hot_cache for the value.
+  # Returns:
   #   {:hit, value, expire_at_ms} -- key is live
   #   :expired                    -- key existed but has passed its TTL (also evicts it)
   #   :miss                       -- key not in ETS (may be in Bitcask)
   #   :no_table                   -- ETS table does not exist (shard restarting)
-  defp ets_get(ets, key, now) do
+  defp ets_get(keydir, hot_cache, key, now) do
     try do
-      case :ets.lookup(ets, key) do
-        [{^key, value, 0}] ->
-          {:hit, value, 0}
+      case :ets.lookup(keydir, key) do
+        [{^key, 0}] ->
+          case :ets.lookup(hot_cache, key) do
+            [{^key, value}] -> {:hit, value, 0}
+            [] -> :miss
+          end
 
-        [{^key, value, exp}] when exp > now ->
-          {:hit, value, exp}
+        [{^key, exp}] when exp > now ->
+          case :ets.lookup(hot_cache, key) do
+            [{^key, value}] -> {:hit, value, exp}
+            [] -> :miss
+          end
 
-        [{^key, _value, _exp}] ->
-          :ets.delete(ets, key)
+        [{^key, _exp}] ->
+          :ets.delete(keydir, key)
+          :ets.delete(hot_cache, key)
           :expired
 
         [] ->

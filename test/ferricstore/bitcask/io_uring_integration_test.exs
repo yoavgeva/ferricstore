@@ -333,15 +333,15 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
       :ok = GenServer.call(pid, :flush)
 
       # Evict from ETS to force cold path
-      ets = :"shard_ets_#{idx}"
-      :ets.delete(ets, "cold_k")
-      assert [] == :ets.lookup(ets, "cold_k")
+      :ets.delete(:"keydir_#{idx}", "cold_k")
+      :ets.delete(:"hot_cache_#{idx}", "cold_k")
+      assert [] == :ets.lookup(:"keydir_#{idx}", "cold_k")
 
       # get should warm the cache from Bitcask
       assert "cold_v" == GenServer.call(pid, {:get, "cold_k"})
 
       # Now ETS should be warm
-      assert [{_, "cold_v", _}] = :ets.lookup(ets, "cold_k")
+      assert [{_, "cold_v"}] = :ets.lookup(:"hot_cache_#{idx}", "cold_k")
     end
 
     test "Router.get takes cold path when ETS is empty for that shard" do
@@ -353,7 +353,8 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
       :ok = GenServer.call(pid, :flush)
 
       # Evict ETS
-      :ets.delete(:"shard_ets_#{idx}", k)
+      :ets.delete(:"keydir_#{idx}", k)
+      :ets.delete(:"hot_cache_#{idx}", k)
 
       # Use GenServer cold path directly
       assert "cold_rtr_v" == GenServer.call(pid, {:get, k})
@@ -1036,10 +1037,9 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
 
       # ETS is written synchronously during put — hot path must work immediately
       idx = Router.shard_for(k)
-      ets = :"shard_ets_#{idx}"
 
       # Confirm in ETS
-      assert [{^k, "hot_v", _exp}] = :ets.lookup(ets, k)
+      assert [{^k, "hot_v"}] = :ets.lookup(:"hot_cache_#{idx}", k)
 
       # Router.get should return from ETS (hot path)
       assert "hot_v" == Router.get(k)
@@ -1052,7 +1052,8 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
       # Force flush and evict ETS
       shard_name = Router.shard_name(Router.shard_for(k))
       :ok = GenServer.call(shard_name, :flush)
-      :ets.delete(:"shard_ets_#{Router.shard_for(k)}", k)
+      :ets.delete(:"keydir_#{Router.shard_for(k)}", k)
+      :ets.delete(:"hot_cache_#{Router.shard_for(k)}", k)
 
       # Cold path: must still return correct value
       assert "cold_v" == Router.get(k)

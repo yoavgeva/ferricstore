@@ -147,15 +147,17 @@ defmodule Ferricstore.Commands.Cluster do
 
   defp collect_shard_info do
     Enum.map(0..(@shard_count - 1), fn index ->
-      ets = :"shard_ets_#{index}"
+      keydir = :"keydir_#{index}"
+      hot_cache = :"hot_cache_#{index}"
       name = Router.shard_name(index)
 
       info =
         try do
-          keys = :ets.info(ets, :size)
-          memory_words = :ets.info(ets, :memory)
+          keys = :ets.info(keydir, :size)
+          keydir_words = :ets.info(keydir, :memory)
+          hot_cache_words = :ets.info(hot_cache, :memory)
           word_size = :erlang.system_info(:wordsize)
-          memory_bytes = memory_words * word_size
+          memory_bytes = (keydir_words + hot_cache_words) * word_size
 
           status =
             case Process.whereis(name) do

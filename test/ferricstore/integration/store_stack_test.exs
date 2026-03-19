@@ -41,8 +41,10 @@ defmodule Ferricstore.Integration.StoreStackTest do
   # Generates a unique key to prevent cross-test interference.
   defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
 
-  # Returns the ETS table name for the shard that owns `key`.
-  defp shard_ets_for(key), do: :"shard_ets_#{Router.shard_for(key)}"
+  # Returns the keydir ETS table name for the shard that owns `key`.
+  defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
+  # Returns the hot_cache ETS table name for the shard that owns `key`.
+  defp hot_cache_for(key), do: :"hot_cache_#{Router.shard_for(key)}"
 
   # Returns the PID of the shard GenServer that owns `key`.
   defp shard_pid_for(key) do
@@ -84,7 +86,7 @@ defmodule Ferricstore.Integration.StoreStackTest do
       assert nil == Strings.handle("GET", [k], store)
 
       # Verify ETS is clean
-      assert [] == :ets.lookup(shard_ets_for(k), k)
+      assert [] == :ets.lookup(keydir_for(k), k)
     end
 
     test "EXISTS reflects current store state" do
@@ -298,8 +300,7 @@ defmodule Ferricstore.Integration.StoreStackTest do
       # GET warms the ETS cache
       assert "cached_val" == Router.get(k)
 
-      ets = shard_ets_for(k)
-      assert [{^k, "cached_val", _}] = :ets.lookup(ets, k)
+      assert [{^k, "cached_val"}] = :ets.lookup(hot_cache_for(k), k)
     end
 
     test "ETS cache is cleared after DEL" do
@@ -307,10 +308,10 @@ defmodule Ferricstore.Integration.StoreStackTest do
       Router.put(k, "val", 0)
       # Warm the cache
       Router.get(k)
-      assert [{^k, _, _}] = :ets.lookup(shard_ets_for(k), k)
+      assert [{^k, _}] = :ets.lookup(keydir_for(k), k)
 
       Router.delete(k)
-      assert [] == :ets.lookup(shard_ets_for(k), k)
+      assert [] == :ets.lookup(keydir_for(k), k)
     end
 
     test "ETS cache stores correct expiry" do
@@ -319,8 +320,8 @@ defmodule Ferricstore.Integration.StoreStackTest do
 
       Router.put(k, "v", future)
       # PUT writes to ETS directly, so it should be there
-      ets = shard_ets_for(k)
-      assert [{^k, "v", ^future}] = :ets.lookup(ets, k)
+      assert [{^k, ^future}] = :ets.lookup(keydir_for(k), k)
+      assert [{^k, "v"}] = :ets.lookup(hot_cache_for(k), k)
     end
 
     test "expired key is evicted from ETS on get" do
@@ -329,12 +330,12 @@ defmodule Ferricstore.Integration.StoreStackTest do
 
       Router.put(k, "v", past)
       # Confirm ETS has the entry (put always writes)
-      ets = shard_ets_for(k)
-      assert [{^k, "v", ^past}] = :ets.lookup(ets, k)
+      assert [{^k, ^past}] = :ets.lookup(keydir_for(k), k)
+      assert [{^k, "v"}] = :ets.lookup(hot_cache_for(k), k)
 
       # GET detects expiry, evicts from ETS, returns nil
       assert nil == Router.get(k)
-      assert [] == :ets.lookup(ets, k)
+      assert [] == :ets.lookup(keydir_for(k), k)
     end
   end
 
@@ -424,8 +425,7 @@ defmodule Ferricstore.Integration.StoreStackTest do
       Router.get(k)
 
       # Confirm ETS has the value
-      ets_name = shard_ets_for(k)
-      assert [{^k, "rebuild_val", _}] = :ets.lookup(ets_name, k)
+      assert [{^k, "rebuild_val"}] = :ets.lookup(hot_cache_for(k), k)
 
       # Flush pending writes to Bitcask before killing so data survives the crash.
       pid = shard_pid_for(k)
@@ -439,7 +439,7 @@ defmodule Ferricstore.Integration.StoreStackTest do
 
       # New ETS table is empty (fresh shard), but GET should warm it from Bitcask
       assert "rebuild_val" == Router.get(k)
-      assert [{^k, "rebuild_val", _}] = :ets.lookup(ets_name, k)
+      assert [{^k, "rebuild_val"}] = :ets.lookup(hot_cache_for(k), k)
     end
 
     test "multiple keys survive shard crash" do

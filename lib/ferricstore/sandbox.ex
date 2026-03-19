@@ -181,18 +181,19 @@ defmodule FerricStore.Sandbox do
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
     Enum.each(0..(shard_count - 1), fn i ->
-      ets_name = :"shard_ets_#{i}"
+      keydir = :"keydir_#{i}"
+      hot_cache = :"hot_cache_#{i}"
 
       try do
-        # Scan the ETS table for keys with the namespace prefix and delete them.
-        # We use :ets.match/2 to find keys, then filter by prefix.
+        # Scan the keydir table for keys with the namespace prefix and delete them.
         keys =
-          :ets.tab2list(ets_name)
-          |> Enum.filter(fn {key, _value, _exp} -> String.starts_with?(key, namespace) end)
-          |> Enum.map(fn {key, _value, _exp} -> key end)
+          :ets.tab2list(keydir)
+          |> Enum.filter(fn {key, _exp} -> String.starts_with?(key, namespace) end)
+          |> Enum.map(fn {key, _exp} -> key end)
 
         Enum.each(keys, fn key ->
-          :ets.delete(ets_name, key)
+          :ets.delete(keydir, key)
+          :ets.delete(hot_cache, key)
           # Also delete from the underlying Bitcask store via Router.delete
           Router.delete(key)
         end)

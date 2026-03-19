@@ -85,8 +85,8 @@ defmodule Ferricstore.Commands.CMSTest do
       expected_width = ceil(:math.exp(1) / 0.01)
       assert sketch.width == expected_width
 
-      # depth = ceil(ln(1 / (1 - 0.99))) = ceil(ln(100)) = ceil(4.605) = 5
-      expected_depth = ceil(:math.log(1.0 / (1.0 - 0.99)))
+      # depth = ceil(ln(1 / prob)) = ceil(ln(1/0.99)) = ceil(0.01005) = 1
+      expected_depth = ceil(:math.log(1.0 / 0.99))
       assert sketch.depth == expected_depth
     end
 
@@ -639,11 +639,11 @@ defmodule Ferricstore.Commands.CMSTest do
       assert sketch.width > 10_000
     end
 
-    test "INITBYPROB with very high probability creates deep sketch" do
+    test "INITBYPROB with very small probability creates deep sketch" do
       store = MockStore.make()
-      :ok = CMS.handle("CMS.INITBYPROB", ["mysketch", "0.01", "0.9999"], store)
+      :ok = CMS.handle("CMS.INITBYPROB", ["mysketch", "0.01", "0.0001"], store)
       {:cms, sketch} = store.get.("mysketch")
-      # depth = ceil(ln(1/(1-0.9999))) = ceil(ln(10000)) = ceil(9.21) = 10
+      # depth = ceil(ln(1/0.0001)) = ceil(ln(10000)) = ceil(9.21) = 10
       assert sketch.depth >= 9
     end
 

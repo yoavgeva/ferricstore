@@ -368,15 +368,21 @@ defmodule Ferricstore.Commands.Server do
     process_mem = :erlang.memory(:processes)
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
-    # Sum ETS memory across all shard tables (one per shard).
-    # Each shard's ETS table is named :shard_ets_N.
+    # Sum ETS memory across both keydir and hot_cache tables per shard.
     keydir_bytes =
       Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
-        table = :"shard_ets_#{i}"
-
         try do
-          # :ets.info returns memory in words; multiply by word size to get bytes.
-          words = :ets.info(table, :memory)
+          keydir_words = :ets.info(:"keydir_#{i}", :memory)
+          hot_cache_words = :ets.info(:"hot_cache_#{i}", :memory)
+
+          words =
+            case {keydir_words, hot_cache_words} do
+              {n1, n2} when is_integer(n1) and is_integer(n2) -> n1 + n2
+              {n1, _} when is_integer(n1) -> n1
+              {_, n2} when is_integer(n2) -> n2
+              _ -> 0
+            end
+
           acc + words * :erlang.system_info(:wordsize)
         rescue
           ArgumentError -> acc

@@ -62,7 +62,8 @@ defmodule Ferricstore.Raft.IntegrationTest do
 
   defp ukey(base), do: "raft_int_#{base}_#{:rand.uniform(9_999_999)}"
 
-  defp shard_ets_for(key), do: :"shard_ets_#{Router.shard_for(key)}"
+  defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
+  defp hot_cache_for(key), do: :"hot_cache_#{Router.shard_for(key)}"
 
   defp shard_pid_for(key) do
     name = Router.shard_name(Router.shard_for(key))
@@ -87,8 +88,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
       Router.put(k, "dual_val", 0)
 
       # ETS should have the value
-      ets = shard_ets_for(k)
-      assert [{^k, "dual_val", 0}] = :ets.lookup(ets, k)
+      assert [{^k, "dual_val"}] = :ets.lookup(hot_cache_for(k), k)
 
       # Flush pending writes to Bitcask before checking NIF directly
       shard_name = Router.shard_name(Router.shard_for(k))
@@ -110,8 +110,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
       assert nil == Router.get(k)
 
       # ETS should be empty
-      ets = shard_ets_for(k)
-      assert [] == :ets.lookup(ets, k)
+      assert [] == :ets.lookup(keydir_for(k), k)
     end
 
     test "multiple writes to same key return latest value" do

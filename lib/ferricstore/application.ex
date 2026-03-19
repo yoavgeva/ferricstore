@@ -184,11 +184,11 @@ defmodule Ferricstore.Application do
         )
 
     Enum.reduce(0..(shard_count - 1), {0, nil, 0}, fn i, {count, largest_key, largest_size} ->
-      ets = :"shard_ets_#{i}"
+      hot_cache = :"hot_cache_#{i}"
 
       try do
         :ets.foldl(
-          fn {key, value, _expire_at_ms}, {c, lk, ls} ->
+          fn {key, value}, {c, lk, ls} ->
             size = byte_size(value)
 
             if size > threshold do
@@ -202,7 +202,7 @@ defmodule Ferricstore.Application do
             end
           end,
           {count, largest_key, largest_size},
-          ets
+          hot_cache
         )
       rescue
         ArgumentError ->
