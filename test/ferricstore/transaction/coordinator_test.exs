@@ -23,35 +23,6 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     :ok
   end
 
-  defp store do
-    %{
-      get: &Router.get/1,
-      get_meta: &Router.get_meta/1,
-      put: &Router.put/3,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      keys: &Router.keys/0,
-      flush: fn ->
-        Enum.each(Router.keys(), &Router.delete/1)
-        :ok
-      end,
-      dbsize: &Router.dbsize/0,
-      incr: &Router.incr/2,
-      incr_float: &Router.incr_float/2,
-      append: &Router.append/2,
-      getset: &Router.getset/2,
-      getdel: &Router.getdel/1,
-      getex: &Router.getex/2,
-      setrange: &Router.setrange/3,
-      cas: &Router.cas/4,
-      lock: &Router.lock/3,
-      unlock: &Router.unlock/2,
-      extend: &Router.extend/3,
-      ratelimit_add: &Router.ratelimit_add/4,
-      list_op: &Router.list_op/2
-    }
-  end
-
   # Verify key-to-shard mapping assumptions used throughout these tests.
   describe "test infrastructure" do
     test "keys route to expected shards" do
