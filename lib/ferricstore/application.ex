@@ -57,6 +57,8 @@ defmodule Ferricstore.Application do
     Ferricstore.Waiters.init()
     # Initialize client tracking ETS tables
     Ferricstore.ClientTracking.init_tables()
+    # Initialize stream metadata ETS tables (owned by this long-lived process)
+    Ferricstore.Commands.Stream.init_tables()
 
     # Start the ra system before shards so that Shard.init can start ra servers.
     if raft_enabled? do

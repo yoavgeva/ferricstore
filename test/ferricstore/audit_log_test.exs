@@ -23,6 +23,19 @@ defmodule Ferricstore.AuditLogTest do
       # Restore default (disabled) after tests.
       Application.put_env(:ferricstore, :audit_log_enabled, false)
       Application.put_env(:ferricstore, :audit_log_max_entries, 128)
+
+      # Reset any config params changed by tests (e.g. hz) to defaults
+      # so subsequent test modules see clean state.
+      defaults = Ferricstore.Config.defaults()
+      Enum.each(defaults, fn {k, v} ->
+        try do
+          Ferricstore.Config.set(k, v)
+        rescue
+          _ -> :ok
+        catch
+          :exit, _ -> :ok
+        end
+      end)
     end)
   end
 

@@ -253,11 +253,24 @@ defmodule Ferricstore.Commands.Stream do
   # ---------------------------------------------------------------------------
 
   @doc """
+  Eagerly creates the stream ETS tables.
+
+  Must be called once during application startup (from `Application.start/2`)
+  so that the tables are owned by the long-lived application process.  This
+  prevents the tables from being destroyed when short-lived connection
+  processes exit.
+  """
+  @spec init_tables() :: :ok
+  def init_tables do
+    ensure_meta_table()
+  end
+
+  @doc """
   Ensures the stream metadata ETS tables exist.
 
   Called lazily on first use. The tables are `:public` and `:named_table`
-  so any process can read and write them. In production these would be
-  owned by a dedicated process; for v1 the creating process owns them.
+  so any process can read and write them. When `init_tables/0` has been
+  called at application startup, this is a cheap no-op.
   """
   @spec ensure_meta_table() :: :ok
   def ensure_meta_table do

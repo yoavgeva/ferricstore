@@ -7,27 +7,20 @@ defmodule Ferricstore.Commands.ConfigTest do
   alias Ferricstore.Stats
   alias Ferricstore.Test.MockStore
 
-  # Reset config to defaults after each test to avoid cross-test contamination.
-  # Also restore any Application env values that side-effects may have changed.
+  # Reset config to defaults before AND after each test to avoid cross-test
+  # and cross-module contamination (e.g. AuditLogTest setting hz to "100").
   setup do
     # Capture original Application env values that CONFIG SET may alter
     orig_eviction = Application.get_env(:ferricstore, :eviction_policy)
     orig_slowlog_us = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
     orig_slowlog_max = Application.get_env(:ferricstore, :slowlog_max_len)
 
+    # Reset read-write config params to defaults BEFORE each test so that
+    # leftover state from other modules does not leak into this module.
+    reset_config_defaults()
+
     on_exit(fn ->
-      # Re-init Config GenServer state by setting all known params back
-      defaults = Config.defaults()
-      Enum.each(defaults, fn {k, v} ->
-        # Use direct GenServer call to bypass validation for read-only params
-        try do
-          Config.set(k, v)
-        rescue
-          _ -> :ok
-        catch
-          :exit, _ -> :ok
-        end
-      end)
+      reset_config_defaults()
 
       # Restore Application env
       if orig_eviction, do: Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
@@ -36,6 +29,19 @@ defmodule Ferricstore.Commands.ConfigTest do
     end)
 
     :ok
+  end
+
+  defp reset_config_defaults do
+    defaults = Config.defaults()
+    Enum.each(defaults, fn {k, v} ->
+      try do
+        Config.set(k, v)
+      rescue
+        _ -> :ok
+      catch
+        :exit, _ -> :ok
+      end
+    end)
   end
 
   # ---------------------------------------------------------------------------
