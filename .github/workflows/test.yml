@@ -78,12 +78,14 @@ jobs:
         run: mix test --trace --timeout 30000
 
       - name: Run cluster tests (multi-node via :peer)
+        if: always()
         run: |
           epmd -daemon
           elixir --sname ci_runner --cookie ferricstore_test -S mix test --include cluster --timeout 60000
         continue-on-error: true
 
       - name: Run Jepsen-style durability tests
+        if: always()
         run: |
           elixir --sname ci_jepsen --cookie ferricstore_test -S mix test --include jepsen --timeout 120000
         continue-on-error: true
