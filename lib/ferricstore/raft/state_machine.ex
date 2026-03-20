@@ -43,7 +43,7 @@ defmodule Ferricstore.Raft.StateMachine do
   @behaviour :ra_machine
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.ListOps
+  alias Ferricstore.Store.{ListOps, PrefixIndex}
 
   @default_release_cursor_interval 1_000
 
@@ -90,6 +90,7 @@ defmodule Ferricstore.Raft.StateMachine do
       store: config.store,
       ets: config.ets,
       hot_cache: Map.get(config, :hot_cache, :"hot_cache_#{config.shard_index}"),
+      prefix_keys: PrefixIndex.table_name(config.shard_index),
       applied_count: 0,
       release_cursor_interval: interval
     }
@@ -480,6 +481,7 @@ defmodule Ferricstore.Raft.StateMachine do
       :ok ->
         :ets.insert(state.ets, {key, expire_at_ms})
         :ets.insert(state.hot_cache, {key, value})
+        sm_prefix_track(state, key)
         :ok
 
       {:error, reason} ->
@@ -491,7 +493,27 @@ defmodule Ferricstore.Raft.StateMachine do
     NIF.delete(state.store, key)
     :ets.delete(state.ets, key)
     :ets.delete(state.hot_cache, key)
+    sm_prefix_untrack(state, key)
     :ok
+  end
+
+  # Tracks a key in the prefix index. Safe to call even if the prefix_keys
+  # table does not exist yet (during state machine init before the shard
+  # has fully started).
+  defp sm_prefix_track(%{prefix_keys: table, shard_index: idx}, key) do
+    try do
+      PrefixIndex.track(table, key, idx)
+    rescue
+      ArgumentError -> :ok
+    end
+  end
+
+  defp sm_prefix_untrack(%{prefix_keys: table, shard_index: idx}, key) do
+    try do
+      PrefixIndex.untrack(table, key, idx)
+    rescue
+      ArgumentError -> :ok
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -828,6 +850,7 @@ defmodule Ferricstore.Raft.StateMachine do
       [{^key, _exp}] ->
         :ets.delete(state.ets, key)
         :ets.delete(state.hot_cache, key)
+        sm_prefix_untrack(state, key)
         :expired
 
       [] ->

@@ -106,11 +106,20 @@ defmodule Ferricstore.MetricsTest do
         |> String.split("\n", trim: true)
         |> Enum.reject(&String.starts_with?(&1, "#"))
 
-      assert length(sample_lines) == 11,
-             "Expected 11 sample lines, got #{length(sample_lines)}"
+      # At least the 11 base metrics, plus any labeled prefix/namespace metrics
+      assert length(sample_lines) >= 11,
+             "Expected at least 11 sample lines, got #{length(sample_lines)}"
 
       for line <- sample_lines do
-        [_name, value_str] = String.split(line, " ", parts: 2)
+        # Handle labeled metrics: metric_name{labels} value
+        value_str =
+          case Regex.run(~r/\}\s+(.+)$/, line) do
+            [_, val] -> val
+            nil ->
+              [_name, val] = String.split(line, " ", parts: 2)
+              val
+          end
+
         {value, ""} = Integer.parse(value_str)
 
         assert value >= 0,
@@ -122,28 +131,21 @@ defmodule Ferricstore.MetricsTest do
       text = Metrics.scrape()
       lines = String.split(text, "\n", trim: true)
 
-      # Group into triplets (HELP, TYPE, sample)
-      triplets = Enum.chunk_every(lines, 3)
+      # Group lines into metric families: each starts with # HELP, then # TYPE,
+      # then one or more sample lines (for labeled metrics there can be many).
+      families = parse_metric_families(lines)
 
-      for triplet <- triplets do
-        assert length(triplet) == 3,
-               "Expected triplet of 3 lines, got #{length(triplet)}: #{inspect(triplet)}"
-
-        [help, type, sample] = triplet
-        assert String.starts_with?(help, "# HELP ")
-        assert String.starts_with?(type, "# TYPE ")
-        refute String.starts_with?(sample, "#")
-
-        # Ensure the metric name is consistent across all three lines
-        help_name = help |> String.replace_prefix("# HELP ", "") |> String.split(" ", parts: 2) |> hd()
-        type_name = type |> String.replace_prefix("# TYPE ", "") |> String.split(" ", parts: 2) |> hd()
-        sample_name = sample |> String.split(" ", parts: 2) |> hd()
-
+      for {help_name, type_name, sample_names} <- families do
         assert help_name == type_name,
                "HELP name (#{help_name}) does not match TYPE name (#{type_name})"
 
-        assert type_name == sample_name,
-               "TYPE name (#{type_name}) does not match sample name (#{sample_name})"
+        # Each sample name should match or start with the metric name
+        # (labeled metrics have {labels} appended)
+        for sample_name <- sample_names do
+          base_name = sample_name |> String.split("{") |> hd()
+          assert base_name == type_name,
+                 "TYPE name (#{type_name}) does not match sample name (#{sample_name})"
+        end
       end
     end
 
@@ -159,7 +161,7 @@ defmodule Ferricstore.MetricsTest do
       assert value >= 0
     end
 
-    test "produces exactly 11 metrics" do
+    test "produces at least 11 base metrics" do
       text = Metrics.scrape()
 
       help_count =
@@ -167,7 +169,8 @@ defmodule Ferricstore.MetricsTest do
         |> String.split("\n", trim: true)
         |> Enum.count(&String.starts_with?(&1, "# HELP"))
 
-      assert help_count == 11
+      # 11 base metrics, plus namespace and prefix metrics when data exists
+      assert help_count >= 11
     end
   end
 
@@ -245,6 +248,45 @@ defmodule Ferricstore.MetricsTest do
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
+
+  # Parses Prometheus text into metric families.
+  # Returns [{help_name, type_name, [sample_names]}]
+  defp parse_metric_families(lines) do
+    parse_metric_families(lines, [])
+  end
+
+  defp parse_metric_families([], acc), do: Enum.reverse(acc)
+
+  defp parse_metric_families(["# HELP " <> rest | lines], acc) do
+    help_name = rest |> String.split(" ", parts: 2) |> hd()
+
+    case lines do
+      ["# TYPE " <> type_rest | sample_lines] ->
+        type_name = type_rest |> String.split(" ", parts: 2) |> hd()
+
+        # Collect all sample lines until the next # HELP or end
+        {samples, remaining} =
+          Enum.split_while(sample_lines, fn line ->
+            not String.starts_with?(line, "# HELP") and not String.starts_with?(line, "# TYPE")
+          end)
+
+        sample_names =
+          samples
+          |> Enum.reject(&String.starts_with?(&1, "#"))
+          |> Enum.map(fn line ->
+            line |> String.split(" ", parts: 2) |> hd()
+          end)
+
+        parse_metric_families(remaining, [{help_name, type_name, sample_names} | acc])
+
+      _ ->
+        parse_metric_families(lines, acc)
+    end
+  end
+
+  defp parse_metric_families([_line | lines], acc) do
+    parse_metric_families(lines, acc)
+  end
 
   defp extract_metric_value(text, metric_name) do
     text

@@ -65,6 +65,7 @@ defmodule Ferricstore.Spec.MemoryGuardBudgetTest do
         keydir_max_ram: 256 * 1024 * 1024,
         max_memory_bytes: 1_073_741_824
       })
+      MemoryGuard.force_check()
 
       ShardHelpers.flush_all_keys()
       ShardHelpers.wait_shards_alive()

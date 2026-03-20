@@ -353,6 +353,20 @@ defmodule Ferricstore.Store.Router do
     end)
   end
 
+  @doc """
+  Returns all live keys that have the given prefix (text before the first `:`).
+
+  Uses the per-shard prefix index for O(matching) lookup instead of scanning
+  all keys. This is the fast path for `SCAN MATCH 'prefix:*'` and
+  `KEYS 'prefix:*'`.
+  """
+  @spec keys_with_prefix(binary()) :: [binary()]
+  def keys_with_prefix(prefix) when is_binary(prefix) do
+    Enum.flat_map(0..(@shard_count - 1), fn i ->
+      GenServer.call(shard_name(i), {:keys_with_prefix, prefix})
+    end)
+  end
+
   @doc "Returns the count of all live keys across every shard."
   @spec dbsize() :: non_neg_integer()
   def dbsize, do: length(keys())

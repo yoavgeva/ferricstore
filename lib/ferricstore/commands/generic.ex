@@ -353,14 +353,34 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_scan(cursor_str, match_pattern, count, type_filter, store) do
-    alias Ferricstore.Store.CompoundKey
+    alias Ferricstore.Store.{CompoundKey, PrefixIndex}
 
+    # Fast path: when the MATCH pattern is a simple 'prefix:*' and there is
+    # no TYPE filter, use the prefix index for O(matching) lookup instead of
+    # scanning all keys.
     all_keys =
-      store.keys.()
-      |> Enum.reject(&CompoundKey.internal_key?/1)
-      |> filter_by_type(type_filter, store)
-      |> filter_by_match(match_pattern)
-      |> Enum.sort()
+      case {match_pattern, type_filter} do
+        {pattern, nil} when is_binary(pattern) ->
+          case PrefixIndex.detect_prefix_pattern(pattern) do
+            {:prefix_match, prefix} when is_map_key(store, :keys_with_prefix) ->
+              store.keys_with_prefix.(prefix)
+              |> Enum.reject(&CompoundKey.internal_key?/1)
+              |> Enum.sort()
+
+            _ ->
+              store.keys.()
+              |> Enum.reject(&CompoundKey.internal_key?/1)
+              |> filter_by_match(match_pattern)
+              |> Enum.sort()
+          end
+
+        _ ->
+          store.keys.()
+          |> Enum.reject(&CompoundKey.internal_key?/1)
+          |> filter_by_type(type_filter, store)
+          |> filter_by_match(match_pattern)
+          |> Enum.sort()
+      end
 
     # Cursor "0" means start from the beginning. Otherwise, cursor is the last
     # key seen -- find the first key strictly after it alphabetically.

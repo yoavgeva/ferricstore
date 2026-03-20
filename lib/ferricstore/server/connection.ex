@@ -1747,6 +1747,7 @@ defmodule Ferricstore.Server.Connection do
       delete: fn _key -> :ok end,
       exists?: fn _key -> false end,
       keys: fn -> [] end,
+      keys_with_prefix: fn _prefix -> [] end,
       flush: fn -> :ok end,
       dbsize: fn -> 0 end,
       incr: fn _key, _delta -> {:ok, 0} end,
@@ -1811,6 +1812,7 @@ defmodule Ferricstore.Server.Connection do
       delete: &Router.delete/1,
       exists?: &Router.exists?/1,
       keys: &Router.keys/0,
+      keys_with_prefix: &Router.keys_with_prefix/1,
       flush: fn ->
         # Drain async apply workers so any fire-and-forget writes from async-
         # durability namespaces land in ETS before we snapshot keys for deletion.

@@ -39,16 +39,31 @@ defmodule Ferricstore.Test.ShardHelpers do
     alias Ferricstore.Store.Router
     alias Ferricstore.Raft.{AsyncApplyWorker, Batcher}
 
+    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+
     # Flush Raft batchers first (moves any pending slot contents into
     # AsyncApplyWorker casts for async namespaces, or applies via Raft
     # for quorum namespaces), then drain async workers so their
     # fire-and-forget writes land in ETS before we snapshot keys.
-    Enum.each(0..3, fn i ->
+    Enum.each(0..(shard_count - 1), fn i ->
       Batcher.flush(i)
       AsyncApplyWorker.drain(i)
     end)
 
     Enum.each(Router.keys(), &Router.delete/1)
+
+    # Also clear compound keys (hash fields, set members, zset entries, etc.)
+    # from ETS that are not captured by Router.keys() (which only returns
+    # top-level user keys, not internal H:, S:, Z:, T: compound entries).
+    Enum.each(0..(shard_count - 1), fn i ->
+      for table <- [:"keydir_#{i}", :"hot_cache_#{i}"] do
+        try do
+          :ets.select_delete(table, [{{:"$1", :_}, [], [true]}])
+        rescue
+          ArgumentError -> :ok
+        end
+      end
+    end)
   end
 
   @doc """

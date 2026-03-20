@@ -22,6 +22,7 @@
 
 pub mod compaction;
 pub mod hint;
+pub mod hnsw;
 pub mod io_backend;
 pub mod keydir;
 pub mod log;
@@ -180,6 +181,7 @@ fn load(env: Env, _info: Term) -> bool {
     let _ = rustler::resource!(GetRangeIterState, env);
     let _ = rustler::resource!(BulkKvBuffer, env);
     let _ = rustler::resource!(BulkOptValBuffer, env);
+    let _ = rustler::resource!(hnsw::HnswResource, env);
     true
 }
 

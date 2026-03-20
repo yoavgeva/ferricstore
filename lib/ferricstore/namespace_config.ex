@@ -313,7 +313,7 @@ defmodule Ferricstore.NamespaceConfig do
   # Private -- ETS operations
   # ---------------------------------------------------------------------------
 
-  defp do_set(prefix, field, value, changed_by \\ "") do
+  defp do_set(prefix, field, value, changed_by) do
     now = System.os_time(:second)
 
     try do

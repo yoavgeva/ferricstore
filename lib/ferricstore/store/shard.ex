@@ -53,7 +53,7 @@ defmodule Ferricstore.Store.Shard do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{PrefixIndex, Router}
 
   require Logger
 
@@ -71,6 +71,7 @@ defmodule Ferricstore.Store.Shard do
     :ets,
     :keydir,
     :hot_cache,
+    :prefix_keys,
     :index,
     :data_dir,
     pending: [],
@@ -137,6 +138,10 @@ defmodule Ferricstore.Store.Shard do
 
     ets = keydir
 
+    # Create (or clear) the prefix index ETS bag table for fast SCAN MATCH
+    # lookups on 'prefix:*' patterns.
+    prefix_keys = PrefixIndex.create_table(index)
+
     # Start the Raft server and Batcher for this shard if raft is enabled.
     # The ra system must already be started (done in Application.start).
     if Application.get_env(:ferricstore, :raft_enabled, true) do
@@ -161,10 +166,17 @@ defmodule Ferricstore.Store.Shard do
     promoted =
       Ferricstore.Store.Promotion.recover_promoted(store, keydir, hot_cache, data_dir, index)
 
+    # Rebuild the prefix index from all keys in the Bitcask store so that
+    # SCAN MATCH 'prefix:*' works immediately after a shard restart without
+    # needing to warm every key through ETS first.
+    for key <- NIF.keys(store) do
+      PrefixIndex.track(prefix_keys, key, index)
+    end
+
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
     {:ok, %__MODULE__{store: store, ets: keydir, keydir: keydir, hot_cache: hot_cache,
-                       index: index, data_dir: data_dir,
+                       prefix_keys: prefix_keys, index: index, data_dir: data_dir,
                        pending: [], flush_in_flight: nil,
                        promoted_instances: promoted},
      {:continue, {:flush_interval, flush_ms}}}
@@ -2339,6 +2351,13 @@ defmodule Ferricstore.Store.Shard do
     {:reply, live_keys(state), state}
   end
 
+  # Returns all live keys matching a given prefix (text before ':'). Uses the
+  # prefix_keys bag table for O(matching) lookup instead of scanning all keys.
+  def handle_call({:keys_with_prefix, prefix}, _from, state) do
+    keys = PrefixIndex.keys_for_prefix(state.prefix_keys, state.keydir, prefix)
+    {:reply, keys, state}
+  end
+
   # Merge-related calls: delegate to NIF and return results directly.
 
   def handle_call(:shard_stats, _from, state) do
@@ -2606,16 +2625,26 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Inserts a key/value/expiry into both the keydir and hot_cache tables.
+  # Inserts a key/value/expiry into both the keydir and hot_cache tables,
+  # and updates the prefix index.
   defp ets_insert(state, key, value, expire_at_ms) do
     :ets.insert(state.keydir, {key, expire_at_ms})
     :ets.insert(state.hot_cache, {key, value})
+
+    if state.prefix_keys do
+      PrefixIndex.track(state.prefix_keys, key, state.index)
+    end
   end
 
-  # Deletes a key from both the keydir and hot_cache tables.
+  # Deletes a key from both the keydir and hot_cache tables,
+  # and removes it from the prefix index.
   defp ets_delete_key(state, key) do
     :ets.delete(state.keydir, key)
     :ets.delete(state.hot_cache, key)
+
+    if state.prefix_keys do
+      PrefixIndex.untrack(state.prefix_keys, key, state.index)
+    end
   end
 
   # Classifies an ETS lookup as a cache hit, expired entry, or miss.

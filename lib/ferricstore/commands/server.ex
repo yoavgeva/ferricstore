@@ -90,13 +90,22 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   def handle("KEYS", [pattern], store) do
-    alias Ferricstore.Store.CompoundKey
+    alias Ferricstore.Store.{CompoundKey, PrefixIndex}
 
-    regex = glob_to_regex(pattern)
+    # Fast path: when the pattern is a simple 'prefix:*', use the prefix
+    # index for O(matching) lookup instead of scanning all keys.
+    case PrefixIndex.detect_prefix_pattern(pattern) do
+      {:prefix_match, prefix} when is_map_key(store, :keys_with_prefix) ->
+        store.keys_with_prefix.(prefix)
+        |> Enum.reject(&CompoundKey.internal_key?/1)
 
-    store.keys.()
-    |> Enum.reject(&CompoundKey.internal_key?/1)
-    |> Enum.filter(&Regex.match?(regex, &1))
+      _ ->
+        regex = glob_to_regex(pattern)
+
+        store.keys.()
+        |> Enum.reject(&CompoundKey.internal_key?/1)
+        |> Enum.filter(&Regex.match?(regex, &1))
+    end
   end
 
   def handle("KEYS", [], _store) do
@@ -534,10 +543,10 @@ defmodule Ferricstore.Commands.Server do
 
         try do
           case :ra.members(shard_id) do
-            {:ok, members, leader} ->
-              # Get counters from ra
+            {:ok, _members, leader} ->
+              # Get counters from ra_counters
               counters = try do
-                :ra.counters(shard_id)
+                :ra_counters.overview(shard_id)
               rescue _ -> %{}
               catch _, _ -> %{}
               end
@@ -659,7 +668,7 @@ defmodule Ferricstore.Commands.Server do
       Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
         shard_id = {:"ferricstore_shard_#{i}", node()}
         try do
-          counters = :ra.counters(shard_id)
+          counters = :ra_counters.overview(shard_id)
           acc + Map.get(counters, :last_applied, 0)
         rescue _ -> acc
         catch _, _ -> acc
@@ -701,7 +710,6 @@ defmodule Ferricstore.Commands.Server do
       Enum.reduce(0..(shard_count - 1), %{}, fn i, acc ->
         table = :"keydir_#{i}"
         try do
-          word_size = :erlang.system_info(:wordsize)
           :ets.foldl(fn {key, _exp}, inner_acc ->
             prefix = Ferricstore.Stats.extract_prefix(key)
             # Estimate per-key bytes: key binary + expire_at + ETS tuple overhead
