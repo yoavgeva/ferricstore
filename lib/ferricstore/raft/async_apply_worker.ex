@@ -104,6 +104,32 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   end
 
   @doc """
+  Blocks until all previously enqueued async batches for `shard_index` have
+  been applied.
+
+  Since the worker is a GenServer that processes messages sequentially, a
+  synchronous `call` placed after all prior `cast`s will not be handled
+  until those casts complete. This makes `drain/1` an efficient barrier
+  without any polling or sleep.
+
+  Returns `:ok`, or `:ok` silently if the worker is not running.
+
+  ## Examples
+
+      iex> AsyncApplyWorker.drain(0)
+      :ok
+  """
+  @spec drain(non_neg_integer()) :: :ok
+  def drain(shard_index) do
+    name = worker_name(shard_index)
+
+    case Process.whereis(name) do
+      nil -> :ok
+      _pid -> GenServer.call(name, :drain, 10_000)
+    end
+  end
+
+  @doc """
   Returns the registered process name for the async worker at `shard_index`.
 
   ## Examples
@@ -126,6 +152,11 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
      %{
        shard_index: shard_index
      }}
+  end
+
+  @impl true
+  def handle_call(:drain, _from, state) do
+    {:reply, :ok, state}
   end
 
   @impl true

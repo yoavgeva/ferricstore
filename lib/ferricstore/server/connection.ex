@@ -1642,6 +1642,14 @@ defmodule Ferricstore.Server.Connection do
       exists?: &Router.exists?/1,
       keys: &Router.keys/0,
       flush: fn ->
+        # Drain async apply workers so any fire-and-forget writes from async-
+        # durability namespaces land in ETS before we snapshot keys for deletion.
+        # We do NOT flush Raft batchers here because quorum-path writes block
+        # their callers until applied, and flushing all batchers would add
+        # significant latency (raft consensus per shard) to every FLUSHDB.
+        shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+        Enum.each(0..(shard_count - 1), &Ferricstore.Raft.AsyncApplyWorker.drain/1)
+
         Enum.each(Router.keys(), &Router.delete/1)
         :ok
       end,

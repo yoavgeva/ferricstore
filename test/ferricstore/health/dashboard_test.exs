@@ -367,10 +367,13 @@ defmodule Ferricstore.Health.DashboardTest do
     test "eviction policy matches configuration" do
       data = Dashboard.collect()
 
-      # The eviction policy may have been changed by CONFIG SET in other tests.
-      # Just verify it's a valid policy atom, not that it matches the default.
-      valid_policies = [:volatile_lru, :allkeys_lru, :volatile_ttl, :noeviction]
-      assert data.memory.eviction_policy in valid_policies
+      # Read the authoritative value directly from MemoryGuard (the same source
+      # Dashboard.collect/0 uses) instead of Application.get_env, which can be
+      # stale when other tests modify it via CONFIG SET without updating the
+      # MemoryGuard GenServer state.
+      configured = Ferricstore.MemoryGuard.eviction_policy()
+
+      assert data.memory.eviction_policy == configured
     end
   end
 
