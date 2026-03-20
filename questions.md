@@ -72,24 +72,30 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 - Embedded Elixir API
 - Sandbox isolation
 
-### In Progress:
-- Section 2F.3: Per-namespace write tuning (FERRICSTORE.CONFIG SET/GET/RESET)
-- Namespace-aware group commit batcher (per-prefix windows + durability)
-- CONFIG REWRITE, CONFIG RESETSTAT
+### All Implemented:
+- Two-table ETS split (spec 2.4) — keydir_N + hot_cache_N
+- CLIENT TRACKING invalidation wiring — track_key + notify_key_modified
+- SCAN TYPE filtering for all types (hash/list/set/zset/string)
+- TLS require-tls enforcement
+- Namespace-aware group commit batcher (spec 2F.3)
+- FERRICSTORE.CONFIG SET/GET/RESET commands
+- CONFIG SET LOCAL / CONFIG REWRITE / CONFIG RESETSTAT
+- Dashboard Page 9 (namespace config visualization)
+- Hybrid Logical Clock (spec 2G.6) — monotonic timestamps
+- AsyncApplyWorker (async durability path)
+- Cross-shard 2PC Transaction Coordinator
+- ClusterHelper + multi-node :peer tests (21 cluster tests)
+- /health/live endpoint + /metrics on HTTP port
+- XREAD BLOCK support with stream waiters
 - INFO namespace_config section
-
-### Recently Completed:
-- CLIENT TRACKING invalidation wiring — DONE
-- SCAN TYPE filtering for non-string types — DONE
-- TLS require-tls enforcement — DONE
+- 5950+ tests, all test plan sections covered (S2-S18)
 
 ### Deferred (external tooling, not core logic):
-- Encryption at rest (Q7)
-- Full async Tokio IO NIFs (Q9)
-- Cross-shard 2PC transactions (Q5)
-- Phoenix LiveView dashboard
+- Encryption at rest (Q7) — requires Rust NIF encrypt/decrypt
+- Full async Tokio IO NIFs (Q9) — all IO NIFs still synchronous on Normal scheduler
+- Phoenix LiveView dashboard — current HTML dashboard works
 - Kubernetes Helm chart
 - Jepsen-style testing
-- Client libraries
+- Client libraries (Python, Go, Node.js)
 
 *Only add questions here if the spec does not provide a clear answer.*

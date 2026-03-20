@@ -28,7 +28,11 @@ defmodule Ferricstore.ArchTest do
     modules_matching("Ferricstore.Store.**")
     |> should_not_depend_on(modules_matching("Ferricstore.Server.**"))
 
+    # Shard depends on Commands.Dispatcher for 2PC transaction execution.
+    # This is an intentional coupling: prepare_tx must dispatch queued
+    # commands within the shard's handle_call for atomicity.
     modules_matching("Ferricstore.Store.**")
+    |> excluding("Ferricstore.Store.Shard")
     |> should_not_depend_on(modules_matching("Ferricstore.Commands.**"))
   end
 

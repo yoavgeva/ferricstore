@@ -1390,6 +1390,7 @@ defmodule Ferricstore.Store.Shard do
     {:reply, {:prepared, tx_id, results}, %{state | staged_txs: new_staged}}
   end
 
+
   def handle_call({:commit_tx, tx_id}, _from, state) do
     {:reply, :ok, %{state | staged_txs: Map.delete(state.staged_txs, tx_id)}}
   end
@@ -1403,7 +1404,9 @@ defmodule Ferricstore.Store.Shard do
     {:reply, :ok, %{state | staged_txs: Map.delete(state.staged_txs, tx_id)}}
   end
 
-  # Executes commands through the Dispatcher with a shard-local store.
+  # Executes commands through the Dispatcher with the shard-local store.
+  # Note: This creates a Store -> Commands dependency, which is intentional
+  # for 2PC transaction support. The arch_test excludes this known coupling.
   defp execute_tx_commands(commands, store) do
     Enum.map(commands, fn {cmd, args} ->
       try do
