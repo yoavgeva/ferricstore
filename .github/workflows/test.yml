@@ -49,27 +49,27 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            native/ferricstore_bitcask/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('native/ferricstore_bitcask/Cargo.lock') }}
+            apps/ferricstore/native/ferricstore_bitcask/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
       - name: Install dependencies
         run: mix deps.get
 
       - name: Check Rust formatting
-        run: cargo fmt --manifest-path native/ferricstore_bitcask/Cargo.toml -- --check
+        run: cargo fmt --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml -- --check
 
       - name: Run Clippy
-        run: cargo clippy --manifest-path native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Rust tests
-        run: cargo test --manifest-path native/ferricstore_bitcask/Cargo.toml
+        run: cargo test --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
 
       - name: Build NIF (release)
         run: |
-          cargo build --release --manifest-path native/ferricstore_bitcask/Cargo.toml
-          mkdir -p priv/native
-          cp native/ferricstore_bitcask/target/release/libferricstore_bitcask.so priv/native/ferricstore_bitcask.so
+          cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+          mkdir -p apps/ferricstore/priv/native
+          cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/ferricstore_bitcask.so
 
       - name: Compile
         run: mix compile

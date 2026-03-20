@@ -44,9 +44,9 @@ jobs:
 
       - name: Build NIF (release)
         run: |
-          cargo build --release --manifest-path native/ferricstore_bitcask/Cargo.toml
-          mkdir -p priv/native
-          cp native/ferricstore_bitcask/target/release/libferricstore_bitcask.so priv/native/ferricstore_bitcask.so
+          cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+          mkdir -p apps/ferricstore/priv/native
+          cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/ferricstore_bitcask.so
 
       - name: Compile (bench env)
         run: mix compile
