@@ -18,12 +18,12 @@
 //! if the BEAM scheduler wants to reclaim the thread. This prevents long
 //! searches from blocking other processes.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Mutex;
 
-use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
 use rustler::schedule::consume_timeslice;
+use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
 
 // ---------------------------------------------------------------------------
 // Distance metrics
@@ -40,15 +40,14 @@ pub enum Metric {
 /// Lower distance = more similar for all metrics.
 fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
-        Metric::L2 => {
-            a.iter()
-                .zip(b.iter())
-                .map(|(ai, bi)| {
-                    let d = ai - bi;
-                    d * d
-                })
-                .sum()
-        }
+        Metric::L2 => a
+            .iter()
+            .zip(b.iter())
+            .map(|(ai, bi)| {
+                let d = ai - bi;
+                d * d
+            })
+            .sum(),
         Metric::Cosine => {
             let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
             for (ai, bi) in a.iter().zip(b.iter()) {
@@ -88,8 +87,8 @@ struct Node {
 /// The HNSW index.
 pub struct HnswIndex {
     dims: usize,
-    m: usize,         // max edges per node per layer
-    m_max0: usize,    // max edges at layer 0 (2*m)
+    m: usize,      // max edges per node per layer
+    m_max0: usize, // max edges at layer 0 (2*m)
     ef_construction: usize,
     metric: Metric,
     nodes: Vec<Node>,
@@ -282,13 +281,7 @@ impl HnswIndex {
     /// Search at a single layer: starting from `ep`, find up to `ef`
     /// nearest non-deleted neighbors of `query_id`. Returns sorted
     /// (nearest first) list of (node_id, distance).
-    fn search_layer(
-        &self,
-        query_id: usize,
-        ep: usize,
-        ef: usize,
-        lc: usize,
-    ) -> Vec<(usize, f32)> {
+    fn search_layer(&self, query_id: usize, ep: usize, ef: usize, lc: usize) -> Vec<(usize, f32)> {
         let query = &self.nodes[query_id].vector;
         self.search_layer_vec(query, ep, ef, lc)
     }
@@ -461,10 +454,7 @@ impl PartialOrd for MinDist {
 impl Ord for MinDist {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap (BinaryHeap is max-heap by default)
-        other
-            .1
-            .partial_cmp(&self.1)
-            .unwrap_or(Ordering::Equal)
+        other.1.partial_cmp(&self.1).unwrap_or(Ordering::Equal)
     }
 }
 
@@ -485,9 +475,7 @@ impl PartialOrd for MaxDist {
 
 impl Ord for MaxDist {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.1
-            .partial_cmp(&other.1)
-            .unwrap_or(Ordering::Equal)
+        self.1.partial_cmp(&other.1).unwrap_or(Ordering::Equal)
     }
 }
 
@@ -563,10 +551,7 @@ pub fn hnsw_add(
     vector: Vec<f64>,
 ) -> NifResult<Term> {
     let vec_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-    let mut index = resource
-        .index
-        .lock()
-        .map_err(|_| rustler::Error::BadArg)?;
+    let mut index = resource.index.lock().map_err(|_| rustler::Error::BadArg)?;
 
     match index.add(&key, vec_f32) {
         Ok(id) => Ok((atoms::ok(), id).encode(env)),
@@ -578,15 +563,8 @@ pub fn hnsw_add(
 /// Returns `{:ok, true}` or `{:ok, false}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn hnsw_delete(
-    env: Env,
-    resource: ResourceArc<HnswResource>,
-    key: String,
-) -> NifResult<Term> {
-    let mut index = resource
-        .index
-        .lock()
-        .map_err(|_| rustler::Error::BadArg)?;
+pub fn hnsw_delete(env: Env, resource: ResourceArc<HnswResource>, key: String) -> NifResult<Term> {
+    let mut index = resource.index.lock().map_err(|_| rustler::Error::BadArg)?;
 
     let deleted = index.delete(&key);
     Ok((atoms::ok(), deleted).encode(env))
@@ -604,10 +582,7 @@ pub fn hnsw_search(
     ef: usize,
 ) -> NifResult<Term> {
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
-    let index = resource
-        .index
-        .lock()
-        .map_err(|_| rustler::Error::BadArg)?;
+    let index = resource.index.lock().map_err(|_| rustler::Error::BadArg)?;
 
     let results = index.search(&query_f32, k, ef);
 
@@ -623,14 +598,8 @@ pub fn hnsw_search(
 /// Returns `{:ok, count}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn hnsw_count(
-    env: Env,
-    resource: ResourceArc<HnswResource>,
-) -> NifResult<Term> {
-    let index = resource
-        .index
-        .lock()
-        .map_err(|_| rustler::Error::BadArg)?;
+pub fn hnsw_count(env: Env, resource: ResourceArc<HnswResource>) -> NifResult<Term> {
+    let index = resource.index.lock().map_err(|_| rustler::Error::BadArg)?;
 
     Ok((atoms::ok(), index.count()).encode(env))
 }
@@ -653,10 +622,7 @@ pub fn vsearch_nif(
     ef: usize,
 ) -> NifResult<Term> {
     let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
-    let index = resource
-        .index
-        .lock()
-        .map_err(|_| rustler::Error::BadArg)?;
+    let index = resource.index.lock().map_err(|_| rustler::Error::BadArg)?;
 
     let results = index.search(&query_f32, k, ef);
 
@@ -700,7 +666,10 @@ mod tests {
         let a = [1.0, 0.0];
         let b = [0.0, 1.0];
         let d = distance(Metric::Cosine, &a, &b);
-        assert!((d - 1.0).abs() < 1e-6, "orthogonal should have ~1.0 cosine distance");
+        assert!(
+            (d - 1.0).abs() < 1e-6,
+            "orthogonal should have ~1.0 cosine distance"
+        );
     }
 
     #[test]
