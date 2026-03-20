@@ -2,7 +2,21 @@ defmodule Ferricstore.Application do
   @moduledoc """
   OTP Application for FerricStore.
 
-  Supervision tree (`:one_for_one`):
+  ## Operational modes
+
+  FerricStore supports two modes controlled by `config :ferricstore, :mode`:
+
+    * `:standalone` (default) -- full supervision tree with TCP/TLS listener,
+      RESP3 protocol handling, and HTTP health/metrics endpoint.
+    * `:embedded` -- core engine only (shards, Raft, ETS, merge, MemoryGuard).
+      No Ranch listener, no TLS, no health HTTP endpoint. The host application
+      uses `FerricStore.set/3`, `FerricStore.get/1`, etc. directly.
+
+  See `Ferricstore.Mode` for details and a comparison table.
+
+  ## Supervision tree (`:one_for_one`)
+
+  ### Standalone mode
 
   ```
   Ferricstore.Supervisor
@@ -15,17 +29,32 @@ defmodule Ferricstore.Application do
   └── Health HTTP endpoint (Ferricstore.Health.Endpoint)
   ```
 
+  ### Embedded mode
+
+  ```
+  Ferricstore.Supervisor
+  ├── Ferricstore.Stats
+  ├── Ferricstore.HLC
+  ├── Ferricstore.Store.ShardSupervisor
+  ├── Ferricstore.Merge.Supervisor
+  ├── Ferricstore.PubSub
+  ├── Ferricstore.FetchOrCompute
+  └── Ferricstore.MemoryGuard
+  ```
+
   `Stats` starts first so counters are available before any connection arrives.
   The `ShardSupervisor` must start **before** the Ranch listener so that the
   key-value store is ready before any client connection can arrive.
   The `Merge.Supervisor` starts after `ShardSupervisor` so that shards are
   available when schedulers attempt their initial fragmentation check.
 
-  The health endpoint starts last. It returns 503 until `Health.set_ready(true)`
-  is called after the supervision tree is fully started (spec 2C.1 Phase 3).
+  The health endpoint starts last (standalone only). It returns 503 until
+  `Health.set_ready(true)` is called after the supervision tree is fully
+  started (spec 2C.1 Phase 3).
 
   ## Configuration (application env)
 
+    * `:mode`             - `:standalone` (default) or `:embedded`
     * `:port`             - TCP port to bind (default: `6379`; test env uses `0` for ephemeral)
     * `:data_dir`         - Bitcask data directory (default: `"data"`)
     * `:health_port`      - HTTP health check port (default: `4000`; test env uses `0`)
@@ -44,10 +73,13 @@ defmodule Ferricstore.Application do
 
   @impl true
   def start(_type, _args) do
+    mode = Ferricstore.Mode.current()
     port = Application.get_env(:ferricstore, :port, 6379)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
     raft_enabled? = Application.get_env(:ferricstore, :raft_enabled, true)
+
+    Logger.info("FerricStore starting in #{mode} mode")
 
     # Create the on-disk directory layout (spec 2B.4) before any process
     # tries to open shard directories or Raft WALs.
@@ -88,9 +120,8 @@ defmodule Ferricstore.Application do
         )
       end)
 
-    health_port = Application.get_env(:ferricstore, :health_port, 4000)
-
-    children =
+    # Core children: always started regardless of mode.
+    core_children =
       [
         Ferricstore.Stats,
         Ferricstore.SlowLog,
@@ -109,13 +140,23 @@ defmodule Ferricstore.Application do
           {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
           Ferricstore.PubSub,
           Ferricstore.FetchOrCompute,
-          {Ferricstore.MemoryGuard, memory_guard_opts()},
-          ranch_listener_spec(port)
-        ] ++
-        tls_listener_children() ++
-        [
-          Ferricstore.Health.Endpoint.child_spec(health_port)
+          {Ferricstore.MemoryGuard, memory_guard_opts()}
         ]
+
+    # Standalone-only children: Ranch TCP/TLS listener + Health HTTP endpoint.
+    # In embedded mode these are omitted -- no network ports are opened.
+    standalone_children =
+      if mode == :standalone do
+        health_port = Application.get_env(:ferricstore, :health_port, 4000)
+
+        [ranch_listener_spec(port)] ++
+          tls_listener_children() ++
+          [Ferricstore.Health.Endpoint.child_spec(health_port)]
+      else
+        []
+      end
+
+    children = core_children ++ standalone_children
 
     opts = [strategy: :one_for_one, name: Ferricstore.Supervisor]
     result = Supervisor.start_link(children, opts)
@@ -123,18 +164,17 @@ defmodule Ferricstore.Application do
     case result do
       {:ok, _pid} ->
         # Mark the node as ready for Kubernetes readiness probes (spec 2C.1).
-        # This must happen after the supervision tree is fully started so
-        # that the /health/ready endpoint returns 200 only when all shards
-        # and the TCP listener are operational.
+        # In embedded mode, set_ready(true) is still called so that
+        # Health.ready?() returns true for any code that checks it.
         Ferricstore.Health.set_ready(true)
 
         :telemetry.execute(
           [:ferricstore, :node, :startup_complete],
           %{duration_ms: System.monotonic_time(:millisecond)},
-          %{shard_count: shard_count, port: port, raft_enabled: raft_enabled?}
+          %{shard_count: shard_count, port: port, raft_enabled: raft_enabled?, mode: mode}
         )
 
-        # Step 6 - Embedded large value check (embedded mode only):
+        # Step 6 - Large value check:
         # Scan keydir for values exceeding the configured threshold.
         # Pure RAM scan -- keydir already holds value_size per entry, no disk reads.
         # Non-blocking: fires before any traffic is served so operator sees the

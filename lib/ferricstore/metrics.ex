@@ -150,10 +150,14 @@ defmodule Ferricstore.Metrics do
 
   @spec connected_clients() :: non_neg_integer()
   defp connected_clients do
-    try do
-      :ranch.procs(Ferricstore.Server.Listener, :connections) |> length()
-    rescue
-      _ -> 0
+    if Ferricstore.Mode.standalone?() do
+      try do
+        :ranch.procs(Ferricstore.Server.Listener, :connections) |> length()
+      rescue
+        _ -> 0
+      end
+    else
+      0
     end
   end
 

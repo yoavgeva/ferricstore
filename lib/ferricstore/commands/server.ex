@@ -313,7 +313,15 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("server", _store) do
-    port = Application.get_env(:ferricstore, :port, 6379)
+    mode = Ferricstore.Mode.current()
+
+    port =
+      if mode == :standalone do
+        Application.get_env(:ferricstore, :port, 6379)
+      else
+        0
+      end
+
     uptime_seconds = Stats.uptime_seconds()
     uptime_days = div(uptime_seconds, 86_400)
 
@@ -324,7 +332,7 @@ defmodule Ferricstore.Commands.Server do
     fields = [
       {"redis_version", "7.4.0"},
       {"ferricstore_version", "0.1.0"},
-      {"redis_mode", "standalone"},
+      {"redis_mode", Atom.to_string(mode)},
       {"os", os_string},
       {"arch_bits", "64"},
       {"tcp_port", Integer.to_string(port)},
@@ -342,10 +350,14 @@ defmodule Ferricstore.Commands.Server do
 
   defp build_section("clients", _store) do
     connected =
-      try do
-        :ranch.procs(Ferricstore.Server.Listener, :connections) |> length()
-      rescue
-        _ -> 0
+      if Ferricstore.Mode.standalone?() do
+        try do
+          :ranch.procs(Ferricstore.Server.Listener, :connections) |> length()
+        rescue
+          _ -> 0
+        end
+      else
+        0
       end
 
     blocked = safe_ets_size(:ferricstore_waiters)
