@@ -1386,11 +1386,7 @@ fn get_range_zero_copy<'a>(
     max_count: u64,
 ) -> NifResult<Term<'a>> {
     let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
-    let pairs = match store.get_range(
-        min_key.as_slice(),
-        max_key.as_slice(),
-        max_count as usize,
-    ) {
+    let pairs = match store.get_range(min_key.as_slice(), max_key.as_slice(), max_count as usize) {
         Ok(p) => p,
         Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
     };
@@ -1482,12 +1478,7 @@ mod bulk_buffer_tests {
     #[test]
     fn bulk_opt_val_buffer_holds_results() {
         let buf = BulkOptValBuffer {
-            results: vec![
-                Some(b"val1".to_vec()),
-                None,
-                Some(b"val3".to_vec()),
-                None,
-            ],
+            results: vec![Some(b"val1".to_vec()), None, Some(b"val3".to_vec()), None],
         };
         assert_eq!(buf.results.len(), 4);
         assert_eq!(buf.results[0].as_ref().unwrap(), b"val1");
@@ -1549,12 +1540,7 @@ mod bulk_buffer_tests {
     #[test]
     fn bulk_kv_buffer_many_pairs() {
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..10_000)
-            .map(|i| {
-                (
-                    format!("key_{i:06}").into_bytes(),
-                    vec![0xAAu8; 1024],
-                )
-            })
+            .map(|i| (format!("key_{i:06}").into_bytes(), vec![0xAAu8; 1024]))
             .collect();
         let buf = BulkKvBuffer { pairs };
         assert_eq!(buf.pairs.len(), 10_000);
