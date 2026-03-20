@@ -173,6 +173,9 @@ defmodule Ferricstore.Store.Router do
   @max_key_size 65_535
   @max_value_size 512 * 1024 * 1024
 
+  @doc "Returns the maximum allowed value size in bytes."
+  def max_value_size, do: @max_value_size
+
   def put(key, value, expire_at_ms \\ 0) do
     cond do
       byte_size(key) > @max_key_size ->

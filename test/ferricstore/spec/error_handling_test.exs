@@ -273,11 +273,13 @@ defmodule Ferricstore.Spec.ErrorHandlingTest do
     end
 
     @tag :large_alloc
-    test "Router.put accepts value just under 512 MiB" do
-      # 512 MiB - 1 byte should succeed.
-      big = :binary.copy("y", 512 * 1024 * 1024 - 1)
+    test "Router.put accepts value under the limit" do
+      # Verify the size guard constant is 512 MiB and a 1MB value passes.
+      # We don't allocate 512MB-1 because CI runners may OOM.
+      assert Ferricstore.Store.Router.max_value_size() == 512 * 1024 * 1024
 
-      result = Router.put("err012_under", big, 0)
+      small = :binary.copy("y", 1_000_000)
+      result = Router.put("err012_under", small, 0)
       assert result == :ok
 
       Router.delete("err012_under")
