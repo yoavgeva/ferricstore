@@ -1,38 +1,19 @@
-defmodule Ferricstore.MixProject do
+defmodule Ferricstore.Umbrella.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :ferricstore,
+      apps_path: "apps",
       version: "0.1.0",
-      elixir: "~> 1.19",
-      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      compilers: Mix.compilers(),
       deps: deps(),
       aliases: aliases()
     ]
   end
 
-  defp elixirc_paths(:test), do: ["lib", "test/support"]
-  defp elixirc_paths(_), do: ["lib"]
-
-  def application do
-    [
-      extra_applications: [:logger, :ssl, :public_key],
-      mod: {Ferricstore.Application, []}
-    ]
-  end
-
   defp deps do
     [
-      {:rustler, "~> 0.37"},
-      {:ranch, "~> 2.2"},
-      {:ra, "~> 2.14"},
-      {:telemetry, "~> 1.4"},
-      {:jason, "~> 1.4"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:arch_test, "~> 0.1.2", only: [:dev, :test], runtime: false},
       {:benchee, "~> 1.3", only: :bench, runtime: false},
       {:benchee_html, "~> 1.0", only: :bench, runtime: false}
     ]
