@@ -295,7 +295,7 @@ defmodule Ferricstore.Commands.Server do
   # Private — INFO section builders
   # ---------------------------------------------------------------------------
 
-  @all_sections ["server", "clients", "memory", "keyspace", "stats", "persistence", "replication", "cpu", "namespace_config"]
+  @all_sections ["server", "clients", "memory", "keyspace", "stats", "persistence", "replication", "cpu", "namespace_config", "raft", "bitcask", "ferricstore", "keydir_analysis"]
 
   defp info_string(section, store) when section in ["all", "everything"] do
     @all_sections
@@ -493,14 +493,232 @@ defmodule Ferricstore.Commands.Server do
     ]
 
     entry_fields =
-      Enum.flat_map(entries, fn %{prefix: prefix, window_ms: w, durability: d} ->
+      Enum.flat_map(entries, fn entry ->
+        %{prefix: prefix, window_ms: w, durability: d} = entry
+        changed_at = Map.get(entry, :changed_at, 0)
+        changed_by = Map.get(entry, :changed_by, "")
+
         [
           {"ns_#{prefix}_window_ms", Integer.to_string(w)},
-          {"ns_#{prefix}_durability", Atom.to_string(d)}
+          {"ns_#{prefix}_durability", Atom.to_string(d)},
+          {"ns_#{prefix}_changed_at", Integer.to_string(changed_at)},
+          {"ns_#{prefix}_changed_by", changed_by}
         ]
       end)
 
     format_section("Namespace_Config", default_fields ++ entry_fields)
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO raft -- per-shard Raft state
+  # ---------------------------------------------------------------------------
+
+  defp build_section("raft", _store) do
+    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+
+    fields =
+      Enum.flat_map(0..(shard_count - 1), fn i ->
+        shard_id = {:"ferricstore_shard_#{i}", node()}
+
+        try do
+          case :ra.members(shard_id) do
+            {:ok, members, leader} ->
+              # Get counters from ra
+              counters = try do
+                :ra.counters(shard_id)
+              rescue _ -> %{}
+              catch _, _ -> %{}
+              end
+
+              role =
+                if leader == shard_id do
+                  "leader"
+                else
+                  "follower"
+                end
+
+              leader_node_str =
+                case leader do
+                  {_name, node_name} -> Atom.to_string(node_name)
+                  _ -> "unknown"
+                end
+
+              commit_index = Map.get(counters, :commit_index, 0)
+              last_applied = Map.get(counters, :last_applied, 0)
+              current_term = Map.get(counters, :term, 0)
+
+              [
+                {"shard_#{i}_role", role},
+                {"shard_#{i}_current_term", Integer.to_string(current_term)},
+                {"shard_#{i}_commit_index", Integer.to_string(commit_index)},
+                {"shard_#{i}_last_applied", Integer.to_string(last_applied)},
+                {"shard_#{i}_leader_node", leader_node_str}
+              ]
+
+            _ ->
+              [
+                {"shard_#{i}_role", "unknown"},
+                {"shard_#{i}_current_term", "0"},
+                {"shard_#{i}_commit_index", "0"},
+                {"shard_#{i}_last_applied", "0"},
+                {"shard_#{i}_leader_node", "unknown"}
+              ]
+          end
+        rescue
+          _ ->
+            [
+              {"shard_#{i}_role", "unknown"},
+              {"shard_#{i}_current_term", "0"},
+              {"shard_#{i}_commit_index", "0"},
+              {"shard_#{i}_last_applied", "0"},
+              {"shard_#{i}_leader_node", "unknown"}
+            ]
+        catch
+          _, _ ->
+            [
+              {"shard_#{i}_role", "unknown"},
+              {"shard_#{i}_current_term", "0"},
+              {"shard_#{i}_commit_index", "0"},
+              {"shard_#{i}_last_applied", "0"},
+              {"shard_#{i}_leader_node", "unknown"}
+            ]
+        end
+      end)
+
+    format_section("Raft", fields)
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO bitcask -- per-shard storage stats
+  # ---------------------------------------------------------------------------
+
+  defp build_section("bitcask", _store) do
+    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+
+    fields =
+      Enum.flat_map(0..(shard_count - 1), fn i ->
+        shard_dir = Ferricstore.DataDir.shard_data_path(data_dir, i)
+
+        {data_files, hint_files, total_bytes} =
+          try do
+            case File.ls(shard_dir) do
+              {:ok, files} ->
+                data = Enum.filter(files, &String.ends_with?(&1, ".log"))
+                hints = Enum.filter(files, &String.ends_with?(&1, ".hint"))
+                total =
+                  Enum.reduce(files, 0, fn f, acc ->
+                    path = Path.join(shard_dir, f)
+                    case File.stat(path) do
+                      {:ok, %{size: size}} -> acc + size
+                      _ -> acc
+                    end
+                  end)
+                {length(data), length(hints), total}
+
+              {:error, _} ->
+                {0, 0, 0}
+            end
+          rescue
+            _ -> {0, 0, 0}
+          end
+
+        merge_candidates = max(0, data_files - 1)
+
+        [
+          {"shard_#{i}_data_file_count", Integer.to_string(data_files)},
+          {"shard_#{i}_hint_file_count", Integer.to_string(hint_files)},
+          {"shard_#{i}_total_size_bytes", Integer.to_string(total_bytes)},
+          {"shard_#{i}_merge_candidates", Integer.to_string(merge_candidates)}
+        ]
+      end)
+
+    format_section("Bitcask", fields)
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO ferricstore -- aggregate native metrics
+  # ---------------------------------------------------------------------------
+
+  defp build_section("ferricstore", _store) do
+    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+
+    raft_committed =
+      Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
+        shard_id = {:"ferricstore_shard_#{i}", node()}
+        try do
+          counters = :ra.counters(shard_id)
+          acc + Map.get(counters, :last_applied, 0)
+        rescue _ -> acc
+        catch _, _ -> acc
+        end
+      end)
+
+    hot_cache_evictions =
+      try do
+        :persistent_term.get({Ferricstore.Stats, :hot_cache_evictions}, 0)
+      rescue _ -> 0
+      catch _, _ -> 0
+      end
+
+    keydir_full_rejections =
+      try do
+        :persistent_term.get({Ferricstore.Stats, :keydir_full_rejections}, 0)
+      rescue _ -> 0
+      catch _, _ -> 0
+      end
+
+    fields = [
+      {"raft_commands_committed", Integer.to_string(raft_committed)},
+      {"hot_cache_evictions", Integer.to_string(hot_cache_evictions)},
+      {"keydir_full_rejections", Integer.to_string(keydir_full_rejections)}
+    ]
+
+    format_section("Ferricstore", fields)
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO keydir_analysis -- per-prefix keydir breakdown
+  # ---------------------------------------------------------------------------
+
+  defp build_section("keydir_analysis", _store) do
+    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+
+    # Collect all keys from all keydir ETS tables and group by prefix
+    prefix_data =
+      Enum.reduce(0..(shard_count - 1), %{}, fn i, acc ->
+        table = :"keydir_#{i}"
+        try do
+          word_size = :erlang.system_info(:wordsize)
+          :ets.foldl(fn {key, _exp}, inner_acc ->
+            prefix = Ferricstore.Stats.extract_prefix(key)
+            # Estimate per-key bytes: key binary + expire_at + ETS tuple overhead
+            key_bytes = byte_size(key) + 8 + 64
+
+            current = Map.get(inner_acc, prefix, {0, 0})
+            {count, bytes} = current
+            Map.put(inner_acc, prefix, {count + 1, bytes + key_bytes})
+          end, acc, table)
+        rescue _ -> acc
+        catch _, _ -> acc
+        end
+      end)
+
+    distinct_prefixes = map_size(prefix_data)
+
+    prefix_fields =
+      prefix_data
+      |> Enum.sort_by(fn {_prefix, {count, _bytes}} -> count end, :desc)
+      |> Enum.flat_map(fn {prefix, {count, bytes}} ->
+        [
+          {"prefix_#{prefix}_key_count", Integer.to_string(count)},
+          {"prefix_#{prefix}_keydir_bytes", Integer.to_string(bytes)}
+        ]
+      end)
+
+    fields = [{"distinct_prefixes", Integer.to_string(distinct_prefixes)} | prefix_fields]
+
+    format_section("Keydir_Analysis", fields)
   end
 
   defp format_section(header, fields) do

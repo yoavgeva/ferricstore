@@ -294,7 +294,8 @@ defmodule Ferricstore.NamespaceConfigTest do
 
     test "GET unconfigured prefix returns defaults" do
       result = Namespace.handle("FERRICSTORE.CONFIG", ["GET", "unknown"], MockStore.make())
-      assert result == ["prefix", "unknown", "window_ms", "1", "durability", "quorum"]
+      assert result == ["prefix", "unknown", "window_ms", "1", "durability", "quorum",
+                        "changed_at", "0", "changed_by", ""]
     end
 
     test "GET with no prefix returns all configured prefixes" do

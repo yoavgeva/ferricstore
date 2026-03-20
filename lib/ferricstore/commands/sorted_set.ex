@@ -531,6 +531,94 @@ defmodule Ferricstore.Commands.SortedSet do
   end
 
   # ---------------------------------------------------------------------------
+  # ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]
+  # ---------------------------------------------------------------------------
+
+  def handle("ZRANGEBYSCORE", [key, min_str, max_str | opts], store) do
+    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+      case {parse_score_bound(min_str), parse_score_bound(max_str)} do
+        {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
+          {with_scores, offset, count} = parse_range_by_score_opts(opts)
+          sorted = load_sorted_members(key, store)
+
+          filtered =
+            Enum.filter(sorted, fn {_member, score} ->
+              score_gte?(score, min_val, min_excl) and score_lte?(score, max_val, max_excl)
+            end)
+
+          paginated = apply_limit(filtered, offset, count)
+
+          if with_scores do
+            Enum.flat_map(paginated, fn {member, score} -> [member, format_score(score)] end)
+          else
+            Enum.map(paginated, fn {member, _score} -> member end)
+          end
+
+        _ ->
+          {:error, "ERR min or max is not a float"}
+      end
+    end
+  end
+
+  def handle("ZRANGEBYSCORE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'zrangebyscore' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]
+  # ---------------------------------------------------------------------------
+
+  def handle("ZREVRANGEBYSCORE", [key, max_str, min_str | opts], store) do
+    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+      case {parse_score_bound(min_str), parse_score_bound(max_str)} do
+        {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
+          {with_scores, offset, count} = parse_range_by_score_opts(opts)
+          sorted = load_sorted_members(key, store) |> Enum.reverse()
+
+          filtered =
+            Enum.filter(sorted, fn {_member, score} ->
+              score_gte?(score, min_val, min_excl) and score_lte?(score, max_val, max_excl)
+            end)
+
+          paginated = apply_limit(filtered, offset, count)
+
+          if with_scores do
+            Enum.flat_map(paginated, fn {member, score} -> [member, format_score(score)] end)
+          else
+            Enum.map(paginated, fn {member, _score} -> member end)
+          end
+
+        _ ->
+          {:error, "ERR min or max is not a float"}
+      end
+    end
+  end
+
+  def handle("ZREVRANGEBYSCORE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'zrevrangebyscore' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # ZREVRANK key member
+  # ---------------------------------------------------------------------------
+
+  def handle("ZREVRANK", [key, member], store) do
+    with :ok <- TypeRegistry.check_type(key, :zset, store) do
+      sorted = load_sorted_members(key, store)
+      reversed = Enum.reverse(sorted)
+
+      case Enum.find_index(reversed, fn {m, _s} -> m == member end) do
+        nil -> nil
+        idx -> idx
+      end
+    end
+  end
+
+  def handle("ZREVRANK", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'zrevrank' command"}
+  end
+
+  # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
@@ -627,6 +715,52 @@ defmodule Ferricstore.Commands.SortedSet do
   defp score_lte?(_score, :neg_infinity, _exclusive), do: false
   defp score_lte?(score, bound, true), do: score < bound
   defp score_lte?(score, bound, false), do: score <= bound
+
+  # ---------------------------------------------------------------------------
+  # ZRANGEBYSCORE / ZREVRANGEBYSCORE option parsing
+  # ---------------------------------------------------------------------------
+
+  # Parses optional [WITHSCORES] [LIMIT offset count] from the trailing args.
+  # Returns {with_scores, offset, count} where count == :all means no limit.
+  defp parse_range_by_score_opts(opts) do
+    do_parse_range_by_score_opts(opts, false, 0, :all)
+  end
+
+  defp do_parse_range_by_score_opts([], ws, offset, count), do: {ws, offset, count}
+
+  defp do_parse_range_by_score_opts([opt | rest], ws, offset, count) do
+    case String.upcase(opt) do
+      "WITHSCORES" ->
+        do_parse_range_by_score_opts(rest, true, offset, count)
+
+      "LIMIT" ->
+        case rest do
+          [offset_str, count_str | remaining] ->
+            {off, ""} = Integer.parse(offset_str)
+            {cnt, ""} = Integer.parse(count_str)
+            # Redis: negative count means all remaining from offset
+            real_count = if cnt < 0, do: :all, else: cnt
+            do_parse_range_by_score_opts(remaining, ws, off, real_count)
+
+          _ ->
+            {ws, offset, count}
+        end
+
+      _ ->
+        {ws, offset, count}
+    end
+  end
+
+  # Applies LIMIT offset count to a filtered list.
+  defp apply_limit(list, 0, :all), do: list
+
+  defp apply_limit(list, offset, :all) do
+    Enum.drop(list, offset)
+  end
+
+  defp apply_limit(list, offset, count) do
+    list |> Enum.drop(offset) |> Enum.take(count)
+  end
 
   # ---------------------------------------------------------------------------
   # ZSCAN helpers

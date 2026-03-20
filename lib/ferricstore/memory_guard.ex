@@ -69,8 +69,12 @@ defmodule Ferricstore.MemoryGuard do
     :max_memory_bytes,
     :eviction_policy,
     :shard_count,
+    :keydir_max_ram,
+    :hot_cache_max_ram,
+    :hot_cache_min_ram,
     last_pressure_level: :ok,
-    last_hot_cache_budget: nil
+    last_hot_cache_budget: nil,
+    keydir_pressure_level: :ok
   ]
 
   @doc "Starts the MemoryGuard GenServer."
@@ -97,12 +101,50 @@ defmodule Ferricstore.MemoryGuard do
     GenServer.call(__MODULE__, :reject_writes?)
   end
 
+  @doc """
+  Returns true if keydir memory usage is at or above 95% of `keydir_max_ram`.
+
+  When true, new key writes should be rejected, but updates to existing keys
+  are still allowed.
+  """
+  @spec keydir_full?() :: boolean()
+  def keydir_full? do
+    GenServer.call(__MODULE__, :keydir_full?)
+  end
+
+  @doc """
+  Reconfigures MemoryGuard with new budget parameters.
+
+  Accepts a map with optional keys:
+    * `:keydir_max_ram` -- maximum keydir ETS memory in bytes
+    * `:hot_cache_max_ram` -- maximum hot_cache ETS memory (or `:auto`)
+    * `:hot_cache_min_ram` -- minimum hot_cache budget
+    * `:max_memory_bytes` -- total memory budget
+    * `:eviction_policy` -- eviction policy atom
+  """
+  @spec reconfigure(map()) :: :ok
+  def reconfigure(params) when is_map(params) do
+    GenServer.call(__MODULE__, {:reconfigure, params})
+  end
+
+  @doc """
+  Forces an immediate memory check cycle.
+
+  Useful in tests to synchronously update pressure levels after changing budgets.
+  """
+  @spec force_check() :: :ok
+  def force_check do
+    GenServer.call(__MODULE__, :force_check)
+  end
+
   @impl true
   def init(opts) do
     interval_ms = Keyword.get(opts, :interval_ms, default_interval())
     max_memory_bytes = Keyword.get(opts, :max_memory_bytes, default_max_memory())
     eviction_policy = Keyword.get(opts, :eviction_policy, default_eviction_policy())
     shard_count = Keyword.get(opts, :shard_count, default_shard_count())
+    keydir_max_ram = Keyword.get(opts, :keydir_max_ram, default_keydir_max_ram())
+    hot_cache_min_ram = Application.get_env(:ferricstore, :hot_cache_min_ram, 0)
 
     initial_budget = hot_cache_budget(max_memory_bytes, :ok)
 
@@ -111,8 +153,12 @@ defmodule Ferricstore.MemoryGuard do
       max_memory_bytes: max_memory_bytes,
       eviction_policy: eviction_policy,
       shard_count: shard_count,
+      keydir_max_ram: keydir_max_ram,
+      hot_cache_max_ram: max_memory_bytes - keydir_max_ram,
+      hot_cache_min_ram: hot_cache_min_ram,
       last_pressure_level: :ok,
-      last_hot_cache_budget: initial_budget
+      last_hot_cache_budget: initial_budget,
+      keydir_pressure_level: :ok
     }
 
     schedule_check(interval_ms)
@@ -124,6 +170,33 @@ defmodule Ferricstore.MemoryGuard do
   def handle_call(:eviction_policy, _from, state), do: {:reply, state.eviction_policy, state}
   def handle_call(:reject_writes?, _from, state) do
     {:reply, state.last_pressure_level == :reject and state.eviction_policy == :noeviction, state}
+  end
+
+  def handle_call(:keydir_full?, _from, state) do
+    {:reply, state.keydir_pressure_level == :reject, state}
+  end
+
+  def handle_call({:reconfigure, params}, _from, state) do
+    new_state =
+      state
+      |> maybe_update(:keydir_max_ram, Map.get(params, :keydir_max_ram))
+      |> maybe_update(:hot_cache_min_ram, Map.get(params, :hot_cache_min_ram))
+      |> maybe_update(:max_memory_bytes, Map.get(params, :max_memory_bytes))
+      |> maybe_update(:eviction_policy, Map.get(params, :eviction_policy))
+
+    new_state =
+      case Map.get(params, :hot_cache_max_ram) do
+        nil -> %{new_state | hot_cache_max_ram: new_state.max_memory_bytes - new_state.keydir_max_ram}
+        :auto -> %{new_state | hot_cache_max_ram: new_state.max_memory_bytes - new_state.keydir_max_ram}
+        val -> %{new_state | hot_cache_max_ram: val}
+      end
+
+    {:reply, :ok, new_state}
+  end
+
+  def handle_call(:force_check, _from, state) do
+    new_state = perform_check(state)
+    {:reply, :ok, new_state}
   end
 
   @impl true
@@ -149,6 +222,19 @@ defmodule Ferricstore.MemoryGuard do
 
     state = emit_hot_cache_budget_events(state, stats, level)
 
+    # Emit keydir-specific pressure telemetry
+    if stats.keydir_pressure_level in [:pressure, :reject] do
+      :telemetry.execute(
+        [:ferricstore, :memory, :keydir_pressure],
+        %{
+          keydir_bytes: stats.keydir_bytes,
+          keydir_max_ram: stats.keydir_max_ram,
+          keydir_ratio: stats.keydir_ratio
+        },
+        %{keydir_pressure_level: stats.keydir_pressure_level}
+      )
+    end
+
     case stats.pressure_level do
       :ok ->
         if state.last_pressure_level in [:pressure, :reject] do
@@ -172,15 +258,75 @@ defmodule Ferricstore.MemoryGuard do
       :reject ->
         Logger.critical("MemoryGuard: critical memory")
         emit_shard_pressure_events(stats)
+        maybe_evict(state)
     end
 
-    %{state | last_pressure_level: stats.pressure_level}
+    %{state | last_pressure_level: stats.pressure_level, keydir_pressure_level: stats.keydir_pressure_level}
   end
 
+  # Evicts keys according to the configured eviction policy when memory
+  # pressure is at :pressure or :reject level.
+  defp maybe_evict(%{eviction_policy: :noeviction}), do: :ok
+
+  defp maybe_evict(%{eviction_policy: policy, shard_count: shard_count}) when policy in [:volatile_lru, :allkeys_lru, :volatile_ttl] do
+    evicted =
+      Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
+        keydir = :"keydir_#{i}"
+        hot_cache = :"hot_cache_#{i}"
+        now = System.os_time(:millisecond)
+
+        try do
+          # Find keys eligible for eviction
+          eligible =
+            :ets.foldl(fn {key, exp}, found ->
+              cond do
+                length(found) >= 10 -> found
+                policy == :volatile_lru and exp > 0 and exp > now -> [{key, exp} | found]
+                policy == :volatile_ttl and exp > 0 and exp > now -> [{key, exp} | found]
+                policy == :allkeys_lru -> [{key, exp} | found]
+                true -> found
+              end
+            end, [], keydir)
+
+          if eligible != [] do
+            # For volatile_ttl, sort by TTL ascending (evict shortest TTL first)
+            to_evict =
+              case policy do
+                :volatile_ttl ->
+                  eligible |> Enum.sort_by(fn {_k, exp} -> exp end) |> Enum.take(5)
+                _ ->
+                  Enum.take(eligible, 5)
+              end
+
+            Enum.each(to_evict, fn {key, _exp} ->
+              :ets.delete(keydir, key)
+              :ets.delete(hot_cache, key)
+            end)
+
+            acc + length(to_evict)
+          else
+            acc
+          end
+        rescue _ -> acc
+        catch _, _ -> acc
+        end
+      end)
+
+    if evicted > 0 do
+      Ferricstore.Stats.incr_evicted_keys(evicted)
+    end
+
+    :ok
+  end
+
+  defp maybe_evict(_state), do: :ok
+
   defp compute_stats(state) do
-    shard_stats =
-      Enum.reduce(0..(state.shard_count - 1), %{}, fn i, acc ->
-        bytes = safe_ets_memory(:"keydir_#{i}") + safe_ets_memory(:"hot_cache_#{i}")
+    {keydir_bytes, hot_cache_bytes, shard_stats} =
+      Enum.reduce(0..(state.shard_count - 1), {0, 0, %{}}, fn i, {kd_acc, hc_acc, shards_acc} ->
+        kd_bytes = safe_ets_memory(:"keydir_#{i}")
+        hc_bytes = safe_ets_memory(:"hot_cache_#{i}")
+        bytes = kd_bytes + hc_bytes
         per_shard_max = div(state.max_memory_bytes, max(state.shard_count, 1))
         ratio =
           cond do
@@ -188,17 +334,27 @@ defmodule Ferricstore.MemoryGuard do
             bytes > 0 -> 1.0
             true -> 0.0
           end
-        Map.put(acc, i, %{bytes: bytes, ratio: ratio})
+        {kd_acc + kd_bytes, hc_acc + hc_bytes, Map.put(shards_acc, i, %{bytes: bytes, ratio: ratio})}
       end)
 
-    total_bytes = shard_stats |> Map.values() |> Enum.map(& &1.bytes) |> Enum.sum()
+    total_bytes = keydir_bytes + hot_cache_bytes
     ratio = if state.max_memory_bytes > 0, do: total_bytes / state.max_memory_bytes, else: 0.0
     pressure_level = classify_pressure(ratio)
+
+    keydir_ratio = if state.keydir_max_ram > 0, do: keydir_bytes / state.keydir_max_ram, else: 0.0
+    keydir_pressure_level = classify_pressure(keydir_ratio)
 
     %{
       total_bytes: total_bytes, max_bytes: state.max_memory_bytes,
       ratio: ratio, pressure_level: pressure_level,
-      shards: shard_stats, eviction_policy: state.eviction_policy
+      shards: shard_stats, eviction_policy: state.eviction_policy,
+      keydir_bytes: keydir_bytes,
+      hot_cache_bytes: hot_cache_bytes,
+      keydir_max_ram: state.keydir_max_ram,
+      hot_cache_max_ram: state.hot_cache_max_ram,
+      hot_cache_min_ram: state.hot_cache_min_ram,
+      keydir_pressure_level: keydir_pressure_level,
+      keydir_ratio: keydir_ratio
     }
   end
 
@@ -292,6 +448,10 @@ defmodule Ferricstore.MemoryGuard do
 
   defp default_eviction_policy, do: Application.get_env(:ferricstore, :eviction_policy, :volatile_lru)
   defp default_shard_count, do: Application.get_env(:ferricstore, :shard_count, 4)
+  defp default_keydir_max_ram, do: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)
+
+  defp maybe_update(state, _key, nil), do: state
+  defp maybe_update(state, key, value), do: Map.put(state, key, value)
 
   defp format_ratio(ratio), do: "#{Float.round(ratio * 100, 1)}%"
   defp format_bytes(bytes) when bytes >= 1_073_741_824, do: "#{Float.round(bytes / 1_073_741_824, 2)} GB"

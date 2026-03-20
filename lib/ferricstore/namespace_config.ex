@@ -105,9 +105,33 @@ defmodule Ferricstore.NamespaceConfig do
   """
   @spec set(binary(), binary(), binary()) :: :ok | {:error, binary()}
   def set(prefix, field, value) when is_binary(prefix) and is_binary(field) and is_binary(value) do
+    set(prefix, field, value, "")
+  end
+
+  @doc """
+  Sets a configuration field for the given namespace prefix with caller identity.
+
+  Behaves identically to `set/3` but also records `changed_by` for audit
+  trail purposes.
+
+  ## Parameters
+
+    * `prefix` -- namespace prefix string
+    * `field` -- field name string: `"window_ms"` or `"durability"`
+    * `value` -- field value string
+    * `changed_by` -- identity of the caller making the change
+
+  ## Returns
+
+    * `:ok` on success
+    * `{:error, reason}` when the field name or value is invalid
+  """
+  @spec set(binary(), binary(), binary(), binary()) :: :ok | {:error, binary()}
+  def set(prefix, field, value, changed_by)
+      when is_binary(prefix) and is_binary(field) and is_binary(value) and is_binary(changed_by) do
     case validate_field_value(field, value) do
       {:ok, parsed_field, parsed_value} ->
-        do_set(prefix, parsed_field, parsed_value)
+        do_set(prefix, parsed_field, parsed_value, changed_by)
 
       {:error, _} = err ->
         err
@@ -289,16 +313,22 @@ defmodule Ferricstore.NamespaceConfig do
   # Private -- ETS operations
   # ---------------------------------------------------------------------------
 
-  defp do_set(prefix, field, value) do
+  defp do_set(prefix, field, value, changed_by \\ "") do
     now = System.os_time(:second)
 
     try do
+      old_durability =
+        case :ets.lookup(@table, prefix) do
+          [{^prefix, _wms, dur, _cat, _cby}] -> dur
+          [] -> @default_durability
+        end
+
       case :ets.lookup(@table, prefix) do
         [{^prefix, window_ms, durability, _changed_at, _changed_by}] ->
           entry =
             case field do
-              :window_ms -> {prefix, value, durability, now, ""}
-              :durability -> {prefix, window_ms, value, now, ""}
+              :window_ms -> {prefix, value, durability, now, changed_by}
+              :durability -> {prefix, window_ms, value, now, changed_by}
             end
 
           :ets.insert(@table, entry)
@@ -306,11 +336,26 @@ defmodule Ferricstore.NamespaceConfig do
         [] ->
           entry =
             case field do
-              :window_ms -> {prefix, value, @default_durability, now, ""}
-              :durability -> {prefix, @default_window_ms, value, now, ""}
+              :window_ms -> {prefix, value, @default_durability, now, changed_by}
+              :durability -> {prefix, @default_window_ms, value, now, changed_by}
             end
 
           :ets.insert(@table, entry)
+      end
+
+      # Emit durability weakening telemetry when changing from quorum to async
+      if field == :durability and old_durability == :quorum and value == :async do
+        :telemetry.execute(
+          [:ferricstore, :config, :durability_weakened],
+          %{system_time: System.system_time(:millisecond)},
+          %{
+            prefix: prefix,
+            old_durability: :quorum,
+            new_durability: :async,
+            changed_by: changed_by,
+            changed_at: now
+          }
+        )
       end
 
       :ok

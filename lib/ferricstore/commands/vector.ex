@@ -190,6 +190,7 @@ defmodule Ferricstore.Commands.Vector do
     with {:ok, {dims, metric, m, ef}} <- get_collection_meta(collection, store) do
       prefix = vector_prefix(collection)
       count = store.compound_count.(collection, prefix)
+      ram_bytes = count * dims * 4
 
       [
         "collection", collection,
@@ -197,7 +198,8 @@ defmodule Ferricstore.Commands.Vector do
         "metric", Atom.to_string(metric),
         "m", m,
         "ef", ef,
-        "vector_count", count
+        "vector_count", count,
+        "ram_resident_bytes", ram_bytes
       ]
     end
   end

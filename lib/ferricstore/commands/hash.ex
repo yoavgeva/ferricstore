@@ -389,6 +389,253 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   # ---------------------------------------------------------------------------
+  # HPEXPIRE key milliseconds FIELDS count field [field ...]
+  # ---------------------------------------------------------------------------
+
+  # Sets a TTL (in milliseconds) on individual hash fields.
+  # Returns: 1 = expiry set, -2 = field/key does not exist.
+  def handle("HPEXPIRE", [key, ms_str, "FIELDS", count_str | fields], store) do
+    with {:ok, ms} <- parse_positive_integer(ms_str, "milliseconds"),
+         {:ok, count} <- parse_positive_integer(count_str, "count"),
+         :ok <- validate_field_count(count, fields) do
+      with :ok <- TypeRegistry.check_type(key, :hash, store) do
+        expire_at_ms = System.os_time(:millisecond) + ms
+
+        Enum.map(fields, fn field ->
+          compound_key = CompoundKey.hash_field(key, field)
+
+          case store.compound_get_meta.(key, compound_key) do
+            nil ->
+              -2
+
+            {value, _old_expire} ->
+              store.compound_put.(key, compound_key, value, expire_at_ms)
+              1
+          end
+        end)
+      end
+    end
+  end
+
+  def handle("HPEXPIRE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'hpexpire' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # HPTTL key FIELDS count field [field ...]
+  # ---------------------------------------------------------------------------
+
+  # Returns remaining TTL (milliseconds) for individual hash fields.
+  # Returns: TTL >= 0, -1 = no expiry, -2 = field/key does not exist.
+  def handle("HPTTL", [key, "FIELDS", count_str | fields], store) do
+    with {:ok, count} <- parse_positive_integer(count_str, "count"),
+         :ok <- validate_field_count(count, fields) do
+      with :ok <- TypeRegistry.check_type(key, :hash, store) do
+        now = System.os_time(:millisecond)
+
+        Enum.map(fields, fn field ->
+          compound_key = CompoundKey.hash_field(key, field)
+
+          case store.compound_get_meta.(key, compound_key) do
+            nil ->
+              -2
+
+            {_value, 0} ->
+              -1
+
+            {_value, expire_at_ms} ->
+              remaining_ms = expire_at_ms - now
+              if remaining_ms > 0, do: remaining_ms, else: -2
+          end
+        end)
+      end
+    end
+  end
+
+  def handle("HPTTL", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'hpttl' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # HEXPIRETIME key FIELDS count field [field ...]
+  # ---------------------------------------------------------------------------
+
+  # Returns the absolute Unix timestamp (seconds) at which each field expires.
+  # Returns: timestamp >= 0, -1 = no expiry, -2 = field/key does not exist.
+  def handle("HEXPIRETIME", [key, "FIELDS", count_str | fields], store) do
+    with {:ok, count} <- parse_positive_integer(count_str, "count"),
+         :ok <- validate_field_count(count, fields) do
+      with :ok <- TypeRegistry.check_type(key, :hash, store) do
+        Enum.map(fields, fn field ->
+          compound_key = CompoundKey.hash_field(key, field)
+
+          case store.compound_get_meta.(key, compound_key) do
+            nil ->
+              -2
+
+            {_value, 0} ->
+              -1
+
+            {_value, expire_at_ms} ->
+              div(expire_at_ms, 1000)
+          end
+        end)
+      end
+    end
+  end
+
+  def handle("HEXPIRETIME", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'hexpiretime' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # HGETDEL key FIELDS count field [field ...]
+  # ---------------------------------------------------------------------------
+
+  # Atomically gets the values of the specified fields and deletes them.
+  # Returns a list of values (nil for missing fields).
+  def handle("HGETDEL", [key, "FIELDS", count_str | fields], store) do
+    with {:ok, count} <- parse_positive_integer(count_str, "count"),
+         :ok <- validate_field_count(count, fields) do
+      with :ok <- TypeRegistry.check_type(key, :hash, store) do
+        results =
+          Enum.map(fields, fn field ->
+            compound_key = CompoundKey.hash_field(key, field)
+
+            case store.compound_get.(key, compound_key) do
+              nil ->
+                nil
+
+              value ->
+                store.compound_delete.(key, compound_key)
+                value
+            end
+          end)
+
+        # Clean up type metadata if hash is now empty
+        deleted_count = Enum.count(results, &(&1 != nil))
+        maybe_cleanup_empty_hash(key, deleted_count, store)
+
+        results
+      end
+    end
+  end
+
+  def handle("HGETDEL", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'hgetdel' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # HGETEX key [PERSIST|EX sec|PX ms|EXAT ts|PXAT ms_ts] FIELDS count field [field ...]
+  # ---------------------------------------------------------------------------
+
+  # Gets the values of the specified fields and optionally modifies their expiry.
+  def handle("HGETEX", [key, mode | rest], store) when mode in ~w(EX PX EXAT PXAT) do
+    case rest do
+      [value_str, "FIELDS", count_str | fields] ->
+        with {:ok, expire_at_ms} <- parse_expiry_mode(mode, value_str),
+             {:ok, count} <- parse_positive_integer(count_str, "count"),
+             :ok <- validate_field_count(count, fields) do
+          with :ok <- TypeRegistry.check_type(key, :hash, store) do
+            Enum.map(fields, fn field ->
+              compound_key = CompoundKey.hash_field(key, field)
+
+              case store.compound_get_meta.(key, compound_key) do
+                nil ->
+                  nil
+
+                {value, _old_expire} ->
+                  store.compound_put.(key, compound_key, value, expire_at_ms)
+                  value
+              end
+            end)
+          end
+        end
+
+      _ ->
+        {:error, "ERR wrong number of arguments for 'hgetex' command"}
+    end
+  end
+
+  def handle("HGETEX", [key, "PERSIST", "FIELDS", count_str | fields], store) do
+    with {:ok, count} <- parse_positive_integer(count_str, "count"),
+         :ok <- validate_field_count(count, fields) do
+      with :ok <- TypeRegistry.check_type(key, :hash, store) do
+        Enum.map(fields, fn field ->
+          compound_key = CompoundKey.hash_field(key, field)
+
+          case store.compound_get_meta.(key, compound_key) do
+            nil ->
+              nil
+
+            {value, _old_expire} ->
+              store.compound_put.(key, compound_key, value, 0)
+              value
+          end
+        end)
+      end
+    end
+  end
+
+  def handle("HGETEX", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'hgetex' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # HSETEX key seconds field value [field value ...]
+  # ---------------------------------------------------------------------------
+
+  # Sets field-value pairs in a hash with a per-field TTL in seconds.
+  # Returns the number of NEW fields added (not updated).
+  def handle("HSETEX", [key, seconds_str | field_value_pairs], store)
+      when length(field_value_pairs) >= 2 do
+    with {:ok, seconds} <- parse_positive_integer(seconds_str, "seconds") do
+      if rem(length(field_value_pairs), 2) != 0 do
+        {:error, "ERR wrong number of arguments for 'hsetex' command"}
+      else
+        with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
+          expire_at_ms = System.os_time(:millisecond) + seconds * 1000
+
+          pairs = Enum.chunk_every(field_value_pairs, 2)
+
+          new_count =
+            Enum.reduce(pairs, 0, fn [field, value], acc ->
+              compound_key = CompoundKey.hash_field(key, field)
+              existing = store.compound_get.(key, compound_key)
+              store.compound_put.(key, compound_key, value, expire_at_ms)
+              if existing == nil, do: acc + 1, else: acc
+            end)
+
+          new_count
+        end
+      end
+    end
+  end
+
+  def handle("HSETEX", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'hsetex' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # HSTRLEN key field
+  # ---------------------------------------------------------------------------
+
+  def handle("HSTRLEN", [key, field], store) do
+    with :ok <- TypeRegistry.check_type(key, :hash, store) do
+      compound_key = CompoundKey.hash_field(key, field)
+
+      case store.compound_get.(key, compound_key) do
+        nil -> 0
+        value -> byte_size(value)
+      end
+    end
+  end
+
+  def handle("HSTRLEN", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'hstrlen' command"}
+  end
+
+  # ---------------------------------------------------------------------------
   # HSCAN key cursor [MATCH pattern] [COUNT count]
   # ---------------------------------------------------------------------------
 
@@ -538,6 +785,43 @@ defmodule Ferricstore.Commands.Hash do
     case Integer.parse(str) do
       {int, ""} when int > 0 -> {:ok, int}
       _ -> {:error, "ERR #{label} is not a positive integer"}
+    end
+  end
+
+  # Parses expiry mode + value to an absolute expire_at_ms timestamp.
+  defp parse_expiry_mode("EX", value_str) do
+    case Integer.parse(value_str) do
+      {seconds, ""} when seconds > 0 ->
+        {:ok, System.os_time(:millisecond) + seconds * 1000}
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
+  defp parse_expiry_mode("PX", value_str) do
+    case Integer.parse(value_str) do
+      {ms, ""} when ms > 0 ->
+        {:ok, System.os_time(:millisecond) + ms}
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
+  defp parse_expiry_mode("EXAT", value_str) do
+    case Integer.parse(value_str) do
+      {ts, ""} when ts > 0 ->
+        {:ok, ts * 1000}
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
+  defp parse_expiry_mode("PXAT", value_str) do
+    case Integer.parse(value_str) do
+      {ts_ms, ""} when ts_ms > 0 ->
+        {:ok, ts_ms}
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 

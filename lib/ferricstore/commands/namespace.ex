@@ -47,6 +47,27 @@ defmodule Ferricstore.Commands.Namespace do
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, _store)
 
+  @doc """
+  4-arity variant that accepts `conn_state` for audit trail (changed_by).
+
+  When `conn_state` contains a `:client_id`, it is recorded as `"client:<id>"`
+  in the audit trail.
+  """
+  @spec handle(binary(), [binary()], map(), map()) :: term()
+  def handle("FERRICSTORE.CONFIG", ["SET", prefix, field, value], _store, conn_state) do
+    changed_by =
+      case Map.get(conn_state, :client_id) do
+        nil -> ""
+        id -> "client:#{id}"
+      end
+
+    NamespaceConfig.set(prefix, String.downcase(field), value, changed_by)
+  end
+
+  def handle(cmd, args, store, _conn_state) do
+    handle(cmd, args, store)
+  end
+
   # ---------------------------------------------------------------------------
   # FERRICSTORE.CONFIG SET prefix field value
   # ---------------------------------------------------------------------------
@@ -105,14 +126,21 @@ defmodule Ferricstore.Commands.Namespace do
   # Private -- formatting
   # ---------------------------------------------------------------------------
 
-  defp format_entry(%{prefix: prefix, window_ms: window_ms, durability: durability}) do
+  defp format_entry(%{prefix: prefix, window_ms: window_ms, durability: durability} = entry) do
+    changed_at = Map.get(entry, :changed_at, 0)
+    changed_by = Map.get(entry, :changed_by, "")
+
     [
       "prefix",
       prefix,
       "window_ms",
       Integer.to_string(window_ms),
       "durability",
-      Atom.to_string(durability)
+      Atom.to_string(durability),
+      "changed_at",
+      Integer.to_string(changed_at),
+      "changed_by",
+      changed_by
     ]
   end
 end

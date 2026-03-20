@@ -127,6 +127,35 @@ defmodule Ferricstore.Commands.Blocking do
     {:error, "ERR wrong number of arguments for 'blmpop' command"}
   end
 
+  @doc """
+  Parses BRPOPLPUSH arguments into `{:ok, source, destination, timeout_ms}` or `{:error, msg}`.
+
+  Format: `source destination timeout`
+
+  ## Parameters
+
+    - `args` -- list of string arguments: `[source, destination, timeout]`
+
+  ## Returns
+
+    - `{:ok, source, destination, timeout_ms}` -- parsed arguments
+    - `{:error, reason}` -- parse error
+  """
+  @spec parse_brpoplpush_args([binary()]) :: {:ok, binary(), binary(), non_neg_integer()} | {:error, binary()}
+  def parse_brpoplpush_args([source, destination, timeout_str]) do
+    case parse_timeout(timeout_str) do
+      {:ok, timeout_ms} ->
+        {:ok, source, destination, timeout_ms}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  def parse_brpoplpush_args(_args) do
+    {:error, "ERR wrong number of arguments for 'brpoplpush' command"}
+  end
+
   # ===========================================================================
   # Private -- parsing helpers
   # ===========================================================================
@@ -189,6 +218,17 @@ defmodule Ferricstore.Commands.Blocking do
   end
 
   def handle("BRPOP", args, store), do: handle("BLPOP", args, store)
+
+  def handle("BRPOPLPUSH", args, store) do
+    case parse_brpoplpush_args(args) do
+      {:ok, source, destination, _timeout_ms} ->
+        alias Ferricstore.Commands.List
+        List.handle("LMOVE", [source, destination, "RIGHT", "LEFT"], store)
+
+      {:error, _} = err ->
+        err
+    end
+  end
 
   def handle("BLMOVE", args, store) do
     case parse_blmove_args(args) do

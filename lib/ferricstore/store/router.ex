@@ -13,6 +13,8 @@ defmodule Ferricstore.Store.Router do
      transparently.
   """
 
+  alias Ferricstore.Stats
+
   @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
 
   # -------------------------------------------------------------------
@@ -106,8 +108,6 @@ defmodule Ferricstore.Store.Router do
   """
   @spec get(binary()) :: binary() | nil
   def get(key) do
-    alias Ferricstore.Stats
-
     idx = shard_for(key)
     keydir = :"keydir_#{idx}"
     hot_cache = :"hot_cache_#{idx}"
@@ -146,8 +146,6 @@ defmodule Ferricstore.Store.Router do
   """
   @spec get_meta(binary()) :: {binary(), non_neg_integer()} | nil
   def get_meta(key) do
-    alias Ferricstore.Stats
-
     idx = shard_for(key)
     keydir = :"keydir_#{idx}"
     hot_cache = :"hot_cache_#{idx}"
@@ -227,7 +225,35 @@ defmodule Ferricstore.Store.Router do
         {:error, "ERR value too large (max #{@max_value_size} bytes)"}
 
       true ->
-        GenServer.call(shard_name(shard_for(key)), {:put, key, value, expire_at_ms})
+        # Check KEYDIR_FULL: reject new keys when keydir budget exceeded
+        # Updates to existing keys are always allowed
+        case check_keydir_full(key) do
+          :ok ->
+            GenServer.call(shard_name(shard_for(key)), {:put, key, value, expire_at_ms})
+
+          {:error, _} = err ->
+            err
+        end
+    end
+  end
+
+  # Checks if the keydir is full. If so, only allows writes to existing keys.
+  defp check_keydir_full(key) do
+    try do
+      if Ferricstore.MemoryGuard.keydir_full?() do
+        # Allow updates to existing keys
+        if exists?(key) do
+          :ok
+        else
+          {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}
+        end
+      else
+        :ok
+      end
+    rescue
+      _ -> :ok
+    catch
+      :exit, _ -> :ok
     end
   end
 

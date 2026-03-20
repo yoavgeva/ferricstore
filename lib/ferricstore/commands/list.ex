@@ -318,6 +318,18 @@ defmodule Ferricstore.Commands.List do
   end
 
   # ---------------------------------------------------------------------------
+  # RPOPLPUSH source destination (deprecated, Redis 6.2+)
+  # ---------------------------------------------------------------------------
+
+  def handle("RPOPLPUSH", [source, destination], store) do
+    handle("LMOVE", [source, destination, "RIGHT", "LEFT"], store)
+  end
+
+  def handle("RPOPLPUSH", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'rpoplpush' command"}
+  end
+
+  # ---------------------------------------------------------------------------
   # LPUSHX key element [element ...]
   # ---------------------------------------------------------------------------
 

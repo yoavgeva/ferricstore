@@ -78,7 +78,10 @@ defmodule Ferricstore.Config do
     "notify-keyspace-events",
     "slowlog-log-slower-than",
     "slowlog-max-len",
-    "hz"
+    "hz",
+    "keydir-max-ram",
+    "hot-cache-max-ram",
+    "hot-cache-min-ram"
   ])
 
   # Valid eviction policy names (string form used by Redis CONFIG SET)
@@ -297,15 +300,82 @@ defmodule Ferricstore.Config do
   def handle_call(:rewrite, _from, state) do
     state = refresh_read_only(state)
     path = config_file_path()
+    dir = Path.dirname(path)
+    File.mkdir_p(dir)
+    tmp_path = path <> ".tmp"
 
-    content =
-      state
-      |> Enum.sort_by(fn {k, _v} -> k end)
-      |> Enum.map_join("\n", fn {k, v} -> "#{k} #{v}" end)
+    # Read existing file content (if any)
+    existing_lines =
+      case File.read(path) do
+        {:ok, content} -> String.split(content, "\n")
+        {:error, _} -> []
+      end
 
-    case File.write(path, content <> "\n") do
+    # Track which keys from state have been written
+    remaining_keys = MapSet.new(Map.keys(state))
+
+    # Process existing lines: preserve comments/blanks, update known keys, keep unknowns
+    {output_lines, written_keys} =
+      Enum.reduce(existing_lines, {[], MapSet.new()}, fn line, {lines_acc, written_acc} ->
+        trimmed = String.trim(line)
+
+        cond do
+          # Comment line or blank line -- preserve as-is
+          trimmed == "" or String.starts_with?(trimmed, "#") ->
+            {lines_acc ++ [line], written_acc}
+
+          # Config line: extract key
+          true ->
+            case String.split(trimmed, " ", parts: 2) do
+              [key | _rest] ->
+                if Map.has_key?(state, key) do
+                  # Known key -- write with live value
+                  value = Map.get(state, key, "")
+                  {lines_acc ++ ["#{key} #{value}"], MapSet.put(written_acc, key)}
+                else
+                  # Unknown key -- preserve verbatim
+                  {lines_acc ++ [line], written_acc}
+                end
+
+              _ ->
+                {lines_acc ++ [line], written_acc}
+            end
+        end
+      end)
+
+    # Append keys from state that weren't already in the file
+    new_keys =
+      MapSet.difference(remaining_keys, written_keys)
+      |> Enum.sort()
+
+    appended_lines =
+      Enum.map(new_keys, fn key ->
+        value = Map.get(state, key, "")
+        "#{key} #{value}"
+      end)
+
+    all_lines = output_lines ++ appended_lines
+
+    # Remove trailing empty strings to avoid double newlines at end
+    all_lines =
+      all_lines
+      |> Enum.reverse()
+      |> Enum.drop_while(&(&1 == ""))
+      |> Enum.reverse()
+
+    content = Enum.join(all_lines, "\n") <> "\n"
+
+    # Atomic write: write to tmp then rename
+    case File.write(tmp_path, content) do
       :ok ->
-        {:reply, :ok, state}
+        case File.rename(tmp_path, path) do
+          :ok ->
+            {:reply, :ok, state}
+
+          {:error, reason} ->
+            File.rm(tmp_path)
+            {:reply, {:error, "ERR failed to rename config file: #{inspect(reason)}"}, state}
+        end
 
       {:error, reason} ->
         {:reply, {:error, "ERR failed to write config file: #{inspect(reason)}"}, state}
@@ -335,7 +405,10 @@ defmodule Ferricstore.Config do
       "notify-keyspace-events" => "",
       "slowlog-log-slower-than" => read_slowlog_threshold(),
       "slowlog-max-len" => read_slowlog_max_len(),
-      "hz" => "10"
+      "hz" => "10",
+      "keydir-max-ram" => Integer.to_string(Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)),
+      "hot-cache-max-ram" => read_hot_cache_max_ram(),
+      "hot-cache-min-ram" => Integer.to_string(Application.get_env(:ferricstore, :hot_cache_min_ram, 64 * 1024 * 1024))
     }
 
     Map.merge(@legacy_rw_defaults, Map.merge(read_only, read_write))
@@ -382,6 +455,17 @@ defmodule Ferricstore.Config do
     case Application.get_env(:ferricstore, :raft_enabled, true) do
       true -> "true"
       false -> "false"
+    end
+  end
+
+  defp read_hot_cache_max_ram do
+    case Application.get_env(:ferricstore, :hot_cache_max_ram) do
+      nil ->
+        max_mem = Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824)
+        keydir = Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)
+        Integer.to_string(max(max_mem - keydir, 64 * 1024 * 1024))
+      val ->
+        Integer.to_string(val)
     end
   end
 
@@ -469,6 +553,13 @@ defmodule Ferricstore.Config do
     end
   end
 
+  defp validate_param(key, value) when key in ["keydir-max-ram", "hot-cache-max-ram", "hot-cache-min-ram"] do
+    case Integer.parse(value) do
+      {n, ""} when n > 0 -> :ok
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET '#{key}'"}
+    end
+  end
+
   defp validate_param(_key, _value), do: :ok
 
   # -------------------------------------------------------------------
@@ -495,6 +586,36 @@ defmodule Ferricstore.Config do
   defp apply_side_effect("slowlog-max-len", value) do
     {n, ""} = Integer.parse(value)
     Application.put_env(:ferricstore, :slowlog_max_len, n)
+  end
+
+  defp apply_side_effect("keydir-max-ram", value) do
+    {n, ""} = Integer.parse(value)
+    Application.put_env(:ferricstore, :keydir_max_ram, n)
+    try do
+      Ferricstore.MemoryGuard.reconfigure(%{keydir_max_ram: n})
+    rescue _ -> :ok
+    catch _, _ -> :ok
+    end
+  end
+
+  defp apply_side_effect("hot-cache-max-ram", value) do
+    {n, ""} = Integer.parse(value)
+    Application.put_env(:ferricstore, :hot_cache_max_ram, n)
+    try do
+      Ferricstore.MemoryGuard.reconfigure(%{hot_cache_max_ram: n})
+    rescue _ -> :ok
+    catch _, _ -> :ok
+    end
+  end
+
+  defp apply_side_effect("hot-cache-min-ram", value) do
+    {n, ""} = Integer.parse(value)
+    Application.put_env(:ferricstore, :hot_cache_min_ram, n)
+    try do
+      Ferricstore.MemoryGuard.reconfigure(%{hot_cache_min_ram: n})
+    rescue _ -> :ok
+    catch _, _ -> :ok
+    end
   end
 
   defp apply_side_effect(_key, _value), do: :ok
