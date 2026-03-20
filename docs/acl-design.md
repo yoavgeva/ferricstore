@@ -39,6 +39,15 @@ user default on nopass ~* &* +@all
 ```
 Same as Redis. Must be locked down before production.
 
+### Safety limit:
+```elixir
+config :ferricstore, :max_acl_users, 10_000  # default
+```
+ACL SETUSER returns `ERR max ACL users reached` when the limit is hit.
+This prevents abuse (accidental or malicious mass user creation).
+At 10,000 users, the ACL ETS table uses ~5.7MB — well within bounds.
+Configurable for multi-tenant deployments that need more.
+
 ---
 
 ## 2. ACL SETUSER Syntax

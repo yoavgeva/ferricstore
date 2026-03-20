@@ -18,6 +18,29 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 - **Q13 (release_cursor):** FIXED — emitted every 1000 applies.
 - **Q16 (Health endpoint):** FIXED — /health/ready on port 9090 + HTML dashboard.
 
+## FUTURE FEATURES
+
+### F1: Shard Placement / Leadership Rebalance (Vertical + Horizontal Scaling)
+**Problem:** When a new node joins with more CPUs, it should lead more shards proportionally.
+**Design:**
+- `CLUSTER REBALANCE` command redistributes shard leadership by node weight (CPU count)
+- `ra:transfer_leadership/2` moves leadership instantly (no data migration)
+- Requires overprovisioning shards at startup (recommend 32+ shards)
+- Example: Node 1 (4 CPUs) leads 8/32 shards, Node 2 (16 CPUs) leads 24/32 shards
+- Auto-rebalance on node join/leave
+**Status:** Deferred — requires cluster management layer.
+
+### F2: Umbrella Package Split
+**Problem:** Embedded users get Ranch/TCP deps they don't need.
+**Design:** Split into `ferricstore` (core) + `ferricstore_server` (TCP/HTTP).
+**Current:** Config-based `:mode` approach works as interim solution.
+**Status:** Deferred — packaging change, not code change.
+
+### F3: ACL v2 Implementation
+**Problem:** Key patterns stored but not enforced, plaintext passwords, missing categories.
+**Design:** See `docs/acl-design.md` — comprehensive 3-phase plan with user stories.
+**Status:** Design complete, implementation deferred.
+
 ## STILL OPEN
 
 ### Q5: Cross-Shard 2PC Transactions
