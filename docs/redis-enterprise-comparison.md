@@ -85,7 +85,7 @@
 | Automatic failover | Yes (single-digit seconds) | Yes (Raft leader election) | Redis Enterprise is more battle-tested |
 | Active-Active geo-replication | Yes (CRDT-based, multi-region) | No | Major differentiator for Redis Enterprise |
 | Cross-datacenter replication | Yes | No | FerricStore is single-region only |
-| Zero-downtime upgrades | Yes | No | FerricStore requires restart for upgrades |
+| Zero-downtime upgrades | Yes (proxy-based rolling) | Yes (OTP hot code loading) | Both support zero-downtime. Redis uses proxy rerouting; FerricStore uses BEAM's native hot code upgrade (code_change/3, release_handler) — modules upgrade while processes keep running, no connections dropped |
 | 99.999% uptime SLA | Yes (Active-Active) | No SLA | FerricStore is pre-1.0 |
 | **Storage & Memory** | | | |
 | Auto Tiering (RAM + SSD) | Yes (Speedb engine, up to 70% cost savings) | Two-tier: ETS hot cache + Bitcask on disk | Different approach -- FerricStore's hot cache is automatic but not SSD-tiered |
