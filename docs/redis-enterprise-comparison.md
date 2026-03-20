@@ -83,7 +83,7 @@
 | **Replication & HA** | | | |
 | Primary-replica replication | Yes (async + diskless) | Via Raft log replication | Different mechanisms |
 | Automatic failover | Yes (single-digit seconds) | Yes (Raft leader election) | Redis Enterprise is more battle-tested |
-| Active-Active geo-replication | Yes (CRDT-based, multi-region) | No | Major differentiator for Redis Enterprise |
+| Active-Active geo-replication | Yes (CRDT-based, multi-region) | Partial (shard-level geo-distribution via Raft) | Redis Enterprise has full CRDT Active-Active (both DCs write any key). FerricStore supports shard-level geo-distribution: different shard leaders in different DCs, strong consistency per shard. Full CRDT Active-Active is on the roadmap. |
 | Cross-datacenter replication | Yes | No | FerricStore is single-region only |
 | Zero-downtime upgrades | Yes (proxy-based rolling) | Yes (OTP hot code loading) | Both support zero-downtime. Redis uses proxy rerouting; FerricStore uses BEAM's native hot code upgrade (code_change/3, release_handler) — modules upgrade while processes keep running, no connections dropped |
 | 99.999% uptime SLA | Yes (Active-Active) | No SLA | FerricStore is pre-1.0 |
@@ -180,7 +180,11 @@ FerricStore provides built-in test isolation via `FerricStore.Sandbox`. Each tes
 
 ### 1. Active-Active Geo-Replication (CRDTs)
 
-This is Redis Enterprise's crown jewel. Active-Active uses conflict-free replicated data types (CRDTs) to allow reads and writes at multiple geographic locations simultaneously, with automatic conflict resolution. FerricStore has no equivalent. For applications that require multi-region write capability with sub-millisecond local latency, Redis Enterprise is the only option.
+This is Redis Enterprise's crown jewel. Active-Active uses conflict-free replicated data types (CRDTs) to allow reads and writes at multiple geographic locations simultaneously, with automatic conflict resolution.
+
+FerricStore supports **shard-level geo-distribution**: in a multi-DC cluster, different shard leaders can be placed in different datacenters via `ra:transfer_leadership`. This gives low-latency writes for keys that hash to the local DC's shards, with strong consistency. However, keys that hash to a remote DC's shard incur cross-DC latency.
+
+For true Active-Active (any key writable at any DC with automatic conflict resolution), FerricStore would need CRDT data types — this is on the roadmap but not yet implemented. The practical middle ground is prefix-based routing: `east:*` keys led by DC-East shards, `west:*` keys led by DC-West shards.
 
 ### 2. Auto Tiering (Redis on Flash)
 
