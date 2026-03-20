@@ -901,6 +901,17 @@ with no password. FerricStore's protected mode makes this impossible — you
 MUST create a user before the server accepts remote connections. The bootstrap
 flow is intentionally friction-full to prevent accidental exposure.
 
+**Disabling protected mode (dev/test environments):**
+```elixir
+# config/dev.exs
+config :ferricstore, :protected_mode, false
+```
+When `protected_mode: false`, all connections accepted from any IP immediately.
+No ACL setup required. Default user works with no password. This is the
+expected behavior for local development and CI environments.
+
+Protected mode is `true` by default in production config.
+
 ---
 
 ### US-12: ACL Survives Node Crash
