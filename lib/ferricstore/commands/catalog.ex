@@ -106,7 +106,9 @@ defmodule Ferricstore.Commands.Catalog do
 
     # -- FerricStore-native -------------------------------------------------
     %{name: "ferricstore.config", arity: -2, flags: ["admin"], first_key: 0, last_key: 0, step: 0,
-      summary: "Manages per-namespace configuration (SET/GET/RESET)."}
+      summary: "Manages per-namespace configuration (SET/GET/RESET)."},
+    %{name: "ferricstore.key_info", arity: 2, flags: ["readonly", "fast"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns diagnostic metadata about a key (type, size, TTL, cache status, shard)."}
   ]
 
   @commands_by_name Map.new(@commands, fn cmd -> {cmd.name, cmd} end)

@@ -181,12 +181,12 @@ defmodule Ferricstore.Spec.OomPreventionTest do
           eviction_policy: :noeviction
         ])
 
-      assert_receive {:pressure, measurements, metadata}, 2000
+      # Match specifically on per-shard events (contain pressure_level, not level)
+      assert_receive {:pressure, measurements, %{pressure_level: :reject} = metadata}, 2000
       assert is_integer(measurements.shard_index)
       assert is_integer(measurements.bytes)
       assert measurements.bytes > 0
       assert metadata.eviction_policy == :noeviction
-      assert metadata.pressure_level == :reject
 
       GenServer.stop(pid)
       :telemetry.detach(handler_id)

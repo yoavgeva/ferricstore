@@ -81,6 +81,7 @@ defmodule Ferricstore.Store.Router do
         nil
 
       :expired ->
+        Stats.incr_keyspace_misses()
         nil
 
       :miss ->
@@ -115,18 +116,24 @@ defmodule Ferricstore.Store.Router do
     case ets_get(keydir, hot_cache, key, now) do
       {:hit, value, _exp} ->
         Stats.record_hot_read(key)
+        Stats.incr_keyspace_hits()
         value
 
       :expired ->
+        Stats.incr_keyspace_misses()
         nil
 
       :miss ->
         Stats.record_cold_read(key)
-        GenServer.call(shard_name(idx), {:get, key})
+        result = GenServer.call(shard_name(idx), {:get, key})
+        if result != nil, do: Stats.incr_keyspace_hits(), else: Stats.incr_keyspace_misses()
+        result
 
       :no_table ->
         Stats.record_cold_read(key)
-        GenServer.call(shard_name(idx), {:get, key})
+        result = GenServer.call(shard_name(idx), {:get, key})
+        if result != nil, do: Stats.incr_keyspace_hits(), else: Stats.incr_keyspace_misses()
+        result
     end
   end
 
@@ -152,6 +159,7 @@ defmodule Ferricstore.Store.Router do
         {value, exp}
 
       :expired ->
+        Stats.incr_keyspace_misses()
         nil
 
       :miss ->

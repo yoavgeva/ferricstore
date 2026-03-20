@@ -14,6 +14,15 @@ defmodule Ferricstore.Acl do
   Implements spec section 6.1: `ACL SETUSER`, `ACL DELUSER`, `ACL GETUSER`,
   `ACL LIST`, `ACL WHOAMI`.
 
+  ## Command categories
+
+  Commands can be granted or revoked by category using `+@category` / `-@category`:
+
+    - `@read`      -- read-only commands (GET, MGET, HGET, EXISTS, TTL, etc.)
+    - `@write`     -- mutation commands (SET, DEL, HSET, LPUSH, INCR, etc.)
+    - `@admin`     -- server administration (CONFIG, ACL, DEBUG, FLUSHDB, etc.)
+    - `@dangerous` -- potentially destructive (FLUSHDB, FLUSHALL, DEBUG, KEYS, SHUTDOWN, etc.)
+
   ## ETS schema
 
   Each row is a tuple:
@@ -31,6 +40,12 @@ defmodule Ferricstore.Acl do
       Ferricstore.Acl.authenticate("alice", "s3cret")
       #=> {:ok, user}
 
+      Ferricstore.Acl.check_command("alice", "GET")
+      #=> :ok
+
+      Ferricstore.Acl.check_command("alice", "FLUSHDB")
+      #=> {:error, "NOPERM this user has no permissions to run the 'flushdb' command"}
+
       Ferricstore.Acl.del_user("alice")
       #=> :ok
   """
@@ -38,6 +53,64 @@ defmodule Ferricstore.Acl do
   use GenServer
 
   @table :ferricstore_acl
+
+  # ---------------------------------------------------------------------------
+  # Command categories
+  # ---------------------------------------------------------------------------
+
+  @read_commands MapSet.new(~w(
+    GET MGET GETRANGE STRLEN GETEX GETDEL GETSET
+    HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN
+    LRANGE LLEN LINDEX LPOS
+    SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER SSCAN
+    ZSCORE ZRANK ZREVRANK ZRANGE ZCARD ZCOUNT ZRANDMEMBER ZMSCORE ZSCAN
+    TYPE EXISTS TTL PTTL EXPIRETIME PEXPIRETIME
+    GETBIT BITCOUNT BITPOS PFCOUNT
+    OBJECT SUBSTR
+    GEOHASH GEOPOS GEODIST GEOSEARCH
+    XLEN XRANGE XREVRANGE XREAD XINFO
+    DBSIZE RANDOMKEY SCAN KEYS
+    JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET
+  ))
+
+  @write_commands MapSet.new(~w(
+    SET SETNX SETEX PSETEX MSET MSETNX APPEND SETRANGE
+    INCR DECR INCRBY DECRBY INCRBYFLOAT
+    DEL UNLINK
+    EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
+    RENAME RENAMENX COPY
+    HSET HDEL HINCRBY HINCRBYFLOAT HSETNX
+    LPUSH RPUSH LPOP RPOP LSET LINSERT LTRIM LREM LMOVE LPUSHX RPUSHX
+    SADD SREM SPOP SMOVE SDIFFSTORE SINTERSTORE SUNIONSTORE
+    ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX
+    SETBIT BITOP PFADD PFMERGE
+    GEOADD GEOSEARCHSTORE
+    XADD XTRIM XDEL
+    GETSET GETDEL
+    JSON.SET JSON.DEL JSON.NUMINCRBY JSON.TOGGLE JSON.CLEAR JSON.ARRAPPEND
+    CAS LOCK UNLOCK EXTEND
+  ))
+
+  @admin_commands MapSet.new(~w(
+    CONFIG ACL DEBUG SLOWLOG SAVE BGSAVE LASTSAVE
+    FLUSHDB FLUSHALL
+    INFO COMMAND MODULE MEMORY
+    CLUSTER.HEALTH CLUSTER.STATS
+    WAITAOF WAIT SELECT
+    FERRICSTORE.HOTNESS FERRICSTORE.METRICS
+  ))
+
+  @dangerous_commands MapSet.new(~w(
+    FLUSHDB FLUSHALL DEBUG CONFIG KEYS SHUTDOWN
+    SORT MIGRATE RESTORE DUMP
+  ))
+
+  @category_map %{
+    "READ" => @read_commands,
+    "WRITE" => @write_commands,
+    "ADMIN" => @admin_commands,
+    "DANGEROUS" => @dangerous_commands
+  }
 
   # ---------------------------------------------------------------------------
   # Types
@@ -77,7 +150,10 @@ defmodule Ferricstore.Acl do
     * `"~pattern"`     -- add a key pattern (e.g. `"~*"` for all keys)
     * `"+command"`     -- allow a specific command
     * `"+@all"`        -- allow all commands
+    * `"+@category"`   -- allow all commands in a category (read, write, admin, dangerous)
     * `"-command"`     -- deny a specific command
+    * `"-@all"`        -- deny all commands
+    * `"-@category"`   -- deny all commands in a category
     * `"allkeys"`      -- shorthand for `"~*"`
     * `"allcommands"`  -- shorthand for `"+@all"`
     * `"resetpass"`    -- clear the password
@@ -95,6 +171,9 @@ defmodule Ferricstore.Acl do
   ## Examples
 
       Ferricstore.Acl.set_user("alice", ["on", ">s3cret", "~*", "+@all"])
+      #=> :ok
+
+      Ferricstore.Acl.set_user("reader", ["on", ">pass", "-@all", "+@read"])
       #=> :ok
   """
   @spec set_user(binary(), [binary()]) :: :ok | {:error, binary()}
@@ -200,11 +279,6 @@ defmodule Ferricstore.Acl do
 
   Returns `{:ok, username}` on success, `{:error, reason}` on failure.
 
-  When `requirepass` is set and the username is "default", the password is
-  checked against `requirepass` first (backwards compatibility). For all
-  other users, or when a user has been explicitly configured via ACL SETUSER,
-  the ACL password takes precedence.
-
   ## Parameters
 
     - `username` -- the username to authenticate
@@ -228,7 +302,6 @@ defmodule Ferricstore.Acl do
         {:error, "WRONGPASS invalid username-password pair or user is disabled."}
 
       %{password: nil} ->
-        # User has no password set -- accept any password (nopass mode).
         {:ok, username}
 
       %{password: stored_pass} when stored_pass == password ->
@@ -240,10 +313,9 @@ defmodule Ferricstore.Acl do
   end
 
   @doc """
-  Checks if the given user is allowed to run the given command.
+  Checks if the given user is allowed to run the given command (enabled check only).
 
-  For v1, this only checks whether the user exists and is enabled. Command
-  and key restrictions are reserved for a future version.
+  Legacy v1 check. Prefer `check_command/2` for full ACL enforcement.
 
   ## Parameters
 
@@ -268,6 +340,73 @@ defmodule Ferricstore.Acl do
         :ok
     end
   end
+
+  @doc """
+  Checks if the given user is allowed to run the given command.
+
+  Performs a full ACL check:
+
+    1. The user must exist.
+    2. The user must be enabled.
+    3. The command must be in the user's allowed command set.
+
+  When the user's commands field is `:all` (i.e. `+@all`), all commands are
+  permitted. When it is a `MapSet`, the command (uppercased) must be a member.
+
+  ## Parameters
+
+    - `username` -- the username
+    - `command`  -- the command name (case-insensitive)
+
+  ## Returns
+
+    - `:ok` if the command is permitted
+    - `{:error, reason}` with a `NOPERM` prefix if denied
+
+  ## Examples
+
+      Ferricstore.Acl.check_command("default", "GET")
+      #=> :ok
+
+      Ferricstore.Acl.check_command("readonly_user", "SET")
+      #=> {:error, "NOPERM this user has no permissions to run the 'set' command"}
+  """
+  @spec check_command(binary(), binary()) :: :ok | {:error, binary()}
+  def check_command(username, command) do
+    cmd = String.upcase(command)
+
+    case get_user(username) do
+      nil ->
+        {:error, "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+
+      %{enabled: false} ->
+        {:error, "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+
+      %{commands: :all} ->
+        :ok
+
+      %{commands: cmds} ->
+        if MapSet.member?(cmds, cmd) do
+          :ok
+        else
+          {:error, "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+        end
+    end
+  end
+
+  @doc """
+  Returns the map of command categories.
+
+  Each key is an uppercase category name (e.g. `"READ"`, `"WRITE"`, `"ADMIN"`,
+  `"DANGEROUS"`) and the value is a `MapSet` of uppercase command names.
+
+  ## Examples
+
+      Ferricstore.Acl.categories()
+      #=> %{"READ" => MapSet.new(["GET", "MGET", ...]), ...}
+  """
+  @spec categories() :: %{binary() => MapSet.t(binary())}
+  def categories, do: @category_map
 
   @doc """
   Resets the ACL to its initial state (only the default user).
@@ -298,7 +437,6 @@ defmodule Ferricstore.Acl do
       if existing do
         existing
       else
-        # New user defaults: disabled, no password, no permissions.
         %{enabled: false, password: nil, commands: :all, keys: :all}
       end
 
@@ -368,6 +506,45 @@ defmodule Ferricstore.Acl do
   defp parse_rule(user, "allkeys"), do: {:ok, %{user | keys: :all}}
   defp parse_rule(user, "allcommands"), do: {:ok, %{user | commands: :all}}
   defp parse_rule(user, "+@all"), do: {:ok, %{user | commands: :all}}
+  defp parse_rule(user, "-@all"), do: {:ok, %{user | commands: MapSet.new()}}
+
+  # +@category -- expand the category to individual commands and add them all.
+  defp parse_rule(user, "+@" <> category) do
+    cat = String.upcase(category)
+
+    case Map.fetch(@category_map, cat) do
+      {:ok, cat_cmds} ->
+        case user.commands do
+          :all ->
+            {:ok, user}
+
+          cmds ->
+            {:ok, %{user | commands: MapSet.union(cmds, cat_cmds)}}
+        end
+
+      :error ->
+        {:error, "ERR Error in ACL SETUSER modifier '+@#{category}': Unknown command category '#{category}'"}
+    end
+  end
+
+  # -@category -- remove all commands in the category from the user's set.
+  defp parse_rule(user, "-@" <> category) do
+    cat = String.upcase(category)
+
+    case Map.fetch(@category_map, cat) do
+      {:ok, cat_cmds} ->
+        case user.commands do
+          :all ->
+            {:ok, user}
+
+          cmds ->
+            {:ok, %{user | commands: MapSet.difference(cmds, cat_cmds)}}
+        end
+
+      :error ->
+        {:error, "ERR Error in ACL SETUSER modifier '-@#{category}': Unknown command category '#{category}'"}
+    end
+  end
 
   defp parse_rule(user, "+" <> command) do
     cmd = String.upcase(command)
@@ -378,15 +555,11 @@ defmodule Ferricstore.Acl do
     end
   end
 
-  defp parse_rule(user, "-@all"), do: {:ok, %{user | commands: MapSet.new()}}
-
   defp parse_rule(user, "-" <> command) do
     cmd = String.upcase(command)
 
     case user.commands do
       :all ->
-        # Cannot remove a single command from :all without enumerating.
-        # For v1, just ignore silently.
         {:ok, user}
 
       cmds ->

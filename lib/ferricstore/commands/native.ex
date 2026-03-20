@@ -3,186 +3,168 @@ defmodule Ferricstore.Commands.Native do
   @moduledoc """
   Handles FerricStore-native commands that go beyond the Redis command set.
 
-  These commands provide primitives useful for distributed coordination and
-  rate limiting, implemented as atomic shard-level operations.
-
   ## Supported commands
 
-    * `CAS key expected new [EX seconds]` — compare-and-swap
-    * `LOCK key owner ttl_ms` — acquire a distributed lock
-    * `UNLOCK key owner` — release a distributed lock
-    * `EXTEND key owner ttl_ms` — extend lock TTL
-    * `RATELIMIT.ADD key window_ms max [count]` — sliding window rate limiter
+    * `CAS key expected new [EX seconds]` -- compare-and-swap
+    * `LOCK key owner ttl_ms` -- acquire a distributed lock
+    * `UNLOCK key owner` -- release a distributed lock
+    * `EXTEND key owner ttl_ms` -- extend lock TTL
+    * `RATELIMIT.ADD key window_ms max [count]` -- sliding window rate limiter
+    * `KEY_INFO key` -- returns diagnostic metadata about a key
   """
 
   alias Ferricstore.Store.Router
 
-  @doc """
-  Handles a native FerricStore command.
-
-  ## Parameters
-
-    - `cmd` - Uppercased command name (e.g. `"CAS"`, `"LOCK"`)
-    - `args` - List of string arguments
-    - `store` - Injected store map (unused; native commands call Router directly)
-
-  ## Returns
-
-  Command-specific return values. See individual command docs below.
-  """
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
-  # ---------------------------------------------------------------------------
-  # CAS — Compare-and-Swap
-  # ---------------------------------------------------------------------------
-
-  def handle("CAS", [key, expected, new_value], _store) do
-    Router.cas(key, expected, new_value, nil)
-  end
-
+  def handle("CAS", [key, expected, new_value], _store), do: Router.cas(key, expected, new_value, nil)
   def handle("CAS", [key, expected, new_value, "EX", secs_str], _store) do
     case Integer.parse(secs_str) do
-      {secs, ""} when secs > 0 ->
-        ttl_ms = secs * 1_000
-        Router.cas(key, expected, new_value, ttl_ms)
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+      {secs, ""} when secs > 0 -> Router.cas(key, expected, new_value, secs * 1_000)
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
-
-  def handle("CAS", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'cas' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # LOCK — Acquire distributed lock
-  # ---------------------------------------------------------------------------
-
+  def handle("CAS", _args, _store), do: {:error, "ERR wrong number of arguments for 'cas' command"}
   def handle("LOCK", [key, owner, ttl_ms_str], _store) do
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms > 0 ->
-        Router.lock(key, owner, ttl_ms)
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+      {ttl_ms, ""} when ttl_ms > 0 -> Router.lock(key, owner, ttl_ms)
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
-
-  def handle("LOCK", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'lock' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # UNLOCK — Release distributed lock
-  # ---------------------------------------------------------------------------
-
-  def handle("UNLOCK", [key, owner], _store) do
-    Router.unlock(key, owner)
-  end
-
-  def handle("UNLOCK", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'unlock' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # EXTEND — Extend lock TTL
-  # ---------------------------------------------------------------------------
-
+  def handle("LOCK", _args, _store), do: {:error, "ERR wrong number of arguments for 'lock' command"}
+  def handle("UNLOCK", [key, owner], _store), do: Router.unlock(key, owner)
+  def handle("UNLOCK", _args, _store), do: {:error, "ERR wrong number of arguments for 'unlock' command"}
   def handle("EXTEND", [key, owner, ttl_ms_str], _store) do
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms > 0 ->
-        Router.extend(key, owner, ttl_ms)
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+      {ttl_ms, ""} when ttl_ms > 0 -> Router.extend(key, owner, ttl_ms)
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
-
-  def handle("EXTEND", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'extend' command"}
+  def handle("EXTEND", _args, _store), do: {:error, "ERR wrong number of arguments for 'extend' command"}
+  def handle("RATELIMIT.ADD", [key, wms, max_str], _store), do: do_ratelimit_add(key, wms, max_str, "1")
+  def handle("RATELIMIT.ADD", [key, wms, max_str, cnt], _store), do: do_ratelimit_add(key, wms, max_str, cnt)
+  def handle("RATELIMIT.ADD", _args, _store), do: {:error, "ERR wrong number of arguments for 'ratelimit.add' command"}
+  def handle("KEY_INFO", [key], _store), do: do_key_info(key)
+  def handle("KEY_INFO", _args, _store), do: {:error, "ERR wrong number of arguments for 'key_info' command"}
+  def handle("FETCH_OR_COMPUTE", [key, ttl], _store), do: do_fetch_or_compute(key, ttl, "")
+  def handle("FETCH_OR_COMPUTE", [key, ttl, hint], _store), do: do_fetch_or_compute(key, ttl, hint)
+  def handle("FETCH_OR_COMPUTE", _args, _store), do: {:error, "ERR wrong number of arguments for 'fetch_or_compute' command"}
+  def handle("FETCH_OR_COMPUTE_RESULT", [key, value, ttl_ms_str], _store) do
+    case Integer.parse(ttl_ms_str) do
+      {ttl_ms, ""} when ttl_ms >= 0 -> Ferricstore.FetchOrCompute.fetch_or_compute_result(key, value, ttl_ms)
+      _ -> {:error, "ERR value is not an integer or out of range"}
+    end
   end
+  def handle("FETCH_OR_COMPUTE_RESULT", _args, _store), do: {:error, "ERR wrong number of arguments for 'fetch_or_compute_result' command"}
+  def handle("FETCH_OR_COMPUTE_ERROR", [key, msg], _store), do: Ferricstore.FetchOrCompute.fetch_or_compute_error(key, msg)
+  def handle("FETCH_OR_COMPUTE_ERROR", _args, _store), do: {:error, "ERR wrong number of arguments for 'fetch_or_compute_error' command"}
 
-  # ---------------------------------------------------------------------------
-  # RATELIMIT.ADD — Sliding window rate limiter
-  # ---------------------------------------------------------------------------
-
-  def handle("RATELIMIT.ADD", [key, window_ms_str, max_str], _store) do
-    do_ratelimit_add(key, window_ms_str, max_str, "1")
-  end
-
-  def handle("RATELIMIT.ADD", [key, window_ms_str, max_str, count_str], _store) do
-    do_ratelimit_add(key, window_ms_str, max_str, count_str)
-  end
-
-  def handle("RATELIMIT.ADD", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'ratelimit.add' command"}
-  end
-
-  defp do_ratelimit_add(key, window_ms_str, max_str, count_str) do
-    with {window_ms, ""} <- Integer.parse(window_ms_str),
-         true <- window_ms > 0,
-         {max, ""} <- Integer.parse(max_str),
-         true <- max > 0,
-         {count, ""} <- Integer.parse(count_str),
-         true <- count > 0 do
-      Router.ratelimit_add(key, window_ms, max, count)
+  defp do_ratelimit_add(key, wms, max_str, cnt) do
+    with {w, ""} <- Integer.parse(wms), true <- w > 0,
+         {m, ""} <- Integer.parse(max_str), true <- m > 0,
+         {c, ""} <- Integer.parse(cnt), true <- c > 0 do
+      Router.ratelimit_add(key, w, m, c)
     else
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # FETCH_OR_COMPUTE — cache-aside with stampede protection
-  # ---------------------------------------------------------------------------
+  defp do_key_info(key) do
+    idx = Router.shard_for(key)
+    keydir = :"keydir_#{idx}"
+    hot_cache = :"hot_cache_#{idx}"
+    now = System.os_time(:millisecond)
+    shard = Router.shard_name(idx)
 
-  def handle("FETCH_OR_COMPUTE", [key, ttl_ms_str], _store) do
-    do_fetch_or_compute(key, ttl_ms_str, "")
+    store = %{
+      get: &Router.get/1,
+      compound_get: fn redis_key, compound_key ->
+        GenServer.call(shard, {:compound_get, redis_key, compound_key})
+      end
+    }
+
+    type = Ferricstore.Store.TypeRegistry.get_type(key, store)
+    alive? = type != "none"
+
+    {value, expire_at_ms} =
+      if alive? do
+        {val, exp, _hot, _ok} = ets_key_info(keydir, hot_cache, key, now)
+        if val != nil do
+          {val, exp}
+        else
+          case Router.get_meta(key) do
+            nil -> {nil, 0}
+            {v, e} -> {v, e}
+          end
+        end
+      else
+        {nil, 0}
+      end
+
+    value_size = if alive? and is_binary(value), do: byte_size(value), else: 0
+
+    ttl_ms =
+      cond do
+        not alive? -> -2
+        expire_at_ms == 0 -> -1
+        true -> max(expire_at_ms - now, 0)
+      end
+
+    hot_status =
+      if alive? do
+        try do
+          case :ets.lookup(hot_cache, key) do
+            [{^key, _}] -> "hot"
+            [] -> "cold"
+          end
+        rescue
+          ArgumentError -> "cold"
+        end
+      else
+        "cold"
+      end
+
+    [
+      "type", type,
+      "value_size", Integer.to_string(value_size),
+      "ttl_ms", Integer.to_string(ttl_ms),
+      "hot_cache_status", hot_status,
+      "last_write_shard", Integer.to_string(idx)
+    ]
   end
 
-  def handle("FETCH_OR_COMPUTE", [key, ttl_ms_str, hint], _store) do
-    do_fetch_or_compute(key, ttl_ms_str, hint)
-  end
-
-  def handle("FETCH_OR_COMPUTE", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'fetch_or_compute' command"}
-  end
-
-  def handle("FETCH_OR_COMPUTE_RESULT", [key, value, ttl_ms_str], _store) do
-    case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms >= 0 ->
-        Ferricstore.FetchOrCompute.fetch_or_compute_result(key, value, ttl_ms)
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+  defp ets_key_info(keydir, hot_cache, key, now) do
+    try do
+      case :ets.lookup(keydir, key) do
+        [{^key, 0}] ->
+          case :ets.lookup(hot_cache, key) do
+            [{^key, v}] -> {v, 0, true, true}
+            [] -> {nil, 0, false, false}
+          end
+        [{^key, exp}] when exp > now ->
+          case :ets.lookup(hot_cache, key) do
+            [{^key, v}] -> {v, exp, true, true}
+            [] -> {nil, exp, false, false}
+          end
+        [{^key, _exp}] -> {nil, 0, false, false}
+        [] -> {nil, 0, false, false}
+      end
+    rescue
+      ArgumentError -> {nil, 0, false, false}
     end
-  end
-
-  def handle("FETCH_OR_COMPUTE_RESULT", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'fetch_or_compute_result' command"}
-  end
-
-  def handle("FETCH_OR_COMPUTE_ERROR", [key, error_msg], _store) do
-    Ferricstore.FetchOrCompute.fetch_or_compute_error(key, error_msg)
-  end
-
-  def handle("FETCH_OR_COMPUTE_ERROR", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'fetch_or_compute_error' command"}
   end
 
   defp do_fetch_or_compute(key, ttl_ms_str, hint) do
     case Integer.parse(ttl_ms_str) do
       {ttl_ms, ""} when ttl_ms > 0 ->
         case Ferricstore.FetchOrCompute.fetch_or_compute(key, ttl_ms, hint) do
-          {:hit, value} -> ["hit", value]
-          {:compute, compute_hint} -> ["compute", compute_hint]
-          {:ok, value} -> ["hit", value]
+          {:hit, v} -> ["hit", v]
+          {:compute, ch} -> ["compute", ch]
+          {:ok, v} -> ["hit", v]
           {:error, reason} -> {:error, "ERR compute failed: " <> reason}
         end
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
+      _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 end

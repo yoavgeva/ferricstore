@@ -439,7 +439,11 @@ defmodule Ferricstore.Commands.Server do
       {"hot_reads", Integer.to_string(hot)},
       {"cold_reads", Integer.to_string(cold)},
       {"hot_read_pct", format_float_field(hot_pct)},
-      {"cold_reads_per_second", format_float_field(cold_per_sec)}
+      {"cold_reads_per_second", format_float_field(cold_per_sec)},
+      {"keyspace_hits", Integer.to_string(Stats.keyspace_hits())},
+      {"keyspace_misses", Integer.to_string(Stats.keyspace_misses())},
+      {"expired_keys", Integer.to_string(Stats.expired_keys())},
+      {"evicted_keys", Integer.to_string(Stats.evicted_keys())}
     ]
 
     format_section("Stats", fields)

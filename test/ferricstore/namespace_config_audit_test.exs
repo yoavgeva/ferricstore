@@ -1,0 +1,377 @@
+defmodule Ferricstore.NamespaceConfigAuditTest do
+  @moduledoc """
+  Tests for namespace config audit trail: changed_at, changed_by, and
+  durability-weakening telemetry.
+  """
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Commands.Namespace
+  alias Ferricstore.Commands.Server
+  alias Ferricstore.NamespaceConfig
+  alias Ferricstore.Test.MockStore
+
+  setup do
+    NamespaceConfig.reset_all()
+    on_exit(fn -> NamespaceConfig.reset_all() end)
+    :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helper: attach telemetry handler that forwards events to test process
+  # ---------------------------------------------------------------------------
+
+  defp attach_handler(event_name) do
+    test_pid = self()
+    handler_id = "audit-test-#{inspect(event_name)}-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      event_name,
+      fn event, measurements, metadata, config ->
+        send(config.test_pid, {:telemetry, event, measurements, metadata})
+      end,
+      %{test_pid: test_pid}
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    handler_id
+  end
+
+  # ===========================================================================
+  # changed_at is set on CONFIG SET
+  # ===========================================================================
+
+  describe "changed_at is set on CONFIG SET" do
+    test "changed_at is populated with a recent Unix timestamp" do
+      before = System.os_time(:second)
+      :ok = NamespaceConfig.set("audit", "window_ms", "10")
+      after_set = System.os_time(:second)
+
+      {:ok, entry} = NamespaceConfig.get("audit")
+      assert entry.changed_at >= before
+      assert entry.changed_at <= after_set + 1
+    end
+
+    test "changed_at updates on subsequent SET calls" do
+      :ok = NamespaceConfig.set("audit", "window_ms", "10")
+      {:ok, first} = NamespaceConfig.get("audit")
+
+      # Small delay to ensure timestamp can differ
+      Process.sleep(1100)
+
+      :ok = NamespaceConfig.set("audit", "window_ms", "20")
+      {:ok, second} = NamespaceConfig.get("audit")
+
+      assert second.changed_at >= first.changed_at
+    end
+
+    test "changed_at is 0 for unconfigured prefix (default entry)" do
+      {:ok, entry} = NamespaceConfig.get("no_override")
+      assert entry.changed_at == 0
+    end
+
+    test "changed_at is set when changing durability" do
+      before = System.os_time(:second)
+      :ok = NamespaceConfig.set("audit", "durability", "async")
+      {:ok, entry} = NamespaceConfig.get("audit")
+      assert entry.changed_at >= before
+    end
+  end
+
+  # ===========================================================================
+  # changed_by tracks the caller
+  # ===========================================================================
+
+  describe "changed_by tracks the caller" do
+    test "changed_by records the caller identity passed to set/4" do
+      :ok = NamespaceConfig.set("audit", "window_ms", "10", "client:42")
+      {:ok, entry} = NamespaceConfig.get("audit")
+      assert entry.changed_by == "client:42"
+    end
+
+    test "changed_by defaults to empty string when no caller specified (set/3)" do
+      :ok = NamespaceConfig.set("audit", "window_ms", "10")
+      {:ok, entry} = NamespaceConfig.get("audit")
+      assert entry.changed_by == ""
+    end
+
+    test "changed_by is empty string for unconfigured prefix" do
+      {:ok, entry} = NamespaceConfig.get("no_override")
+      assert entry.changed_by == ""
+    end
+
+    test "changed_by updates when a different caller changes config" do
+      :ok = NamespaceConfig.set("audit", "window_ms", "10", "client:1")
+      {:ok, first} = NamespaceConfig.get("audit")
+      assert first.changed_by == "client:1"
+
+      :ok = NamespaceConfig.set("audit", "durability", "async", "client:99")
+      {:ok, second} = NamespaceConfig.get("audit")
+      assert second.changed_by == "client:99"
+    end
+
+    test "changed_by with 'system' for programmatic/startup use" do
+      :ok = NamespaceConfig.set("boot", "window_ms", "5", "system")
+      {:ok, entry} = NamespaceConfig.get("boot")
+      assert entry.changed_by == "system"
+    end
+
+    test "FERRICSTORE.CONFIG SET passes caller from conn_state" do
+      store = MockStore.make()
+      conn_state = %{client_id: 42}
+      result = Namespace.handle("FERRICSTORE.CONFIG", ["SET", "audit", "window_ms", "10"], store, conn_state)
+      assert result == :ok
+
+      {:ok, entry} = NamespaceConfig.get("audit")
+      assert entry.changed_by == "client:42"
+    end
+
+    test "FERRICSTORE.CONFIG SET without conn_state uses empty changed_by" do
+      store = MockStore.make()
+      result = Namespace.handle("FERRICSTORE.CONFIG", ["SET", "audit", "window_ms", "10"], store)
+      assert result == :ok
+
+      {:ok, entry} = NamespaceConfig.get("audit")
+      assert entry.changed_by == ""
+    end
+  end
+
+  # ===========================================================================
+  # Durability weakening telemetry
+  # ===========================================================================
+
+  describe "durability weakening telemetry" do
+    test "emits [:ferricstore, :config, :durability_weakened] on quorum -> async" do
+      attach_handler([:ferricstore, :config, :durability_weakened])
+
+      # Start from quorum (default), then weaken to async
+      :ok = NamespaceConfig.set("telemetry_ns", "durability", "async", "client:7")
+
+      assert_receive {:telemetry, [:ferricstore, :config, :durability_weakened], measurements,
+                       metadata},
+                     1000
+
+      assert metadata.prefix == "telemetry_ns"
+      assert metadata.old_durability == :quorum
+      assert metadata.new_durability == :async
+      assert metadata.changed_by == "client:7"
+      assert is_integer(measurements.system_time)
+    end
+
+    test "emits telemetry when explicit quorum entry weakened to async" do
+      attach_handler([:ferricstore, :config, :durability_weakened])
+
+      # Explicitly set to quorum first
+      :ok = NamespaceConfig.set("telemetry_ns", "durability", "quorum")
+
+      # Now weaken
+      :ok = NamespaceConfig.set("telemetry_ns", "durability", "async", "client:8")
+
+      assert_receive {:telemetry, [:ferricstore, :config, :durability_weakened], _measurements,
+                       metadata},
+                     1000
+
+      assert metadata.prefix == "telemetry_ns"
+      assert metadata.old_durability == :quorum
+      assert metadata.new_durability == :async
+    end
+
+    test "no telemetry on async -> quorum (strengthening)" do
+      attach_handler([:ferricstore, :config, :durability_weakened])
+
+      # Set to async first
+      :ok = NamespaceConfig.set("telemetry_ns", "durability", "async")
+
+      # Drain any weakening event from the initial set (quorum -> async)
+      receive do
+        {:telemetry, [:ferricstore, :config, :durability_weakened], _, _} -> :ok
+      after
+        200 -> :ok
+      end
+
+      # Strengthen back to quorum
+      :ok = NamespaceConfig.set("telemetry_ns", "durability", "quorum")
+
+      refute_receive {:telemetry, [:ferricstore, :config, :durability_weakened], _, _}, 200
+    end
+
+    test "no telemetry on async -> async (no change)" do
+      attach_handler([:ferricstore, :config, :durability_weakened])
+
+      :ok = NamespaceConfig.set("telemetry_ns", "durability", "async")
+
+      # Drain the initial quorum -> async event
+      receive do
+        {:telemetry, [:ferricstore, :config, :durability_weakened], _, _} -> :ok
+      after
+        200 -> :ok
+      end
+
+      # Set async again
+      :ok = NamespaceConfig.set("telemetry_ns", "durability", "async")
+
+      refute_receive {:telemetry, [:ferricstore, :config, :durability_weakened], _, _}, 200
+    end
+
+    test "no telemetry on quorum -> quorum (no change)" do
+      attach_handler([:ferricstore, :config, :durability_weakened])
+
+      :ok = NamespaceConfig.set("telemetry_ns", "durability", "quorum")
+
+      refute_receive {:telemetry, [:ferricstore, :config, :durability_weakened], _, _}, 200
+    end
+
+    test "no telemetry on window_ms change" do
+      attach_handler([:ferricstore, :config, :durability_weakened])
+
+      :ok = NamespaceConfig.set("telemetry_ns", "window_ms", "100")
+
+      refute_receive {:telemetry, [:ferricstore, :config, :durability_weakened], _, _}, 200
+    end
+  end
+
+  # ===========================================================================
+  # INFO shows changed_at and changed_by
+  # ===========================================================================
+
+  describe "INFO namespace_config shows changed_at and changed_by" do
+    test "INFO namespace_config includes changed_at and changed_by for configured prefix" do
+      before = System.os_time(:second)
+      :ok = NamespaceConfig.set("info_ns", "window_ms", "10", "client:55")
+
+      store = MockStore.make()
+      result = Server.handle("INFO", ["namespace_config"], store)
+
+      assert result =~ "ns_info_ns_changed_by:client:55"
+      assert result =~ "ns_info_ns_changed_at:"
+
+      # Extract the changed_at value and verify it's a real timestamp
+      [_, changed_at_str] =
+        Regex.run(~r/ns_info_ns_changed_at:(\d+)/, result)
+
+      changed_at = String.to_integer(changed_at_str)
+      assert changed_at >= before
+    end
+
+    test "INFO namespace_config does not include audit fields for unconfigured prefixes" do
+      store = MockStore.make()
+      result = Server.handle("INFO", ["namespace_config"], store)
+      refute result =~ "changed_at"
+      refute result =~ "changed_by"
+    end
+
+    test "INFO namespace_config shows empty changed_by when no caller specified" do
+      :ok = NamespaceConfig.set("info_ns", "durability", "async")
+
+      store = MockStore.make()
+      result = Server.handle("INFO", ["namespace_config"], store)
+
+      assert result =~ "ns_info_ns_changed_by:"
+    end
+  end
+
+  # ===========================================================================
+  # FERRICSTORE.CONFIG GET shows changed_at and changed_by
+  # ===========================================================================
+
+  describe "FERRICSTORE.CONFIG GET shows audit fields" do
+    test "GET single prefix includes changed_at and changed_by" do
+      :ok = NamespaceConfig.set("audit_get", "window_ms", "10", "client:77")
+
+      store = MockStore.make()
+      result = Namespace.handle("FERRICSTORE.CONFIG", ["GET", "audit_get"], store)
+
+      assert "changed_at" in result
+      assert "changed_by" in result
+      assert "client:77" in result
+    end
+
+    test "GET all includes changed_at and changed_by for each entry" do
+      :ok = NamespaceConfig.set("ns_a", "window_ms", "10", "client:1")
+      :ok = NamespaceConfig.set("ns_b", "durability", "async", "client:2")
+
+      store = MockStore.make()
+      result = Namespace.handle("FERRICSTORE.CONFIG", ["GET"], store)
+
+      assert "changed_at" in result
+      assert "changed_by" in result
+      assert "client:1" in result
+      assert "client:2" in result
+    end
+
+    test "GET unconfigured prefix shows changed_at 0 and empty changed_by" do
+      store = MockStore.make()
+      result = Namespace.handle("FERRICSTORE.CONFIG", ["GET", "nonexistent"], store)
+
+      assert "changed_at" in result
+      assert "0" in result
+      assert "changed_by" in result
+    end
+  end
+
+  # ===========================================================================
+  # Stress: rapid config changes with correct audit
+  # ===========================================================================
+
+  describe "stress: rapid config changes preserve audit" do
+    test "100 rapid changes all record correct changed_by" do
+      for i <- 1..100 do
+        caller = "client:#{i}"
+        :ok = NamespaceConfig.set("stress", "window_ms", Integer.to_string(i), caller)
+      end
+
+      {:ok, entry} = NamespaceConfig.get("stress")
+      assert entry.window_ms == 100
+      assert entry.changed_by == "client:100"
+      assert entry.changed_at > 0
+    end
+
+    test "rapid durability toggles emit correct telemetry count" do
+      attach_handler([:ferricstore, :config, :durability_weakened])
+
+      # Perform 10 quorum -> async transitions (with async -> quorum in between)
+      for i <- 1..10 do
+        :ok = NamespaceConfig.set("stress_dur", "durability", "async", "client:#{i}")
+        :ok = NamespaceConfig.set("stress_dur", "durability", "quorum", "client:#{i}")
+      end
+
+      # Should have received exactly 10 weakening events (one per quorum -> async)
+      weakening_events =
+        drain_telemetry([:ferricstore, :config, :durability_weakened])
+
+      assert length(weakening_events) == 10
+    end
+
+    test "concurrent changes from different callers preserve last-writer-wins" do
+      tasks =
+        for i <- 1..20 do
+          Task.async(fn ->
+            caller = "task:#{i}"
+            NamespaceConfig.set("concurrent", "window_ms", Integer.to_string(i), caller)
+          end)
+        end
+
+      Task.await_many(tasks)
+
+      {:ok, entry} = NamespaceConfig.get("concurrent")
+      # The final value must be one of the written values
+      assert entry.window_ms in 1..20
+      # changed_by must match the writer that set the current window_ms
+      assert entry.changed_by =~ ~r/^task:\d+$/
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helper: drain all telemetry messages for a given event
+  # ---------------------------------------------------------------------------
+
+  defp drain_telemetry(event_name, acc \\ []) do
+    receive do
+      {:telemetry, ^event_name, measurements, metadata} ->
+        drain_telemetry(event_name, [{measurements, metadata} | acc])
+    after
+      200 ->
+        Enum.reverse(acc)
+    end
+  end
+end

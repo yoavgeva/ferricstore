@@ -52,6 +52,10 @@ defmodule Ferricstore.Stats do
   @counter_hot_reads 3
   @counter_cold_reads 4
   @counter_active_connections 5
+  @counter_keyspace_hits 6
+  @counter_keyspace_misses 7
+  @counter_expired_keys 8
+  @counter_evicted_keys 9
 
   @hotness_table :ferricstore_hotness
   @max_tracked_prefixes 1000
@@ -141,6 +145,34 @@ defmodule Ferricstore.Stats do
   def total_commands do
     :counters.get(counter_ref(), @counter_commands)
   end
+
+
+  @doc "Increments the keyspace_hits counter by 1."
+  @spec incr_keyspace_hits() :: :ok
+  def incr_keyspace_hits, do: (:counters.add(counter_ref(), @counter_keyspace_hits, 1); :ok)
+  @doc "Increments the keyspace_misses counter by 1."
+  @spec incr_keyspace_misses() :: :ok
+  def incr_keyspace_misses, do: (:counters.add(counter_ref(), @counter_keyspace_misses, 1); :ok)
+  @doc "Returns the total number of successful key lookups since startup."
+  @spec keyspace_hits() :: non_neg_integer()
+  def keyspace_hits, do: :counters.get(counter_ref(), @counter_keyspace_hits)
+  @doc "Returns the total number of failed key lookups since startup."
+  @spec keyspace_misses() :: non_neg_integer()
+  def keyspace_misses, do: :counters.get(counter_ref(), @counter_keyspace_misses)
+  @doc "Increments the expired_keys counter by `count`."
+  @spec incr_expired_keys(non_neg_integer()) :: :ok
+  def incr_expired_keys(0), do: :ok
+  def incr_expired_keys(count) when is_integer(count) and count > 0, do: (:counters.add(counter_ref(), @counter_expired_keys, count); :ok)
+  @doc "Increments the evicted_keys counter by `count`."
+  @spec incr_evicted_keys(non_neg_integer()) :: :ok
+  def incr_evicted_keys(0), do: :ok
+  def incr_evicted_keys(count) when is_integer(count) and count > 0, do: (:counters.add(counter_ref(), @counter_evicted_keys, count); :ok)
+  @doc "Returns expired keys count."
+  @spec expired_keys() :: non_neg_integer()
+  def expired_keys, do: :counters.get(counter_ref(), @counter_expired_keys)
+  @doc "Returns evicted keys count."
+  @spec evicted_keys() :: non_neg_integer()
+  def evicted_keys, do: :counters.get(counter_ref(), @counter_evicted_keys)
 
   @doc """
   Records a hot read (ETS cache hit) for the given key.
@@ -311,6 +343,10 @@ defmodule Ferricstore.Stats do
     :counters.put(ref, @counter_commands, 0)
     :counters.put(ref, @counter_hot_reads, 0)
     :counters.put(ref, @counter_cold_reads, 0)
+    :counters.put(ref, @counter_keyspace_hits, 0)
+    :counters.put(ref, @counter_keyspace_misses, 0)
+    :counters.put(ref, @counter_expired_keys, 0)
+    :counters.put(ref, @counter_evicted_keys, 0)
 
     try do
       :ets.delete_all_objects(@hotness_table)
@@ -352,7 +388,7 @@ defmodule Ferricstore.Stats do
 
   @impl true
   def init(_opts) do
-    ref = :counters.new(5, [:atomics])
+    ref = :counters.new(9, [:atomics])
     run_id = :crypto.strong_rand_bytes(20) |> Base.encode16(case: :lower)
     start_time = System.monotonic_time(:millisecond)
 

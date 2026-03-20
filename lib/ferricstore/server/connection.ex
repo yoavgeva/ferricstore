@@ -600,29 +600,37 @@ defmodule Ferricstore.Server.Connection do
 
   # Dispatches a single pure command inside a Task. Returns {action, encoded_response}.
   # Pure commands don't modify connection state, so we don't thread state through.
+  # ACL command-level checks are applied here for pipelined commands.
   defp dispatch_pure_command(cmd, store, state) do
     case normalise_cmd(cmd) do
       :unknown ->
         {:continue, Encoder.encode({:error, "ERR unknown command format"})}
 
       {name, args} ->
-        Stats.incr_commands()
+        # ACL command-level check for pipelined commands
+        case Ferricstore.Acl.check_command(state.username, name) do
+          {:error, _reason} = err ->
+            {:continue, Encoder.encode(err)}
 
-        result =
-          try do
-            Dispatcher.dispatch(name, args, store)
-          catch
-            :exit, {:noproc, _} ->
-              {:error, "ERR server not ready, shard process unavailable"}
+          :ok ->
+            Stats.incr_commands()
 
-            :exit, {reason, _} ->
-              {:error, "ERR internal error: #{inspect(reason)}"}
-          end
+            result =
+              try do
+                Dispatcher.dispatch(name, args, store)
+              catch
+                :exit, {:noproc, _} ->
+                  {:error, "ERR server not ready, shard process unavailable"}
 
-        maybe_notify_keyspace(name, args, result)
-        # Client tracking: notify writes from pipelined commands
-        maybe_notify_tracking(name, args, result, state)
-        {:continue, Encoder.encode(result)}
+                :exit, {reason, _} ->
+                  {:error, "ERR internal error: #{inspect(reason)}"}
+              end
+
+            maybe_notify_keyspace(name, args, result)
+            # Client tracking: notify writes from pipelined commands
+            maybe_notify_tracking(name, args, result, state)
+            {:continue, Encoder.encode(result)}
+        end
     end
   end
 
@@ -637,14 +645,30 @@ defmodule Ferricstore.Server.Connection do
 
   @pre_auth_cmds ~w(AUTH HELLO QUIT RESET)
 
+  # Commands that bypass ACL command-level checks. These are protocol-level
+  # commands needed for connection setup, teardown, and user switching.
+  @acl_bypass_cmds ~w(AUTH HELLO QUIT RESET)
+
   defp handle_command([name | args], state) when is_binary(name) do
     cmd = String.upcase(name)
 
-    if requires_auth?(state) and cmd not in @pre_auth_cmds do
-      {:continue, Encoder.encode({:error, "NOAUTH Authentication required."}), state}
-    else
-      Stats.incr_commands()
-      dispatch(cmd, args, state)
+    cond do
+      requires_auth?(state) and cmd not in @pre_auth_cmds ->
+        {:continue, Encoder.encode({:error, "NOAUTH Authentication required."}), state}
+
+      cmd not in @acl_bypass_cmds ->
+        case Ferricstore.Acl.check_command(state.username, cmd) do
+          :ok ->
+            Stats.incr_commands()
+            dispatch(cmd, args, state)
+
+          {:error, _reason} = err ->
+            {:continue, Encoder.encode(err), state}
+        end
+
+      true ->
+        Stats.incr_commands()
+        dispatch(cmd, args, state)
     end
   end
 

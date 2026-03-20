@@ -36,11 +36,11 @@ defmodule Ferricstore.MemoryGuard do
     * `[:ferricstore, :memory, :recovered]` -- emitted once when pressure drops
       back to `:ok` from `:pressure` or `:reject`.
 
-    * `[:ferricstore, :hot_cache, :limit_reduced]` -- emitted when the hot_cache
-      budget shrinks due to increasing memory pressure.
+    * `[:ferricstore, :hot_cache, :limit_reduced]` -- emitted when the computed
+      hot_cache budget shrinks due to increasing memory pressure.
 
-    * `[:ferricstore, :hot_cache, :limit_restored]` -- emitted when the hot_cache
-      budget recovers as memory pressure decreases.
+    * `[:ferricstore, :hot_cache, :limit_restored]` -- emitted when the computed
+      hot_cache budget recovers as memory pressure decreases.
 
   ## Configuration
 
@@ -73,6 +73,10 @@ defmodule Ferricstore.MemoryGuard do
     last_hot_cache_budget: nil
   ]
 
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
   @doc "Starts the MemoryGuard GenServer."
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -97,6 +101,10 @@ defmodule Ferricstore.MemoryGuard do
     GenServer.call(__MODULE__, :reject_writes?)
   end
 
+  # ---------------------------------------------------------------------------
+  # GenServer callbacks
+  # ---------------------------------------------------------------------------
+
   @impl true
   def init(opts) do
     interval_ms = Keyword.get(opts, :interval_ms, default_interval())
@@ -120,8 +128,14 @@ defmodule Ferricstore.MemoryGuard do
   end
 
   @impl true
-  def handle_call(:stats, _from, state), do: {:reply, compute_stats(state), state}
-  def handle_call(:eviction_policy, _from, state), do: {:reply, state.eviction_policy, state}
+  def handle_call(:stats, _from, state) do
+    {:reply, compute_stats(state), state}
+  end
+
+  def handle_call(:eviction_policy, _from, state) do
+    {:reply, state.eviction_policy, state}
+  end
+
   def handle_call(:reject_writes?, _from, state) do
     {:reply, state.last_pressure_level == :reject and state.eviction_policy == :noeviction, state}
   end
@@ -133,7 +147,13 @@ defmodule Ferricstore.MemoryGuard do
     {:noreply, state}
   end
 
-  def handle_info(_msg, state), do: {:noreply, state}
+  def handle_info(_msg, state) do
+    {:noreply, state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: check logic
+  # ---------------------------------------------------------------------------
 
   defp perform_check(state) do
     stats = compute_stats(state)
@@ -152,7 +172,7 @@ defmodule Ferricstore.MemoryGuard do
     case stats.pressure_level do
       :ok ->
         if state.last_pressure_level in [:pressure, :reject] do
-          Logger.info("MemoryGuard: memory pressure resolved")
+          Logger.info("MemoryGuard: memory pressure resolved (#{format_ratio(stats.ratio)})")
           :telemetry.execute(
             [:ferricstore, :memory, :recovered],
             %{total_bytes: stats.total_bytes, max_bytes: stats.max_bytes, ratio: stats.ratio},
@@ -162,15 +182,25 @@ defmodule Ferricstore.MemoryGuard do
 
       :warning ->
         if state.last_pressure_level not in [:warning, :pressure, :reject] do
-          Logger.warning("MemoryGuard: memory warning")
+          Logger.warning(
+            "MemoryGuard: memory at #{format_ratio(stats.ratio)} " <>
+              "(#{format_bytes(stats.total_bytes)}/#{format_bytes(stats.max_bytes)})"
+          )
         end
 
       :pressure ->
-        Logger.error("MemoryGuard: high memory pressure")
+        Logger.error(
+          "MemoryGuard: high memory pressure at #{format_ratio(stats.ratio)} " <>
+            "(#{format_bytes(stats.total_bytes)}/#{format_bytes(stats.max_bytes)})"
+        )
         emit_shard_pressure_events(stats)
 
       :reject ->
-        Logger.critical("MemoryGuard: critical memory")
+        Logger.critical(
+          "MemoryGuard: critical memory at #{format_ratio(stats.ratio)} " <>
+            "(#{format_bytes(stats.total_bytes)}/#{format_bytes(stats.max_bytes)}) " <>
+            "- writes may be rejected (policy: #{state.eviction_policy})"
+        )
         emit_shard_pressure_events(stats)
     end
 
@@ -192,25 +222,39 @@ defmodule Ferricstore.MemoryGuard do
       end)
 
     total_bytes = shard_stats |> Map.values() |> Enum.map(& &1.bytes) |> Enum.sum()
-    ratio = if state.max_memory_bytes > 0, do: total_bytes / state.max_memory_bytes, else: 0.0
+
+    ratio =
+      if state.max_memory_bytes > 0 do
+        total_bytes / state.max_memory_bytes
+      else
+        0.0
+      end
+
     pressure_level = classify_pressure(ratio)
 
     %{
-      total_bytes: total_bytes, max_bytes: state.max_memory_bytes,
-      ratio: ratio, pressure_level: pressure_level,
-      shards: shard_stats, eviction_policy: state.eviction_policy
+      total_bytes: total_bytes,
+      max_bytes: state.max_memory_bytes,
+      ratio: ratio,
+      pressure_level: pressure_level,
+      shards: shard_stats,
+      eviction_policy: state.eviction_policy
     }
   end
 
   defp safe_ets_memory(table_name) do
     case :ets.info(table_name, :memory) do
       :undefined -> 0
-      memory when is_integer(memory) -> memory * :erlang.system_info(:wordsize)
+      memory when is_integer(memory) -> memory * word_size()
       _ -> 0
     end
-  rescue _ -> 0
-  catch _, _ -> 0
+  rescue
+    _ -> 0
+  catch
+    _, _ -> 0
   end
+
+  defp word_size, do: :erlang.system_info(:wordsize)
 
   defp classify_pressure(ratio) when ratio >= @reject_threshold, do: :reject
   defp classify_pressure(ratio) when ratio >= @pressure_threshold, do: :pressure
@@ -275,6 +319,7 @@ defmodule Ferricstore.MemoryGuard do
   defp hot_cache_budget(max_memory_bytes, :full), do: div(max_memory_bytes * 5, 100)
 
   defp schedule_check(interval_ms), do: Process.send_after(self(), :check, interval_ms)
+
   defp default_interval, do: Application.get_env(:ferricstore, :memory_guard_interval_ms, @check_interval_ms)
   defp default_max_memory, do: Application.get_env(:ferricstore, :max_memory_bytes, default_system_memory())
 
@@ -282,11 +327,15 @@ defmodule Ferricstore.MemoryGuard do
     try do
       data = apply(:memsup, :get_system_memory_data, [])
       case data do
-        list when is_list(list) -> trunc(Keyword.get(list, :total_memory, 1_073_741_824) * 0.75)
+        list when is_list(list) ->
+          total = Keyword.get(list, :total_memory, 1_073_741_824)
+          trunc(total * 0.75)
         _ -> 1_073_741_824
       end
-    rescue _ -> 1_073_741_824
-    catch _, _ -> 1_073_741_824
+    rescue
+      _ -> 1_073_741_824
+    catch
+      _, _ -> 1_073_741_824
     end
   end
 
@@ -294,6 +343,7 @@ defmodule Ferricstore.MemoryGuard do
   defp default_shard_count, do: Application.get_env(:ferricstore, :shard_count, 4)
 
   defp format_ratio(ratio), do: "#{Float.round(ratio * 100, 1)}%"
+
   defp format_bytes(bytes) when bytes >= 1_073_741_824, do: "#{Float.round(bytes / 1_073_741_824, 2)} GB"
   defp format_bytes(bytes) when bytes >= 1_048_576, do: "#{Float.round(bytes / 1_048_576, 2)} MB"
   defp format_bytes(bytes) when bytes >= 1_024, do: "#{Float.round(bytes / 1_024, 2)} KB"

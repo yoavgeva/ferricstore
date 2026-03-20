@@ -104,9 +104,10 @@ defmodule Ferricstore.MemoryGuardTest do
           shard_count: 4
         ])
 
-      # With max_memory_bytes=1, any ETS data should trigger pressure
+      # With max_memory_bytes=1, any ETS data should trigger pressure.
+      # Match specifically on per-shard events (contain pressure_level in metadata).
       assert_receive {:pressure_event, [:ferricstore, :memory, :pressure], measurements,
-                      _metadata},
+                      %{pressure_level: _}},
                      2000
 
       assert is_integer(measurements.shard_index)

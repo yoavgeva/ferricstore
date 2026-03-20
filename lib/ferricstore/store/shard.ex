@@ -2796,6 +2796,7 @@ defmodule Ferricstore.Store.Shard do
     if count > 0 do
       Enum.each(expired_keys, fn key -> ets_delete_key(state, key) end)
       NIF.purge_expired(state.store)
+      Ferricstore.Stats.incr_expired_keys(count)
 
       require Logger
       Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")

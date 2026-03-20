@@ -60,7 +60,9 @@ defmodule Ferricstore.TelemetryEventsTest do
           shard_count: 4
         ])
 
-      assert_receive {:telemetry, [:ferricstore, :memory, :pressure], measurements, metadata},
+      # Match specifically on per-shard events (contain pressure_level in metadata)
+      assert_receive {:telemetry, [:ferricstore, :memory, :pressure], measurements,
+                      %{pressure_level: _} = metadata},
                      2000
 
       assert is_integer(measurements.shard_index)

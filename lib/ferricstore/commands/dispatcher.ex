@@ -30,7 +30,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @bitmap_cmds ~w(SETBIT GETBIT BITCOUNT BITPOS BITOP)
   @hll_cmds ~w(PFADD PFCOUNT PFMERGE)
   @hash_cmds ~w(HSET HGET HDEL HMGET HGETALL HEXISTS HKEYS HVALS HLEN HINCRBY HINCRBYFLOAT HSETNX HSTRLEN HRANDFIELD HSCAN HEXPIRE HTTL HPERSIST)
-  @list_cmds ~w(LPUSH RPUSH LPOP RPOP LRANGE LLEN LINDEX LSET LREM LTRIM LPOS LINSERT LMOVE LPUSHX RPUSHX)
+  @list_cmds ~w(LPUSH RPUSH LPOP RPOP LRANGE LLEN LINDEX LSET LREM LTRIM LPOS LINSERT LMOVE LPUSHX RPUSHX RPOPLPUSH)
   @set_cmds ~w(SADD SREM SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER SPOP SDIFF SINTER SUNION SDIFFSTORE SINTERSTORE SUNIONSTORE SINTERCARD SMOVE SSCAN)
   @zset_cmds ~w(ZADD ZREM ZSCORE ZRANK ZREVRANK ZRANGE ZCARD ZINCRBY ZCOUNT ZPOPMIN ZPOPMAX ZRANDMEMBER ZSCAN ZMSCORE)
   @geo_cmds ~w(GEOADD GEOPOS GEODIST GEOHASH GEOSEARCH GEOSEARCHSTORE)
@@ -98,6 +98,7 @@ defmodule Ferricstore.Commands.Dispatcher do
         cmd == "FERRICSTORE.HOTNESS" -> Cluster.handle(cmd, args, store)
         cmd == "FERRICSTORE.CONFIG" -> Namespace.handle(cmd, upcase_subcommand_ferricstore(args), store)
         cmd == "FERRICSTORE.METRICS" -> Ferricstore.Metrics.handle(cmd, args)
+        cmd == "FERRICSTORE.KEY_INFO" -> Native.handle("KEY_INFO", args, store)
         cmd in @pubsub_cmds -> PubSub.handle(cmd, args)
         cmd == "MEMORY" ->
           case args do
