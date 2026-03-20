@@ -287,4 +287,140 @@ defmodule Ferricstore.Cluster.RateLimitTest do
              "different key should be independent"
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Section 14: Rate Limit Counter Consistent Across Nodes
+  #
+  # Test plan: increment on different nodes, counter stays consistent.
+  #
+  # In single-node Raft mode, each node has independent rate limit state.
+  # A counter incremented on node1 is NOT reflected on node2. This test
+  # verifies per-node independence and documents expected behavior when
+  # multi-node Raft is added (at which point all nodes should share the
+  # counter via Raft log replication).
+  # ---------------------------------------------------------------------------
+
+  describe "rate limit counter consistency across nodes" do
+    @tag :cluster
+    test "increments on different nodes are independent in single-node mode", %{nodes: nodes} do
+      [n1, n2, n3] = nodes
+      key = "rl:cross:counter"
+      window = 60_000
+      limit = 10
+
+      # Send 3 requests through n1
+      for _ <- 1..3 do
+        [status | _] =
+          :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+
+        assert status == "allowed"
+      end
+
+      # Check n1's effective count
+      [_status, n1_count, _remaining, _ttl] =
+        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+
+      assert n1_count == 4, "n1 should have count of 4 after 4 requests"
+
+      # In single-node mode, n2's counter for the same key starts at 0
+      # (no replication). When multi-node Raft is added, n2 should see
+      # the aggregate count from n1's requests.
+      [status2, n2_count, _remaining2, _ttl2] =
+        :rpc.call(n2.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+
+      assert status2 == "allowed"
+
+      # In single-node mode, n2's count starts fresh at 1
+      assert n2_count == 1,
+             "in single-node mode, n2 counter should be independent (got #{n2_count})"
+
+      # Same for n3
+      [status3, n3_count, _remaining3, _ttl3] =
+        :rpc.call(n3.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+
+      assert status3 == "allowed"
+      assert n3_count == 1, "n3 counter should also be independent"
+    end
+
+    @tag :cluster
+    test "rate limit per-node isolation: exhausting on one node does not affect others", %{
+      nodes: nodes
+    } do
+      [n1, n2, _n3] = nodes
+      key = "rl:cross:exhaust"
+      window = 60_000
+      limit = 5
+
+      # Exhaust rate limit on n1
+      for _ <- 1..5 do
+        [status | _] =
+          :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+
+        assert status == "allowed"
+      end
+
+      # n1 is exhausted
+      [denied_status | _] =
+        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+
+      assert denied_status == "denied", "n1 should be rate-limited"
+
+      # n2 is NOT exhausted (independent state in single-node mode)
+      # When multi-node Raft is added, n2 should also return "denied".
+      [n2_status | _] =
+        :rpc.call(n2.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+
+      assert n2_status == "allowed",
+             "in single-node mode, n2 should not be affected by n1's exhausted counter"
+    end
+
+    @tag :cluster
+    test "concurrent increments on different nodes stay within per-node limits", %{
+      nodes: nodes
+    } do
+      window = 60_000
+      limit = 15
+
+      # Each node gets 30 concurrent requests on the same key, independently
+      tasks =
+        Enum.flat_map(nodes, fn node ->
+          for _i <- 1..30 do
+            Task.async(fn ->
+              result =
+                :rpc.call(
+                  node.name,
+                  Ferricstore.Store.Router,
+                  :ratelimit_add,
+                  ["rl:cross:concurrent", window, limit, 1],
+                  10_000
+                )
+
+              {node.index, result}
+            end)
+          end
+        end)
+
+      results = Task.await_many(tasks, 30_000)
+
+      # Group by node and verify per-node limits
+      by_node = Enum.group_by(results, &elem(&1, 0), &elem(&1, 1))
+
+      Enum.each(by_node, fn {node_idx, node_results} ->
+        valid =
+          Enum.filter(node_results, fn
+            [_status | _] -> true
+            _ -> false
+          end)
+
+        allowed = Enum.count(valid, fn [status | _] -> status == "allowed" end)
+        denied = Enum.count(valid, fn [status | _] -> status == "denied" end)
+
+        assert allowed <= limit,
+               "node #{node_idx}: allowed (#{allowed}) should not exceed limit (#{limit})"
+
+        assert allowed + denied == length(valid),
+               "node #{node_idx}: all responses should be either allowed or denied"
+      end)
+    end
+  end
 end

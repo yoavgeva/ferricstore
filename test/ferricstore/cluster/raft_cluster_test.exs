@@ -1,0 +1,545 @@
+defmodule Ferricstore.Cluster.RaftLogReplicationTest do
+  @moduledoc """
+  Raft log replication and apply correctness tests from test plan Section 6.
+
+  Covers:
+  - RA-001: Entry committed to quorum before ACK
+  - RA-002: Entry applied on all nodes
+  - RA-005: apply() determinism -- same commands produce same state
+
+  In single-node Raft mode, each node is its own independent Raft cluster
+  with self-quorum. These tests verify that the Raft log is correctly
+  committed and applied on each independent node. When multi-node Raft is
+  implemented, these tests will validate cross-node replication and quorum
+  commit semantics.
+
+  ## Running
+
+      mix test test/ferricstore/cluster/ --include cluster
+  """
+
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Test.ClusterHelper
+
+  @moduletag :cluster
+
+  setup_all do
+    unless ClusterHelper.peer_available?() do
+      raise "requires OTP 25+ for :peer"
+    end
+
+    nodes = ClusterHelper.start_cluster(3)
+    on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+    %{nodes: nodes}
+  end
+
+  # ---------------------------------------------------------------------------
+  # RA-001: Entry committed to quorum before ACK
+  # (Section 6.1)
+  #
+  # In single-node mode, quorum is 1 (self). We verify that after a PUT
+  # returns :ok, the entry is present in the Raft log on the local node.
+  # We check this by confirming the ra server has a non-zero last_applied
+  # index and the written value is immediately readable.
+  # ---------------------------------------------------------------------------
+
+  describe "RA-001: entry committed to quorum before ACK" do
+    @tag :cluster
+    test "write returns :ok only after Raft commit on local node", %{nodes: nodes} do
+      Enum.each(nodes, fn node ->
+        key = "ra001:committed:#{node.index}"
+        val = "quorum_val_#{node.index}"
+
+        # PUT should return :ok only after Raft commit
+        result = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, val, 0])
+        assert result == :ok, "PUT should succeed (Raft commit on self-quorum)"
+
+        # Immediately after ACK, the entry must be in the ra log.
+        # We verify by checking ra:members returns a valid leader and
+        # the value is readable (proving apply() ran after commit).
+        shard_idx = :rpc.call(node.name, Ferricstore.Store.Router, :shard_for, [key])
+        server_id = {:"ferricstore_shard_#{shard_idx}", node.name}
+
+        # ra:members confirms the server is healthy with a committed log
+        {:ok, members, {_leader_name, leader_node}} =
+          :rpc.call(node.name, :ra, :members, [server_id])
+
+        assert leader_node == node.name,
+               "node should be its own leader in single-node mode"
+
+        assert length(members) >= 1, "ra group should have at least 1 member"
+
+        # Value must be readable immediately after ACK (apply ran)
+        read_val = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+        assert read_val == val, "value should be readable immediately after Raft commit ACK"
+      end)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # RA-002: Entry applied on all nodes
+  # (Section 6.1)
+  #
+  # Write a value via one node, then verify it is readable from that node.
+  # In single-node mode, "all nodes" for a Raft group is just the one member.
+  # When multi-node Raft is added, GET from any of the 3 nodes should return
+  # the value.
+  # ---------------------------------------------------------------------------
+
+  describe "RA-002: entry applied on all nodes" do
+    @tag :cluster
+    test "SET on one node, GET returns value on same node (single-node Raft)", %{nodes: nodes} do
+      [n1, n2, n3] = nodes
+
+      # Write on n1
+      :ok = :rpc.call(n1.name, Ferricstore.Store.Router, :put, ["ra002:key", "applied", 0])
+
+      # Readable on n1 (the only member of its Raft group)
+      assert :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["ra002:key"]) == "applied"
+
+      # In single-node mode, n2 and n3 are independent and won't see n1's data.
+      # Verify they each independently apply their own writes.
+      :ok = :rpc.call(n2.name, Ferricstore.Store.Router, :put, ["ra002:n2_key", "n2_val", 0])
+      :ok = :rpc.call(n3.name, Ferricstore.Store.Router, :put, ["ra002:n3_key", "n3_val", 0])
+
+      assert :rpc.call(n2.name, Ferricstore.Store.Router, :get, ["ra002:n2_key"]) == "n2_val"
+      assert :rpc.call(n3.name, Ferricstore.Store.Router, :get, ["ra002:n3_key"]) == "n3_val"
+    end
+
+    @tag :cluster
+    test "batch of writes all applied and readable on the writing node", %{nodes: nodes} do
+      [n1 | _] = nodes
+
+      # Write 100 keys
+      for i <- 1..100 do
+        :ok =
+          :rpc.call(n1.name, Ferricstore.Store.Router, :put, [
+            "ra002:batch:#{i}",
+            "v#{i}",
+            0
+          ])
+      end
+
+      # All 100 should be readable
+      for i <- 1..100 do
+        val = :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["ra002:batch:#{i}"])
+        assert val == "v#{i}", "key ra002:batch:#{i} should be applied and readable"
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # RA-005: apply() determinism
+  # (Section 6.1)
+  #
+  # Execute the exact same sequence of commands on all 3 nodes. Each node
+  # independently applies them through its own Raft state machine. Verify
+  # that all nodes reach the identical ETS state, proving apply() is
+  # deterministic.
+  # ---------------------------------------------------------------------------
+
+  describe "RA-005: apply() determinism" do
+    @tag :cluster
+    test "same commands produce identical state on all nodes", %{nodes: nodes} do
+      commands =
+        for i <- 1..50 do
+          {"ra005:det:#{i}", "deterministic_#{i}"}
+        end
+
+      # Apply the exact same command sequence on every node
+      Enum.each(nodes, fn node ->
+        Enum.each(commands, fn {key, val} ->
+          :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, val, 0])
+        end)
+      end)
+
+      # Verify all nodes have identical state
+      expected_state =
+        Enum.map(commands, fn {key, val} ->
+          read = :rpc.call(hd(nodes).name, Ferricstore.Store.Router, :get, [key])
+          {key, read}
+        end)
+
+      Enum.each(nodes, fn node ->
+        actual_state =
+          Enum.map(commands, fn {key, _val} ->
+            read = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+            {key, read}
+          end)
+
+        assert actual_state == expected_state,
+               "RA-005: node #{node.name} should have identical state after same commands"
+      end)
+    end
+
+    @tag :cluster
+    test "overwrite sequence produces identical final state on all nodes", %{nodes: nodes} do
+      # Write, then overwrite with different values -- all nodes should
+      # end up at the same final state
+      Enum.each(nodes, fn node ->
+        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:ow", "first", 0])
+        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:ow", "second", 0])
+        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:ow", "final", 0])
+      end)
+
+      Enum.each(nodes, fn node ->
+        val = :rpc.call(node.name, Ferricstore.Store.Router, :get, ["ra005:ow"])
+        assert val == "final", "RA-005: all nodes should have 'final' after overwrite sequence"
+      end)
+    end
+
+    @tag :cluster
+    test "delete + re-write sequence is deterministic across nodes", %{nodes: nodes} do
+      Enum.each(nodes, fn node ->
+        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:del", "exists", 0])
+        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :delete, ["ra005:del"])
+        nil_val = :rpc.call(node.name, Ferricstore.Store.Router, :get, ["ra005:del"])
+        assert nil_val == nil, "key should be nil after delete"
+
+        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:del", "reborn", 0])
+      end)
+
+      Enum.each(nodes, fn node ->
+        val = :rpc.call(node.name, Ferricstore.Store.Router, :get, ["ra005:del"])
+        assert val == "reborn", "RA-005: delete+re-write should be deterministic"
+      end)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # AP-006: TTL consistency across nodes
+  # (Section 6.4)
+  #
+  # SET a key with EX (TTL), then verify all nodes report the same expiry
+  # metadata. In single-node mode, we verify per-node consistency. Each
+  # node sets the same key with the same TTL independently.
+  # ---------------------------------------------------------------------------
+
+  describe "AP-006: TTL apply consistency" do
+    @tag :cluster
+    test "SET with TTL produces consistent expiry metadata on all nodes", %{nodes: nodes} do
+      ttl_ms = 30_000
+      now = System.os_time(:millisecond)
+      expire_at_ms = now + ttl_ms
+
+      # Set key with TTL on all nodes (same absolute expiry)
+      Enum.each(nodes, fn node ->
+        :ok =
+          :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+            "ap006:ttl",
+            "ttl_val",
+            expire_at_ms
+          ])
+      end)
+
+      # Verify all nodes have the value and consistent expiry
+      Enum.each(nodes, fn node ->
+        meta =
+          :rpc.call(node.name, Ferricstore.Store.Router, :get_meta, ["ap006:ttl"])
+
+        assert meta != nil, "AP-006: key should exist on #{node.name}"
+
+        {value, actual_expire} = meta
+        assert value == "ttl_val", "AP-006: value should be correct"
+
+        # Expiry should be the same (exact match since we used absolute timestamps)
+        assert actual_expire == expire_at_ms,
+               "AP-006: expire_at_ms on #{node.name} should match " <>
+                 "(expected #{expire_at_ms}, got #{actual_expire})"
+      end)
+    end
+
+    @tag :cluster
+    test "expired key returns nil on all nodes", %{nodes: nodes} do
+      # Set with a very short TTL (already expired by the time we read)
+      past_expire = System.os_time(:millisecond) - 1000
+
+      Enum.each(nodes, fn node ->
+        :ok =
+          :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+            "ap006:expired:#{node.index}",
+            "gone",
+            past_expire
+          ])
+      end)
+
+      # All nodes should return nil (expired)
+      Enum.each(nodes, fn node ->
+        val =
+          :rpc.call(node.name, Ferricstore.Store.Router, :get, [
+            "ap006:expired:#{node.index}"
+          ])
+
+        assert val == nil,
+               "AP-006: expired key should return nil on #{node.name}"
+      end)
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Leader Election Tests
+# ---------------------------------------------------------------------------
+
+defmodule Ferricstore.Cluster.LeaderElectionTest do
+  @moduledoc """
+  Leader election tests from test plan Section 6.2.
+
+  Covers:
+  - LE-001: Election after leader crash (election time < 3s)
+  - LE-002: Single leader per shard (no dual leaders)
+
+  In single-node Raft mode, each node elects itself as leader immediately.
+  These tests verify the election mechanism works correctly per-node and
+  that the leadership invariant holds. When multi-node Raft is added,
+  LE-001 will measure actual re-election time after a kill, and LE-002
+  will verify no split-brain across the cluster.
+
+  ## Running
+
+      mix test test/ferricstore/cluster/ --include cluster
+  """
+
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Test.ClusterHelper
+
+  @moduletag :cluster
+
+  setup_all do
+    unless ClusterHelper.peer_available?() do
+      raise "requires OTP 25+ for :peer"
+    end
+
+    nodes = ClusterHelper.start_cluster(3)
+    on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+    %{nodes: nodes}
+  end
+
+  # ---------------------------------------------------------------------------
+  # LE-001: Election after leader crash
+  # (Section 6.2)
+  #
+  # Kill a node (its own Raft leader), then verify the remaining nodes
+  # still have their leaders elected within a bounded time. In single-node
+  # mode, each surviving node is still its own leader. When multi-node
+  # Raft is added, this test will verify that a new leader emerges within
+  # election_timeout_ms (default 1500ms, max 3s).
+  # ---------------------------------------------------------------------------
+
+  describe "LE-001: election after leader crash" do
+    @tag :cluster
+    test "surviving nodes have leaders within 3 seconds after one node killed", %{
+      nodes: nodes
+    } do
+      # Kill last node
+      target = List.last(nodes)
+      {_killed, remaining} = ClusterHelper.kill_node(nodes, target)
+
+      # Measure time to confirm leaders on remaining nodes
+      start_time = System.monotonic_time(:millisecond)
+
+      :ok = ClusterHelper.wait_for_leaders(remaining, 4, timeout: 3_000)
+
+      elapsed = System.monotonic_time(:millisecond) - start_time
+
+      assert elapsed < 3_000,
+             "LE-001: leaders should be confirmed within 3 seconds, took #{elapsed}ms"
+
+      # Verify each remaining node is its own leader
+      Enum.each(remaining, fn node ->
+        for shard <- 0..3 do
+          server_id = {:"ferricstore_shard_#{shard}", node.name}
+          {:ok, _members, {_name, leader}} = :rpc.call(node.name, :ra, :members, [server_id])
+          assert leader == node.name, "LE-001: #{node.name} should be leader for shard #{shard}"
+        end
+      end)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # LE-002: Single leader per shard at all times
+  # (Section 6.2)
+  #
+  # Verify that at any given moment, each shard has exactly one leader on
+  # each node. In single-node mode, each node reports itself as leader
+  # for all its shards. We verify no node reports a foreign leader or
+  # reports being follower (which would be a bug in single-node mode).
+  # ---------------------------------------------------------------------------
+
+  describe "LE-002: single leader per shard" do
+    @tag :cluster
+    test "each node reports itself as leader for all shards (single-node mode)", %{
+      nodes: nodes
+    } do
+      alive_nodes =
+        Enum.filter(nodes, fn node ->
+          case :rpc.call(node.name, Node, :self, []) do
+            {:badrpc, _} -> false
+            _ -> true
+          end
+        end)
+
+      Enum.each(alive_nodes, fn node ->
+        for shard <- 0..3 do
+          server_id = {:"ferricstore_shard_#{shard}", node.name}
+          result = :rpc.call(node.name, :ra, :members, [server_id])
+
+          case result do
+            {:ok, members, {_leader_name, leader_node}} ->
+              assert leader_node == node.name,
+                     "LE-002: shard #{shard} on #{node.name} should have self as leader, " <>
+                       "but leader is #{inspect(leader_node)}"
+
+              # In single-node mode, the member list should have exactly 1 entry
+              assert length(members) == 1,
+                     "LE-002: shard #{shard} on #{node.name} should have 1 member, " <>
+                       "got #{length(members)}"
+
+            _ ->
+              flunk("LE-002: ra:members failed for shard #{shard} on #{node.name}: #{inspect(result)}")
+          end
+        end
+      end)
+    end
+
+    @tag :cluster
+    test "no node claims to be leader for another node's shard", %{nodes: nodes} do
+      alive_nodes =
+        Enum.filter(nodes, fn node ->
+          case :rpc.call(node.name, Node, :self, []) do
+            {:badrpc, _} -> false
+            _ -> true
+          end
+        end)
+
+      # Collect all leadership claims: {shard, node_claiming_leadership}
+      claims =
+        for node <- alive_nodes, shard <- 0..3 do
+          server_id = {:"ferricstore_shard_#{shard}", node.name}
+
+          case :rpc.call(node.name, :ra, :members, [server_id]) do
+            {:ok, _members, {_name, leader}} -> {shard, node.name, leader}
+            _ -> nil
+          end
+        end
+        |> Enum.reject(&is_nil/1)
+
+      # In single-node mode, every node should claim itself as leader
+      Enum.each(claims, fn {shard, queried_node, claimed_leader} ->
+        assert queried_node == claimed_leader,
+               "LE-002: node #{queried_node} claims leader for shard #{shard} is " <>
+                 "#{claimed_leader} (should be self)"
+      end)
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Snapshot / Node Join Tests
+# ---------------------------------------------------------------------------
+
+defmodule Ferricstore.Cluster.SnapshotJoinTest do
+  @moduledoc """
+  Snapshot and node join tests from test plan Section 6.3.
+
+  Covers:
+  - SN-002: New node joins and catches up
+
+  In single-node Raft mode, we simulate "node join" by starting a new
+  peer node that runs FerricStore independently. We verify the new node
+  can start, elect its own leaders, and serve read/write operations.
+
+  When multi-node Raft is added, this test will verify that a new node
+  receives a snapshot from the cluster and applies delta log entries to
+  catch up.
+
+  ## Running
+
+      mix test test/ferricstore/cluster/ --include cluster
+  """
+
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Test.ClusterHelper
+
+  @moduletag :cluster
+
+  # ---------------------------------------------------------------------------
+  # SN-002: New node joins and catches up
+  # (Section 6.3)
+  #
+  # Start a 3-node cluster, write data, then start a 4th node. In
+  # single-node mode, the new node starts independently. We verify it
+  # can boot, elect leaders, and serve operations. When multi-node Raft
+  # is added, the new node should receive a snapshot and catch up.
+  # ---------------------------------------------------------------------------
+
+  describe "SN-002: new node joins and becomes operational" do
+    @tag :cluster
+    test "4th node starts, elects leaders, and serves operations" do
+      # Start initial 3-node cluster
+      nodes = ClusterHelper.start_cluster(3)
+
+      # Write data on existing nodes
+      Enum.each(nodes, fn node ->
+        for i <- 1..10 do
+          :ok =
+            :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+              "sn002:pre:#{node.index}:#{i}",
+              "v#{i}",
+              0
+            ])
+        end
+      end)
+
+      # Start a 4th node
+      new_nodes = ClusterHelper.start_cluster(1)
+      all_nodes = nodes ++ new_nodes
+
+      try do
+        [new_node] = new_nodes
+
+        # Verify the new node has elected leaders for all shards
+        :ok = ClusterHelper.wait_for_leaders([new_node], 4, timeout: 10_000)
+
+        # New node can serve write operations
+        :ok =
+          :rpc.call(new_node.name, Ferricstore.Store.Router, :put, [
+            "sn002:new_node",
+            "hello",
+            0
+          ])
+
+        val = :rpc.call(new_node.name, Ferricstore.Store.Router, :get, ["sn002:new_node"])
+        assert val == "hello", "SN-002: new node should serve reads/writes"
+
+        # New node can serve multiple operations
+        for i <- 1..20 do
+          :ok =
+            :rpc.call(new_node.name, Ferricstore.Store.Router, :put, [
+              "sn002:new:#{i}",
+              "new_v#{i}",
+              0
+            ])
+        end
+
+        for i <- 1..20 do
+          val = :rpc.call(new_node.name, Ferricstore.Store.Router, :get, ["sn002:new:#{i}"])
+          assert val == "new_v#{i}", "SN-002: new node key sn002:new:#{i} should have value"
+        end
+
+        # In single-node mode, the new node does NOT have data from old nodes
+        # (no replication). When multi-node Raft is added, this assertion changes.
+        old_key_on_new =
+          :rpc.call(new_node.name, Ferricstore.Store.Router, :get, ["sn002:pre:1:1"])
+
+        assert old_key_on_new == nil,
+               "SN-002: in single-node mode, new node should not have old node data"
+      after
+        ClusterHelper.stop_cluster(all_nodes)
+      end
+    end
+  end
+end

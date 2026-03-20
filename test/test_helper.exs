@@ -11,7 +11,10 @@
 #   multiple BEAM nodes and are slow (~10-30s per test). Excluded by default.
 #   Run with `mix test --include cluster` or
 #   `mix test test/ferricstore/cluster/ --include cluster`.
-ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster])
+# :jepsen — Jepsen-style durability and consistency tests that spin up multi-node
+#   `:peer` clusters and inject faults. Excluded by default; run with
+#   `mix test test/ferricstore/jepsen/ --include jepsen`.
+ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen])
 
 # Clean up the test data directory after the suite finishes.
 # Each run uses a unique dir (ferricstore_test_<pid>) so parallel runs don't

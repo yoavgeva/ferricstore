@@ -268,4 +268,108 @@ defmodule Ferricstore.Cluster.LockTest do
              "wrong owner on any node should not unlock, got #{inspect(result)}"
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Section 13: Lock Visible On All Nodes
+  #
+  # Test plan: LOCK on node1, check on node2.
+  #
+  # In single-node Raft mode, each node has independent lock state, so a
+  # lock acquired on node1 is NOT visible on node2. This test verifies
+  # that per-node lock isolation works correctly and documents the
+  # expected behavior change when multi-node Raft is added (at which
+  # point the lock should be visible cluster-wide via Raft replication).
+  # ---------------------------------------------------------------------------
+
+  describe "lock visible across nodes" do
+    @tag :cluster
+    test "lock acquired on one node is visible on same node only (single-node mode)", %{
+      nodes: nodes
+    } do
+      [n1, n2, n3] = nodes
+
+      # Acquire lock on n1
+      result =
+        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+          "lock:cross:vis",
+          "owner_alpha",
+          30_000
+        ])
+
+      assert result == :ok, "lock should be acquired on n1"
+
+      # On n1, the lock is held -- another owner cannot acquire
+      blocked =
+        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+          "lock:cross:vis",
+          "owner_beta",
+          5_000
+        ])
+
+      assert match?({:error, _}, blocked),
+             "lock on n1 should block other owners on n1"
+
+      # In single-node mode, n2 has independent state -- the same key
+      # is NOT locked on n2 (no Raft replication between nodes).
+      n2_result =
+        :rpc.call(n2.name, Ferricstore.Store.Router, :lock, [
+          "lock:cross:vis",
+          "owner_gamma",
+          30_000
+        ])
+
+      # When multi-node Raft is added, this should change to:
+      #   assert match?({:error, _}, n2_result)
+      assert n2_result == :ok,
+             "in single-node mode, n2 should independently acquire the same lock key"
+
+      # Same for n3
+      n3_result =
+        :rpc.call(n3.name, Ferricstore.Store.Router, :lock, [
+          "lock:cross:vis",
+          "owner_delta",
+          30_000
+        ])
+
+      assert n3_result == :ok,
+             "in single-node mode, n3 should independently acquire the same lock key"
+    end
+
+    @tag :cluster
+    test "lock acquired and unlocked on one node does not affect other nodes", %{nodes: nodes} do
+      [n1, n2 | _] = nodes
+
+      # Acquire and release on n1
+      :ok =
+        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+          "lock:cross:iso",
+          "worker_a",
+          30_000
+        ])
+
+      result = :rpc.call(n1.name, Ferricstore.Store.Router, :unlock, ["lock:cross:iso", "worker_a"])
+      assert result == 1, "unlock on n1 should succeed"
+
+      # n1 lock is released, re-acquirable
+      reacquire =
+        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+          "lock:cross:iso",
+          "worker_b",
+          30_000
+        ])
+
+      assert reacquire == :ok
+
+      # n2 never had this lock, so it can acquire independently
+      n2_result =
+        :rpc.call(n2.name, Ferricstore.Store.Router, :lock, [
+          "lock:cross:iso",
+          "worker_c",
+          30_000
+        ])
+
+      assert n2_result == :ok,
+             "n2 should acquire independently (no cross-node state in single-node mode)"
+    end
+  end
 end
