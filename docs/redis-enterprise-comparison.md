@@ -96,7 +96,7 @@
 | io_uring support | No (standard fsync) | Yes (Linux, auto-detected) | FerricStore can use io_uring for writes on Linux >= 5.1 |
 | **Security** | | | |
 | TLS/SSL | Yes (in-transit encryption) | Yes (TLS 1.2/1.3 via Ranch SSL) | |
-| Encryption at rest | Yes | No | FerricStore does not encrypt Bitcask files on disk |
+| Encryption at rest | Yes (built-in) | Yes (LUKS recommended) | FerricStore recommends LUKS/dm-crypt for disk encryption — covers ALL files (Bitcask, WAL, hints, config), zero code overhead, hardware-accelerated AES-NI. Same approach Redis Enterprise uses on managed cloud. |
 | RBAC / ACL | Yes (role-based, LDAP integration) | Yes (ACL with categories: read/write/admin/dangerous) | Redis Enterprise has LDAP; FerricStore has local ACL only |
 | Password hashing | Yes | Yes (PBKDF2-SHA256) | |
 | Audit logging | Yes (administrative actions) | Yes (auth, config changes, dangerous commands, ACL denials) | |
