@@ -79,7 +79,7 @@
 | Full-text search | Yes (RediSearch, built into Redis 8) | No | Major gap -- RediSearch is very mature |
 | Secondary indexes | Yes (RediSearch) | No | FerricStore uses prefix index for SCAN only |
 | Aggregation pipelines | Yes (RediSearch) | No | |
-| Vector similarity search | Yes (RediSearch, horizontal scaling) | Yes (brute-force, <100K vectors) | Redis Enterprise scales to millions; FerricStore is brute-force only |
+| Vector similarity search | Yes (RediSearch, horizontal scaling) | Yes (HNSW with yielding NIF, up to 10M vectors) | Redis Enterprise integrates with RediSearch; FerricStore has native HNSW with cosine/L2/inner_product, auto-threshold (brute-force <1K, HNSW >=1K) |
 | **Replication & HA** | | | |
 | Primary-replica replication | Yes (async + diskless) | Via Raft log replication | Different mechanisms |
 | Automatic failover | Yes (single-digit seconds) | Yes (Raft leader election) | Redis Enterprise is more battle-tested |
@@ -192,7 +192,7 @@ Redis Enterprise has been in production at thousands of companies for over a dec
 
 ### 4. RediSearch -- Full-Text Search and Indexing
 
-RediSearch (now integrated into Redis 8) provides full-text search, secondary indexes, aggregation pipelines, and vector similarity search at scale (millions of vectors with horizontal scaling). FerricStore has brute-force vector search adequate for <100K vectors and no full-text search capability at all. This is a major gap.
+RediSearch (now integrated into Redis 8) provides full-text search, secondary indexes, aggregation pipelines, and vector similarity search at scale (millions of vectors with horizontal scaling). FerricStore has native HNSW vector search (implemented in Rust with yielding NIF for BEAM scheduler safety) supporting up to 10M vectors with cosine, L2, and inner product distance metrics. It auto-selects brute-force for <1K vectors and HNSW for larger collections. However, FerricStore has no full-text search or secondary index capability — this remains a gap.
 
 ### 5. Time Series Support
 
