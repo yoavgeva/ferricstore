@@ -7,7 +7,11 @@
 # :large_alloc — tests that allocate ≥ 512 MiB in-process to verify the size
 #   guard fires. Excluded by default to avoid OOM on CI runners with < 2 GB RAM.
 #   Run locally with `mix test --include large_alloc`.
-ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc])
+# :cluster — multi-node `:peer` cluster tests (OTP 25+). These spin up
+#   multiple BEAM nodes and are slow (~10-30s per test). Excluded by default.
+#   Run with `mix test --include cluster` or
+#   `mix test test/ferricstore/cluster/ --include cluster`.
+ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster])
 
 # Clean up the test data directory after the suite finishes.
 # Each run uses a unique dir (ferricstore_test_<pid>) so parallel runs don't

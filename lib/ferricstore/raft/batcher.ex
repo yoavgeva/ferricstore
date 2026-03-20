@@ -5,7 +5,7 @@ defmodule Ferricstore.Raft.Batcher do
   Per spec sections 2C.5 and 2F.3, each shard has its own Batcher GenServer
   that accumulates write commands into per-namespace buffers, each with its
   own commit window and durability mode. When a namespace's timer fires, only
-  that namespace's buffer is flushed to Raft via `:ra.process_command/2`.
+  that namespace's buffer is flushed.
 
   ## How it works
 
@@ -19,7 +19,7 @@ defmodule Ferricstore.Raft.Batcher do
   5. On the first write to an empty slot, a timer is started using the
      namespace's `window_ms`.
   6. When the timer fires (`:flush_slot`), only that slot's commands are
-     submitted to ra as a single batch.
+     submitted.
   7. Each caller receives their individual result from the batch.
 
   ## Namespace configuration
@@ -28,10 +28,14 @@ defmodule Ferricstore.Raft.Batcher do
   table managed by `Ferricstore.NamespaceConfig`. If no configuration exists
   for a prefix, the defaults are used: `window_ms = 1`, `durability = :quorum`.
 
-  Both `:quorum` and `:async` durability modes currently route through the
-  standard `:ra.process_command/2` path. The async optimization (leader-only
-  WAL + fdatasync without waiting for followers) is deferred to a future
-  implementation.
+  For `:quorum` durability, commands are submitted to ra via
+  `:ra.process_command/2`, which blocks until quorum acknowledgement.
+
+  For `:async` durability (spec 2F.3), commands bypass Raft consensus
+  entirely and are sent to `Ferricstore.Raft.AsyncApplyWorker`, which
+  writes directly to the shard's Bitcask + ETS. Callers are replied to
+  immediately with `:ok` without waiting for disk I/O. This trades
+  consistency for lower write latency.
 
   ## Why a separate GenServer?
 
@@ -43,6 +47,7 @@ defmodule Ferricstore.Raft.Batcher do
   ## Configuration
 
     * `:shard_id` (required) -- the ra server ID for this shard
+    * `:shard_index` (required) -- zero-based shard index
     * `:max_batch_size` -- flush immediately when batch reaches this size (default: 1000)
   """
 
@@ -85,6 +90,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   defstruct [
     :shard_id,
+    :shard_index,
     :max_batch_size,
     slots: %{}
   ]
@@ -112,10 +118,12 @@ defmodule Ferricstore.Raft.Batcher do
   Submits a write command to the batcher for the given shard.
 
   The command is accumulated into the appropriate namespace buffer and
-  submitted to ra when the namespace's commit window expires or the buffer
+  submitted when the namespace's commit window expires or the buffer
   reaches `max_batch_size`.
 
-  This call blocks until the ra command is committed and applied.
+  For `:quorum` durability, this call blocks until the ra command is
+  committed and applied. For `:async` durability, the call returns as
+  soon as the command is handed off to the `AsyncApplyWorker`.
 
   ## Parameters
 
@@ -191,10 +199,12 @@ defmodule Ferricstore.Raft.Batcher do
   @impl true
   def init(opts) do
     shard_id = Keyword.fetch!(opts, :shard_id)
+    shard_index = Keyword.fetch!(opts, :shard_index)
     max_batch_size = Keyword.get(opts, :max_batch_size, @default_max_batch_size)
 
     state = %__MODULE__{
       shard_id: shard_id,
+      shard_index: shard_index,
       max_batch_size: max_batch_size
     }
 
@@ -292,14 +302,26 @@ defmodule Ferricstore.Raft.Batcher do
         batch = Enum.reverse(slot.cmds)
         froms = Enum.reverse(slot.froms)
 
-        # For single commands, submit directly without batch wrapper
-        # For multiple commands, wrap in a batch
-        case batch do
-          [single_cmd] ->
-            submit_single(state.shard_id, single_cmd, froms)
+        {_prefix, durability} = slot_key
 
-          _multiple ->
-            submit_batch(state.shard_id, batch, froms)
+        case durability do
+          :async ->
+            # Async durability path (spec 2F.3): write directly to the shard
+            # via AsyncApplyWorker and reply to callers immediately without
+            # waiting for Raft consensus.
+            submit_async(state.shard_index, batch, froms)
+
+          :quorum ->
+            # Quorum durability path: submit through Raft for consensus.
+            # For single commands, submit directly without batch wrapper.
+            # For multiple commands, wrap in a batch.
+            case batch do
+              [single_cmd] ->
+                submit_single(state.shard_id, single_cmd, froms)
+
+              _multiple ->
+                submit_batch(state.shard_id, batch, froms)
+            end
         end
 
         # Remove the slot entirely once flushed (clean up empty slots)
@@ -345,6 +367,20 @@ defmodule Ferricstore.Raft.Batcher do
           GenServer.reply(from, {:error, :ra_timeout})
         end)
     end
+  end
+
+  # Async durability path: sends commands to the AsyncApplyWorker (fire-and-forget)
+  # and replies to all callers immediately with :ok. The AsyncApplyWorker
+  # processes the batch in the background.
+  defp submit_async(shard_index, batch, froms) do
+    alias Ferricstore.Raft.AsyncApplyWorker
+
+    AsyncApplyWorker.apply_batch(shard_index, batch)
+
+    # Reply immediately to all callers with :ok
+    Enum.each(froms, fn from ->
+      GenServer.reply(from, :ok)
+    end)
   end
 
   # ---------------------------------------------------------------------------

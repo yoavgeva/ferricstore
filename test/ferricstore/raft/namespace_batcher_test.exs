@@ -225,9 +225,11 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       k = pkey("ephemeral", "async_test")
       shard = Router.shard_for(k)
 
-      # Both modes currently route through the same ra path, but the batcher
-      # creates separate slots for them
+      # Async durability bypasses Raft consensus and writes via
+      # AsyncApplyWorker. The write returns immediately; the data
+      # becomes visible after the worker processes the batch.
       assert :ok == Batcher.write(shard, {:put, k, "async_val", 0})
+      Process.sleep(100)
       assert "async_val" == Router.get(k)
     end
 

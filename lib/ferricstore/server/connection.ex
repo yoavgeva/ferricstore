@@ -1543,43 +1543,11 @@ defmodule Ferricstore.Server.Connection do
   # Transaction execution
   # ---------------------------------------------------------------------------
 
-  # Executes the queued commands if WATCH keys are unmodified, or returns nil
-  # (abort) if any watched key's version has changed.
+  # Delegates to the 2PC Coordinator which handles both single-shard (fast path)
+  # and cross-shard (2PC) transactions. WATCH conflict detection is also handled
+  # by the Coordinator.
   defp execute_transaction(%{watched_keys: watched, multi_queue: queue, sandbox_namespace: ns}) do
-    if watches_clean?(watched) do
-      results =
-        Enum.map(queue, fn {cmd, args} ->
-          store = build_store(ns)
-
-          try do
-            Dispatcher.dispatch(cmd, args, store)
-          catch
-            :exit, {:noproc, _} ->
-              {:error, "ERR server not ready, shard process unavailable"}
-
-            :exit, {reason, _} ->
-              {:error, "ERR internal error: #{inspect(reason)}"}
-          end
-        end)
-
-      results
-    else
-      # WATCH detected a conflict — abort and return nil (like Redis).
-      nil
-    end
-  end
-
-  # Returns true if all watched keys still have their original versions.
-  defp watches_clean?(watched) when map_size(watched) == 0, do: true
-
-  defp watches_clean?(watched) do
-    Enum.all?(watched, fn {key, saved_version} ->
-      try do
-        Router.get_version(key) == saved_version
-      catch
-        :exit, _ -> false
-      end
-    end)
+    Ferricstore.Transaction.Coordinator.execute(queue, watched, ns)
   end
 
   # ---------------------------------------------------------------------------
