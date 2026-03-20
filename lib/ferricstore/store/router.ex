@@ -58,6 +58,40 @@ defmodule Ferricstore.Store.Router do
   # -------------------------------------------------------------------
 
   @doc """
+  Returns the on-disk file reference for a key's value, or `nil`.
+
+  Used by the sendfile optimisation in standalone TCP mode. Returns
+  `{file_path, value_byte_offset, value_size}` for cold (on-disk) keys.
+  Returns `nil` for hot keys (ETS), expired keys, or missing keys --
+  the caller should fall back to the normal read path.
+
+  Only cold keys benefit from sendfile: hot keys are already in BEAM memory
+  and would need a normal `get` + `transport.send`.
+  """
+  @spec get_file_ref(binary()) :: {binary(), non_neg_integer(), non_neg_integer()} | nil
+  def get_file_ref(key) do
+    idx = shard_for(key)
+    keydir = :"keydir_#{idx}"
+    hot_cache = :"hot_cache_#{idx}"
+    now = System.os_time(:millisecond)
+
+    case ets_get(keydir, hot_cache, key, now) do
+      {:hit, _value, _exp} ->
+        # Hot key — value is in ETS, sendfile not applicable.
+        nil
+
+      :expired ->
+        nil
+
+      :miss ->
+        GenServer.call(shard_name(idx), {:get_file_ref, key})
+
+      :no_table ->
+        nil
+    end
+  end
+
+  @doc """
   Retrieves the value for `key`, or `nil` if the key does not exist or is
   expired.
 

@@ -1408,6 +1408,152 @@ defmodule Ferricstore.Server.Connection do
     end
   end
 
+  # -- GET sendfile optimisation (standalone TCP only) --------------------------
+  #
+  # For large values (>= @sendfile_threshold_bytes), skip the normal path
+  # (pread into Rust Vec -> copy to OwnedBinary -> BEAM writev) and instead:
+  #   1. writev RESP3 bulk-string header ("$<len>\r\n")
+  #   2. sendfile the value bytes from the Bitcask data file (zero userspace copy)
+  #   3. writev RESP3 trailer ("\r\n")
+  #
+  # This only applies when ALL of:
+  #   - Transport is :ranch_tcp (not TLS, not embedded)
+  #   - Key is cold (on disk, not hot in ETS)
+  #   - Value size >= threshold
+  #
+  # If any condition fails, we fall through to the normal dispatch path.
+
+  @sendfile_threshold_bytes 65_536
+
+  defp dispatch("GET", [key], %{transport: :ranch_tcp} = state)
+       when byte_size(key) > 0 and byte_size(key) <= 65_535 do
+    if in_pubsub_mode?(state) do
+      {:continue,
+       Encoder.encode({:error, "ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"}),
+       state}
+    else
+      case try_sendfile_get(key, state) do
+        {:sent, new_state} ->
+          # Response was sent directly via sendfile — return empty iodata.
+          {:continue, "", new_state}
+
+        :fallback ->
+          # Sendfile not applicable — use normal dispatch.
+          dispatch_normal("GET", [key], state)
+      end
+    end
+  end
+
+  defp try_sendfile_get(key, state) do
+    alias Ferricstore.Store.Router
+
+    ns = state.sandbox_namespace
+    lookup_key = if ns, do: ns <> key, else: key
+
+    case Router.get_file_ref(lookup_key) do
+      {path, offset, size} when size >= @sendfile_threshold_bytes ->
+        do_sendfile_get(key, path, offset, size, state)
+
+      _ ->
+        :fallback
+    end
+  end
+
+  defp do_sendfile_get(key, path, offset, size, state) do
+    socket = state.socket
+
+    # Open the data file (keeps the fd alive even if compaction removes the file).
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          # RESP3 bulk string: $<len>\r\n<data>\r\n
+          header = [?$, Integer.to_string(size), "\r\n"]
+          trailer = "\r\n"
+
+          # TCP_NOPUSH/TCP_CORK: coalesce the header + sendfile + trailer into
+          # fewer TCP segments. :ranch_tcp wraps :gen_tcp which uses :inet.
+          set_cork(socket, true)
+
+          case :gen_tcp.send(socket, header) do
+            :ok ->
+              case :file.sendfile(fd, socket, offset, size, []) do
+                {:ok, _sent} ->
+                  case :gen_tcp.send(socket, trailer) do
+                    :ok ->
+                      set_cork(socket, false)
+                      new_state = maybe_track_read_sendfile("GET", [key], state)
+                      {:sent, new_state}
+
+                    {:error, _} ->
+                      set_cork(socket, false)
+                      :fallback
+                  end
+
+                {:error, _} ->
+                  set_cork(socket, false)
+                  :fallback
+              end
+
+            {:error, _} ->
+              set_cork(socket, false)
+              :fallback
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, _} ->
+        :fallback
+    end
+  end
+
+  # Helper to set/clear TCP_CORK (Linux) or TCP_NOPUSH (macOS/BSD).
+  # Silently ignores errors (option may not be available on all platforms).
+  defp set_cork(socket, enabled) do
+    value = if enabled, do: 1, else: 0
+
+    case :os.type() do
+      {:unix, :linux} ->
+        # TCP_CORK = 3, IPPROTO_TCP = 6
+        :inet.setopts(socket, [{:raw, 6, 3, <<value::native-32>>}])
+
+      {:unix, _bsd_or_darwin} ->
+        # TCP_NOPUSH = 4 on macOS/BSD, IPPROTO_TCP = 6
+        :inet.setopts(socket, [{:raw, 6, 4, <<value::native-32>>}])
+
+      _ ->
+        :ok
+    end
+  end
+
+  # Track reads for sendfile path (client tracking support).
+  # We pass a non-nil result so that maybe_track_read registers the key.
+  defp maybe_track_read_sendfile(cmd, args, state) do
+    maybe_track_read(cmd, args, :sendfile_ok, state)
+  end
+
+  # Normal dispatch path (extracted for reuse by sendfile fallback).
+  defp dispatch_normal(cmd, args, state) do
+    store = build_store(state.sandbox_namespace)
+
+    result =
+      try do
+        Dispatcher.dispatch(cmd, args, store)
+      catch
+        :exit, {:noproc, _} ->
+          {:error, "ERR server not ready, shard process unavailable"}
+
+        :exit, {reason, _} ->
+          {:error, "ERR internal error: #{inspect(reason)}"}
+      end
+
+    maybe_notify_keyspace(cmd, args, result)
+    new_state = maybe_track_read(cmd, args, result, state)
+    maybe_notify_tracking(cmd, args, result, state)
+
+    {:continue, Encoder.encode(result), new_state}
+  end
+
   # -- XREAD BLOCK dispatch -----------------------------------------------------
   # XREAD with BLOCK option needs connection-level blocking similar to BLPOP.
   # The Stream handler returns {:block, timeout_ms, stream_ids, count} when

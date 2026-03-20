@@ -161,7 +161,7 @@ defmodule Ferricstore.Store.Promotion do
     bitcask_markers =
       Enum.filter(bitcask_keys, &String.starts_with?(&1, @promotion_marker_prefix))
       |> Enum.map(fn <<"PM:", redis_key::binary>> ->
-        {:ok, type_str} = NIF.get(shared_store, marker_key(redis_key))
+        {:ok, type_str} = NIF.get_zero_copy(shared_store, marker_key(redis_key))
         :ets.insert(keydir, {marker_key(redis_key), 0})
         :ets.insert(hot_cache, {marker_key(redis_key), type_str})
         {redis_key, type_str}
@@ -207,7 +207,7 @@ defmodule Ferricstore.Store.Promotion do
       case :ets.lookup(hot_cache, mk) do
         [{^mk, type_str}] -> CompoundKey.decode_type(type_str)
         [] ->
-          case NIF.get(shared_store, mk) do
+          case NIF.get_zero_copy(shared_store, mk) do
             {:ok, type_str} when is_binary(type_str) -> CompoundKey.decode_type(type_str)
             _ -> :hash
           end

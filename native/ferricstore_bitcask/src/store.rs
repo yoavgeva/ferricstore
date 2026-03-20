@@ -193,6 +193,41 @@ impl Store {
         Ok(())
     }
 
+    /// Look up a key and return its on-disk file location **without** reading the
+    /// value bytes. Used by the sendfile optimisation in the TCP connection layer.
+    ///
+    /// Returns `Some((file_path, value_byte_offset, value_size))` if the key
+    /// exists and is not expired, or `None` otherwise.
+    ///
+    /// The `value_byte_offset` points to the first byte of the value data inside
+    /// the data file (past the record header and key bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if an expired-key tombstone cannot be written.
+    pub fn get_file_ref(&mut self, key: &[u8]) -> Result<Option<(PathBuf, u64, u32)>> {
+        let now_ms = now_ms();
+        let entry = match self.keydir.get(key) {
+            Some(e) => e.clone(),
+            None => return Ok(None),
+        };
+
+        if entry.expire_at_ms != 0 && entry.expire_at_ms <= now_ms {
+            self.keydir.delete(key);
+            self.writer.write_tombstone(key)?;
+            return Ok(None);
+        }
+
+        if entry.value_size == 0 {
+            // Tombstone — treat as not found.
+            return Ok(None);
+        }
+
+        let file = log_path(&self.data_dir, entry.file_id);
+        let value_offset = entry.offset + HEADER_SIZE as u64 + key.len() as u64;
+        Ok(Some((file, value_offset, entry.value_size)))
+    }
+
     /// Read the value for `key`. Returns `None` if not found or expired.
     ///
     /// # Errors

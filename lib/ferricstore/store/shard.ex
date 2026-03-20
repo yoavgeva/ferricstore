@@ -196,6 +196,36 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
+  # Returns {file_path, value_offset, value_size} for sendfile optimization,
+  # or nil if the key is not found / expired / only in ETS (hot cache).
+  def handle_call({:get_file_ref, key}, _from, state) do
+    case ets_lookup(state, key) do
+      {:hit, _value, _expire_at_ms} ->
+        # Key is hot (in ETS). The value may not yet be flushed to Bitcask,
+        # so we cannot safely sendfile. Return nil to fall back to normal path.
+        {:reply, nil, state}
+
+      :expired ->
+        {:reply, nil, state}
+
+      :miss ->
+        # Cold key — it must be on disk. Flush pending writes first.
+        state = await_in_flight(state)
+        state = flush_pending_sync(state)
+
+        case NIF.get_file_ref(state.store, key) do
+          {:ok, {path, offset, size}} ->
+            {:reply, {path, offset, size}, state}
+
+          {:ok, nil} ->
+            {:reply, nil, state}
+
+          {:error, _reason} ->
+            {:reply, nil, state}
+        end
+    end
+  end
+
   def handle_call({:get_meta, key}, _from, state) do
     case ets_lookup(state, key) do
       {:hit, value, expire_at_ms} ->
@@ -334,7 +364,7 @@ defmodule Ferricstore.Store.Shard do
           {:hit, value, _exp} -> {:reply, value, state}
           :expired -> {:reply, nil, state}
           :miss ->
-            case NIF.get(dedicated, compound_key) do
+            case NIF.get_zero_copy(dedicated, compound_key) do
               {:ok, nil} -> {:reply, nil, state}
               {:ok, value} ->
                 ets_insert(state, compound_key, value, 0)
@@ -362,7 +392,7 @@ defmodule Ferricstore.Store.Shard do
           {:hit, value, expire_at_ms} -> {:reply, {value, expire_at_ms}, state}
           :expired -> {:reply, nil, state}
           :miss ->
-            case NIF.get(dedicated, compound_key) do
+            case NIF.get_zero_copy(dedicated, compound_key) do
               {:ok, nil} -> {:reply, nil, state}
               {:ok, value} ->
                 ets_insert(state, compound_key, value, 0)
@@ -1484,7 +1514,7 @@ defmodule Ferricstore.Store.Shard do
             :expired -> nil
             :miss ->
               # Read directly from Bitcask to avoid GenServer.call deadlock
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> nil
                 {:ok, value} ->
                   ets_insert(state, key, value, 0)
@@ -1509,7 +1539,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, value, exp} -> {value, exp}
             :expired -> nil
             :miss ->
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> nil
                 {:ok, value} ->
                   ets_insert(state, key, value, 0)
@@ -1534,7 +1564,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, _, _} -> true
             :expired -> false
             :miss ->
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> false
                 {:ok, _value} -> true
                 _error -> false
@@ -1553,7 +1583,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, value, _exp} -> value
             :expired -> nil
             :miss ->
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> nil
                 {:ok, v} -> v
                 _ -> nil
@@ -1592,7 +1622,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, value, _exp} -> value
             :expired -> nil
             :miss ->
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> nil
                 {:ok, v} -> v
                 _ -> nil
@@ -1631,7 +1661,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, value, _exp} -> value
             :expired -> ""
             :miss ->
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> ""
                 {:ok, v} -> v
                 _ -> ""
@@ -1654,7 +1684,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, value, _exp} -> value
             :expired -> nil
             :miss ->
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> nil
                 {:ok, v} -> v
                 _ -> nil
@@ -1676,7 +1706,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, value, _exp} -> value
             :expired -> nil
             :miss ->
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> nil
                 {:ok, v} -> v
                 _ -> nil
@@ -1701,7 +1731,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, v, _exp} -> v
             :expired -> nil
             :miss ->
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> nil
                 {:ok, v} -> v
                 _ -> nil
@@ -1726,7 +1756,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, v, _exp} -> v
             :expired -> ""
             :miss ->
-              case NIF.get(state.store, key) do
+              case NIF.get_zero_copy(state.store, key) do
                 {:ok, nil} -> ""
                 {:ok, v} -> v
                 _ -> ""
@@ -1774,7 +1804,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, value, _exp} -> value
             :expired -> nil
             :miss ->
-              case NIF.get(state.store, compound_key) do
+              case NIF.get_zero_copy(state.store, compound_key) do
                 {:ok, nil} -> nil
                 {:ok, v} ->
                   ets_insert(state, compound_key, v, 0)
@@ -1793,7 +1823,7 @@ defmodule Ferricstore.Store.Shard do
             {:hit, value, exp} -> {value, exp}
             :expired -> nil
             :miss ->
-              case NIF.get(state.store, compound_key) do
+              case NIF.get_zero_copy(state.store, compound_key) do
                 {:ok, nil} -> nil
                 {:ok, v} ->
                   ets_insert(state, compound_key, v, 0)
@@ -2617,7 +2647,7 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp warm_from_store(state, key) do
-    case NIF.get(state.store, key) do
+    case NIF.get_zero_copy(state.store, key) do
       {:ok, nil} ->
         nil
 
@@ -2631,7 +2661,7 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp warm_meta_from_store(state, key) do
-    case NIF.get(state.store, key) do
+    case NIF.get_zero_copy(state.store, key) do
       {:ok, nil} ->
         nil
 

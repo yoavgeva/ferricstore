@@ -39,6 +39,54 @@ use std::sync::atomic::Ordering;
 
 use store::Store;
 
+/// A resource that owns a value buffer read from the Bitcask log.
+///
+/// When used with `ResourceArc::make_binary`, the BEAM creates a binary term
+/// that points directly into this buffer — zero copy from Rust to BEAM.
+/// The BEAM's GC tracks the reference: once the Erlang binary term becomes
+/// unreachable, the `ResourceArc` ref-count drops to zero and this `Vec` is
+/// freed.
+///
+/// ## Safety invariant
+///
+/// The `data` field MUST NOT be mutated after the `ResourceArc<ValueBuffer>`
+/// is passed to `make_binary`. The returned BEAM binary shares the same
+/// backing memory; any mutation would violate the immutability guarantee of
+/// Erlang binaries and cause undefined behaviour.
+struct ValueBuffer {
+    data: Vec<u8>,
+}
+
+/// A resource that owns a collection of key-value pairs from a bulk read.
+///
+/// When used with `ResourceArc::make_binary`, the BEAM creates binary terms
+/// that point directly into this buffer's `Vec<u8>` allocations - zero copy.
+/// The BEAM's GC tracks the reference: as long as any binary term created from
+/// this buffer is reachable, the `ResourceArc` ref-count stays above zero and
+/// the backing `Vec`s are not freed.
+///
+/// ## Safety invariant
+///
+/// The `pairs` field MUST NOT be mutated after any `ResourceArc::make_binary`
+/// call. The returned BEAM binaries share the same backing memory; any mutation
+/// would violate the immutability guarantee of Erlang binaries and cause
+/// undefined behaviour.
+struct BulkKvBuffer {
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// A resource that owns a collection of optional value buffers from a batch
+/// lookup. Similar to `BulkKvBuffer` but for `get_batch` which returns
+/// `Option<Vec<u8>>` per key (missing keys map to `None`/`:nil`).
+///
+/// ## Safety invariant
+///
+/// Same as `BulkKvBuffer` - the `results` field MUST NOT be mutated after any
+/// `ResourceArc::make_binary` call.
+struct BulkOptValBuffer {
+    results: Vec<Option<Vec<u8>>>,
+}
+
 mod atoms {
     rustler::atoms! {
         ok,
@@ -125,10 +173,13 @@ struct GetRangeIterState {
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
     let _ = rustler::resource!(StoreResource, env);
+    let _ = rustler::resource!(ValueBuffer, env);
     let _ = rustler::resource!(KeysIterState, env);
     let _ = rustler::resource!(GetAllIterState, env);
     let _ = rustler::resource!(GetBatchIterState, env);
     let _ = rustler::resource!(GetRangeIterState, env);
+    let _ = rustler::resource!(BulkKvBuffer, env);
+    let _ = rustler::resource!(BulkOptValBuffer, env);
     true
 }
 
@@ -191,6 +242,73 @@ fn get<'a>(
             let mut bin = OwnedBinary::new(value.len()).ok_or(rustler::Error::BadArg)?;
             bin.as_mut_slice().copy_from_slice(&value);
             Ok((atoms::ok(), Binary::from_owned(bin, env)).encode(env))
+        }
+        Ok(None) => Ok((atoms::ok(), atoms::nil()).encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Zero-copy GET: returns a BEAM binary that points directly into a
+/// Rust-owned `ValueBuffer` resource, avoiding the `Vec → OwnedBinary`
+/// memcpy that the regular `get/3` performs.
+///
+/// The BEAM binary created by `ResourceArc::make_binary` shares the
+/// backing memory of the `ValueBuffer`. The resource's ref-count is
+/// incremented by the binary term; when the Erlang binary is GC'd the
+/// ref-count drops and the `Vec` is freed. No copy occurs.
+///
+/// Returns `{:ok, binary}`, `{:ok, :nil}`, or `{:error, reason}`.
+///
+/// ## Scheduler contract
+///
+/// Same as `get/3` — runs on a Normal BEAM scheduler. A single pread
+/// (<1ms on NVMe) is fast enough; the shard GenServer serializes access.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn get_zero_copy<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    key: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    match store.get(key.as_slice()) {
+        Ok(Some(value)) => {
+            // Wrap the value Vec in a resource. `make_binary` calls
+            // `enif_make_resource_binary` under the hood, which creates
+            // a BEAM binary term pointing directly into `buffer.data`.
+            let buffer = ResourceArc::new(ValueBuffer { data: value });
+            let bin = buffer.make_binary(env, |buf| &buf.data);
+            Ok((atoms::ok(), bin).encode(env))
+        }
+        Ok(None) => Ok((atoms::ok(), atoms::nil()).encode(env)),
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Look up a key's on-disk file location without reading the value.
+///
+/// Returns `{:ok, {file_path, value_offset, value_size}}` if the key exists,
+/// `{:ok, :nil}` if not found/expired, or `{:error, reason}`.
+///
+/// Used by the sendfile optimisation in standalone TCP mode: the Elixir
+/// connection layer can use `:file.sendfile/5` to zero-copy the value bytes
+/// directly from the Bitcask data file to the TCP socket.
+///
+/// ## Scheduler contract
+///
+/// Runs on a Normal BEAM scheduler. Only a keydir lookup — no disk I/O.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn get_file_ref<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    key: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    match store.get_file_ref(key.as_slice()) {
+        Ok(Some((path, offset, size))) => {
+            let path_str = path.to_string_lossy().to_string();
+            Ok((atoms::ok(), (path_str, offset, u64::from(size))).encode(env))
         }
         Ok(None) => Ok((atoms::ok(), atoms::nil()).encode(env)),
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
@@ -1185,6 +1303,264 @@ fn available_disk_space(env: Env, resource: ResourceArc<StoreResource>) -> NifRe
     match store.available_disk_space() {
         Ok(space) => Ok((atoms::ok(), space).encode(env)),
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+// ===========================================================================
+// Zero-copy bulk NIFs
+// ===========================================================================
+
+/// Zero-copy get_all: returns `{:ok, [{key, value}, ...]}` where every key and
+/// value binary points directly into a Rust-owned `BulkKvBuffer` resource.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn get_all_zero_copy<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+) -> NifResult<Term<'a>> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    let pairs = match store.get_all() {
+        Ok(p) => p,
+        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+    };
+    drop(store);
+
+    if pairs.is_empty() {
+        let empty: Vec<Term> = Vec::new();
+        return Ok((atoms::ok(), empty).encode(env));
+    }
+
+    let buffer = ResourceArc::new(BulkKvBuffer { pairs });
+    let len = buffer.pairs.len();
+    let mut terms = Vec::with_capacity(len);
+    for i in 0..len {
+        let kbin = buffer.make_binary(env, |buf| &buf.pairs[i].0);
+        let vbin = buffer.make_binary(env, |buf| &buf.pairs[i].1);
+        terms.push((kbin, vbin).encode(env));
+    }
+    Ok((atoms::ok(), terms).encode(env))
+}
+
+/// Zero-copy get_batch: returns `{:ok, [value | nil, ...]}` where every non-nil
+/// value binary points directly into a Rust-owned `BulkOptValBuffer` resource.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn get_batch_zero_copy<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    keys: Vec<Binary<'a>>,
+) -> NifResult<Term<'a>> {
+    let key_slices: Vec<&[u8]> = keys.iter().map(Binary::as_slice).collect();
+
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    let results = match store.get_batch(&key_slices) {
+        Ok(r) => r,
+        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+    };
+    drop(store);
+
+    let buffer = ResourceArc::new(BulkOptValBuffer { results });
+    let len = buffer.results.len();
+    let mut terms = Vec::with_capacity(len);
+    for i in 0..len {
+        let term = match buffer.results[i] {
+            Some(ref _v) => buffer
+                .make_binary(env, |buf| buf.results[i].as_deref().unwrap())
+                .encode(env),
+            None => atoms::nil().encode(env),
+        };
+        terms.push(term);
+    }
+    Ok((atoms::ok(), terms).encode(env))
+}
+
+/// Zero-copy get_range: returns `{:ok, [{key, value}, ...]}` where every key
+/// and value binary points directly into a Rust-owned `BulkKvBuffer` resource.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn get_range_zero_copy<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    min_key: Binary<'a>,
+    max_key: Binary<'a>,
+    max_count: u64,
+) -> NifResult<Term<'a>> {
+    let mut store = resource.store.lock().map_err(|_| rustler::Error::BadArg)?;
+    let pairs = match store.get_range(
+        min_key.as_slice(),
+        max_key.as_slice(),
+        max_count as usize,
+    ) {
+        Ok(p) => p,
+        Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+    };
+    drop(store);
+
+    if pairs.is_empty() {
+        let empty: Vec<Term> = Vec::new();
+        return Ok((atoms::ok(), empty).encode(env));
+    }
+
+    let buffer = ResourceArc::new(BulkKvBuffer { pairs });
+    let len = buffer.pairs.len();
+    let mut terms = Vec::with_capacity(len);
+    for i in 0..len {
+        let kbin = buffer.make_binary(env, |buf| &buf.pairs[i].0);
+        let vbin = buffer.make_binary(env, |buf| &buf.pairs[i].1);
+        terms.push((kbin, vbin).encode(env));
+    }
+    Ok((atoms::ok(), terms).encode(env))
+}
+
+#[cfg(test)]
+mod bulk_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn bulk_kv_buffer_holds_pairs() {
+        let buf = BulkKvBuffer {
+            pairs: vec![
+                (b"key1".to_vec(), b"val1".to_vec()),
+                (b"key2".to_vec(), b"val2".to_vec()),
+                (b"key3".to_vec(), b"val3".to_vec()),
+            ],
+        };
+        assert_eq!(buf.pairs.len(), 3);
+        assert_eq!(&buf.pairs[0].0, b"key1");
+        assert_eq!(&buf.pairs[0].1, b"val1");
+        assert_eq!(&buf.pairs[2].0, b"key3");
+        assert_eq!(&buf.pairs[2].1, b"val3");
+    }
+
+    #[test]
+    fn bulk_kv_buffer_empty() {
+        let buf = BulkKvBuffer { pairs: Vec::new() };
+        assert!(buf.pairs.is_empty());
+    }
+
+    #[test]
+    fn bulk_kv_buffer_large_values() {
+        let large_val = vec![0xABu8; 100_000];
+        let buf = BulkKvBuffer {
+            pairs: vec![
+                (b"k1".to_vec(), large_val.clone()),
+                (b"k2".to_vec(), large_val.clone()),
+            ],
+        };
+        assert_eq!(buf.pairs[0].1.len(), 100_000);
+        assert_eq!(buf.pairs[1].1.len(), 100_000);
+        assert_eq!(buf.pairs[0].1[0], 0xAB);
+    }
+
+    #[test]
+    fn bulk_kv_buffer_pointer_stability() {
+        let buf = BulkKvBuffer {
+            pairs: vec![
+                (b"key1".to_vec(), b"val1".to_vec()),
+                (b"key2".to_vec(), b"val2".to_vec()),
+            ],
+        };
+        let ptr0_k = buf.pairs[0].0.as_ptr();
+        let ptr0_v = buf.pairs[0].1.as_ptr();
+        let ptr1_k = buf.pairs[1].0.as_ptr();
+        let ptr1_v = buf.pairs[1].1.as_ptr();
+        assert_eq!(buf.pairs[0].0.as_ptr(), ptr0_k);
+        assert_eq!(buf.pairs[0].1.as_ptr(), ptr0_v);
+        assert_eq!(buf.pairs[1].0.as_ptr(), ptr1_k);
+        assert_eq!(buf.pairs[1].1.as_ptr(), ptr1_v);
+    }
+
+    #[test]
+    fn bulk_kv_buffer_binary_data() {
+        let buf = BulkKvBuffer {
+            pairs: vec![(vec![0, 1, 2, 3], vec![0xFF, 0xFE, 0x00, 0x01])],
+        };
+        assert_eq!(&buf.pairs[0].0, &[0, 1, 2, 3]);
+        assert_eq!(&buf.pairs[0].1, &[0xFF, 0xFE, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn bulk_opt_val_buffer_holds_results() {
+        let buf = BulkOptValBuffer {
+            results: vec![
+                Some(b"val1".to_vec()),
+                None,
+                Some(b"val3".to_vec()),
+                None,
+            ],
+        };
+        assert_eq!(buf.results.len(), 4);
+        assert_eq!(buf.results[0].as_ref().unwrap(), b"val1");
+        assert!(buf.results[1].is_none());
+        assert_eq!(buf.results[2].as_ref().unwrap(), b"val3");
+        assert!(buf.results[3].is_none());
+    }
+
+    #[test]
+    fn bulk_opt_val_buffer_empty() {
+        let buf = BulkOptValBuffer {
+            results: Vec::new(),
+        };
+        assert!(buf.results.is_empty());
+    }
+
+    #[test]
+    fn bulk_opt_val_buffer_all_none() {
+        let buf = BulkOptValBuffer {
+            results: vec![None, None, None],
+        };
+        assert!(buf.results.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn bulk_opt_val_buffer_all_some() {
+        let buf = BulkOptValBuffer {
+            results: vec![
+                Some(b"a".to_vec()),
+                Some(b"b".to_vec()),
+                Some(b"c".to_vec()),
+            ],
+        };
+        assert!(buf.results.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn bulk_opt_val_buffer_large_values() {
+        let large = vec![0x42u8; 100_000];
+        let buf = BulkOptValBuffer {
+            results: vec![Some(large.clone()), None, Some(large)],
+        };
+        assert_eq!(buf.results[0].as_ref().unwrap().len(), 100_000);
+        assert!(buf.results[1].is_none());
+        assert_eq!(buf.results[2].as_ref().unwrap().len(), 100_000);
+    }
+
+    #[test]
+    fn bulk_opt_val_buffer_pointer_stability() {
+        let buf = BulkOptValBuffer {
+            results: vec![Some(b"val1".to_vec()), Some(b"val2".to_vec())],
+        };
+        let ptr0 = buf.results[0].as_ref().unwrap().as_ptr();
+        let ptr1 = buf.results[1].as_ref().unwrap().as_ptr();
+        assert_eq!(buf.results[0].as_ref().unwrap().as_ptr(), ptr0);
+        assert_eq!(buf.results[1].as_ref().unwrap().as_ptr(), ptr1);
+    }
+
+    #[test]
+    fn bulk_kv_buffer_many_pairs() {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..10_000)
+            .map(|i| {
+                (
+                    format!("key_{i:06}").into_bytes(),
+                    vec![0xAAu8; 1024],
+                )
+            })
+            .collect();
+        let buf = BulkKvBuffer { pairs };
+        assert_eq!(buf.pairs.len(), 10_000);
+        assert_eq!(&buf.pairs[0].0, b"key_000000");
+        assert_eq!(&buf.pairs[9999].0, b"key_009999");
+        assert_eq!(buf.pairs[5000].1.len(), 1024);
     }
 }
 

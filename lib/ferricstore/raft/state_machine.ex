@@ -832,7 +832,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       [] ->
         # ETS miss -- try Bitcask for cold keys
-        case NIF.get(state.store, key) do
+        case NIF.get_zero_copy(state.store, key) do
           {:ok, nil} ->
             :miss
 
@@ -926,7 +926,7 @@ defmodule Ferricstore.Raft.StateMachine do
         nil
 
       [] ->
-        case NIF.get(state.store, key) do
+        case NIF.get_zero_copy(state.store, key) do
           {:ok, nil} ->
             nil
 
@@ -966,7 +966,7 @@ defmodule Ferricstore.Raft.StateMachine do
         nil
 
       [] ->
-        case NIF.get(state.store, key) do
+        case NIF.get_zero_copy(state.store, key) do
           {:ok, nil} ->
             nil
 
