@@ -320,9 +320,7 @@ impl HnswIndex {
 
         while let Some(MinDist(current, c_dist)) = candidates.pop() {
             // If current candidate is farther than the worst result, stop
-            let worst_dist = results
-                .peek()
-                .map_or(f32::INFINITY, |MaxDist(_, d)| *d);
+            let worst_dist = results.peek().map_or(f32::INFINITY, |MaxDist(_, d)| *d);
 
             if c_dist > worst_dist && results.len() >= ef {
                 break;
@@ -342,9 +340,7 @@ impl HnswIndex {
 
                 let d = distance(self.metric, query, &self.nodes[nid].vector);
 
-                let worst_dist = results
-                    .peek()
-                    .map_or(f32::INFINITY, |MaxDist(_, d)| *d);
+                let worst_dist = results.peek().map_or(f32::INFINITY, |MaxDist(_, d)| *d);
 
                 if d < worst_dist || results.len() < ef {
                     candidates.push(MinDist(nid, d));
