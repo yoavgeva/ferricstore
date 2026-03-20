@@ -910,7 +910,11 @@ When `protected_mode: false`, all connections accepted from any IP immediately.
 No ACL setup required. Default user works with no password. This is the
 expected behavior for local development and CI environments.
 
-Protected mode is `true` by default in production config.
+**Defaults by mode:**
+- Standalone: `protected_mode: true` (secure by default)
+- Embedded: `protected_mode: false` (no network, no risk)
+
+These defaults are set automatically based on `:mode` config. Can be overridden explicitly.
 
 ---
 
