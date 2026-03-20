@@ -104,7 +104,7 @@
 | LDAP / SAML integration | Yes | No | |
 | IP allowlisting | Yes | No | |
 | **Observability** | | | |
-| Prometheus metrics | Yes (v2 scraping endpoint, cluster/node/db/shard/proxy levels) | Yes (text exposition format, custom FERRICSTORE.METRICS command) | Redis Enterprise has much richer metric hierarchy |
+| Prometheus metrics | Yes (cluster/node/db/shard/proxy hierarchy) | Yes (23+ metrics, per-prefix labels, per-shard INFO, /metrics endpoint) | Redis Enterprise has proxy-level metrics (multi-tenant hosting). FerricStore has per-prefix hot/cold reads, namespace config metrics, and per-shard Raft/Bitcask stats — equivalent operational coverage without the proxy layer. |
 | Grafana dashboards | Yes (official dashboards) | No (metrics are compatible but no dashboards shipped) | |
 | Slow log | Yes | Yes | |
 | INFO command | Yes | Yes | |
