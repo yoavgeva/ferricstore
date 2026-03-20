@@ -1379,8 +1379,13 @@ defmodule Ferricstore.Store.Shard do
   # deadlocking (we are already inside the shard's handle_call).
 
   def handle_call({:prepare_tx, tx_id, commands}, _from, state) do
+    # Track keys deleted within this prepare batch so that subsequent
+    # operations (GET, EXISTS) see them as gone even before the Bitcask
+    # tombstone is written.
+    Process.put(:tx_deleted_keys, MapSet.new())
     local_store = build_local_store(state)
     results = execute_tx_commands(commands, local_store)
+    Process.delete(:tx_deleted_keys)
     new_staged = Map.put(state.staged_txs, tx_id, %{results: results})
     {:reply, {:prepared, tx_id, results}, %{state | staged_txs: new_staged}}
   end
@@ -1435,6 +1440,13 @@ defmodule Ferricstore.Store.Shard do
     local_put = fn key, value, expire_at_ms ->
       if Router.shard_for(key) == my_idx do
         ets_insert(state, key, value, expire_at_ms)
+        # If key was previously deleted in this tx, un-delete it
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+        if MapSet.member?(deleted, key) do
+          Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
+        end
+
         # Send ourselves a message to persist (will be processed after handle_call returns)
         send(self(), {:tx_pending_write, key, value, expire_at_ms})
         :ok
@@ -1446,6 +1458,9 @@ defmodule Ferricstore.Store.Shard do
     local_delete = fn key ->
       if Router.shard_for(key) == my_idx do
         ets_delete_key(state, key)
+        # Track deletion so subsequent reads within this tx see the key as gone
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+        Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
         send(self(), {:tx_pending_delete, key})
         :ok
       else
@@ -1455,18 +1470,25 @@ defmodule Ferricstore.Store.Shard do
 
     local_get = fn key ->
       if Router.shard_for(key) == my_idx do
-        case ets_lookup(state, key) do
-          {:hit, value, _exp} -> value
-          :expired -> nil
-          :miss ->
-            # Read directly from Bitcask to avoid GenServer.call deadlock
-            case NIF.get(state.store, key) do
-              {:ok, nil} -> nil
-              {:ok, value} ->
-                ets_insert(state, key, value, 0)
-                value
-              _error -> nil
-            end
+        # Check if key was deleted within this transaction
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+        if MapSet.member?(deleted, key) do
+          nil
+        else
+          case ets_lookup(state, key) do
+            {:hit, value, _exp} -> value
+            :expired -> nil
+            :miss ->
+              # Read directly from Bitcask to avoid GenServer.call deadlock
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> nil
+                {:ok, value} ->
+                  ets_insert(state, key, value, 0)
+                  value
+                _error -> nil
+              end
+          end
         end
       else
         Router.get(key)
@@ -1475,17 +1497,23 @@ defmodule Ferricstore.Store.Shard do
 
     local_get_meta = fn key ->
       if Router.shard_for(key) == my_idx do
-        case ets_lookup(state, key) do
-          {:hit, value, exp} -> {value, exp}
-          :expired -> nil
-          :miss ->
-            case NIF.get(state.store, key) do
-              {:ok, nil} -> nil
-              {:ok, value} ->
-                ets_insert(state, key, value, 0)
-                {value, 0}
-              _error -> nil
-            end
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+        if MapSet.member?(deleted, key) do
+          nil
+        else
+          case ets_lookup(state, key) do
+            {:hit, value, exp} -> {value, exp}
+            :expired -> nil
+            :miss ->
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> nil
+                {:ok, value} ->
+                  ets_insert(state, key, value, 0)
+                  {value, 0}
+                _error -> nil
+              end
+          end
         end
       else
         Router.get_meta(key)
@@ -1494,15 +1522,21 @@ defmodule Ferricstore.Store.Shard do
 
     local_exists = fn key ->
       if Router.shard_for(key) == my_idx do
-        case ets_lookup(state, key) do
-          {:hit, _, _} -> true
-          :expired -> false
-          :miss ->
-            case NIF.get(state.store, key) do
-              {:ok, nil} -> false
-              {:ok, _value} -> true
-              _error -> false
-            end
+        deleted = Process.get(:tx_deleted_keys, MapSet.new())
+
+        if MapSet.member?(deleted, key) do
+          false
+        else
+          case ets_lookup(state, key) do
+            {:hit, _, _} -> true
+            :expired -> false
+            :miss ->
+              case NIF.get(state.store, key) do
+                {:ok, nil} -> false
+                {:ok, _value} -> true
+                _error -> false
+              end
+          end
         end
       else
         Router.exists?(key)
