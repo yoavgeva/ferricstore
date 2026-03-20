@@ -105,6 +105,7 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
+    #[must_use]
     pub fn new(dims: usize, m: usize, ef_construction: usize, metric: Metric) -> Self {
         let ml = 1.0 / (m as f64).ln();
         Self {
@@ -139,6 +140,15 @@ impl HnswIndex {
     }
 
     /// Add a vector with the given key. Returns the node index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `vector.len()` does not match the configured `dims`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the entry point is `Some` but no longer valid (should never
+    /// happen under normal use).
     pub fn add(&mut self, key: &str, vector: Vec<f32>) -> Result<usize, String> {
         if vector.len() != self.dims {
             return Err(format!(
@@ -199,7 +209,7 @@ impl HnswIndex {
                 .collect();
 
             // Set forward edges
-            self.nodes[node_id].neighbors[lc] = neighbors.clone();
+            self.nodes[node_id].neighbors[lc].clone_from(&neighbors);
 
             // Set reverse edges (with pruning)
             for &neighbor_id in &neighbors {
@@ -312,8 +322,7 @@ impl HnswIndex {
             // If current candidate is farther than the worst result, stop
             let worst_dist = results
                 .peek()
-                .map(|MaxDist(_, d)| *d)
-                .unwrap_or(f32::INFINITY);
+                .map_or(f32::INFINITY, |MaxDist(_, d)| *d);
 
             if c_dist > worst_dist && results.len() >= ef {
                 break;
@@ -335,8 +344,7 @@ impl HnswIndex {
 
                 let worst_dist = results
                     .peek()
-                    .map(|MaxDist(_, d)| *d)
-                    .unwrap_or(f32::INFINITY);
+                    .map_or(f32::INFINITY, |MaxDist(_, d)| *d);
 
                 if d < worst_dist || results.len() < ef {
                     candidates.push(MinDist(nid, d));
@@ -358,6 +366,12 @@ impl HnswIndex {
     }
 
     /// Search the index for the k nearest neighbors of the given query vector.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the entry point is `Some` but no longer valid (should never
+    /// happen under normal use).
+    #[must_use]
     pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(String, f32)> {
         if k == 0 || self.entry_point.is_none() {
             return Vec::new();
@@ -427,6 +441,7 @@ impl HnswIndex {
     }
 
     /// Count of live (non-deleted) vectors.
+    #[must_use]
     pub fn count(&self) -> usize {
         self.key_to_id.len()
     }
