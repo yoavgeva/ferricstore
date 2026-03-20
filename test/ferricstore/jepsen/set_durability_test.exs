@@ -1,0 +1,231 @@
+defmodule Ferricstore.Jepsen.SetDurabilityTest do
+  @moduledoc """
+  Jepsen-style set durability tests from test plan Section 19.5.
+
+  SADD members that were ACKed must always be in SMEMBERS after any fault.
+  This is the Jepsen set test -- one of the clearest correctness checks
+  because set membership is unambiguous: a member is either present or it
+  is not.
+
+  In single-node Raft mode (current architecture), each node is independent.
+  Set operations are local. The test verifies:
+
+    1. ACKed SADD members survive sibling node crashes.
+    2. No phantom members appear (members that were never ACKed).
+    3. After multiple rounds of node kills, all ACKed members are still present.
+
+  When multi-node Raft is implemented, these tests will validate that SADD
+  is durable across the cluster and survives leader failover.
+
+  ## Running
+
+      mix test test/ferricstore/jepsen/ --include jepsen
+  """
+
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Test.ClusterHelper
+  alias Ferricstore.Test.HistoryRecorder
+
+  @moduletag :jepsen
+  @moduletag :cluster
+
+  setup_all do
+    unless ClusterHelper.peer_available?() do
+      raise "requires OTP 25+ for :peer"
+    end
+
+    Process.sleep(500)
+
+    nodes = ClusterHelper.start_cluster(3)
+    on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+    %{nodes: nodes}
+  end
+
+  describe "19.5 set members never disappear" do
+    @tag :jepsen
+    test "set: no ACKed member missing after sibling node kills", %{nodes: nodes} do
+      [n1, n2, n3] = nodes
+      key = "jepsen:set"
+
+      {:ok, history} = HistoryRecorder.new()
+
+      on_exit(fn -> if Process.alive?(history), do: HistoryRecorder.stop(history) end)
+
+      # SADD 200 members on n1, killing sibling nodes every 50 adds
+      for i <- 1..200 do
+        member = "member:#{i}"
+
+        case :rpc.call(n1.name, FerricStore, :sadd, [key, [member]]) do
+          {:ok, count} when is_integer(count) ->
+            HistoryRecorder.record_ok(history, key, member, n1.name)
+
+          _other ->
+            :ok
+        end
+
+        # Kill a sibling every 50 adds to introduce disruption
+        if rem(i, 50) == 0 do
+          alive_siblings =
+            Enum.filter([n2, n3], fn n ->
+              case :rpc.call(n.name, Node, :self, []) do
+                {:badrpc, _} -> false
+                _ -> true
+              end
+            end)
+
+          if length(alive_siblings) > 0 do
+            target = hd(alive_siblings)
+            ClusterHelper.kill_node(nodes, target)
+            Process.sleep(100)
+          end
+        end
+      end
+
+      # Allow pending flushes
+      Process.sleep(200)
+      :ok = ClusterHelper.wait_for_leaders([n1], 4, timeout: 5_000)
+
+      # Verify all ACKed members are present on n1 (the writing node)
+      violations = HistoryRecorder.verify_set_durability(history, [n1], key)
+
+      assert violations == [],
+             "Set durability violated:\n" <>
+               HistoryRecorder.format_violations(violations)
+
+      {:ok, members} = :rpc.call(n1.name, FerricStore, :smembers, [key])
+
+      IO.puts(
+        "  #{length(members)} members present; 0 ACKed members lost " <>
+          "after sibling node kills"
+      )
+    end
+
+    @tag :jepsen
+    test "set: no phantom member appears that was never ACKed", %{nodes: nodes} do
+      # Find an alive node
+      alive =
+        Enum.filter(nodes, fn n ->
+          case :rpc.call(n.name, Node, :self, []) do
+            {:badrpc, _} -> false
+            _ -> true
+          end
+        end)
+
+      assert length(alive) >= 1, "need at least 1 alive node"
+      node = hd(alive)
+
+      key = "jepsen:set:phantom"
+      {:ok, history} = HistoryRecorder.new()
+
+      on_exit(fn -> if Process.alive?(history), do: HistoryRecorder.stop(history) end)
+
+      # Add 50 members, recording which ones were ACKed
+      for i <- 1..50 do
+        member = "m:#{i}"
+
+        case :rpc.call(node.name, FerricStore, :sadd, [key, [member]]) do
+          {:ok, _count} ->
+            HistoryRecorder.record_ok(history, key, member, node.name)
+
+          _other ->
+            :ok
+        end
+      end
+
+      # Allow pending flushes
+      Process.sleep(100)
+
+      # Read current members
+      {:ok, present} = :rpc.call(node.name, FerricStore, :smembers, [key])
+
+      # Build the set of ACKed members
+      acked =
+        history
+        |> HistoryRecorder.all()
+        |> Enum.map(fn {:ok, _k, v, _n, _t} -> v end)
+        |> MapSet.new()
+
+      present_set = MapSet.new(present)
+
+      # Check for phantom members: present but never ACKed
+      phantom = MapSet.difference(present_set, acked)
+
+      assert MapSet.size(phantom) == 0,
+             "Phantom members appeared that were never ACKed: " <>
+               inspect(MapSet.to_list(phantom))
+
+      # Also check for missing ACKed members
+      missing = MapSet.difference(acked, present_set)
+
+      assert MapSet.size(missing) == 0,
+             "ACKed members missing from SMEMBERS: " <>
+               inspect(MapSet.to_list(missing))
+
+      IO.puts(
+        "  #{MapSet.size(acked)} ACKed members present; " <>
+          "0 phantom members; 0 missing members"
+      )
+    end
+
+    @tag :jepsen
+    test "set: concurrent SADD operations produce correct membership", %{nodes: nodes} do
+      alive =
+        Enum.filter(nodes, fn n ->
+          case :rpc.call(n.name, Node, :self, []) do
+            {:badrpc, _} -> false
+            _ -> true
+          end
+        end)
+
+      assert length(alive) >= 1, "need at least 1 alive node"
+      node = hd(alive)
+
+      key = "jepsen:set:concurrent"
+      {:ok, history} = HistoryRecorder.new()
+
+      on_exit(fn -> if Process.alive?(history), do: HistoryRecorder.stop(history) end)
+
+      # 50 concurrent SADD tasks, each adding a unique member
+      tasks =
+        for i <- 1..50 do
+          Task.async(fn ->
+            member = "concurrent:#{i}"
+
+            case :rpc.call(node.name, FerricStore, :sadd, [key, [member]]) do
+              {:ok, _count} ->
+                HistoryRecorder.record_ok(history, key, member, node.name)
+                {:ok, member}
+
+              other ->
+                {:error, other}
+            end
+          end)
+        end
+
+      results = Task.await_many(tasks, 15_000)
+      ok_count = Enum.count(results, &match?({:ok, _}, &1))
+
+      # Allow flush
+      Process.sleep(100)
+
+      # Verify all ACKed members are present
+      violations = HistoryRecorder.verify_set_durability(history, [node], key)
+
+      assert violations == [],
+             "Set durability violated under concurrency:\n" <>
+               HistoryRecorder.format_violations(violations)
+
+      {:ok, members} = :rpc.call(node.name, FerricStore, :smembers, [key])
+
+      assert length(members) == ok_count,
+             "Expected #{ok_count} members after #{ok_count} successful SADDs, " <>
+               "got #{length(members)}"
+
+      IO.puts(
+        "  #{ok_count} concurrent SADD operations; " <>
+          "#{length(members)} members present; 0 missing"
+      )
+    end
+  end
+end
