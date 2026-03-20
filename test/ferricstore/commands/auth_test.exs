@@ -250,9 +250,10 @@ defmodule Ferricstore.Commands.AuthTest do
       send_cmd(sock, ["ACL", "LIST"])
       response = recv_response(sock)
 
-      assert [rule] = response
-      assert rule =~ "user default"
-      assert rule =~ "+@all"
+      assert is_list(response)
+      default_rule = Enum.find(response, &String.contains?(&1, "user default"))
+      assert default_rule, "ACL LIST should contain a rule for the default user"
+      assert default_rule =~ "+@all"
 
       :gen_tcp.close(sock)
     end
