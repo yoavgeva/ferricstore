@@ -830,6 +830,130 @@ listener, ACL is unnecessary.
 
 ---
 
+### US-11: First-Time Setup (Day 1 Bootstrap)
+
+**As a** new FerricStore operator deploying for the first time,
+**I want** a clear, secure bootstrap flow that guides me from zero to production,
+**so that** I don't accidentally leave the server open to the internet.
+
+**Day 1 workflow:**
+
+```bash
+# Step 1: Start FerricStore (protected mode is ON by default)
+$ ferricstore-server start
+
+# At this point:
+# - Only localhost connections accepted (protected mode)
+# - Default user has no password, full access
+# - Remote connections get: "DENIED FerricStore is in protected mode"
+
+# Step 2: Connect from localhost and create admin user
+$ ferricstore-cli -h 127.0.0.1
+127.0.0.1:6379> ACL SETUSER admin on >$(openssl rand -hex 32) ~* &* +@all
+OK
+
+# Step 3: Lock down the default user
+127.0.0.1:6379> ACL SETUSER default off
+OK
+
+# Step 4: Create application user with least privilege
+127.0.0.1:6379> ACL SETUSER app on >app_secret ~app:* +@read +@write -@dangerous
+OK
+
+# Step 5: Persist to disk
+127.0.0.1:6379> ACL SAVE
+OK
+
+# Step 6: Now remote connections work (non-default user with password exists)
+# Protected mode automatically lifts
+```
+
+**What happens on restart:**
+
+```
+1. FerricStore starts
+2. Loads acl.conf → admin, app users restored with bcrypt hashes
+3. Default user is OFF (as saved)
+4. Protected mode checks: admin user exists with password → remote connections allowed
+5. Raft replays any ACL changes since last SAVE → state is current
+```
+
+**What happens if acl.conf is lost:**
+
+```
+1. FerricStore starts
+2. No acl.conf found → only default user (on, nopass, full access)
+3. Protected mode: ON (no non-default user with password)
+4. Only localhost connections accepted
+5. Operator must re-create users from localhost
+6. If this is a cluster node: Raft replay restores all ACL changes → no data loss
+```
+
+**Behavior:**
+- Fresh install: only localhost works, must create admin first
+- `ACL SAVE` persists to `data_dir/acl.conf`
+- Restart loads from file, then Raft catches up
+- Lost file on standalone: must re-create from localhost
+- Lost file on cluster: Raft replay restores everything
+
+**Why this matters:** The #1 security incident with Redis is exposed instances
+with no password. FerricStore's protected mode makes this impossible — you
+MUST create a user before the server accepts remote connections. The bootstrap
+flow is intentionally friction-full to prevent accidental exposure.
+
+---
+
+### US-12: ACL Survives Node Crash
+
+**As an** operator running a 3-node FerricStore cluster,
+**I want** ACL rules to survive node crashes without manual intervention,
+**so that** security configuration is never lost.
+
+**Scenario:**
+```
+t=0  ACL SETUSER app on >secret ~app:* +@read +@write   # Raft-replicated
+t=1  ACL SAVE                                             # Written to acl.conf
+t=2  ACL SETUSER reader on >rpass ~* +@read               # Raft-replicated, NOT saved
+t=3  Node 1 crashes (power failure)
+t=4  Node 1 restarts
+t=5  Load acl.conf → "app" user restored
+t=6  Raft WAL replay → "reader" user restored (from t=2)
+t=7  Both users work correctly
+```
+
+**Behavior:**
+- Raft WAL is the source of truth, not the file
+- File is a bootstrap fallback for standalone mode
+- Crash + restart = full ACL recovery via Raft
+- No manual intervention needed in a cluster
+- Standalone crash without `ACL SAVE` after changes = changes lost
+
+**Test scenario:**
+```elixir
+test "ACL survives node crash in cluster" do
+  nodes = ClusterHelper.start_cluster(3)
+  leader = ClusterHelper.find_leader(nodes, 0)
+
+  # Create users through Raft
+  :rpc.call(leader, Ferricstore.Acl, :set_user, ["crash_test", ["on", ">pass", "~*", "+@all"]])
+
+  # Kill the leader
+  {killed, remaining} = ClusterHelper.kill_leader(nodes)
+  :ok = ClusterHelper.wait_for_leaders(remaining, 4)
+
+  # User exists on surviving nodes
+  new_leader = hd(remaining).name
+  assert {:ok, _} = :rpc.call(new_leader, Ferricstore.Acl, :authenticate, ["crash_test", "pass"])
+
+  # Restart killed node
+  # ... rejoin cluster ...
+  # User should exist after Raft replay
+  assert {:ok, _} = :rpc.call(killed.name, Ferricstore.Acl, :authenticate, ["crash_test", "pass"])
+end
+```
+
+---
+
 ## 13. Test Scenarios from User Stories
 
 Each user story maps to one or more acceptance tests. These tests validate the
@@ -1036,6 +1160,51 @@ test "embedded mode does not start ACL GenServer" do
   # Direct calls work without auth
   assert :ok = Ferricstore.set(store, "key", "value")
   assert {:ok, "value"} = Ferricstore.get(store, "key")
+end
+```
+
+### TS-11: First-Time Bootstrap (from US-11)
+
+```elixir
+test "protected mode blocks remote connections until ACL user created" do
+  # Fresh start — only default user, no password
+  # Simulate remote connection (non-localhost)
+  assert {:error, "DENIED" <> _} = connect_remote(port)
+
+  # Create admin from localhost
+  assert :ok = Acl.set_user("admin", ["on", ">strong_pass", "~*", "+@all"])
+
+  # Now remote connections work (protected mode lifts)
+  assert {:ok, _sock} = connect_remote(port)
+
+  # Lock default user
+  Acl.set_user("default", ["off"])
+
+  # ACL SAVE persists
+  assert :ok = Acl.save()
+  assert File.exists?(Path.join(data_dir, "acl.conf"))
+end
+```
+
+### TS-12: ACL Crash Recovery (from US-12)
+
+```elixir
+test "ACL users survive node crash via Raft replay" do
+  nodes = ClusterHelper.start_cluster(3)
+  leader = hd(nodes).name
+
+  # Create user through Raft
+  :rpc.call(leader, Ferricstore.Acl, :set_user, ["survivor", ["on", ">pass", "~*", "+@all"]])
+
+  # Kill leader
+  {killed, remaining} = ClusterHelper.kill_leader(nodes)
+  :ok = ClusterHelper.wait_for_leaders(remaining, 4)
+
+  # User exists on surviving nodes
+  assert {:ok, _} = :rpc.call(hd(remaining).name, Ferricstore.Acl, :authenticate, ["survivor", "pass"])
+
+  # After restart + Raft replay: user still exists
+  # (restart logic depends on ClusterHelper implementation)
 end
 ```
 
