@@ -210,24 +210,27 @@ defmodule Ferricstore.Spec.CommandFunctionalityTest do
       key_minute = ukey("rl006_min")
       key_hour = ukey("rl006_hour")
 
-      # Short window (100ms), limit 3.
+      # Short window (500ms), limit 3 -- CI-friendly timing.
       for _ <- 1..3 do
-        ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key_minute, "100", "3"], dummy_store())
+        ["allowed" | _] = Native.handle("RATELIMIT.ADD", [key_minute, "500", "3"], dummy_store())
       end
 
       # Minute-window key is now at limit.
-      result_min = Native.handle("RATELIMIT.ADD", [key_minute, "100", "3"], dummy_store())
+      result_min = Native.handle("RATELIMIT.ADD", [key_minute, "500", "3"], dummy_store())
       assert ["denied" | _] = result_min
 
       # Hour-window key with higher limit should still be available.
       result_hour = Native.handle("RATELIMIT.ADD", [key_hour, "3600000", "1000"], dummy_store())
       assert ["allowed", 1, 999, _ms_reset] = result_hour
 
-      # Wait for short window to expire.
-      Process.sleep(150)
+      # The sliding window approximation requires waiting for 2x the window
+      # duration to fully expire the previous window's count. Sleep for
+      # 1200ms (>= 500ms * 2 + margin) so that both the current and previous
+      # windows are fully expired.
+      Process.sleep(1_200)
 
-      # Short window should have reset.
-      result_min_after = Native.handle("RATELIMIT.ADD", [key_minute, "100", "3"], dummy_store())
+      # Short window should have fully reset.
+      result_min_after = Native.handle("RATELIMIT.ADD", [key_minute, "500", "3"], dummy_store())
       assert ["allowed" | _] = result_min_after
     end
   end

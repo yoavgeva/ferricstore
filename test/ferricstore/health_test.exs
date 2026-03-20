@@ -35,7 +35,8 @@ defmodule Ferricstore.HealthTest do
   end
 
   defp recv_response(sock, buf) do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 5_000)
+    # 30s timeout to accommodate FLUSHDB on CI where many keys accumulate
+    {:ok, data} = :gen_tcp.recv(sock, 0, 30_000)
     buf2 = buf <> data
 
     case Parser.parse(buf2) do

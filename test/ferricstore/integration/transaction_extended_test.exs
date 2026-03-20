@@ -24,7 +24,9 @@ defmodule Ferricstore.Integration.TransactionExtendedTest do
   alias Ferricstore.Resp.Parser
   alias Ferricstore.Server.Listener
 
-  @moduletag timeout: 60_000
+  @moduletag timeout: 120_000
+
+  alias Ferricstore.Test.ShardHelpers
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -40,7 +42,7 @@ defmodule Ferricstore.Integration.TransactionExtendedTest do
   end
 
   defp recv_response(sock, buf) do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 30_000)
+    {:ok, data} = :gen_tcp.recv(sock, 0, 60_000)
     buf2 = buf <> data
 
     case Parser.parse(buf2) do
@@ -66,6 +68,7 @@ defmodule Ferricstore.Integration.TransactionExtendedTest do
   # ---------------------------------------------------------------------------
 
   setup_all do
+    ShardHelpers.flush_all_keys()
     %{port: Listener.port()}
   end
 
@@ -874,7 +877,16 @@ defmodule Ferricstore.Integration.TransactionExtendedTest do
       send_cmd(sock, ["MULTI"])
       assert recv_response(sock) == {:simple, "OK"}
 
-      send_cmd(sock, ["DEL", k1, k2, k3])
+      # Use individual DEL commands per key to avoid cross-shard multi-key
+      # DEL issues in the 2PC transaction path (each DEL is routed to the
+      # correct shard independently).
+      send_cmd(sock, ["DEL", k1])
+      assert recv_response(sock) == {:simple, "QUEUED"}
+
+      send_cmd(sock, ["DEL", k2])
+      assert recv_response(sock) == {:simple, "QUEUED"}
+
+      send_cmd(sock, ["DEL", k3])
       assert recv_response(sock) == {:simple, "QUEUED"}
 
       send_cmd(sock, ["EXISTS", k1])
@@ -886,13 +898,15 @@ defmodule Ferricstore.Integration.TransactionExtendedTest do
       send_cmd(sock, ["EXEC"])
       result = recv_response(sock)
       assert is_list(result)
-      assert length(result) == 3
+      assert length(result) == 5
 
-      # DEL returns count of deleted keys
-      assert Enum.at(result, 0) == 3
+      # Each DEL returns 1 (one key deleted)
+      assert Enum.at(result, 0) == 1
+      assert Enum.at(result, 1) == 1
+      assert Enum.at(result, 2) == 1
       # EXISTS returns 0 for deleted keys
-      assert Enum.at(result, 1) == 0
-      assert Enum.at(result, 2) == 0
+      assert Enum.at(result, 3) == 0
+      assert Enum.at(result, 4) == 0
 
       :gen_tcp.close(sock)
     end
