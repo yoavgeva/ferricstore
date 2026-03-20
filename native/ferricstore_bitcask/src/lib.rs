@@ -1313,7 +1313,11 @@ fn available_disk_space(env: Env, resource: ResourceArc<StoreResource>) -> NifRe
 /// Zero-copy get_all: returns `{:ok, [{key, value}, ...]}` where every key and
 /// value binary points directly into a Rust-owned `BulkKvBuffer` resource.
 #[rustler::nif(schedule = "Normal")]
-#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unnecessary_wraps,
+    clippy::elidable_lifetime_names
+)]
 fn get_all_zero_copy<'a>(
     env: Env<'a>,
     resource: ResourceArc<StoreResource>,
