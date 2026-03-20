@@ -48,8 +48,6 @@ defmodule Ferricstore.NamespaceConfig do
 
   use GenServer
 
-  alias Ferricstore.Raft.Batcher
-
   @table :ferricstore_ns_config
   @default_window_ms 1
   @default_durability :quorum
@@ -456,7 +454,10 @@ defmodule Ferricstore.NamespaceConfig do
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
     for i <- 0..(shard_count - 1) do
-      name = Batcher.batcher_name(i)
+      # Inline the batcher name to avoid a circular dependency:
+      # NamespaceConfig -> Raft.Batcher -> NamespaceConfig.
+      # This must stay in sync with Ferricstore.Raft.Batcher.batcher_name/1.
+      name = :"Ferricstore.Raft.Batcher.#{i}"
 
       case Process.whereis(name) do
         nil -> :ok
