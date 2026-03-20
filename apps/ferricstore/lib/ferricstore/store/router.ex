@@ -182,14 +182,22 @@ defmodule Ferricstore.Store.Router do
       case :ets.lookup(keydir, key) do
         [{^key, 0}] ->
           case :ets.lookup(hot_cache, key) do
-            [{^key, value}] -> {:hit, value, 0}
-            [] -> :miss
+            [{^key, value, _access_ms}] ->
+              :ets.insert(hot_cache, {key, value, now})
+              {:hit, value, 0}
+
+            [] ->
+              :miss
           end
 
         [{^key, exp}] when exp > now ->
           case :ets.lookup(hot_cache, key) do
-            [{^key, value}] -> {:hit, value, exp}
-            [] -> :miss
+            [{^key, value, _access_ms}] ->
+              :ets.insert(hot_cache, {key, value, now})
+              {:hit, value, exp}
+
+            [] ->
+              :miss
           end
 
         [{^key, _exp}] ->
@@ -369,7 +377,15 @@ defmodule Ferricstore.Store.Router do
 
   @doc "Returns the count of all live keys across every shard."
   @spec dbsize() :: non_neg_integer()
-  def dbsize, do: length(keys())
+  def dbsize do
+    Enum.reduce(0..(@shard_count - 1), 0, fn i, acc ->
+      try do
+        acc + :ets.info(:"keydir_#{i}", :size)
+      rescue
+        ArgumentError -> acc
+      end
+    end)
+  end
 
   @doc """
   Returns the current write version of the shard that owns `key`.

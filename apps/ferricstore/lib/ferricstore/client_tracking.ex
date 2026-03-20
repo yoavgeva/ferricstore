@@ -97,11 +97,11 @@ defmodule Ferricstore.ClientTracking do
   @spec init_tables() :: :ok
   def init_tables do
     if :ets.whereis(@tracking_table) == :undefined do
-      :ets.new(@tracking_table, [:bag, :public, :named_table])
+      :ets.new(@tracking_table, [:bag, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
     end
 
     if :ets.whereis(@connections_table) == :undefined do
-      :ets.new(@connections_table, [:set, :public, :named_table])
+      :ets.new(@connections_table, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
     end
 
     :ok

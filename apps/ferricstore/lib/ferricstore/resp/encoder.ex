@@ -160,13 +160,11 @@ defmodule Ferricstore.Resp.Encoder do
   # -- Private helpers --------------------------------------------------------
 
   defp encode_list_elements(elements) do
-    Enum.flat_map(elements, &List.wrap(encode(&1)))
+    Enum.map(elements, &encode/1)
   end
 
   defp encode_map_pairs(map) do
-    Enum.flat_map(map, fn {key, value} ->
-      List.wrap(encode(key)) ++ List.wrap(encode(value))
-    end)
+    Enum.map(map, fn {key, value} -> [encode(key), encode(value)] end)
   end
 
   defp validate_no_crlf!(str, type) do

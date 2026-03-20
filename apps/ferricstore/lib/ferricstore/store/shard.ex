@@ -119,7 +119,7 @@ defmodule Ferricstore.Store.Shard do
     keydir =
       case :ets.whereis(:"keydir_#{index}") do
         :undefined ->
-          :ets.new(:"keydir_#{index}", [:set, :public, :named_table])
+          :ets.new(:"keydir_#{index}", [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
 
         _ref ->
           :ets.delete_all_objects(:"keydir_#{index}")
@@ -129,7 +129,7 @@ defmodule Ferricstore.Store.Shard do
     hot_cache =
       case :ets.whereis(:"hot_cache_#{index}") do
         :undefined ->
-          :ets.new(:"hot_cache_#{index}", [:set, :public, :named_table])
+          :ets.new(:"hot_cache_#{index}", [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
 
         _ref ->
           :ets.delete_all_objects(:"hot_cache_#{index}")
@@ -263,7 +263,7 @@ defmodule Ferricstore.Store.Shard do
         fn {key, exp}, acc ->
           if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
             case :ets.lookup(state.hot_cache, key) do
-              [{^key, value}] ->
+              [{^key, value, _access_ms}] ->
                 field =
                   case :binary.split(key, <<0>>) do
                     [_prefix_part, sub] -> sub
@@ -544,7 +544,7 @@ defmodule Ferricstore.Store.Shard do
             fn {key, exp}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
                 case :ets.lookup(state.hot_cache, key) do
-                  [{^key, value}] ->
+                  [{^key, value, _access_ms}] ->
                     field =
                       case :binary.split(key, <<0>>) do
                         [_prefix_part, sub] -> sub
@@ -576,7 +576,7 @@ defmodule Ferricstore.Store.Shard do
             fn {key, exp}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
                 case :ets.lookup(state.hot_cache, key) do
-                  [{^key, value}] ->
+                  [{^key, value, _access_ms}] ->
                     field =
                       case :binary.split(key, <<0>>) do
                         [_prefix_part, sub] -> sub
@@ -1182,14 +1182,14 @@ defmodule Ferricstore.Store.Shard do
 
   # Direct path for GETSET (no Raft).
   defp handle_getset_direct(key, new_value, state) do
-    old =
+    {old, state} =
       case ets_lookup(state, key) do
-        {:hit, value, _expire_at_ms} -> value
-        :expired -> nil
+        {:hit, value, _expire_at_ms} -> {value, state}
+        :expired -> {nil, state}
         :miss ->
           state = await_in_flight(state)
           state = flush_pending_sync(state)
-          do_get(state, key)
+          {do_get(state, key), state}
       end
 
     ets_insert(state, key, new_value, 0)
@@ -1229,14 +1229,14 @@ defmodule Ferricstore.Store.Shard do
 
   # Direct path for GETDEL (no Raft).
   defp handle_getdel_direct(key, state) do
-    old =
+    {old, state} =
       case ets_lookup(state, key) do
-        {:hit, value, _expire_at_ms} -> value
-        :expired -> nil
+        {:hit, value, _expire_at_ms} -> {value, state}
+        :expired -> {nil, state}
         :miss ->
           state = await_in_flight(state)
           state = flush_pending_sync(state)
-          do_get(state, key)
+          {do_get(state, key), state}
       end
 
     if old != nil do
@@ -1877,7 +1877,7 @@ defmodule Ferricstore.Store.Shard do
               fn {key, exp}, acc ->
                 if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
                   case :ets.lookup(state.hot_cache, key) do
-                    [{^key, value}] ->
+                    [{^key, value, _access_ms}] ->
                       field =
                         case :binary.split(key, <<0>>) do
                           [_prefix_part, sub] -> sub
@@ -1982,7 +1982,10 @@ defmodule Ferricstore.Store.Shard do
   defp handle_cas_raft(key, expected, new_value, ttl_ms, state) do
     alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:cas, key, expected, new_value, ttl_ms})
+    # Pre-compute absolute expiry before entering Raft so the state machine
+    # apply/3 remains deterministic (no System.os_time calls).
+    expire_at_ms = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: nil
+    result = Batcher.write(state.index, {:cas, key, expected, new_value, expire_at_ms})
 
     case result do
       r when r in [1, 0, nil] ->
@@ -2024,7 +2027,10 @@ defmodule Ferricstore.Store.Shard do
   defp handle_lock_raft(key, owner, ttl_ms, state) do
     alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:lock, key, owner, ttl_ms})
+    # Pre-compute absolute expiry before entering Raft so the state machine
+    # apply/3 remains deterministic.
+    expire_at_ms = System.os_time(:millisecond) + ttl_ms
+    result = Batcher.write(state.index, {:lock, key, owner, expire_at_ms})
 
     case result do
       :ok ->
@@ -2113,7 +2119,10 @@ defmodule Ferricstore.Store.Shard do
   defp handle_extend_raft(key, owner, ttl_ms, state) do
     alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:extend, key, owner, ttl_ms})
+    # Pre-compute absolute expiry before entering Raft so the state machine
+    # apply/3 remains deterministic.
+    expire_at_ms = System.os_time(:millisecond) + ttl_ms
+    result = Batcher.write(state.index, {:extend, key, owner, expire_at_ms})
 
     case result do
       1 ->
@@ -2157,7 +2166,10 @@ defmodule Ferricstore.Store.Shard do
   defp handle_ratelimit_add_raft(key, window_ms, max, count, state) do
     alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:ratelimit_add, key, window_ms, max, count})
+    # Pre-compute `now` before entering Raft so the state machine
+    # apply/3 remains deterministic.
+    now_ms = System.os_time(:millisecond)
+    result = Batcher.write(state.index, {:ratelimit_add, key, window_ms, max, count, now_ms})
 
     case result do
       [_status, _count, _remaining, _ttl] = reply ->
@@ -2465,6 +2477,13 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
+  # Catch-all for unexpected messages. Without this, any unmatched message
+  # (stale timer, DOWN from a linked process, etc.) would crash the shard
+  # GenServer, causing a restart and temporary unavailability.
+  def handle_info(_msg, state) do
+    {:noreply, state}
+  end
+
   # -------------------------------------------------------------------
   # Graceful shutdown (spec 2C.6, step 8)
   #
@@ -2626,10 +2645,11 @@ defmodule Ferricstore.Store.Shard do
   end
 
   # Inserts a key/value/expiry into both the keydir and hot_cache tables,
-  # and updates the prefix index.
+  # and updates the prefix index. The hot_cache entry includes the current
+  # wall-clock time as `last_access_ms` for approximate LRU eviction.
   defp ets_insert(state, key, value, expire_at_ms) do
     :ets.insert(state.keydir, {key, expire_at_ms})
-    :ets.insert(state.hot_cache, {key, value})
+    :ets.insert(state.hot_cache, {key, value, System.os_time(:millisecond)})
 
     if state.prefix_keys do
       PrefixIndex.track(state.prefix_keys, key, state.index)
@@ -2649,20 +2669,29 @@ defmodule Ferricstore.Store.Shard do
 
   # Classifies an ETS lookup as a cache hit, expired entry, or miss.
   # Expired entries are evicted immediately from both keydir and hot_cache.
+  # On a hit, the hot_cache entry's last_access_ms is touched for LRU tracking.
   defp ets_lookup(%{keydir: keydir, hot_cache: hot_cache}, key) do
     now = System.os_time(:millisecond)
 
     case :ets.lookup(keydir, key) do
       [{^key, 0}] ->
         case :ets.lookup(hot_cache, key) do
-          [{^key, value}] -> {:hit, value, 0}
-          [] -> :miss
+          [{^key, value, _access_ms}] ->
+            :ets.insert(hot_cache, {key, value, now})
+            {:hit, value, 0}
+
+          [] ->
+            :miss
         end
 
       [{^key, exp}] when exp > now ->
         case :ets.lookup(hot_cache, key) do
-          [{^key, value}] -> {:hit, value, exp}
-          [] -> :miss
+          [{^key, value, _access_ms}] ->
+            :ets.insert(hot_cache, {key, value, now})
+            {:hit, value, exp}
+
+          [] ->
+            :miss
         end
 
       [{^key, _exp}] ->

@@ -32,7 +32,7 @@ defmodule Ferricstore.Waiters do
   """
   @spec init() :: :ok
   def init do
-    :ets.new(@table, [:duplicate_bag, :public, :named_table])
+    :ets.new(@table, [:duplicate_bag, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
     :ok
   end
 

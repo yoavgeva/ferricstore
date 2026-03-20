@@ -53,10 +53,10 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 **Current impl:** Not implemented. Data files are plaintext.
 **Decision:** Deferred — requires Rust NIF changes to encrypt/decrypt in the write/read path.
 
-### Q9: Async Tokio for ALL IO NIFs (Section 2B.5 Pattern 1)
+### Q9: Async Tokio vs Yielding NIFs (Section 2B.5) — RESOLVED
 **Spec says:** Every Bitcask IO operation submits work to Tokio and returns immediately.
-**Current impl:** Only put_batch_async uses async Tokio (via io_uring on Linux). Other IO NIFs block Normal scheduler synchronously.
-**Decision:** Deferred — synchronous IO on Normal scheduler with yielding is tolerable for v1. Full async Tokio requires major Rust NIF refactor.
+**Decision:** Yielding NIFs (consume_timeslice + schedule_nif) instead of Tokio.
+**Rationale:** For CPU-bound work (HNSW, bloom, CMS), yielding is the right approach — moving CPU work to Tokio doesn't save cycles, just moves where they run. For IO-bound work (fsync, pread), NVMe completes in ~50-200μs — too fast for Tokio's submit/callback overhead to matter. Yielding gives the BEAM scheduler the same benefit (run other processes between slices) with 10x less complexity. Tokio would only help for >1ms IO operations (spinning disks, network storage). On NVMe, the difference is negligible.
 
 ### Q14: Merge IO Priority (Section 2E.11)
 **Spec says:** IOPRIO_CLASS_BE for background merge IO.

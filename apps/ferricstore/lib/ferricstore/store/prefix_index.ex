@@ -68,7 +68,7 @@ defmodule Ferricstore.Store.PrefixIndex do
 
     case :ets.whereis(table_name) do
       :undefined ->
-        :ets.new(table_name, [:bag, :public, :named_table])
+        :ets.new(table_name, [:bag, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
 
       _ref ->
         :ets.delete_all_objects(table_name)
