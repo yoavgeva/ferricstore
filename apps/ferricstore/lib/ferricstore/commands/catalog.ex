@@ -108,7 +108,37 @@ defmodule Ferricstore.Commands.Catalog do
     %{name: "ferricstore.config", arity: -2, flags: ["admin"], first_key: 0, last_key: 0, step: 0,
       summary: "Manages per-namespace configuration (SET/GET/RESET)."},
     %{name: "ferricstore.key_info", arity: 2, flags: ["readonly", "fast"], first_key: 1, last_key: 1, step: 1,
-      summary: "Returns diagnostic metadata about a key (type, size, TTL, cache status, shard)."}
+      summary: "Returns diagnostic metadata about a key (type, size, TTL, cache status, shard)."},
+
+    # -- T-Digest ---------------------------------------------------------------
+    %{name: "tdigest.create", arity: -2, flags: ["write", "denyoom"], first_key: 1, last_key: 1, step: 1,
+      summary: "Creates a new t-digest sketch."},
+    %{name: "tdigest.add", arity: -3, flags: ["write", "denyoom"], first_key: 1, last_key: 1, step: 1,
+      summary: "Adds one or more observations to a t-digest sketch."},
+    %{name: "tdigest.reset", arity: 2, flags: ["write"], first_key: 1, last_key: 1, step: 1,
+      summary: "Resets a t-digest sketch to empty, preserving compression."},
+    %{name: "tdigest.quantile", arity: -3, flags: ["readonly"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns estimated values at one or more quantile positions."},
+    %{name: "tdigest.cdf", arity: -3, flags: ["readonly"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns the estimated CDF for one or more values."},
+    %{name: "tdigest.rank", arity: -3, flags: ["readonly"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns the estimated rank of one or more values."},
+    %{name: "tdigest.revrank", arity: -3, flags: ["readonly"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns the estimated reverse rank of one or more values."},
+    %{name: "tdigest.byrank", arity: -3, flags: ["readonly"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns the estimated value at one or more rank positions."},
+    %{name: "tdigest.byrevrank", arity: -3, flags: ["readonly"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns the estimated value at one or more reverse-rank positions."},
+    %{name: "tdigest.trimmed_mean", arity: 4, flags: ["readonly"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns the mean of observations between two quantile boundaries."},
+    %{name: "tdigest.min", arity: 2, flags: ["readonly", "fast"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns the minimum observed value."},
+    %{name: "tdigest.max", arity: 2, flags: ["readonly", "fast"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns the maximum observed value."},
+    %{name: "tdigest.info", arity: 2, flags: ["readonly", "fast"], first_key: 1, last_key: 1, step: 1,
+      summary: "Returns metadata about a t-digest sketch."},
+    %{name: "tdigest.merge", arity: -4, flags: ["write", "denyoom"], first_key: 1, last_key: 1, step: 1,
+      summary: "Merges one or more source t-digests into a destination."}
   ]
 
   @commands_by_name Map.new(@commands, fn cmd -> {cmd.name, cmd} end)

@@ -22,8 +22,11 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   alias Ferricstore.Commands.{Bitmap, Bloom, Client, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Namespace, Native, PubSub, Server, Set, SortedSet, Stream, Strings, Vector}
   alias Ferricstore.Commands.CMS
+  alias Ferricstore.Commands.TDigest
   alias Ferricstore.Commands.TopK
 
+  # Build a compile-time Map from command name -> handler tag for O(1) dispatch.
+  # Each tag corresponds to a handler module and any special pre-processing.
   @string_cmds ~w(GET SET DEL EXISTS MGET MSET INCR DECR INCRBY DECRBY INCRBYFLOAT APPEND STRLEN GETSET GETDEL GETEX SETNX SETEX PSETEX GETRANGE SETRANGE MSETNX)
   @expiry_cmds ~w(EXPIRE EXPIREAT PEXPIRE PEXPIREAT TTL PTTL PERSIST)
   @generic_cmds ~w(TYPE UNLINK RENAME RENAMENX COPY RANDOMKEY SCAN EXPIRETIME PEXPIRETIME OBJECT WAIT)
@@ -41,9 +44,47 @@ defmodule Ferricstore.Commands.Dispatcher do
   @cuckoo_cmds ~w(CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO)
   @cms_cmds ~w(CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO)
   @topk_cmds ~w(TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.INFO)
+  @tdigest_cmds ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.MERGE)
   @vector_cmds ~w(VCREATE VADD VGET VDEL VSEARCH VINFO VLIST VEVICT)
   @pubsub_cmds ~w(PUBLISH PUBSUB)
   @server_cmds ~w(PING ECHO DBSIZE KEYS FLUSHDB FLUSHALL INFO COMMAND SELECT LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF)
+
+  # Compile-time dispatch map: command name -> handler tag (O(1) lookup)
+  @cmd_dispatch_map (
+    pairs =
+      Enum.map(@string_cmds, &{&1, :strings}) ++
+      Enum.map(@expiry_cmds, &{&1, :expiry}) ++
+      Enum.map(@generic_cmds, &{&1, :generic}) ++
+      Enum.map(@bitmap_cmds, &{&1, :bitmap}) ++
+      Enum.map(@hll_cmds, &{&1, :hll}) ++
+      Enum.map(@hash_cmds, &{&1, :hash}) ++
+      Enum.map(@list_cmds, &{&1, :list}) ++
+      Enum.map(@set_cmds, &{&1, :set}) ++
+      Enum.map(@zset_cmds, &{&1, :zset}) ++
+      Enum.map(@geo_cmds, &{&1, :geo}) ++
+      Enum.map(@stream_cmds, &{&1, :stream}) ++
+      Enum.map(@json_cmds, &{&1, :json}) ++
+      Enum.map(@native_cmds, &{&1, :native}) ++
+      Enum.map(@bloom_cmds, &{&1, :bloom}) ++
+      Enum.map(@cuckoo_cmds, &{&1, :cuckoo}) ++
+      Enum.map(@cms_cmds, &{&1, :cms}) ++
+      Enum.map(@topk_cmds, &{&1, :topk}) ++
+      Enum.map(@tdigest_cmds, &{&1, :tdigest}) ++
+      Enum.map(@vector_cmds, &{&1, :vector}) ++
+      Enum.map(@pubsub_cmds, &{&1, :pubsub}) ++
+      Enum.map(@server_cmds, &{&1, :server}) ++
+      [
+        {"RATELIMIT.ADD", :ratelimit},
+        {"CLUSTER.HEALTH", :cluster},
+        {"CLUSTER.STATS", :cluster},
+        {"FERRICSTORE.HOTNESS", :cluster},
+        {"FERRICSTORE.CONFIG", :ferricstore_config},
+        {"FERRICSTORE.METRICS", :ferricstore_metrics},
+        {"FERRICSTORE.KEY_INFO", :ferricstore_key_info},
+        {"MEMORY", :memory}
+      ]
+    Map.new(pairs)
+  )
 
   @doc """
   Dispatches a Redis command to the appropriate handler module.
@@ -73,40 +114,39 @@ defmodule Ferricstore.Commands.Dispatcher do
     start = System.monotonic_time(:microsecond)
 
     result =
-      cond do
-        cmd in @string_cmds -> Strings.handle(cmd, args, store)
-        cmd in @expiry_cmds -> Expiry.handle(cmd, args, store)
-        cmd in @generic_cmds -> Generic.handle(cmd, upcase_subcommand(cmd, args), store)
-        cmd in @bitmap_cmds -> Bitmap.handle(cmd, args, store)
-        cmd in @hll_cmds -> HyperLogLog.handle(cmd, args, store)
-        cmd in @hash_cmds -> Hash.handle(cmd, args, store)
-        cmd in @list_cmds -> List.handle(cmd, args, store)
-        cmd in @set_cmds -> Set.handle(cmd, args, store)
-        cmd in @zset_cmds -> SortedSet.handle(cmd, args, store)
-        cmd in @geo_cmds -> Geo.handle(cmd, args, store)
-        cmd in @stream_cmds -> Stream.handle(cmd, args, store)
-        cmd in @json_cmds -> Json.handle(cmd, args, store)
-        cmd in @bloom_cmds -> Bloom.handle(cmd, args, store)
-        cmd in @cuckoo_cmds -> Cuckoo.handle(cmd, args, store)
-        cmd in @cms_cmds -> CMS.handle(cmd, args, store)
-        cmd in @topk_cmds -> TopK.handle(cmd, args, store)
-        cmd in @native_cmds -> Native.handle(cmd, args, store)
-        cmd in @vector_cmds -> Vector.handle(cmd, args, store)
-        cmd == "RATELIMIT.ADD" -> Native.handle("RATELIMIT.ADD", args, store)
-        cmd == "CLUSTER.HEALTH" -> Cluster.handle(cmd, args, store)
-        cmd == "CLUSTER.STATS" -> Cluster.handle(cmd, args, store)
-        cmd == "FERRICSTORE.HOTNESS" -> Cluster.handle(cmd, args, store)
-        cmd == "FERRICSTORE.CONFIG" -> Namespace.handle(cmd, upcase_subcommand_ferricstore(args), store)
-        cmd == "FERRICSTORE.METRICS" -> Ferricstore.Metrics.handle(cmd, args)
-        cmd == "FERRICSTORE.KEY_INFO" -> Native.handle("KEY_INFO", args, store)
-        cmd in @pubsub_cmds -> PubSub.handle(cmd, args)
-        cmd == "MEMORY" ->
+      case Map.get(@cmd_dispatch_map, cmd) do
+        :strings -> Strings.handle(cmd, args, store)
+        :expiry -> Expiry.handle(cmd, args, store)
+        :generic -> Generic.handle(cmd, upcase_subcommand(cmd, args), store)
+        :bitmap -> Bitmap.handle(cmd, args, store)
+        :hll -> HyperLogLog.handle(cmd, args, store)
+        :hash -> Hash.handle(cmd, args, store)
+        :list -> List.handle(cmd, args, store)
+        :set -> Set.handle(cmd, args, store)
+        :zset -> SortedSet.handle(cmd, args, store)
+        :geo -> Geo.handle(cmd, args, store)
+        :stream -> Stream.handle(cmd, args, store)
+        :json -> Json.handle(cmd, args, store)
+        :native -> Native.handle(cmd, args, store)
+        :bloom -> Bloom.handle(cmd, args, store)
+        :cuckoo -> Cuckoo.handle(cmd, args, store)
+        :cms -> CMS.handle(cmd, args, store)
+        :topk -> TopK.handle(cmd, args, store)
+        :tdigest -> TDigest.handle(cmd, args, store)
+        :vector -> Vector.handle(cmd, args, store)
+        :pubsub -> PubSub.handle(cmd, args)
+        :server -> Server.handle(cmd, upcase_subcommand(cmd, args), store)
+        :ratelimit -> Native.handle("RATELIMIT.ADD", args, store)
+        :cluster -> Cluster.handle(cmd, args, store)
+        :ferricstore_config -> Namespace.handle(cmd, upcase_subcommand_ferricstore(args), store)
+        :ferricstore_metrics -> Ferricstore.Metrics.handle(cmd, args)
+        :ferricstore_key_info -> Native.handle("KEY_INFO", args, store)
+        :memory ->
           case args do
             [subcmd | rest] -> Memory.handle(String.upcase(subcmd), rest, store)
             [] -> {:error, "ERR wrong number of arguments for 'memory' command"}
           end
-        cmd in @server_cmds -> Server.handle(cmd, upcase_subcommand(cmd, args), store)
-        true -> {:error, "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "}
+        nil -> {:error, "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "}
       end
 
     duration = System.monotonic_time(:microsecond) - start
