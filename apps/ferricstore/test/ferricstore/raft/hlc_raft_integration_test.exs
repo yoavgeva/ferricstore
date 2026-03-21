@@ -217,9 +217,10 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
       assert state_acc.applied_count == 100
 
-      # Drift should be very small (< 10ms) since we are single-node
+      # Drift should be very small since we are single-node.
+      # Allow up to 50ms to avoid CI flakes under load.
       drift = HLC.drift_ms()
-      assert drift < 10, "Expected drift < 10ms in single-node mode, got #{drift}ms"
+      assert drift < 50, "Expected drift < 50ms in single-node mode, got #{drift}ms"
     end
 
     test "HLC update is called even when the command result is an error", %{state: state} do

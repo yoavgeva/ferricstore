@@ -89,13 +89,10 @@ defmodule Ferricstore.Raft.Cluster do
   def start_shard_server(shard_index, store, ets) do
     server_id = shard_server_id(shard_index)
 
-    hot_cache = :"hot_cache_#{shard_index}"
-
     machine_config = %{
       shard_index: shard_index,
       store: store,
-      ets: ets,
-      hot_cache: hot_cache
+      ets: ets
     }
 
     server_config = %{

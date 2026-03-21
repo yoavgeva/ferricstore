@@ -71,7 +71,6 @@ defmodule FerricstoreServer.StartupTest do
 
       # Clear the ETS cache entry to force a Bitcask read.
       :ets.delete(:"keydir_#{shard_idx}", key)
-      :ets.delete(:"hot_cache_#{shard_idx}", key)
 
       # The get must warm from Bitcask -- keydir must be valid.
       assert "persisted_value" == Router.get(key)

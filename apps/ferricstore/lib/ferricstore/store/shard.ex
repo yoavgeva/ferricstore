@@ -70,7 +70,6 @@ defmodule Ferricstore.Store.Shard do
     :store,
     :ets,
     :keydir,
-    :hot_cache,
     :prefix_keys,
     :index,
     :data_dir,
@@ -129,18 +128,11 @@ defmodule Ferricstore.Store.Shard do
           :"keydir_#{index}"
       end
 
-    # Create (or recreate) the hot_cache table for this shard.
-    # The hot_cache stores {key, value, access_ms} 3-tuples and is used by
-    # the Raft state machine, Router, and MemoryGuard for LRU eviction.
-    hot_cache =
-      case :ets.whereis(:"hot_cache_#{index}") do
-        :undefined ->
-          :ets.new(:"hot_cache_#{index}", [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
-
-        _ref ->
-          :ets.delete_all_objects(:"hot_cache_#{index}")
-          :"hot_cache_#{index}"
-      end
+    # Remove any leftover hot_cache table from a previous run.
+    case :ets.whereis(:"hot_cache_#{index}") do
+      :undefined -> :ok
+      _ref -> :ets.delete(:"hot_cache_#{index}")
+    end
 
     ets = keydir
 
@@ -201,7 +193,6 @@ defmodule Ferricstore.Store.Shard do
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
     {:ok, %__MODULE__{store: store, ets: keydir, keydir: keydir,
-                       hot_cache: hot_cache,
                        prefix_keys: prefix_keys, index: index, data_dir: data_dir,
                        pending: [], flush_in_flight: nil,
                        promoted_instances: promoted},

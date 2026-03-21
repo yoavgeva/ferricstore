@@ -21,6 +21,8 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
 
   use ExUnit.Case, async: false
 
+  @moduletag :legacy_hot_cache
+
   alias Ferricstore.MemoryGuard
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router

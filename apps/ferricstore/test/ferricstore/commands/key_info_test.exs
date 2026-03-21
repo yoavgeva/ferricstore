@@ -165,43 +165,23 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       assert info["hot_cache_status"] == "hot"
     end
 
-    test "shows cold status for key not in hot cache" do
+    test "shows cold status for key not in ETS cache" do
       key = ukey("ki_cold")
-      # Put value directly -- it goes into keydir + hot_cache via Shard GenServer.
+      # Put value directly -- it goes into keydir via Shard GenServer.
       Router.put(key, "value", 0)
 
-      # Evict from hot_cache to simulate a cold key.
+      # Evict the value from keydir to simulate a cold key (value = nil).
+      # In the single-table format, a cold key has {key, nil, expire, lfu}.
       idx = Router.shard_for(key)
-      hot_cache = :"hot_cache_#{idx}"
-      :ets.delete(hot_cache, key)
-
-      # KEY_INFO checks ETS directly first. Since we deleted from hot_cache,
-      # the key is only in keydir (with expiry metadata). The fallback to
-      # get_meta will re-warm it, but we re-check hot_cache status AFTER
-      # that. We need to also clear it from keydir so the ETS path sees :miss,
-      # then the GenServer get_meta warms it but we check before that.
-      # Actually, the simplest approach: delete from both keydir and hot_cache,
-      # so the key is entirely cold (only in Bitcask).
       keydir = :"keydir_#{idx}"
       :ets.delete(keydir, key)
-      :ets.delete(hot_cache, key)
 
       # Now the key is truly cold -- only on disk.
       # However, get_meta in do_key_info will warm it back.
-      # The final hot_cache check happens AFTER get_meta, so the key
-      # might be re-warmed. But get_meta only warms through GenServer
-      # which puts the value in hot_cache. So after get_meta, it IS hot.
-      #
-      # To truly test "cold", we need a key that exists but whose value
-      # is not in hot_cache at the time of the final check. Since
-      # do_key_info calls get_meta which warms it, this is tricky.
-      # Let's verify the key is reported as "hot" after the warming
-      # that happens inside do_key_info -- this is actually correct
-      # behavior since get_meta warms the cache.
+      # KEY_INFO causes a warm-up as a side effect, so the final status is "hot".
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)
       # After get_meta warms the key, the final check sees it as hot.
-      # This is expected behavior -- KEY_INFO causes a warm-up as a side effect.
       assert info["hot_cache_status"] == "hot"
       assert info["type"] == "string"
     end

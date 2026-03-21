@@ -17,7 +17,11 @@
 # :bloom_nif_mmap — tests for the NIF-backed mmap Bloom filter persistence
 #   feature which is not yet integrated into the pure-Elixir Bloom module.
 #   Run with `mix test --include bloom_nif_mmap`.
-ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen, :bloom_nif_mmap])
+# :legacy_hot_cache — tests that verify the old two-table (keydir + hot_cache)
+#   eviction model. The codebase migrated to a single-table LFU format.
+#   The replacement suite is spec/single_table_lfu_test.exs.
+#   Run with `mix test --include legacy_hot_cache`.
+ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen, :bloom_nif_mmap, :legacy_hot_cache])
 
 # Clean up the test data directory after the suite finishes.
 # Each run uses a unique dir (ferricstore_test_<pid>) so parallel runs don't
