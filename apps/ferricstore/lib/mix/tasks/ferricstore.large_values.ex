@@ -88,18 +88,18 @@ defmodule Mix.Tasks.Ferricstore.LargeValues do
     end
   end
 
-  # Scans all shard ETS hot_cache tables for values exceeding the threshold.
+  # Scans all shard keydir ETS tables for values exceeding the threshold.
   # Returns a list of `{key, byte_size, shard_index}` tuples sorted by size
   # descending.
   @spec scan_large_entries(non_neg_integer(), non_neg_integer()) ::
           [{binary(), non_neg_integer(), non_neg_integer()}]
   defp scan_large_entries(shard_count, threshold) do
     Enum.flat_map(0..(shard_count - 1), fn i ->
-      hot_cache = :"hot_cache_#{i}"
+      keydir = :"keydir_#{i}"
 
       try do
         :ets.foldl(
-          fn {key, value, _access_ms}, acc ->
+          fn {key, value, _exp, _lfu}, acc when is_binary(value) ->
             size = byte_size(value)
 
             if size > threshold do
@@ -107,9 +107,13 @@ defmodule Mix.Tasks.Ferricstore.LargeValues do
             else
               acc
             end
+
+            {_key, nil, _exp, _lfu}, acc ->
+              # Cold key (value evicted) -- skip
+              acc
           end,
           [],
-          hot_cache
+          keydir
         )
       rescue
         ArgumentError -> []

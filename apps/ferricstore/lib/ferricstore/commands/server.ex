@@ -710,10 +710,10 @@ defmodule Ferricstore.Commands.Server do
       Enum.reduce(0..(shard_count - 1), %{}, fn i, acc ->
         table = :"keydir_#{i}"
         try do
-          :ets.foldl(fn {key, _exp}, inner_acc ->
+          :ets.foldl(fn {key, _value, _exp, _lfu}, inner_acc ->
             prefix = Ferricstore.Stats.extract_prefix(key)
-            # Estimate per-key bytes: key binary + expire_at + ETS tuple overhead
-            key_bytes = byte_size(key) + 8 + 64
+            # Estimate per-key bytes: key binary + value + expire_at + LFU + ETS tuple overhead
+            key_bytes = byte_size(key) + 8 + 8 + 64
 
             current = Map.get(inner_acc, prefix, {0, 0})
             {count, bytes} = current

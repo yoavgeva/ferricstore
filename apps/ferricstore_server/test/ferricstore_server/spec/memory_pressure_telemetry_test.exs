@@ -440,8 +440,7 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
   defp measure_total_ets_bytes do
     Enum.reduce(0..3, 0, fn i, acc ->
       keydir_bytes = safe_ets_memory(:"keydir_#{i}")
-      hot_cache_bytes = safe_ets_memory(:"hot_cache_#{i}")
-      acc + keydir_bytes + hot_cache_bytes
+      acc + keydir_bytes
     end)
   end
 

@@ -697,7 +697,7 @@ defmodule Ferricstore.Store.Shard do
         # Not promoted -- route deletes through Raft
         keys_to_delete =
           :ets.foldl(
-            fn {key, _exp}, acc ->
+            fn {key, _value, _exp, _lfu}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) do
                 [key | acc]
               else
@@ -722,7 +722,7 @@ defmodule Ferricstore.Store.Shard do
         # Delete compound keys from ETS
         keys_to_delete =
           :ets.foldl(
-            fn {key, _exp}, acc ->
+            fn {key, _value, _exp, _lfu}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) do
                 [key | acc]
               else
@@ -756,7 +756,7 @@ defmodule Ferricstore.Store.Shard do
         # Not promoted -- delete from ETS (same as {:delete_prefix, prefix})
         keys_to_delete =
           :ets.foldl(
-            fn {key, _exp}, acc ->
+            fn {key, _value, _exp, _lfu}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) do
                 [key | acc]
               else
@@ -777,7 +777,7 @@ defmodule Ferricstore.Store.Shard do
         # Delete compound keys from ETS
         keys_to_delete =
           :ets.foldl(
-            fn {key, _exp}, acc ->
+            fn {key, _value, _exp, _lfu}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) do
                 [key | acc]
               else
@@ -1941,7 +1941,7 @@ defmodule Ferricstore.Store.Shard do
         if Router.shard_for(redis_key) == my_idx do
           keys_to_delete =
             :ets.foldl(
-              fn {key, _exp}, acc ->
+              fn {key, _value, _exp, _lfu}, acc ->
                 if is_binary(key) and String.starts_with?(key, prefix) do
                   [key | acc]
                 else
