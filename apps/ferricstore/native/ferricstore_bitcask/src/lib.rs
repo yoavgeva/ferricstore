@@ -1765,4 +1765,381 @@ fn run_compaction_async<'a>(
     Ok((atoms::pending(), atoms::ok()).encode(env))
 }
 
+// ---------------------------------------------------------------------------
+// v2 Pure stateless NIF functions — no Store, no Mutex, no keydir in Rust.
+// These are the building blocks for the Elixir-owned ETS keydir architecture.
+// ---------------------------------------------------------------------------
+
+/// Append a record to a data file. Returns `{:ok, {offset, record_size}}`.
+///
+/// Pure I/O — no keydir, no Mutex for reads.
+/// The caller (Elixir Shard GenServer) serialises writes.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_append_record<'a>(
+    env: Env<'a>,
+    path: String,
+    key: Binary,
+    value: Binary,
+    expire_at_ms: u64,
+) -> NifResult<Term<'a>> {
+    use crate::log::validate_kv_sizes;
+
+    if let Err(msg) = validate_kv_sizes(key.as_slice(), value.as_slice()) {
+        return Ok((atoms::error(), msg).encode(env));
+    }
+
+    let p = std::path::Path::new(&path);
+
+    // Parse file_id from the filename (e.g. "00000000000000000001.log" -> 1)
+    let file_id = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.trim_start_matches('0').parse::<u64>().ok())
+        .unwrap_or(0);
+
+    match log::LogWriter::open(p, file_id) {
+        Ok(mut writer) => {
+            let offset = writer
+                .write(key.as_slice(), value.as_slice(), expire_at_ms)
+                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+            writer
+                .sync()
+                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+            let record_size =
+                (log::HEADER_SIZE + key.as_slice().len() + value.as_slice().len()) as u64;
+            Ok((atoms::ok(), (offset, record_size)).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Append a tombstone record (logical delete) to a data file.
+/// Returns `{:ok, {offset, record_size}}`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_append_tombstone<'a>(env: Env<'a>, path: String, key: Binary) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+    let file_id = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.trim_start_matches('0').parse::<u64>().ok())
+        .unwrap_or(0);
+
+    match log::LogWriter::open(p, file_id) {
+        Ok(mut writer) => {
+            let offset = writer
+                .write_tombstone(key.as_slice())
+                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+            writer
+                .sync()
+                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+            let record_size = (log::HEADER_SIZE + key.as_slice().len()) as u64;
+            Ok((atoms::ok(), (offset, record_size)).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Append a batch of records with a single fsync. Returns
+/// `{:ok, [{offset, value_size}, ...]}`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_append_batch<'a>(
+    env: Env<'a>,
+    path: String,
+    records: Vec<(Binary<'a>, Binary<'a>, u64)>,
+) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+    let file_id = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.trim_start_matches('0').parse::<u64>().ok())
+        .unwrap_or(0);
+
+    match log::LogWriter::open(p, file_id) {
+        Ok(mut writer) => {
+            let entries: Vec<(&[u8], &[u8], u64)> = records
+                .iter()
+                .map(|(k, v, exp)| (k.as_slice(), v.as_slice(), *exp))
+                .collect();
+
+            match writer.write_batch(&entries) {
+                Ok(results) => {
+                    let tuples: Vec<(u64, usize)> = results;
+                    Ok((atoms::ok(), tuples).encode(env))
+                }
+                Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+            }
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Read the value at a specific offset in a data file. Validates CRC.
+/// Returns `{:ok, value_binary}` or `{:error, reason}`.
+///
+/// This is the cold-read path: ETS has the key's file_id, offset, value_size
+/// but not the value bytes. We pread from disk and return the value.
+///
+/// No Mutex needed — pread is stateless and thread-safe.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_pread_at<'a>(env: Env<'a>, path: String, offset: u64) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+
+    match log::LogReader::open(p) {
+        Ok(mut reader) => match reader.read_at(offset) {
+            Ok(Some(record)) => match record.value {
+                Some(value) => {
+                    // Zero-copy: wrap the value in a ResourceArc
+                    let resource = ResourceArc::new(ValueBuffer { data: value });
+                    let binary = resource.make_binary(env, |vb| &vb.data);
+                    Ok((atoms::ok(), binary).encode(env))
+                }
+                None => {
+                    // Tombstone at this offset
+                    Ok((atoms::ok(), atoms::nil()).encode(env))
+                }
+            },
+            Ok(None) => Ok((atoms::error(), "offset past EOF").encode(env)),
+            Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+        },
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Scan all records in a data file. Returns a list of record metadata.
+/// `{:ok, [{key, offset, value_size, expire_at_ms, is_tombstone}, ...]}`.
+///
+/// Used by compaction and crash recovery to rebuild the ETS keydir.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_scan_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+
+    match log::LogReader::open(p) {
+        Ok(mut reader) => {
+            let records = reader
+                .iter_from_start_tolerant()
+                .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+
+            let mut results: Vec<Term<'a>> = Vec::with_capacity(records.len());
+            let mut offset: u64 = 0;
+
+            for record in &records {
+                let key_bin = {
+                    let mut ob = OwnedBinary::new(record.key.len()).unwrap();
+                    ob.as_mut_slice().copy_from_slice(&record.key);
+                    ob.release(env)
+                };
+
+                let value_size = record.value.as_ref().map_or(0u32, |v| v.len() as u32);
+                let is_tombstone = record.value.is_none();
+
+                let tuple = (
+                    key_bin,
+                    offset,
+                    value_size,
+                    record.expire_at_ms,
+                    is_tombstone,
+                )
+                    .encode(env);
+
+                results.push(tuple);
+
+                // Advance offset past this record
+                offset += (log::HEADER_SIZE
+                    + record.key.len()
+                    + record.value.as_ref().map_or(0, Vec::len)) as u64;
+            }
+
+            Ok((atoms::ok(), results).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Batch pread: read values at multiple offsets from the same file.
+/// Returns `{:ok, [value_binary | nil, ...]}`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_pread_batch<'a>(
+    env: Env<'a>,
+    path: String,
+    locations: Vec<u64>,
+) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+
+    match log::LogReader::open(p) {
+        Ok(mut reader) => {
+            let mut results: Vec<Term<'a>> = Vec::with_capacity(locations.len());
+
+            for &offset in &locations {
+                match reader.read_at(offset) {
+                    Ok(Some(record)) => match record.value {
+                        Some(value) => {
+                            let resource = ResourceArc::new(ValueBuffer { data: value });
+                            let binary = resource.make_binary(env, |vb| &vb.data);
+                            results.push(binary.encode(env));
+                        }
+                        None => results.push(atoms::nil().encode(env)),
+                    },
+                    _ => results.push(atoms::nil().encode(env)),
+                }
+            }
+
+            Ok((atoms::ok(), results).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Fsync a data file. Returns `:ok` or `{:error, reason}`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_fsync<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+    match std::fs::File::open(p) {
+        Ok(f) => match f.sync_all() {
+            Ok(()) => Ok(atoms::ok().encode(env)),
+            Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+        },
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Write a hint file from a list of entries.
+/// Each entry is `{key, file_id, offset, value_size, expire_at_ms}`.
+/// Returns `:ok` or `{:error, reason}`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_write_hint_file<'a>(
+    env: Env<'a>,
+    path: String,
+    entries: Vec<(Binary<'a>, u64, u64, u32, u64)>,
+) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+
+    match hint::HintWriter::open(p) {
+        Ok(mut writer) => {
+            for (key, file_id, offset, value_size, expire_at_ms) in &entries {
+                let entry = hint::HintEntry {
+                    file_id: *file_id,
+                    offset: *offset,
+                    value_size: *value_size,
+                    expire_at_ms: *expire_at_ms,
+                    key: key.as_slice().to_vec(),
+                };
+                if let Err(e) = writer.write_entry(&entry) {
+                    return Ok((atoms::error(), e.to_string()).encode(env));
+                }
+            }
+            match writer.commit() {
+                Ok(()) => Ok(atoms::ok().encode(env)),
+                Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+            }
+        }
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Read a hint file and return all entries.
+/// Returns `{:ok, [{key, file_id, offset, value_size, expire_at_ms}, ...]}`.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_read_hint_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+    let p = std::path::Path::new(&path);
+
+    match hint::HintReader::open(p) {
+        Ok(mut reader) => match reader.read_all() {
+            Ok(entries) => {
+                let mut results: Vec<Term<'a>> = Vec::with_capacity(entries.len());
+                for entry in &entries {
+                    let key_bin = {
+                        let mut ob = OwnedBinary::new(entry.key.len()).unwrap();
+                        ob.as_mut_slice().copy_from_slice(&entry.key);
+                        ob.release(env)
+                    };
+                    let tuple = (
+                        key_bin,
+                        entry.file_id,
+                        entry.offset,
+                        entry.value_size,
+                        entry.expire_at_ms,
+                    )
+                        .encode(env);
+                    results.push(tuple);
+                }
+                Ok((atoms::ok(), results).encode(env))
+            }
+            Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+        },
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Copy specified records from a source file to a destination file.
+/// Returns `{:ok, [{new_offset, new_size}, ...]}`.
+///
+/// Used by compaction to copy only live records to a new file.
+#[rustler::nif(schedule = "DirtyIo")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_copy_records<'a>(
+    env: Env<'a>,
+    source_path: String,
+    dest_path: String,
+    offsets: Vec<u64>,
+) -> NifResult<Term<'a>> {
+    let src = std::path::Path::new(&source_path);
+    let dst = std::path::Path::new(&dest_path);
+
+    let dest_file_id = dst
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.trim_start_matches('0').parse::<u64>().ok())
+        .unwrap_or(0);
+
+    match log::LogReader::open(src) {
+        Ok(mut reader) => match log::LogWriter::open(dst, dest_file_id) {
+            Ok(mut writer) => {
+                let mut results: Vec<(u64, u64)> = Vec::with_capacity(offsets.len());
+
+                for &offset in &offsets {
+                    match reader.read_at(offset) {
+                        Ok(Some(record)) => {
+                            if let Some(ref value) = record.value {
+                                let new_offset = writer
+                                    .write(&record.key, value, record.expire_at_ms)
+                                    .map_err(|e| {
+                                        rustler::Error::Term(Box::new(e.to_string()))
+                                    })?;
+                                let new_size = (log::HEADER_SIZE
+                                    + record.key.len()
+                                    + value.len())
+                                    as u64;
+                                results.push((new_offset, new_size));
+                            }
+                            // Skip tombstones silently
+                        }
+                        Ok(None) => {
+                            // Offset past EOF — skip
+                        }
+                        Err(e) => {
+                            return Ok((atoms::error(), e.to_string()).encode(env));
+                        }
+                    }
+                }
+
+                writer
+                    .sync()
+                    .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+                Ok((atoms::ok(), results).encode(env))
+            }
+            Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+        },
+        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
 rustler::init!("Elixir.Ferricstore.Bitcask.NIF", load = load);

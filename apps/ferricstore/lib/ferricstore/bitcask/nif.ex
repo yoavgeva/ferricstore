@@ -97,4 +97,16 @@ defmodule Ferricstore.Bitcask.NIF do
 
   # -- Tracking allocator --
   def rust_allocated_bytes, do: :erlang.nif_error(:nif_not_loaded)
+
+  # -- v2 Pure stateless NIFs (no Store resource, no Mutex) --
+  def v2_append_record(_path, _key, _value, _expire_at_ms), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_append_tombstone(_path, _key), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_append_batch(_path, _records), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_pread_at(_path, _offset), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_scan_file(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_pread_batch(_path, _locations), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_fsync(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_write_hint_file(_path, _entries), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_read_hint_file(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_copy_records(_source_path, _dest_path, _offsets), do: :erlang.nif_error(:nif_not_loaded)
 end
