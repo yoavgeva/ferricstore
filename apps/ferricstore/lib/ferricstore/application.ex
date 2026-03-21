@@ -215,7 +215,7 @@ defmodule Ferricstore.Application do
 
       try do
         :ets.foldl(
-          fn {key, value}, {c, lk, ls} ->
+          fn {key, value, _access_ms}, {c, lk, ls} ->
             size = byte_size(value)
 
             if size > threshold do

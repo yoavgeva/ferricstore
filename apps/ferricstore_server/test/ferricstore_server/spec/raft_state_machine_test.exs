@@ -75,7 +75,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
       # Verify the hot_cache ETS table has the key with the correct value
       hot_cache = :"hot_cache_#{shard_index}"
-      assert [{^key, "cached_value"}] = :ets.lookup(hot_cache, key)
+      assert [{^key, "cached_value", _}] = :ets.lookup(hot_cache, key)
     end
 
     test "SET with expiry populates hot_cache and keydir with correct expire_at_ms" do
@@ -89,7 +89,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       assert [{^key, ^future}] = :ets.lookup(keydir, key)
 
       hot_cache = :"hot_cache_#{shard_index}"
-      assert [{^key, "ttl_value"}] = :ets.lookup(hot_cache, key)
+      assert [{^key, "ttl_value", _}] = :ets.lookup(hot_cache, key)
     end
 
     test "overwrite updates ETS hot cache to new value" do
@@ -100,7 +100,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       :ok = Batcher.write(shard_index, {:put, key, "new_value", 0})
 
       hot_cache = :"hot_cache_#{shard_index}"
-      assert [{^key, "new_value"}] = :ets.lookup(hot_cache, key)
+      assert [{^key, "new_value", _}] = :ets.lookup(hot_cache, key)
     end
 
     test "GET reads from ETS hot cache without GenServer call (hot path)" do

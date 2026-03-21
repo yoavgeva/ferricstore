@@ -308,7 +308,9 @@ defmodule Ferricstore.Store.ConcurrencyTest do
       assert length(entries) == 30
 
       for i <- 0..29 do
-        assert [{"ets_key_#{i}", "ets_val_#{i}"}] == :ets.lookup(ets, "ets_key_#{i}")
+        [{k, v, _access_ms}] = :ets.lookup(ets, "ets_key_#{i}")
+        assert k == "ets_key_#{i}"
+        assert v == "ets_val_#{i}"
       end
     end
 

@@ -299,7 +299,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   def apply(meta, {:ratelimit_add, key, window_ms, max, count}, state) do
-    result = do_ratelimit_add(state, key, window_ms, max, count)
+    result = do_ratelimit_add(state, key, window_ms, max, count, nil)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # 6-tuple variant: shard pre-computes now_ms for deterministic replay.
+  def apply(meta, {:ratelimit_add, key, window_ms, max, count, now_ms}, state) do
+    result = do_ratelimit_add(state, key, window_ms, max, count, now_ms)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -523,7 +531,11 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp apply_single(state, {:ratelimit_add, key, window_ms, max, count}) do
-    do_ratelimit_add(state, key, window_ms, max, count)
+    do_ratelimit_add(state, key, window_ms, max, count, nil)
+  end
+
+  defp apply_single(state, {:ratelimit_add, key, window_ms, max, count, now_ms}) do
+    do_ratelimit_add(state, key, window_ms, max, count, now_ms)
   end
 
   defp do_put(state, key, value, expire_at_ms) do
@@ -731,10 +743,13 @@ defmodule Ferricstore.Raft.StateMachine do
   # Returns 1 (swapped), 0 (mismatch), or nil (missing/expired).
   #
   # Replicates the exact shard.ex handle_cas_direct logic.
-  defp do_cas(state, key, expected, new_value, ttl_ms) do
+  # NOTE: The caller (shard.ex) pre-computes expire_at_ms as an absolute
+  # timestamp before entering Raft to keep the state machine deterministic
+  # (no System.os_time calls). So the 5th arg is already absolute, not relative.
+  defp do_cas(state, key, expected, new_value, expire_at_ms) do
     case ets_lookup(state, key) do
       {:hit, ^expected, old_exp} ->
-        expire = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: old_exp
+        expire = if expire_at_ms, do: expire_at_ms, else: old_exp
         do_put(state, key, new_value, expire)
         1
 
@@ -757,13 +772,13 @@ defmodule Ferricstore.Raft.StateMachine do
   # by the same owner, sets {owner, ttl}. Returns :ok or {:error, reason}.
   #
   # Replicates the exact shard.ex handle_lock_direct logic.
-  defp do_lock(state, key, owner, ttl_ms) do
-    expire = System.os_time(:millisecond) + ttl_ms
-
+  # NOTE: The caller (shard.ex) pre-computes expire_at_ms as an absolute
+  # timestamp before entering Raft to keep the state machine deterministic.
+  defp do_lock(state, key, owner, expire_at_ms) do
     case ets_lookup(state, key) do
       {:hit, ^owner, _exp} ->
         # Same owner -- re-acquire (idempotent)
-        do_put(state, key, owner, expire)
+        do_put(state, key, owner, expire_at_ms)
         :ok
 
       {:hit, _other, _exp} ->
@@ -771,7 +786,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
       _ ->
         # Missing or expired -- acquire
-        do_put(state, key, owner, expire)
+        do_put(state, key, owner, expire_at_ms)
         :ok
     end
   end
@@ -799,12 +814,12 @@ defmodule Ferricstore.Raft.StateMachine do
   # the TTL. Returns 1 on success, {:error, reason} on mismatch or missing.
   #
   # Replicates the exact shard.ex handle_extend_direct logic.
-  defp do_extend(state, key, owner, ttl_ms) do
-    new_expire = System.os_time(:millisecond) + ttl_ms
-
+  # NOTE: The caller (shard.ex) pre-computes expire_at_ms as an absolute
+  # timestamp before entering Raft to keep the state machine deterministic.
+  defp do_extend(state, key, owner, expire_at_ms) do
     case ets_lookup(state, key) do
       {:hit, ^owner, _exp} ->
-        do_put(state, key, owner, new_expire)
+        do_put(state, key, owner, expire_at_ms)
         1
 
       {:hit, _other, _exp} ->
@@ -825,8 +840,8 @@ defmodule Ferricstore.Raft.StateMachine do
   # Returns [status, count, remaining, ms_until_reset].
   #
   # Replicates the exact shard.ex handle_ratelimit_add_direct logic.
-  defp do_ratelimit_add(state, key, window_ms, max, count) do
-    now = System.os_time(:millisecond)
+  defp do_ratelimit_add(state, key, window_ms, max, count, precomputed_now_ms) do
+    now = precomputed_now_ms || System.os_time(:millisecond)
 
     {cur_count, cur_start, prv_count} =
       case ets_lookup(state, key) do

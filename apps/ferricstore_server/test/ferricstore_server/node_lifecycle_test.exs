@@ -201,7 +201,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # Verify ETS has the entry.
       ets_name = :hot_cache_2
-      assert [{^key, "ets_test"}] = :ets.lookup(ets_name, key)
+      assert [{^key, "ets_test", _}] = :ets.lookup(ets_name, key)
 
       # Flush and crash shard 2.
       :ok = GenServer.call(Router.shard_name(2), :flush)
@@ -221,7 +221,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       assert "ets_test" == Router.get(key)
 
       # Now it should be back in ETS.
-      assert [{^key, "ets_test"}] = :ets.lookup(ets_name, key)
+      assert [{^key, "ets_test", _}] = :ets.lookup(ets_name, key)
     end
   end
 

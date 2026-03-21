@@ -293,7 +293,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
       :ok = GenServer.call(pid, {:put, "ets_sync", "val", 0})
 
       # ETS must have the value immediately (sync write in put handler)
-      assert [{_, "val"}] = :ets.lookup(ets, "ets_sync")
+      assert [{_, "val", _}] = :ets.lookup(ets, "ets_sync")
     end
 
     test "delete clears ETS entry" do

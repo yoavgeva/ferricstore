@@ -1522,8 +1522,9 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "SET edge cases through Raft" do
     test "SET with EX (TTL) — value expires after TTL elapses" do
       k = ukey("set_ex_expire")
-      # Set a very short TTL so we can observe expiry
-      short_ttl_ms = 50
+      # Set a TTL long enough to survive Raft commit latency but short enough
+      # to test expiry within a reasonable wait.
+      short_ttl_ms = 2_000
       expire_at = System.os_time(:millisecond) + short_ttl_ms
 
       :ok = Router.put(k, "ephemeral", expire_at)
@@ -1531,7 +1532,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert "ephemeral" == Router.get(k)
 
       # Wait for TTL to expire
-      Process.sleep(short_ttl_ms + 20)
+      Process.sleep(short_ttl_ms + 100)
 
       # After expiry, GET should return nil
       assert nil == Router.get(k)

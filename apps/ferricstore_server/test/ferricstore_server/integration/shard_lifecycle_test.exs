@@ -223,7 +223,7 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
 
       # Verify ETS contains the warmed entry
       hot_cache_name = :"hot_cache_#{shard_idx}"
-      assert [{^k, ^v}] = :ets.lookup(hot_cache_name, k)
+      assert [{^k, ^v, _}] = :ets.lookup(hot_cache_name, k)
     end
 
     test "multiple shard restarts don't lose data" do
