@@ -139,12 +139,8 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       assert Router.get("vol_access_ts") == "hello"
       Process.sleep(10)
 
-      # Get initial access time -- after Router.get the entry should be a 3-tuple
-      access_before =
-        case :ets.lookup(hot_cache, "vol_access_ts") do
-          [{_, _, access_ms}] -> access_ms
-          [{_, _}] -> System.os_time(:millisecond)
-        end
+      # Get initial access time -- entry is always a 3-tuple.
+      [{_, _, access_before}] = :ets.lookup(hot_cache, "vol_access_ts")
 
       assert is_integer(access_before) and access_before > 0
 
@@ -153,11 +149,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       # Read the key again to update access time
       assert Router.get("vol_access_ts") == "hello"
 
-      access_after =
-        case :ets.lookup(hot_cache, "vol_access_ts") do
-          [{_, _, access_ms}] -> access_ms
-          [{_, _}] -> System.os_time(:millisecond)
-        end
+      [{_, _, access_after}] = :ets.lookup(hot_cache, "vol_access_ts")
 
       assert access_after >= access_before,
              "Access time should be updated on read: before=#{access_before}, after=#{access_after}"

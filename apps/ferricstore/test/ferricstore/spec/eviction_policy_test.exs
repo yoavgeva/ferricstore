@@ -59,20 +59,10 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       hot_cache = :"hot_cache_#{Router.shard_for("access_test_key")}"
       expected_key = "access_test_key"
 
-      # hot_cache entries may be 3-tuples {key, value, access_ms} (direct shard)
-      # or 2-tuples {key, value} (Raft state machine). Both are valid.
-      case :ets.lookup(hot_cache, expected_key) do
-        [{^expected_key, value, access_ms}] ->
-          assert value == "hello"
-          assert is_integer(access_ms)
-          assert access_ms > 0
-
-        [{^expected_key, value}] ->
-          assert value == "hello"
-
-        other ->
-          flunk("Expected hot_cache entry for key, got: #{inspect(other)}")
-      end
+      # hot_cache entries are always 3-tuples {key, value, access_ms}.
+      assert [{^expected_key, "hello", access_ms}] = :ets.lookup(hot_cache, expected_key)
+      assert is_integer(access_ms)
+      assert access_ms > 0
     end
 
     test "reading a key upgrades hot_cache entry to 3-tuple with access time" do
@@ -84,19 +74,10 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       # Read the key via Router.get -- should upgrade to 3-tuple with access_ms
       assert Router.get("access_read_key") == "world"
 
-      # After a GET, the entry should be a 3-tuple (upgraded by Router.ets_get)
-      case :ets.lookup(hot_cache, "access_read_key") do
-        [{_, _, access_after}] ->
-          assert is_integer(access_after)
-          assert access_after > 0
-
-        [{_, _}] ->
-          # 2-tuple means the Router GET path didn't upgrade -- still valid
-          :ok
-
-        other ->
-          flunk("Unexpected hot_cache format after GET: #{inspect(other)}")
-      end
+      # After a GET, the entry is a 3-tuple with updated access_ms.
+      assert [{_, "world", access_after}] = :ets.lookup(hot_cache, "access_read_key")
+      assert is_integer(access_after)
+      assert access_after > 0
     end
   end
 
