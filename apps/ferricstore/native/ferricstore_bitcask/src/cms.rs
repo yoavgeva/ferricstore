@@ -600,4 +600,121 @@ mod tests {
         data[8..16].copy_from_slice(&0u64.to_le_bytes()); // depth = 0
         assert!(CountMinSketch::from_bytes(&data).is_none());
     }
+
+    // ==================================================================
+    // Deep NIF edge cases — targeting CMS / FFI safety pitfalls
+    // ==================================================================
+
+    #[test]
+    fn incrby_i64_max_no_overflow_panic() {
+        let mut s = CountMinSketch::new(100, 3);
+        // Increment by i64::MAX -- should not panic (Rust wraps on overflow
+        // in release mode, saturates in debug with checked_add)
+        s.increment(b"big", i64::MAX);
+        let est = s.query(b"big");
+        assert_eq!(est, i64::MAX);
+    }
+
+    #[test]
+    fn query_after_massive_incrby() {
+        let mut s = CountMinSketch::new(100, 3);
+        s.increment(b"massive", i64::MAX / 2);
+        s.increment(b"massive", i64::MAX / 2);
+        // This may wrap but must not crash
+        let est = s.query(b"massive");
+        let _ = est; // no crash requirement
+    }
+
+    #[test]
+    fn merge_with_self() {
+        let mut s = CountMinSketch::new(100, 5);
+        s.increment(b"self_merge", 10);
+        let mut dest = CountMinSketch::new(100, 5);
+        dest.merge_weighted(&[(&s, 1), (&s, 1)]);
+        // 10 * 1 + 10 * 1 = 20
+        assert_eq!(dest.query(b"self_merge"), 20);
+    }
+
+    #[test]
+    fn merge_empty_into_full() {
+        let empty = CountMinSketch::new(100, 5);
+        let mut full = CountMinSketch::new(100, 5);
+        full.increment(b"item", 42);
+
+        let mut dest = CountMinSketch::new(100, 5);
+        dest.merge_weighted(&[(&empty, 1), (&full, 1)]);
+        // 0 * 1 + 42 * 1 = 42
+        assert_eq!(dest.query(b"item"), 42);
+    }
+
+    #[test]
+    fn width_1_depth_1_degenerate_sketch() {
+        let mut s = CountMinSketch::new(1, 1);
+        s.increment(b"only", 5);
+        s.increment(b"other", 3);
+        // Everything hashes to the single cell
+        assert_eq!(s.query(b"only"), 8);
+        assert_eq!(s.query(b"other"), 8);
+        assert_eq!(s.query(b"anything"), 8);
+    }
+
+    #[test]
+    fn increment_by_zero_does_not_change_estimate() {
+        let mut s = CountMinSketch::new(100, 5);
+        s.increment(b"key", 10);
+        s.increment(b"key", 0);
+        assert_eq!(s.query(b"key"), 10);
+    }
+
+    #[test]
+    fn empty_key_hashes_deterministically() {
+        let mut s = CountMinSketch::new(100, 5);
+        s.increment(b"", 7);
+        assert_eq!(s.query(b""), 7);
+    }
+
+    #[test]
+    fn serialize_roundtrip_large_sketch() {
+        let mut s = CountMinSketch::new(10_000, 10);
+        for i in 0..1000 {
+            s.increment(format!("key_{i}").as_bytes(), (i + 1) as i64);
+        }
+        let bytes = s.to_bytes();
+        let s2 = CountMinSketch::from_bytes(&bytes).unwrap();
+        assert_eq!(s2.width(), 10_000);
+        assert_eq!(s2.depth(), 10);
+        for i in [0, 100, 500, 999] {
+            let key = format!("key_{i}");
+            assert_eq!(
+                s.query(key.as_bytes()),
+                s2.query(key.as_bytes()),
+                "key_{i} estimate mismatch after serialize/deserialize"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_increment_with_mutex() {
+        use std::sync::{Arc, Mutex};
+        let s = Arc::new(Mutex::new(CountMinSketch::new(1000, 7)));
+
+        let handles: Vec<_> = (0..10)
+            .map(|t| {
+                let s_clone = Arc::clone(&s);
+                std::thread::spawn(move || {
+                    for i in 0..100 {
+                        let mut guard = s_clone.lock().unwrap();
+                        guard.increment(format!("t{t}_k{i}").as_bytes(), 1);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let guard = s.lock().unwrap();
+        assert_eq!(guard.count(), 1000);
+    }
 }

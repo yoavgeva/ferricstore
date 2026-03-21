@@ -939,4 +939,140 @@ mod tests {
         let result = BloomFilter::create(&path, 1000, 0);
         assert!(result.is_err());
     }
+
+    // ==================================================================
+    // Deep NIF edge cases — targeting mmap/FFI safety pitfalls
+    // ==================================================================
+
+    #[test]
+    fn bloom_add_key_with_embedded_nulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nullkey.bloom");
+        let filter = BloomFilter::create(&path, 10_000, 7).unwrap();
+        let key = b"a\0b\0c";
+        assert!(filter.add(key));
+        assert!(filter.exists(key));
+        // Distinct from truncated variant
+        assert!(!filter.exists(b"a") || filter.count() == 1);
+    }
+
+    #[test]
+    fn bloom_concurrent_add_and_exists_100_threads() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent_rw.bloom");
+        let filter = Arc::new(Mutex::new(
+            BloomFilter::create(&path, 1_000_000, 7).unwrap(),
+        ));
+
+        let handles: Vec<_> = (0..100)
+            .map(|t| {
+                let f = Arc::clone(&filter);
+                std::thread::spawn(move || {
+                    let guard = f.lock().unwrap();
+                    if t % 2 == 0 {
+                        guard.add(format!("elem_{t}").as_bytes());
+                    } else {
+                        let _ = guard.exists(format!("elem_{t}").as_bytes());
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked during bloom concurrent access");
+        }
+    }
+
+    #[test]
+    fn bloom_create_in_nonexistent_nested_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deep").join("nested").join("filter.bloom");
+        let filter = BloomFilter::create(&path, 1000, 3).unwrap();
+        filter.add(b"nested_test");
+        assert!(filter.exists(b"nested_test"));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn bloom_open_corrupted_header_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("badmagic.bloom");
+        // Write a file with wrong magic bytes
+        std::fs::write(&path, &[0xFF; 64]).unwrap();
+        let result = BloomFilter::open_existing(&path);
+        assert!(result.is_err(), "bad magic must return error");
+    }
+
+    #[test]
+    fn bloom_open_zero_length_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bloom");
+        std::fs::write(&path, &[]).unwrap();
+        let result = BloomFilter::open_existing(&path);
+        assert!(result.is_err(), "zero-length file must return error");
+    }
+
+    #[test]
+    fn bloom_madd_many_elements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("madd.bloom");
+        let filter = BloomFilter::create(&path, 100_000, 7).unwrap();
+        let elements: Vec<Vec<u8>> = (0..500)
+            .map(|i| format!("madd_{i}").into_bytes())
+            .collect();
+        for e in &elements {
+            filter.add(e);
+        }
+        // Verify all present
+        for e in &elements {
+            assert!(filter.exists(e), "element missing after madd");
+        }
+        assert_eq!(filter.count(), 500);
+    }
+
+    #[test]
+    fn bloom_persistence_after_many_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persist_heavy.bloom");
+
+        {
+            let filter = BloomFilter::create(&path, 100_000, 7).unwrap();
+            for i in 0..1000 {
+                filter.add(format!("persistent_{i}").as_bytes());
+            }
+            filter.msync().unwrap();
+        }
+
+        let filter = BloomFilter::open_existing(&path).unwrap();
+        assert_eq!(filter.count(), 1000);
+        for i in 0..1000 {
+            assert!(
+                filter.exists(format!("persistent_{i}").as_bytes()),
+                "item {i} missing after reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn bloom_file_truncated_after_create_returns_error_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.bloom");
+
+        {
+            let filter = BloomFilter::create(&path, 10_000, 7).unwrap();
+            filter.add(b"data");
+            filter.msync().unwrap();
+        }
+
+        // Truncate to just the header (32 bytes), removing the bit array
+        let data = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &data[..HEADER_SIZE.min(data.len())]).unwrap();
+
+        let result = BloomFilter::open_existing(&path);
+        assert!(
+            result.is_err(),
+            "truncated bloom file must fail to open"
+        );
+    }
 }

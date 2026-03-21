@@ -944,4 +944,172 @@ mod tests {
             assert!(*dist < 1e-6, "expected distance ~0, got {dist}");
         }
     }
+
+    // ==================================================================
+    // Deep NIF edge cases — targeting HNSW/FFI safety pitfalls
+    // ==================================================================
+
+    #[test]
+    fn search_on_index_with_all_deleted_nodes() {
+        let mut index = HnswIndex::new(3, 16, 128, Metric::L2);
+        index.add("a", vec![1.0, 0.0, 0.0]).unwrap();
+        index.add("b", vec![0.0, 1.0, 0.0]).unwrap();
+        index.add("c", vec![0.0, 0.0, 1.0]).unwrap();
+        assert!(index.delete("a"));
+        assert!(index.delete("b"));
+        assert!(index.delete("c"));
+        let results = index.search(&[1.0, 0.0, 0.0], 5, 50);
+        assert!(results.is_empty(), "all-deleted index should return empty");
+    }
+
+    #[test]
+    fn insert_vector_wrong_dimensions_returns_error() {
+        let mut index = HnswIndex::new(4, 16, 128, Metric::L2);
+        // Too few dimensions
+        let result = index.add("short", vec![1.0, 2.0]);
+        assert!(result.is_err());
+        // Too many dimensions
+        let result = index.add("long", vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn insert_vector_with_nan_components() {
+        let mut index = HnswIndex::new(3, 16, 128, Metric::L2);
+        // NaN in vector should not crash -- may insert but search results
+        // will be unpredictable. The key safety property is no panic/UB.
+        let result = index.add("nan_vec", vec![f32::NAN, 1.0, 0.0]);
+        // Should either succeed or return error, but never crash
+        let _ = result;
+        // Search with NaN query should also not crash
+        let results = index.search(&[f32::NAN, 0.0, 0.0], 5, 50);
+        let _ = results; // just verify no panic
+    }
+
+    #[test]
+    fn insert_vector_with_infinity() {
+        let mut index = HnswIndex::new(3, 16, 128, Metric::L2);
+        let result = index.add("inf_vec", vec![f32::INFINITY, 0.0, 0.0]);
+        // Should not crash
+        let _ = result;
+        let results = index.search(&[0.0, 0.0, 0.0], 5, 50);
+        let _ = results; // no crash is the requirement
+    }
+
+    #[test]
+    fn insert_duplicate_key_soft_deletes_old() {
+        let mut index = HnswIndex::new(3, 16, 128, Metric::L2);
+        // Add an anchor node so the graph has structure for the second "dup"
+        // to connect to. Without it, the entry point becomes the soft-deleted
+        // first "dup" and the second node may be unreachable.
+        index.add("anchor", vec![0.5, 0.5, 0.5]).unwrap();
+        index.add("dup", vec![1.0, 0.0, 0.0]).unwrap();
+        index.add("dup", vec![0.0, 0.0, 1.0]).unwrap();
+        // After re-adding "dup", the old node is soft-deleted and the new
+        // one is inserted. count() reflects the live count.
+        assert_eq!(index.count(), 2, "anchor + new dup");
+        let results = index.search(&[0.0, 0.0, 1.0], 5, 50);
+        let has_dup = results.iter().any(|(k, _)| k == "dup");
+        assert!(has_dup, "replaced 'dup' must be searchable");
+    }
+
+    #[test]
+    fn search_with_ef_zero() {
+        let mut index = HnswIndex::new(3, 16, 128, Metric::L2);
+        index.add("a", vec![1.0, 0.0, 0.0]).unwrap();
+        // ef=0 is degenerate but should not crash
+        let results = index.search(&[1.0, 0.0, 0.0], 1, 0);
+        // May return 0 or 1 results depending on implementation
+        let _ = results;
+    }
+
+    #[test]
+    fn search_with_ef_larger_than_index_size() {
+        let mut index = HnswIndex::new(3, 16, 128, Metric::L2);
+        index.add("only", vec![1.0, 0.0, 0.0]).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 1, 10_000);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "only");
+    }
+
+    #[test]
+    fn delete_then_reinsert_same_key() {
+        let mut index = HnswIndex::new(3, 16, 128, Metric::L2);
+        index.add("recycled", vec![1.0, 0.0, 0.0]).unwrap();
+        // Also add a second node so the graph has edges for search traversal
+        index.add("anchor", vec![0.0, 0.0, 1.0]).unwrap();
+        assert!(index.delete("recycled"));
+        assert_eq!(index.count(), 1);
+        // Reinsert with different vector
+        index.add("recycled", vec![0.0, 1.0, 0.0]).unwrap();
+        assert_eq!(index.count(), 2);
+        let results = index.search(&[0.0, 1.0, 0.0], 1, 50);
+        assert_eq!(results[0].0, "recycled");
+    }
+
+    #[test]
+    fn build_index_with_m_zero_handled() {
+        // m=0 means no edges per layer; degenerate but should not crash
+        let mut index = HnswIndex::new(3, 0, 128, Metric::L2);
+        // Add may succeed but search may not find anything useful
+        let _ = index.add("a", vec![1.0, 0.0, 0.0]);
+        let results = index.search(&[1.0, 0.0, 0.0], 1, 50);
+        let _ = results; // no crash is the requirement
+    }
+
+    #[test]
+    fn concurrent_insert_search_100_threads() {
+        use std::sync::{Arc, Mutex};
+        let index = Arc::new(Mutex::new(HnswIndex::new(3, 16, 128, Metric::L2)));
+
+        // Pre-populate
+        {
+            let mut guard = index.lock().unwrap();
+            for i in 0..50 {
+                let v = vec![i as f32, 0.0, 0.0];
+                guard.add(&format!("pre_{i}"), v).unwrap();
+            }
+        }
+
+        let handles: Vec<_> = (0..100)
+            .map(|t| {
+                let idx = Arc::clone(&index);
+                std::thread::spawn(move || {
+                    let mut guard = idx.lock().unwrap();
+                    if t % 2 == 0 {
+                        let v = vec![t as f32, t as f32, 0.0];
+                        let _ = guard.add(&format!("thread_{t}"), v);
+                    } else {
+                        let _ = guard.search(&[t as f32, 0.0, 0.0], 5, 50);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked in HNSW concurrent test");
+        }
+    }
+
+    #[test]
+    fn negative_distance_with_inner_product() {
+        let mut index = HnswIndex::new(3, 16, 128, Metric::InnerProduct);
+        index.add("pos", vec![1.0, 1.0, 1.0]).unwrap();
+        index.add("neg", vec![-1.0, -1.0, -1.0]).unwrap();
+        // Query with positive vector; InnerProduct dist = 1 - dot
+        let results = index.search(&[1.0, 1.0, 1.0], 2, 50);
+        assert_eq!(results.len(), 2);
+        // "pos" should be closest (dist = 1 - 3 = -2)
+        assert_eq!(results[0].0, "pos");
+    }
+
+    #[test]
+    fn very_large_ef_construction_does_not_crash() {
+        // ef_construction = u32::MAX-like value; degenerate but safe
+        let mut index = HnswIndex::new(3, 4, 10_000, Metric::L2);
+        index.add("a", vec![1.0, 0.0, 0.0]).unwrap();
+        index.add("b", vec![0.0, 1.0, 0.0]).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 1, 10_000);
+        assert_eq!(results[0].0, "a");
+    }
 }

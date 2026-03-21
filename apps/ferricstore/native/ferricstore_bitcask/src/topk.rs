@@ -770,4 +770,131 @@ mod tests {
         let result = TopK::from_bytes(truncated);
         assert!(result.is_err());
     }
+
+    // ==================================================================
+    // Deep NIF edge cases — targeting TopK / FFI safety pitfalls
+    // ==================================================================
+
+    #[test]
+    fn add_item_longer_than_64kb() {
+        let mut topk = TopK::new(3, 8, 7, 0.9);
+        let big_item = "x".repeat(65536);
+        topk.add(&big_item, 100);
+        assert!(topk.query(&big_item));
+    }
+
+    #[test]
+    fn all_items_same_frequency_all_in_topk() {
+        let mut topk = TopK::new(5, 100, 7, 0.9);
+        for i in 0..5 {
+            topk.add(&format!("same_freq_{i}"), 10);
+        }
+        let list = topk.list();
+        assert_eq!(list.len(), 5);
+    }
+
+    #[test]
+    fn decay_very_low_does_not_crash() {
+        // decay = 0.0 is degenerate
+        let mut topk = TopK::new(3, 8, 7, 0.0);
+        topk.add("a", 10);
+        topk.add("b", 20);
+        topk.add("c", 30);
+        // Should not crash even with zero decay
+        let list = topk.list();
+        assert!(!list.is_empty());
+    }
+
+    #[test]
+    fn decay_one_point_zero() {
+        // decay = 1.0 means no decay
+        let mut topk = TopK::new(3, 8, 7, 1.0);
+        topk.add("a", 10);
+        topk.add("b", 20);
+        let list = topk.list();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn add_empty_string_item() {
+        let mut topk = TopK::new(3, 8, 7, 0.9);
+        topk.add("", 5);
+        assert!(topk.query(""));
+        let list = topk.list();
+        assert!(list.iter().any(|(e, _)| e.is_empty()));
+    }
+
+    #[test]
+    fn k_equals_1_constant_replacement() {
+        let mut topk = TopK::new(1, 8, 7, 0.9);
+        topk.add("first", 10);
+        assert!(topk.query("first"));
+
+        // Higher count replaces
+        topk.add("second", 100);
+        assert!(topk.query("second"));
+
+        // Lower count does not replace
+        topk.add("third", 1);
+        assert!(!topk.query("third"));
+    }
+
+    #[test]
+    fn serialize_empty_topk_roundtrip() {
+        let topk = TopK::new(5, 8, 7, 0.9);
+        let bytes = topk.to_bytes();
+        let restored = TopK::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.list().len(), 0);
+        assert_eq!(restored.k, 5);
+    }
+
+    #[test]
+    fn incrby_large_count_does_not_overflow() {
+        let mut topk = TopK::new(3, 100, 7, 0.9);
+        topk.add("big", i64::MAX / 2);
+        topk.add("big", i64::MAX / 2);
+        // Must not panic
+        let list = topk.list();
+        assert!(list.iter().any(|(e, _)| e == "big"));
+    }
+
+    #[test]
+    fn many_unique_items_only_top_k_remain() {
+        let mut topk = TopK::new(10, 200, 7, 0.9);
+        for i in 0..1000 {
+            topk.add(&format!("item_{i}"), (i + 1) as i64);
+        }
+        let list = topk.list();
+        assert_eq!(list.len(), 10);
+        // All items in the list should have high counts
+        for (_, count) in &list {
+            assert!(*count > 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_add_with_mutex_no_corruption() {
+        use std::sync::{Arc, Mutex};
+        let topk = Arc::new(Mutex::new(TopK::new(10, 100, 7, 0.9)));
+
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let topk_c = Arc::clone(&topk);
+                std::thread::spawn(move || {
+                    for i in 0..100 {
+                        let mut guard = topk_c.lock().unwrap();
+                        guard.add(&format!("t{t}_i{i}"), 1);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let guard = topk.lock().unwrap();
+        let list = guard.list();
+        assert_eq!(list.len(), 10);
+    }
 }

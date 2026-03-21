@@ -2417,4 +2417,407 @@ mod tests {
             "crc_key3 must be recovered from log replay after CRC-corrupt hint"
         );
     }
+
+    // ==================================================================
+    // Deep NIF edge cases — targeting FFI/NIF boundary pitfalls
+    // ==================================================================
+
+    // ---- Key / value boundary sizes ----
+
+    #[test]
+    fn get_empty_key_returns_value() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"", b"empty_key_val", 0).unwrap();
+        assert_eq!(store.get(b"").unwrap(), Some(b"empty_key_val".to_vec()));
+    }
+
+    #[test]
+    fn get_key_with_embedded_null_bytes() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let key = b"a\0b\0c";
+        store.put(key, b"nulls_in_key", 0).unwrap();
+        assert_eq!(store.get(key).unwrap(), Some(b"nulls_in_key".to_vec()));
+        // Different null pattern must not collide
+        assert!(store.get(b"a\0b").unwrap().is_none());
+    }
+
+    #[test]
+    fn put_empty_value_treated_as_tombstone() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"k", b"v", 0).unwrap();
+        // Empty value is treated as delete per store.rs line 173-178
+        store.put(b"k", b"", 0).unwrap();
+        assert!(
+            store.get(b"k").unwrap().is_none(),
+            "empty value must act as tombstone"
+        );
+    }
+
+    #[test]
+    fn put_max_key_65535_bytes() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let key = vec![0xABu8; 65535]; // u16::MAX
+        store.put(&key, b"v", 0).unwrap();
+        assert_eq!(store.get(&key).unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn put_key_65536_bytes_rejected_by_validate() {
+        let key = vec![0xABu8; 65536]; // u16::MAX + 1
+        let result = crate::log::validate_kv_sizes(&key, b"v");
+        assert!(result.is_err(), "key > 65535 bytes must be rejected");
+    }
+
+    #[test]
+    fn put_value_with_all_null_bytes() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let value = vec![0u8; 1024];
+        store.put(b"nullval", &value, 0).unwrap();
+        assert_eq!(store.get(b"nullval").unwrap(), Some(value));
+    }
+
+    #[test]
+    fn put_batch_empty_list_no_side_effects() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"pre", b"existing", 0).unwrap();
+        store.put_batch(&[]).unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(b"pre").unwrap(), Some(b"existing".to_vec()));
+    }
+
+    #[test]
+    fn put_batch_single_item() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put_batch(&[(b"only", b"one" as &[u8], 0)]).unwrap();
+        assert_eq!(store.get(b"only").unwrap(), Some(b"one".to_vec()));
+    }
+
+    #[test]
+    fn put_batch_1000_items_all_readable() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let kv: Vec<(Vec<u8>, Vec<u8>)> = (0..1000)
+            .map(|i| (format!("bk_{i:04}").into_bytes(), format!("bv_{i:04}").into_bytes()))
+            .collect();
+        let entries: Vec<(&[u8], &[u8], u64)> = kv
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice(), 0u64))
+            .collect();
+        store.put_batch(&entries).unwrap();
+        for (k, v) in &kv {
+            assert_eq!(store.get(k).unwrap(), Some(v.clone()));
+        }
+    }
+
+    #[test]
+    fn delete_nonexistent_key_no_side_effects() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"keep", b"v", 0).unwrap();
+        assert!(!store.delete(b"nonexistent").unwrap());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(b"keep").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn delete_twice_same_key() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"dbl_del", b"v", 0).unwrap();
+        assert!(store.delete(b"dbl_del").unwrap());
+        assert!(!store.delete(b"dbl_del").unwrap());
+        assert!(store.get(b"dbl_del").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_after_delete_returns_none() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"gone", b"val", 0).unwrap();
+        store.delete(b"gone").unwrap();
+        assert!(store.get(b"gone").unwrap().is_none());
+    }
+
+    #[test]
+    fn keys_on_empty_store_returns_empty() {
+        let dir = tmp();
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.keys().is_empty());
+    }
+
+    #[test]
+    fn store_open_close_open_same_dir_preserves_data() {
+        let dir = tmp();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put(b"survive", b"reopen", 0).unwrap();
+        }
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            assert_eq!(store.get(b"survive").unwrap(), Some(b"reopen".to_vec()));
+            store.put(b"second", b"open", 0).unwrap();
+        }
+        let mut store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(b"survive").unwrap(), Some(b"reopen".to_vec()));
+        assert_eq!(store.get(b"second").unwrap(), Some(b"open".to_vec()));
+    }
+
+    #[test]
+    fn store_open_nonexistent_dir_creates_it() {
+        let base = tmp();
+        let nested = base.path().join("deep").join("nested").join("store");
+        assert!(!nested.exists());
+        let mut store = Store::open(&nested).unwrap();
+        assert!(nested.exists());
+        store.put(b"k", b"v", 0).unwrap();
+        assert_eq!(store.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn store_open_readonly_dir_fails_gracefully() {
+        // Create a dir, make it read-only, try to open store
+        let dir = tmp();
+        let readonly = dir.path().join("ro_store");
+        std::fs::create_dir_all(&readonly).unwrap();
+
+        // Make the directory read-only
+        let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&readonly, perms).unwrap();
+
+        // Opening should fail because we can't create/write the log file
+        let result = Store::open(&readonly);
+        // Restore permissions for cleanup
+        let mut perms2 = std::fs::metadata(&readonly).unwrap().permissions();
+        perms2.set_mode(0o755);
+        std::fs::set_permissions(&readonly, perms2).unwrap();
+
+        assert!(result.is_err(), "opening read-only dir must fail");
+    }
+
+    // ---- Read-modify-write edge cases ----
+
+    #[test]
+    fn rmw_incr_on_nonexistent_key_starts_from_zero() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let result = store.read_modify_write(b"counter", &RmwOp::IncrBy(5)).unwrap();
+        assert_eq!(result, b"5");
+    }
+
+    #[test]
+    fn rmw_incr_overflow_i64_max_returns_error() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let max_str = i64::MAX.to_string();
+        store.put(b"big", max_str.as_bytes(), 0).unwrap();
+        let result = store.read_modify_write(b"big", &RmwOp::IncrBy(1));
+        assert!(result.is_err(), "i64::MAX + 1 must overflow");
+        let err = result.unwrap_err();
+        assert!(
+            err.0.contains("overflow"),
+            "error must mention overflow: {err}"
+        );
+    }
+
+    #[test]
+    fn rmw_incr_underflow_i64_min_returns_error() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let min_str = i64::MIN.to_string();
+        store.put(b"small", min_str.as_bytes(), 0).unwrap();
+        let result = store.read_modify_write(b"small", &RmwOp::IncrBy(-1));
+        assert!(result.is_err(), "i64::MIN - 1 must underflow");
+    }
+
+    #[test]
+    fn rmw_incr_float_nan_rejected() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let result = store.read_modify_write(b"nankey", &RmwOp::IncrByFloat(f64::NAN));
+        assert!(result.is_err(), "NaN delta must be rejected");
+    }
+
+    #[test]
+    fn rmw_incr_float_infinity_rejected() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let result = store.read_modify_write(b"infkey", &RmwOp::IncrByFloat(f64::INFINITY));
+        assert!(result.is_err(), "Infinity delta must be rejected");
+    }
+
+    #[test]
+    fn rmw_incr_float_neg_infinity_rejected() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let result = store.read_modify_write(b"ninfkey", &RmwOp::IncrByFloat(f64::NEG_INFINITY));
+        assert!(result.is_err(), "NEG_INFINITY delta must be rejected");
+    }
+
+    #[test]
+    fn rmw_setrange_beyond_512mb_rejected() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        // Try to create a value at offset 512MiB
+        let offset = 512 * 1024 * 1024;
+        let result = store.read_modify_write(b"huge", &RmwOp::SetRange(offset, vec![0x42]));
+        assert!(
+            result.is_err(),
+            "SETRANGE beyond 512MB must be rejected"
+        );
+    }
+
+    #[test]
+    fn rmw_append_to_nonexistent_creates_value() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let result = store
+            .read_modify_write(b"appkey", &RmwOp::Append(b"hello".to_vec()))
+            .unwrap();
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn rmw_setbit_on_nonexistent_key() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let result = store
+            .read_modify_write(b"bitkey", &RmwOp::SetBit(7, 1))
+            .unwrap();
+        // bit 7 in byte 0 is the LSB (big-endian bit numbering)
+        assert_eq!(result, vec![1]);
+    }
+
+    // ---- Concurrent store access (thread safety) ----
+
+    #[test]
+    fn concurrent_put_get_100_threads() {
+        use std::sync::{Arc, Mutex};
+        let dir = tmp();
+        let store = Arc::new(Mutex::new(Store::open(dir.path()).unwrap()));
+
+        // Writers
+        let handles: Vec<_> = (0..10)
+            .map(|t| {
+                let s = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for i in 0..100 {
+                        let mut guard = s.lock().unwrap();
+                        let key = format!("t{t}_k{i}");
+                        let val = format!("t{t}_v{i}");
+                        guard.put(key.as_bytes(), val.as_bytes(), 0).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify all written
+        let mut guard = store.lock().unwrap();
+        for t in 0..10 {
+            for i in 0..100 {
+                let key = format!("t{t}_k{i}");
+                let val = format!("t{t}_v{i}");
+                assert_eq!(
+                    guard.get(key.as_bytes()).unwrap(),
+                    Some(val.into_bytes()),
+                    "missing: {key}"
+                );
+            }
+        }
+    }
+
+    // ---- get_all / get_batch / get_range edge cases ----
+
+    #[test]
+    fn get_all_on_empty_store() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let pairs = store.get_all().unwrap();
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn get_batch_empty_keys_list() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"x", b"y", 0).unwrap();
+        let results = store.get_batch(&[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn get_batch_all_missing_keys() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let results = store.get_batch(&[b"a", b"b", b"c"]).unwrap();
+        assert!(results.iter().all(|r| r.is_none()));
+    }
+
+    #[test]
+    fn get_range_empty_range() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"aaa", b"v1", 0).unwrap();
+        store.put(b"zzz", b"v2", 0).unwrap();
+        // Range between the two keys where nothing exists
+        let pairs = store.get_range(b"bbb", b"ccc", 100).unwrap();
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn get_range_max_count_zero() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put(b"a", b"v", 0).unwrap();
+        let pairs = store.get_range(b"a", b"z", 0).unwrap();
+        assert!(pairs.is_empty());
+    }
+
+    // ---- Binary pattern edge cases ----
+
+    #[test]
+    fn all_256_byte_values_as_single_byte_keys() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        for b in 0u8..=255 {
+            store.put(&[b], &[b.wrapping_add(1)], 0).unwrap();
+        }
+        for b in 0u8..=255 {
+            assert_eq!(
+                store.get(&[b]).unwrap(),
+                Some(vec![b.wrapping_add(1)]),
+                "byte {b:#04x} failed"
+            );
+        }
+    }
+
+    #[test]
+    fn key_is_all_0xff_bytes() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let key = vec![0xFF; 256];
+        store.put(&key, b"allff", 0).unwrap();
+        assert_eq!(store.get(&key).unwrap(), Some(b"allff".to_vec()));
+    }
+
+    #[test]
+    fn key_is_all_0x00_bytes() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+        let key = vec![0x00; 256];
+        store.put(&key, b"allzero", 0).unwrap();
+        assert_eq!(store.get(&key).unwrap(), Some(b"allzero".to_vec()));
+    }
 }

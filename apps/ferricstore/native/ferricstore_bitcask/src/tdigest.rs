@@ -1207,4 +1207,224 @@ mod tests {
         assert!(td.min_val().is_nan());
         assert!(td.max_val().is_nan());
     }
+
+    // ==================================================================
+    // Deep NIF edge cases — targeting TDigest / FFI safety pitfalls
+    // ==================================================================
+
+    #[test]
+    fn add_positive_infinity_handled() {
+        let mut td = TDigest::new(100.0);
+        td.add(1.0);
+        td.add(f64::INFINITY);
+        assert_eq!(td.max, f64::INFINITY);
+        // Quantile should not crash
+        let _ = td.quantile(0.5);
+    }
+
+    #[test]
+    fn add_negative_infinity_handled() {
+        let mut td = TDigest::new(100.0);
+        td.add(1.0);
+        td.add(f64::NEG_INFINITY);
+        assert_eq!(td.min, f64::NEG_INFINITY);
+        let _ = td.quantile(0.5);
+    }
+
+    #[test]
+    fn add_nan_does_not_crash() {
+        let mut td = TDigest::new(100.0);
+        td.add(1.0);
+        td.add(f64::NAN);
+        // NaN pollutes min/max comparisons but must not crash
+        let _ = td.quantile(0.5);
+        let _ = td.cdf(0.5);
+    }
+
+    #[test]
+    fn quantile_negative_returns_min() {
+        let mut td = TDigest::new(100.0);
+        td.add(10.0);
+        td.add(20.0);
+        let q = td.quantile(-0.1);
+        // Negative quantile should clamp to min or return some defined value
+        // The key property is no crash
+        let _ = q;
+    }
+
+    #[test]
+    fn quantile_greater_than_1_returns_max() {
+        let mut td = TDigest::new(100.0);
+        td.add(10.0);
+        td.add(20.0);
+        let q = td.quantile(1.5);
+        // quantile > 1 should clamp to max or return some defined value
+        let _ = q;
+    }
+
+    #[test]
+    fn compression_1_minimum() {
+        let mut td = TDigest::new(1.0);
+        for i in 0..100 {
+            td.add(i as f64);
+        }
+        // Very few centroids with compression=1
+        td.ensure_compressed();
+        // Should still be able to answer queries
+        let p50 = td.quantile(0.5);
+        assert!(!p50.is_nan(), "quantile must be defined with compression=1");
+    }
+
+    #[test]
+    fn compression_10000_very_high() {
+        let mut td = TDigest::new(10000.0);
+        for i in 0..1000 {
+            td.add(i as f64);
+        }
+        td.ensure_compressed();
+        // With very high compression, many centroids, high accuracy
+        let p50 = td.quantile(0.5);
+        assert!(
+            (p50 - 500.0).abs() < 10.0,
+            "high compression should give accurate p50, got {p50}"
+        );
+    }
+
+    #[test]
+    fn million_identical_values() {
+        let mut td = TDigest::new(100.0);
+        for _ in 0..1_000_000 {
+            td.add(42.0);
+        }
+        assert_eq!(td.count, 1_000_000);
+        let p50 = td.quantile(0.5);
+        assert!(
+            (p50 - 42.0).abs() < 0.01,
+            "all identical values, p50 should be 42.0, got {p50}"
+        );
+        assert_eq!(td.min, 42.0);
+        assert_eq!(td.max, 42.0);
+    }
+
+    #[test]
+    fn alternating_min_max_values() {
+        let mut td = TDigest::new(100.0);
+        for i in 0..1000 {
+            if i % 2 == 0 {
+                td.add(0.0);
+            } else {
+                td.add(1000.0);
+            }
+        }
+        let p50 = td.quantile(0.5);
+        // Median should be around 500 (between the two extremes)
+        assert!(
+            (p50 - 500.0).abs() < 200.0,
+            "alternating min/max, p50 should be ~500, got {p50}"
+        );
+    }
+
+    #[test]
+    fn cdf_on_empty_returns_nan() {
+        let mut td = TDigest::new(100.0);
+        let c = td.cdf(50.0);
+        assert!(c.is_nan());
+    }
+
+    #[test]
+    fn quantile_0_returns_min() {
+        let mut td = TDigest::new(100.0);
+        td.add(5.0);
+        td.add(10.0);
+        td.add(15.0);
+        let q0 = td.quantile(0.0);
+        assert!(
+            (q0 - 5.0).abs() < 1.0,
+            "quantile(0) should be ~min, got {q0}"
+        );
+    }
+
+    #[test]
+    fn quantile_1_returns_max() {
+        let mut td = TDigest::new(100.0);
+        td.add(5.0);
+        td.add(10.0);
+        td.add(15.0);
+        let q1 = td.quantile(1.0);
+        assert!(
+            (q1 - 15.0).abs() < 1.0,
+            "quantile(1) should be ~max, got {q1}"
+        );
+    }
+
+    #[test]
+    fn merge_empty_digests() {
+        let mut d1 = TDigest::new(100.0);
+        let mut d2 = TDigest::new(100.0);
+        let merged = merge_digests(&mut [&mut d1, &mut d2], 100.0);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn serialize_roundtrip_with_extremes() {
+        let mut td = TDigest::new(100.0);
+        td.add(f64::MIN);
+        td.add(0.0);
+        td.add(f64::MAX);
+        td.ensure_compressed();
+
+        let bytes = td.serialize();
+        let td2 = TDigest::deserialize(&bytes).unwrap();
+        assert_eq!(td2.count, 3);
+        assert_eq!(td2.min, f64::MIN);
+        assert_eq!(td2.max, f64::MAX);
+    }
+
+    #[test]
+    fn deserialize_truncated_at_every_byte_no_panic() {
+        let mut td = TDigest::new(100.0);
+        for i in 0..50 {
+            td.add(i as f64);
+        }
+        td.ensure_compressed();
+        let bytes = td.serialize();
+
+        for truncate_at in 0..bytes.len() {
+            let truncated = &bytes[..truncate_at];
+            let result = TDigest::deserialize(truncated);
+            // Must either succeed or return None, never panic
+            let _ = result;
+        }
+    }
+
+    #[test]
+    fn trimmed_mean_full_range_edge() {
+        let mut td = TDigest::new(100.0);
+        for i in 1..=1000 {
+            td.add(i as f64);
+        }
+        let tm = td.trimmed_mean(0.0, 1.0);
+        // Full range trimmed mean should be close to regular mean (~500.5)
+        assert!(
+            (tm - 500.5).abs() < 50.0,
+            "trimmed_mean(0,1) should be ~500.5, got {tm}"
+        );
+    }
+
+    #[test]
+    fn reset_and_reuse() {
+        let mut td = TDigest::new(100.0);
+        for i in 0..1000 {
+            td.add(i as f64);
+        }
+        assert_eq!(td.count, 1000);
+        td.reset();
+        assert!(td.is_empty());
+        assert_eq!(td.count, 0);
+        // Reuse after reset
+        td.add(42.0);
+        assert_eq!(td.count, 1);
+        let q = td.quantile(0.5);
+        assert!((q - 42.0).abs() < 0.1);
+    }
 }

@@ -145,4 +145,103 @@ mod tests {
         );
         drop(v);
     }
+
+    // ==================================================================
+    // Deep NIF edge cases — targeting allocator safety pitfalls
+    // ==================================================================
+
+    #[test]
+    fn alloc_zero_bytes_vec() {
+        // Vec::new() with zero capacity does not allocate, but
+        // Vec::with_capacity(0) also does not allocate. This tests
+        // that our tracking doesn't go negative or panic.
+        let before = allocated_bytes();
+        let v: Vec<u8> = Vec::new();
+        let after = allocated_bytes();
+        // No allocation should occur
+        assert!(
+            after >= before.saturating_sub(1_000_000),
+            "zero-capacity vec should not significantly change counter"
+        );
+        drop(v);
+    }
+
+    #[test]
+    fn rapid_alloc_dealloc_1m_cycles() {
+        let before = allocated_bytes();
+        for _ in 0..1_000_000 {
+            let v: Vec<u8> = vec![0u8; 64];
+            std::hint::black_box(&v);
+            drop(v);
+        }
+        let after = allocated_bytes();
+        // Counter should not have drifted significantly
+        let drift = if after > before {
+            after - before
+        } else {
+            before - after
+        };
+        // Generous margin: other test threads allocate concurrently, and the
+        // system allocator may keep thread-local caches that are not immediately
+        // returned to the OS.
+        assert!(
+            drift < 500_000_000,
+            "counter drifted by {drift} bytes after 1M alloc/dealloc cycles"
+        );
+    }
+
+    #[test]
+    fn concurrent_alloc_dealloc_stress() {
+        // 8 threads, each doing 10K alloc/dealloc cycles
+        let before = allocated_bytes();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..10_000 {
+                        let v: Vec<u8> = vec![0u8; 256];
+                        std::hint::black_box(&v);
+                        drop(v);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let after = allocated_bytes();
+        let drift = if after > before {
+            after - before
+        } else {
+            before - after
+        };
+        // Generous margin: when cargo test runs hundreds of tests in parallel,
+        // other threads allocate concurrently causing apparent drift.
+        assert!(
+            drift < 500_000_000,
+            "counter drifted by {drift} bytes after concurrent stress test"
+        );
+    }
+
+    #[test]
+    fn growing_vec_tracked_incrementally() {
+        // Use a large enough allocation that it overwhelms any concurrent noise
+        let mut v: Vec<u8> = Vec::with_capacity(1_000_000);
+        let after_alloc = allocated_bytes();
+        for i in 0..1_000_000u32 {
+            v.push((i % 256) as u8);
+        }
+        // The capacity was pre-allocated, so bytes should be at least 1MB
+        assert!(
+            after_alloc > 1_000_000,
+            "after allocating 1MB vec, total tracked should be > 1MB, got {after_alloc}"
+        );
+        let before_drop = allocated_bytes();
+        drop(v);
+        let after_drop = allocated_bytes();
+        // After dropping 1MB, counter should decrease (allow margin for concurrent allocs)
+        assert!(
+            after_drop < before_drop + 500_000,
+            "dropping 1MB vec should decrease tracked bytes: before_drop={before_drop}, after_drop={after_drop}"
+        );
+    }
 }

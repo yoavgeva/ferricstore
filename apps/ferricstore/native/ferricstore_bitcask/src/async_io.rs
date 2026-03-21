@@ -146,4 +146,82 @@ mod tests {
         // Sum of 0..9999 = 9999*10000/2 = 49_995_000
         assert_eq!(sum, 49_995_000);
     }
+
+    // ==================================================================
+    // Deep NIF edge cases — targeting async runtime / FFI pitfalls
+    // ==================================================================
+
+    #[test]
+    fn panic_in_tokio_task_does_not_crash_runtime() {
+        let rt = runtime();
+        // Spawn multiple panicking tasks
+        let mut panic_handles = Vec::new();
+        for i in 0..10 {
+            panic_handles.push(rt.spawn(async move {
+                if i % 2 == 0 {
+                    panic!("deliberate panic in task {i}");
+                }
+                i
+            }));
+        }
+
+        // All panicking tasks should return JoinError
+        for h in panic_handles {
+            let _ = rt.block_on(h); // Ok or Err, but no crash
+        }
+
+        // Runtime must still be functional
+        let ok_handle = rt.spawn(async { 999 });
+        assert_eq!(rt.block_on(ok_handle).unwrap(), 999);
+    }
+
+    #[test]
+    fn task_with_large_closure_1mb() {
+        let rt = runtime();
+        let large_data = vec![0xABu8; 1_024 * 1_024]; // 1 MB
+        let handle = rt.spawn(async move {
+            large_data.len()
+        });
+        let result = rt.block_on(handle).unwrap();
+        assert_eq!(result, 1_024 * 1_024);
+    }
+
+    #[test]
+    fn spawn_from_multiple_os_threads_concurrently() {
+        let handles: Vec<_> = (0..20)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let rt = runtime();
+                    let mut tasks = Vec::new();
+                    for i in 0..50 {
+                        tasks.push(rt.spawn(async move { t * 1000 + i }));
+                    }
+                    let mut results = Vec::new();
+                    for task in tasks {
+                        results.push(rt.block_on(task).unwrap());
+                    }
+                    results
+                })
+            })
+            .collect();
+
+        let mut total = 0;
+        for h in handles {
+            let results = h.join().unwrap();
+            assert_eq!(results.len(), 50);
+            total += results.len();
+        }
+        assert_eq!(total, 1000);
+    }
+
+    #[test]
+    fn nested_spawn_works() {
+        let rt = runtime();
+        let outer = rt.spawn(async {
+            let inner = tokio::spawn(async { 42 });
+            inner.await.unwrap()
+        });
+        let result = rt.block_on(outer).unwrap();
+        assert_eq!(result, 42);
+    }
 }

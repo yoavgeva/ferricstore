@@ -892,4 +892,125 @@ mod tests {
         // All 1000 items should have been attempted
         assert!(guard.num_items > 0);
     }
+
+    // ==================================================================
+    // Deep NIF edge cases — targeting cuckoo filter / FFI pitfalls
+    // ==================================================================
+
+    #[test]
+    fn add_to_completely_full_filter_returns_error() {
+        // Tiny filter: 1 bucket * 1 slot = 1 total slot, max_kicks=0
+        let mut f = CuckooFilter::new(1, 1, 0);
+        // First add should succeed
+        let first = f.add(b"first");
+        assert!(first.is_ok());
+        // Second add must fail (only 1 slot, kicks=0)
+        let second = f.add(b"second");
+        assert!(second.is_err(), "full filter must return error");
+    }
+
+    #[test]
+    fn delete_from_empty_filter_returns_zero() {
+        let mut f = CuckooFilter::new(1024, 4, 500);
+        assert_eq!(f.delete(b"nothing"), 0);
+        assert_eq!(f.num_items, 0);
+        assert_eq!(f.num_deletes, 0);
+    }
+
+    #[test]
+    fn addnx_race_condition_mutex_protected() {
+        use std::sync::{Arc, Mutex};
+        let f = Arc::new(Mutex::new(CuckooFilter::new(4096, 4, 500)));
+
+        // Multiple threads all trying addnx on the same item
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let f_clone = Arc::clone(&f);
+                std::thread::spawn(move || {
+                    let mut guard = f_clone.lock().unwrap();
+                    guard.addnx(b"race_item").unwrap()
+                })
+            })
+            .collect();
+
+        let results: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // Exactly one thread should have returned 1 (inserted), rest 0
+        let inserted_count = results.iter().filter(|&&r| r == 1).count();
+        assert_eq!(inserted_count, 1, "exactly one addnx must succeed");
+    }
+
+    #[test]
+    fn deserialize_all_zeros_returns_error() {
+        let zeros = vec![0u8; 100];
+        let result = CuckooFilter::deserialize(&zeros);
+        assert!(result.is_err(), "all-zero bytes must fail deserialization (bad magic)");
+    }
+
+    #[test]
+    fn deserialize_truncated_at_every_byte_fuzzlike() {
+        let mut f = CuckooFilter::new(64, 4, 500);
+        for i in 0..10 {
+            f.add(format!("fuzz_{i}").as_bytes()).unwrap();
+        }
+        let bytes = f.serialize();
+
+        // Try deserializing at every truncation point
+        for truncate_at in 0..bytes.len() {
+            let truncated = &bytes[..truncate_at];
+            let result = CuckooFilter::deserialize(truncated);
+            // Must either succeed or return error, never panic
+            let _ = result;
+        }
+    }
+
+    #[test]
+    fn serialize_empty_filter_roundtrip() {
+        let f = CuckooFilter::new(256, 4, 500);
+        let bytes = f.serialize();
+        let f2 = CuckooFilter::deserialize(&bytes).unwrap();
+        assert_eq!(f2.num_items, 0);
+        assert_eq!(f2.num_buckets, 256);
+        assert!(!f2.exists(b"anything"));
+    }
+
+    #[test]
+    fn add_delete_add_same_item() {
+        let mut f = CuckooFilter::new(1024, 4, 500);
+        f.add(b"cycle").unwrap();
+        assert!(f.exists(b"cycle"));
+        f.delete(b"cycle");
+        assert!(!f.exists(b"cycle"));
+        f.add(b"cycle").unwrap();
+        assert!(f.exists(b"cycle"));
+    }
+
+    #[test]
+    fn count_after_multiple_adds_and_deletes() {
+        let mut f = CuckooFilter::new(1024, 4, 500);
+        f.add(b"x").unwrap();
+        f.add(b"x").unwrap();
+        f.add(b"x").unwrap();
+        assert_eq!(f.count(b"x"), 3);
+        f.delete(b"x");
+        assert_eq!(f.count(b"x"), 2);
+        f.delete(b"x");
+        f.delete(b"x");
+        assert_eq!(f.count(b"x"), 0);
+    }
+
+    #[test]
+    fn mexists_empty_list() {
+        let f = CuckooFilter::new(1024, 4, 500);
+        let results = f.mexists(&[]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn deserialize_wrong_version_returns_error() {
+        let mut bytes = vec![MAGIC[0], MAGIC[1]];
+        bytes.push(0xFF); // bad version
+        bytes.extend_from_slice(&[0; HEADER_SIZE - 3]);
+        let result = CuckooFilter::deserialize(&bytes);
+        assert!(result.is_err());
+    }
 }
