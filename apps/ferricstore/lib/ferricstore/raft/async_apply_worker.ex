@@ -189,13 +189,14 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   # For puts, we batch all consecutive puts together and flush them in a
   # single `NIF.put_batch/2` call for efficiency. Deletes are applied
   # individually since they don't benefit from batching.
+  @lfu_initial_counter 5
+
   @spec apply_commands(non_neg_integer(), [command()]) :: :ok
   defp apply_commands(shard_index, commands) do
     alias Ferricstore.Store.PrefixIndex
 
     store = get_store(shard_index)
     keydir = :"keydir_#{shard_index}"
-    hot_cache = :"hot_cache_#{shard_index}"
     prefix_table = PrefixIndex.table_name(shard_index)
 
     # Separate puts (which can be batched) from other commands
@@ -211,8 +212,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
         :ok ->
           # Update ETS and prefix index for each put
           Enum.each(puts, fn {:put, key, value, expire_at_ms} ->
-            :ets.insert(keydir, {key, expire_at_ms})
-            :ets.insert(hot_cache, {key, value, System.os_time(:millisecond)})
+            :ets.insert(keydir, {key, value, expire_at_ms, @lfu_initial_counter})
 
             try do
               PrefixIndex.track(prefix_table, key, shard_index)
@@ -233,7 +233,6 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
       {:delete, key} ->
         NIF.delete(store, key)
         :ets.delete(keydir, key)
-        :ets.delete(hot_cache, key)
 
         try do
           PrefixIndex.untrack(prefix_table, key, shard_index)

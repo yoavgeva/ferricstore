@@ -36,9 +36,7 @@ static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 /// reached). This is a fatal error since the NIF library cannot function
 /// without the runtime.
 pub fn runtime() -> &'static Runtime {
-    TOKIO_RT.get_or_init(|| {
-        Runtime::new().expect("Failed to create Tokio runtime")
-    })
+    TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime"))
 }
 
 #[cfg(test)]
@@ -179,9 +177,7 @@ mod tests {
     fn task_with_large_closure_1mb() {
         let rt = runtime();
         let large_data = vec![0xABu8; 1_024 * 1_024]; // 1 MB
-        let handle = rt.spawn(async move {
-            large_data.len()
-        });
+        let handle = rt.spawn(async move { large_data.len() });
         let result = rt.block_on(handle).unwrap();
         assert_eq!(result, 1_024 * 1_024);
     }

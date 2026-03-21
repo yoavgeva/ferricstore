@@ -2504,7 +2504,12 @@ mod tests {
         let dir = tmp();
         let mut store = Store::open(dir.path()).unwrap();
         let kv: Vec<(Vec<u8>, Vec<u8>)> = (0..1000)
-            .map(|i| (format!("bk_{i:04}").into_bytes(), format!("bv_{i:04}").into_bytes()))
+            .map(|i| {
+                (
+                    format!("bk_{i:04}").into_bytes(),
+                    format!("bv_{i:04}").into_bytes(),
+                )
+            })
             .collect();
         let entries: Vec<(&[u8], &[u8], u64)> = kv
             .iter()
@@ -2609,7 +2614,9 @@ mod tests {
     fn rmw_incr_on_nonexistent_key_starts_from_zero() {
         let dir = tmp();
         let mut store = Store::open(dir.path()).unwrap();
-        let result = store.read_modify_write(b"counter", &RmwOp::IncrBy(5)).unwrap();
+        let result = store
+            .read_modify_write(b"counter", &RmwOp::IncrBy(5))
+            .unwrap();
         assert_eq!(result, b"5");
     }
 
@@ -2669,10 +2676,7 @@ mod tests {
         // Try to create a value at offset 512MiB
         let offset = 512 * 1024 * 1024;
         let result = store.read_modify_write(b"huge", &RmwOp::SetRange(offset, vec![0x42]));
-        assert!(
-            result.is_err(),
-            "SETRANGE beyond 512MB must be rejected"
-        );
+        assert!(result.is_err(), "SETRANGE beyond 512MB must be rejected");
     }
 
     #[test]

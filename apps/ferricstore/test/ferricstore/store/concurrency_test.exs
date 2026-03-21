@@ -303,12 +303,13 @@ defmodule Ferricstore.Store.ConcurrencyTest do
 
       assert Enum.all?(results, &(&1 == :ok))
 
-      ets = :ets.whereis(:"hot_cache_#{index}")
+      # Shard uses single-table format: {key, value, expire_at_ms, lfu_counter} in keydir
+      ets = :"keydir_#{index}"
       entries = :ets.tab2list(ets)
       assert length(entries) == 30
 
       for i <- 0..29 do
-        [{k, v, _access_ms}] = :ets.lookup(ets, "ets_key_#{i}")
+        [{k, v, 0, _lfu}] = :ets.lookup(ets, "ets_key_#{i}")
         assert k == "ets_key_#{i}"
         assert v == "ets_val_#{i}"
       end
@@ -345,7 +346,7 @@ defmodule Ferricstore.Store.ConcurrencyTest do
 
       assert Enum.all?(results, &(&1 == :ok))
 
-      ets = :ets.whereis(:"hot_cache_#{index}")
+      ets = :"keydir_#{index}"
 
       for i <- 0..19 do
         assert [] == :ets.lookup(ets, "del_ets_#{i}"),

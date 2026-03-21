@@ -211,11 +211,11 @@ defmodule Ferricstore.Application do
         )
 
     Enum.reduce(0..(shard_count - 1), {0, nil, 0}, fn i, {count, largest_key, largest_size} ->
-      hot_cache = :"hot_cache_#{i}"
+      keydir = :"keydir_#{i}"
 
       try do
         :ets.foldl(
-          fn {key, value, _access_ms}, {c, lk, ls} ->
+          fn {key, value, _expire_at_ms, _lfu}, {c, lk, ls} when is_binary(value) ->
             size = byte_size(value)
 
             if size > threshold do
@@ -227,9 +227,13 @@ defmodule Ferricstore.Application do
             else
               {c, lk, ls}
             end
+
+            {_key, nil, _exp, _lfu}, acc ->
+              # Cold key (value evicted from RAM) -- skip
+              acc
           end,
           {count, largest_key, largest_size},
-          hot_cache
+          keydir
         )
       rescue
         ArgumentError ->

@@ -71,7 +71,6 @@ defmodule Ferricstore.Raft.StateMachine do
           shard_index: non_neg_integer(),
           store: reference(),
           ets: atom(),
-          hot_cache: atom(),
           applied_count: non_neg_integer(),
           release_cursor_interval: pos_integer()
         }
@@ -109,7 +108,6 @@ defmodule Ferricstore.Raft.StateMachine do
       shard_index: config.shard_index,
       store: config.store,
       ets: config.ets,
-      hot_cache: Map.get(config, :hot_cache, :"hot_cache_#{config.shard_index}"),
       prefix_keys: PrefixIndex.table_name(config.shard_index),
       applied_count: 0,
       release_cursor_interval: interval
@@ -538,14 +536,15 @@ defmodule Ferricstore.Raft.StateMachine do
     do_ratelimit_add(state, key, window_ms, max, count, now_ms)
   end
 
+  @lfu_initial_counter 5
+
   defp do_put(state, key, value, expire_at_ms) do
     # Synchronous Bitcask write -- deterministic, called on every node.
     # put_batch is used for a single entry to match the existing NIF API
     # which handles fsync internally.
     case NIF.put_batch(state.store, [{key, value, expire_at_ms}]) do
       :ok ->
-        :ets.insert(state.ets, {key, expire_at_ms})
-        :ets.insert(state.hot_cache, {key, value, System.os_time(:millisecond)})
+        :ets.insert(state.ets, {key, value, expire_at_ms, @lfu_initial_counter})
         sm_prefix_track(state, key)
         :ok
 
@@ -557,7 +556,6 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_delete(state, key) do
     NIF.delete(state.store, key)
     :ets.delete(state.ets, key)
-    :ets.delete(state.hot_cache, key)
     sm_prefix_untrack(state, key)
     :ok
   end
@@ -903,42 +901,56 @@ defmodule Ferricstore.Raft.StateMachine do
     now = System.os_time(:millisecond)
 
     case :ets.lookup(state.ets, key) do
-      [{^key, 0}] ->
-        case :ets.lookup(state.hot_cache, key) do
-          [{^key, value, _access_ms}] ->
-            :ets.insert(state.hot_cache, {key, value, now})
-            {:hit, value, 0}
-          [] -> :miss
-        end
+      [{^key, value, 0, _lfu}] when value != nil ->
+        {:hit, value, 0}
 
-      [{^key, exp}] when exp > now ->
-        case :ets.lookup(state.hot_cache, key) do
-          [{^key, value, _access_ms}] ->
-            :ets.insert(state.hot_cache, {key, value, now})
-            {:hit, value, exp}
-          [] -> :miss
-        end
+      [{^key, nil, 0, _lfu}] ->
+        # Cold key -- try Bitcask
+        warm_from_bitcask(state, key)
 
-      [{^key, _exp}] ->
+      [{^key, value, exp, _lfu}] when exp > now and value != nil ->
+        {:hit, value, exp}
+
+      [{^key, nil, exp, _lfu}] when exp > now ->
+        # Cold key with valid TTL -- try Bitcask
+        warm_from_bitcask_with_exp(state, key, exp)
+
+      [{^key, _value, _exp, _lfu}] ->
         :ets.delete(state.ets, key)
-        :ets.delete(state.hot_cache, key)
         sm_prefix_untrack(state, key)
         :expired
 
       [] ->
-        # ETS miss -- try Bitcask for cold keys
-        case NIF.get_zero_copy(state.store, key) do
-          {:ok, nil} ->
-            :miss
+        # ETS miss -- try Bitcask for keys not yet in keydir
+        warm_from_bitcask(state, key)
+    end
+  end
 
-          {:ok, value} ->
-            :ets.insert(state.ets, {key, 0})
-            :ets.insert(state.hot_cache, {key, value, now})
-            {:hit, value, 0}
+  defp warm_from_bitcask(state, key) do
+    case NIF.get_zero_copy(state.store, key) do
+      {:ok, nil} ->
+        :miss
 
-          _error ->
-            :miss
-        end
+      {:ok, value} ->
+        :ets.insert(state.ets, {key, value, 0, @lfu_initial_counter})
+        {:hit, value, 0}
+
+      _error ->
+        :miss
+    end
+  end
+
+  defp warm_from_bitcask_with_exp(state, key, exp) do
+    case NIF.get_zero_copy(state.store, key) do
+      {:ok, nil} ->
+        :miss
+
+      {:ok, value} ->
+        :ets.insert(state.ets, {key, value, exp, @lfu_initial_counter})
+        {:hit, value, exp}
+
+      _error ->
+        :miss
     end
   end
 
@@ -974,7 +986,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp do_delete_prefix(state, prefix) do
     keys_to_delete =
       :ets.foldl(
-        fn {key, _exp}, acc ->
+        fn {key, _value, _exp, _lfu}, acc ->
           if is_binary(key) and String.starts_with?(key, prefix) do
             [key | acc]
           else
@@ -1000,87 +1012,20 @@ defmodule Ferricstore.Raft.StateMachine do
   # the shard's `do_get/2` logic so that list operations can read current
   # state within the state machine.
   defp do_get(state, key) do
-    now = System.os_time(:millisecond)
-
-    case :ets.lookup(state.ets, key) do
-      [{^key, 0}] ->
-        case :ets.lookup(state.hot_cache, key) do
-          [{^key, value, _access_ms}] ->
-            :ets.insert(state.hot_cache, {key, value, now})
-            value
-          [] -> nil
-        end
-
-      [{^key, exp}] when exp > now ->
-        case :ets.lookup(state.hot_cache, key) do
-          [{^key, value, _access_ms}] ->
-            :ets.insert(state.hot_cache, {key, value, now})
-            value
-          [] -> nil
-        end
-
-      [{^key, _exp}] ->
-        :ets.delete(state.ets, key)
-        :ets.delete(state.hot_cache, key)
-        nil
-
-      [] ->
-        case NIF.get_zero_copy(state.store, key) do
-          {:ok, nil} ->
-            nil
-
-          {:ok, value} ->
-            :ets.insert(state.ets, {key, 0})
-            :ets.insert(state.hot_cache, {key, value, now})
-            value
-
-          _error ->
-            nil
-        end
+    case ets_lookup(state, key) do
+      {:hit, value, _exp} -> value
+      :expired -> nil
+      :miss -> nil
     end
   end
 
   # Reads a value + expire_at_ms from ETS, falling back to Bitcask for cold
-  # keys. Returns `{value, expire_at_ms}` or `nil`. Mirrors shard.ex
-  # do_get_meta/2.
+  # keys. Returns `{value, expire_at_ms}` or `nil`.
   defp do_get_meta(state, key) do
-    now = System.os_time(:millisecond)
-
-    case :ets.lookup(state.ets, key) do
-      [{^key, 0}] ->
-        case :ets.lookup(state.hot_cache, key) do
-          [{^key, value, _access_ms}] ->
-            :ets.insert(state.hot_cache, {key, value, now})
-            {value, 0}
-          [] -> nil
-        end
-
-      [{^key, exp}] when exp > now ->
-        case :ets.lookup(state.hot_cache, key) do
-          [{^key, value, _access_ms}] ->
-            :ets.insert(state.hot_cache, {key, value, now})
-            {value, exp}
-          [] -> nil
-        end
-
-      [{^key, _exp}] ->
-        :ets.delete(state.ets, key)
-        :ets.delete(state.hot_cache, key)
-        nil
-
-      [] ->
-        case NIF.get_zero_copy(state.store, key) do
-          {:ok, nil} ->
-            nil
-
-          {:ok, value} ->
-            :ets.insert(state.ets, {key, 0})
-            :ets.insert(state.hot_cache, {key, value, now})
-            {value, 0}
-
-          _error ->
-            nil
-        end
+    case ets_lookup(state, key) do
+      {:hit, value, exp} -> {value, exp}
+      :expired -> nil
+      :miss -> nil
     end
   end
 

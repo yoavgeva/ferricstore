@@ -797,7 +797,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       keydir = :"keydir_#{Router.shard_for("vttl_updated")}"
 
       # Verify keydir has the new expiry
-      [{_, exp}] = :ets.lookup(keydir, "vttl_updated")
+      [{_, _value, exp, _lfu}] = :ets.lookup(keydir, "vttl_updated")
       assert exp == now + 600_000,
              "Keydir should have updated TTL, got #{exp}"
 

@@ -72,16 +72,9 @@ defmodule Ferricstore.Test.ShardHelpers do
     # After the per-shard deletes and drain above this should be a no-op,
     # but guards against edge cases where NIF tombstones haven't propagated.
     Enum.each(0..(shard_count - 1), fn i ->
-      # keydir has 2-element tuples {key, expire_at_ms}
+      # Single-table keydir has 4-element tuples {key, value, expire_at_ms, lfu_counter}
       try do
-        :ets.select_delete(:"keydir_#{i}", [{{:"$1", :_}, [], [true]}])
-      rescue
-        ArgumentError -> :ok
-      end
-
-      # hot_cache has 3-element tuples {key, value, last_access_ms}
-      try do
-        :ets.select_delete(:"hot_cache_#{i}", [{{:"$1", :_, :_}, [], [true]}])
+        :ets.select_delete(:"keydir_#{i}", [{{:"$1", :_, :_, :_}, [], [true]}])
       rescue
         ArgumentError -> :ok
       end

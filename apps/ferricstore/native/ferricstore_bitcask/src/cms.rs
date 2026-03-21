@@ -323,8 +323,7 @@ pub fn cms_merge<'a>(
         for i in 0..size {
             dest_sketch.counters[i] += counters[i] * weight;
         }
-        dest_sketch.count =
-            (dest_sketch.count as i64 + *count as i64 * weight) as u64;
+        dest_sketch.count = (dest_sketch.count as i64 + *count as i64 * weight) as u64;
     }
 
     // Clamp negatives to 0
@@ -353,10 +352,7 @@ pub fn cms_info(env: Env, resource: ResourceArc<CmsResource>) -> NifResult<Term>
 /// Returns `{:ok, binary}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cms_to_bytes<'a>(
-    env: Env<'a>,
-    resource: ResourceArc<CmsResource>,
-) -> NifResult<Term<'a>> {
+pub fn cms_to_bytes<'a>(env: Env<'a>, resource: ResourceArc<CmsResource>) -> NifResult<Term<'a>> {
     let sketch = resource.sketch.lock().map_err(|_| rustler::Error::BadArg)?;
     let bytes = sketch.to_bytes();
     let mut bin = rustler::OwnedBinary::new(bytes.len()).ok_or(rustler::Error::BadArg)?;
@@ -368,10 +364,7 @@ pub fn cms_to_bytes<'a>(
 /// Returns `{:ok, resource}` or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cms_from_bytes<'a>(
-    env: Env<'a>,
-    data: rustler::Binary<'a>,
-) -> NifResult<Term<'a>> {
+pub fn cms_from_bytes<'a>(env: Env<'a>, data: rustler::Binary<'a>) -> NifResult<Term<'a>> {
     match CountMinSketch::from_bytes(data.as_slice()) {
         Some(sketch) => {
             let resource = ResourceArc::new(CmsResource {
@@ -417,8 +410,7 @@ mod tests {
     #[test]
     fn never_undercounts() {
         let mut s = CountMinSketch::new(1000, 7);
-        let items: Vec<(&[u8], i64)> =
-            vec![(b"apple", 100), (b"banana", 50), (b"cherry", 200)];
+        let items: Vec<(&[u8], i64)> = vec![(b"apple", 100), (b"banana", 50), (b"cherry", 200)];
         for (elem, count) in &items {
             s.increment(elem, *count);
         }
@@ -496,10 +488,7 @@ mod tests {
             let key = format!("key_{i}");
             let est = s.query(key.as_bytes());
             let true_count = (i + 1) as i64;
-            assert!(
-                est >= true_count,
-                "key_{i}: est {est} < true {true_count}"
-            );
+            assert!(est >= true_count, "key_{i}: est {est} < true {true_count}");
         }
     }
 
@@ -520,9 +509,8 @@ mod tests {
     fn overcount_property() {
         // CMS always overcounts, never undercounts
         let mut s = CountMinSketch::new(500, 7);
-        let items: Vec<(&[u8], i64)> = vec![
-            (b"a", 10), (b"b", 20), (b"c", 30), (b"d", 40), (b"e", 50),
-        ];
+        let items: Vec<(&[u8], i64)> =
+            vec![(b"a", 10), (b"b", 20), (b"c", 30), (b"d", 40), (b"e", 50)];
         for (elem, count) in &items {
             s.increment(elem, *count);
         }

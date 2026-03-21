@@ -74,10 +74,9 @@ defmodule Ferricstore.Store.Router do
   def get_file_ref(key) do
     idx = shard_for(key)
     keydir = :"keydir_#{idx}"
-    hot_cache = :"hot_cache_#{idx}"
     now = System.os_time(:millisecond)
 
-    case ets_get(keydir, hot_cache, key, now) do
+    case ets_get(keydir, key, now) do
       {:hit, _value, _exp} ->
         # Hot key — value is in ETS, sendfile not applicable.
         nil
@@ -110,10 +109,9 @@ defmodule Ferricstore.Store.Router do
   def get(key) do
     idx = shard_for(key)
     keydir = :"keydir_#{idx}"
-    hot_cache = :"hot_cache_#{idx}"
     now = System.os_time(:millisecond)
 
-    case ets_get(keydir, hot_cache, key, now) do
+    case ets_get(keydir, key, now) do
       {:hit, value, _exp} ->
         Stats.record_hot_read(key)
         Stats.incr_keyspace_hits()
@@ -148,10 +146,9 @@ defmodule Ferricstore.Store.Router do
   def get_meta(key) do
     idx = shard_for(key)
     keydir = :"keydir_#{idx}"
-    hot_cache = :"hot_cache_#{idx}"
     now = System.os_time(:millisecond)
 
-    case ets_get(keydir, hot_cache, key, now) do
+    case ets_get(keydir, key, now) do
       {:hit, value, exp} ->
         Stats.record_hot_read(key)
         {value, exp}
@@ -170,31 +167,35 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  # ETS fast-path lookup using the two-table split.
-  # Checks keydir for expiry, then hot_cache for the value.
+  # ETS fast-path lookup using the single keydir table.
+  # Tuple format: {key, value | nil, expire_at_ms, lfu_counter}
   # Returns:
-  #   {:hit, value, expire_at_ms} -- key is live
+  #   {:hit, value, expire_at_ms} -- key is live and hot (value != nil)
   #   :expired                    -- key existed but has passed its TTL (also evicts it)
-  #   :miss                       -- key not in ETS (may be in Bitcask)
+  #   :miss                       -- key not in ETS or cold (value == nil, may be in Bitcask)
   #   :no_table                   -- ETS table does not exist (shard restarting)
-  defp ets_get(keydir, hot_cache, key, now) do
+  defp ets_get(keydir, key, now) do
     try do
       case :ets.lookup(keydir, key) do
-        [{^key, 0}] ->
-          case hot_cache_lookup(hot_cache, key, now) do
-            {:hit, value} -> {:hit, value, 0}
-            :miss -> :miss
-          end
+        [{^key, value, 0, lfu}] when value != nil ->
+          lfu_touch(keydir, key, lfu)
+          {:hit, value, 0}
 
-        [{^key, exp}] when exp > now ->
-          case hot_cache_lookup(hot_cache, key, now) do
-            {:hit, value} -> {:hit, value, exp}
-            :miss -> :miss
-          end
+        [{^key, nil, 0, _lfu}] ->
+          # Cold key (evicted from RAM) -- miss for the fast path
+          :miss
 
-        [{^key, _exp}] ->
+        [{^key, value, exp, lfu}] when exp > now and value != nil ->
+          lfu_touch(keydir, key, lfu)
+          {:hit, value, exp}
+
+        [{^key, nil, exp, _lfu}] when exp > now ->
+          # Cold key with valid TTL -- miss for the fast path
+          :miss
+
+        [{^key, _value, _exp, _lfu}] ->
+          # Expired entry
           :ets.delete(keydir, key)
-          :ets.delete(hot_cache, key)
           :expired
 
         [] ->
@@ -205,22 +206,14 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  # Looks up a key in hot_cache, handling both 3-element tuples
-  # `{key, value, access_ms}` (direct shard path) and 2-element tuples
-  # `{key, value}` (Raft state machine path). On hit, upgrades the entry
-  # to a 3-tuple with the current timestamp for LRU tracking.
-  defp hot_cache_lookup(hot_cache, key, now) do
-    case :ets.lookup(hot_cache, key) do
-      [{^key, value, _access_ms}] ->
-        :ets.insert(hot_cache, {key, value, now})
-        {:hit, value}
+  # Probabilistic LFU counter increment for the Router hot path.
+  # Higher counters are harder to increment.
+  defp lfu_touch(keydir, key, counter) do
+    log_factor = Application.get_env(:ferricstore, :lfu_log_factor, 10)
 
-      [{^key, value}] ->
-        :ets.insert(hot_cache, {key, value, now})
-        {:hit, value}
-
-      [] ->
-        :miss
+    if :rand.uniform() < 1.0 / (counter * log_factor + 1) do
+      new_counter = min(counter + 1, 255)
+      :ets.update_element(keydir, key, {4, new_counter})
     end
   end
 

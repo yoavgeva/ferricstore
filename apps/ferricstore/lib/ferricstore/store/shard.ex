@@ -109,6 +109,8 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   @impl true
+  @lfu_initial_counter 5
+
   def init(opts) do
     index = Keyword.fetch!(opts, :index)
     data_dir = Keyword.fetch!(opts, :data_dir)
@@ -127,6 +129,9 @@ defmodule Ferricstore.Store.Shard do
           :"keydir_#{index}"
       end
 
+    # Create (or recreate) the hot_cache table for this shard.
+    # The hot_cache stores {key, value, access_ms} 3-tuples and is used by
+    # the Raft state machine, Router, and MemoryGuard for LRU eviction.
     hot_cache =
       case :ets.whereis(:"hot_cache_#{index}") do
         :undefined ->
@@ -165,20 +170,18 @@ defmodule Ferricstore.Store.Shard do
 
     # Recover any promoted collection instances from the shared Bitcask.
     promoted =
-      Ferricstore.Store.Promotion.recover_promoted(store, keydir, hot_cache, data_dir, index)
+      Ferricstore.Store.Promotion.recover_promoted(store, keydir, data_dir, index)
 
-    # Warm up ETS (keydir + hot_cache) and the prefix index from all keys in
-    # the Bitcask store so that SCAN MATCH, compound_scan, and compound_count
-    # work immediately after a shard restart without waiting for lazy warming.
-    now = System.os_time(:millisecond)
-
+    # Warm up ETS (keydir) and the prefix index from all keys in the Bitcask
+    # store so that SCAN MATCH, compound_scan, and compound_count work
+    # immediately after a shard restart without waiting for lazy warming.
+    # Single-table format: {key, value, expire_at_ms, lfu_counter}
     for key <- NIF.keys(store) do
       PrefixIndex.track(prefix_keys, key, index)
 
       case NIF.get(store, key) do
         {:ok, value} when is_binary(value) ->
-          :ets.insert(keydir, {key, 0})
-          :ets.insert(hot_cache, {key, value, now})
+          :ets.insert(keydir, {key, value, 0, @lfu_initial_counter})
 
         _ ->
           :ok
@@ -197,7 +200,8 @@ defmodule Ferricstore.Store.Shard do
 
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
-    {:ok, %__MODULE__{store: store, ets: keydir, keydir: keydir, hot_cache: hot_cache,
+    {:ok, %__MODULE__{store: store, ets: keydir, keydir: keydir,
+                       hot_cache: hot_cache,
                        prefix_keys: prefix_keys, index: index, data_dir: data_dir,
                        pending: [], flush_in_flight: nil,
                        promoted_instances: promoted},
@@ -293,21 +297,15 @@ defmodule Ferricstore.Store.Shard do
 
     results =
       :ets.foldl(
-        fn {key, exp}, acc ->
-          if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-            case :ets.lookup(state.hot_cache, key) do
-              [{^key, value, _access_ms}] ->
-                field =
-                  case :binary.split(key, <<0>>) do
-                    [_prefix_part, sub] -> sub
-                    _ -> key
-                  end
+        fn {key, value, exp, _lfu}, acc ->
+          if is_binary(key) and value != nil and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+            field =
+              case :binary.split(key, <<0>>) do
+                [_prefix_part, sub] -> sub
+                _ -> key
+              end
 
-                [{field, value} | acc]
-
-              [] ->
-                acc
-            end
+            [{field, value} | acc]
           else
             acc
           end
@@ -325,7 +323,7 @@ defmodule Ferricstore.Store.Shard do
 
     count =
       :ets.foldl(
-        fn {key, exp}, acc ->
+        fn {key, _value, exp, _lfu}, acc ->
           if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
             acc + 1
           else
@@ -346,7 +344,7 @@ defmodule Ferricstore.Store.Shard do
 
       keys_to_delete =
         :ets.foldl(
-          fn {key, _exp}, acc ->
+          fn {key, _value, _exp, _lfu}, acc ->
             if is_binary(key) and String.starts_with?(key, prefix) do
               [key | acc]
             else
@@ -366,7 +364,7 @@ defmodule Ferricstore.Store.Shard do
     else
       keys_to_delete =
         :ets.foldl(
-          fn {key, _exp}, acc ->
+          fn {key, _value, _exp, _lfu}, acc ->
             if is_binary(key) and String.starts_with?(key, prefix) do
               [key | acc]
             else
@@ -574,21 +572,15 @@ defmodule Ferricstore.Store.Shard do
 
         results =
           :ets.foldl(
-            fn {key, exp}, acc ->
-              if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-                case :ets.lookup(state.hot_cache, key) do
-                  [{^key, value, _access_ms}] ->
-                    field =
-                      case :binary.split(key, <<0>>) do
-                        [_prefix_part, sub] -> sub
-                        _ -> key
-                      end
+            fn {key, value, exp, _lfu}, acc ->
+              if is_binary(key) and value != nil and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+                field =
+                  case :binary.split(key, <<0>>) do
+                    [_prefix_part, sub] -> sub
+                    _ -> key
+                  end
 
-                    [{field, value} | acc]
-
-                  [] ->
-                    acc
-                end
+                [{field, value} | acc]
               else
                 acc
               end
@@ -606,21 +598,15 @@ defmodule Ferricstore.Store.Shard do
         # First check ETS for warm entries
         ets_results =
           :ets.foldl(
-            fn {key, exp}, acc ->
-              if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-                case :ets.lookup(state.hot_cache, key) do
-                  [{^key, value, _access_ms}] ->
-                    field =
-                      case :binary.split(key, <<0>>) do
-                        [_prefix_part, sub] -> sub
-                        _ -> key
-                      end
+            fn {key, value, exp, _lfu}, acc ->
+              if is_binary(key) and value != nil and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+                field =
+                  case :binary.split(key, <<0>>) do
+                    [_prefix_part, sub] -> sub
+                    _ -> key
+                  end
 
-                    [{field, value} | acc]
-
-                  [] ->
-                    acc
-                end
+                [{field, value} | acc]
               else
                 acc
               end
@@ -665,7 +651,7 @@ defmodule Ferricstore.Store.Shard do
 
         count =
           :ets.foldl(
-            fn {key, exp}, acc ->
+            fn {key, _value, exp, _lfu}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
                 acc + 1
               else
@@ -754,7 +740,6 @@ defmodule Ferricstore.Store.Shard do
           redis_key,
           state.store,
           state.keydir,
-          state.hot_cache,
           state.data_dir,
           state.index
         )
@@ -810,7 +795,6 @@ defmodule Ferricstore.Store.Shard do
           redis_key,
           state.store,
           state.keydir,
-          state.hot_cache,
           state.data_dir,
           state.index
         )
@@ -828,7 +812,10 @@ defmodule Ferricstore.Store.Shard do
   def handle_call({:put, key, value, expire_at_ms}, _from, state) do
     # Reject new-key writes when the keydir is at capacity (spec 2.4).
     # Updates to existing keys are always allowed regardless of memory pressure.
-    is_new = :ets.lookup(state.keydir, key) == []
+    is_new = case :ets.lookup(state.keydir, key) do
+      [] -> true
+      _ -> false
+    end
 
     if is_new and Ferricstore.MemoryGuard.reject_writes?() do
       {:reply, {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}, state}
@@ -1907,21 +1894,15 @@ defmodule Ferricstore.Store.Shard do
 
           results =
             :ets.foldl(
-              fn {key, exp}, acc ->
-                if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-                  case :ets.lookup(state.hot_cache, key) do
-                    [{^key, value, _access_ms}] ->
-                      field =
-                        case :binary.split(key, <<0>>) do
-                          [_prefix_part, sub] -> sub
-                          _ -> key
-                        end
+              fn {key, value, exp, _lfu}, acc ->
+                if is_binary(key) and value != nil and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+                  field =
+                    case :binary.split(key, <<0>>) do
+                      [_prefix_part, sub] -> sub
+                      _ -> key
+                    end
 
-                      [{field, value} | acc]
-
-                    [] ->
-                      acc
-                  end
+                  [{field, value} | acc]
                 else
                   acc
                 end
@@ -1941,7 +1922,7 @@ defmodule Ferricstore.Store.Shard do
           now = System.os_time(:millisecond)
 
           :ets.foldl(
-            fn {key, exp}, acc ->
+            fn {key, _value, exp, _lfu}, acc ->
               if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
                 acc + 1
               else
@@ -2706,23 +2687,19 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Inserts a key/value/expiry into both the keydir and hot_cache tables,
-  # and updates the prefix index. The hot_cache entry includes the current
-  # wall-clock time as `last_access_ms` for approximate LRU eviction.
+  # Inserts a key/value/expiry into the single keydir table with LFU counter,
+  # and updates the prefix index. New keys start at LFU counter 5.
   defp ets_insert(state, key, value, expire_at_ms) do
-    :ets.insert(state.keydir, {key, expire_at_ms})
-    :ets.insert(state.hot_cache, {key, value, System.os_time(:millisecond)})
+    :ets.insert(state.keydir, {key, value, expire_at_ms, @lfu_initial_counter})
 
     if state.prefix_keys do
       PrefixIndex.track(state.prefix_keys, key, state.index)
     end
   end
 
-  # Deletes a key from both the keydir and hot_cache tables,
-  # and removes it from the prefix index.
+  # Deletes a key from the keydir table and removes it from the prefix index.
   defp ets_delete_key(state, key) do
     :ets.delete(state.keydir, key)
-    :ets.delete(state.hot_cache, key)
 
     if state.prefix_keys do
       PrefixIndex.untrack(state.prefix_keys, key, state.index)
@@ -2730,39 +2707,49 @@ defmodule Ferricstore.Store.Shard do
   end
 
   # Classifies an ETS lookup as a cache hit, expired entry, or miss.
-  # Expired entries are evicted immediately from both keydir and hot_cache.
-  # On a hit, the hot_cache entry's last_access_ms is touched for LRU tracking.
-  defp ets_lookup(%{keydir: keydir, hot_cache: hot_cache}, key) do
+  # Single-table format: {key, value | nil, expire_at_ms, lfu_counter}
+  # A hit requires value != nil (hot). value = nil means cold (evicted from RAM).
+  # On a hit, probabilistically increments the LFU counter.
+  defp ets_lookup(%{keydir: keydir}, key) do
     now = System.os_time(:millisecond)
 
     case :ets.lookup(keydir, key) do
-      [{^key, 0}] ->
-        case :ets.lookup(hot_cache, key) do
-          [{^key, value, _access_ms}] ->
-            :ets.insert(hot_cache, {key, value, now})
-            {:hit, value, 0}
+      [{^key, value, 0, lfu}] when value != nil ->
+        lfu_touch(keydir, key, lfu)
+        {:hit, value, 0}
 
-          [] ->
-            :miss
-        end
+      [{^key, nil, 0, _lfu}] ->
+        # Cold key (evicted from RAM) with no expiry -- miss for ETS,
+        # caller should fall through to Bitcask.
+        :miss
 
-      [{^key, exp}] when exp > now ->
-        case :ets.lookup(hot_cache, key) do
-          [{^key, value, _access_ms}] ->
-            :ets.insert(hot_cache, {key, value, now})
-            {:hit, value, exp}
+      [{^key, value, exp, lfu}] when exp > now and value != nil ->
+        lfu_touch(keydir, key, lfu)
+        {:hit, value, exp}
 
-          [] ->
-            :miss
-        end
+      [{^key, nil, exp, _lfu}] when exp > now ->
+        # Cold key with valid TTL -- miss for ETS
+        :miss
 
-      [{^key, _exp}] ->
+      [{^key, _value, _exp, _lfu}] ->
+        # Expired entry -- delete it
         :ets.delete(keydir, key)
-        :ets.delete(hot_cache, key)
         :expired
 
       [] ->
         :miss
+    end
+  end
+
+  # Probabilistic LFU counter increment. Higher counters are harder to
+  # increment, following a logarithmic distribution. This prevents hot keys
+  # from saturating the counter space too quickly.
+  defp lfu_touch(keydir, key, counter) do
+    log_factor = Application.get_env(:ferricstore, :lfu_log_factor, 10)
+
+    if :rand.uniform() < 1.0 / (counter * log_factor + 1) do
+      new_counter = min(counter + 1, 255)
+      :ets.update_element(keydir, key, {4, new_counter})
     end
   end
 
@@ -2772,7 +2759,13 @@ defmodule Ferricstore.Store.Shard do
         nil
 
       {:ok, value} ->
-        ets_insert(state, key, value, 0)
+        # Re-warm: check if there's an existing cold entry to preserve expiry
+        case :ets.lookup(state.keydir, key) do
+          [{^key, nil, exp, _lfu}] ->
+            :ets.insert(state.keydir, {key, value, exp, @lfu_initial_counter})
+          _ ->
+            ets_insert(state, key, value, 0)
+        end
         value
 
       _error ->
@@ -2786,8 +2779,14 @@ defmodule Ferricstore.Store.Shard do
         nil
 
       {:ok, value} ->
-        ets_insert(state, key, value, 0)
-        {value, 0}
+        case :ets.lookup(state.keydir, key) do
+          [{^key, nil, exp, _lfu}] ->
+            :ets.insert(state.keydir, {key, value, exp, @lfu_initial_counter})
+            {value, exp}
+          _ ->
+            ets_insert(state, key, value, 0)
+            {value, 0}
+        end
 
       _error ->
         nil
@@ -2804,8 +2803,8 @@ defmodule Ferricstore.Store.Shard do
 
   defp key_alive?(keydir, key, now) do
     case :ets.lookup(keydir, key) do
-      [{_, 0}] -> true
-      [{_, exp}] -> exp > now
+      [{_, _, 0, _}] -> true
+      [{_, _, exp, _}] -> exp > now
       [] -> true
     end
   end
@@ -2956,8 +2955,10 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp scan_expired(keydir, now, limit) do
+    # Single-table format: {key, value, expire_at_ms, lfu_counter}
+    # Match entries where expire_at_ms > 0 and expire_at_ms <= now
     match_spec = [
-      {{:"$1", :"$2"},
+      {{:"$1", :_, :"$2", :_},
        [{:andalso, {:>, :"$2", 0}, {:"=<", :"$2", now}}],
        [:"$1"]}
     ]
@@ -3039,7 +3040,7 @@ defmodule Ferricstore.Store.Shard do
 
           count =
             :ets.foldl(
-              fn {key, exp}, acc ->
+              fn {key, _value, exp, _lfu}, acc ->
                 if is_binary(key) and String.starts_with?(key, prefix) and
                      (exp == 0 or exp > now) do
                   acc + 1
@@ -3061,7 +3062,6 @@ defmodule Ferricstore.Store.Shard do
                    redis_key,
                    state.store,
                    state.keydir,
-                   state.hot_cache,
                    state.data_dir,
                    state.index
                  ) do

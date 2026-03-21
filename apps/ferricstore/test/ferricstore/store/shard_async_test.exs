@@ -289,18 +289,19 @@ defmodule Ferricstore.Store.ShardAsyncTest do
       {pid, index, dir} = start_shard()
       on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
 
-      ets = :"hot_cache_#{index}"
+      # Shard uses single-table format: {key, value, expire_at_ms, lfu_counter} in keydir
+      ets = :"keydir_#{index}"
       :ok = GenServer.call(pid, {:put, "ets_sync", "val", 0})
 
       # ETS must have the value immediately (sync write in put handler)
-      assert [{_, "val", _}] = :ets.lookup(ets, "ets_sync")
+      assert [{"ets_sync", "val", 0, _lfu}] = :ets.lookup(ets, "ets_sync")
     end
 
     test "delete clears ETS entry" do
       {pid, index, dir} = start_shard()
       on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
 
-      ets = :"hot_cache_#{index}"
+      ets = :"keydir_#{index}"
       :ok = GenServer.call(pid, {:put, "ets_del", "val", 0})
       :ok = GenServer.call(pid, {:delete, "ets_del"})
 

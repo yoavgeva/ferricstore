@@ -342,8 +342,7 @@ impl CuckooFilter {
             return Err(format!("cuckoo: unsupported version {}", data[2]));
         }
 
-        let num_buckets =
-            u32::from_le_bytes([data[3], data[4], data[5], data[6]]) as usize;
+        let num_buckets = u32::from_le_bytes([data[3], data[4], data[5], data[6]]) as usize;
         let bucket_size = data[7] as usize;
         let fingerprint_size = data[8] as usize;
         let max_kicks = u16::from_le_bytes([data[9], data[10]]) as u32;
@@ -438,7 +437,11 @@ pub fn cuckoo_create(
 /// Returns `:ok` or `{:error, "filter is full"}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_add<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>, item: Binary<'a>) -> NifResult<Term<'a>> {
+pub fn cuckoo_add<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<CuckooResource>,
+    item: Binary<'a>,
+) -> NifResult<Term<'a>> {
     let mut filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     match filter.add(item.as_slice()) {
         Ok(()) => Ok(atoms::ok().encode(env)),
@@ -450,7 +453,11 @@ pub fn cuckoo_add<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>, item:
 /// Returns 0 (already present) or 1 (added), or `{:error, ...}` if full.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_addnx<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>, item: Binary<'a>) -> NifResult<Term<'a>> {
+pub fn cuckoo_addnx<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<CuckooResource>,
+    item: Binary<'a>,
+) -> NifResult<Term<'a>> {
     let mut filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     match filter.addnx(item.as_slice()) {
         Ok(val) => Ok(val.encode(env)),
@@ -462,7 +469,11 @@ pub fn cuckoo_addnx<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>, ite
 /// Returns 0 (not found) or 1 (deleted).
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_del<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>, item: Binary<'a>) -> NifResult<Term<'a>> {
+pub fn cuckoo_del<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<CuckooResource>,
+    item: Binary<'a>,
+) -> NifResult<Term<'a>> {
     let mut filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let result = filter.delete(item.as_slice());
     Ok(result.encode(env))
@@ -472,7 +483,11 @@ pub fn cuckoo_del<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>, item:
 /// Returns 0 or 1.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_exists<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>, item: Binary<'a>) -> NifResult<Term<'a>> {
+pub fn cuckoo_exists<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<CuckooResource>,
+    item: Binary<'a>,
+) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let result: u64 = if filter.exists(item.as_slice()) { 1 } else { 0 };
     Ok(result.encode(env))
@@ -497,7 +512,11 @@ pub fn cuckoo_mexists<'a>(
 /// Returns a non-negative integer.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_count<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>, item: Binary<'a>) -> NifResult<Term<'a>> {
+pub fn cuckoo_count<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<CuckooResource>,
+    item: Binary<'a>,
+) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let result = filter.count(item.as_slice());
     Ok(result.encode(env))
@@ -529,7 +548,10 @@ pub fn cuckoo_info<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>) -> N
 /// Returns `{:ok, binary}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_serialize<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>) -> NifResult<Term<'a>> {
+pub fn cuckoo_serialize<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<CuckooResource>,
+) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let bytes = filter.serialize();
     let mut bin = OwnedBinary::new(bytes.len()).ok_or(rustler::Error::BadArg)?;
@@ -559,30 +581,77 @@ pub fn cuckoo_deserialize<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<
 
 /// Standard MD5 per-round shift amounts.
 const S: [u32; 64] = [
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
+    14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15,
+    21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
 ];
 
 /// Pre-computed table: T[i] = floor(2^32 * |sin(i+1)|).
 const K: [u32; 64] = [
-    0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
-    0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
-    0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be,
-    0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821,
-    0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa,
-    0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8,
-    0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
-    0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a,
-    0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c,
-    0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70,
-    0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05,
-    0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665,
-    0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039,
-    0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
-    0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
-    0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
+    0xd76a_a478,
+    0xe8c7_b756,
+    0x2420_70db,
+    0xc1bd_ceee,
+    0xf57c_0faf,
+    0x4787_c62a,
+    0xa830_4613,
+    0xfd46_9501,
+    0x6980_98d8,
+    0x8b44_f7af,
+    0xffff_5bb1,
+    0x895c_d7be,
+    0x6b90_1122,
+    0xfd98_7193,
+    0xa679_438e,
+    0x49b4_0821,
+    0xf61e_2562,
+    0xc040_b340,
+    0x265e_5a51,
+    0xe9b6_c7aa,
+    0xd62f_105d,
+    0x0244_1453,
+    0xd8a1_e681,
+    0xe7d3_fbc8,
+    0x21e1_cde6,
+    0xc337_07d6,
+    0xf4d5_0d87,
+    0x455a_14ed,
+    0xa9e3_e905,
+    0xfcef_a3f8,
+    0x676f_02d9,
+    0x8d2a_4c8a,
+    0xfffa_3942,
+    0x8771_f681,
+    0x6d9d_6122,
+    0xfde5_380c,
+    0xa4be_ea44,
+    0x4bde_cfa9,
+    0xf6bb_4b60,
+    0xbebf_bc70,
+    0x289b_7ec6,
+    0xeaa1_27fa,
+    0xd4ef_3085,
+    0x0488_1d05,
+    0xd9d4_d039,
+    0xe6db_99e5,
+    0x1fa2_7cf8,
+    0xc4ac_5665,
+    0xf429_2244,
+    0x432a_ff97,
+    0xab94_23a7,
+    0xfc93_a039,
+    0x655b_59c3,
+    0x8f0c_cc92,
+    0xffef_f47d,
+    0x8584_5dd1,
+    0x6fa8_7e4f,
+    0xfe2c_e6e0,
+    0xa301_4314,
+    0x4e08_11a1,
+    0xf753_7e82,
+    0xbd3a_f235,
+    0x2ad7_d2bb,
+    0xeb86_d391,
 ];
 
 /// Compute MD5 hash of `input`, returning the 16-byte digest.
@@ -606,7 +675,8 @@ fn md5_hash(input: &[u8]) -> [u8; 16] {
         let mut m = [0u32; 16];
         for (i, word) in m.iter_mut().enumerate() {
             let off = i * 4;
-            *word = u32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+            *word =
+                u32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
         }
 
         let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
@@ -740,7 +810,10 @@ mod tests {
         // Test many elements to increase chance of hitting the zero case.
         for i in 0..10_000 {
             let fp = f.fingerprint(format!("elem_{i}").as_bytes());
-            assert!(!fp.iter().all(|&b| b == 0), "fingerprint was all zeros for elem_{i}");
+            assert!(
+                !fp.iter().all(|&b| b == 0),
+                "fingerprint was all zeros for elem_{i}"
+            );
         }
     }
 
@@ -943,7 +1016,10 @@ mod tests {
     fn deserialize_all_zeros_returns_error() {
         let zeros = vec![0u8; 100];
         let result = CuckooFilter::deserialize(&zeros);
-        assert!(result.is_err(), "all-zero bytes must fail deserialization (bad magic)");
+        assert!(
+            result.is_err(),
+            "all-zero bytes must fail deserialization (bad magic)"
+        );
     }
 
     #[test]

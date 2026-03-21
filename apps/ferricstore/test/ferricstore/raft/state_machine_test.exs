@@ -72,37 +72,36 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "apply/3 with {:put, key, value, expire_at_ms}" do
-    test "writes value to Bitcask and ETS", %{state: state, ets: ets, hot_cache: hot_cache, store: store} do
+    test "writes value to Bitcask and ETS", %{state: state, ets: ets, store: store} do
       {new_state, result} =
         StateMachine.apply(%{}, {:put, "key1", "value1", 0}, state)
 
       assert result == :ok
       assert new_state.applied_count == 1
 
-      # Verify ETS
-      assert [{_, "value1", _}] = :ets.lookup(hot_cache, "key1")
+      # Verify ETS (single-table format: {key, value, expire_at_ms, lfu_counter})
+      assert [{"key1", "value1", 0, _lfu}] = :ets.lookup(ets, "key1")
 
       # Verify Bitcask
       assert {:ok, "value1"} = NIF.get(store, "key1")
     end
 
-    test "put with expiry stores expire_at_ms", %{state: state, ets: ets, hot_cache: hot_cache} do
+    test "put with expiry stores expire_at_ms", %{state: state, ets: ets} do
       future = System.os_time(:millisecond) + 60_000
 
       {_new_state, result} =
         StateMachine.apply(%{}, {:put, "expiring", "val", future}, state)
 
       assert result == :ok
-      assert [{_, ^future}] = :ets.lookup(ets, "expiring")
-      assert [{_, "val", _}] = :ets.lookup(hot_cache, "expiring")
+      assert [{"expiring", "val", ^future, _lfu}] = :ets.lookup(ets, "expiring")
     end
 
-    test "put overwrites previous value", %{state: state, ets: ets, hot_cache: hot_cache} do
+    test "put overwrites previous value", %{state: state, ets: ets} do
       {state2, :ok} = StateMachine.apply(%{}, {:put, "k", "v1", 0}, state)
       {state3, :ok} = StateMachine.apply(%{}, {:put, "k", "v2", 0}, state2)
 
       assert state3.applied_count == 2
-      assert [{_, "v2", _}] = :ets.lookup(hot_cache, "k")
+      assert [{"k", "v2", 0, _lfu}] = :ets.lookup(ets, "k")
     end
 
     test "increments applied_count on each put", %{state: state} do
@@ -144,7 +143,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "apply/3 with {:batch, commands}" do
-    test "processes all commands and returns results list", %{state: state, ets: ets, hot_cache: hot_cache} do
+    test "processes all commands and returns results list", %{state: state, ets: ets} do
       commands = [
         {:put, "batch_a", "val_a", 0},
         {:put, "batch_b", "val_b", 0},
@@ -157,13 +156,13 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert results == [:ok, :ok, :ok]
       assert new_state.applied_count == 3
 
-      # All keys in ETS
-      assert [{_, "val_a", _}] = :ets.lookup(hot_cache, "batch_a")
-      assert [{_, "val_b", _}] = :ets.lookup(hot_cache, "batch_b")
-      assert [{_, "val_c", _}] = :ets.lookup(hot_cache, "batch_c")
+      # All keys in ETS (single-table format)
+      assert [{"batch_a", "val_a", 0, _}] = :ets.lookup(ets, "batch_a")
+      assert [{"batch_b", "val_b", 0, _}] = :ets.lookup(ets, "batch_b")
+      assert [{"batch_c", "val_c", 0, _}] = :ets.lookup(ets, "batch_c")
     end
 
-    test "mixed put and delete batch", %{state: state, ets: ets, hot_cache: hot_cache} do
+    test "mixed put and delete batch", %{state: state, ets: ets} do
       {state2, :ok} = StateMachine.apply(%{}, {:put, "mix_a", "va", 0}, state)
 
       commands = [
@@ -179,8 +178,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert new_state.applied_count == 4
 
       assert [] == :ets.lookup(ets, "mix_a")
-      assert [{_, "vb", _}] = :ets.lookup(hot_cache, "mix_b")
-      assert [{_, "vc", _}] = :ets.lookup(hot_cache, "mix_c")
+      assert [{"mix_b", "vb", 0, _}] = :ets.lookup(ets, "mix_b")
+      assert [{"mix_c", "vc", 0, _}] = :ets.lookup(ets, "mix_c")
     end
 
     test "empty batch returns empty results", %{state: state} do

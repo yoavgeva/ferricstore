@@ -404,7 +404,11 @@ pub fn topk_create(env: Env, k: usize, width: usize, depth: usize, decay: f64) -
 /// (nil for no eviction, string for evicted element name).
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn topk_add(env: Env, resource: ResourceArc<TopKResource>, items: Vec<String>) -> NifResult<Term> {
+pub fn topk_add(
+    env: Env,
+    resource: ResourceArc<TopKResource>,
+    items: Vec<String>,
+) -> NifResult<Term> {
     let mut topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
 
     let results: Vec<Term> = items
@@ -453,7 +457,10 @@ pub fn topk_query(
 ) -> NifResult<Term> {
     let topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
 
-    let results: Vec<i32> = items.iter().map(|item| if topk.query(item) { 1 } else { 0 }).collect();
+    let results: Vec<i32> = items
+        .iter()
+        .map(|item| if topk.query(item) { 1 } else { 0 })
+        .collect();
 
     Ok(results.encode(env))
 }

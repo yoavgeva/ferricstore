@@ -268,41 +268,44 @@ defmodule Ferricstore.MemoryGuard do
   # pressure is at :pressure or :reject level.
   defp maybe_evict(%{eviction_policy: :noeviction}), do: :ok
 
-  defp maybe_evict(%{eviction_policy: policy, shard_count: shard_count}) when policy in [:volatile_lru, :allkeys_lru, :volatile_ttl] do
+  defp maybe_evict(%{eviction_policy: policy, shard_count: shard_count}) when policy in [:volatile_lfu, :allkeys_lfu, :volatile_lru, :allkeys_lru, :volatile_ttl] do
     evicted =
       Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
         keydir = :"keydir_#{i}"
-        hot_cache = :"hot_cache_#{i}"
         now = System.os_time(:millisecond)
 
         try do
-          # Find keys eligible for eviction
+          # Sample hot entries (value != nil) eligible for eviction
           eligible =
-            :ets.foldl(fn {key, exp}, found ->
+            :ets.foldl(fn {key, value, exp, lfu}, found ->
               cond do
                 length(found) >= 10 -> found
-                policy == :volatile_lru and exp > 0 and exp > now -> [{key, exp} | found]
-                policy == :volatile_ttl and exp > 0 and exp > now -> [{key, exp} | found]
-                policy == :allkeys_lru -> [{key, exp} | found]
+                value == nil -> found  # Already cold, skip
+                policy in [:volatile_lfu, :volatile_lru] and exp > 0 and exp > now -> [{key, exp, lfu} | found]
+                policy == :volatile_ttl and exp > 0 and exp > now -> [{key, exp, lfu} | found]
+                policy in [:allkeys_lfu, :allkeys_lru] -> [{key, exp, lfu} | found]
                 true -> found
               end
             end, [], keydir)
 
           if eligible != [] do
-            # For volatile_ttl, sort by TTL ascending (evict shortest TTL first)
             to_evict =
               case policy do
                 :volatile_ttl ->
-                  eligible |> Enum.sort_by(fn {_k, exp} -> exp end) |> Enum.take(5)
+                  # Sort by TTL ascending (evict shortest TTL first)
+                  eligible |> Enum.sort_by(fn {_k, exp, _lfu} -> exp end) |> Enum.take(5)
+                p when p in [:volatile_lfu, :allkeys_lfu] ->
+                  # Sort by LFU counter ascending (evict lowest frequency first)
+                  eligible |> Enum.sort_by(fn {_k, _exp, lfu} -> lfu end) |> Enum.take(5)
                 _ ->
+                  # LRU fallback: take first 5 from sample
                   Enum.take(eligible, 5)
               end
 
-            # Only remove from hot_cache -- keydir and Bitcask are untouched.
-            # The key stays discoverable via keydir and its value stays on disk.
-            # Next GET: keydir hit -> hot_cache miss -> pread from Bitcask -> warm back.
-            Enum.each(to_evict, fn {key, _exp} ->
-              :ets.delete(hot_cache, key)
+            # Eviction = set value to nil. Key stays in keydir, data stays on disk.
+            # Next GET: keydir hit with nil value -> fall through to Bitcask -> re-warm.
+            Enum.each(to_evict, fn {key, _exp, _lfu} ->
+              :ets.update_element(keydir, key, {2, nil})
             end)
 
             acc + length(to_evict)
@@ -324,22 +327,20 @@ defmodule Ferricstore.MemoryGuard do
   defp maybe_evict(_state), do: :ok
 
   defp compute_stats(state) do
-    {keydir_bytes, hot_cache_bytes, shard_stats} =
-      Enum.reduce(0..(state.shard_count - 1), {0, 0, %{}}, fn i, {kd_acc, hc_acc, shards_acc} ->
+    {keydir_bytes, shard_stats} =
+      Enum.reduce(0..(state.shard_count - 1), {0, %{}}, fn i, {kd_acc, shards_acc} ->
         kd_bytes = safe_ets_memory(:"keydir_#{i}")
-        hc_bytes = safe_ets_memory(:"hot_cache_#{i}")
-        bytes = kd_bytes + hc_bytes
         per_shard_max = div(state.max_memory_bytes, max(state.shard_count, 1))
         ratio =
           cond do
-            per_shard_max > 0 -> bytes / per_shard_max
-            bytes > 0 -> 1.0
+            per_shard_max > 0 -> kd_bytes / per_shard_max
+            kd_bytes > 0 -> 1.0
             true -> 0.0
           end
-        {kd_acc + kd_bytes, hc_acc + hc_bytes, Map.put(shards_acc, i, %{bytes: bytes, ratio: ratio})}
+        {kd_acc + kd_bytes, Map.put(shards_acc, i, %{bytes: kd_bytes, ratio: ratio})}
       end)
 
-    total_bytes = keydir_bytes + hot_cache_bytes
+    total_bytes = keydir_bytes
     ratio = if state.max_memory_bytes > 0, do: total_bytes / state.max_memory_bytes, else: 0.0
     pressure_level = classify_pressure(ratio)
 
@@ -351,7 +352,7 @@ defmodule Ferricstore.MemoryGuard do
       ratio: ratio, pressure_level: pressure_level,
       shards: shard_stats, eviction_policy: state.eviction_policy,
       keydir_bytes: keydir_bytes,
-      hot_cache_bytes: hot_cache_bytes,
+      hot_cache_bytes: 0,
       keydir_max_ram: state.keydir_max_ram,
       hot_cache_max_ram: state.hot_cache_max_ram,
       hot_cache_min_ram: state.hot_cache_min_ram,

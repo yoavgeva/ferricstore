@@ -143,15 +143,14 @@ defmodule Ferricstore.Store.PrefixIndex do
       :ets.lookup(prefix_table, prefix)
       |> Enum.reduce([], fn {_prefix, key}, acc ->
         case :ets.lookup(keydir, key) do
+          # Single-table format: {key, value | nil, expire_at_ms, lfu_counter}
           # No expiry set -- live
-          [{^key, 0}] -> [key | acc]
+          [{^key, _value, 0, _lfu}] -> [key | acc]
           # Has TTL, not yet expired -- live
-          [{^key, exp}] when exp > now -> [key | acc]
+          [{^key, _value, exp, _lfu}] when exp > now -> [key | acc]
           # Has TTL, expired -- skip
-          [{^key, _exp}] -> acc
-          # Not in keydir (cold key, loaded from Bitcask at init but not
-          # yet warmed into ETS). Considered live (Bitcask keys have no
-          # TTL until warmed).
+          [{^key, _value, _exp, _lfu}] -> acc
+          # Not in keydir -- considered live (may be in Bitcask)
           [] -> [key | acc]
         end
       end)
@@ -170,7 +169,7 @@ defmodule Ferricstore.Store.PrefixIndex do
   @spec rebuild_from_keydir(atom(), atom()) :: :ok
   def rebuild_from_keydir(prefix_table, keydir) do
     :ets.foldl(
-      fn {key, _exp}, :ok ->
+      fn {key, _value, _exp, _lfu}, :ok ->
         case extract_prefix(key) do
           nil -> :ok
           prefix ->

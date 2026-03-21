@@ -541,19 +541,17 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       end)
 
       keydir = :"keydir_#{index}"
-      hot_cache = :"hot_cache_#{index}"
 
       # Put via GenServer (writes to both NIF and ETS)
       :ok = GenServer.call(pid, {:put, "warm_test", "warm_value", 0})
 
       # Manually evict from ETS to simulate a cache miss
       :ets.delete(keydir, "warm_test")
-      :ets.delete(hot_cache, "warm_test")
-      assert [] == :ets.lookup(hot_cache, "warm_test")
+      assert [] == :ets.lookup(keydir, "warm_test")
 
-      # Get should warm ETS from NIF
+      # Get should warm ETS from NIF (single-table format)
       assert "warm_value" == GenServer.call(pid, {:get, "warm_test"})
-      assert [{_, "warm_value", _}] = :ets.lookup(hot_cache, "warm_test")
+      assert [{"warm_test", "warm_value", 0, _lfu}] = :ets.lookup(keydir, "warm_test")
     end
   end
 
@@ -566,15 +564,14 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       end)
 
       keydir = :"keydir_#{index}"
-      hot_cache = :"hot_cache_#{index}"
 
       # Write a key with 100ms TTL
       expire_at = System.os_time(:millisecond) + 100
       :ok = GenServer.call(pid, {:put, "lazy_exp", "temp_val", expire_at})
 
       # Confirm it's in ETS
-      assert [{_, ^expire_at}] = :ets.lookup(keydir, "lazy_exp")
-      assert [{_, "temp_val", _}] = :ets.lookup(hot_cache, "lazy_exp")
+      # Single-table format: {key, value, expire_at_ms, lfu_counter}
+      assert [{"lazy_exp", "temp_val", ^expire_at, _lfu}] = :ets.lookup(keydir, "lazy_exp")
 
       # Wait for expiry
       Process.sleep(200)
@@ -582,7 +579,6 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       # Get should return nil and evict from ETS
       assert nil == GenServer.call(pid, {:get, "lazy_exp"})
       assert [] == :ets.lookup(keydir, "lazy_exp")
-      assert [] == :ets.lookup(hot_cache, "lazy_exp")
     end
   end
 
@@ -634,18 +630,15 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       end)
 
       keydir = :"keydir_#{index}"
-      hot_cache = :"hot_cache_#{index}"
 
       :ok = GenServer.call(pid, {:put, "meta_warm", "mw_val", 0})
 
       # Clear ETS to force NIF fallback
       :ets.delete(keydir, "meta_warm")
-      :ets.delete(hot_cache, "meta_warm")
 
       assert {"mw_val", 0} == GenServer.call(pid, {:get_meta, "meta_warm"})
-      # Verify ETS was warmed
-      assert [{_, "mw_val", _}] = :ets.lookup(hot_cache, "meta_warm")
-      assert [{_, 0}] = :ets.lookup(keydir, "meta_warm")
+      # Verify ETS was warmed (single-table format)
+      assert [{"meta_warm", "mw_val", 0, _lfu}] = :ets.lookup(keydir, "meta_warm")
     end
   end
 

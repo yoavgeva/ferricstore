@@ -642,7 +642,13 @@ pub fn vsearch_nif(
     drop(index);
 
     // Consume timeslice proportionally to index size
-    let pct = if n < 1_000 { 10 } else if n < 10_000 { 50 } else { 100 };
+    let pct = if n < 1_000 {
+        10
+    } else if n < 10_000 {
+        50
+    } else {
+        100
+    };
     let _ = consume_timeslice(env, pct);
 
     let terms: Vec<(String, f64)> = results
@@ -802,8 +808,11 @@ mod tests {
                 .map(|(i, v)| (i, distance(Metric::L2, query, v)))
                 .collect();
             dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            let brute_top10: std::collections::HashSet<String> =
-                dists.iter().take(10).map(|(i, _)| format!("v{i}")).collect();
+            let brute_top10: std::collections::HashSet<String> = dists
+                .iter()
+                .take(10)
+                .map(|(i, _)| format!("v{i}"))
+                .collect();
 
             // HNSW top-10
             let hnsw_results = index.search(query, 10, 200);

@@ -72,15 +72,17 @@ defmodule Ferricstore.Store.Promotion do
     NIF.new(path)
   end
 
-  @spec promote_hash!(binary(), reference(), atom(), atom(), binary(), non_neg_integer()) ::
+  @lfu_initial_counter 5
+
+  @spec promote_hash!(binary(), reference(), atom(), binary(), non_neg_integer()) ::
           {:ok, reference()} | {:error, term()}
-  def promote_hash!(redis_key, shared_store, keydir, hot_cache, data_dir, shard_index) do
-    promote_collection!(:hash, redis_key, shared_store, keydir, hot_cache, data_dir, shard_index)
+  def promote_hash!(redis_key, shared_store, keydir, data_dir, shard_index) do
+    promote_collection!(:hash, redis_key, shared_store, keydir, data_dir, shard_index)
   end
 
-  @spec promote_collection!(atom(), binary(), reference(), atom(), atom(), binary(), non_neg_integer()) ::
+  @spec promote_collection!(atom(), binary(), reference(), atom(), binary(), non_neg_integer()) ::
           {:ok, reference()} | {:error, term()}
-  def promote_collection!(type, redis_key, shared_store, keydir, hot_cache, data_dir, shard_index) do
+  def promote_collection!(type, redis_key, shared_store, keydir, data_dir, shard_index) do
     prefix = compound_prefix_for(type, redis_key)
     type_str = CompoundKey.encode_type(type)
     type_label = type_label(type)
@@ -88,12 +90,9 @@ defmodule Ferricstore.Store.Promotion do
 
     entries =
       :ets.foldl(
-        fn {key, exp}, acc ->
-          if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
-            case :ets.lookup(hot_cache, key) do
-              [{^key, value, _access_ms}] -> [{key, value, exp} | acc]
-              [] -> acc
-            end
+        fn {key, value, exp, _lfu}, acc ->
+          if is_binary(key) and value != nil and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
+            [{key, value, exp} | acc]
           else
             acc
           end
@@ -111,14 +110,12 @@ defmodule Ferricstore.Store.Promotion do
 
         Enum.each(entries, fn {key, _value, _exp} ->
           :ets.delete(keydir, key)
-          :ets.delete(hot_cache, key)
           NIF.delete(shared_store, key)
         end)
 
         mk = marker_key(redis_key)
         NIF.put(shared_store, mk, type_str, 0)
-        :ets.insert(keydir, {mk, 0})
-        :ets.insert(hot_cache, {mk, type_str, System.os_time(:millisecond)})
+        :ets.insert(keydir, {mk, type_str, 0, @lfu_initial_counter})
 
         Logger.info(
           "Promoted #{type_label} #{inspect(redis_key)} to dedicated Bitcask " <>
@@ -136,17 +133,14 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  @spec recover_promoted(reference(), atom(), atom(), binary(), non_neg_integer()) :: map()
-  def recover_promoted(shared_store, keydir, hot_cache, data_dir, shard_index) do
+  @spec recover_promoted(reference(), atom(), binary(), non_neg_integer()) :: map()
+  def recover_promoted(shared_store, keydir, data_dir, shard_index) do
     markers =
       :ets.foldl(
-        fn {key, _exp}, acc ->
+        fn {key, value, _exp, _lfu}, acc ->
           case key do
-            <<"PM:", redis_key::binary>> ->
-              case :ets.lookup(hot_cache, key) do
-                [{^key, type_str, _access_ms}] -> [{redis_key, type_str} | acc]
-                [] -> acc
-              end
+            <<"PM:", redis_key::binary>> when value != nil ->
+              [{redis_key, value} | acc]
 
             _ ->
               acc
@@ -162,8 +156,7 @@ defmodule Ferricstore.Store.Promotion do
       Enum.filter(bitcask_keys, &String.starts_with?(&1, @promotion_marker_prefix))
       |> Enum.map(fn <<"PM:", redis_key::binary>> ->
         {:ok, type_str} = NIF.get_zero_copy(shared_store, marker_key(redis_key))
-        :ets.insert(keydir, {marker_key(redis_key), 0})
-        :ets.insert(hot_cache, {marker_key(redis_key), type_str, System.os_time(:millisecond)})
+        :ets.insert(keydir, {marker_key(redis_key), type_str, 0, @lfu_initial_counter})
         {redis_key, type_str}
       end)
 
@@ -178,11 +171,8 @@ defmodule Ferricstore.Store.Promotion do
         {:ok, dedicated_store} ->
           case NIF.get_all(dedicated_store) do
             {:ok, pairs} ->
-              now_ms = System.os_time(:millisecond)
-
               Enum.each(pairs, fn {k, v} ->
-                :ets.insert(keydir, {k, 0})
-                :ets.insert(hot_cache, {k, v, now_ms})
+                :ets.insert(keydir, {k, v, 0, @lfu_initial_counter})
               end)
 
             _ ->
@@ -201,14 +191,16 @@ defmodule Ferricstore.Store.Promotion do
     end)
   end
 
-  @spec cleanup_promoted!(binary(), reference(), atom(), atom(), binary(), non_neg_integer()) :: :ok
-  def cleanup_promoted!(redis_key, shared_store, keydir, hot_cache, data_dir, shard_index) do
+  @spec cleanup_promoted!(binary(), reference(), atom(), binary(), non_neg_integer()) :: :ok
+  def cleanup_promoted!(redis_key, shared_store, keydir, data_dir, shard_index) do
     mk = marker_key(redis_key)
 
     type =
-      case :ets.lookup(hot_cache, mk) do
-        [{^mk, type_str, _access_ms}] -> CompoundKey.decode_type(type_str)
-        [] ->
+      case :ets.lookup(keydir, mk) do
+        [{^mk, type_str, _exp, _lfu}] when type_str != nil ->
+          CompoundKey.decode_type(type_str)
+
+        _ ->
           case NIF.get_zero_copy(shared_store, mk) do
             {:ok, type_str} when is_binary(type_str) -> CompoundKey.decode_type(type_str)
             _ -> :hash
@@ -219,7 +211,6 @@ defmodule Ferricstore.Store.Promotion do
 
     NIF.delete(shared_store, mk)
     :ets.delete(keydir, mk)
-    :ets.delete(hot_cache, mk)
 
     path = dedicated_path(data_dir, shard_index, type, redis_key)
 

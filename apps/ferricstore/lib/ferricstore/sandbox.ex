@@ -182,18 +182,17 @@ defmodule FerricStore.Sandbox do
 
     Enum.each(0..(shard_count - 1), fn i ->
       keydir = :"keydir_#{i}"
-      hot_cache = :"hot_cache_#{i}"
 
       try do
-        # Scan the keydir table for keys with the namespace prefix and delete them.
+        # Scan the single keydir table for keys with the namespace prefix
+        # and delete them. Format: {key, value, expire_at_ms, lfu_counter}
         keys =
           :ets.tab2list(keydir)
-          |> Enum.filter(fn {key, _exp} -> String.starts_with?(key, namespace) end)
-          |> Enum.map(fn {key, _exp} -> key end)
+          |> Enum.filter(fn {key, _value, _exp, _lfu} -> String.starts_with?(key, namespace) end)
+          |> Enum.map(fn {key, _value, _exp, _lfu} -> key end)
 
         Enum.each(keys, fn key ->
           :ets.delete(keydir, key)
-          :ets.delete(hot_cache, key)
           # Also delete from the underlying Bitcask store via Router.delete
           Router.delete(key)
         end)

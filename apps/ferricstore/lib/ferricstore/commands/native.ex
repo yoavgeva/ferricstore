@@ -73,7 +73,6 @@ defmodule Ferricstore.Commands.Native do
   defp do_key_info(key) do
     idx = Router.shard_for(key)
     keydir = :"keydir_#{idx}"
-    hot_cache = :"hot_cache_#{idx}"
     now = System.os_time(:millisecond)
     shard = Router.shard_name(idx)
 
@@ -87,19 +86,19 @@ defmodule Ferricstore.Commands.Native do
     type = Ferricstore.Store.TypeRegistry.get_type(key, store)
     alive? = type != "none"
 
-    {value, expire_at_ms} =
+    {value, expire_at_ms, hot_status} =
       if alive? do
-        {val, exp, _hot, _ok} = ets_key_info(keydir, hot_cache, key, now)
+        {val, exp, hot} = ets_key_info(keydir, key, now)
         if val != nil do
-          {val, exp}
+          {val, exp, hot}
         else
           case Router.get_meta(key) do
-            nil -> {nil, 0}
-            {v, e} -> {v, e}
+            nil -> {nil, 0, "cold"}
+            {v, e} -> {v, e, "cold"}
           end
         end
       else
-        {nil, 0}
+        {nil, 0, "cold"}
       end
 
     value_size = if alive? and is_binary(value), do: byte_size(value), else: 0
@@ -111,20 +110,6 @@ defmodule Ferricstore.Commands.Native do
         true -> max(expire_at_ms - now, 0)
       end
 
-    hot_status =
-      if alive? do
-        try do
-          case :ets.lookup(hot_cache, key) do
-            [{^key, _, _}] -> "hot"
-            [] -> "cold"
-          end
-        rescue
-          ArgumentError -> "cold"
-        end
-      else
-        "cold"
-      end
-
     [
       "type", type,
       "value_size", Integer.to_string(value_size),
@@ -134,24 +119,25 @@ defmodule Ferricstore.Commands.Native do
     ]
   end
 
-  defp ets_key_info(keydir, hot_cache, key, now) do
+  # Single-table keydir lookup: {key, value | nil, expire_at_ms, lfu_counter}
+  defp ets_key_info(keydir, key, now) do
     try do
       case :ets.lookup(keydir, key) do
-        [{^key, 0}] ->
-          case :ets.lookup(hot_cache, key) do
-            [{^key, v, _access_ms}] -> {v, 0, true, true}
-            [] -> {nil, 0, false, false}
-          end
-        [{^key, exp}] when exp > now ->
-          case :ets.lookup(hot_cache, key) do
-            [{^key, v, _access_ms}] -> {v, exp, true, true}
-            [] -> {nil, exp, false, false}
-          end
-        [{^key, _exp}] -> {nil, 0, false, false}
-        [] -> {nil, 0, false, false}
+        [{^key, value, 0, _lfu}] when value != nil ->
+          {value, 0, "hot"}
+        [{^key, nil, 0, _lfu}] ->
+          {nil, 0, "cold"}
+        [{^key, value, exp, _lfu}] when exp > now and value != nil ->
+          {value, exp, "hot"}
+        [{^key, nil, exp, _lfu}] when exp > now ->
+          {nil, exp, "cold"}
+        [{^key, _value, _exp, _lfu}] ->
+          {nil, 0, "cold"}
+        [] ->
+          {nil, 0, "cold"}
       end
     rescue
-      ArgumentError -> {nil, 0, false, false}
+      ArgumentError -> {nil, 0, "cold"}
     end
   end
 

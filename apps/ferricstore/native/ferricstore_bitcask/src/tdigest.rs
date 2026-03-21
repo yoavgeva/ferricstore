@@ -98,7 +98,11 @@ impl TDigest {
         }
 
         // Sort by mean
-        all.sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal));
+        all.sort_by(|a, b| {
+            a.mean
+                .partial_cmp(&b.mean)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let total_weight: f64 = all.iter().map(|c| c.weight).sum();
 
@@ -138,9 +142,8 @@ impl TDigest {
 
             if proposed_weight <= max_w {
                 // Merge into current centroid
-                let new_mean =
-                    (current.mean * current.weight + centroid.mean * centroid.weight)
-                        / proposed_weight;
+                let new_mean = (current.mean * current.weight + centroid.mean * centroid.weight)
+                    / proposed_weight;
                 current = Centroid {
                     mean: new_mean,
                     weight: proposed_weight,
@@ -258,8 +261,8 @@ impl TDigest {
                 }
                 let prev_c = prev.unwrap();
                 let frac = (value - prev_c.mean) / (c.mean - prev_c.mean);
-                let partial =
-                    cum_weight - prev_c.weight / 2.0 + frac * (prev_c.weight / 2.0 + c.weight / 2.0);
+                let partial = cum_weight - prev_c.weight / 2.0
+                    + frac * (prev_c.weight / 2.0 + c.weight / 2.0);
                 return (partial / total_weight).clamp(0.0, 1.0);
             }
             if (value - c.mean).abs() < f64::EPSILON {
@@ -570,11 +573,13 @@ fn merge_digests(digests: &mut [&mut TDigest], compression: f64) -> TDigest {
         total_comps += d.total_compressions;
     }
 
-    all_centroids
-        .sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal));
+    all_centroids.sort_by(|a, b| {
+        a.mean
+            .partial_cmp(&b.mean)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    let merged =
-        TDigest::merge_centroids(&all_centroids, total_weight as f64, compression);
+    let merged = TDigest::merge_centroids(&all_centroids, total_weight as f64, compression);
 
     let buffer_max = (compression * 3.0).ceil() as usize;
 
@@ -623,7 +628,11 @@ fn tdigest_create(env: Env, comp: f64) -> NifResult<Term> {
 
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn tdigest_add(env: Env, resource: ResourceArc<TDigestResource>, values: Vec<f64>) -> NifResult<Term> {
+fn tdigest_add(
+    env: Env,
+    resource: ResourceArc<TDigestResource>,
+    values: Vec<f64>,
+) -> NifResult<Term> {
     let mut digest = resource.digest.lock().map_err(|_| rustler::Error::BadArg)?;
     digest.add_many(&values);
     Ok(atoms::ok().encode(env))
@@ -841,10 +850,7 @@ fn tdigest_reset(env: Env, resource: ResourceArc<TDigestResource>) -> NifResult<
 /// Serialize the digest to a byte array for Bitcask storage.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn tdigest_serialize(
-    env: Env,
-    resource: ResourceArc<TDigestResource>,
-) -> NifResult<Term> {
+fn tdigest_serialize(env: Env, resource: ResourceArc<TDigestResource>) -> NifResult<Term> {
     let digest = resource.digest.lock().map_err(|_| rustler::Error::BadArg)?;
     let bytes = digest.serialize();
 
@@ -1077,10 +1083,7 @@ mod tests {
             td.add(i as f64);
         }
         let cdf_min = td.cdf(1.0);
-        assert!(
-            cdf_min < 0.05,
-            "CDF of min should be ~0, got {cdf_min}"
-        );
+        assert!(cdf_min < 0.05, "CDF of min should be ~0, got {cdf_min}");
     }
 
     #[test]
@@ -1090,10 +1093,7 @@ mod tests {
             td.add(i as f64);
         }
         let cdf_max = td.cdf(100.0);
-        assert!(
-            cdf_max > 0.95,
-            "CDF of max should be ~1.0, got {cdf_max}"
-        );
+        assert!(cdf_max > 0.95, "CDF of max should be ~1.0, got {cdf_max}");
     }
 
     #[test]
@@ -1157,10 +1157,7 @@ mod tests {
         assert_eq!(td.min, -100.0);
         assert_eq!(td.max, 100.0);
         let p50 = td.quantile(0.5);
-        assert!(
-            (p50 - 0.0).abs() < 50.0,
-            "median should be ~0, got {p50}"
-        );
+        assert!((p50 - 0.0).abs() < 50.0, "median should be ~0, got {p50}");
     }
 
     #[test]

@@ -23,8 +23,8 @@
 pub mod async_io;
 pub mod bloom;
 pub mod cms;
-pub mod cuckoo;
 pub mod compaction;
+pub mod cuckoo;
 pub mod hint;
 pub mod hnsw;
 pub mod io_backend;
@@ -38,8 +38,6 @@ pub mod tracking_alloc;
 use rustler::schedule::consume_timeslice;
 use rustler::{Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term};
 use std::sync::Mutex;
-
-
 
 use std::sync::atomic::AtomicU64;
 
@@ -1597,7 +1595,6 @@ mod bulk_buffer_tests {
     }
 }
 
-
 // ===========================================================================
 // Tokio async IO NIFs
 // ===========================================================================
@@ -1622,7 +1619,12 @@ fn get_async<'a>(
             Ok(Some(value)) => match OwnedBinary::new(value.len()) {
                 Some(mut bin) => {
                     bin.as_mut_slice().copy_from_slice(&value);
-                    (atoms::tokio_complete(), atoms::ok(), Binary::from_owned(bin, env)).encode(env)
+                    (
+                        atoms::tokio_complete(),
+                        atoms::ok(),
+                        Binary::from_owned(bin, env),
+                    )
+                        .encode(env)
                 }
                 None => (atoms::tokio_complete(), atoms::error(), "alloc_failed").encode(env),
             },
@@ -1715,7 +1717,10 @@ fn write_hint_async<'a>(env: Env<'a>, resource: ResourceArc<StoreResource>) -> N
 
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn purge_expired_async<'a>(env: Env<'a>, resource: ResourceArc<StoreResource>) -> NifResult<Term<'a>> {
+fn purge_expired_async<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+) -> NifResult<Term<'a>> {
     let pid: LocalPid = env.pid();
     let store_clone = resource.clone();
     async_io::runtime().spawn(async move {
@@ -1748,9 +1753,12 @@ fn run_compaction_async<'a>(
         };
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&pid, |env| match result {
-            Ok((written, dropped, reclaimed)) => {
-                (atoms::tokio_complete(), atoms::ok(), (written, dropped, reclaimed)).encode(env)
-            }
+            Ok((written, dropped, reclaimed)) => (
+                atoms::tokio_complete(),
+                atoms::ok(),
+                (written, dropped, reclaimed),
+            )
+                .encode(env),
             Err(e) => (atoms::tokio_complete(), atoms::error(), e.to_string()).encode(env),
         });
     });

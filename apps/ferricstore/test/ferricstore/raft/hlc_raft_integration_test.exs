@@ -79,7 +79,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
   describe "apply/3 with HLC-wrapped commands" do
     test "unwraps and processes a put command with hlc_ts metadata", %{
       state: state,
-      hot_cache: hot_cache,
+      ets: ets,
       store: store
     } do
       hlc_ts = HLC.now()
@@ -91,7 +91,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       assert new_state.applied_count == 1
 
       # Verify the inner command was processed correctly
-      assert [{_, "hlc_val", _}] = :ets.lookup(hot_cache, "hlc_key")
+      # Single-table format: {key, value, expire_at_ms, lfu_counter}
+      assert [{"hlc_key", "hlc_val", 0, _lfu}] = :ets.lookup(ets, "hlc_key")
       assert {:ok, "hlc_val"} = NIF.get(store, "hlc_key")
     end
 
@@ -114,7 +115,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
     test "unwraps and processes a batch command with hlc_ts metadata", %{
       state: state,
-      hot_cache: hot_cache
+      ets: ets
     } do
       hlc_ts = HLC.now()
       batch = [{:put, "b1", "v1", 0}, {:put, "b2", "v2", 0}]
@@ -124,8 +125,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
       assert results == [:ok, :ok]
       assert new_state.applied_count == 2
-      assert [{_, "v1", _}] = :ets.lookup(hot_cache, "b1")
-      assert [{_, "v2", _}] = :ets.lookup(hot_cache, "b2")
+      assert [{"b1", "v1", 0, _}] = :ets.lookup(ets, "b1")
+      assert [{"b2", "v2", 0, _}] = :ets.lookup(ets, "b2")
     end
 
     test "unwraps and processes an incr_float command with hlc_ts metadata", %{
@@ -155,14 +156,14 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
     test "legacy unwrapped commands still work (backward compatibility)", %{
       state: state,
-      hot_cache: hot_cache
+      ets: ets
     } do
       # Ensure unwrapped commands (no HLC metadata) continue to function
       {new_state, result} = StateMachine.apply(%{}, {:put, "legacy", "val", 0}, state)
 
       assert result == :ok
       assert new_state.applied_count == 1
-      assert [{_, "val", _}] = :ets.lookup(hot_cache, "legacy")
+      assert [{"legacy", "val", 0, _lfu}] = :ets.lookup(ets, "legacy")
     end
   end
 

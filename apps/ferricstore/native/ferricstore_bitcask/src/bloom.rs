@@ -91,10 +91,12 @@ impl BloomFilter {
         header[16..20].copy_from_slice(&num_hashes.to_le_bytes());
         // bytes 20..24 reserved (zero)
         // bytes 24..32 count = 0
-        file.write_all(&header).map_err(|e| format!("write header: {e}"))?;
+        file.write_all(&header)
+            .map_err(|e| format!("write header: {e}"))?;
         // Write zeroed bit array.
         let zeros = vec![0u8; byte_count];
-        file.write_all(&zeros).map_err(|e| format!("write bits: {e}"))?;
+        file.write_all(&zeros)
+            .map_err(|e| format!("write bits: {e}"))?;
         file.sync_all().map_err(|e| format!("fsync: {e}"))?;
         drop(file);
 
@@ -131,10 +133,7 @@ impl BloomFilter {
         };
 
         if mmap == libc::MAP_FAILED {
-            return Err(format!(
-                "mmap failed: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
         }
 
         let ptr = mmap as *mut u8;
@@ -195,11 +194,7 @@ impl BloomFilter {
     /// Write the insertion count to the header.
     fn set_count(&self, count: u64) {
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                count.to_le_bytes().as_ptr(),
-                self.mmap.add(24),
-                8,
-            );
+            std::ptr::copy_nonoverlapping(count.to_le_bytes().as_ptr(), self.mmap.add(24), 8);
         }
     }
 
@@ -268,13 +263,8 @@ impl BloomFilter {
 
     /// Flush changes to disk.
     pub fn msync(&self) -> Result<(), String> {
-        let ret = unsafe {
-            libc::msync(
-                self.mmap as *mut libc::c_void,
-                self.mmap_len,
-                libc::MS_SYNC,
-            )
-        };
+        let ret =
+            unsafe { libc::msync(self.mmap as *mut libc::c_void, self.mmap_len, libc::MS_SYNC) };
         if ret != 0 {
             Err(format!("msync failed: {}", std::io::Error::last_os_error()))
         } else {
@@ -314,11 +304,7 @@ impl Drop for BloomFilter {
         if !self.mmap.is_null() {
             // Best-effort msync before munmap.
             unsafe {
-                libc::msync(
-                    self.mmap as *mut libc::c_void,
-                    self.mmap_len,
-                    libc::MS_SYNC,
-                );
+                libc::msync(self.mmap as *mut libc::c_void, self.mmap_len, libc::MS_SYNC);
                 libc::munmap(self.mmap as *mut libc::c_void, self.mmap_len);
             }
         }
@@ -357,30 +343,77 @@ fn md5_compute(data: &[u8]) -> [u8; 16] {
 
     // Per-round shift amounts
     const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-        5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
-        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
 
     // Pre-computed T[i] = floor(2^32 * |sin(i + 1)|)
     const K: [u32; 64] = [
-        0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
-        0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
-        0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be,
-        0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821,
-        0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa,
-        0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8,
-        0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
-        0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a,
-        0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c,
-        0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70,
-        0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05,
-        0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665,
-        0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039,
-        0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
-        0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
-        0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
     ];
 
     for chunk in msg.chunks_exact(64) {
@@ -403,8 +436,7 @@ fn md5_compute(data: &[u8]) -> [u8; 16] {
             d = c;
             c = b;
             b = b.wrapping_add(
-                (a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g]))
-                    .rotate_left(S[i]),
+                (a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g])).rotate_left(S[i]),
             );
             a = temp;
         }
@@ -610,19 +642,13 @@ mod tests {
     #[test]
     fn md5_empty() {
         let digest = md5_compute(b"");
-        assert_eq!(
-            hex(&digest),
-            "d41d8cd98f00b204e9800998ecf8427e"
-        );
+        assert_eq!(hex(&digest), "d41d8cd98f00b204e9800998ecf8427e");
     }
 
     #[test]
     fn md5_hello() {
         let digest = md5_compute(b"hello");
-        assert_eq!(
-            hex(&digest),
-            "5d41402abc4b2a76b9719d911017c592"
-        );
+        assert_eq!(hex(&digest), "5d41402abc4b2a76b9719d911017c592");
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -696,7 +722,7 @@ mod tests {
 
         // Parameters for ~1% FPR with 1000 items
         let num_bits = 9586; // -1000 * ln(0.01) / (ln(2))^2
-        let num_hashes = 7;  // (9586/1000) * ln(2)
+        let num_hashes = 7; // (9586/1000) * ln(2)
         let filter = BloomFilter::create(&path, num_bits, num_hashes).unwrap();
 
         for i in 0..1000 {
@@ -709,10 +735,7 @@ mod tests {
             .count();
 
         let fp_rate = fp_count as f64 / test_count as f64;
-        assert!(
-            fp_rate < 0.02,
-            "False positive rate {fp_rate} exceeds 2%"
-        );
+        assert!(fp_rate < 0.02, "False positive rate {fp_rate} exceeds 2%");
     }
 
     // -----------------------------------------------------------------------
@@ -776,8 +799,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("idem.bloom");
         let filter = BloomFilter::create(&path, 10_000, 7).unwrap();
-        assert!(filter.add(b"dup"));   // first add: new bit(s) set
-        assert!(!filter.add(b"dup"));  // second add: no new bits
+        assert!(filter.add(b"dup")); // first add: new bit(s) set
+        assert!(!filter.add(b"dup")); // second add: no new bits
         assert_eq!(filter.count(), 1); // count only incremented once
         assert!(filter.exists(b"dup"));
     }
@@ -980,7 +1003,8 @@ mod tests {
             .collect();
 
         for h in handles {
-            h.join().expect("thread panicked during bloom concurrent access");
+            h.join()
+                .expect("thread panicked during bloom concurrent access");
         }
     }
 
@@ -1018,9 +1042,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("madd.bloom");
         let filter = BloomFilter::create(&path, 100_000, 7).unwrap();
-        let elements: Vec<Vec<u8>> = (0..500)
-            .map(|i| format!("madd_{i}").into_bytes())
-            .collect();
+        let elements: Vec<Vec<u8>> = (0..500).map(|i| format!("madd_{i}").into_bytes()).collect();
         for e in &elements {
             filter.add(e);
         }
@@ -1070,9 +1092,6 @@ mod tests {
         std::fs::write(&path, &data[..HEADER_SIZE.min(data.len())]).unwrap();
 
         let result = BloomFilter::open_existing(&path);
-        assert!(
-            result.is_err(),
-            "truncated bloom file must fail to open"
-        );
+        assert!(result.is_err(), "truncated bloom file must fail to open");
     }
 }
