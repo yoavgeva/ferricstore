@@ -63,22 +63,19 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "AP-002: apply() updates ETS hot cache" do
-    test "SET via Batcher populates both keydir and hot_cache ETS tables" do
+    test "SET via Batcher populates keydir ETS table" do
       key = pkey("ap002", "hot_cache")
       shard_index = Router.shard_for(key)
 
       :ok = Batcher.write(shard_index, {:put, key, "cached_value", 0})
 
-      # Verify the keydir ETS table has the key with expire_at_ms = 0
+      # Verify the keydir ETS table has the key in single-table format
+      # {key, value, expire_at_ms, lfu_counter}
       keydir = :"keydir_#{shard_index}"
-      assert [{^key, 0}] = :ets.lookup(keydir, key)
-
-      # Verify the hot_cache ETS table has the key with the correct value
-      hot_cache = :"hot_cache_#{shard_index}"
-      assert [{^key, "cached_value", _}] = :ets.lookup(hot_cache, key)
+      assert [{^key, "cached_value", 0, _lfu}] = :ets.lookup(keydir, key)
     end
 
-    test "SET with expiry populates hot_cache and keydir with correct expire_at_ms" do
+    test "SET with expiry populates keydir with correct expire_at_ms" do
       key = pkey("ap002", "hot_cache_ttl")
       shard_index = Router.shard_for(key)
       future = System.os_time(:millisecond) + 60_000
@@ -86,24 +83,21 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       :ok = Batcher.write(shard_index, {:put, key, "ttl_value", future})
 
       keydir = :"keydir_#{shard_index}"
-      assert [{^key, ^future}] = :ets.lookup(keydir, key)
-
-      hot_cache = :"hot_cache_#{shard_index}"
-      assert [{^key, "ttl_value", _}] = :ets.lookup(hot_cache, key)
+      assert [{^key, "ttl_value", ^future, _lfu}] = :ets.lookup(keydir, key)
     end
 
-    test "overwrite updates ETS hot cache to new value" do
+    test "overwrite updates ETS to new value" do
       key = pkey("ap002", "overwrite")
       shard_index = Router.shard_for(key)
 
       :ok = Batcher.write(shard_index, {:put, key, "old_value", 0})
       :ok = Batcher.write(shard_index, {:put, key, "new_value", 0})
 
-      hot_cache = :"hot_cache_#{shard_index}"
-      assert [{^key, "new_value", _}] = :ets.lookup(hot_cache, key)
+      keydir = :"keydir_#{shard_index}"
+      assert [{^key, "new_value", 0, _lfu}] = :ets.lookup(keydir, key)
     end
 
-    test "GET reads from ETS hot cache without GenServer call (hot path)" do
+    test "GET reads from ETS without GenServer call (hot path)" do
       key = pkey("ap002", "hot_read")
       shard_index = Router.shard_for(key)
 
@@ -113,7 +107,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       assert "hot_read_val" == Router.get(key)
     end
 
-    test "delete removes key from both keydir and hot_cache ETS" do
+    test "delete removes key from keydir ETS" do
       key = pkey("ap002", "delete_cache")
       shard_index = Router.shard_for(key)
 
@@ -122,9 +116,6 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
       keydir = :"keydir_#{shard_index}"
       assert [] = :ets.lookup(keydir, key)
-
-      hot_cache = :"hot_cache_#{shard_index}"
-      assert [] = :ets.lookup(hot_cache, key)
     end
   end
 
@@ -276,7 +267,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
       # Check keydir ETS directly
       keydir = :"keydir_#{shard_index}"
-      [{^key, ets_expire}] = :ets.lookup(keydir, key)
+      [{^key, _value, ets_expire, _lfu}] = :ets.lookup(keydir, key)
 
       # Check via get_meta
       {_value, meta_expire} = Router.get_meta(key)

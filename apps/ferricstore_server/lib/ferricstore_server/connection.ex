@@ -66,6 +66,14 @@ defmodule FerricstoreServer.Connection do
 
   alias Ferricstore.PubSub, as: PS
 
+  # L1 per-connection cache limits.
+  # Maximum number of entries in the L1 cache map.
+  @l1_max_entries Application.compile_env(:ferricstore, :l1_cache_max_entries, 64)
+  # Maximum total value bytes stored in L1.
+  @l1_max_bytes Application.compile_env(:ferricstore, :l1_cache_max_bytes, 1_048_576)
+  # Values larger than this threshold are never cached in L1.
+  @l1_large_value_skip 262_144
+
   # Connection state
   defstruct [
     :socket,
@@ -85,7 +93,11 @@ defmodule FerricstoreServer.Connection do
     pubsub_patterns: MapSet.new(),
     tracking: nil,
     read_mode: :consistent,
-    acl_cache: nil
+    acl_cache: nil,
+    # L1 per-connection cache fields
+    l1_cache: %{},
+    l1_size_bytes: 0,
+    l1_enabled: true
   ]
 
   @type multi_state :: :none | :queuing
@@ -133,6 +145,12 @@ defmodule FerricstoreServer.Connection do
     GETSET GETDEL
     CAS LOCK UNLOCK EXTEND)
 
+  @typedoc """
+  A single L1 cache entry: the cached value, its absolute expiry timestamp
+  (0 = no expiry), and a saturating hit counter for eviction priority.
+  """
+  @type l1_entry :: %{value: binary(), expire_at_ms: non_neg_integer(), hits: non_neg_integer()}
+
   @type t :: %__MODULE__{
           socket: :inet.socket(),
           transport: module(),
@@ -146,7 +164,10 @@ defmodule FerricstoreServer.Connection do
           watched_keys: %{binary() => non_neg_integer()},
           tracking: ClientTracking.tracking_config() | nil,
           read_mode: read_mode(),
-          acl_cache: acl_cache()
+          acl_cache: acl_cache(),
+          l1_cache: %{binary() => l1_entry()},
+          l1_size_bytes: non_neg_integer(),
+          l1_enabled: boolean()
         }
 
   # Commands that are NOT queued during MULTI — they are always executed immediately.
@@ -218,7 +239,8 @@ defmodule FerricstoreServer.Connection do
             created_at: System.monotonic_time(:millisecond),
             peer: peer,
             tracking: ClientTracking.new_config(),
-            acl_cache: default_cache
+            acl_cache: default_cache,
+            l1_enabled: Application.get_env(:ferricstore, :l1_cache_enabled, true)
           }
 
           AuditLog.log(:connection_open, %{
@@ -273,9 +295,12 @@ defmodule FerricstoreServer.Connection do
 
         # Client tracking invalidation push — sent by notify_key_modified when
         # another connection writes a key this connection is tracking.
+        # Also clears invalidated keys from the L1 cache so the next read
+        # fetches fresh data from L2.
         {:tracking_invalidation, iodata} ->
+          new_state = l1_invalidate_from_push(state, iodata)
           transport.send(socket, iodata)
-          loop(state)
+          loop(new_state)
 
         # ACL invalidation — an admin changed a user's permissions via
         # ACL SETUSER or ACL DELUSER. Refresh the local cache from ETS.
@@ -744,6 +769,24 @@ defmodule FerricstoreServer.Connection do
   # CLIENT HELLO [version] is the two-token form sent by some Redis clients.
   defp dispatch("CLIENT", ["HELLO" | args], state), do: handle_hello(args, state)
 
+  # CLIENT L1CACHE ON|OFF — per-connection L1 cache toggle.
+  # Handled directly in the connection layer because it modifies connection struct
+  # fields (l1_cache, l1_size_bytes, l1_enabled) that are not part of conn_state.
+  defp dispatch("CLIENT", ["L1CACHE", toggle | _], state) do
+    case String.upcase(toggle) do
+      "ON" ->
+        {:continue, Encoder.encode(:ok), %{state | l1_enabled: true}}
+
+      "OFF" ->
+        {:continue, Encoder.encode(:ok),
+         %{state | l1_enabled: false, l1_cache: %{}, l1_size_bytes: 0}}
+
+      _ ->
+        {:continue,
+         Encoder.encode({:error, "ERR syntax error, expected CLIENT L1CACHE ON|OFF"}), state}
+    end
+  end
+
   # CLIENT subcommands that need connection state.
   defp dispatch("CLIENT", args, state) do
     store = build_store(state.sandbox_namespace)
@@ -970,7 +1013,8 @@ defmodule FerricstoreServer.Connection do
 
   defp dispatch("RESET", _args, state) do
     # RESET clears transaction state, sandbox namespace, read mode, tracking state,
-    # auth state, pub/sub subscriptions, and rebuilds ACL cache for the default user.
+    # auth state, pub/sub subscriptions, L1 cache, and rebuilds ACL cache for the
+    # default user.
     cleanup_pubsub(state)
     ClientTracking.cleanup(self())
     new_state = %{state |
@@ -984,7 +1028,9 @@ defmodule FerricstoreServer.Connection do
       username: "default",
       pubsub_channels: MapSet.new(),
       pubsub_patterns: MapSet.new(),
-      acl_cache: build_acl_cache("default")
+      acl_cache: build_acl_cache("default"),
+      l1_cache: %{},
+      l1_size_bytes: 0
     }
     {:continue, Encoder.encode({:simple, "RESET"}), new_state}
   end
@@ -1629,7 +1675,25 @@ defmodule FerricstoreServer.Connection do
   end
 
   # Normal dispatch path (extracted for reuse by sendfile fallback).
+  # Includes L1 cache integration: reads check L1 first, misses warm L1,
+  # and writes update L1 (write-through) or remove stale entries.
   defp dispatch_normal(cmd, args, state) do
+    # L1 fast path: for single-key GET, check L1 before hitting L2.
+    case l1_try_read(cmd, args, state) do
+      {:l1_hit, result, new_state} ->
+        # L1 hit — return immediately without touching L2, but still track reads.
+        new_state2 = maybe_track_read(cmd, args, result, new_state)
+        {:continue, Encoder.encode(result), new_state2}
+
+      :l1_skip ->
+        # L1 miss or not applicable — fall through to normal L2 dispatch.
+        dispatch_normal_l2(cmd, args, state)
+    end
+  end
+
+  # L2 dispatch: the original dispatch path, with L1 warming on read results
+  # and L1 removal on write results.
+  defp dispatch_normal_l2(cmd, args, state) do
     store = build_store(state.sandbox_namespace)
 
     result =
@@ -1647,7 +1711,11 @@ defmodule FerricstoreServer.Connection do
     new_state = maybe_track_read(cmd, args, result, state)
     maybe_notify_tracking(cmd, args, result, state)
 
-    {:continue, Encoder.encode(result), new_state}
+    # L1 post-dispatch: warm L1 on read miss (with expiry from L2 metadata),
+    # or remove key from L1 on write.
+    new_state2 = l1_post_dispatch(cmd, args, result, new_state, store)
+
+    {:continue, Encoder.encode(result), new_state2}
   end
 
   # -- XREAD BLOCK dispatch -----------------------------------------------------
@@ -1752,32 +1820,14 @@ defmodule FerricstoreServer.Connection do
 
   # All other commands go through the Dispatcher with an injected store.
   # But first check pub/sub mode restriction (PING is allowed in pub/sub mode).
+  # Delegates to dispatch_normal which handles L1 cache integration.
   defp dispatch(cmd, args, state) do
     if in_pubsub_mode?(state) and cmd not in ~w(PING) do
       {:continue,
        Encoder.encode({:error, "ERR Can't execute '#{String.downcase(cmd)}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"}),
        state}
     else
-      store = build_store(state.sandbox_namespace)
-
-      result =
-        try do
-          Dispatcher.dispatch(cmd, args, store)
-        catch
-          :exit, {:noproc, _} ->
-            {:error, "ERR server not ready, shard process unavailable"}
-
-          :exit, {reason, _} ->
-            {:error, "ERR internal error: #{inspect(reason)}"}
-        end
-
-      maybe_notify_keyspace(cmd, args, result)
-
-      # Client tracking: track reads and notify writes
-      new_state = maybe_track_read(cmd, args, result, state)
-      maybe_notify_tracking(cmd, args, result, state)
-
-      {:continue, Encoder.encode(result), new_state}
+      dispatch_normal(cmd, args, state)
     end
   end
 
@@ -2022,8 +2072,9 @@ defmodule FerricstoreServer.Connection do
 
       # Client tracking invalidation push — can arrive while in pub/sub mode
       {:tracking_invalidation, iodata} ->
+        new_state = l1_invalidate_from_push(state, iodata)
         transport.send(socket, iodata)
-        pubsub_loop(state)
+        pubsub_loop(new_state)
 
       # ACL invalidation — refresh cache even while in pub/sub mode
       {:acl_invalidate, username} ->
@@ -2033,6 +2084,266 @@ defmodule FerricstoreServer.Connection do
 
   defp in_pubsub_mode?(state) do
     MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
+  end
+
+  # ---------------------------------------------------------------------------
+  # L1 per-connection cache helpers
+  # ---------------------------------------------------------------------------
+  #
+  # L1 is a Map in each connection process state that caches GET results to
+  # avoid repeated ETS (L2) lookups for hot keys. Each entry stores the binary
+  # value, its absolute expiry timestamp, and a saturating hit counter used for
+  # eviction priority (lowest-hit-count entry is evicted first).
+  #
+  # Invariants:
+  #   - l1_cache is a Map of key => %{value: binary, expire_at_ms: int, hits: int}
+  #   - l1_size_bytes == sum of byte_size(entry.value) for all entries in l1_cache
+  #   - map_size(l1_cache) <= @l1_max_entries (enforced by eviction)
+  #   - l1_size_bytes <= @l1_max_bytes (enforced by eviction)
+
+  # Commands eligible for L1 read cache. Currently only single-key GET.
+  # MGET, HGET, etc. could be added later but GET covers the vast majority
+  # of hot-path reads.
+  @l1_read_cmds ~w(GET)
+
+  # Commands whose results should trigger L1 removal of the affected key.
+  # All writes invalidate the L1 entry to prevent staleness. Clients re-warm
+  # L1 on the next GET. Write-through (caching the new value directly) is
+  # intentionally NOT done because without CLIENT TRACKING enabled, other
+  # connections' writes would never invalidate the L1 entry, leading to stale
+  # reads.
+  @l1_write_cmds ~w(SET SETNX SETEX PSETEX DEL UNLINK EXPIRE PEXPIRE EXPIREAT
+    PEXPIREAT PERSIST INCR DECR INCRBY DECRBY INCRBYFLOAT APPEND GETSET
+    GETDEL SETRANGE RENAME RENAMENX COPY MSET MSETNX)
+
+  # Attempts an L1 read for the given command. Returns {:l1_hit, value, state}
+  # if the value is cached and valid, or :l1_skip if L1 doesn't apply.
+  @spec l1_try_read(binary(), [binary()], t()) :: {:l1_hit, term(), t()} | :l1_skip
+  defp l1_try_read(cmd, args, state) do
+    with true <- state.l1_enabled,
+         true <- cmd in @l1_read_cmds,
+         [key] <- args do
+      l1_get(state, key)
+    else
+      _ -> :l1_skip
+    end
+  end
+
+  # Looks up a key in the L1 cache. Checks expiry and increments the hit counter.
+  # Returns {:l1_hit, value, updated_state} on cache hit, or :l1_skip on miss.
+  # Note: expired entries cause a miss but the stale entry is lazily evicted
+  # (it will be replaced by l1_post_dispatch warming from the L2 result).
+  @spec l1_get(t(), binary()) :: {:l1_hit, binary() | nil, t()} | :l1_skip
+  defp l1_get(state, key) do
+    case Map.get(state.l1_cache, key) do
+      nil ->
+        :l1_skip
+
+      %{value: value, expire_at_ms: 0, hits: h} ->
+        {:l1_hit, value, l1_touch(state, key, h)}
+
+      %{value: value, expire_at_ms: exp, hits: h} ->
+        if exp > System.os_time(:millisecond) do
+          {:l1_hit, value, l1_touch(state, key, h)}
+        else
+          # Expired — miss. The stale entry will be replaced when
+          # l1_post_dispatch warms L1 with the fresh L2 result.
+          :l1_skip
+        end
+    end
+  end
+
+  # Increments the hit counter for a cached entry (saturates at 255).
+  defp l1_touch(state, key, hits) do
+    new_hits = min(hits + 1, 255)
+    new_cache = Map.update!(state.l1_cache, key, fn e -> %{e | hits: new_hits} end)
+    %{state | l1_cache: new_cache}
+  end
+
+  # Post-dispatch L1 integration: warms L1 on read misses, removes L1 on writes.
+  # The store is passed so that read warming can fetch expiry metadata from L2.
+  @spec l1_post_dispatch(binary(), [binary()], term(), t(), map()) :: t()
+  defp l1_post_dispatch(_cmd, _args, {:error, _}, state, _store), do: state
+
+  defp l1_post_dispatch(cmd, [key], result, state, store) when cmd in @l1_read_cmds do
+    # Read command — warm L1 with the result value and its expiry from L2.
+    l1_maybe_warm(state, key, result, store)
+  end
+
+  defp l1_post_dispatch(cmd, args, _result, state, _store) when cmd in @l1_write_cmds do
+    # Write command — remove the affected key(s) from L1 to prevent staleness.
+    # We do NOT write-through (cache the new value) because without CLIENT
+    # TRACKING, other connections' writes would never clear the L1 entry.
+    # The next GET will re-warm L1 from L2.
+    case cmd do
+      c when c in ~w(MSET MSETNX) ->
+        # MSET key1 val1 key2 val2 ... — remove all keys
+        args
+        |> Enum.chunk_every(2)
+        |> Enum.reduce(state, fn
+          [key | _], s -> l1_remove(s, key)
+          _, s -> s
+        end)
+
+      "RENAME" ->
+        # RENAME source dest — both keys are affected
+        case args do
+          [src, dst | _] -> state |> l1_remove(src) |> l1_remove(dst)
+          [key] -> l1_remove(state, key)
+          _ -> state
+        end
+
+      _ ->
+        # Single-key commands: first arg is the key
+        case args do
+          [key | _] -> l1_remove(state, key)
+          _ -> state
+        end
+    end
+  end
+
+  defp l1_post_dispatch(_cmd, _args, _result, state, _store), do: state
+
+  # Conditionally warms L1 with a value. Fetches expiry from L2 metadata via
+  # the store's get_meta function so that expired keys are properly handled.
+  @spec l1_maybe_warm(t(), binary(), term(), map()) :: t()
+  defp l1_maybe_warm(state, _key, nil, _store), do: state
+
+  defp l1_maybe_warm(state, key, value, store) when is_binary(value) do
+    if not state.l1_enabled do
+      state
+    else
+      val_size = byte_size(value)
+
+      # Fetch expiry from L2 metadata. The get_meta call is cheap (ETS hot path)
+      # and only done on L1 miss (not on every read).
+      expire_at_ms =
+        try do
+          case store.get_meta.(key) do
+            {_value, exp} when is_integer(exp) -> exp
+            _ -> 0
+          end
+        catch
+          _, _ -> 0
+        end
+
+      cond do
+        val_size > @l1_large_value_skip ->
+          # Skip caching values larger than the threshold.
+          state
+
+        map_size(state.l1_cache) >= @l1_max_entries ->
+          l1_evict_and_put(state, key, value, expire_at_ms)
+
+        state.l1_size_bytes + val_size > @l1_max_bytes ->
+          l1_evict_and_put(state, key, value, expire_at_ms)
+
+        true ->
+          l1_put(state, key, value, expire_at_ms)
+      end
+    end
+  end
+
+  defp l1_maybe_warm(state, _key, _non_binary_result, _store), do: state
+
+  # Inserts a key-value pair into L1, optionally with an expiry timestamp.
+  # If the key already exists, replaces it (adjusting size tracking).
+  @spec l1_put(t(), binary(), binary(), non_neg_integer()) :: t()
+  defp l1_put(state, key, value, expire_at_ms) do
+    if not state.l1_enabled do
+      state
+    else
+      val_size = byte_size(value)
+
+      if val_size > @l1_large_value_skip do
+        state
+      else
+        entry = %{value: value, expire_at_ms: expire_at_ms, hits: 1}
+
+        # Remove old entry size if replacing.
+        old_size =
+          case Map.get(state.l1_cache, key) do
+            nil -> 0
+            old -> byte_size(old.value)
+          end
+
+        new_bytes = state.l1_size_bytes - old_size + val_size
+        %{state | l1_cache: Map.put(state.l1_cache, key, entry), l1_size_bytes: new_bytes}
+      end
+    end
+  end
+
+  # Evicts the lowest-hit entry and inserts a new key-value pair.
+  defp l1_evict_and_put(state, key, value, expire_at_ms) do
+    if map_size(state.l1_cache) == 0 do
+      l1_put(state, key, value, expire_at_ms)
+    else
+      # Find the entry with the lowest hit count.
+      {evict_key, evict_entry} = Enum.min_by(state.l1_cache, fn {_, e} -> e.hits end)
+      evicted_size = byte_size(evict_entry.value)
+      new_cache = Map.delete(state.l1_cache, evict_key)
+      new_bytes = state.l1_size_bytes - evicted_size
+
+      new_state = %{state | l1_cache: new_cache, l1_size_bytes: new_bytes}
+
+      # Check if we still need more evictions (for byte limit).
+      val_size = byte_size(value)
+
+      if map_size(new_cache) >= @l1_max_entries or new_bytes + val_size > @l1_max_bytes do
+        l1_evict_and_put(new_state, key, value, expire_at_ms)
+      else
+        l1_put(new_state, key, value, expire_at_ms)
+      end
+    end
+  end
+
+  # Removes a key from L1 and adjusts byte tracking.
+  @spec l1_remove(t(), binary()) :: t()
+  defp l1_remove(state, key) do
+    case Map.pop(state.l1_cache, key) do
+      {nil, _} ->
+        state
+
+      {entry, new_cache} ->
+        %{state | l1_cache: new_cache, l1_size_bytes: state.l1_size_bytes - byte_size(entry.value)}
+    end
+  end
+
+  # Parses invalidation push iodata to extract key names, then removes them from L1.
+  # The invalidation message format is RESP3 push:
+  #   >2\r\n+invalidate\r\n*N\r\n$len\r\nkey\r\n...
+  @spec l1_invalidate_from_push(t(), iodata()) :: t()
+  defp l1_invalidate_from_push(state, iodata) do
+    if map_size(state.l1_cache) == 0 do
+      state
+    else
+      keys = l1_parse_invalidation_keys(iodata)
+      Enum.reduce(keys, state, fn key, s -> l1_remove(s, key) end)
+    end
+  end
+
+  # Extracts key names from a RESP3 invalidation push message.
+  # The push message structure: >2\r\n+invalidate\r\n*N\r\n$len\r\nkey\r\n...
+  # Parser returns: {:push, [{:simple, "invalidate"}, ["key1", "key2", ...]]}
+  defp l1_parse_invalidation_keys(iodata) do
+    binary = IO.iodata_to_binary(iodata)
+
+    case Parser.parse(binary) do
+      {:ok, [parsed], _rest} ->
+        case parsed do
+          {:push, [{:simple, "invalidate"}, keys]} when is_list(keys) ->
+            keys
+
+          {:push, ["invalidate", keys]} when is_list(keys) ->
+            keys
+
+          _ ->
+            []
+        end
+
+      _ ->
+        []
+    end
   end
 
   # ---------------------------------------------------------------------------

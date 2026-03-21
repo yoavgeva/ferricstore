@@ -207,7 +207,8 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
 
       shard_idx = shard_index_for(k)
       keydir_name = :"keydir_#{shard_idx}"
-      assert [{^k, _}] = :ets.lookup(keydir_name, k)
+      # Single-table format: {key, value, expire_at_ms, lfu_counter}
+      assert [{^k, _, _, _}] = :ets.lookup(keydir_name, k)
 
       # Flush to Bitcask before crashing so data is durable.
       :ok = GenServer.call(shard_pid_for(k), :flush)
@@ -221,9 +222,8 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       # Second GET: served from ETS
       assert v == Router.get(k)
 
-      # Verify ETS contains the warmed entry
-      hot_cache_name = :"hot_cache_#{shard_idx}"
-      assert [{^k, ^v, _}] = :ets.lookup(hot_cache_name, k)
+      # Verify ETS contains the warmed entry in single-table format
+      assert [{^k, ^v, 0, _lfu}] = :ets.lookup(keydir_name, k)
     end
 
     test "multiple shard restarts don't lose data" do

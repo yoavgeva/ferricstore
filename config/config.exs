@@ -10,6 +10,14 @@ config :ferricstore, :port, 6379
 # Data directory for Bitcask shards
 config :ferricstore, :data_dir, "data"
 
+# L1 per-connection cache defaults.
+# Each connection process caches GET results in a Map to avoid repeated ETS
+# (L2) lookups for hot keys. Invalidation is handled by CLIENT TRACKING:
+# when another connection writes a tracked key, L1 clears the stale entry.
+config :ferricstore, :l1_cache_enabled, true
+config :ferricstore, :l1_cache_max_entries, 64
+config :ferricstore, :l1_cache_max_bytes, 1_048_576
+
 # Node discovery via libcluster.
 # Default: Gossip strategy for local/dev multi-node clusters.
 # Override in prod.exs or runtime.exs for Kubernetes DNS or other strategies.

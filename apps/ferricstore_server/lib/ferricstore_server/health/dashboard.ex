@@ -265,18 +265,16 @@ defmodule FerricstoreServer.Health.Dashboard do
   defp collect_shards do
     Enum.map(0..(@shard_count - 1), fn index ->
       keydir = :"keydir_#{index}"
-      hot_cache = :"hot_cache_#{index}"
 
       {status, keys, ets_mem} =
         try do
           keys = :ets.info(keydir, :size)
           keydir_words = :ets.info(keydir, :memory)
-          hot_cache_words = :ets.info(hot_cache, :memory)
 
           mem_bytes =
-            case {keydir_words, hot_cache_words} do
-              {n1, n2} when is_integer(n1) and is_integer(n2) ->
-                (n1 + n2) * :erlang.system_info(:wordsize)
+            case keydir_words do
+              n when is_integer(n) ->
+                n * :erlang.system_info(:wordsize)
 
               _ ->
                 0
