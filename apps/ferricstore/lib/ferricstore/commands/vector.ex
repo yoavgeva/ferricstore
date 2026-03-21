@@ -81,6 +81,11 @@ defmodule Ferricstore.Commands.Vector do
       else
         meta = :erlang.term_to_binary({dims, metric, m, ef})
         store.put.(mk, meta, 0)
+        # Also persist an HNSW sentinel key (V:collection\0__hnsw_meta__) in the
+        # same shard's Bitcask so HnswRegistry can rebuild the index on restart.
+        # We route by collection so it lands on the same shard as vector data.
+        sentinel_key = "V:" <> collection <> <<0>> <> "__hnsw_meta__"
+        store.compound_put.(collection, sentinel_key, meta, 0)
         :ok
       end
     end
@@ -168,6 +173,8 @@ defmodule Ferricstore.Commands.Vector do
         entries = store.compound_scan.(collection, prefix)
 
         entries
+        # Exclude the HNSW metadata sentinel key used for index rebuild
+        |> Enum.reject(fn {sub_key, _} -> sub_key == "__hnsw_meta__" end)
         |> Enum.map(fn {sub_key, encoded} ->
           vec = :erlang.binary_to_term(encoded)
           dist = compute_distance(metric, query_floats, vec)
@@ -189,7 +196,11 @@ defmodule Ferricstore.Commands.Vector do
   def handle("VINFO", [collection], store) do
     with {:ok, {dims, metric, m, ef}} <- get_collection_meta(collection, store) do
       prefix = vector_prefix(collection)
-      count = store.compound_count.(collection, prefix)
+      # Subtract 1 for the __hnsw_meta__ sentinel key that shares the prefix
+      raw_count = store.compound_count.(collection, prefix)
+      sentinel_key = "V:" <> collection <> <<0>> <> "__hnsw_meta__"
+      has_sentinel = store.compound_get.(collection, sentinel_key) != nil
+      count = if has_sentinel, do: max(0, raw_count - 1), else: raw_count
       ram_bytes = count * dims * 4
 
       [

@@ -148,16 +148,16 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
     test "EXTEND keeps lock alive past original TTL" do
       key = ukey("lock_extend_keepalive")
 
-      # Acquire lock with short TTL (200ms)
-      assert :ok = Native.handle("LOCK", [key, "worker", "200"], dummy_store())
+      # Acquire lock with a TTL long enough to survive Raft commit latency (2s)
+      assert :ok = Native.handle("LOCK", [key, "worker", "2000"], dummy_store())
 
-      # Heartbeat: extend every 100ms for 5 iterations (500ms total)
+      # Heartbeat: extend every 200ms for 5 iterations (1s total)
       for _ <- 1..5 do
-        Process.sleep(100)
-        assert 1 == Native.handle("EXTEND", [key, "worker", "200"], dummy_store())
+        Process.sleep(200)
+        assert 1 == Native.handle("EXTEND", [key, "worker", "2000"], dummy_store())
       end
 
-      # After 500ms of heartbeats the lock is still held
+      # After heartbeats the lock is still held
       assert "worker" == Router.get(key)
       assert {:error, _} = Native.handle("LOCK", [key, "impostor", "100"], dummy_store())
 

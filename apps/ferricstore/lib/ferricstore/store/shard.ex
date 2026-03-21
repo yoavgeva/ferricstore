@@ -167,11 +167,22 @@ defmodule Ferricstore.Store.Shard do
     promoted =
       Ferricstore.Store.Promotion.recover_promoted(store, keydir, hot_cache, data_dir, index)
 
-    # Rebuild the prefix index from all keys in the Bitcask store so that
-    # SCAN MATCH 'prefix:*' works immediately after a shard restart without
-    # needing to warm every key through ETS first.
+    # Warm up ETS (keydir + hot_cache) and the prefix index from all keys in
+    # the Bitcask store so that SCAN MATCH, compound_scan, and compound_count
+    # work immediately after a shard restart without waiting for lazy warming.
+    now = System.os_time(:millisecond)
+
     for key <- NIF.keys(store) do
       PrefixIndex.track(prefix_keys, key, index)
+
+      case NIF.get(store, key) do
+        {:ok, value} when is_binary(value) ->
+          :ets.insert(keydir, {key, 0})
+          :ets.insert(hot_cache, {key, value, now})
+
+        _ ->
+          :ok
+      end
     end
 
     # Rebuild HNSW vector indices from persisted vectors.
