@@ -247,6 +247,11 @@ defmodule FerricstoreServer.TelemetryEventsTest do
         GenServer.call(shard_name, :expiry_sweep)
       end
 
+      # Drain any stale recovered events from other shards (cross-test contamination)
+      # then trigger one more sweep on shard 1 to ensure the event fires.
+      flush_telemetry([:ferricstore, :expiry, :recovered])
+      GenServer.call(shard_name, :expiry_sweep)
+
       assert_receive {:telemetry, [:ferricstore, :expiry, :recovered], measurements, _metadata},
                      1000
 
@@ -570,6 +575,16 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       assert info =~ "hot_reads:"
       assert info =~ "cold_reads:"
       assert info =~ "hot_read_pct:"
+    end
+  end
+
+  # Drains all pending telemetry messages for the given event name from the
+  # process mailbox so they don't interfere with subsequent assert_receive.
+  defp flush_telemetry(event_name) do
+    receive do
+      {:telemetry, ^event_name, _measurements, _metadata} -> flush_telemetry(event_name)
+    after
+      0 -> :ok
     end
   end
 end

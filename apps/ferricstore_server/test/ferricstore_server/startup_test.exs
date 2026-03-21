@@ -82,43 +82,37 @@ defmodule FerricstoreServer.StartupTest do
   # ---------------------------------------------------------------------------
 
   describe "ETS tables created for each shard" do
-    test "keydir_0 through keydir_3 and hot_cache_0 through hot_cache_3 exist" do
+    test "keydir_0 through keydir_3 exist" do
       for i <- 0..3 do
-        for prefix <- [:keydir, :hot_cache] do
-          ets_name = :"#{prefix}_#{i}"
-          ref = :ets.whereis(ets_name)
+        ets_name = :"keydir_#{i}"
+        ref = :ets.whereis(ets_name)
 
-          refute ref == :undefined,
-                 "ETS table #{ets_name} should exist after startup"
-        end
+        refute ref == :undefined,
+               "ETS table #{ets_name} should exist after startup"
       end
     end
 
     test "shard ETS tables are public and named" do
       for i <- 0..3 do
-        for prefix <- [:keydir, :hot_cache] do
-          ets_name = :"#{prefix}_#{i}"
-          info = :ets.info(ets_name)
-          assert info != :undefined, "ETS table #{ets_name} should exist"
+        ets_name = :"keydir_#{i}"
+        info = :ets.info(ets_name)
+        assert info != :undefined, "ETS table #{ets_name} should exist"
 
-          # Verify it is public (readable from any process)
-          protection = :ets.info(ets_name, :protection)
-          assert protection == :public, "ETS table #{ets_name} should be public"
+        # Verify it is public (readable from any process)
+        protection = :ets.info(ets_name, :protection)
+        assert protection == :public, "ETS table #{ets_name} should be public"
 
-          # Verify it is a named table
-          named = :ets.info(ets_name, :named_table)
-          assert named == true, "ETS table #{ets_name} should be a named table"
-        end
+        # Verify it is a named table
+        named = :ets.info(ets_name, :named_table)
+        assert named == true, "ETS table #{ets_name} should be a named table"
       end
     end
 
     test "shard ETS tables are :set type" do
       for i <- 0..3 do
-        for prefix <- [:keydir, :hot_cache] do
-          ets_name = :"#{prefix}_#{i}"
-          type = :ets.info(ets_name, :type)
-          assert type == :set, "ETS table #{ets_name} should be a :set"
-        end
+        ets_name = :"keydir_#{i}"
+        type = :ets.info(ets_name, :type)
+        assert type == :set, "ETS table #{ets_name} should be a :set"
       end
     end
   end

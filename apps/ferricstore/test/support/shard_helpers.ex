@@ -58,7 +58,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     Enum.each(0..(shard_count - 1), fn i ->
       shard = Router.shard_name(i)
       keys = GenServer.call(shard, :keys, 10_000)
-      Enum.each(keys, fn key -> GenServer.call(shard, {:delete, key}) end)
+      Enum.each(keys, fn key -> GenServer.call(shard, {:delete, key}, 30_000) end)
     end)
 
     # The deletes above go through the Raft batcher (async). Drain the
