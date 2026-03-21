@@ -2,149 +2,84 @@ defmodule Ferricstore.Store.ListOps do
   @moduledoc """
   Pure-logic module for list data structure operations.
 
-  Encapsulates all read-modify-write logic for Redis-compatible list
-  operations. This module lives in the `Store` layer so it can be used by
-  both `Ferricstore.Store.Shard` (the GenServer that owns the data) and
-  `Ferricstore.Commands.List` (the command handler that parses arguments).
+  ## Storage format (compound key / float-position)
 
-  ## Storage format
+  Each list element is stored as an individual compound key entry:
+  `L:redis_key\\0{encoded_position} -> element_value`
 
-  Lists are stored as serialized Erlang terms: `:erlang.term_to_binary({:list, elements})`.
-  This tagged format distinguishes lists from plain string values and hash
-  values (`{:hash, _}`).
+  A metadata key stores length and position boundaries:
+  `LM:redis_key -> :erlang.term_to_binary({length, next_left_pos, next_right_pos})`
 
-  ## Design
-
-  All functions accept closures for reading, writing, and deleting stored
-  data. This makes the module agnostic to the storage backend — it works
-  with both the Bitcask-backed Shard and the Agent-backed MockStore.
+  A legacy `execute/4` overload is retained for the Raft state machine.
   """
 
-  @wrongtype_error {:error,
-                    "WRONGTYPE Operation against a key holding the wrong kind of value"}
+  alias Ferricstore.Store.CompoundKey
 
-  # ---------------------------------------------------------------------------
-  # Public API — execute a list operation
-  # ---------------------------------------------------------------------------
+  @initial_position 0.0
+  @position_step 1.0
 
-  @doc """
-  Executes a list operation on raw stored data.
+  @spec execute(binary(), map(), term()) :: term()
+  def execute(key, store, operation) do
+    meta = read_meta(key, store)
+    do_execute(key, store, meta, operation)
+  end
 
-  Performs the full read-modify-write cycle for a single-key list operation.
+  def execute(get_fn, put_fn, delete_fn, operation)
+      when is_function(get_fn, 0) and is_function(put_fn, 1) and is_function(delete_fn, 0) do
+    legacy_execute_blob(get_fn, put_fn, delete_fn, operation)
+  end
 
-  ## Parameters
-
-    - `get_fn` - Zero-arity function returning the raw stored binary for the
-      key, or `nil` if the key does not exist
-    - `put_fn` - Arity-1 function accepting an encoded binary to persist
-    - `delete_fn` - Zero-arity function that deletes the key
-    - `operation` - The list operation tuple (e.g. `{:lpush, elements}`)
-
-  ## Returns
-
-  The result of the operation: integer, binary, list, nil, `:ok`, or
-  `{:error, message}`.
-  """
-  @spec execute(
-          get_fn :: (-> binary() | nil),
-          put_fn :: (binary() -> :ok),
-          delete_fn :: (-> :ok),
-          operation :: term()
-        ) :: term()
-  def execute(get_fn, put_fn, delete_fn, operation) do
-    case decode_stored(get_fn.()) do
-      {:ok, elements} ->
-        do_execute(elements, put_fn, delete_fn, operation)
-
-      :not_found ->
-        do_execute_missing(put_fn, delete_fn, operation)
-
-      {:error, :wrongtype} ->
-        @wrongtype_error
+  @spec execute_lmove(binary(), binary(), map(), :left | :right, :left | :right) ::
+          binary() | nil | {:error, binary()}
+  def execute_lmove(src_key, dst_key, store, from_dir, to_dir) when is_map(store) do
+    src_meta = read_meta(src_key, store)
+    case src_meta do
+      nil -> nil
+      {0, _, _} -> nil
+      {_len, _left, _right} ->
+        sorted = sorted_elements(src_key, store)
+        if sorted == [] do
+          nil
+        else
+          {pos, element} = case from_dir do
+            :left -> hd(sorted)
+            :right -> List.last(sorted)
+          end
+          store.compound_delete.(src_key, CompoundKey.list_element(src_key, pos))
+          remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
+          if remaining == [] do
+            delete_meta(src_key, store)
+          else
+            update_meta_from_remaining(src_key, store, length(remaining), remaining)
+          end
+          dst_meta = read_meta(dst_key, store)
+          case dst_meta do
+            nil ->
+              new_pos = @initial_position
+              store.compound_put.(dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
+              write_meta(dst_key, store, {1, new_pos - @position_step, new_pos + @position_step})
+            {dst_len, dst_left, dst_right} ->
+              new_pos = case to_dir do
+                :left -> dst_left
+                :right -> dst_right
+              end
+              store.compound_put.(dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
+              new_left = if to_dir == :left, do: new_pos - @position_step, else: dst_left
+              new_right = if to_dir == :right, do: new_pos + @position_step, else: dst_right
+              write_meta(dst_key, store, {dst_len + 1, new_left, new_right})
+          end
+          element
+        end
     end
   end
 
-  @doc """
-  Executes an LMOVE operation spanning two keys.
-
-  Pops an element from one end of the source list and pushes it to one end
-  of the destination list. Correctly handles the same-key case (list
-  rotation) by reading the destination after modifying the source.
-
-  ## Parameters
-
-    - `src_get_fn` - Returns raw stored binary for source key, or nil
-    - `src_put_fn` - Persists encoded binary for source key
-    - `src_delete_fn` - Deletes the source key
-    - `dst_get_fn` - Returns raw stored binary for destination key, or nil
-    - `dst_put_fn` - Persists encoded binary for destination key
-    - `from_dir` - `:left` or `:right` — which end to pop from source
-    - `to_dir` - `:left` or `:right` — which end to push to destination
-
-  ## Returns
-
-  The moved element as a binary string, or `nil` if the source list is
-  empty or does not exist, or `{:error, message}` on type mismatch.
-  """
-  @spec execute_lmove(
-          src_get_fn :: (-> binary() | nil),
-          src_put_fn :: (binary() -> :ok),
-          src_delete_fn :: (-> :ok),
-          dst_get_fn :: (-> binary() | nil),
-          dst_put_fn :: (binary() -> :ok),
-          from_dir :: :left | :right,
-          to_dir :: :left | :right
-        ) :: binary() | nil | {:error, binary()}
-  def execute_lmove(src_get_fn, src_put_fn, src_delete_fn, dst_get_fn, dst_put_fn, from_dir, to_dir) do
-    with {:src, {:ok, src_elements}} <- {:src, decode_stored(src_get_fn.())},
-         true <- src_elements != [] do
-      {element, remaining} = pop_element(src_elements, from_dir)
-
-      # Update source BEFORE reading destination. This is critical for
-      # same-key LMOVE (rotate), where source == destination.
-      if remaining == [] do
-        src_delete_fn.()
-      else
-        src_put_fn.(encode_list(remaining))
-      end
-
-      # Now read the destination (which may have been updated above if same key).
-      case decode_stored(dst_get_fn.()) do
-        {:error, :wrongtype} ->
-          @wrongtype_error
-
-        :not_found ->
-          dst_put_fn.(encode_list(push_element([], element, to_dir)))
-          element
-
-        {:ok, dst_elements} ->
-          new_dst = push_element(dst_elements, element, to_dir)
-          dst_put_fn.(encode_list(new_dst))
-          element
-      end
-    else
-      {:src, :not_found} -> nil
-      {:src, {:error, :wrongtype}} -> @wrongtype_error
-      false -> nil
-    end
+  def execute_lmove(src_get_fn, src_put_fn, src_delete_fn, dst_get_fn, dst_put_fn, from_dir, to_dir)
+      when is_function(src_get_fn, 0) do
+    legacy_execute_lmove(src_get_fn, src_put_fn, src_delete_fn, dst_get_fn, dst_put_fn, from_dir, to_dir)
   end
 
-  # ---------------------------------------------------------------------------
-  # Encoding / Decoding
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Decodes a stored binary into list elements, detecting type mismatches.
-
-  ## Returns
-
-    - `{:ok, [binary()]}` — valid list
-    - `:not_found` — nil input (key does not exist)
-    - `{:error, :wrongtype}` — stored value is a string or hash
-  """
   @spec decode_stored(binary() | nil) :: {:ok, [binary()]} | :not_found | {:error, :wrongtype}
   def decode_stored(nil), do: :not_found
-
   def decode_stored(binary) when is_binary(binary) do
     try do
       case :erlang.binary_to_term(binary) do
@@ -157,385 +92,375 @@ defmodule Ferricstore.Store.ListOps do
     end
   end
 
-  @doc """
-  Encodes a list of elements into the tagged binary storage format.
-  """
   @spec encode_list([binary()]) :: binary()
   def encode_list(elements), do: :erlang.term_to_binary({:list, elements})
 
-  @doc """
-  Checks if a raw stored binary is a tagged type (list or hash).
-
-  Returns `{:error, "WRONGTYPE ..."}` if the value is a list or hash,
-  or the original value if it is a plain string.
-
-  Used by string commands (GET) to enforce type safety.
-  """
   @spec check_string_type(binary()) :: binary() | {:error, binary()}
   def check_string_type(value) when is_binary(value) do
     try do
       case :erlang.binary_to_term(value) do
-        {:list, _} ->
-          {:error,
-           "WRONGTYPE Operation against a key holding the wrong kind of value"}
-
-        {:hash, _} ->
-          {:error,
-           "WRONGTYPE Operation against a key holding the wrong kind of value"}
-
-        _ ->
-          # Not a recognized tagged type — treat as raw string.
-          value
+        {:list, _} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        {:hash, _} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        _ -> value
       end
     rescue
-      ArgumentError ->
-        # Not valid ETF — definitely a plain string.
-        value
+      ArgumentError -> value
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Private — execute on existing list
-  # ---------------------------------------------------------------------------
-
-  defp do_execute(elements, put_fn, _delete_fn, {:lpush, new_elements}) do
-    # Redis LPUSH inserts elements left-to-right, so the last argument
-    # ends up as the leftmost element.
-    updated = Enum.reverse(new_elements) ++ elements
-    put_fn.(encode_list(updated))
-    length(updated)
-  end
-
-  defp do_execute(elements, put_fn, _delete_fn, {:rpush, new_elements}) do
-    updated = elements ++ new_elements
-    put_fn.(encode_list(updated))
-    length(updated)
-  end
-
-  defp do_execute([], _put_fn, _delete_fn, {:lpop, _count}), do: nil
-
-  defp do_execute(elements, put_fn, delete_fn, {:lpop, count}) do
-    actual_count = min(count, length(elements))
-    {popped, remaining} = Enum.split(elements, actual_count)
-
-    if remaining == [] do
-      delete_fn.()
-    else
-      put_fn.(encode_list(remaining))
-    end
-
-    # When called without explicit count arg, return single element (not list)
-    case count do
-      1 -> List.first(popped)
-      _ -> popped
+  @doc false
+  def read_meta(key, store) do
+    meta_key = CompoundKey.list_meta_key(key)
+    case store.compound_get.(key, meta_key) do
+      nil -> nil
+      binary -> :erlang.binary_to_term(binary)
     end
   end
 
-  defp do_execute([], _put_fn, _delete_fn, {:rpop, _count}), do: nil
+  defp write_meta(key, store, {_len, _left, _right} = meta) do
+    store.compound_put.(key, CompoundKey.list_meta_key(key), :erlang.term_to_binary(meta), 0)
+  end
 
-  defp do_execute(elements, put_fn, delete_fn, {:rpop, count}) do
-    len = length(elements)
-    actual_count = min(count, len)
-    {remaining, popped} = Enum.split(elements, len - actual_count)
+  defp delete_meta(key, store) do
+    store.compound_delete.(key, CompoundKey.list_meta_key(key))
+  end
 
-    if remaining == [] do
-      delete_fn.()
-    else
-      put_fn.(encode_list(remaining))
-    end
+  defp sorted_elements(key, store) do
+    prefix = CompoundKey.list_prefix(key)
+    store.compound_scan.(key, prefix)
+    |> Enum.map(fn {encoded_pos, value} -> {CompoundKey.decode_position(encoded_pos), value} end)
+  end
 
-    # Redis RPOP with count returns elements from tail to head (rightmost first)
-    popped_reversed = Enum.reverse(popped)
+  defp ordered_values(key, store) do
+    sorted_elements(key, store) |> Enum.map(fn {_pos, value} -> value end)
+  end
 
-    case count do
-      1 -> List.first(popped_reversed)
-      _ -> popped_reversed
+  defp update_meta_from_remaining(key, store, new_len, remaining) do
+    {min_pos, _} = hd(remaining)
+    {max_pos, _} = List.last(remaining)
+    write_meta(key, store, {new_len, min_pos - @position_step, max_pos + @position_step})
+  end
+
+  # LPUSH
+  defp do_execute(key, store, nil, {:lpush, new_elements}), do: do_lpush_new(key, store, new_elements)
+  defp do_execute(key, store, {len, left_pos, right_pos}, {:lpush, new_elements}) do
+    reversed = Enum.reverse(new_elements); count = length(reversed)
+    # reversed=[c,b,a]. Assign: c at left_pos-(count-1)*step, b at left_pos-(count-2)*step, a at left_pos
+    Enum.with_index(reversed) |> Enum.each(fn {elem, idx} ->
+      pos = left_pos - (count - 1 - idx) * @position_step
+      store.compound_put.(key, CompoundKey.list_element(key, pos), elem, 0)
+    end)
+    new_left = left_pos - (count - 1) * @position_step - @position_step
+    new_len = len + length(new_elements)
+    write_meta(key, store, {new_len, new_left, right_pos})
+    new_len
+  end
+
+  # RPUSH
+  defp do_execute(key, store, nil, {:rpush, new_elements}), do: do_rpush_new(key, store, new_elements)
+  defp do_execute(key, store, {len, left_pos, right_pos}, {:rpush, new_elements}) do
+    {new_right, _} = Enum.reduce(new_elements, {right_pos, 0}, fn elem, {pos, idx} ->
+      store.compound_put.(key, CompoundKey.list_element(key, pos), elem, 0)
+      {pos + @position_step, idx + 1}
+    end)
+    new_len = len + length(new_elements)
+    write_meta(key, store, {new_len, left_pos, new_right})
+    new_len
+  end
+
+  # LPOP
+  defp do_execute(_key, _store, nil, {:lpop, _count}), do: nil
+  defp do_execute(_key, _store, {0, _, _}, {:lpop, _count}), do: nil
+  defp do_execute(key, store, {len, _, _}, {:lpop, count}) do
+    sorted = sorted_elements(key, store)
+    if sorted == [] do nil else
+      actual_count = min(count, length(sorted))
+      {to_pop, remaining} = Enum.split(sorted, actual_count)
+      Enum.each(to_pop, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+      if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - actual_count, remaining)
+      popped_values = Enum.map(to_pop, fn {_, val} -> val end)
+      case count do 1 -> List.first(popped_values); _ -> popped_values end
     end
   end
 
-  defp do_execute(elements, _put_fn, _delete_fn, {:lrange, start, stop}) do
-    len = length(elements)
-    norm_start = normalize_index(start, len)
-    norm_stop = normalize_index(stop, len)
-
-    cond do
-      norm_start > norm_stop -> []
-      norm_start >= len -> []
-      true -> Enum.slice(elements, norm_start..norm_stop//1)
+  # RPOP
+  defp do_execute(_key, _store, nil, {:rpop, _count}), do: nil
+  defp do_execute(_key, _store, {0, _, _}, {:rpop, _count}), do: nil
+  defp do_execute(key, store, {len, _, _}, {:rpop, count}) do
+    sorted = sorted_elements(key, store)
+    if sorted == [] do nil else
+      total = length(sorted)
+      actual_count = min(count, total)
+      {remaining, to_pop} = Enum.split(sorted, total - actual_count)
+      Enum.each(to_pop, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+      if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - actual_count, remaining)
+      popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
+      case count do 1 -> List.first(popped_values); _ -> popped_values end
     end
   end
 
-  defp do_execute(elements, _put_fn, _delete_fn, :llen), do: length(elements)
-
-  defp do_execute(elements, _put_fn, _delete_fn, {:lindex, index}) do
-    len = length(elements)
-
-    # Guard against negative underflow: if the negative index is beyond the list
-    # start, return nil before normalize_index clamps it to 0.
-    if index < 0 and len + index < 0 do
-      nil
-    else
-      norm = normalize_index(index, len)
-
-      if norm >= 0 and norm < len do
-        Enum.at(elements, norm)
-      else
-        nil
-      end
-    end
+  # LRANGE
+  defp do_execute(_key, _store, nil, {:lrange, _, _}), do: []
+  defp do_execute(key, store, {len, _, _}, {:lrange, start, stop}) do
+    ns = normalize_index(start, len); ne = normalize_index(stop, len)
+    cond do ns > ne -> []; ns >= len -> []; true -> ordered_values(key, store) |> Enum.slice(ns..ne//1) end
   end
 
-  defp do_execute(elements, put_fn, _delete_fn, {:lset, index, element}) do
-    len = length(elements)
+  # LLEN
+  defp do_execute(_key, _store, nil, :llen), do: 0
+  defp do_execute(_key, _store, {len, _, _}, :llen), do: len
+
+  # LINDEX
+  defp do_execute(_key, _store, nil, {:lindex, _}), do: nil
+  defp do_execute(key, store, {len, _, _}, {:lindex, index}) do
+    if index < 0 and len + index < 0, do: nil, else: (norm = normalize_index(index, len); if norm >= 0 and norm < len, do: ordered_values(key, store) |> Enum.at(norm), else: nil)
+  end
+
+  # LSET
+  defp do_execute(_key, _store, nil, {:lset, _, _}), do: {:error, "ERR no such key"}
+  defp do_execute(key, store, {len, _, _}, {:lset, index, element}) do
     norm = normalize_index(index, len)
-
     if norm >= 0 and norm < len do
-      updated = List.replace_at(elements, norm, element)
-      put_fn.(encode_list(updated))
+      {old_pos, _} = sorted_elements(key, store) |> Enum.at(norm)
+      store.compound_put.(key, CompoundKey.list_element(key, old_pos), element, 0)
       :ok
     else
       {:error, "ERR index out of range"}
     end
   end
 
-  defp do_execute(elements, put_fn, delete_fn, {:lrem, count, element}) do
-    {updated, removed_count} = remove_elements(elements, count, element)
-
+  # LREM
+  defp do_execute(_key, _store, nil, {:lrem, _, _}), do: 0
+  defp do_execute(key, store, {len, _, _}, {:lrem, count, element}) do
+    sorted = sorted_elements(key, store)
+    {to_remove, remaining, removed_count} = select_removals(sorted, count, element)
     cond do
-      removed_count == 0 ->
-        0
-
-      updated == [] ->
-        delete_fn.()
-        removed_count
-
+      removed_count == 0 -> 0
+      remaining == [] ->
+        Enum.each(to_remove, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+        delete_meta(key, store); removed_count
       true ->
-        put_fn.(encode_list(updated))
-        removed_count
+        Enum.each(to_remove, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+        update_meta_from_remaining(key, store, len - removed_count, remaining); removed_count
     end
   end
 
-  defp do_execute(elements, put_fn, delete_fn, {:ltrim, start, stop}) do
-    len = length(elements)
-    norm_start = normalize_index(start, len)
-    norm_stop = normalize_index(stop, len)
-
-    trimmed =
-      cond do
-        norm_start > norm_stop -> []
-        norm_start >= len -> []
-        true -> Enum.slice(elements, norm_start..norm_stop//1)
-      end
-
-    if trimmed == [] do
-      delete_fn.()
-    else
-      put_fn.(encode_list(trimmed))
+  # LTRIM
+  defp do_execute(_key, _store, nil, {:ltrim, _, _}), do: :ok
+  defp do_execute(key, store, {len, _, _}, {:ltrim, start, stop}) do
+    ns = normalize_index(start, len); ne = normalize_index(stop, len)
+    sorted = sorted_elements(key, store)
+    {to_keep, to_delete} = cond do
+      ns > ne -> {[], sorted}; ns >= len -> {[], sorted}
+      true -> (kept = Enum.slice(sorted, ns..ne//1); ks = MapSet.new(kept, fn {p, _} -> p end); {kept, Enum.reject(sorted, fn {p, _} -> MapSet.member?(ks, p) end)})
     end
-
+    Enum.each(to_delete, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+    if to_keep == [], do: delete_meta(key, store), else: (
+      {mp, _} = hd(to_keep); {xp, _} = List.last(to_keep)
+      write_meta(key, store, {length(to_keep), mp - @position_step, xp + @position_step})
+    )
     :ok
   end
 
-  defp do_execute(elements, _put_fn, _delete_fn, {:lpos, element, rank, count, maxlen}) do
-    find_positions(elements, element, rank, count, maxlen)
+  # LPOS
+  defp do_execute(_key, _store, nil, {:lpos, _, _, _, _}), do: nil
+  defp do_execute(key, store, {_, _, _}, {:lpos, element, rank, count, maxlen}) do
+    find_positions(ordered_values(key, store), element, rank, count, maxlen)
   end
 
-  defp do_execute(elements, put_fn, _delete_fn, {:linsert, direction, pivot, element}) do
-    case find_pivot_index(elements, pivot) do
-      nil ->
-        -1
-
+  # LINSERT
+  defp do_execute(_key, _store, nil, {:linsert, _, _, _}), do: 0
+  defp do_execute(key, store, {len, left_pos, right_pos}, {:linsert, direction, pivot, element}) do
+    sorted = sorted_elements(key, store)
+    values = Enum.map(sorted, fn {_, val} -> val end)
+    case Enum.find_index(values, &(&1 == pivot)) do
+      nil -> -1
       idx ->
-        insert_idx = if direction == :before, do: idx, else: idx + 1
-        updated = List.insert_at(elements, insert_idx, element)
-        put_fn.(encode_list(updated))
-        length(updated)
+        new_pos = case direction do
+          :before -> if idx == 0, do: (elem(hd(sorted), 0) - @position_step), else: ((elem(Enum.at(sorted, idx - 1), 0) + elem(Enum.at(sorted, idx), 0)) / 2.0)
+          :after -> if idx == length(sorted) - 1, do: (elem(List.last(sorted), 0) + @position_step), else: ((elem(Enum.at(sorted, idx), 0) + elem(Enum.at(sorted, idx + 1), 0)) / 2.0)
+        end
+        store.compound_put.(key, CompoundKey.list_element(key, new_pos), element, 0)
+        write_meta(key, store, {len + 1, min(left_pos, new_pos - @position_step), max(right_pos, new_pos + @position_step)})
+        len + 1
     end
   end
 
-  defp do_execute(_elements, _put_fn, _delete_fn, {:lmove, _destination, _from_dir, _to_dir}) do
-    # This clause should not be reached — LMOVE is handled via execute_lmove/7.
-    {:error, "ERR lmove must be handled at the store layer"}
-  end
+  defp do_execute(_, _, _, {:lmove, _, _, _}), do: {:error, "ERR lmove must be handled at the store layer"}
 
-  defp do_execute([], _put_fn, _delete_fn, {:pop_for_move, _dir}), do: nil
-
-  defp do_execute(elements, put_fn, delete_fn, {:pop_for_move, dir}) do
-    {element, remaining} = pop_element(elements, dir)
-
-    if remaining == [] do
-      delete_fn.()
-    else
-      put_fn.(encode_list(remaining))
+  # pop_for_move
+  defp do_execute(_key, _store, nil, {:pop_for_move, _}), do: nil
+  defp do_execute(_key, _store, {0, _, _}, {:pop_for_move, _}), do: nil
+  defp do_execute(key, store, {len, _, _}, {:pop_for_move, dir}) do
+    sorted = sorted_elements(key, store)
+    if sorted == [] do nil else
+      {pos, element} = case dir do :left -> hd(sorted); :right -> List.last(sorted) end
+      store.compound_delete.(key, CompoundKey.list_element(key, pos))
+      remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
+      if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - 1, remaining)
+      element
     end
-
-    element
   end
 
-  defp do_execute(elements, put_fn, _delete_fn, {:lpushx, new_elements}) do
-    updated = Enum.reverse(new_elements) ++ elements
-    put_fn.(encode_list(updated))
-    length(updated)
+  # LPUSHX / RPUSHX
+  defp do_execute(_, _, nil, {:lpushx, _}), do: 0
+  defp do_execute(key, store, meta, {:lpushx, elems}), do: do_execute(key, store, meta, {:lpush, elems})
+  defp do_execute(_, _, nil, {:rpushx, _}), do: 0
+  defp do_execute(key, store, meta, {:rpushx, elems}), do: do_execute(key, store, meta, {:rpush, elems})
+
+  defp do_lpush_new(key, store, elements) do
+    reversed = Enum.reverse(elements); count = length(reversed)
+    # reversed=[c,b,a] for LPUSH key a b c. c should be leftmost (smallest pos).
+    # Assign: c at -(count-1)*step, b at -(count-2)*step, ..., a at 0.0
+    Enum.with_index(reversed) |> Enum.each(fn {elem, idx} ->
+      pos = @initial_position - (count - 1 - idx) * @position_step
+      store.compound_put.(key, CompoundKey.list_element(key, pos), elem, 0)
+    end)
+    min_a = @initial_position - (count - 1) * @position_step
+    write_meta(key, store, {count, min_a - @position_step, @initial_position + @position_step})
+    count
   end
 
-  defp do_execute(elements, put_fn, _delete_fn, {:rpushx, new_elements}) do
-    updated = elements ++ new_elements
-    put_fn.(encode_list(updated))
-    length(updated)
+  defp do_rpush_new(key, store, elements) do
+    count = length(elements)
+    Enum.with_index(elements) |> Enum.each(fn {elem, idx} ->
+      store.compound_put.(key, CompoundKey.list_element(key, @initial_position + idx * @position_step), elem, 0)
+    end)
+    max_a = @initial_position + (count - 1) * @position_step
+    write_meta(key, store, {count, @initial_position - @position_step, max_a + @position_step})
+    count
   end
 
-  # ---------------------------------------------------------------------------
-  # Private — execute when key does not exist
-  # ---------------------------------------------------------------------------
-
-  defp do_execute_missing(put_fn, _delete_fn, {:lpush, elements}) do
-    list = Enum.reverse(elements)
-    put_fn.(encode_list(list))
-    length(list)
-  end
-
-  defp do_execute_missing(put_fn, _delete_fn, {:rpush, elements}) do
-    put_fn.(encode_list(elements))
-    length(elements)
-  end
-
-  defp do_execute_missing(_put_fn, _delete_fn, {:lpop, _count}), do: nil
-  defp do_execute_missing(_put_fn, _delete_fn, {:rpop, _count}), do: nil
-  defp do_execute_missing(_put_fn, _delete_fn, {:lrange, _start, _stop}), do: []
-  defp do_execute_missing(_put_fn, _delete_fn, :llen), do: 0
-  defp do_execute_missing(_put_fn, _delete_fn, {:lindex, _index}), do: nil
-
-  defp do_execute_missing(_put_fn, _delete_fn, {:lset, _index, _element}) do
-    {:error, "ERR no such key"}
-  end
-
-  defp do_execute_missing(_put_fn, _delete_fn, {:lrem, _count, _element}), do: 0
-  defp do_execute_missing(_put_fn, _delete_fn, {:ltrim, _start, _stop}), do: :ok
-  defp do_execute_missing(_put_fn, _delete_fn, {:lpos, _element, _rank, _count, _maxlen}), do: nil
-  defp do_execute_missing(_put_fn, _delete_fn, {:linsert, _dir, _pivot, _element}), do: 0
-  defp do_execute_missing(_put_fn, _delete_fn, {:lpushx, _elements}), do: 0
-  defp do_execute_missing(_put_fn, _delete_fn, {:rpushx, _elements}), do: 0
-  defp do_execute_missing(_put_fn, _delete_fn, {:lmove, _destination, _from_dir, _to_dir}), do: nil
-  defp do_execute_missing(_put_fn, _delete_fn, {:pop_for_move, _dir}), do: nil
-
-  # ---------------------------------------------------------------------------
-  # Private — index normalization
-  # ---------------------------------------------------------------------------
-
-  # Converts negative indices to positive. Clamps to 0 at the low end.
   defp normalize_index(index, len) when index < 0, do: max(0, len + index)
   defp normalize_index(index, _len), do: index
 
-  # ---------------------------------------------------------------------------
-  # Private — element removal
-  # ---------------------------------------------------------------------------
-
-  defp remove_elements(elements, 0, target) do
-    # Remove all occurrences
-    updated = Enum.reject(elements, &(&1 == target))
-    {updated, length(elements) - length(updated)}
+  defp select_removals(sorted, 0, target) do
+    {removed, kept} = Enum.split_with(sorted, fn {_, val} -> val == target end)
+    {removed, kept, length(removed)}
+  end
+  defp select_removals(sorted, count, target) when count > 0, do: remove_n_from_head(sorted, count, target)
+  defp select_removals(sorted, count, target) when count < 0 do
+    {removed, remaining_rev, n} = remove_n_from_head(Enum.reverse(sorted), abs(count), target)
+    {removed, Enum.reverse(remaining_rev), n}
   end
 
-  defp remove_elements(elements, count, target) when count > 0 do
-    # Remove first `count` occurrences from head
-    remove_from_head(elements, count, target, [], 0)
+  defp remove_n_from_head(sorted, max_remove, target) do
+    {removed, remaining, _} = Enum.reduce(sorted, {[], [], max_remove}, fn {_, val} = entry, {rem_acc, keep_acc, budget} ->
+      if val == target and budget > 0, do: {[entry | rem_acc], keep_acc, budget - 1}, else: {rem_acc, [entry | keep_acc], budget}
+    end)
+    {Enum.reverse(removed), Enum.reverse(remaining), length(removed)}
   end
-
-  defp remove_elements(elements, count, target) when count < 0 do
-    # Remove last `abs(count)` occurrences (from tail)
-    # Reverse, remove from head, reverse back
-    abs_count = abs(count)
-
-    {reversed_updated, removed} =
-      remove_from_head(Enum.reverse(elements), abs_count, target, [], 0)
-
-    {Enum.reverse(reversed_updated), removed}
-  end
-
-  defp remove_from_head([], _remaining, _target, acc, removed) do
-    {Enum.reverse(acc), removed}
-  end
-
-  defp remove_from_head([elem | rest], 0, _target, acc, removed) do
-    {Enum.reverse(acc) ++ [elem | rest], removed}
-  end
-
-  defp remove_from_head([elem | rest], remaining, target, acc, removed) do
-    if elem == target do
-      remove_from_head(rest, remaining - 1, target, acc, removed + 1)
-    else
-      remove_from_head(rest, remaining, target, [elem | acc], removed)
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private — LPOS position finding
-  # ---------------------------------------------------------------------------
 
   defp find_positions(elements, element, rank, count, maxlen) do
-    # Determine scan direction and effective list
-    {scan_list, reverse?} =
-      if rank < 0 do
-        {Enum.reverse(elements), true}
-      else
-        {elements, false}
-      end
-
+    {scan_list, reverse?} = if rank < 0, do: {Enum.reverse(elements), true}, else: {elements, false}
     abs_rank = abs(rank)
-    effective_maxlen = if maxlen == 0, do: length(scan_list), else: min(maxlen, length(scan_list))
-    scan_slice = Enum.take(scan_list, effective_maxlen)
+    eff = if maxlen == 0, do: length(scan_list), else: min(maxlen, length(scan_list))
     total_len = length(elements)
-
-    # Find all matching positions within the scan window
-    matches =
-      scan_slice
-      |> Enum.with_index()
-      |> Enum.filter(fn {elem, _idx} -> elem == element end)
-      |> Enum.map(fn {_elem, idx} ->
-        if reverse?, do: total_len - 1 - idx, else: idx
-      end)
-
-    # Skip to the rank-th match
-    matches_from_rank = Enum.drop(matches, abs_rank - 1)
-
+    matches = Enum.take(scan_list, eff) |> Enum.with_index() |> Enum.filter(fn {e, _} -> e == element end) |> Enum.map(fn {_, idx} -> if reverse?, do: total_len - 1 - idx, else: idx end)
+    from_rank = Enum.drop(matches, abs_rank - 1)
     case count do
-      # No COUNT specified — return single position or nil
-      nil ->
-        case matches_from_rank do
-          [pos | _] -> pos
-          [] -> nil
-        end
-
-      # COUNT 0 — return all matches from rank onward
-      0 ->
-        matches_from_rank
-
-      # COUNT N — return up to N matches from rank onward
-      n ->
-        Enum.take(matches_from_rank, n)
+      nil -> case from_rank do [pos | _] -> pos; [] -> nil end
+      0 -> from_rank
+      n -> Enum.take(from_rank, n)
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Private — pivot finding
-  # ---------------------------------------------------------------------------
-
-  defp find_pivot_index(elements, pivot) do
-    Enum.find_index(elements, &(&1 == pivot))
+  # Legacy blob-based execution
+  defp legacy_execute_blob(get_fn, put_fn, delete_fn, operation) do
+    case decode_stored(get_fn.()) do
+      {:ok, elements} -> leg_do(elements, put_fn, delete_fn, operation)
+      :not_found -> leg_missing(put_fn, delete_fn, operation)
+      {:error, :wrongtype} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+    end
   end
 
-  # ---------------------------------------------------------------------------
-  # Private — element pop/push helpers (for LMOVE)
-  # ---------------------------------------------------------------------------
+  defp leg_do(el, pf, _, {:lpush, ne}), do: (u = Enum.reverse(ne) ++ el; pf.(encode_list(u)); length(u))
+  defp leg_do(el, pf, _, {:rpush, ne}), do: (u = el ++ ne; pf.(encode_list(u)); length(u))
+  defp leg_do([], _, _, {:lpop, _}), do: nil
+  defp leg_do(el, pf, df, {:lpop, c}) do
+    ac = min(c, length(el)); {popped, rem} = Enum.split(el, ac)
+    if rem == [], do: df.(), else: pf.(encode_list(rem))
+    case c do 1 -> List.first(popped); _ -> popped end
+  end
+  defp leg_do([], _, _, {:rpop, _}), do: nil
+  defp leg_do(el, pf, df, {:rpop, c}) do
+    len = length(el); ac = min(c, len); {rem, popped} = Enum.split(el, len - ac)
+    if rem == [], do: df.(), else: pf.(encode_list(rem))
+    pr = Enum.reverse(popped)
+    case c do 1 -> List.first(pr); _ -> pr end
+  end
+  defp leg_do(el, _, _, {:lrange, s, e}), do: (len = length(el); ns = normalize_index(s, len); ne = normalize_index(e, len); cond do ns > ne -> []; ns >= len -> []; true -> Enum.slice(el, ns..ne//1) end)
+  defp leg_do(el, _, _, :llen), do: length(el)
+  defp leg_do(el, _, _, {:lindex, i}), do: (len = length(el); if i < 0 and len + i < 0, do: nil, else: (n = normalize_index(i, len); if n >= 0 and n < len, do: Enum.at(el, n), else: nil))
+  defp leg_do(el, pf, _, {:lset, i, e}), do: (len = length(el); n = normalize_index(i, len); if n >= 0 and n < len, do: (pf.(encode_list(List.replace_at(el, n, e))); :ok), else: {:error, "ERR index out of range"})
+  defp leg_do(el, pf, df, {:lrem, c, e}) do
+    {u, rc} = leg_rem(el, c, e)
+    cond do rc == 0 -> 0; u == [] -> (df.(); rc); true -> (pf.(encode_list(u)); rc) end
+  end
+  defp leg_do(el, pf, df, {:ltrim, s, e}) do
+    len = length(el); ns = normalize_index(s, len); ne = normalize_index(e, len)
+    t = cond do ns > ne -> []; ns >= len -> []; true -> Enum.slice(el, ns..ne//1) end
+    if t == [], do: df.(), else: pf.(encode_list(t)); :ok
+  end
+  defp leg_do(el, _, _, {:lpos, e, r, c, m}), do: find_positions(el, e, r, c, m)
+  defp leg_do(el, pf, _, {:linsert, d, pv, e}) do
+    case Enum.find_index(el, &(&1 == pv)) do
+      nil -> -1; idx -> (ii = if d == :before, do: idx, else: idx + 1; u = List.insert_at(el, ii, e); pf.(encode_list(u)); length(u))
+    end
+  end
+  defp leg_do(_, _, _, {:lmove, _, _, _}), do: {:error, "ERR lmove must be handled at the store layer"}
+  defp leg_do([], _, _, {:pop_for_move, _}), do: nil
+  defp leg_do(el, pf, df, {:pop_for_move, dir}) do
+    {e, r} = leg_pop(el, dir); if r == [], do: df.(), else: pf.(encode_list(r)); e
+  end
+  defp leg_do(el, pf, _, {:lpushx, ne}), do: (u = Enum.reverse(ne) ++ el; pf.(encode_list(u)); length(u))
+  defp leg_do(el, pf, _, {:rpushx, ne}), do: (u = el ++ ne; pf.(encode_list(u)); length(u))
 
-  defp pop_element(elements, :left), do: {hd(elements), tl(elements)}
+  defp leg_missing(pf, _, {:lpush, el}), do: (l = Enum.reverse(el); pf.(encode_list(l)); length(l))
+  defp leg_missing(pf, _, {:rpush, el}), do: (pf.(encode_list(el)); length(el))
+  defp leg_missing(_, _, {:lpop, _}), do: nil
+  defp leg_missing(_, _, {:rpop, _}), do: nil
+  defp leg_missing(_, _, {:lrange, _, _}), do: []
+  defp leg_missing(_, _, :llen), do: 0
+  defp leg_missing(_, _, {:lindex, _}), do: nil
+  defp leg_missing(_, _, {:lset, _, _}), do: {:error, "ERR no such key"}
+  defp leg_missing(_, _, {:lrem, _, _}), do: 0
+  defp leg_missing(_, _, {:ltrim, _, _}), do: :ok
+  defp leg_missing(_, _, {:lpos, _, _, _, _}), do: nil
+  defp leg_missing(_, _, {:linsert, _, _, _}), do: 0
+  defp leg_missing(_, _, {:lpushx, _}), do: 0
+  defp leg_missing(_, _, {:rpushx, _}), do: 0
+  defp leg_missing(_, _, {:lmove, _, _, _}), do: nil
+  defp leg_missing(_, _, {:pop_for_move, _}), do: nil
 
-  defp pop_element(elements, :right) do
-    last = List.last(elements)
-    remaining = Enum.slice(elements, 0..(length(elements) - 2)//1)
-    {last, remaining}
+  defp leg_rem(el, 0, t), do: (u = Enum.reject(el, &(&1 == t)); {u, length(el) - length(u)})
+  defp leg_rem(el, c, t) when c > 0, do: leg_rem_head(el, c, t, [], 0)
+  defp leg_rem(el, c, t) when c < 0 do
+    {ru, r} = leg_rem_head(Enum.reverse(el), abs(c), t, [], 0); {Enum.reverse(ru), r}
+  end
+  defp leg_rem_head([], _, _, acc, r), do: {Enum.reverse(acc), r}
+  defp leg_rem_head([e | rest], 0, _, acc, r), do: {Enum.reverse(acc) ++ [e | rest], r}
+  defp leg_rem_head([e | rest], rem, t, acc, r), do: if(e == t, do: leg_rem_head(rest, rem - 1, t, acc, r + 1), else: leg_rem_head(rest, rem, t, [e | acc], r))
+
+  defp leg_pop(el, :left), do: {hd(el), tl(el)}
+  defp leg_pop(el, :right), do: {List.last(el), Enum.slice(el, 0..(length(el) - 2)//1)}
+
+  defp legacy_execute_lmove(sg, sp, sd, dg, dp, fd, td) do
+    with {:src, {:ok, se}} <- {:src, decode_stored(sg.())}, true <- se != [] do
+      {e, r} = leg_pop(se, fd)
+      if r == [], do: sd.(), else: sp.(encode_list(r))
+      case decode_stored(dg.()) do
+        {:error, :wrongtype} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        :not_found -> (dp.(encode_list(leg_push([], e, td))); e)
+        {:ok, de} -> (dp.(encode_list(leg_push(de, e, td))); e)
+      end
+    else
+      {:src, :not_found} -> nil
+      {:src, {:error, :wrongtype}} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+      false -> nil
+    end
   end
 
-  defp push_element(elements, value, :left), do: [value | elements]
-  defp push_element(elements, value, :right), do: elements ++ [value]
+  defp leg_push(el, v, :left), do: [v | el]
+  defp leg_push(el, v, :right), do: el ++ [v]
 end

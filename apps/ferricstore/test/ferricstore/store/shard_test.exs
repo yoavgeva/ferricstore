@@ -124,7 +124,7 @@ defmodule Ferricstore.Store.ShardTest do
       hot_cache = :"hot_cache_#{index}"
       assert :ets.whereis(keydir) != :undefined
       assert [{_, 0}] = :ets.lookup(keydir, "cached_key")
-      assert [{_, "val"}] = :ets.lookup(hot_cache, "cached_key")
+      assert [{_, "val", _}] = :ets.lookup(hot_cache, "cached_key")
     end
 
     test "get warms ETS on miss", %{shard: shard, index: index} do
@@ -136,7 +136,7 @@ defmodule Ferricstore.Store.ShardTest do
       :ets.delete(hot_cache, "warm_key")
       # Now get — should fetch from Bitcask and warm ETS
       assert "warm_val" == GenServer.call(shard, {:get, "warm_key"})
-      assert [{_, "warm_val"}] = :ets.lookup(hot_cache, "warm_key")
+      assert [{_, "warm_val", _}] = :ets.lookup(hot_cache, "warm_key")
     end
 
     test "delete evicts ETS entry", %{shard: shard, index: index} do
@@ -155,7 +155,7 @@ defmodule Ferricstore.Store.ShardTest do
       hot_cache = :"hot_cache_#{index}"
       # Confirm entry is in ETS (put always writes to ETS)
       assert [{_, ^past}] = :ets.lookup(keydir, "exp_key")
-      assert [{_, "val"}] = :ets.lookup(hot_cache, "exp_key")
+      assert [{_, "val", _}] = :ets.lookup(hot_cache, "exp_key")
       # get should detect expiry and evict
       assert nil == GenServer.call(shard, {:get, "exp_key"})
       assert [] == :ets.lookup(keydir, "exp_key")

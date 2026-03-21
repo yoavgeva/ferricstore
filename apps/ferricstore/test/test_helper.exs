@@ -14,7 +14,10 @@
 # :jepsen — Jepsen-style durability and consistency tests that spin up multi-node
 #   `:peer` clusters and inject faults. Excluded by default; run with
 #   `mix test test/ferricstore/jepsen/ --include jepsen`.
-ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen])
+# :bloom_nif_mmap — tests for the NIF-backed mmap Bloom filter persistence
+#   feature which is not yet integrated into the pure-Elixir Bloom module.
+#   Run with `mix test --include bloom_nif_mmap`.
+ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen, :bloom_nif_mmap])
 
 # Clean up the test data directory after the suite finishes.
 # Each run uses a unique dir (ferricstore_test_<pid>) so parallel runs don't

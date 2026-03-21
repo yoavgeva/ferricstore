@@ -450,13 +450,14 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
       # Fixed formula produces the correct depth.
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYPROB", ["sk", "0.01", "0.01"], store)
-      {:cms, sketch} = store.get.("sk")
 
       correct_depth = ceil(:math.log(1.0 / 0.01))
 
-      # After fix: depth matches the correct formula
+      # After fix: depth matches the correct formula (query via CMS.INFO)
       assert correct_depth == 5
-      assert sketch.depth == correct_depth
+      info = CMS.handle("CMS.INFO", ["sk"], store)
+      depth_idx = Enum.find_index(info, &(&1 == "depth"))
+      assert Enum.at(info, depth_idx + 1) == correct_depth
     end
 
     @tag :bug
@@ -465,10 +466,11 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
       # A depth-5 sketch gives 1-(1/2)^5 = 96.9% confidence.
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYPROB", ["sk", "0.01", "0.01"], store)
-      {:cms, sketch} = store.get.("sk")
 
-      # Fixed behavior: depth is 5
-      assert sketch.depth == 5
+      # Fixed behavior: depth is 5 (query via CMS.INFO)
+      info = CMS.handle("CMS.INFO", ["sk"], store)
+      depth_idx = Enum.find_index(info, &(&1 == "depth"))
+      assert Enum.at(info, depth_idx + 1) == 5
     end
   end
 

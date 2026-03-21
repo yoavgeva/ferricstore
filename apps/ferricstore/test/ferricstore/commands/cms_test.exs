@@ -79,15 +79,18 @@ defmodule Ferricstore.Commands.CMSTest do
     test "sketch dimensions match theoretical formulas" do
       store = MockStore.make()
       assert :ok = CMS.handle("CMS.INITBYPROB", ["mysketch", "0.01", "0.99"], store)
-      {:cms, sketch} = store.get.("mysketch")
+
+      # Use CMS.INFO to inspect dimensions (sketch is now a NIF resource)
+      ["width", width, "depth", depth, "count", 0] =
+        CMS.handle("CMS.INFO", ["mysketch"], store)
 
       # width = ceil(e / error) = ceil(2.718 / 0.01) = 272
       expected_width = ceil(:math.exp(1) / 0.01)
-      assert sketch.width == expected_width
+      assert width == expected_width
 
       # depth = ceil(ln(1 / prob)) = ceil(ln(1/0.99)) = ceil(0.01005) = 1
       expected_depth = ceil(:math.log(1.0 / 0.99))
-      assert sketch.depth == expected_depth
+      assert depth == expected_depth
     end
 
     test "returns error when key already exists" do
@@ -634,17 +637,17 @@ defmodule Ferricstore.Commands.CMSTest do
     test "INITBYPROB with very small error rate creates large sketch" do
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYPROB", ["mysketch", "0.0001", "0.99"], store)
-      {:cms, sketch} = store.get.("mysketch")
+      ["width", width, "depth", _, "count", _] = CMS.handle("CMS.INFO", ["mysketch"], store)
       # width = ceil(e / 0.0001) = ceil(27183) = 27183
-      assert sketch.width > 10_000
+      assert width > 10_000
     end
 
     test "INITBYPROB with very small probability creates deep sketch" do
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYPROB", ["mysketch", "0.01", "0.0001"], store)
-      {:cms, sketch} = store.get.("mysketch")
+      ["width", _, "depth", depth, "count", _] = CMS.handle("CMS.INFO", ["mysketch"], store)
       # depth = ceil(ln(1/0.0001)) = ceil(ln(10000)) = ceil(9.21) = 10
-      assert sketch.depth >= 9
+      assert depth >= 9
     end
 
     test "merge with all zero weights creates empty sketch" do
@@ -682,6 +685,124 @@ defmodule Ferricstore.Commands.CMSTest do
       assert :ok = Dispatcher.dispatch("cms.initbydim", ["mysketch", "100", "7"], store)
       assert [1] = Dispatcher.dispatch("cms.incrby", ["mysketch", "a", "1"], store)
       assert [1] = Dispatcher.dispatch("cms.query", ["mysketch", "a"], store)
+    end
+  end
+
+  # ===========================================================================
+  # NIF resource lifecycle
+  # ===========================================================================
+
+  describe "NIF resource lifecycle" do
+    test "NIF resource survives multiple operations" do
+      store = MockStore.make()
+      :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
+      for i <- 1..50 do
+        CMS.handle("CMS.INCRBY", ["mysketch", "elem_#{i}", "#{i}"], store)
+      end
+
+      for i <- 1..50 do
+        [est] = CMS.handle("CMS.QUERY", ["mysketch", "elem_#{i}"], store)
+        assert est >= i, "elem_#{i}: expected >= #{i}, got #{est}"
+      end
+
+      ["width", 100, "depth", 7, "count", total] = CMS.handle("CMS.INFO", ["mysketch"], store)
+      assert total == Enum.sum(1..50)
+    end
+
+    test "multiple independent NIF sketches do not interfere" do
+      store = MockStore.make()
+      :ok = CMS.handle("CMS.INITBYDIM", ["sketch_a", "100", "7"], store)
+      :ok = CMS.handle("CMS.INITBYDIM", ["sketch_b", "100", "7"], store)
+      CMS.handle("CMS.INCRBY", ["sketch_a", "x", "10"], store)
+      CMS.handle("CMS.INCRBY", ["sketch_b", "x", "20"], store)
+      [a_est] = CMS.handle("CMS.QUERY", ["sketch_a", "x"], store)
+      [b_est] = CMS.handle("CMS.QUERY", ["sketch_b", "x"], store)
+      assert a_est >= 10
+      assert b_est >= 20
+      assert a_est < b_est
+    end
+  end
+
+  # ===========================================================================
+  # Large sketch (width=10000, depth=10)
+  # ===========================================================================
+
+  describe "large sketch" do
+    test "width=10000 depth=10 sketch handles many elements" do
+      store = MockStore.make()
+      :ok = CMS.handle("CMS.INITBYDIM", ["big", "10000", "10"], store)
+      for i <- 1..5000, do: CMS.handle("CMS.INCRBY", ["big", "key_#{i}", "1"], store)
+      ["width", 10_000, "depth", 10, "count", 5000] = CMS.handle("CMS.INFO", ["big"], store)
+      for i <- [1, 1000, 2500, 5000] do
+        [est] = CMS.handle("CMS.QUERY", ["big", "key_#{i}"], store)
+        assert est >= 1
+      end
+    end
+  end
+
+  # ===========================================================================
+  # Merge correctness
+  # ===========================================================================
+
+  describe "merge correctness (NIF)" do
+    test "merge of three sources with different weights" do
+      store = MockStore.make()
+      :ok = CMS.handle("CMS.INITBYDIM", ["s1", "100", "7"], store)
+      :ok = CMS.handle("CMS.INITBYDIM", ["s2", "100", "7"], store)
+      :ok = CMS.handle("CMS.INITBYDIM", ["s3", "100", "7"], store)
+      CMS.handle("CMS.INCRBY", ["s1", "a", "10"], store)
+      CMS.handle("CMS.INCRBY", ["s2", "a", "20"], store)
+      CMS.handle("CMS.INCRBY", ["s3", "a", "30"], store)
+      assert :ok =
+        CMS.handle("CMS.MERGE", ["dst", "3", "s1", "s2", "s3", "WEIGHTS", "1", "2", "3"], store)
+      [est] = CMS.handle("CMS.QUERY", ["dst", "a"], store)
+      assert est == 140
+    end
+
+    test "merge preserves counts for distinct elements" do
+      store = MockStore.make()
+      :ok = CMS.handle("CMS.INITBYDIM", ["s1", "200", "7"], store)
+      :ok = CMS.handle("CMS.INITBYDIM", ["s2", "200", "7"], store)
+      CMS.handle("CMS.INCRBY", ["s1", "only_in_s1", "5"], store)
+      CMS.handle("CMS.INCRBY", ["s2", "only_in_s2", "8"], store)
+      assert :ok = CMS.handle("CMS.MERGE", ["dst", "2", "s1", "s2"], store)
+      [est1] = CMS.handle("CMS.QUERY", ["dst", "only_in_s1"], store)
+      [est2] = CMS.handle("CMS.QUERY", ["dst", "only_in_s2"], store)
+      assert est1 >= 5
+      assert est2 >= 8
+    end
+  end
+
+  # ===========================================================================
+  # Concurrent queries
+  # ===========================================================================
+
+  describe "concurrent queries" do
+    test "parallel queries return consistent results" do
+      store = MockStore.make()
+      :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "1000", "7"], store)
+      CMS.handle("CMS.INCRBY", ["mysketch", "elem", "42"], store)
+      tasks = for _ <- 1..100, do: Task.async(fn ->
+        CMS.handle("CMS.QUERY", ["mysketch", "elem"], store)
+      end)
+      results = Task.await_many(tasks, 5000)
+      for [est] <- results, do: assert(est >= 42)
+    end
+
+    test "parallel increments and queries are safe" do
+      store = MockStore.make()
+      :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "1000", "7"], store)
+      incr_tasks = for _ <- 1..50, do: Task.async(fn ->
+        CMS.handle("CMS.INCRBY", ["mysketch", "shared_elem", "1"], store)
+      end)
+      query_tasks = for _ <- 1..50, do: Task.async(fn ->
+        CMS.handle("CMS.QUERY", ["mysketch", "shared_elem"], store)
+      end)
+      Task.await_many(incr_tasks, 5000)
+      query_results = Task.await_many(query_tasks, 5000)
+      for [est] <- query_results, do: assert(est >= 0)
+      [final] = CMS.handle("CMS.QUERY", ["mysketch", "shared_elem"], store)
+      assert final >= 50
     end
   end
 end

@@ -99,7 +99,7 @@ defmodule Mix.Tasks.Ferricstore.LargeValues do
 
       try do
         :ets.foldl(
-          fn {key, value}, acc ->
+          fn {key, value, _access_ms}, acc ->
             size = byte_size(value)
 
             if size > threshold do

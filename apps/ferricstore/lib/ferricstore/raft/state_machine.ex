@@ -27,6 +27,25 @@ defmodule Ferricstore.Raft.StateMachine do
   - In single-node mode, the shard's Raft group has one member (self quorum),
     so every write commits immediately after local log append + fsync.
 
+  ## HLC piggybacking (spec 2G.6)
+
+  HLC timestamps are piggybacked on Raft commands. The `Batcher` stamps each
+  command with the leader's current HLC timestamp before submitting it to ra.
+  When `apply/3` processes a command carrying an `hlc_ts` metadata map, it
+  calls `HLC.update/1` to merge the leader's clock into the local node's HLC.
+
+  In single-node mode this merge is a no-op (the node merges its own
+  timestamp). In multi-node clusters, followers use this to stay
+  causally synchronized with the leader's clock, bounding inter-node TTL
+  precision to Raft heartbeat RTT (~10 ms).
+
+  Commands may arrive in two forms:
+
+    * **Wrapped**: `{inner_command, %{hlc_ts: {physical_ms, logical}}}` --
+      the metadata map carries the leader's HLC timestamp for merging.
+    * **Unwrapped**: `inner_command` (legacy / test) -- processed as before
+      without HLC merging.
+
   ## Log compaction (spec 2E.5)
 
   The Raft log grows unbounded unless compacted. Every
@@ -43,6 +62,7 @@ defmodule Ferricstore.Raft.StateMachine do
   @behaviour :ra_machine
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.HLC
   alias Ferricstore.Store.{ListOps, PrefixIndex}
 
   @default_release_cursor_interval 1_000
@@ -285,8 +305,34 @@ defmodule Ferricstore.Raft.StateMachine do
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
+  # ---------------------------------------------------------------------------
+  # HLC-wrapped commands (spec 2G.6)
+  #
+  # When the Batcher stamps a command with an HLC timestamp, it wraps the
+  # original command in a 2-tuple: `{inner_command, %{hlc_ts: {phys, logical}}}`.
+  #
+  # This catch-all clause:
+  #   1. Merges the remote HLC timestamp into the local HLC (side-effect only,
+  #      does not affect deterministic state machine output).
+  #   2. Delegates to the matching `apply/3` clause for the inner command.
+  #
+  # In single-node mode, the merge is effectively a no-op because the leader
+  # and the applying node are the same process. In multi-node clusters, this
+  # ensures follower HLCs stay synchronized with the leader.
+  # ---------------------------------------------------------------------------
+
+  def apply(meta, {inner_command, %{hlc_ts: remote_ts}}, state) when is_tuple(inner_command) do
+    merge_hlc(remote_ts)
+    __MODULE__.apply(meta, inner_command, state)
+  end
+
   @doc """
   Lifecycle hook called when the Raft node transitions roles.
+
+  When becoming leader, generates a fresh HLC timestamp via `HLC.now/0` to
+  ensure the leader's clock is up to date before it starts stamping commands.
+  This is a side-effect only -- it does not affect the deterministic state
+  machine output.
 
   In single-node mode, the node is always the leader. In multi-node clusters,
   this can be used to start/stop leader-only processes (e.g., merge scheduler,
@@ -295,7 +341,14 @@ defmodule Ferricstore.Raft.StateMachine do
   Returns a list of effects (currently empty).
   """
   @impl true
-  def state_enter(:leader, _state), do: []
+  def state_enter(:leader, _state) do
+    # Ensure the leader's HLC is freshly advanced. In multi-node clusters,
+    # this guarantees the new leader's clock is at least at wall-clock time
+    # before it begins stamping commands for followers to merge.
+    HLC.now()
+    []
+  end
+
   def state_enter(:follower, _state), do: []
   def state_enter(:candidate, _state), do: []
   def state_enter(:await_condition, _state), do: []
@@ -480,7 +533,7 @@ defmodule Ferricstore.Raft.StateMachine do
     case NIF.put_batch(state.store, [{key, value, expire_at_ms}]) do
       :ok ->
         :ets.insert(state.ets, {key, expire_at_ms})
-        :ets.insert(state.hot_cache, {key, value})
+        :ets.insert(state.hot_cache, {key, value, System.os_time(:millisecond)})
         sm_prefix_track(state, key)
         :ok
 
@@ -837,13 +890,17 @@ defmodule Ferricstore.Raft.StateMachine do
     case :ets.lookup(state.ets, key) do
       [{^key, 0}] ->
         case :ets.lookup(state.hot_cache, key) do
-          [{^key, value}] -> {:hit, value, 0}
+          [{^key, value, _access_ms}] ->
+            :ets.insert(state.hot_cache, {key, value, now})
+            {:hit, value, 0}
           [] -> :miss
         end
 
       [{^key, exp}] when exp > now ->
         case :ets.lookup(state.hot_cache, key) do
-          [{^key, value}] -> {:hit, value, exp}
+          [{^key, value, _access_ms}] ->
+            :ets.insert(state.hot_cache, {key, value, now})
+            {:hit, value, exp}
           [] -> :miss
         end
 
@@ -861,7 +918,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
           {:ok, value} ->
             :ets.insert(state.ets, {key, 0})
-            :ets.insert(state.hot_cache, {key, value})
+            :ets.insert(state.hot_cache, {key, value, now})
             {:hit, value, 0}
 
           _error ->
@@ -933,13 +990,17 @@ defmodule Ferricstore.Raft.StateMachine do
     case :ets.lookup(state.ets, key) do
       [{^key, 0}] ->
         case :ets.lookup(state.hot_cache, key) do
-          [{^key, value}] -> value
+          [{^key, value, _access_ms}] ->
+            :ets.insert(state.hot_cache, {key, value, now})
+            value
           [] -> nil
         end
 
       [{^key, exp}] when exp > now ->
         case :ets.lookup(state.hot_cache, key) do
-          [{^key, value}] -> value
+          [{^key, value, _access_ms}] ->
+            :ets.insert(state.hot_cache, {key, value, now})
+            value
           [] -> nil
         end
 
@@ -955,7 +1016,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
           {:ok, value} ->
             :ets.insert(state.ets, {key, 0})
-            :ets.insert(state.hot_cache, {key, value})
+            :ets.insert(state.hot_cache, {key, value, now})
             value
 
           _error ->
@@ -973,13 +1034,17 @@ defmodule Ferricstore.Raft.StateMachine do
     case :ets.lookup(state.ets, key) do
       [{^key, 0}] ->
         case :ets.lookup(state.hot_cache, key) do
-          [{^key, value}] -> {value, 0}
+          [{^key, value, _access_ms}] ->
+            :ets.insert(state.hot_cache, {key, value, now})
+            {value, 0}
           [] -> nil
         end
 
       [{^key, exp}] when exp > now ->
         case :ets.lookup(state.hot_cache, key) do
-          [{^key, value}] -> {value, exp}
+          [{^key, value, _access_ms}] ->
+            :ets.insert(state.hot_cache, {key, value, now})
+            {value, exp}
           [] -> nil
         end
 
@@ -995,12 +1060,31 @@ defmodule Ferricstore.Raft.StateMachine do
 
           {:ok, value} ->
             :ets.insert(state.ets, {key, 0})
-            :ets.insert(state.hot_cache, {key, value})
+            :ets.insert(state.hot_cache, {key, value, now})
             {value, 0}
 
           _error ->
             nil
         end
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: HLC merging (spec 2G.6)
+  # ---------------------------------------------------------------------------
+
+  # Merges a remote HLC timestamp into the local node's HLC. This is a
+  # side-effect that does not affect the deterministic state machine output.
+  #
+  # The merge is wrapped in a try/catch because the HLC GenServer may not be
+  # running in unit tests that exercise the state machine in isolation.
+  @spec merge_hlc(HLC.timestamp()) :: :ok
+  defp merge_hlc(remote_ts) do
+    HLC.update(remote_ts)
+  rescue
+    # HLC GenServer not running (e.g. unit tests without full app)
+    _error -> :ok
+  catch
+    :exit, _reason -> :ok
   end
 end

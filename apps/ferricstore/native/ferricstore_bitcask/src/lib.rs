@@ -20,6 +20,10 @@
 #![allow(clippy::manual_let_else)]
 #![allow(clippy::doc_link_with_quotes)]
 
+pub mod async_io;
+pub mod bloom;
+pub mod cms;
+pub mod cuckoo;
 pub mod compaction;
 pub mod hint;
 pub mod hnsw;
@@ -27,14 +31,18 @@ pub mod io_backend;
 pub mod keydir;
 pub mod log;
 pub mod store;
+pub mod tdigest;
+pub mod topk;
+pub mod tracking_alloc;
 
 use rustler::schedule::consume_timeslice;
-use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
+use rustler::{Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term};
 use std::sync::Mutex;
 
-#[cfg(target_os = "linux")]
-use rustler::LocalPid;
+
+
 use std::sync::atomic::AtomicU64;
+
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 
@@ -97,6 +105,7 @@ mod atoms {
         false_ = "false",
         pending,
         io_complete,
+        tokio_complete,
         set_range,
         set_bit,
         append,
@@ -138,9 +147,17 @@ struct StoreResource {
 // Yielding NIF continuation state resources
 // ---------------------------------------------------------------------------
 
-/// Number of items to encode per yielding NIF timeslice before checking
-/// whether the BEAM scheduler wants us to yield.
+/// Safety limit: maximum items to encode before unconditionally checking
+/// `consume_timeslice`. In practice, the BEAM-guided check every
+/// `YIELD_CHECK_INTERVAL` items will trigger yielding much sooner than
+/// this for large datasets.
 const YIELD_CHUNK_SIZE: usize = 500;
+
+/// How often (in items) to call `consume_timeslice` and let the BEAM
+/// decide whether we should yield.  64 is a good trade-off: low enough
+/// to keep scheduler latency under ~1ms for typical item sizes, high
+/// enough that the per-item overhead of the timeslice check is negligible.
+const YIELD_CHECK_INTERVAL: usize = 64;
 
 /// Continuation state for `keys()` — holds pre-collected keys from RAM and
 /// tracks encoding progress across yield points.
@@ -182,6 +199,11 @@ fn load(env: Env, _info: Term) -> bool {
     let _ = rustler::resource!(BulkKvBuffer, env);
     let _ = rustler::resource!(BulkOptValBuffer, env);
     let _ = rustler::resource!(hnsw::HnswResource, env);
+    let _ = rustler::resource!(cuckoo::CuckooResource, env);
+    let _ = rustler::resource!(topk::TopKResource, env);
+    let _ = rustler::resource!(cms::CmsResource, env);
+    let _ = rustler::resource!(bloom::BloomResource, env);
+    tdigest::register_resource(env);
     true
 }
 
@@ -514,10 +536,12 @@ fn delete<'a>(
 //    continuation function with two args: [state_resource, partial_list].
 //
 // 2. **Continuation**: Decodes the state resource and the partial BEAM
-//    list from argv. Encodes up to YIELD_CHUNK_SIZE items into BEAM
-//    terms and prepends them to the partial list. Calls
-//    `consume_timeslice`. If timeslice exhausted and more work remains,
-//    reschedules itself. When done, reverses the list and returns.
+//    list from argv. Processes items one at a time, calling
+//    `consume_timeslice(env, 1)` every `YIELD_CHECK_INTERVAL` items.
+//    When `consume_timeslice` returns `true` (timeslice exhausted) and
+//    more work remains, reschedules itself. This is BEAM-guided: the
+//    scheduler decides when to yield based on actual CPU time consumed,
+//    not a fixed item count. When done, reverses the list and returns.
 //
 // 3. **Result**: From the caller's perspective: one NIF call, one result.
 //    From the BEAM's perspective: N short slices with other processes
@@ -531,6 +555,13 @@ fn delete<'a>(
 // For small result sets (<= YIELD_CHUNK_SIZE items), the entry NIF
 // encodes everything directly without rescheduling, avoiding the overhead
 // of resource allocation and env switching.
+//
+// The continuation functions use BEAM-guided adaptive yielding: every
+// YIELD_CHECK_INTERVAL items (64), we call `consume_timeslice(env, 1)`.
+// If it returns `true`, the BEAM wants the thread back and we yield.
+// This adapts naturally to item size: encoding large values consumes the
+// timeslice faster, so we yield after fewer items. For small items, we
+// may process thousands before the BEAM asks us to yield.
 
 /// Encode one key `Vec<u8>` into a BEAM binary term.
 fn encode_key_term<'a>(env: Env<'a>, k: &[u8]) -> Option<Term<'a>> {
@@ -602,34 +633,39 @@ unsafe extern "C" fn keys_continue(
 
     let mut idx = state.index.lock().unwrap();
     let total = state.keys.len();
-    let chunk_end = (*idx + YIELD_CHUNK_SIZE).min(total);
 
-    // Build up the list by consing new elements onto the front.
-    // We iterate in reverse so the final reversed list is in the original order.
+    // BEAM-guided adaptive yielding: process items one at a time, checking
+    // consume_timeslice every YIELD_CHECK_INTERVAL items. The BEAM tells
+    // us when our timeslice is exhausted (returns true), at which point we
+    // yield. This adapts naturally to item size and system load.
     let mut acc = partial_list;
-    for k in &state.keys[*idx..chunk_end] {
-        if let Some(term) = encode_key_term(env, k) {
+    let mut items_this_slice: usize = 0;
+
+    while *idx < total {
+        if let Some(term) = encode_key_term(env, &state.keys[*idx]) {
             acc = acc.list_prepend(term);
         } else {
             return rustler::codegen_runtime::NifReturned::BadArg.apply(env);
         }
-    }
-    *idx = chunk_end;
+        *idx += 1;
+        items_this_slice += 1;
 
-    if *idx < total {
-        let pct = ((*idx as f64 / total as f64) * 100.0) as i32;
-        let _ = consume_timeslice(env, pct.clamp(1, 100));
-        drop(idx);
-
-        let new_state_term = state_term.as_c_arg();
-        let new_list = acc.as_c_arg();
-        return rustler::codegen_runtime::NifReturned::Reschedule {
-            fun_name: std::ffi::CString::new("keys").unwrap(),
-            flags: rustler::SchedulerFlags::Normal,
-            fun: keys_continue,
-            args: vec![new_state_term, new_list],
+        // Ask the BEAM every 64 items if our timeslice is exhausted
+        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total {
+            if consume_timeslice(env, 1) {
+                // BEAM says yield — timeslice exhausted
+                drop(idx);
+                let new_state_term = state_term.as_c_arg();
+                let new_list = acc.as_c_arg();
+                return rustler::codegen_runtime::NifReturned::Reschedule {
+                    fun_name: std::ffi::CString::new("keys").unwrap(),
+                    flags: rustler::SchedulerFlags::Normal,
+                    fun: keys_continue,
+                    args: vec![new_state_term, new_list],
+                }
+                .apply(env);
+            }
         }
-        .apply(env);
     }
 
     // Done — consume full timeslice, reverse, and return.
@@ -731,32 +767,34 @@ unsafe extern "C" fn get_all_continue(
 
     let mut idx = state.index.lock().unwrap();
     let total = state.pairs.len();
-    let chunk_end = (*idx + YIELD_CHUNK_SIZE).min(total);
 
     let mut acc = partial_list;
-    for (k, v) in &state.pairs[*idx..chunk_end] {
+    let mut items_this_slice: usize = 0;
+
+    while *idx < total {
+        let (k, v) = &state.pairs[*idx];
         if let Some(term) = encode_kv_term(env, k, v) {
             acc = acc.list_prepend(term);
         } else {
             return rustler::codegen_runtime::NifReturned::BadArg.apply(env);
         }
-    }
-    *idx = chunk_end;
+        *idx += 1;
+        items_this_slice += 1;
 
-    if *idx < total {
-        let pct = ((*idx as f64 / total as f64) * 100.0) as i32;
-        let _ = consume_timeslice(env, pct.clamp(1, 100));
-        drop(idx);
-
-        let new_state = state_term.as_c_arg();
-        let new_list = acc.as_c_arg();
-        return rustler::codegen_runtime::NifReturned::Reschedule {
-            fun_name: std::ffi::CString::new("get_all").unwrap(),
-            flags: rustler::SchedulerFlags::Normal,
-            fun: get_all_continue,
-            args: vec![new_state, new_list],
+        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total {
+            if consume_timeslice(env, 1) {
+                drop(idx);
+                let new_state = state_term.as_c_arg();
+                let new_list = acc.as_c_arg();
+                return rustler::codegen_runtime::NifReturned::Reschedule {
+                    fun_name: std::ffi::CString::new("get_all").unwrap(),
+                    flags: rustler::SchedulerFlags::Normal,
+                    fun: get_all_continue,
+                    args: vec![new_state, new_list],
+                }
+                .apply(env);
+            }
         }
-        .apply(env);
     }
 
     let _ = consume_timeslice(env, 100);
@@ -867,29 +905,30 @@ unsafe extern "C" fn get_batch_continue(
 
     let mut idx = state.index.lock().unwrap();
     let total = state.results.len();
-    let chunk_end = (*idx + YIELD_CHUNK_SIZE).min(total);
 
     let mut acc = partial_list;
-    for opt in &state.results[*idx..chunk_end] {
-        let term = encode_opt_val_term(env, opt);
+    let mut items_this_slice: usize = 0;
+
+    while *idx < total {
+        let term = encode_opt_val_term(env, &state.results[*idx]);
         acc = acc.list_prepend(term);
-    }
-    *idx = chunk_end;
+        *idx += 1;
+        items_this_slice += 1;
 
-    if *idx < total {
-        let pct = ((*idx as f64 / total as f64) * 100.0) as i32;
-        let _ = consume_timeslice(env, pct.clamp(1, 100));
-        drop(idx);
-
-        let new_state = state_term.as_c_arg();
-        let new_list = acc.as_c_arg();
-        return rustler::codegen_runtime::NifReturned::Reschedule {
-            fun_name: std::ffi::CString::new("get_batch").unwrap(),
-            flags: rustler::SchedulerFlags::Normal,
-            fun: get_batch_continue,
-            args: vec![new_state, new_list],
+        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total {
+            if consume_timeslice(env, 1) {
+                drop(idx);
+                let new_state = state_term.as_c_arg();
+                let new_list = acc.as_c_arg();
+                return rustler::codegen_runtime::NifReturned::Reschedule {
+                    fun_name: std::ffi::CString::new("get_batch").unwrap(),
+                    flags: rustler::SchedulerFlags::Normal,
+                    fun: get_batch_continue,
+                    args: vec![new_state, new_list],
+                }
+                .apply(env);
+            }
         }
-        .apply(env);
     }
 
     let _ = consume_timeslice(env, 100);
@@ -1007,32 +1046,34 @@ unsafe extern "C" fn get_range_continue(
 
     let mut idx = state.index.lock().unwrap();
     let total = state.pairs.len();
-    let chunk_end = (*idx + YIELD_CHUNK_SIZE).min(total);
 
     let mut acc = partial_list;
-    for (k, v) in &state.pairs[*idx..chunk_end] {
+    let mut items_this_slice: usize = 0;
+
+    while *idx < total {
+        let (k, v) = &state.pairs[*idx];
         if let Some(term) = encode_kv_term(env, k, v) {
             acc = acc.list_prepend(term);
         } else {
             return rustler::codegen_runtime::NifReturned::BadArg.apply(env);
         }
-    }
-    *idx = chunk_end;
+        *idx += 1;
+        items_this_slice += 1;
 
-    if *idx < total {
-        let pct = ((*idx as f64 / total as f64) * 100.0) as i32;
-        let _ = consume_timeslice(env, pct.clamp(1, 100));
-        drop(idx);
-
-        let new_state = state_term.as_c_arg();
-        let new_list = acc.as_c_arg();
-        return rustler::codegen_runtime::NifReturned::Reschedule {
-            fun_name: std::ffi::CString::new("get_range").unwrap(),
-            flags: rustler::SchedulerFlags::Normal,
-            fun: get_range_continue,
-            args: vec![new_state, new_list],
+        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total {
+            if consume_timeslice(env, 1) {
+                drop(idx);
+                let new_state = state_term.as_c_arg();
+                let new_list = acc.as_c_arg();
+                return rustler::codegen_runtime::NifReturned::Reschedule {
+                    fun_name: std::ffi::CString::new("get_range").unwrap(),
+                    flags: rustler::SchedulerFlags::Normal,
+                    fun: get_range_continue,
+                    args: vec![new_state, new_list],
+                }
+                .apply(env);
+            }
         }
-        .apply(env);
     }
 
     let _ = consume_timeslice(env, 100);
@@ -1554,6 +1595,166 @@ mod bulk_buffer_tests {
         assert_eq!(&buf.pairs[9999].0, b"key_009999");
         assert_eq!(buf.pairs[5000].1.len(), 1024);
     }
+}
+
+
+// ===========================================================================
+// Tokio async IO NIFs
+// ===========================================================================
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn get_async<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    key: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    let pid: LocalPid = env.pid();
+    let key_bytes = key.as_slice().to_vec();
+    let store_clone = resource.clone();
+    async_io::runtime().spawn(async move {
+        let result = {
+            let mut store = store_clone.store.lock().unwrap();
+            store.get(&key_bytes)
+        };
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&pid, |env| match result {
+            Ok(Some(value)) => match OwnedBinary::new(value.len()) {
+                Some(mut bin) => {
+                    bin.as_mut_slice().copy_from_slice(&value);
+                    (atoms::tokio_complete(), atoms::ok(), Binary::from_owned(bin, env)).encode(env)
+                }
+                None => (atoms::tokio_complete(), atoms::error(), "alloc_failed").encode(env),
+            },
+            Ok(None) => (atoms::tokio_complete(), atoms::ok(), atoms::nil()).encode(env),
+            Err(e) => (atoms::tokio_complete(), atoms::error(), e.to_string()).encode(env),
+        });
+    });
+    Ok((atoms::pending(), atoms::ok()).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn delete_async<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    key: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    let pid: LocalPid = env.pid();
+    let key_bytes = key.as_slice().to_vec();
+    let store_clone = resource.clone();
+    async_io::runtime().spawn(async move {
+        let result = {
+            let mut store = store_clone.store.lock().unwrap();
+            store.delete(&key_bytes)
+        };
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&pid, |env| match result {
+            Ok(true) => (atoms::tokio_complete(), atoms::ok(), atoms::true_()).encode(env),
+            Ok(false) => (atoms::tokio_complete(), atoms::ok(), atoms::false_()).encode(env),
+            Err(e) => (atoms::tokio_complete(), atoms::error(), e.to_string()).encode(env),
+        });
+    });
+    Ok((atoms::pending(), atoms::ok()).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn put_batch_tokio_async<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    batch: Vec<(Binary<'a>, Binary<'a>, u64)>,
+) -> NifResult<Term<'a>> {
+    for (k, v, _) in &batch {
+        if let Err(msg) = crate::log::validate_kv_sizes(k.as_slice(), v.as_slice()) {
+            return Ok((atoms::error(), msg).encode(env));
+        }
+    }
+    let pid: LocalPid = env.pid();
+    let owned_batch: Vec<(Vec<u8>, Vec<u8>, u64)> = batch
+        .iter()
+        .map(|(k, v, exp)| (k.as_slice().to_vec(), v.as_slice().to_vec(), *exp))
+        .collect();
+    let store_clone = resource.clone();
+    async_io::runtime().spawn(async move {
+        let result = {
+            let mut store = store_clone.store.lock().unwrap();
+            let entries: Vec<(&[u8], &[u8], u64)> = owned_batch
+                .iter()
+                .map(|(k, v, exp)| (k.as_slice(), v.as_slice(), *exp))
+                .collect();
+            store.put_batch(&entries)
+        };
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&pid, |env| match result {
+            Ok(()) => (atoms::tokio_complete(), atoms::ok(), atoms::ok()).encode(env),
+            Err(e) => (atoms::tokio_complete(), atoms::error(), e.to_string()).encode(env),
+        });
+    });
+    Ok((atoms::pending(), atoms::ok()).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn write_hint_async<'a>(env: Env<'a>, resource: ResourceArc<StoreResource>) -> NifResult<Term<'a>> {
+    let pid: LocalPid = env.pid();
+    let store_clone = resource.clone();
+    async_io::runtime().spawn(async move {
+        let result = {
+            let mut store = store_clone.store.lock().unwrap();
+            store.write_hint_file()
+        };
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&pid, |env| match result {
+            Ok(()) => (atoms::tokio_complete(), atoms::ok(), atoms::ok()).encode(env),
+            Err(e) => (atoms::tokio_complete(), atoms::error(), e.to_string()).encode(env),
+        });
+    });
+    Ok((atoms::pending(), atoms::ok()).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn purge_expired_async<'a>(env: Env<'a>, resource: ResourceArc<StoreResource>) -> NifResult<Term<'a>> {
+    let pid: LocalPid = env.pid();
+    let store_clone = resource.clone();
+    async_io::runtime().spawn(async move {
+        let result = {
+            let mut store = store_clone.store.lock().unwrap();
+            store.purge_expired()
+        };
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&pid, |env| match result {
+            Ok(count) => (atoms::tokio_complete(), atoms::ok(), count as u64).encode(env),
+            Err(e) => (atoms::tokio_complete(), atoms::error(), e.to_string()).encode(env),
+        });
+    });
+    Ok((atoms::pending(), atoms::ok()).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+fn run_compaction_async<'a>(
+    env: Env<'a>,
+    resource: ResourceArc<StoreResource>,
+    file_ids: Vec<u64>,
+) -> NifResult<Term<'a>> {
+    let pid: LocalPid = env.pid();
+    let store_clone = resource.clone();
+    async_io::runtime().spawn(async move {
+        let result = {
+            let mut store = store_clone.store.lock().unwrap();
+            store.run_compaction(&file_ids)
+        };
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&pid, |env| match result {
+            Ok((written, dropped, reclaimed)) => {
+                (atoms::tokio_complete(), atoms::ok(), (written, dropped, reclaimed)).encode(env)
+            }
+            Err(e) => (atoms::tokio_complete(), atoms::error(), e.to_string()).encode(env),
+        });
+    });
+    Ok((atoms::pending(), atoms::ok()).encode(env))
 }
 
 rustler::init!("Elixir.Ferricstore.Bitcask.NIF", load = load);

@@ -88,7 +88,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
       Router.put(k, "dual_val", 0)
 
       # ETS should have the value
-      assert [{^k, "dual_val"}] = :ets.lookup(hot_cache_for(k), k)
+      assert [{^k, "dual_val", _}] = :ets.lookup(hot_cache_for(k), k)
 
       # Flush pending writes to Bitcask before checking NIF directly
       shard_name = Router.shard_name(Router.shard_for(k))

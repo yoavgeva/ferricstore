@@ -298,8 +298,10 @@ defmodule Ferricstore.MemoryGuard do
                   Enum.take(eligible, 5)
               end
 
+            # Only remove from hot_cache -- keydir and Bitcask are untouched.
+            # The key stays discoverable via keydir and its value stays on disk.
+            # Next GET: keydir hit -> hot_cache miss -> pread from Bitcask -> warm back.
             Enum.each(to_evict, fn {key, _exp} ->
-              :ets.delete(keydir, key)
               :ets.delete(hot_cache, key)
             end)
 

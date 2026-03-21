@@ -25,3 +25,9 @@ config :ferricstore, :merge,
 
 # Raft: enabled in test — single node is its own quorum (per spec).
 config :ferricstore, :raft_enabled, true
+
+# Disable libcluster in test -- no multicast or node discovery during tests.
+# NOTE: We must use :disabled (not []) because Config.Reader.merge deep-merges
+# keyword lists, so [] gets merged with the parent config's keyword list and
+# the parent values survive. Using a non-keyword-list atom forces a full replace.
+config :libcluster, topologies: :disabled

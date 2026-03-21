@@ -176,9 +176,11 @@ defmodule Ferricstore.MemoryGuardTest do
           {key, value, 0}
         end
 
+      now = System.os_time(:millisecond)
+
       Enum.each(large_entries, fn {key, value, expire} ->
         :ets.insert(keydir, {key, expire})
-        :ets.insert(hot_cache, {key, value})
+        :ets.insert(hot_cache, {key, value, now})
       end)
 
       stats_after = MemoryGuard.stats()

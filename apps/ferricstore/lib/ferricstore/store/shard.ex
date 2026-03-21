@@ -80,7 +80,8 @@ defmodule Ferricstore.Store.Shard do
     sweep_at_ceiling_count: 0,
     sweep_struggling: false,
     promoted_instances: %{},
-    staged_txs: %{}
+    staged_txs: %{},
+    pending_reads: []
   ]
 
   # -------------------------------------------------------------------
@@ -173,6 +174,16 @@ defmodule Ferricstore.Store.Shard do
       PrefixIndex.track(prefix_keys, key, index)
     end
 
+    # Rebuild HNSW vector indices from persisted vectors.
+    hnsw_get_fn = fn key ->
+      case NIF.get(store, key) do
+        {:ok, value} -> value
+        _ -> nil
+      end
+    end
+
+    Ferricstore.Store.HnswRegistry.rebuild_for_shard(store, index, hnsw_get_fn)
+
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
     {:ok, %__MODULE__{store: store, ets: keydir, keydir: keydir, hot_cache: hot_cache,
@@ -190,7 +201,7 @@ defmodule Ferricstore.Store.Shard do
   end
 
   @impl true
-  def handle_call({:get, key}, _from, state) do
+  def handle_call({:get, key}, from, state) do
     # Fast path: ETS hit — no need to wait for in-flight writes.
     case ets_lookup(state, key) do
       {:hit, value, _expire_at_ms} ->
@@ -204,7 +215,18 @@ defmodule Ferricstore.Store.Shard do
         # so Bitcask has the latest data before we query it.
         state = await_in_flight(state)
         state = flush_pending_sync(state)
-        {:reply, warm_from_store(state, key), state}
+
+        # Submit async read to Tokio — the BEAM scheduler is freed immediately.
+        # The result arrives as {:tokio_complete, :ok | :error, result} and is
+        # handled by handle_info/2 which replies to the caller and warms ETS.
+        case NIF.get_async(state.store, key) do
+          {:pending, :ok} ->
+            new_pending_reads = [{from, key} | state.pending_reads]
+            {:noreply, %{state | pending_reads: new_pending_reads}}
+
+          {:error, _reason} ->
+            {:reply, nil, state}
+        end
     end
   end
 
@@ -2474,6 +2496,35 @@ defmodule Ferricstore.Store.Shard do
     else
       # Stale or unknown op_id — ignore.
       {:noreply, state}
+    end
+  end
+
+  # Handle Tokio async read completion. Reply to the pending caller and
+  # warm the ETS cache if the key was found.
+  def handle_info({:tokio_complete, :ok, value}, state) do
+    case state.pending_reads do
+      [{from, key} | rest] ->
+        if value != nil do
+          ets_insert(state, key, value, 0)
+        end
+
+        GenServer.reply(from, value)
+        {:noreply, %{state | pending_reads: rest}}
+
+      [] ->
+        # No pending reads — stale message, ignore.
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:tokio_complete, :error, _reason}, state) do
+    case state.pending_reads do
+      [{from, _key} | rest] ->
+        GenServer.reply(from, nil)
+        {:noreply, %{state | pending_reads: rest}}
+
+      [] ->
+        {:noreply, state}
     end
   end
 

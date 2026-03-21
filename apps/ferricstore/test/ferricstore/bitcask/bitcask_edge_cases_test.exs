@@ -553,7 +553,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
       # Get should warm ETS from NIF
       assert "warm_value" == GenServer.call(pid, {:get, "warm_test"})
-      assert [{_, "warm_value"}] = :ets.lookup(hot_cache, "warm_test")
+      assert [{_, "warm_value", _}] = :ets.lookup(hot_cache, "warm_test")
     end
   end
 
@@ -574,7 +574,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
       # Confirm it's in ETS
       assert [{_, ^expire_at}] = :ets.lookup(keydir, "lazy_exp")
-      assert [{_, "temp_val"}] = :ets.lookup(hot_cache, "lazy_exp")
+      assert [{_, "temp_val", _}] = :ets.lookup(hot_cache, "lazy_exp")
 
       # Wait for expiry
       Process.sleep(200)
@@ -644,7 +644,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
       assert {"mw_val", 0} == GenServer.call(pid, {:get_meta, "meta_warm"})
       # Verify ETS was warmed
-      assert [{_, "mw_val"}] = :ets.lookup(hot_cache, "meta_warm")
+      assert [{_, "mw_val", _}] = :ets.lookup(hot_cache, "meta_warm")
       assert [{_, 0}] = :ets.lookup(keydir, "meta_warm")
     end
   end

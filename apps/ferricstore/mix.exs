@@ -31,6 +31,7 @@ defmodule Ferricstore.MixProject do
     [
       {:rustler, "~> 0.37"},
       {:ra, "~> 2.14"},
+      {:libcluster, "~> 3.3"},
       {:telemetry, "~> 1.4"},
       {:jason, "~> 1.4"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

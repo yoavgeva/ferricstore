@@ -46,8 +46,13 @@ defmodule Ferricstore.Store.TypeRegistry do
 
     case store.compound_get.(redis_key, type_key) do
       nil ->
-        store.compound_put.(redis_key, type_key, expected, 0)
-        :ok
+        # No type metadata. If the key exists as a plain string, reject.
+        if is_map_key(store, :exists?) and store.exists?.(redis_key) do
+          {:error, @wrongtype_msg}
+        else
+          store.compound_put.(redis_key, type_key, expected, 0)
+          :ok
+        end
 
       ^expected ->
         :ok
@@ -133,7 +138,15 @@ defmodule Ferricstore.Store.TypeRegistry do
     expected = CompoundKey.encode_type(type)
 
     case store.compound_get.(redis_key, type_key) do
-      nil -> :ok
+      nil ->
+        # No type metadata. Check if the key exists as a plain string --
+        # if so, it is a type mismatch for data structure commands.
+        if is_map_key(store, :get) and is_map_key(store, :exists?) do
+          if store.exists?.(redis_key), do: {:error, @wrongtype_msg}, else: :ok
+        else
+          :ok
+        end
+
       ^expected -> :ok
       _other_type -> {:error, @wrongtype_msg}
     end

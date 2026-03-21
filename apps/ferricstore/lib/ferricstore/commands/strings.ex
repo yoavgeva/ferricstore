@@ -71,7 +71,17 @@ defmodule Ferricstore.Commands.Strings do
 
   def handle("GET", [key], store) do
     case store.get.(key) do
-      nil -> nil
+      nil ->
+        # Plain key is nil. Check if this is a data structure key (compound keys).
+        if is_map_key(store, :compound_get) do
+          type_key = Ferricstore.Store.CompoundKey.type_key(key)
+          case store.compound_get.(key, type_key) do
+            nil -> nil
+            _type_str -> @wrongtype_error
+          end
+        else
+          nil
+        end
       value when is_binary(value) -> maybe_check_type(value)
       other -> other
     end
@@ -137,7 +147,10 @@ defmodule Ferricstore.Commands.Strings do
             end
 
           store.compound_delete_prefix.(key, prefix)
-          if type_str == "list", do: store.delete.(key)
+          if type_str == "list" do
+            meta_key = CompoundKey.list_meta_key(key)
+            store.compound_delete.(key, meta_key)
+          end
           TypeRegistry.delete_type(key, store)
           true
       end
@@ -157,7 +170,12 @@ defmodule Ferricstore.Commands.Strings do
 
   def handle("EXISTS", keys, store) do
     Enum.reduce(keys, 0, fn key, acc ->
-      if store.exists?.(key), do: acc + 1, else: acc
+      exists = store.exists?.(key)
+      # Also check TypeRegistry for compound-key-based data structures
+      # (lists, hashes, sets, zsets) that don't use the plain key store.
+      exists = exists or (is_map_key(store, :compound_get) and
+        store.compound_get.(key, Ferricstore.Store.CompoundKey.type_key(key)) != nil)
+      if exists, do: acc + 1, else: acc
     end)
   end
 

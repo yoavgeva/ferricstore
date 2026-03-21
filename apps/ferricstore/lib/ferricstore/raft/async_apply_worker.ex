@@ -212,7 +212,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
           # Update ETS and prefix index for each put
           Enum.each(puts, fn {:put, key, value, expire_at_ms} ->
             :ets.insert(keydir, {key, expire_at_ms})
-            :ets.insert(hot_cache, {key, value})
+            :ets.insert(hot_cache, {key, value, System.os_time(:millisecond)})
 
             try do
               PrefixIndex.track(prefix_table, key, shard_index)

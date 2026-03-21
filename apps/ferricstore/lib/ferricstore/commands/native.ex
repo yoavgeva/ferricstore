@@ -115,7 +115,7 @@ defmodule Ferricstore.Commands.Native do
       if alive? do
         try do
           case :ets.lookup(hot_cache, key) do
-            [{^key, _}] -> "hot"
+            [{^key, _, _}] -> "hot"
             [] -> "cold"
           end
         rescue
@@ -139,12 +139,12 @@ defmodule Ferricstore.Commands.Native do
       case :ets.lookup(keydir, key) do
         [{^key, 0}] ->
           case :ets.lookup(hot_cache, key) do
-            [{^key, v}] -> {v, 0, true, true}
+            [{^key, v, _access_ms}] -> {v, 0, true, true}
             [] -> {nil, 0, false, false}
           end
         [{^key, exp}] when exp > now ->
           case :ets.lookup(hot_cache, key) do
-            [{^key, v}] -> {v, exp, true, true}
+            [{^key, v, _access_ms}] -> {v, exp, true, true}
             [] -> {nil, exp, false, false}
           end
         [{^key, _exp}] -> {nil, 0, false, false}

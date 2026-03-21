@@ -91,7 +91,7 @@ defmodule Ferricstore.Store.Promotion do
         fn {key, exp}, acc ->
           if is_binary(key) and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
             case :ets.lookup(hot_cache, key) do
-              [{^key, value}] -> [{key, value, exp} | acc]
+              [{^key, value, _access_ms}] -> [{key, value, exp} | acc]
               [] -> acc
             end
           else
@@ -118,7 +118,7 @@ defmodule Ferricstore.Store.Promotion do
         mk = marker_key(redis_key)
         NIF.put(shared_store, mk, type_str, 0)
         :ets.insert(keydir, {mk, 0})
-        :ets.insert(hot_cache, {mk, type_str})
+        :ets.insert(hot_cache, {mk, type_str, System.os_time(:millisecond)})
 
         Logger.info(
           "Promoted #{type_label} #{inspect(redis_key)} to dedicated Bitcask " <>
@@ -144,7 +144,7 @@ defmodule Ferricstore.Store.Promotion do
           case key do
             <<"PM:", redis_key::binary>> ->
               case :ets.lookup(hot_cache, key) do
-                [{^key, type_str}] -> [{redis_key, type_str} | acc]
+                [{^key, type_str, _access_ms}] -> [{redis_key, type_str} | acc]
                 [] -> acc
               end
 
@@ -163,7 +163,7 @@ defmodule Ferricstore.Store.Promotion do
       |> Enum.map(fn <<"PM:", redis_key::binary>> ->
         {:ok, type_str} = NIF.get_zero_copy(shared_store, marker_key(redis_key))
         :ets.insert(keydir, {marker_key(redis_key), 0})
-        :ets.insert(hot_cache, {marker_key(redis_key), type_str})
+        :ets.insert(hot_cache, {marker_key(redis_key), type_str, System.os_time(:millisecond)})
         {redis_key, type_str}
       end)
 
@@ -178,9 +178,11 @@ defmodule Ferricstore.Store.Promotion do
         {:ok, dedicated_store} ->
           case NIF.get_all(dedicated_store) do
             {:ok, pairs} ->
+              now_ms = System.os_time(:millisecond)
+
               Enum.each(pairs, fn {k, v} ->
                 :ets.insert(keydir, {k, 0})
-                :ets.insert(hot_cache, {k, v})
+                :ets.insert(hot_cache, {k, v, now_ms})
               end)
 
             _ ->
@@ -205,7 +207,7 @@ defmodule Ferricstore.Store.Promotion do
 
     type =
       case :ets.lookup(hot_cache, mk) do
-        [{^mk, type_str}] -> CompoundKey.decode_type(type_str)
+        [{^mk, type_str, _access_ms}] -> CompoundKey.decode_type(type_str)
         [] ->
           case NIF.get_zero_copy(shared_store, mk) do
             {:ok, type_str} when is_binary(type_str) -> CompoundKey.decode_type(type_str)

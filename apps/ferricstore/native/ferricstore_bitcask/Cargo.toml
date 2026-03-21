@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 libc = "0.2"
 rustler = "0.37"
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "fs"] }
 
 # io_uring is Linux-only. On macOS/Windows these deps are completely absent —
 # Cargo does not download, compile, or link them. Falls back to SyncBackend.

@@ -127,6 +127,12 @@ defmodule Ferricstore.Store.CompoundKey do
   # -------------------------------------------------------------------
 
   @doc """
+  Builds the metadata compound key for a list.
+  """
+  @spec list_meta_key(binary()) :: binary()
+  def list_meta_key(redis_key), do: "LM:" <> redis_key
+
+  @doc """
   Builds a compound key for a list element at a given float64 position.
 
   The position is encoded as a fixed-width, zero-padded float string to
@@ -343,5 +349,6 @@ defmodule Ferricstore.Store.CompoundKey do
   def internal_key?(<<"V:", _rest::binary>>), do: true
   def internal_key?(<<"VM:", _rest::binary>>), do: true
   def internal_key?(<<"PM:", _rest::binary>>), do: true
+  def internal_key?(<<"LM:", _rest::binary>>), do: true
   def internal_key?(_), do: false
 end

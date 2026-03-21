@@ -80,7 +80,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert new_state.applied_count == 1
 
       # Verify ETS
-      assert [{_, "value1"}] = :ets.lookup(hot_cache, "key1")
+      assert [{_, "value1", _}] = :ets.lookup(hot_cache, "key1")
 
       # Verify Bitcask
       assert {:ok, "value1"} = NIF.get(store, "key1")
@@ -94,7 +94,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       assert result == :ok
       assert [{_, ^future}] = :ets.lookup(ets, "expiring")
-      assert [{_, "val"}] = :ets.lookup(hot_cache, "expiring")
+      assert [{_, "val", _}] = :ets.lookup(hot_cache, "expiring")
     end
 
     test "put overwrites previous value", %{state: state, ets: ets, hot_cache: hot_cache} do
@@ -102,7 +102,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {state3, :ok} = StateMachine.apply(%{}, {:put, "k", "v2", 0}, state2)
 
       assert state3.applied_count == 2
-      assert [{_, "v2"}] = :ets.lookup(hot_cache, "k")
+      assert [{_, "v2", _}] = :ets.lookup(hot_cache, "k")
     end
 
     test "increments applied_count on each put", %{state: state} do
@@ -158,9 +158,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert new_state.applied_count == 3
 
       # All keys in ETS
-      assert [{_, "val_a"}] = :ets.lookup(hot_cache, "batch_a")
-      assert [{_, "val_b"}] = :ets.lookup(hot_cache, "batch_b")
-      assert [{_, "val_c"}] = :ets.lookup(hot_cache, "batch_c")
+      assert [{_, "val_a", _}] = :ets.lookup(hot_cache, "batch_a")
+      assert [{_, "val_b", _}] = :ets.lookup(hot_cache, "batch_b")
+      assert [{_, "val_c", _}] = :ets.lookup(hot_cache, "batch_c")
     end
 
     test "mixed put and delete batch", %{state: state, ets: ets, hot_cache: hot_cache} do
@@ -179,8 +179,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert new_state.applied_count == 4
 
       assert [] == :ets.lookup(ets, "mix_a")
-      assert [{_, "vb"}] = :ets.lookup(hot_cache, "mix_b")
-      assert [{_, "vc"}] = :ets.lookup(hot_cache, "mix_c")
+      assert [{_, "vb", _}] = :ets.lookup(hot_cache, "mix_b")
+      assert [{_, "vc", _}] = :ets.lookup(hot_cache, "mix_c")
     end
 
     test "empty batch returns empty results", %{state: state} do

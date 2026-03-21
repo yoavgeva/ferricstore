@@ -181,23 +181,15 @@ defmodule Ferricstore.Store.Router do
     try do
       case :ets.lookup(keydir, key) do
         [{^key, 0}] ->
-          case :ets.lookup(hot_cache, key) do
-            [{^key, value, _access_ms}] ->
-              :ets.insert(hot_cache, {key, value, now})
-              {:hit, value, 0}
-
-            [] ->
-              :miss
+          case hot_cache_lookup(hot_cache, key, now) do
+            {:hit, value} -> {:hit, value, 0}
+            :miss -> :miss
           end
 
         [{^key, exp}] when exp > now ->
-          case :ets.lookup(hot_cache, key) do
-            [{^key, value, _access_ms}] ->
-              :ets.insert(hot_cache, {key, value, now})
-              {:hit, value, exp}
-
-            [] ->
-              :miss
+          case hot_cache_lookup(hot_cache, key, now) do
+            {:hit, value} -> {:hit, value, exp}
+            :miss -> :miss
           end
 
         [{^key, _exp}] ->
@@ -210,6 +202,25 @@ defmodule Ferricstore.Store.Router do
       end
     rescue
       ArgumentError -> :no_table
+    end
+  end
+
+  # Looks up a key in hot_cache, handling both 3-element tuples
+  # `{key, value, access_ms}` (direct shard path) and 2-element tuples
+  # `{key, value}` (Raft state machine path). On hit, upgrades the entry
+  # to a 3-tuple with the current timestamp for LRU tracking.
+  defp hot_cache_lookup(hot_cache, key, now) do
+    case :ets.lookup(hot_cache, key) do
+      [{^key, value, _access_ms}] ->
+        :ets.insert(hot_cache, {key, value, now})
+        {:hit, value}
+
+      [{^key, value}] ->
+        :ets.insert(hot_cache, {key, value, now})
+        {:hit, value}
+
+      [] ->
+        :miss
     end
   end
 

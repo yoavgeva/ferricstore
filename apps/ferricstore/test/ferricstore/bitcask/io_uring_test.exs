@@ -1200,7 +1200,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
       # get warms ETS from Bitcask
       assert "wval" == GenServer.call(new_pid, {:get, "warm_me"})
-      assert [{_, "wval"}] = :ets.lookup(:"hot_cache_#{idx}", "warm_me")
+      assert [{_, "wval", _}] = :ets.lookup(:"hot_cache_#{idx}", "warm_me")
     end
   end
 

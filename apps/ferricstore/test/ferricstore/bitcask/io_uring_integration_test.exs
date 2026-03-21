@@ -341,7 +341,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
       assert "cold_v" == GenServer.call(pid, {:get, "cold_k"})
 
       # Now ETS should be warm
-      assert [{_, "cold_v"}] = :ets.lookup(:"hot_cache_#{idx}", "cold_k")
+      assert [{_, "cold_v", _}] = :ets.lookup(:"hot_cache_#{idx}", "cold_k")
     end
 
     test "Router.get takes cold path when ETS is empty for that shard" do
@@ -1039,7 +1039,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
       idx = Router.shard_for(k)
 
       # Confirm in ETS
-      assert [{^k, "hot_v"}] = :ets.lookup(:"hot_cache_#{idx}", k)
+      assert [{^k, "hot_v", _}] = :ets.lookup(:"hot_cache_#{idx}", k)
 
       # Router.get should return from ETS (hot path)
       assert "hot_v" == Router.get(k)

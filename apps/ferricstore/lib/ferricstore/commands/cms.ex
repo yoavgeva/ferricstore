@@ -1,73 +1,28 @@
 defmodule Ferricstore.Commands.CMS do
   @moduledoc """
-  Handles Count-Min Sketch commands: CMS.INITBYDIM, CMS.INITBYPROB,
-  CMS.INCRBY, CMS.QUERY, CMS.MERGE, CMS.INFO.
+  Count-Min Sketch commands backed by a Rust NIF resource.
 
-  A Count-Min Sketch is a probabilistic data structure for frequency estimation.
-  It answers "how many times has element X occurred?" and never undercounts --
-  the estimate is always >= the true count. It may overcount by a bounded error
-  that decreases as sketch dimensions increase.
-
-  Error bound: `true_count + (total_insertions / width)` with probability
-  `1 - (1/2)^depth`.
-
-  ## Storage format
-
-  Sketches are stored as tagged tuples via the injected store map:
-
-      {:cms, %{width: w, depth: d, total_count: n, counters: counters}}
-
-  where `counters` is an Erlang `:array` of `width * depth` non-negative
-  integers (row-major order: row 0 occupies indices 0..width-1, row 1
-  occupies indices width..2*width-1, etc.).
-
-  ## Supported commands
-
-    * `CMS.INITBYDIM key width depth` -- create sketch with exact dimensions
-    * `CMS.INITBYPROB key error probability` -- create sketch sized for target accuracy
-    * `CMS.INCRBY key element count [element count ...]` -- increment element counts
-    * `CMS.QUERY key element [element ...]` -- query estimated counts
-    * `CMS.MERGE dst numkeys src1 [src2 ...] [WEIGHTS w1 w2 ...]` -- merge sketches
-    * `CMS.INFO key` -- return sketch metadata
+  The sketch matrix lives in Rust (`ferricstore_bitcask/src/cms.rs`).
+  The Elixir layer handles RESP argument parsing and store interaction.
   """
 
-  @doc """
-  Handles a CMS command.
+  alias Ferricstore.Bitcask.NIF
 
-  ## Parameters
-
-    - `cmd` -- uppercased command name (e.g. `"CMS.INITBYDIM"`)
-    - `args` -- list of string arguments
-    - `store` -- injected store map with `get`, `put`, `exists?` callbacks
-
-  ## Returns
-
-  Plain Elixir term: `:ok`, integer, list, map, or `{:error, message}`.
-  """
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
-
-  # ---------------------------------------------------------------------------
-  # CMS.INITBYDIM key width depth
-  # ---------------------------------------------------------------------------
 
   def handle("CMS.INITBYDIM", [key, width_str, depth_str], store) do
     with {:ok, width} <- parse_pos_integer(width_str, "width"),
          {:ok, depth} <- parse_pos_integer(depth_str, "depth"),
          :ok <- check_not_exists(store, key) do
-      sketch = new_sketch(width, depth)
-      store.put.(key, {:cms, sketch}, 0)
+      ref = new_sketch(width, depth)
+      store.put.(key, {:cms, ref}, 0)
       :ok
     end
   end
 
-  def handle("CMS.INITBYDIM", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'cms.initbydim' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # CMS.INITBYPROB key error probability
-  # ---------------------------------------------------------------------------
+  def handle("CMS.INITBYDIM", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cms.initbydim' command"}
 
   def handle("CMS.INITBYPROB", [key, error_str, prob_str], store) do
     with {:ok, error} <- parse_pos_float(error_str, "error"),
@@ -75,121 +30,88 @@ defmodule Ferricstore.Commands.CMS do
          :ok <- check_not_exists(store, key) do
       width = ceil(:math.exp(1) / error)
       depth = ceil(:math.log(1.0 / prob))
-      sketch = new_sketch(width, depth)
-      store.put.(key, {:cms, sketch}, 0)
+      ref = new_sketch(width, depth)
+      store.put.(key, {:cms, ref}, 0)
       :ok
     end
   end
 
-  def handle("CMS.INITBYPROB", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'cms.initbyprob' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # CMS.INCRBY key element count [element count ...]
-  # ---------------------------------------------------------------------------
+  def handle("CMS.INITBYPROB", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cms.initbyprob' command"}
 
   def handle("CMS.INCRBY", [key | rest], store) when rest != [] do
     with {:ok, pairs} <- parse_element_count_pairs(rest),
-         {:ok, sketch} <- get_sketch(store, key) do
-      {updated, counts} = increment_elements(sketch, pairs)
-      store.put.(key, {:cms, updated}, 0)
+         {:ok, ref} <- get_sketch(store, key) do
+      items = Enum.map(pairs, fn {element, count} -> {element, count} end)
+      {:ok, counts} = NIF.cms_incrby(ref, items)
+      store.put.(key, {:cms, ref}, 0)
       counts
     end
   end
 
-  def handle("CMS.INCRBY", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'cms.incrby' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # CMS.QUERY key element [element ...]
-  # ---------------------------------------------------------------------------
+  def handle("CMS.INCRBY", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cms.incrby' command"}
 
   def handle("CMS.QUERY", [key | elements], store) when elements != [] do
-    with {:ok, sketch} <- get_sketch(store, key) do
-      Enum.map(elements, &query_element(sketch, &1))
+    with {:ok, ref} <- get_sketch(store, key) do
+      {:ok, counts} = NIF.cms_query(ref, elements)
+      counts
     end
   end
 
-  def handle("CMS.QUERY", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'cms.query' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # CMS.MERGE dst numkeys src1 [src2 ...] [WEIGHTS w1 w2 ...]
-  # ---------------------------------------------------------------------------
+  def handle("CMS.QUERY", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cms.query' command"}
 
   def handle("CMS.MERGE", [dst, numkeys_str | rest], store) do
     with {:ok, numkeys} <- parse_pos_integer(numkeys_str, "numkeys"),
          {:ok, src_keys, weights} <- parse_merge_args(rest, numkeys),
-         {:ok, sketches} <- load_source_sketches(store, src_keys),
-         :ok <- validate_merge_dimensions(sketches) do
-      first = hd(sketches)
-      merged = merge_sketches(first.width, first.depth, sketches, weights)
-      apply_merge_to_dst(store, dst, first, merged)
+         {:ok, src_refs} <- load_source_sketches(store, src_keys),
+         {:ok, src_infos} <- get_sketch_infos(src_refs),
+         :ok <- validate_merge_dimensions(src_infos) do
+      {first_w, first_d, _} = hd(src_infos)
+      apply_merge_to_dst(store, dst, first_w, first_d, src_refs, weights)
     end
   end
 
-  def handle("CMS.MERGE", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'cms.merge' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # CMS.INFO key
-  # ---------------------------------------------------------------------------
+  def handle("CMS.MERGE", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cms.merge' command"}
 
   def handle("CMS.INFO", [key], store) do
-    with {:ok, sketch} <- get_sketch(store, key) do
-      ["width", sketch.width, "depth", sketch.depth, "count", sketch.total_count]
+    with {:ok, ref} <- get_sketch(store, key) do
+      {:ok, {width, depth, count}} = NIF.cms_info(ref)
+      ["width", width, "depth", depth, "count", count]
     end
   end
 
-  def handle("CMS.INFO", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'cms.info' command"}
-  end
+  def handle("CMS.INFO", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'cms.info' command"}
 
-  # ---------------------------------------------------------------------------
-  # Internal API (for Top-K usage)
-  # ---------------------------------------------------------------------------
-
+  # Internal API for Top-K
   @doc false
-  @spec new_sketch(pos_integer(), pos_integer()) :: map()
   def new_sketch(width, depth) do
-    counters = :array.new(width * depth, default: 0)
-
-    %{
-      width: width,
-      depth: depth,
-      total_count: 0,
-      counters: counters
-    }
+    {:ok, ref} = NIF.cms_create(width, depth)
+    ref
   end
 
   @doc false
-  @spec increment(map(), binary(), non_neg_integer()) :: {map(), non_neg_integer()}
-  def increment(sketch, element, count) do
-    %{width: width, depth: depth, counters: counters, total_count: total} = sketch
-    hashes = hash_element(element, depth)
-
-    {updated_counters, min_count} =
-      Enum.reduce(Enum.with_index(hashes), {counters, :infinity}, fn {hash, row}, {ctr, min} ->
-        idx = row * width + rem(hash, width)
-        new_val = :array.get(idx, ctr) + count
-        {:array.set(idx, new_val, ctr), min(min, new_val)}
-      end)
-
-    updated = %{sketch | counters: updated_counters, total_count: total + count}
-    {updated, min_count}
+  def increment(ref, element, count) do
+    {:ok, [min_count]} = NIF.cms_incrby(ref, [{element, count}])
+    {ref, min_count}
   end
 
   @doc false
-  @spec estimate(map(), binary()) :: non_neg_integer()
-  def estimate(sketch, element), do: query_element(sketch, element)
+  def estimate(ref, element) do
+    {:ok, [count]} = NIF.cms_query(ref, [element])
+    count
+  end
 
-  # ---------------------------------------------------------------------------
-  # Private: sketch operations
-  # ---------------------------------------------------------------------------
+  @doc false
+  def sketch_info(ref) do
+    {:ok, info} = NIF.cms_info(ref)
+    info
+  end
+
+  # Private helpers
 
   defp check_not_exists(store, key) do
     if store.exists?.(key), do: {:error, "ERR item already exists"}, else: :ok
@@ -198,67 +120,37 @@ defmodule Ferricstore.Commands.CMS do
   defp get_sketch(store, key) do
     case store.get.(key) do
       nil -> {:error, "ERR CMS: key does not exist"}
-      {:cms, sketch} -> {:ok, sketch}
+      {:cms, ref} -> {:ok, ref}
       _ -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
     end
   end
 
-  defp query_element(sketch, element) do
-    %{width: width, depth: depth, counters: counters} = sketch
-    hashes = hash_element(element, depth)
-
-    hashes
-    |> Enum.with_index()
-    |> Enum.map(fn {hash, row} -> :array.get(row * width + rem(hash, width), counters) end)
-    |> Enum.min()
+  defp get_sketch_infos(refs) do
+    {:ok, Enum.map(refs, fn ref -> {:ok, info} = NIF.cms_info(ref); info end)}
   end
 
-  defp increment_elements(sketch, pairs) do
-    {updated, counts} =
-      Enum.reduce(pairs, {sketch, []}, fn {element, count}, {sk, acc} ->
-        {new_sk, min_count} = increment(sk, element, count)
-        {new_sk, [min_count | acc]}
-      end)
-
-    {updated, Enum.reverse(counts)}
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private: hashing
-  # ---------------------------------------------------------------------------
-
-  # Produces `depth` independent hash values for `element` using double hashing.
-  defp hash_element(element, depth) do
-    h1 = :erlang.phash2(element, 1_073_741_824)
-    h2 = :erlang.phash2({element, :salt}, 1_073_741_824)
-    Enum.map(0..(depth - 1), fn i -> abs(h1 + i * h2) end)
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private: merge operations
-  # ---------------------------------------------------------------------------
-
-  defp apply_merge_to_dst(store, dst, first, merged) do
+  defp apply_merge_to_dst(store, dst, first_w, first_d, src_refs, weights) do
     case get_sketch(store, dst) do
-      {:ok, existing} ->
-        validate_and_merge_into_existing(store, dst, existing, first, merged)
+      {:ok, existing_ref} ->
+        {:ok, {ew, ed, _}} = NIF.cms_info(existing_ref)
+        if ew != first_w or ed != first_d do
+          {:error, "ERR CMS: width/depth of src and dst must be equal"}
+        else
+          sources = Enum.zip(src_refs, weights)
+          :ok = NIF.cms_merge(existing_ref, sources)
+          store.put.(dst, {:cms, existing_ref}, 0)
+          :ok
+        end
 
       {:error, "ERR CMS: key does not exist"} ->
-        store.put.(dst, {:cms, merged}, 0)
+        dest_ref = new_sketch(first_w, first_d)
+        sources = Enum.zip(src_refs, weights)
+        :ok = NIF.cms_merge(dest_ref, sources)
+        store.put.(dst, {:cms, dest_ref}, 0)
         :ok
 
       {:error, _} = err ->
         err
-    end
-  end
-
-  defp validate_and_merge_into_existing(store, dst, existing, first, merged) do
-    if existing.width != first.width or existing.depth != first.depth do
-      {:error, "ERR CMS: width/depth of src and dst must be equal"}
-    else
-      combined = merge_two(existing, merged)
-      store.put.(dst, {:cms, combined}, 0)
-      :ok
     end
   end
 
@@ -268,50 +160,12 @@ defmodule Ferricstore.Commands.CMS do
     if error, do: error, else: {:ok, Enum.map(results, fn {:ok, s} -> s end)}
   end
 
-  defp validate_merge_dimensions(sketches) do
-    first = hd(sketches)
-
-    if Enum.all?(sketches, fn s -> s.width == first.width and s.depth == first.depth end) do
-      :ok
-    else
-      {:error, "ERR CMS: width/depth of src sketches must be equal"}
-    end
+  defp validate_merge_dimensions(infos) do
+    {first_w, first_d, _} = hd(infos)
+    if Enum.all?(infos, fn {w, d, _} -> w == first_w and d == first_d end),
+      do: :ok,
+      else: {:error, "ERR CMS: width/depth of src sketches must be equal"}
   end
-
-  defp merge_sketches(width, depth, sketches, weights) do
-    size = width * depth
-    weighted_pairs = Enum.zip(sketches, weights)
-
-    counters =
-      Enum.reduce(0..(size - 1), :array.new(size, default: 0), fn idx, acc ->
-        sum = Enum.reduce(weighted_pairs, 0, fn {sk, w}, t -> t + :array.get(idx, sk.counters) * w end)
-        :array.set(idx, max(0, sum), acc)
-      end)
-
-    total = Enum.reduce(weighted_pairs, 0, fn {sk, w}, t -> t + sk.total_count * w end)
-    %{width: width, depth: depth, total_count: max(0, total), counters: counters}
-  end
-
-  defp merge_two(existing, incoming) do
-    %{width: width, depth: depth} = existing
-    size = width * depth
-
-    counters =
-      Enum.reduce(0..(size - 1), :array.new(size, default: 0), fn idx, acc ->
-        :array.set(idx, :array.get(idx, existing.counters) + :array.get(idx, incoming.counters), acc)
-      end)
-
-    %{
-      width: width,
-      depth: depth,
-      total_count: existing.total_count + incoming.total_count,
-      counters: counters
-    }
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private: argument parsing
-  # ---------------------------------------------------------------------------
 
   defp parse_pos_integer(str, label) do
     case Integer.parse(str) do
@@ -341,11 +195,11 @@ defmodule Ferricstore.Commands.CMS do
     if rem(length(args), 2) != 0 do
       {:error, "ERR wrong number of arguments for 'cms.incrby' command"}
     else
-      do_parse_element_count_pairs(args)
+      do_parse_pairs(args)
     end
   end
 
-  defp do_parse_element_count_pairs(args) do
+  defp do_parse_pairs(args) do
     result =
       args
       |> Enum.chunk_every(2)
@@ -379,9 +233,8 @@ defmodule Ferricstore.Commands.CMS do
     parse_merge_weights(src_keys, remaining, numkeys)
   end
 
-  defp parse_merge_weights(src_keys, [], numkeys) do
-    {:ok, src_keys, List.duplicate(1, numkeys)}
-  end
+  defp parse_merge_weights(src_keys, [], numkeys),
+    do: {:ok, src_keys, List.duplicate(1, numkeys)}
 
   defp parse_merge_weights(src_keys, ["WEIGHTS" | weight_strs], numkeys) do
     if length(weight_strs) != numkeys do
@@ -391,9 +244,8 @@ defmodule Ferricstore.Commands.CMS do
     end
   end
 
-  defp parse_merge_weights(_src_keys, _remaining, _numkeys) do
-    {:error, "ERR syntax error in 'cms.merge' command"}
-  end
+  defp parse_merge_weights(_src_keys, _remaining, _numkeys),
+    do: {:error, "ERR syntax error in 'cms.merge' command"}
 
   defp parse_weight_values(src_keys, weight_strs) do
     weights =

@@ -88,11 +88,6 @@ defmodule Ferricstore.Test.MockStore do
         end)
         :ok
       end,
-      list_op: fn key, operation ->
-        Agent.get_and_update(pid, fn state ->
-          do_list_op(state, key, operation)
-        end)
-      end,
       incr: fn key, delta ->
         Agent.get_and_update(pid, fn state ->
           case Map.get(state, key) do
@@ -298,75 +293,6 @@ defmodule Ferricstore.Test.MockStore do
   defp live_count(state) do
     now = System.os_time(:millisecond)
     Enum.count(state, fn {_, {_, exp}} -> exp == 0 or exp > now end)
-  end
-
-  # --- List operation helpers ---
-
-  defp do_list_op(state, key, {:lmove, destination, from_dir, to_dir}) do
-    alias Ferricstore.Store.ListOps
-
-    src_get_fn = fn -> raw_value(state, key) end
-    Process.put(:mock_list_op_state, state)
-
-    dst_get_fn = fn ->
-      s = Process.get(:mock_list_op_state)
-      raw_value(s, destination)
-    end
-
-    src_put_fn = fn encoded ->
-      s = Process.get(:mock_list_op_state)
-      Process.put(:mock_list_op_state, Map.put(s, key, {encoded, 0}))
-      :ok
-    end
-
-    dst_put_fn = fn encoded ->
-      s = Process.get(:mock_list_op_state)
-      Process.put(:mock_list_op_state, Map.put(s, destination, {encoded, 0}))
-      :ok
-    end
-
-    src_delete_fn = fn ->
-      s = Process.get(:mock_list_op_state)
-      Process.put(:mock_list_op_state, Map.delete(s, key))
-      :ok
-    end
-
-    result = ListOps.execute_lmove(src_get_fn, src_put_fn, src_delete_fn, dst_get_fn, dst_put_fn, from_dir, to_dir)
-    new_state = Process.get(:mock_list_op_state)
-    Process.delete(:mock_list_op_state)
-    {result, new_state}
-  end
-
-  defp do_list_op(state, key, operation) do
-    alias Ferricstore.Store.ListOps
-
-    get_fn = fn -> raw_value(state, key) end
-    Process.put(:mock_list_op_state, state)
-
-    put_fn = fn encoded_binary ->
-      s = Process.get(:mock_list_op_state)
-      Process.put(:mock_list_op_state, Map.put(s, key, {encoded_binary, 0}))
-      :ok
-    end
-
-    delete_fn = fn ->
-      s = Process.get(:mock_list_op_state)
-      Process.put(:mock_list_op_state, Map.delete(s, key))
-      :ok
-    end
-
-    result = ListOps.execute(get_fn, put_fn, delete_fn, operation)
-    new_state = Process.get(:mock_list_op_state)
-    Process.delete(:mock_list_op_state)
-    {result, new_state}
-  end
-
-  defp raw_value(state, key) do
-    case Map.get(state, key) do
-      nil -> nil
-      {value, 0} -> value
-      {value, exp} -> if Ferricstore.Test.MockStore.alive?(exp), do: value, else: nil
-    end
   end
 
   # Public so anonymous functions passed to Agent can use it.

@@ -70,6 +70,8 @@ defmodule Ferricstore.Application do
     Ferricstore.ClientTracking.init_tables()
     # Initialize stream metadata ETS tables (owned by this long-lived process)
     Ferricstore.Commands.Stream.init_tables()
+    # Initialize HNSW vector index registry (used by VCREATE/VADD/VSEARCH)
+    Ferricstore.Store.HnswRegistry.create_table()
 
     # Start the ra system before shards so that Shard.init can start ra servers.
     if raft_enabled? do
@@ -99,8 +101,15 @@ defmodule Ferricstore.Application do
         )
       end)
 
+    # Optional libcluster node discovery (DNS, Kubernetes labels, or gossip).
+    # When topologies are configured, Cluster.Supervisor is the first child so
+    # that node discovery begins before the store is ready to serve traffic.
+    # When no topologies are configured (nil or []), the supervisor is omitted.
+    cluster_children = cluster_supervisor_children()
+
     # Core children: always started regardless of mode.
     children =
+      cluster_children ++
       [
         Ferricstore.Stats,
         Ferricstore.SlowLog,
@@ -247,6 +256,30 @@ defmodule Ferricstore.Application do
           %{count: count, largest_size: largest_size},
           %{largest_key: largest_key}
         )
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Cluster supervisor (libcluster)
+  # ---------------------------------------------------------------------------
+
+  # Returns a list containing the Cluster.Supervisor child spec when libcluster
+  # topologies are configured, or an empty list when they are not. This makes
+  # libcluster entirely optional -- the application starts cleanly without it.
+  @spec cluster_supervisor_children() :: [Supervisor.child_spec()]
+  defp cluster_supervisor_children do
+    case Application.get_env(:libcluster, :topologies) do
+      nil ->
+        []
+
+      [] ->
+        []
+
+      :disabled ->
+        []
+
+      topologies when is_list(topologies) ->
+        [{Cluster.Supervisor, [topologies, [name: Ferricstore.ClusterSupervisor]]}]
     end
   end
 
