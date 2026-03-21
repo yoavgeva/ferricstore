@@ -63,7 +63,6 @@ defmodule Ferricstore.Raft.IntegrationTest do
   defp ukey(base), do: "raft_int_#{base}_#{:rand.uniform(9_999_999)}"
 
   defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
-  defp hot_cache_for(key), do: :"hot_cache_#{Router.shard_for(key)}"
 
   defp shard_pid_for(key) do
     name = Router.shard_name(Router.shard_for(key))

@@ -607,9 +607,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       {:ok, store} = NIF.new(dir)
       suffix = :rand.uniform(9_999_999)
       keydir_name = :"sn001_keydir_#{suffix}"
-      hot_cache_name = :"sn001_hot_cache_#{suffix}"
       :ets.new(keydir_name, [:set, :public, :named_table])
-      :ets.new(hot_cache_name, [:set, :public, :named_table])
 
       on_exit(fn ->
         try do
@@ -618,16 +616,10 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           ArgumentError -> :ok
         end
 
-        try do
-          :ets.delete(hot_cache_name)
-        rescue
-          ArgumentError -> :ok
-        end
-
         File.rm_rf!(dir)
       end)
 
-      %{store: store, keydir: keydir_name, hot_cache: hot_cache_name, dir: dir}
+      %{store: store, keydir: keydir_name, dir: dir}
     end
 
     test "release_cursor emitted exactly at the configured interval", ctx do
@@ -638,7 +630,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           shard_index: 0,
           store: ctx.store,
           ets: ctx.keydir,
-          hot_cache: ctx.hot_cache,
+
           release_cursor_interval: interval
         })
 
@@ -680,7 +672,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           shard_index: 0,
           store: ctx.store,
           ets: ctx.keydir,
-          hot_cache: ctx.hot_cache,
+
           release_cursor_interval: interval
         })
 
@@ -709,7 +701,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           shard_index: 0,
           store: ctx.store,
           ets: ctx.keydir,
-          hot_cache: ctx.hot_cache,
+
           release_cursor_interval: interval
         })
 
@@ -738,7 +730,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           shard_index: 0,
           store: ctx.store,
           ets: ctx.keydir,
-          hot_cache: ctx.hot_cache,
+
           release_cursor_interval: interval
         })
 

@@ -53,7 +53,7 @@ defmodule Ferricstore.Store.Shard do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.{PrefixIndex, Router}
+  alias Ferricstore.Store.{BloomRegistry, PrefixIndex, Router}
 
   require Logger
 
@@ -70,7 +70,6 @@ defmodule Ferricstore.Store.Shard do
     :store,
     :ets,
     :keydir,
-    :hot_cache,
     :prefix_keys,
     :index,
     :data_dir,
@@ -129,22 +128,21 @@ defmodule Ferricstore.Store.Shard do
           :"keydir_#{index}"
       end
 
-    # Create (or recreate) the hot_cache table for this shard.
-    hot_cache =
-      case :ets.whereis(:"hot_cache_#{index}") do
-        :undefined ->
-          :ets.new(:"hot_cache_#{index}", [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
-
-        _ref ->
-          :ets.delete_all_objects(:"hot_cache_#{index}")
-          :"hot_cache_#{index}"
-      end
+    # Remove any leftover hot_cache table from a previous run.
+    case :ets.whereis(:"hot_cache_#{index}") do
+      :undefined -> :ok
+      _ref -> :ets.delete(:"hot_cache_#{index}")
+    end
 
     ets = keydir
 
     # Create (or clear) the prefix index ETS bag table for fast SCAN MATCH
     # lookups on 'prefix:*' patterns.
     prefix_keys = PrefixIndex.create_table(index)
+
+    # Create (or clear) the bloom registry ETS table for mmap-backed bloom
+    # filter NIF resources.
+    BloomRegistry.create_table(index)
 
     # Start the Raft server and Batcher for this shard if raft is enabled.
     # The ra system must already be started (done in Application.start).
@@ -196,9 +194,16 @@ defmodule Ferricstore.Store.Shard do
 
     Ferricstore.Store.HnswRegistry.rebuild_for_shard(store, index, hnsw_get_fn)
 
+    # Re-open all mmap-backed bloom filter files from disk.
+    bloom_count = BloomRegistry.recover(data_dir, index)
+
+    if bloom_count > 0 do
+      Logger.debug("Shard #{index}: recovered #{bloom_count} bloom filter(s)")
+    end
+
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
-    {:ok, %__MODULE__{store: store, ets: keydir, keydir: keydir, hot_cache: hot_cache,
+    {:ok, %__MODULE__{store: store, ets: keydir, keydir: keydir,
                        prefix_keys: prefix_keys, index: index, data_dir: data_dir,
                        pending: [], flush_in_flight: nil,
                        promoted_instances: promoted},
@@ -228,16 +233,33 @@ defmodule Ferricstore.Store.Shard do
         state = await_in_flight(state)
         state = flush_pending_sync(state)
 
-        # Submit async read to Tokio — the BEAM scheduler is freed immediately.
-        # The result arrives as {:tokio_complete, :ok | :error, result} and is
-        # handled by handle_info/2 which replies to the caller and warms ETS.
-        case NIF.get_async(state.store, key) do
-          {:pending, :ok} ->
-            new_pending_reads = [{from, key} | state.pending_reads]
-            {:noreply, %{state | pending_reads: new_pending_reads}}
+        if state.pending_reads == [] do
+          # No other async read in-flight — use Tokio async path.
+          # The result arrives as {:tokio_complete, :ok | :error, result} and
+          # is handled by handle_info/2 which replies to the caller and warms ETS.
+          case NIF.get_async(state.store, key) do
+            {:pending, :ok} ->
+              new_pending_reads = [{from, key} | state.pending_reads]
+              {:noreply, %{state | pending_reads: new_pending_reads}}
 
-          {:error, _reason} ->
-            {:reply, nil, state}
+            {:error, _reason} ->
+              {:reply, nil, state}
+          end
+        else
+          # Another async read is already pending. Fall back to synchronous
+          # NIF.get to avoid misordering — {:tokio_complete, ...} messages
+          # carry no correlation ID, so multiple in-flight async reads can
+          # swap results via the LIFO pending_reads stack.
+          value = case NIF.get(state.store, key) do
+            {:ok, v} -> v
+            {:error, _} -> nil
+          end
+
+          if value != nil do
+            cold_read_warm_ets(state, key, value)
+          end
+
+          {:reply, value, state}
         end
     end
   end
@@ -1959,6 +1981,12 @@ defmodule Ferricstore.Store.Shard do
           shard = Router.shard_name(Router.shard_for(redis_key))
           GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
         end
+      end,
+      prob_dir: fn ->
+        Path.join([state.data_dir, "prob", "shard_#{state.index}"])
+      end,
+      vectors_dir: fn ->
+        Path.join([state.data_dir, "vectors", "shard_#{state.index}"])
       end
     }
   end
@@ -2494,7 +2522,7 @@ defmodule Ferricstore.Store.Shard do
     case state.pending_reads do
       [{from, key} | rest] ->
         if value != nil do
-          ets_insert(state, key, value, 0)
+          cold_read_warm_ets(state, key, value)
         end
 
         GenServer.reply(from, value)
@@ -2767,6 +2795,19 @@ defmodule Ferricstore.Store.Shard do
 
       _error ->
         nil
+    end
+  end
+
+  # Re-warms the ETS cache after a successful cold read (async Tokio path).
+  # If the key was evicted (value set to nil, row still present), preserves the
+  # original expire_at_ms. Otherwise inserts a fresh row with expire_at_ms = 0.
+  defp cold_read_warm_ets(state, key, value) do
+    case :ets.lookup(state.keydir, key) do
+      [{^key, nil, exp, _lfu}] ->
+        :ets.insert(state.keydir, {key, value, exp, @lfu_initial_counter})
+
+      _ ->
+        ets_insert(state, key, value, 0)
     end
   end
 

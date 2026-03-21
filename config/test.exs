@@ -23,6 +23,11 @@ config :ferricstore, :merge,
   check_interval_ms: 600_000,
   fragmentation_threshold: 0.99
 
+# Expiry sweep: use a very long interval to prevent periodic timers from
+# firing during tests. Tests that need expiry sweeps call
+# GenServer.call(shard, :expiry_sweep) explicitly.
+config :ferricstore, :expiry_sweep_interval_ms, 600_000
+
 # Raft: enabled in test — single node is its own quorum (per spec).
 config :ferricstore, :raft_enabled, true
 

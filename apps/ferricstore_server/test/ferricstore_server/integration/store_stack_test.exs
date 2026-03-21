@@ -43,8 +43,6 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
 
   # Returns the keydir ETS table name for the shard that owns `key`.
   defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
-  # Returns the hot_cache ETS table name for the shard that owns `key`.
-  defp hot_cache_for(key), do: :"hot_cache_#{Router.shard_for(key)}"
 
   # Returns the PID of the shard GenServer that owns `key`.
   defp shard_pid_for(key) do

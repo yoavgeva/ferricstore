@@ -224,6 +224,10 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       shard_name = Router.shard_name(1)
       GenServer.call(shard_name, :expiry_sweep)
 
+      # Drain any stale recovered events produced by the reset sweep above
+      # (shard 1 may have been left in struggling state by a previous test).
+      flush_telemetry([:ferricstore, :expiry, :recovered])
+
       past = System.os_time(:millisecond) - 5_000
       uid = System.unique_integer([:positive])
 
@@ -243,14 +247,11 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       end
 
       # Run more sweeps to drain remaining keys (4 left) and drop below ceiling.
+      # The recovered event will be emitted during one of these sweeps when
+      # the removed count drops below the ceiling.
       for _ <- 1..3 do
         GenServer.call(shard_name, :expiry_sweep)
       end
-
-      # Drain any stale recovered events from other shards (cross-test contamination)
-      # then trigger one more sweep on shard 1 to ensure the event fires.
-      flush_telemetry([:ferricstore, :expiry, :recovered])
-      GenServer.call(shard_name, :expiry_sweep)
 
       assert_receive {:telemetry, [:ferricstore, :expiry, :recovered], measurements, _metadata},
                      1000
@@ -549,9 +550,11 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       shard_name = Router.shard_name(shard_idx)
       :ok = GenServer.call(shard_name, :flush)
 
-      # Remove from ETS to force a cold read.
-      :ets.delete(:"keydir_#{shard_idx}", key)
-      :ets.delete(:"hot_cache_#{shard_idx}", key)
+      # Evict the value from the hot cache (set value to nil) to force a
+      # cold read. This mirrors the MemoryGuard eviction mechanism: the keydir
+      # row stays so metadata (TTL, LFU counter) is preserved, but the value
+      # slot is nil so the next GET falls through to Bitcask.
+      :ets.update_element(:"keydir_#{shard_idx}", key, {2, nil})
 
       Ferricstore.Stats.reset_hotness()
 

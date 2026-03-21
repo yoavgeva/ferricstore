@@ -108,7 +108,6 @@ defmodule Ferricstore.Raft.StateMachine do
       shard_index: config.shard_index,
       store: config.store,
       ets: config.ets,
-      hot_cache: Map.get(config, :hot_cache, :"hot_cache_#{config.shard_index}"),
       prefix_keys: PrefixIndex.table_name(config.shard_index),
       applied_count: 0,
       release_cursor_interval: interval

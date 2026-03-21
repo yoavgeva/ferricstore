@@ -353,9 +353,8 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
           for _ <- 1..1_000, do: Router.get(key)
         end)
 
-      # Delete from ETS to force cold path (but leave in Bitcask)
+      # Delete from keydir to force cold path (but leave in Bitcask)
       idx = Router.shard_for(key)
-      hot_cache = :"hot_cache_#{idx}"
       keydir = :"keydir_#{idx}"
 
       # Record cold path time by doing repeated GenServer calls
@@ -363,10 +362,9 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       cold_keys = for i <- 1..100, do: ukey("cold_#{i}")
       Enum.each(cold_keys, fn k -> Router.put(k, "cold_value") end)
 
-      # Evict cold keys from hot cache to force cold reads
+      # Evict cold keys from keydir to force cold reads
       Enum.each(cold_keys, fn k ->
         try do
-          :ets.delete(hot_cache, k)
           :ets.delete(keydir, k)
         rescue
           _ -> :ok

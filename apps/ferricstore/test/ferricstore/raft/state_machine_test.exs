@@ -23,16 +23,13 @@ defmodule Ferricstore.Raft.StateMachineTest do
     {:ok, store} = NIF.new(dir)
     suffix = :rand.uniform(9_999_999)
     keydir_name = :"sm_test_keydir_#{suffix}"
-    hot_cache_name = :"sm_test_hot_cache_#{suffix}"
     :ets.new(keydir_name, [:set, :public, :named_table])
-    :ets.new(hot_cache_name, [:set, :public, :named_table])
 
     state =
       StateMachine.init(%{
         shard_index: 0,
         store: store,
-        ets: keydir_name,
-        hot_cache: hot_cache_name
+        ets: keydir_name
       })
 
     on_exit(fn ->
@@ -42,16 +39,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
         ArgumentError -> :ok
       end
 
-      try do
-        :ets.delete(hot_cache_name)
-      rescue
-        ArgumentError -> :ok
-      end
-
       File.rm_rf!(dir)
     end)
 
-    %{state: state, ets: keydir_name, hot_cache: hot_cache_name, store: store, dir: dir}
+    %{state: state, ets: keydir_name, store: store, dir: dir}
   end
 
   # ---------------------------------------------------------------------------

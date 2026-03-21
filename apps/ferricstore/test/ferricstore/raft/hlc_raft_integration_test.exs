@@ -30,16 +30,13 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     {:ok, store} = NIF.new(dir)
     suffix = :rand.uniform(9_999_999)
     keydir_name = :"hlc_raft_keydir_#{suffix}"
-    hot_cache_name = :"hlc_raft_hot_cache_#{suffix}"
     :ets.new(keydir_name, [:set, :public, :named_table])
-    :ets.new(hot_cache_name, [:set, :public, :named_table])
 
     state =
       StateMachine.init(%{
         shard_index: 0,
         store: store,
-        ets: keydir_name,
-        hot_cache: hot_cache_name
+        ets: keydir_name
       })
 
     # Reset the HLC atomics to a clean slate so tests don't interfere.
@@ -54,19 +51,12 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
         ArgumentError -> :ok
       end
 
-      try do
-        :ets.delete(hot_cache_name)
-      rescue
-        ArgumentError -> :ok
-      end
-
       File.rm_rf!(dir)
     end)
 
     %{
       state: state,
       ets: keydir_name,
-      hot_cache: hot_cache_name,
       store: store,
       dir: dir
     }
@@ -247,8 +237,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
   describe "release_cursor with HLC-wrapped commands" do
     test "release_cursor is emitted at interval boundary for wrapped commands", %{
       store: store,
-      ets: ets,
-      hot_cache: hot_cache
+      ets: ets
     } do
       interval = 3
 
@@ -257,7 +246,6 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
           shard_index: 0,
           store: store,
           ets: ets,
-          hot_cache: hot_cache,
           release_cursor_interval: interval
         })
 

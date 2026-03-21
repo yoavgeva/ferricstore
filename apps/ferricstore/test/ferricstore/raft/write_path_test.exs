@@ -90,7 +90,6 @@ defmodule Ferricstore.Raft.WritePathTest do
   defp ukey(base), do: "raft_wp_#{base}_#{:rand.uniform(9_999_999)}"
 
   defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
-  defp hot_cache_for(key), do: :"hot_cache_#{Router.shard_for(key)}"
 
   defp shard_pid_for(key) do
     name = Router.shard_name(Router.shard_for(key))
@@ -512,40 +511,21 @@ defmodule Ferricstore.Raft.WritePathTest do
     {:ok, store} = NIF.new(dir)
     suffix = :rand.uniform(9_999_999)
     keydir_name = :"wp_sm_keydir_#{suffix}"
-    hot_cache_name = :"wp_sm_hot_cache_#{suffix}"
     :ets.new(keydir_name, [:set, :public, :named_table])
-    :ets.new(hot_cache_name, [:set, :public, :named_table])
 
     state =
       Ferricstore.Raft.StateMachine.init(%{
         shard_index: 0,
         store: store,
-        ets: keydir_name,
-        hot_cache: hot_cache_name
+        ets: keydir_name
       })
 
-    {state, keydir_name, store, dir, hot_cache_name}
+    {state, keydir_name, store, dir}
   end
 
   defp cleanup_sm({_state, ets_name, _store, dir}) do
     try do
       :ets.delete(ets_name)
-    rescue
-      ArgumentError -> :ok
-    end
-
-    File.rm_rf!(dir)
-  end
-
-  defp cleanup_sm({_state, ets_name, _store, dir, hot_cache_name}) do
-    try do
-      :ets.delete(ets_name)
-    rescue
-      ArgumentError -> :ok
-    end
-
-    try do
-      :ets.delete(hot_cache_name)
     rescue
       ArgumentError -> :ok
     end
@@ -563,7 +543,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: LPUSH through Raft adds element" do
     test "LPUSH to a new key creates a list with the pushed elements" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir, _hc} = ctx
+      {state, ets, store, _dir} = ctx
 
       {new_state, result} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["a", "b", "c"]}}, state)
@@ -584,7 +564,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "LPUSH to existing list prepends elements" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       {state2, 2} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["a", "b"]}}, state)
@@ -606,7 +586,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: RPUSH through Raft adds element" do
     test "RPUSH to a new key creates a list with the pushed elements" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       {_new_state, result} =
         SM.apply(%{}, {:list_op, "rlist", {:rpush, ["x", "y", "z"]}}, state)
@@ -621,7 +601,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "RPUSH to existing list appends elements" do
       ctx = fresh_sm_state()
-      {state, _ets, _store, _dir, _hc} = ctx
+      {state, _ets, _store, _dir} = ctx
 
       {state2, 2} =
         SM.apply(%{}, {:list_op, "rlist", {:rpush, ["a", "b"]}}, state)
@@ -646,7 +626,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: LPOP through Raft removes element" do
     test "LPOP from a list returns and removes the leftmost element" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       # Build a list: [a, b, c]
       {state2, 3} =
@@ -668,7 +648,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "LPOP from empty / non-existent key returns nil" do
       ctx = fresh_sm_state()
-      {state, _ets, _store, _dir, _hc} = ctx
+      {state, _ets, _store, _dir} = ctx
 
       {_new_state, result} =
         SM.apply(%{}, {:list_op, "nokey", {:lpop, 1}}, state)
@@ -680,7 +660,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "LPOP all elements deletes the key" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       {state2, 1} =
         SM.apply(%{}, {:list_op, "single", {:rpush, ["only"]}}, state)
@@ -702,7 +682,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: RPOP through Raft removes element" do
     test "RPOP from a list returns and removes the rightmost element" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       {state2, 3} =
         SM.apply(%{}, {:list_op, "rpoplist", {:rpush, ["a", "b", "c"]}}, state)
@@ -726,7 +706,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_put: HSET through Raft writes field" do
     test "compound_put inserts a hash field into ETS and Bitcask" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir, _hc} = ctx
+      {state, ets, store, _dir} = ctx
 
       compound_key = "myhash\x00field1"
 
@@ -747,7 +727,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "compound_put overwrites existing field value" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       compound_key = "myhash\x00field1"
 
@@ -764,7 +744,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "multiple compound_puts for different fields" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       {state2, :ok} =
         SM.apply(%{}, {:compound_put, "h\x00f1", "val1", 0}, state)
@@ -790,7 +770,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_delete: HDEL through Raft removes field" do
     test "compound_delete removes a hash field from ETS and Bitcask" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir, _hc} = ctx
+      {state, ets, store, _dir} = ctx
 
       compound_key = "myhash\x00field1"
 
@@ -809,7 +789,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "compound_delete on non-existent key returns :ok" do
       ctx = fresh_sm_state()
-      {state, _ets, _store, _dir, _hc} = ctx
+      {state, _ets, _store, _dir} = ctx
 
       {_new_state, result} =
         SM.apply(%{}, {:compound_delete, "nonexistent\x00field"}, state)
@@ -827,7 +807,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_put: SADD through Raft adds member" do
     test "compound_put adds a set member (presence marker)" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir, _hc} = ctx
+      {state, ets, store, _dir} = ctx
 
       # Sets use a presence marker as the value
       compound_key = "myset\x00member1"
@@ -845,7 +825,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "multiple set members via compound_put" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       {state2, :ok} =
         SM.apply(%{}, {:compound_put, "myset\x00m1", "1", 0}, state)
@@ -871,7 +851,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_delete_prefix: DEL on hash through Raft cleans up all fields" do
     test "deletes all compound keys matching prefix" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir, _hc} = ctx
+      {state, ets, store, _dir} = ctx
 
       # Insert several fields for a hash "myhash"
       prefix = "myhash\x00"
@@ -917,7 +897,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "deletes all set members when DEL is called on the set key" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       prefix = "myset\x00"
 
@@ -942,7 +922,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "compound_delete_prefix with no matching keys is a no-op" do
       ctx = fresh_sm_state()
-      {state, _ets, _store, _dir, _hc} = ctx
+      {state, _ets, _store, _dir} = ctx
 
       {new_state, :ok} =
         SM.apply(%{}, {:compound_delete_prefix, "nonexistent\x00"}, state)
@@ -954,7 +934,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
     test "compound_delete_prefix does not affect unrelated keys" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       {state2, :ok} =
         SM.apply(%{}, {:compound_put, "hash_a\x00f1", "v1", 0}, state)
@@ -980,7 +960,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "batch containing new command types" do
     test "batch with list_op, compound_put, and compound_delete" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir, _hc} = ctx
+      {state, ets, _store, _dir} = ctx
 
       commands = [
         {:list_op, "mylist", {:rpush, ["a", "b"]}},
