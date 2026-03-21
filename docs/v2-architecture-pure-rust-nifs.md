@@ -93,10 +93,61 @@ Phase 3: New pure NIF API (pread_at, append_record)
 Phase 4: Remove Rust keydir, remove Store struct
 Phase 5: Remove Mutex (pure functions don't need it)
 
+## Three storage tiers — each with the right tool
+
+```
+┌─────────────────────┐
+│  ETS keydir          │  Key-value data (strings, hash, list, set, zset)
+│  {key, value|nil,    │  Elixir manages hot/cold via LFU
+│   expire, lfu,       │  value=nil → cold, pread from Bitcask
+│   fid, offset, size} │  value=binary → hot, return from ETS
+└──────────┬──────────┘
+           │ cold reads
+           ▼
+┌─────────────────────┐
+│  Bitcask data files  │  Append-only log files
+│  Pure Rust IO:       │  NIF.pread_at(path, offset, size)
+│  append, pread,      │  NIF.append_record(path, key, value)
+│  fsync, compact      │  No state, no HashMap, no Mutex
+└─────────────────────┘
+
+┌─────────────────────┐
+│  mmap files          │  Binary structures (fixed-layout, random access)
+│  prob/shard_N/*.bloom│  Bloom: bit array, random bit set/check
+│  prob/shard_N/*.cuck │  Cuckoo: bucket array, fingerprint ops
+│  prob/shard_N/*.cms  │  CMS: counter matrix, hash-indexed increment
+│  prob/shard_N/*.topk │  TopK: CMS + min-heap
+│  prob/shard_N/*.tdig │  TDigest: sorted centroid array
+│  vectors/shard_N/*.v │  Vectors: flat f32 array, distance math
+│                      │
+│  OS page cache       │  OS decides hot/cold — not us
+│  manages RAM         │  No ETS, no serialization, zero-copy
+│  NIF = pointer math  │  Pure Rust: read/write at offset
+└─────────────────────┘
+```
+
+### Why three tiers, not one:
+
+| Data type | Access pattern | Best storage |
+|-----------|---------------|-------------|
+| Strings/Hash/List/Set/ZSet | Key lookup, TTL, LFU eviction | **ETS** (we need control over eviction) |
+| Bloom/Cuckoo/CMS/TopK/TDigest | Random byte/bit access on fixed-size arrays | **mmap** (OS page cache, zero-copy) |
+| Vectors | Sequential/random f32 reads, distance math | **mmap** (OS page cache, SIMD-friendly layout) |
+
+### What NEVER goes in ETS:
+- Probabilistic structures (too large, wrong abstraction)
+- Vectors (too large, need SIMD-aligned layout)
+- Anything >64KB (ETS copies on read)
+
+### What NEVER goes in mmap:
+- Key-value data (needs TTL, LFU, per-key eviction)
+- Metadata (needs atomic update_element)
+
 ## The "should this be in Rust?" test
 
 1. Is it CPU-intensive? (hash, distance, crypto) → **Rust**
 2. Is it a syscall wrapper? (pread, fsync, mmap) → **Rust**
-3. Does it have state? → **Elixir**
-4. Does it make decisions? → **Elixir**
-5. Does it need debugging in production? → **Elixir**
+3. Is it pointer math on mmap? (bloom bits, CMS counters) → **Rust**
+4. Does it have state? → **Elixir**
+5. Does it make decisions? → **Elixir**
+6. Does it need debugging in production? → **Elixir**
