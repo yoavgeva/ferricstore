@@ -35,7 +35,13 @@ defmodule Ferricstore.Test.AuditFormatter do
 
   @impl true
   def handle_cast({:test_finished, %ExUnit.Test{} = test}, state) do
-    status = if test.state == nil, do: "PASS", else: "FAIL"
+    status = case test.state do
+      nil -> "PASS"
+      {:excluded, _} -> "SKIP"
+      {:skipped, _} -> "SKIP"
+      {:invalid, _} -> "INVALID"
+      _ -> "FAIL"
+    end
     duration_ms = div(test.time, 1000)
 
     shard_count = try_shard_count()
