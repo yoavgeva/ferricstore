@@ -2129,9 +2129,7 @@ defmodule FerricstoreServer.Connection do
       keys: &Router.keys/0,
       keys_with_prefix: &Router.keys_with_prefix/1,
       flush: fn ->
-        shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-        Enum.each(0..(shard_count - 1), &Ferricstore.Raft.AsyncApplyWorker.drain/1)
-        Enum.each(Router.keys(), &Router.delete/1)
+        FerricStore.flushdb()
         :ok
       end,
       dbsize: &Router.dbsize/0,

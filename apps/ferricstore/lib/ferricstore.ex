@@ -1418,8 +1418,33 @@ defmodule FerricStore do
       # Re-set the namespace since checkin clears it
       Process.put(:ferricstore_sandbox, namespace)
     else
-      all_keys = Router.keys()
-      Enum.each(all_keys, &Router.delete/1)
+      # Delete ALL keys including compound sub-keys through the Shard
+      # GenServer which handles ETS + Bitcask tombstones properly.
+      shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+
+      for i <- 0..(shard_count - 1) do
+        shard = Router.shard_name(i)
+
+        # Get ALL raw keys from ETS (including H:, S:, Z:, T: compound keys)
+        raw_keys =
+          try do
+            :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], :"keydir_#{i}")
+          rescue
+            ArgumentError -> []
+          end
+
+        # Delete each through the shard to write Bitcask tombstones
+        Enum.each(raw_keys, fn key ->
+          try do
+            GenServer.call(shard, {:delete, key}, 10_000)
+          catch
+            :exit, _ -> :ok
+          end
+        end)
+
+        # Clear prefix index
+        try do :ets.delete_all_objects(:"prefix_keys_#{i}") catch :error, :badarg -> :ok end
+      end
     end
 
     :ok
