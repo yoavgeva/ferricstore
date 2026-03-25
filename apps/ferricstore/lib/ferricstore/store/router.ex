@@ -175,15 +175,31 @@ defmodule Ferricstore.Store.Router do
         if byte_size(v) > max_hot, do: nil, else: v
     end
     disk_value = to_disk_binary(value)
-    :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
     PrefixIndex.track(PrefixIndex.table_name(idx), key, idx)
-
     {file_id, file_path, _} = :persistent_term.get({:ferricstore_active_file, idx})
-    Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, key, disk_value, expire_at_ms)
 
-    WriteVersion.increment(idx)
-    async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
-    :ok
+    if value_for_ets == nil do
+      # Large value: sync NIF write to get offset, then ETS with real location.
+      # Cannot use async BitcaskWriter because ETS value is nil (too large for
+      # hot cache) and readers would see nil until the async write completes.
+      case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, [{key, disk_value, expire_at_ms}]) do
+        {:ok, [{offset, _record_size}]} ->
+          :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)})
+          WriteVersion.increment(idx)
+          async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
+          :ok
+
+        {:error, reason} ->
+          {:error, "ERR disk write failed: #{inspect(reason)}"}
+      end
+    else
+      # Small value: inline in ETS for instant reads, async Bitcask write.
+      :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
+      Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, key, disk_value, expire_at_ms)
+      WriteVersion.increment(idx)
+      async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
+      :ok
+    end
   end
 
   defp async_write(idx, {:delete, key}) do

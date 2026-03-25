@@ -2575,6 +2575,98 @@ defmodule FerricStore do
     {:ok, MapSet.to_list(result)}
   end
 
+  @doc """
+  Computes the set difference of the given keys and stores the result in `destination`.
+
+  Returns the number of elements in the resulting set.
+
+  ## Examples
+
+      {:ok, 2} = FerricStore.sdiffstore("dst", ["set1", "set2"])
+
+  """
+  @spec sdiffstore(key(), [key()]) :: {:ok, non_neg_integer()}
+  def sdiffstore(destination, keys) when is_list(keys) do
+    resolved_dst = sandbox_key(destination)
+    resolved_keys = Enum.map(keys, &sandbox_key/1)
+    store = build_compound_store(resolved_dst)
+    result = Ferricstore.Commands.Set.handle("SDIFFSTORE", [resolved_dst | resolved_keys], store)
+    wrap_result(result)
+  end
+
+  @doc """
+  Computes the set intersection of the given keys and stores the result in `destination`.
+
+  Returns the number of elements in the resulting set.
+
+  ## Examples
+
+      {:ok, 2} = FerricStore.sinterstore("dst", ["set1", "set2"])
+
+  """
+  @spec sinterstore(key(), [key()]) :: {:ok, non_neg_integer()}
+  def sinterstore(destination, keys) when is_list(keys) do
+    resolved_dst = sandbox_key(destination)
+    resolved_keys = Enum.map(keys, &sandbox_key/1)
+    store = build_compound_store(resolved_dst)
+    result = Ferricstore.Commands.Set.handle("SINTERSTORE", [resolved_dst | resolved_keys], store)
+    wrap_result(result)
+  end
+
+  @doc """
+  Computes the set union of the given keys and stores the result in `destination`.
+
+  Returns the number of elements in the resulting set.
+
+  ## Examples
+
+      {:ok, 4} = FerricStore.sunionstore("dst", ["set1", "set2"])
+
+  """
+  @spec sunionstore(key(), [key()]) :: {:ok, non_neg_integer()}
+  def sunionstore(destination, keys) when is_list(keys) do
+    resolved_dst = sandbox_key(destination)
+    resolved_keys = Enum.map(keys, &sandbox_key/1)
+    store = build_compound_store(resolved_dst)
+    result = Ferricstore.Commands.Set.handle("SUNIONSTORE", [resolved_dst | resolved_keys], store)
+    wrap_result(result)
+  end
+
+  @doc """
+  Returns the cardinality of the intersection of all given sets.
+
+  When `limit` is provided and > 0, stops counting after reaching the limit.
+
+  ## Options
+
+    * `:limit` - Maximum count to return (0 means no limit, default 0).
+
+  ## Examples
+
+      {:ok, 3} = FerricStore.sintercard(["set1", "set2"])
+      {:ok, 2} = FerricStore.sintercard(["set1", "set2"], limit: 2)
+
+  """
+  @spec sintercard([key()], keyword()) :: {:ok, non_neg_integer()}
+  def sintercard(keys, opts \\ []) when is_list(keys) do
+    resolved_keys = Enum.map(keys, &sandbox_key/1)
+    numkeys = Integer.to_string(length(resolved_keys))
+    limit = Keyword.get(opts, :limit, 0)
+
+    args =
+      [numkeys | resolved_keys] ++
+        if limit > 0, do: ["LIMIT", Integer.to_string(limit)], else: []
+
+    store =
+      case resolved_keys do
+        [first | _] -> build_compound_store(first)
+        [] -> build_compound_store("")
+      end
+
+    result = Ferricstore.Commands.Set.handle("SINTERCARD", args, store)
+    wrap_result(result)
+  end
+
   # Gathers all set members for a resolved key, routing to the correct shard.
   defp gather_set_members(resolved_key) do
     shard = Router.shard_name(Router.shard_for(resolved_key))

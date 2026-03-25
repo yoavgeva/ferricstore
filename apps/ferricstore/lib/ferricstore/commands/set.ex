@@ -1,7 +1,8 @@
 defmodule Ferricstore.Commands.Set do
   @moduledoc """
   Handles Redis set commands: SADD, SREM, SMEMBERS, SISMEMBER, SCARD,
-  SINTER, SUNION, SDIFF, SRANDMEMBER, SPOP, SMOVE, SSCAN.
+  SINTER, SUNION, SDIFF, SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD,
+  SRANDMEMBER, SPOP, SMOVE, SSCAN.
 
   Each set member is stored as a compound key:
 
@@ -340,8 +341,151 @@ defmodule Ferricstore.Commands.Set do
   end
 
   # ---------------------------------------------------------------------------
+  # SDIFFSTORE destination key [key ...]
+  # ---------------------------------------------------------------------------
+
+  def handle("SDIFFSTORE", [destination | [_ | _] = keys], store) do
+    with :ok <- check_all_types(keys, store) do
+      first_set = get_members_set(hd(keys), store)
+      rest_sets = Enum.map(tl(keys), fn key -> get_members_set(key, store) end)
+      result = Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))
+
+      store_set_at(destination, result, store)
+    end
+  end
+
+  def handle("SDIFFSTORE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'sdiffstore' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # SINTERSTORE destination key [key ...]
+  # ---------------------------------------------------------------------------
+
+  def handle("SINTERSTORE", [destination | [_ | _] = keys], store) do
+    with :ok <- check_all_types(keys, store) do
+      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
+
+      result =
+        case sets do
+          [first | rest] -> Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
+          [] -> MapSet.new()
+        end
+
+      store_set_at(destination, result, store)
+    end
+  end
+
+  def handle("SINTERSTORE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'sinterstore' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # SUNIONSTORE destination key [key ...]
+  # ---------------------------------------------------------------------------
+
+  def handle("SUNIONSTORE", [destination | [_ | _] = keys], store) do
+    with :ok <- check_all_types(keys, store) do
+      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
+      result = Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))
+
+      store_set_at(destination, result, store)
+    end
+  end
+
+  def handle("SUNIONSTORE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'sunionstore' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # SINTERCARD numkeys key [key ...] [LIMIT limit]
+  # ---------------------------------------------------------------------------
+
+  def handle("SINTERCARD", [numkeys_str | rest], store) when rest != [] do
+    with {:ok, numkeys} <- parse_numkeys(numkeys_str),
+         {:ok, keys, limit} <- parse_sintercard_args(rest, numkeys) do
+      with :ok <- check_all_types(keys, store) do
+        sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
+
+        intersection =
+          case sets do
+            [first | others] -> Enum.reduce(others, first, &MapSet.intersection(&2, &1))
+            [] -> MapSet.new()
+          end
+
+        count = MapSet.size(intersection)
+
+        if limit > 0 and count > limit do
+          limit
+        else
+          count
+        end
+      end
+    end
+  end
+
+  def handle("SINTERCARD", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'sintercard' command"}
+  end
+
+  # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  # Clears any existing set at `destination`, writes `members` as a new set,
+  # and returns the member count.
+  defp store_set_at(destination, members, store) do
+    # Clear existing destination data
+    prefix = CompoundKey.set_prefix(destination)
+    store.compound_delete_prefix.(destination, prefix)
+    TypeRegistry.delete_type(destination, store)
+
+    members_list = MapSet.to_list(members)
+
+    if members_list != [] do
+      TypeRegistry.check_or_set(destination, :set, store)
+
+      Enum.each(members_list, fn member ->
+        compound_key = CompoundKey.set_member(destination, member)
+        store.compound_put.(destination, compound_key, @presence_marker, 0)
+      end)
+    end
+
+    length(members_list)
+  end
+
+  defp parse_numkeys(str) do
+    case Integer.parse(str) do
+      {n, ""} when n > 0 -> {:ok, n}
+      _ -> {:error, "ERR numkeys can't be non-positive value"}
+    end
+  end
+
+  defp parse_sintercard_args(args, numkeys) do
+    {key_args, tail} = Enum.split(args, numkeys)
+
+    if length(key_args) < numkeys do
+      {:error, "ERR Number of keys can't be greater than number of args"}
+    else
+      case tail do
+        [] ->
+          {:ok, key_args, 0}
+
+        [opt, limit_str] when is_binary(opt) ->
+          if String.upcase(opt) == "LIMIT" do
+            case Integer.parse(limit_str) do
+              {limit, ""} when limit >= 0 -> {:ok, key_args, limit}
+              _ -> {:error, "ERR value is not an integer or out of range"}
+            end
+          else
+            {:error, "ERR syntax error"}
+          end
+
+        _ ->
+          {:error, "ERR syntax error"}
+      end
+    end
+  end
 
   defp get_members_set(key, store) do
     prefix = CompoundKey.set_prefix(key)
