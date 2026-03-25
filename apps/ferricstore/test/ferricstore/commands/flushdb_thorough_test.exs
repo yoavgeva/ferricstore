@@ -1,0 +1,176 @@
+defmodule Ferricstore.Commands.FlushdbThoroughTest do
+  @moduledoc """
+  Thorough tests for FLUSHDB/FLUSHALL verifying all storage layers are cleaned:
+  ETS keydirs, prefix index, compound keys (H:, T:, S:, Z:), and Bitcask.
+  """
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Store.Router
+
+  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
+
+  setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    :ok
+  end
+
+  defp ets_total_keys do
+    Enum.reduce(0..(@shard_count - 1), 0, fn i, acc ->
+      try do acc + :ets.info(:"keydir_#{i}", :size) rescue _ -> acc end
+    end)
+  end
+
+  defp prefix_index_total do
+    Enum.reduce(0..(@shard_count - 1), 0, fn i, acc ->
+      try do acc + :ets.info(:"prefix_keys_#{i}", :size) rescue _ -> acc end
+    end)
+  end
+
+  describe "FLUSHDB clears ETS completely" do
+    test "string keys removed from ETS" do
+      for i <- 1..100, do: Router.put("flush_str:#{i}", "val", 0)
+      assert ets_total_keys() >= 100
+
+      FerricStore.flushall()
+
+      assert ets_total_keys() == 0
+    end
+
+    test "prefix index cleared" do
+      for i <- 1..50, do: Router.put("myprefix:#{i}", "val", 0)
+      assert prefix_index_total() > 0
+
+      FerricStore.flushall()
+
+      assert prefix_index_total() == 0
+    end
+
+    test "hash compound keys (H: and T:) removed from ETS" do
+      FerricStore.hset("myhash", %{"f1" => "v1", "f2" => "v2", "f3" => "v3"})
+
+      # Verify compound keys exist
+      has_compound = Enum.any?(0..(@shard_count - 1), fn i ->
+        try do
+          :ets.foldl(fn {key, _, _, _, _, _, _}, acc ->
+            if String.starts_with?(key, "H:") or String.starts_with?(key, "T:"), do: acc + 1, else: acc
+          end, 0, :"keydir_#{i}") > 0
+        rescue
+          _ -> false
+        end
+      end)
+      assert has_compound
+
+      FerricStore.flushall()
+
+      assert ets_total_keys() == 0
+    end
+
+    test "set compound keys (S: and T:) removed from ETS" do
+      FerricStore.sadd("myset", ["a", "b", "c"])
+
+      FerricStore.flushall()
+
+      assert ets_total_keys() == 0
+    end
+
+    test "sorted set compound keys (Z: and T:) removed from ETS" do
+      FerricStore.zadd("myzset", [{1.0, "a"}, {2.0, "b"}])
+
+      FerricStore.flushall()
+
+      assert ets_total_keys() == 0
+    end
+
+    test "list keys removed from ETS" do
+      FerricStore.lpush("mylist", ["a", "b", "c"])
+
+      FerricStore.flushall()
+
+      assert ets_total_keys() == 0
+    end
+
+    test "mixed types all removed" do
+      Router.put("str_key", "val", 0)
+      FerricStore.hset("hash_key", %{"f" => "v"})
+      FerricStore.sadd("set_key", ["m"])
+      FerricStore.zadd("zset_key", [{1.0, "m"}])
+      FerricStore.lpush("list_key", ["a"])
+
+      assert ets_total_keys() > 5
+
+      FerricStore.flushall()
+
+      assert ets_total_keys() == 0
+    end
+  end
+
+  describe "FLUSHDB keys don't resurrect" do
+    test "GET after flush returns nil" do
+      Router.put("resurrect:k1", "val", 0)
+      Router.put("resurrect:k2", "val", 0)
+
+      FerricStore.flushall()
+
+      assert Router.get("resurrect:k1") == nil
+      assert Router.get("resurrect:k2") == nil
+    end
+
+    test "HGET after flush returns nil" do
+      FerricStore.hset("resurrect:hash", %{"f1" => "v1"})
+
+      FerricStore.flushall()
+
+      assert {:ok, nil} = FerricStore.hget("resurrect:hash", "f1")
+    end
+
+    test "DBSIZE after flush is 0" do
+      for i <- 1..50, do: Router.put("dbsize:#{i}", "v", 0)
+
+      FerricStore.flushall()
+
+      assert Router.dbsize() == 0
+    end
+
+    test "KEYS after flush returns empty" do
+      for i <- 1..20, do: Router.put("keys_test:#{i}", "v", 0)
+
+      FerricStore.flushall()
+
+      assert Router.keys() == []
+    end
+  end
+
+  describe "FLUSHDB via TCP" do
+    test "FLUSHDB over TCP clears all keys" do
+      port = FerricstoreServer.Listener.port()
+
+      for i <- 1..50, do: Router.put("tcp_flush:#{i}", "val", 0)
+      FerricStore.hset("tcp_flush:hash", %{"f" => "v"})
+
+      assert ets_total_keys() > 50
+
+      {:ok, sock} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+      :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+      {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
+
+      :gen_tcp.send(sock, "*1\r\n$7\r\nFLUSHDB\r\n")
+      {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
+
+      :gen_tcp.close(sock)
+
+      assert ets_total_keys() == 0
+      assert Router.dbsize() == 0
+    end
+  end
+
+  describe "double flush is idempotent" do
+    test "flush twice doesn't crash" do
+      Router.put("double:k", "v", 0)
+
+      FerricStore.flushall()
+      FerricStore.flushall()
+
+      assert ets_total_keys() == 0
+    end
+  end
+end
