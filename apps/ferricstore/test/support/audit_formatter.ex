@@ -19,24 +19,23 @@ defmodule Ferricstore.Test.AuditFormatter do
 
   @impl true
   def init(_opts) do
-    # Only clear log on first app's suite start (core app).
-    # Subsequent apps (server, ecto) append to the same file.
-    if not File.exists?(@log_path) or first_app?() do
+    # Clear log if it's from a previous run (>10s old) or doesn't exist.
+    # Within the same umbrella run, apps start within seconds of each other.
+    stale? = case File.stat(@log_path) do
+      {:ok, %{mtime: mtime}} ->
+        now = :calendar.local_time() |> :calendar.datetime_to_gregorian_seconds()
+        file_time = :calendar.datetime_to_gregorian_seconds(mtime)
+        now - file_time > 10
+      _ -> true
+    end
+
+    if stale? do
       File.write!(@log_path, "=== Suite started #{timestamp()} ===\n")
     else
       File.write!(@log_path, "\n=== App started #{timestamp()} ===\n", [:append])
     end
-    {:ok, %{}}
-  end
 
-  defp first_app? do
-    case System.get_env("FERRICSTORE_AUDIT_STARTED") do
-      nil ->
-        System.put_env("FERRICSTORE_AUDIT_STARTED", "1")
-        true
-      _ ->
-        false
-    end
+    {:ok, %{}}
   end
 
   @impl true
@@ -51,17 +50,28 @@ defmodule Ferricstore.Test.AuditFormatter do
     proc_count = length(Process.list())
     {bitcask_files, bitcask_bytes} = bitcask_snapshot(shard_count)
 
+    # Sample up to 5 key prefixes to trace ownership
+    key_prefixes = if ets_count > 0, do: sample_key_prefixes(shard_count, 5), else: ""
+
+    # Try to get the test's sandbox namespace from the test process
+    # (only works if the test uses FerricStore.Sandbox.Case)
+    sandbox_ns = case test.tags[:namespace] do
+      ns when is_binary(ns) -> ns
+      _ -> "-"
+    end
+
     leak_parts =
       []
       |> maybe_append(writer_pending > 0, "writer_pending=#{writer_pending}")
       |> maybe_append(batcher_pending > 0, "batcher_pending=#{batcher_pending}")
+      |> maybe_append(key_prefixes != "", "keys=[#{key_prefixes}]")
 
-    leak_tag = if leak_parts == [], do: "", else: " QUEUED: [#{Enum.join(leak_parts, ", ")}]"
+    leak_tag = if leak_parts == [], do: "", else: " #{Enum.join(leak_parts, " ")}"
 
     module = inspect(test.module)
     line =
       "[#{timestamp()}] #{status} (#{duration_ms}ms) #{module} > #{test.name} | " <>
-        "ets=#{ets_count} prefix=#{prefix_count} pt=#{pt_count} procs=#{proc_count} " <>
+        "ns=#{sandbox_ns} ets=#{ets_count} prefix=#{prefix_count} pt=#{pt_count} procs=#{proc_count} " <>
         "disk_files=#{bitcask_files} disk_bytes=#{bitcask_bytes}#{leak_tag}\n"
 
     File.write!(@log_path, line, [:append])
@@ -143,6 +153,36 @@ defmodule Ferricstore.Test.AuditFormatter do
     else
       {0, 0}
     end
+  end
+
+  # Sample key prefixes from ETS to identify which test/namespace owns the keys.
+  # Extracts the part before the first ":" from up to `max` keys, deduplicates,
+  # and returns a comma-separated string like "test_abc,session,H:test_abc".
+  defp sample_key_prefixes(shard_count, max) do
+    keys =
+      Enum.reduce(0..(shard_count - 1), [], fn i, acc ->
+        try do
+          :ets.foldl(fn {k, _, _, _, _, _, _}, a when is_binary(k) ->
+            if length(a) < max * 3, do: [k | a], else: throw(:enough)
+          _, a -> a
+          end, acc, :"keydir_#{i}")
+        catch
+          :throw, :enough -> acc
+        rescue
+          _ -> acc
+        end
+      end)
+
+    keys
+    |> Enum.map(fn k ->
+      case String.split(k, ":", parts: 2) do
+        [prefix, _] -> prefix
+        [single] -> single
+      end
+    end)
+    |> Enum.uniq()
+    |> Enum.take(max)
+    |> Enum.join(",")
   end
 
   defp message_queue_len(name) do
