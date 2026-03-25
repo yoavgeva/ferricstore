@@ -94,13 +94,13 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
       end
     end
 
-    test "shard_for with custom shard count distributes correctly" do
-      shard_assignments =
-        Enum.group_by(0..999, fn i -> Router.shard_for("key_#{i}", 8) end)
+    test "slot_for distributes keys across many slots" do
+      slot_assignments =
+        Enum.group_by(0..999, fn i -> Router.slot_for("key_#{i}") end)
 
-      assert map_size(shard_assignments) == 8,
-             "Expected 1000 keys to cover all 8 shards, " <>
-               "but only covered #{map_size(shard_assignments)}"
+      assert map_size(slot_assignments) > 100,
+             "Expected 1000 keys to cover many slots, " <>
+               "but only covered #{map_size(slot_assignments)}"
     end
   end
 

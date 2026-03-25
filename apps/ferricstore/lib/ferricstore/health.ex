@@ -34,7 +34,6 @@ defmodule Ferricstore.Health do
   alias Ferricstore.Store.Router
 
   @ready_key {__MODULE__, :ready}
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
 
   # ---------------------------------------------------------------------------
   # Types
@@ -123,11 +122,12 @@ defmodule Ferricstore.Health do
   """
   @spec check() :: health_result()
   def check do
-    shards = collect_shard_info()
+    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+    shards = collect_shard_info(shard_count)
 
     %{
       status: if(ready?(), do: :ok, else: :starting),
-      shard_count: @shard_count,
+      shard_count: shard_count,
       shards: shards,
       uptime_seconds: Stats.uptime_seconds()
     }
@@ -137,9 +137,9 @@ defmodule Ferricstore.Health do
   # Private
   # ---------------------------------------------------------------------------
 
-  @spec collect_shard_info() :: [shard_info()]
-  defp collect_shard_info do
-    Enum.map(0..(@shard_count - 1), fn index ->
+  @spec collect_shard_info(non_neg_integer()) :: [shard_info()]
+  defp collect_shard_info(shard_count) do
+    Enum.map(0..(shard_count - 1), fn index ->
       ets = :"keydir_#{index}"
       name = Router.shard_name(index)
 

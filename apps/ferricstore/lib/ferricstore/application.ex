@@ -88,10 +88,10 @@ defmodule Ferricstore.Application do
     # when CONFIG SET notify-keyspace-events is called.
     :persistent_term.put(:ferricstore_keyspace_events, "")
 
-    # Cache shard_count and promotion_threshold in persistent_term.
-    # These values are read on warm paths (INFO sections, maybe_promote)
-    # and never change at runtime.
-    :persistent_term.put(:ferricstore_shard_count, shard_count)
+    # Initialize the slot map BEFORE any shard starts. This builds
+    # a uniform 1024-slot -> shard mapping and stores it in persistent_term.
+    # Also sets :ferricstore_shard_count.
+    Ferricstore.Store.SlotMap.init(shard_count)
     :persistent_term.put(:ferricstore_promotion_threshold,
       Application.get_env(:ferricstore, :promotion_threshold, 100))
     :persistent_term.put(:ferricstore_read_sample_rate,

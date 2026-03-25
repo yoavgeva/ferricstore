@@ -77,6 +77,8 @@ defmodule Ferricstore.Commands.Dispatcher do
         {"RATELIMIT.ADD", :ratelimit},
         {"CLUSTER.HEALTH", :cluster},
         {"CLUSTER.STATS", :cluster},
+        {"CLUSTER.KEYSLOT", :cluster},
+        {"CLUSTER.SLOTS", :cluster},
         {"FERRICSTORE.HOTNESS", :cluster},
         {"FERRICSTORE.CONFIG", :ferricstore_config},
         {"FERRICSTORE.METRICS", :ferricstore_metrics},

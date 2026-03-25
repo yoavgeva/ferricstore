@@ -40,7 +40,8 @@ defmodule FerricstoreServer.Health.Dashboard do
   alias Ferricstore.{Health, MemoryGuard, NamespaceConfig, SlowLog, Stats}
   alias Ferricstore.Merge.Scheduler, as: MergeScheduler
 
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
+  @doc false
+  defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
 
   # ---------------------------------------------------------------------------
   # Types
@@ -263,7 +264,7 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @spec collect_shards() :: [shard_data()]
   defp collect_shards do
-    Enum.map(0..(@shard_count - 1), fn index ->
+    Enum.map(0..(shard_count() - 1), fn index ->
       keydir = :"keydir_#{index}"
 
       {status, keys, ets_mem} =
@@ -364,7 +365,7 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @spec collect_merge() :: [merge_status()]
   defp collect_merge do
-    Enum.map(0..(@shard_count - 1), fn index ->
+    Enum.map(0..(shard_count() - 1), fn index ->
       try do
         status = MergeScheduler.status(index)
 

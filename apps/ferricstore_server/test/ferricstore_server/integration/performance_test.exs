@@ -518,7 +518,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       # Count how many keys map to each shard
       shard_counts =
         keys
-        |> Enum.group_by(fn key -> Router.shard_for(key, @shard_count) end)
+        |> Enum.group_by(fn key -> Router.shard_for(key) end)
         |> Enum.map(fn {shard, shard_keys} -> {shard, length(shard_keys)} end)
         |> Map.new()
 

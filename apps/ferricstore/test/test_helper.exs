@@ -20,7 +20,10 @@
 #   Run with `mix test --include legacy_hot_cache`.
 # :bench — long-running throughput benchmarks (30s+ per test). Excluded by default.
 #   Run with `mix test test/ferricstore/cluster/throughput_bench_test.exs --include bench`.
-ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen, :legacy_hot_cache, :bench])
+ExUnit.start(
+  exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen, :legacy_hot_cache, :bench],
+  formatters: [ExUnit.CLIFormatter, Ferricstore.Test.AuditFormatter]
+)
 
 # NOTE: data directory cleanup is handled by the ferricstore_server app's
 # test_helper.exs which runs last in the umbrella. We must NOT delete the

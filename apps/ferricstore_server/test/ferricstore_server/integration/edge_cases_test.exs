@@ -20,11 +20,9 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   # max value length enforced by the Rust NIF guard (512 MiB)
   @max_value_bytes 512 * 1024 * 1024
 
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
-
   setup_all do
     # Give any previously-killed shards time to restart before this module runs.
-    shard_count = @shard_count
+    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
 
     Enum.each(0..(shard_count - 1), fn i ->
       name = Router.shard_name(i)

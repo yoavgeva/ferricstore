@@ -16,16 +16,11 @@ defmodule Ferricstore.Store.Router do
   """
 
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{LFU, PrefixIndex, WriteVersion}
+  alias Ferricstore.Store.{LFU, PrefixIndex, SlotMap, WriteVersion}
 
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
+  import Bitwise, only: [band: 2]
 
-  # Pre-computed shard name atoms. `elem/2` is ~5ns vs ~300ns for string
-  # interpolation + atom conversion. Since there are only @shard_count
-  # possible values, we compute them once at compile time.
-  @shard_names List.to_tuple(
-    for i <- 0..(@shard_count - 1), do: :"Ferricstore.Store.Shard.#{i}"
-  )
+  @slot_mask 1023
 
   # ---------------------------------------------------------------------------
   # Write-path dispatch: quorum writes bypass Shard, async writes use Shard
@@ -404,33 +399,29 @@ defmodule Ferricstore.Store.Router do
   # -------------------------------------------------------------------
 
   @doc """
+  Returns the slot (0-1023) for a key, respecting hash tags.
+  """
+  @spec slot_for(binary()) :: non_neg_integer()
+  def slot_for(key) do
+    hash_input = extract_hash_tag(key) || key
+    :erlang.phash2(hash_input) |> band(@slot_mask)
+  end
+
+  @doc """
   Returns the shard index (0-based) that owns `key`.
 
-  Uses `:erlang.phash2/2` for fast, deterministic distribution. Supports
-  Redis hash tags: if the key contains `{tag}` (non-empty content between
-  the first `{` and the next `}`), the tag is used for hashing instead of
-  the full key.
+  Routes through the 1,024-slot indirection layer:
+  `key -> phash2(key) & 0x3FF -> slot -> slot_map[slot] -> shard_index`
 
-  ## Parameters
-
-    * `key` -- binary key to route
-    * `shard_count` -- total number of shards (defaults to compile-time
-      `:ferricstore, :shard_count` or 4)
-
-  ## Examples
-
-      iex> Ferricstore.Store.Router.shard_for("user:42", 4) in 0..3
-      true
-
-      iex> Ferricstore.Store.Router.shard_for("{user:42}:session", 4) ==
-      ...>   Ferricstore.Store.Router.shard_for("{user:42}:profile", 4)
-      true
-
+  Supports Redis hash tags: if the key contains `{tag}` (non-empty content
+  between the first `{` and the next `}`), the tag is used for hashing
+  instead of the full key.
   """
-  @spec shard_for(binary(), pos_integer()) :: non_neg_integer()
-  def shard_for(key, shard_count \\ @shard_count) do
-    hash_input = extract_hash_tag(key) || key
-    :erlang.phash2(hash_input, shard_count)
+  @spec shard_for(binary()) :: non_neg_integer()
+  def shard_for(key) do
+    slot = slot_for(key)
+    slot_map = :persistent_term.get(:ferricstore_slot_map)
+    elem(slot_map, slot)
   end
 
   @doc """
@@ -475,21 +466,8 @@ defmodule Ferricstore.Store.Router do
 
   @doc """
   Returns the registered process name for the shard at `index`.
-
-  Uses a pre-computed tuple for O(1) lookup (~5ns) instead of string
-  interpolation + atom conversion (~300ns).
-
-  ## Examples
-
-      iex> Ferricstore.Store.Router.shard_name(0)
-      :"Ferricstore.Store.Shard.0"
-
   """
   @spec shard_name(non_neg_integer()) :: atom()
-  def shard_name(index) when index >= 0 and index < @shard_count,
-    do: elem(@shard_names, index)
-
-  # Fallback for out-of-range indices (e.g. tests with custom shard counts)
   def shard_name(index), do: :"Ferricstore.Store.Shard.#{index}"
 
   # -------------------------------------------------------------------
@@ -839,7 +817,8 @@ defmodule Ferricstore.Store.Router do
   @doc "Returns all live (non-expired, non-deleted) keys across every shard."
   @spec keys() :: [binary()]
   def keys do
-    Enum.flat_map(0..(@shard_count - 1), fn i ->
+    shard_count = :persistent_term.get(:ferricstore_shard_count)
+    Enum.flat_map(0..(shard_count - 1), fn i ->
       GenServer.call(shard_name(i), :keys)
     end)
   end
@@ -853,7 +832,8 @@ defmodule Ferricstore.Store.Router do
   """
   @spec keys_with_prefix(binary()) :: [binary()]
   def keys_with_prefix(prefix) when is_binary(prefix) do
-    Enum.flat_map(0..(@shard_count - 1), fn i ->
+    shard_count = :persistent_term.get(:ferricstore_shard_count)
+    Enum.flat_map(0..(shard_count - 1), fn i ->
       GenServer.call(shard_name(i), {:keys_with_prefix, prefix})
     end)
   end
@@ -861,7 +841,8 @@ defmodule Ferricstore.Store.Router do
   @doc "Returns the count of all live keys across every shard."
   @spec dbsize() :: non_neg_integer()
   def dbsize do
-    Enum.reduce(0..(@shard_count - 1), 0, fn i, acc ->
+    shard_count = :persistent_term.get(:ferricstore_shard_count)
+    Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
       try do
         acc + :ets.info(:"keydir_#{i}", :size)
       rescue

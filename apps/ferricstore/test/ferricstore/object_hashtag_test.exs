@@ -220,34 +220,32 @@ defmodule Ferricstore.ObjectHashtagTest do
       assert Router.shard_for("{a}:x") == Router.shard_for("{a}:y")
     end
 
-    test "{a}:x and {b}:x likely go to different shards" do
-      # With 4 shards there's a 25% chance they collide, use more shards
-      shard_a = Router.shard_for("{a}:x", 1024)
-      shard_b = Router.shard_for("{b}:x", 1024)
-      # Extremely unlikely to collide with 1024 shards
-      assert shard_a != shard_b
+    test "{a}:x and {b}:x likely go to different slots" do
+      slot_a = Router.slot_for("{a}:x")
+      slot_b = Router.slot_for("{b}:x")
+      # Extremely unlikely to collide with 1024 slots
+      assert slot_a != slot_b
     end
 
     test "no tag key hashes on full key" do
-      # shard_for("plain") should equal phash2("plain", shard_count)
-      shard_count = 4
-      expected = :erlang.phash2("plain", shard_count)
-      assert Router.shard_for("plain", shard_count) == expected
+      import Bitwise
+      expected_slot = :erlang.phash2("plain") |> band(0x3FF)
+      assert Router.slot_for("plain") == expected_slot
     end
 
     test "empty tag {} hashes on full key" do
-      shard_count = 4
+      import Bitwise
       key = "{}empty"
-      expected = :erlang.phash2(key, shard_count)
-      assert Router.shard_for(key, shard_count) == expected
+      expected_slot = :erlang.phash2(key) |> band(0x3FF)
+      assert Router.slot_for(key) == expected_slot
     end
 
-    test "hash tag with shard_for matches extract_hash_tag" do
+    test "hash tag with slot_for matches extract_hash_tag" do
+      import Bitwise
       key = "{user:42}:data"
       tag = Router.extract_hash_tag(key)
-      shard_count = 4
-      # shard_for should hash on the tag, same as hashing the tag directly
-      assert Router.shard_for(key, shard_count) == :erlang.phash2(tag, shard_count)
+      # slot_for should hash on the tag, same as hashing the tag directly
+      assert Router.slot_for(key) == (:erlang.phash2(tag) |> band(0x3FF))
     end
   end
 end

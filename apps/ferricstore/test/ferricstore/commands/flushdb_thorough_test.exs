@@ -7,21 +7,21 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
   alias Ferricstore.Store.Router
 
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
-
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
     :ok
   end
 
+  defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
+
   defp ets_total_keys do
-    Enum.reduce(0..(@shard_count - 1), 0, fn i, acc ->
+    Enum.reduce(0..(shard_count() - 1), 0, fn i, acc ->
       try do acc + :ets.info(:"keydir_#{i}", :size) rescue _ -> acc end
     end)
   end
 
   defp prefix_index_total do
-    Enum.reduce(0..(@shard_count - 1), 0, fn i, acc ->
+    Enum.reduce(0..(shard_count() - 1), 0, fn i, acc ->
       try do acc + :ets.info(:"prefix_keys_#{i}", :size) rescue _ -> acc end
     end)
   end
@@ -49,7 +49,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
       FerricStore.hset("myhash", %{"f1" => "v1", "f2" => "v2", "f3" => "v3"})
 
       # Verify compound keys exist
-      has_compound = Enum.any?(0..(@shard_count - 1), fn i ->
+      has_compound = Enum.any?(0..(shard_count() - 1), fn i ->
         try do
           :ets.foldl(fn {key, _, _, _, _, _, _}, acc ->
             if String.starts_with?(key, "H:") or String.starts_with?(key, "T:"), do: acc + 1, else: acc

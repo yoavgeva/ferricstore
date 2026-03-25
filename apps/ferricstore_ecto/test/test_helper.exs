@@ -26,4 +26,6 @@ for i <- 0..(shard_count - 1) do
   try do :ets.delete_all_objects(:"prefix_keys_#{i}") catch :error, :badarg -> :ok end
 end
 
-ExUnit.start()
+ExUnit.start(
+  formatters: [ExUnit.CLIFormatter, Ferricstore.Test.AuditFormatter]
+)

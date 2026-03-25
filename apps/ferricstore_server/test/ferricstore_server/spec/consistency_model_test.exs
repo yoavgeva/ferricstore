@@ -53,8 +53,6 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
     sock
   end
 
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
-
   # Hash tag ensures all generated keys co-locate on the same shard.
   defp ukey(name), do: "{spec5}:#{name}_#{:rand.uniform(999_999)}"
 
@@ -62,12 +60,12 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
   # Returns two keys guaranteed to hash to the same shard index.
   defp same_shard_keys(prefix1, prefix2) do
     base_key1 = ukey(prefix1)
-    target_shard = Router.shard_for(base_key1, @shard_count)
+    target_shard = Router.shard_for(base_key1)
 
     base_key2 =
       Enum.find(0..10_000, fn i ->
         candidate = ukey("#{prefix2}_#{i}")
-        Router.shard_for(candidate, @shard_count) == target_shard
+        Router.shard_for(candidate) == target_shard
       end)
 
     {base_key1, ukey("#{prefix2}_#{base_key2}")}
@@ -463,13 +461,13 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
       assert v1_after > v1_before
 
       # Another write to the same shard (even a different key) bumps version
-      target_shard = Router.shard_for(k1, @shard_count)
+      target_shard = Router.shard_for(k1)
 
       # Find a key that hashes to the same shard
       same_shard_idx =
         Enum.find(0..10_000, fn i ->
           candidate = "ver_check_#{i}"
-          Router.shard_for(candidate, @shard_count) == target_shard
+          Router.shard_for(candidate) == target_shard
         end)
 
       same_shard_key = "ver_check_#{same_shard_idx}"

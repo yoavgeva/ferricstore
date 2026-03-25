@@ -32,7 +32,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
   import Ferricstore.Test.ShardHelpers
 
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
+  defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
 
   setup do
     flush_all_keys()
@@ -1479,7 +1479,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
   # Counts hot_cache entries across all shards whose key starts with the given prefix.
   defp count_hot_cache_entries(prefix) do
-    Enum.reduce(0..(@shard_count - 1), 0, fn i, acc ->
+    Enum.reduce(0..(shard_count() - 1), 0, fn i, acc ->
       hot_cache = :"hot_cache_#{i}"
 
       try do
@@ -1523,7 +1523,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
   # Counts all hot_cache entries across all shards.
   defp count_all_hot_cache_entries do
-    Enum.reduce(0..(@shard_count - 1), 0, fn i, acc ->
+    Enum.reduce(0..(shard_count() - 1), 0, fn i, acc ->
       try do
         acc + :ets.info(:"hot_cache_#{i}", :size)
       rescue
@@ -1534,7 +1534,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
   # Returns the total ETS memory (in bytes) of all hot_cache tables.
   defp total_hot_cache_memory do
-    Enum.reduce(0..(@shard_count - 1), 0, fn i, acc ->
+    Enum.reduce(0..(shard_count() - 1), 0, fn i, acc ->
       try do
         words = :ets.info(:"hot_cache_#{i}", :memory)
         if is_integer(words), do: acc + words * :erlang.system_info(:wordsize), else: acc

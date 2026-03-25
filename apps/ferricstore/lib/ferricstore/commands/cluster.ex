@@ -12,9 +12,7 @@ defmodule Ferricstore.Commands.Cluster do
     * `CLUSTER.STATS` -- returns per-shard key/memory stats plus totals
   """
 
-  alias Ferricstore.Store.Router
-
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
+  alias Ferricstore.Store.{Router, SlotMap}
 
   @doc """
   Handles a cluster command.
@@ -82,6 +80,27 @@ defmodule Ferricstore.Commands.Cluster do
     {:error, "ERR wrong number of arguments for 'cluster.stats' command"}
   end
 
+  def handle("CLUSTER.KEYSLOT", [key], _store) do
+    Router.slot_for(key)
+  end
+
+  def handle("CLUSTER.KEYSLOT", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.keyslot' command"}
+  end
+
+  def handle("CLUSTER.SLOTS", [], _store) do
+    slot_map = SlotMap.get()
+    ranges = SlotMap.slot_ranges(slot_map)
+
+    Enum.map(ranges, fn {start_slot, end_slot, shard_index} ->
+      [start_slot, end_slot, shard_index]
+    end)
+  end
+
+  def handle("CLUSTER.SLOTS", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.slots' command"}
+  end
+
   # FERRICSTORE.HOTNESS — returns per-prefix hot/cold read statistics.
   # Accepts optional TOP n and WINDOW seconds arguments.
   # Response is a flat list of key-value string pairs:
@@ -146,7 +165,8 @@ defmodule Ferricstore.Commands.Cluster do
   # -------------------------------------------------------------------
 
   defp collect_shard_info do
-    Enum.map(0..(@shard_count - 1), fn index ->
+    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+    Enum.map(0..(shard_count - 1), fn index ->
       keydir = :"keydir_#{index}"
       name = Router.shard_name(index)
 

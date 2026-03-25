@@ -12,7 +12,7 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
 
   alias Ferricstore.Merge.{Scheduler, Semaphore}
 
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
+  defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
 
   # -------------------------------------------------------------------
   # 1. MergeSupervisor is alive after app start
@@ -51,7 +51,7 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
 
   describe "per-shard Scheduler processes" do
     test "one Scheduler process exists for each shard" do
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         name = Scheduler.scheduler_name(i)
         pid = Process.whereis(name)
 
@@ -66,10 +66,10 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
     test "MergeSupervisor has exactly shard_count + 1 children (Semaphore + N Schedulers)" do
       children = Supervisor.which_children(Ferricstore.Merge.Supervisor)
 
-      expected_count = @shard_count + 1
+      expected_count = shard_count() + 1
 
       assert length(children) == expected_count,
-             "Expected #{expected_count} children (1 Semaphore + #{@shard_count} Schedulers), " <>
+             "Expected #{expected_count} children (1 Semaphore + #{shard_count()} Schedulers), " <>
                "got #{length(children)}: #{inspect(Enum.map(children, fn {id, _, _, _} -> id end))}"
     end
 
@@ -90,7 +90,7 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
 
   describe "Scheduler status queries" do
     test "each Scheduler responds to status with correct shard_index" do
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         status = Scheduler.status(i)
 
         assert is_map(status), "Expected status to be a map for shard #{i}"
@@ -116,7 +116,7 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
 
   describe "trigger_check resilience" do
     test "trigger_check on each shard returns :ok without crashing" do
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         assert :ok = Scheduler.trigger_check(i),
                "Expected trigger_check to return :ok for shard #{i}"
 
@@ -129,7 +129,7 @@ defmodule Ferricstore.Merge.SupervisorIntegrationTest do
     end
 
     test "trigger_check does not leave Semaphore in held state when fragmentation is low" do
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         :ok = Scheduler.trigger_check(i)
       end
 

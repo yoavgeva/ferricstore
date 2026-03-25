@@ -55,6 +55,7 @@ defmodule Ferricstore.MixProject do
       {:libcluster, "~> 3.3"},
       {:telemetry, "~> 1.4"},
       {:jason, "~> 1.4"},
+      {:plug, "~> 1.16", optional: true},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:arch_test, "~> 0.1.2", only: [:dev, :test], runtime: false}
     ]

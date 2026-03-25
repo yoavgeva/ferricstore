@@ -17,7 +17,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
+  defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
 
   setup_all do
     ShardHelpers.wait_shards_alive()
@@ -86,7 +86,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       fields = parse_info(result)
 
       # Each shard should have a role field
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         role_key = "shard_#{i}_role"
         assert Map.has_key?(fields, role_key),
                "missing #{role_key} in INFO raft, got: #{inspect(Map.keys(fields))}"
@@ -108,7 +108,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       store = build_real_store()
       fields = parse_info(Server.handle("INFO", ["raft"], store))
 
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         assert Map.has_key?(fields, "shard_#{i}_commit_index"),
                "missing shard_#{i}_commit_index"
 
@@ -121,7 +121,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       store = build_real_store()
       fields = parse_info(Server.handle("INFO", ["raft"], store))
 
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         assert Map.has_key?(fields, "shard_#{i}_leader_node"),
                "missing shard_#{i}_leader_node"
 
@@ -151,7 +151,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
 
       fields = parse_info(result)
 
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         key = "shard_#{i}_data_file_count"
         assert Map.has_key?(fields, key),
                "missing #{key} in INFO bitcask, got: #{inspect(Map.keys(fields))}"
@@ -165,7 +165,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       store = build_real_store()
       fields = parse_info(Server.handle("INFO", ["bitcask"], store))
 
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         key = "shard_#{i}_total_size_bytes"
         assert Map.has_key?(fields, key), "missing #{key}"
 
@@ -178,7 +178,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       store = build_real_store()
       fields = parse_info(Server.handle("INFO", ["bitcask"], store))
 
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         key = "shard_#{i}_merge_candidates"
         assert Map.has_key?(fields, key), "missing #{key}"
 
@@ -191,7 +191,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       store = build_real_store()
       fields = parse_info(Server.handle("INFO", ["bitcask"], store))
 
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         key = "shard_#{i}_hint_file_count"
         assert Map.has_key?(fields, key), "missing #{key}"
 
@@ -212,7 +212,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       # At least one shard should have >= 1 data file
       total_files =
         Enum.sum(
-          for i <- 0..(@shard_count - 1) do
+          for i <- 0..(shard_count() - 1) do
             {count, ""} = Integer.parse(Map.fetch!(fields, "shard_#{i}_data_file_count"))
             count
           end

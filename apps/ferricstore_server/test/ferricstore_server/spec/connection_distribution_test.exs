@@ -18,7 +18,7 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.MockStore
 
-  @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
+  defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
 
   defp ukey(base), do: "conn_dist_#{base}_#{:rand.uniform(999_999)}"
 
@@ -36,7 +36,7 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
       lines = String.split(result, "\r\n")
 
       # Should have entries for each shard
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         assert Enum.any?(lines, &String.contains?(&1, "shard_#{i}:")),
                "Missing shard_#{i} in CLUSTER.HEALTH output"
       end
@@ -137,7 +137,7 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
       lines = String.split(result, "\r\n")
 
       # Per-shard entries
-      for i <- 0..(@shard_count - 1) do
+      for i <- 0..(shard_count() - 1) do
         assert Enum.any?(lines, &String.contains?(&1, "shard_#{i}:")),
                "Missing shard_#{i} in CLUSTER.STATS output"
       end
