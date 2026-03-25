@@ -18,7 +18,10 @@ defmodule Ferricstore.Store.PrefixInterningTest do
 
   setup do
     ShardHelpers.flush_all_keys()
-    on_exit(fn -> ShardHelpers.wait_shards_alive() end)
+    on_exit(fn ->
+      ShardHelpers.flush_all_keys()
+      ShardHelpers.wait_shards_alive()
+    end)
   end
 
   # Builds a store map backed by the real Router (application-supervised shards).

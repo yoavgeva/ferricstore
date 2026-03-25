@@ -79,6 +79,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
   setup do
     flush_all_keys()
+    on_exit(fn -> flush_all_keys() end)
     :ok
   end
 

@@ -30,7 +30,11 @@ defmodule Ferricstore.Raft.AsyncWalTest do
   end
 
   setup do
-    on_exit(fn -> ShardHelpers.wait_shards_alive() end)
+    ShardHelpers.flush_all_keys()
+    on_exit(fn ->
+      ShardHelpers.flush_all_keys()
+      ShardHelpers.wait_shards_alive()
+    end)
   end
 
   defp ukey(base), do: "async_wal_#{base}_#{:rand.uniform(9_999_999)}"

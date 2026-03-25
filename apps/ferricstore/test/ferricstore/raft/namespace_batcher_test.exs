@@ -25,10 +25,11 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
   end
 
   setup do
-    # Reset namespace config between tests to avoid cross-contamination
+    ShardHelpers.flush_all_keys()
     NamespaceConfig.reset_all()
 
     on_exit(fn ->
+      ShardHelpers.flush_all_keys()
       NamespaceConfig.reset_all()
       ShardHelpers.wait_shards_alive()
     end)

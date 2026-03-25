@@ -34,7 +34,10 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
   # and ensure shards are alive after tests that kill them.
   setup do
     ShardHelpers.flush_all_keys()
-    on_exit(fn -> ShardHelpers.wait_shards_alive() end)
+    on_exit(fn ->
+      ShardHelpers.flush_all_keys()
+      ShardHelpers.wait_shards_alive()
+    end)
   end
 
   # -------------------------------------------------------------------
