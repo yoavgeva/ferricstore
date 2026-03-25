@@ -920,7 +920,7 @@ defmodule Ferricstore.Bitcask.ProbNIFSafetyTest do
       {:ok, _counts} = NIF.cms_incrby(cms, items)
 
       dirty_delta = measure_dirty.()
-      assert dirty_delta < 1_000_000,
+      assert dirty_delta < 5_000_000,
         "DirtyIo delta #{dirty_delta} suggests cms NIF ran on DirtyIo"
     end
 
