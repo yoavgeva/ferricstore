@@ -54,7 +54,10 @@ defmodule Ferricstore.KeyspaceNotifications do
   """
   @spec notify(binary(), binary(), binary() | nil) :: :ok
   def notify(key, event, flags \\ nil) do
-    config_flags = flags || Ferricstore.Config.get_value("notify-keyspace-events") || ""
+    # Read from persistent_term (~5ns) instead of ETS Config.get_value (~100-300ns).
+    # The persistent_term is updated by Config.apply_side_effect when
+    # CONFIG SET notify-keyspace-events is called.
+    config_flags = flags || :persistent_term.get(:ferricstore_keyspace_events, "")
 
     if config_flags != "" and should_notify?(event, config_flags) do
       if String.contains?(config_flags, "K") do

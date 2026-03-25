@@ -320,7 +320,11 @@ impl AsyncUringBackend {
                 // Push the fsync SQE. No IO_LINK flag — it is the terminal
                 // SQE in the chain. Its `user_data` is the `op_id` so the
                 // completion thread can look up the PendingOp.
-                let fsync_sqe = opcode::Fsync::new(fd).build().user_data(op_id);
+                // C-7 fix: use fdatasync instead of fsync
+                let fsync_sqe = opcode::Fsync::new(fd)
+                    .flags(types::FsyncFlags::DATASYNC)
+                    .build()
+                    .user_data(op_id);
 
                 unsafe {
                     sq.push(&fsync_sqe).map_err(|_| {

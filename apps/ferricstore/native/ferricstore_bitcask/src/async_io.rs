@@ -25,10 +25,13 @@ static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 
 /// Returns a reference to the global Tokio runtime, creating it on first call.
 ///
-/// The runtime uses the multi-threaded scheduler with default thread count
-/// (typically equal to the number of CPU cores). This is separate from the
-/// BEAM's scheduler threads — Tokio threads handle disk IO while BEAM
-/// schedulers remain free for Elixir process scheduling.
+/// H-8 fix: limits worker threads to `min(4, num_cpus)` instead of the default
+/// (one per CPU core). The Tokio runtime is only used for disk IO operations
+/// (pread, fsync), which are limited by NVMe parallelism (4-8 outstanding IOs
+/// is optimal). On a 64-core server, the default would create 64 Tokio threads
+/// in addition to the BEAM's ~64 scheduler threads — 128 threads competing
+/// for CPU. With 4 workers the IO throughput is unchanged but context switching
+/// overhead drops significantly.
 ///
 /// # Panics
 ///
@@ -36,7 +39,18 @@ static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 /// reached). This is a fatal error since the NIF library cannot function
 /// without the runtime.
 pub fn runtime() -> &'static Runtime {
-    TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime"))
+    TOKIO_RT.get_or_init(|| {
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let workers = num_cpus.min(4).max(1);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .thread_name("ferric-tokio")
+            .enable_all()
+            .build()
+            .expect("Failed to create Tokio runtime")
+    })
 }
 
 #[cfg(test)]
@@ -219,5 +233,46 @@ mod tests {
         });
         let result = rt.block_on(outer).unwrap();
         assert_eq!(result, 42);
+    }
+
+    // ------------------------------------------------------------------
+    // H-8: Tokio runtime limits worker threads to min(4, num_cpus)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn h8_runtime_functional_with_limited_threads() {
+        let rt = runtime();
+        // Verify that spawning more tasks than worker threads still works
+        // (tasks are multiplexed onto the worker pool).
+        let mut handles = Vec::with_capacity(100);
+        for i in 0..100u64 {
+            handles.push(rt.spawn(async move { i * 2 }));
+        }
+        let mut sum = 0u64;
+        for h in handles {
+            sum += rt.block_on(h).unwrap();
+        }
+        assert_eq!(sum, 9900); // sum of 0*2 + 1*2 + ... + 99*2 = 2 * 4950 = 9900
+    }
+
+    #[test]
+    fn h8_concurrent_io_tasks_complete() {
+        let rt = runtime();
+        // Spawn many tasks that do a small amount of compute work.
+        let mut handles = Vec::new();
+        for i in 0u64..20 {
+            handles.push(rt.spawn(async move {
+                // Simulate a small amount of work
+                let mut sum = 0u64;
+                for j in 0..100 {
+                    sum += i + j;
+                }
+                sum
+            }));
+        }
+        for h in handles {
+            let result = rt.block_on(h).unwrap();
+            assert!(result > 0);
+        }
     }
 }

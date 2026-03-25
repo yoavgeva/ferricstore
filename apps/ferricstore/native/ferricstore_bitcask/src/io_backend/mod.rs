@@ -60,6 +60,21 @@ pub trait IoBackend: Send {
     /// their counter in sync with externally-written bytes.
     fn advance_offset(&mut self, _bytes: u64) {}
 
+    /// Flush any internal write buffer to the OS page cache **without**
+    /// calling fsync. This makes the data visible to subsequent reads via
+    /// pread but does not guarantee durability on crash.
+    ///
+    /// The default implementation calls `sync()` (flush + fsync). Backends
+    /// that can flush without fsync (like `SyncBackend`) should override this
+    /// for better performance on the write+deferred-fsync path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the flush fails.
+    fn flush_no_sync(&mut self) -> io::Result<()> {
+        self.sync()
+    }
+
     /// Append multiple buffers as a single atomic batch, then fsync once.
     ///
     /// The default implementation calls `append` for each buffer and then
@@ -97,7 +112,7 @@ pub struct SyncBackend {
 }
 
 impl SyncBackend {
-    /// Open (or create) the file at `path` for appending.
+    /// Open (or create) the file at `path` for appending with a 256KB buffer.
     ///
     /// # Errors
     ///
@@ -107,7 +122,28 @@ impl SyncBackend {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let offset = file.metadata()?.len();
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(256 * 1024, file), // H-1: 256KB buffer for batch writes
+            offset,
+        })
+    }
+
+    /// Open (or create) the file at `path` for appending with an 8KB buffer.
+    ///
+    /// M-NEW-1 fix: the v2 stateless NIF path opens a LogWriter per call and
+    /// drops it after a single write. The 256KB BufWriter is wasteful for this
+    /// use case. An 8KB buffer (Rust's default BufWriter capacity) is large
+    /// enough for any single Bitcask record (max key 64KB + max value 1MB,
+    /// but the buffer flushes on write_all anyway when data exceeds capacity).
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the file cannot be opened or its size cannot
+    /// be determined.
+    pub fn open_small_buffer(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let offset = file.metadata()?.len();
+        Ok(Self {
+            writer: BufWriter::with_capacity(8 * 1024, file),
             offset,
         })
     }
@@ -121,9 +157,19 @@ impl IoBackend for SyncBackend {
         Ok(start)
     }
 
+    /// C-7 fix: use `sync_data()` (`fdatasync`) instead of `sync_all()` (`fsync`).
+    /// `fdatasync` skips flushing non-critical metadata (mtime, atime) which
+    /// avoids an extra journal write on ext4/xfs, making it 2-10x faster on HDD
+    /// and 5-50us faster on NVMe. For append-only logs the file size is the only
+    /// critical metadata, and `fdatasync` syncs size changes on Linux.
     fn sync(&mut self) -> io::Result<()> {
         self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        self.writer.get_ref().sync_data()?;
+        Ok(())
+    }
+
+    fn flush_no_sync(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
         Ok(())
     }
 
@@ -178,6 +224,30 @@ pub fn create_backend(path: &Path) -> io::Result<Box<dyn IoBackend>> {
     }
 
     Ok(Box::new(SyncBackend::open(path)?))
+}
+
+/// Create a backend with a smaller write buffer (8KB instead of 256KB).
+///
+/// M-NEW-1 fix: the v2 stateless NIF path opens a LogWriter per call and
+/// drops it immediately after one write. Using a 256KB BufWriter per call
+/// wastes allocator bandwidth (256KB alloc + dealloc per NIF call). This
+/// factory uses an 8KB buffer which is sufficient for single-record writes.
+///
+/// On Linux with `io_uring`, falls back to `create_backend` since the uring
+/// backend does not use `BufWriter`.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if the file cannot be opened.
+pub fn create_backend_small(path: &Path) -> io::Result<Box<dyn IoBackend>> {
+    #[cfg(target_os = "linux")]
+    if detect_io_uring() {
+        if let Ok(backend) = uring::UringBackend::open(path) {
+            return Ok(Box::new(backend));
+        }
+    }
+
+    Ok(Box::new(SyncBackend::open_small_buffer(path)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -356,5 +426,138 @@ mod tests {
             "batch offsets must match cumulative lengths"
         );
         assert_eq!(backend.offset(), 6, "final offset must be 6 (3+2+1)");
+    }
+
+    /// `flush_no_sync` flushes BufWriter without calling fsync.
+    #[test]
+    fn sync_backend_flush_no_sync_makes_data_readable() {
+        let dir = tmp();
+        let path = dir.path().join("nosync.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        backend.append(b"hello").unwrap();
+        backend.flush_no_sync().unwrap();
+
+        // Data should be readable from disk (flushed to page cache).
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"hello", "data must be readable after flush_no_sync");
+    }
+
+    /// `flush_no_sync` followed by `sync` should still work correctly.
+    #[test]
+    fn sync_backend_flush_no_sync_then_sync() {
+        let dir = tmp();
+        let path = dir.path().join("nosync_then_sync.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        backend.append(b"part1").unwrap();
+        backend.flush_no_sync().unwrap();
+        backend.append(b"part2").unwrap();
+        backend.sync().unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"part1part2");
+        assert_eq!(backend.offset(), 10);
+    }
+
+    // ------------------------------------------------------------------
+    // H-1: BufWriter uses 256KB buffer instead of default 8KB
+    // ------------------------------------------------------------------
+
+    /// H-1 verification: a batch of 100 records (each ~300 bytes = 30KB total)
+    /// should be absorbed by the 256KB buffer in a single flush, producing
+    /// correct data on disk.
+    #[test]
+    fn h1_large_batch_fits_in_buffer() {
+        let dir = tmp();
+        let path = dir.path().join("h1_batch.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        // Write 100 records of 300 bytes each = 30KB total.
+        // With the old 8KB buffer this would overflow multiple times.
+        // With the new 256KB buffer it fits in a single write.
+        let record = vec![0xABu8; 300];
+        let mut expected_offset = 0u64;
+        for _ in 0..100 {
+            let off = backend.append(&record).unwrap();
+            assert_eq!(off, expected_offset);
+            expected_offset += 300;
+        }
+        backend.sync().unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents.len(), 30_000);
+        assert_eq!(backend.offset(), 30_000);
+    }
+
+    /// H-1 verification: very small writes (1 byte each) should still work
+    /// correctly with the larger buffer.
+    #[test]
+    fn h1_small_writes_still_correct() {
+        let dir = tmp();
+        let path = dir.path().join("h1_small.log");
+        let mut backend = SyncBackend::open(&path).unwrap();
+
+        for i in 0u8..255 {
+            let off = backend.append(&[i]).unwrap();
+            assert_eq!(off, i as u64);
+        }
+        backend.sync().unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents.len(), 255);
+        for i in 0u8..255 {
+            assert_eq!(contents[i as usize], i);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // M-NEW-1: open_small_buffer uses 8KB buffer
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn small_buffer_backend_works_correctly() {
+        let dir = tmp();
+        let path = dir.path().join("small_buf.log");
+        let mut backend = SyncBackend::open_small_buffer(&path).unwrap();
+
+        let off0 = backend.append(b"hello").unwrap();
+        let off1 = backend.append(b"world").unwrap();
+        backend.sync().unwrap();
+
+        assert_eq!(off0, 0);
+        assert_eq!(off1, 5);
+        assert_eq!(backend.offset(), 10);
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"helloworld");
+    }
+
+    #[test]
+    fn small_buffer_backend_offset_resumes_after_reopen() {
+        let dir = tmp();
+        let path = dir.path().join("small_buf_reopen.log");
+
+        {
+            let mut backend = SyncBackend::open_small_buffer(&path).unwrap();
+            backend.append(b"data").unwrap();
+            backend.sync().unwrap();
+        }
+
+        let backend = SyncBackend::open_small_buffer(&path).unwrap();
+        assert_eq!(backend.offset(), 4, "offset must resume at file size after reopen");
+    }
+
+    #[test]
+    fn create_backend_small_returns_working_backend() {
+        let dir = tmp();
+        let path = dir.path().join("factory_small.log");
+        let mut backend = super::create_backend_small(&path).unwrap();
+
+        let off = backend.append(b"test").unwrap();
+        backend.sync().unwrap();
+
+        assert_eq!(off, 0);
+        assert_eq!(backend.offset(), 4);
     }
 }

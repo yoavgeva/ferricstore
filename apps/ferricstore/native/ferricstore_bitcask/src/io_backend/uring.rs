@@ -142,11 +142,18 @@ impl UringBackend {
         Ok(())
     }
 
-    /// Submit a single fsync SQE and wait for one completion.
+    /// Submit a single fdatasync SQE and wait for one completion.
+    ///
+    /// C-7 fix: uses `FsyncFlags::DATASYNC` (fdatasync) instead of plain
+    /// `Fsync` (fsync). fdatasync skips non-critical metadata (mtime/atime),
+    /// which is 2-10x faster on ext4/xfs.
     fn submit_fsync(&mut self) -> io::Result<()> {
         let fd = types::Fd(self.file.as_raw_fd());
 
-        let sqe = opcode::Fsync::new(fd).build().user_data(0x02);
+        let sqe = opcode::Fsync::new(fd)
+            .flags(types::FsyncFlags::DATASYNC)
+            .build()
+            .user_data(0x02);
 
         // SAFETY: no buffer involved; fsync SQE only carries the fd.
         unsafe {

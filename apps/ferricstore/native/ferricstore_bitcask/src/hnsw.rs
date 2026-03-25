@@ -499,6 +499,11 @@ pub struct HnswResource {
     pub index: Mutex<HnswIndex>,
 }
 
+/// Stub for mmap-backed HNSW resource registration (not yet implemented).
+pub fn register_mmap_resource(_env: Env) {
+    // No-op: file-backed HNSW resources are not yet implemented.
+}
+
 // ---------------------------------------------------------------------------
 // NIF functions
 // ---------------------------------------------------------------------------

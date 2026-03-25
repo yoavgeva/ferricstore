@@ -56,13 +56,46 @@ defmodule Ferricstore.Application do
     port = Application.get_env(:ferricstore, :port, 6379)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-    raft_enabled? = Application.get_env(:ferricstore, :raft_enabled, true)
-
     Logger.info("FerricStore starting in #{mode} mode")
 
     # Create the on-disk directory layout (spec 2B.4) before any process
     # tries to open shard directories or Raft WALs.
     Ferricstore.DataDir.ensure_layout!(data_dir, shard_count)
+
+    # Cache LFU config in persistent_term for hot-path reads (~5ns vs ~250ns).
+    # Must run before any shard starts touching keys.
+    Ferricstore.Store.LFU.init_config_cache()
+
+    # Cache hot_cache_max_value_size in persistent_term for zero-overhead
+    # hot-path reads. Values larger than this threshold are stored as nil
+    # in ETS (cold) to avoid copying large binaries on every :ets.lookup.
+    :persistent_term.put(
+      :ferricstore_hot_cache_max_value_size,
+      Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536)
+    )
+
+    # Initialize per-shard atomic write version counters (used by WATCH/EXEC
+    # and the Shard-bypass quorum write path in Router).
+    Ferricstore.Store.WriteVersion.init(shard_count)
+
+    # Initialize MemoryGuard persistent_term flags (default: not full).
+    # MemoryGuard.perform_check will update these every 100ms.
+    :persistent_term.put(:ferricstore_keydir_full, false)
+    :persistent_term.put(:ferricstore_reject_writes, false)
+
+    # Initialize keyspace notification events config in persistent_term
+    # (default: empty string = disabled). Updated by Config.apply_side_effect
+    # when CONFIG SET notify-keyspace-events is called.
+    :persistent_term.put(:ferricstore_keyspace_events, "")
+
+    # Cache shard_count and promotion_threshold in persistent_term.
+    # These values are read on warm paths (INFO sections, maybe_promote)
+    # and never change at runtime.
+    :persistent_term.put(:ferricstore_shard_count, shard_count)
+    :persistent_term.put(:ferricstore_promotion_threshold,
+      Application.get_env(:ferricstore, :promotion_threshold, 100))
+    :persistent_term.put(:ferricstore_read_sample_rate,
+      Application.get_env(:ferricstore, :read_sample_rate, 100))
 
     # Initialize waiter registry ETS for blocking commands
     Ferricstore.Waiters.init()
@@ -73,31 +106,40 @@ defmodule Ferricstore.Application do
     # Initialize HNSW vector index registry (used by VCREATE/VADD/VSEARCH)
     Ferricstore.Store.HnswRegistry.create_table()
 
+    # Load the patched ra_log_wal with async fdatasync BEFORE starting
+    # the ra system, so the patched module is in place when the WAL starts.
+    install_patched_wal()
+
     # Start the ra system before shards so that Shard.init can start ra servers.
-    if raft_enabled? do
-      Ferricstore.Raft.Cluster.start_system(data_dir)
-    end
+    Ferricstore.Raft.Cluster.start_system(data_dir)
 
     batcher_children =
-      if raft_enabled? do
-        Enum.map(0..(shard_count - 1), fn i ->
-          shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+      Enum.map(0..(shard_count - 1), fn i ->
+        shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
 
-          Supervisor.child_spec(
-            {Ferricstore.Raft.Batcher,
-             shard_index: i, shard_id: shard_id},
-            id: :"batcher_#{i}"
-          )
-        end)
-      else
-        []
-      end
+        Supervisor.child_spec(
+          {Ferricstore.Raft.Batcher,
+           shard_index: i, shard_id: shard_id},
+          id: :"batcher_#{i}"
+        )
+      end)
 
     async_worker_children =
       Enum.map(0..(shard_count - 1), fn i ->
         Supervisor.child_spec(
           {Ferricstore.Raft.AsyncApplyWorker, shard_index: i},
           id: :"async_apply_worker_#{i}"
+        )
+      end)
+
+    # Background Bitcask writers — one per shard. Must start BEFORE the
+    # ShardSupervisor because StateMachine.apply sends casts to these
+    # processes during shard init/recovery when replaying the Raft log.
+    bitcask_writer_children =
+      Enum.map(0..(shard_count - 1), fn i ->
+        Supervisor.child_spec(
+          {Ferricstore.Store.BitcaskWriter, shard_index: i},
+          id: :"bitcask_writer_#{i}"
         )
       end)
 
@@ -120,8 +162,9 @@ defmodule Ferricstore.Application do
         Ferricstore.HLC
       ] ++
         batcher_children ++
+        bitcask_writer_children ++
         [
-        {Ferricstore.Store.ShardSupervisor, data_dir: data_dir}
+        {Ferricstore.Store.ShardSupervisor, data_dir: data_dir, shard_count: shard_count}
       ] ++
         async_worker_children ++
         [
@@ -144,7 +187,7 @@ defmodule Ferricstore.Application do
         :telemetry.execute(
           [:ferricstore, :node, :startup_complete],
           %{duration_ms: System.monotonic_time(:millisecond)},
-          %{shard_count: shard_count, port: port, raft_enabled: raft_enabled?, mode: mode}
+          %{shard_count: shard_count, port: port, mode: mode}
         )
 
         # Step 6 - Large value check:
@@ -215,7 +258,7 @@ defmodule Ferricstore.Application do
 
       try do
         :ets.foldl(
-          fn {key, value, _expire_at_ms, _lfu}, {c, lk, ls} when is_binary(value) ->
+          fn {key, value, _expire_at_ms, _lfu, _fid, _off, vsize}, {c, lk, ls} when is_binary(value) ->
             size = byte_size(value)
 
             if size > threshold do
@@ -228,8 +271,19 @@ defmodule Ferricstore.Application do
               {c, lk, ls}
             end
 
-            {_key, nil, _exp, _lfu}, acc ->
-              # Cold key (value evicted from RAM) -- skip
+            {key, nil, _exp, _lfu, _fid, _off, vsize}, {c, lk, ls} when is_integer(vsize) and vsize > 0 ->
+              # Cold key (value evicted from RAM) -- use vsize from disk location
+              if vsize > threshold do
+                if vsize > ls do
+                  {c + 1, key, vsize}
+                else
+                  {c + 1, lk, ls}
+                end
+              else
+                {c, lk, ls}
+              end
+
+            _entry, acc ->
               acc
           end,
           {count, largest_key, largest_size},
@@ -309,6 +363,63 @@ defmodule Ferricstore.Application do
     case Application.get_env(:ferricstore, :memory_guard_interval_ms) do
       nil -> opts
       val -> Keyword.put(opts, :interval_ms, val)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Patched ra_log_wal (async fdatasync)
+  # ---------------------------------------------------------------------------
+
+  # Compiles and hot-loads a patched version of ra_log_wal that decouples
+  # fdatasync from the batch processing loop. The patched module:
+  #
+  # 1. Writes data to the kernel buffer synchronously (fast)
+  # 2. Spawns a linked process to run fdatasync asynchronously
+  # 3. While fdatasync runs, keeps accepting new entries
+  # 4. When fdatasync completes, notifies ALL accumulated writers
+  #
+  # Writers are ONLY notified AFTER fdatasync, preserving Raft durability.
+  #
+  # This must be called BEFORE ra_system:start/1 so the patched module is
+  # loaded before the WAL process starts.
+  @spec install_patched_wal() :: :ok | :error
+  defp install_patched_wal do
+    wal_source =
+      :ferricstore
+      |> :code.priv_dir()
+      |> Path.join("patched/ra_log_wal.erl")
+
+    # Resolve the ra source directory for include paths. In a Mix dev/test
+    # environment, :code.lib_dir(:ra, :src) may return {:error, :bad_name}
+    # because Mix manages deps differently. Fall back to the deps/ directory.
+    ra_src_dir =
+      case :code.lib_dir(:ra, :src) do
+        {:error, _} ->
+          # Mix dev mode: sources are in deps/ra/src
+          wal_source
+          |> Path.dirname()
+          |> Path.join("../../../../deps/ra/src")
+          |> Path.expand()
+          |> to_charlist()
+
+        dir ->
+          to_charlist(dir)
+      end
+
+    compile_opts =
+      [:binary, :return_errors, :return_warnings,
+       {:i, ra_src_dir}]
+
+    case :compile.file(to_charlist(wal_source), compile_opts) do
+      {:ok, :ra_log_wal, binary, _warnings} ->
+        :code.purge(:ra_log_wal)
+        {:module, :ra_log_wal} = :code.load_binary(:ra_log_wal, ~c"ra_log_wal.erl", binary)
+        Logger.info("Loaded patched ra_log_wal with async fdatasync")
+        :ok
+
+      {:error, errors, _warnings} ->
+        Logger.error("Failed to compile patched ra_log_wal: #{inspect(errors)}")
+        :error
     end
   end
 end

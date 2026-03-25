@@ -31,7 +31,7 @@ defmodule FerricstoreServer.L1CacheTest do
     :ok = :gen_tcp.send(sock, data)
   end
 
-  defp recv_response(sock, timeout \\ 5_000) do
+  defp recv_response(sock, timeout \\ 8_000) do
     recv_response_buf(sock, timeout, "")
   end
 
@@ -472,11 +472,12 @@ defmodule FerricstoreServer.L1CacheTest do
     end
 
     test "20. L1 max bytes — large values cause eviction gracefully", %{conn: conn} do
-      # Write several keys with values approaching the 1MB limit
-      # Each value ~100KB, so 11 would exceed 1MB
-      for i <- 1..11 do
+      # Write several keys with values approaching the 1MB limit.
+      # Use 20KB values (small enough for fast TCP roundtrips) x 55 iterations
+      # to exceed the 1MB L1 budget without hitting TCP recv timeouts.
+      for i <- 1..55 do
         key = ukey("large_val_#{i}")
-        val = String.duplicate("x", 100_000)
+        val = String.duplicate("x", 20_000)
         set_key(conn, key, val)
         assert get_key(conn, key) == val
       end

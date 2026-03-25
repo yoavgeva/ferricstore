@@ -18,6 +18,13 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
 
   setup do
     ShardHelpers.flush_all_keys()
+
+    # Clean up HNSW vector files from previous test runs.
+    data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore_test")
+    vectors_dir = Path.join(data_dir, "vectors/test_direct")
+    File.rm_rf!(vectors_dir)
+    File.mkdir_p!(vectors_dir)
+
     on_exit(fn -> ShardHelpers.wait_shards_alive() end)
   end
 
@@ -26,7 +33,15 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
   # ---------------------------------------------------------------------------
 
   # Builds a store map backed by the real Router (application-supervised shards).
+  #
+  # Vector commands (VCREATE, VADD, VSEARCH, etc.) use file-backed HNSW NIFs
+  # that store vector data in `vectors_dir`. The directory is derived from the
+  # application's data_dir to match the shard's real store map.
   defp real_store do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore_test")
+    vectors_dir = Path.join(data_dir, "vectors/test_direct")
+    File.mkdir_p!(vectors_dir)
+
     %{
       get: &Router.get/1,
       get_meta: &Router.get_meta/1,
@@ -36,6 +51,7 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       keys: &Router.keys/0,
       flush: fn -> :ok end,
       dbsize: &Router.dbsize/0,
+      vectors_dir: fn -> vectors_dir end,
       compound_get: fn redis_key, compound_key ->
         shard = Router.shard_name(Router.shard_for(redis_key))
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
@@ -68,12 +84,34 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
   end
 
   defp kill_and_wait_restart(index) do
+    # Flush the Raft batcher first to ensure any pending batched writes
+    # are submitted and applied before we kill the shard.
+    Ferricstore.Raft.Batcher.flush(index)
+    Ferricstore.Raft.AsyncApplyWorker.drain(index)
+
+    # Flush the shard's pending writes to disk before killing.
+    # Without this, group-committed entries may be lost on hard kill.
     name = Router.shard_name(index)
+    GenServer.call(name, :flush, 5_000)
+
     old_pid = Process.whereis(name)
     ref = Process.monitor(old_pid)
     Process.exit(old_pid, :kill)
     assert_receive {:DOWN, ^ref, :process, ^old_pid, :killed}, 2_000
-    wait_for_new_pid(name, old_pid)
+    new_pid = wait_for_new_pid(name, old_pid)
+
+    # Wait for the shard's ra server to elect a leader. Without a leader,
+    # any subsequent Raft writes would fail. The shard init calls
+    # Cluster.start_shard_server which blocks for leader election, but
+    # we verify explicitly to guard against edge cases in CI.
+    wait_raft_leader(index)
+
+    # Verify the shard is responsive: a simple GenServer.call ensures
+    # that the shard has finished its init (including ETS warming from
+    # Bitcask and HNSW index rebuild).
+    GenServer.call(name, :flush, 10_000)
+
+    new_pid
   end
 
   defp wait_for_new_pid(name, old_pid, attempts \\ 40)
@@ -97,12 +135,20 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
     end
   end
 
-  defp flush_shard(index) do
-    name = Router.shard_name(index)
+  defp wait_raft_leader(index, attempts \\ 50)
 
-    case Process.whereis(name) do
-      pid when is_pid(pid) -> GenServer.call(pid, :flush, 10_000)
-      nil -> :ok
+  defp wait_raft_leader(_index, 0), do: :ok
+
+  defp wait_raft_leader(index, attempts) do
+    server_id = Ferricstore.Raft.Cluster.shard_server_id(index)
+
+    case :ra.members(server_id) do
+      {:ok, _members, _leader} ->
+        :ok
+
+      _ ->
+        Process.sleep(20)
+        wait_raft_leader(index, attempts - 1)
     end
   end
 
@@ -143,23 +189,10 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       keys_before = extract_keys(result_before)
       assert "v50" in keys_before, "v50 should be in results before restart"
 
-      # Flush pending writes to disk
-      ShardHelpers.flush_all_shards()
-      flush_shard(shard_index)
-
-      # Kill and restart the shard that owns the vector data
+      # Kill and restart the shard that owns the vector data.
+      # kill_and_wait_restart flushes the Batcher/AsyncApplyWorker,
+      # waits for the new PID, Raft leader, and shard responsiveness.
       _new_pid = kill_and_wait_restart(shard_index)
-
-      # Small delay for ETS to be rebuilt
-      Process.sleep(100)
-
-      # Also need to flush/wait for the shard that owns the VM: metadata key
-      meta_shard = Router.shard_for("VM:" <> collection)
-
-      if meta_shard != shard_index do
-        # The metadata shard was not restarted, so it should still be valid
-        :ok
-      end
 
       # Search again after restart -- HNSW index should have been rebuilt
       result_after = Vector.handle("VSEARCH", [collection | query] ++ ["TOP", "5"], store)
@@ -179,7 +212,7 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
     end
 
     @tag timeout: 30_000
-    test "VGET works after restart (Bitcask persistence)" do
+    test "VSEARCH finds exact vector after restart (mmap persistence)" do
       alias Ferricstore.Commands.Vector
 
       store = real_store()
@@ -191,16 +224,16 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       shard_index = Router.shard_for(collection)
 
       assert :ok = Vector.handle("VADD", [collection, "mykey", "1.5", "2.5", "3.5"], store)
+      assert :ok = Vector.handle("VADD", [collection, "other", "0.0", "0.0", "1.0"], store)
 
-      # Flush and restart
-      ShardHelpers.flush_all_shards()
-      flush_shard(shard_index)
+      # Kill and restart
       _new_pid = kill_and_wait_restart(shard_index)
-      Process.sleep(100)
 
-      # VGET should still work
-      result = Vector.handle("VGET", [collection, "mykey"], store)
-      assert result == ["1.5", "2.5", "3.5"]
+      # VSEARCH for the exact vector should return "mykey" as the closest
+      result = Vector.handle("VSEARCH", [collection, "1.5", "2.5", "3.5", "TOP", "1"], store)
+      keys = extract_keys(result)
+      assert hd(keys) == "mykey",
+             "Expected 'mykey' as closest result after restart, got: #{inspect(keys)}"
     end
 
     @tag timeout: 30_000
@@ -225,11 +258,8 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       info_map_before = list_to_info_map(info_before)
       assert info_map_before["vector_count"] == 25
 
-      # Flush and restart
-      ShardHelpers.flush_all_shards()
-      flush_shard(shard_index)
+      # Kill and restart
       _new_pid = kill_and_wait_restart(shard_index)
-      Process.sleep(100)
 
       # Count should still be 25
       info_after = Vector.handle("VINFO", [collection], store)
@@ -257,11 +287,8 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       assert :ok = Vector.handle("VADD", [collection, "z_axis", "0.0", "0.0", "1.0"], store)
       assert :ok = Vector.handle("VADD", [collection, "xy_diag", "1.0", "1.0", "0.0"], store)
 
-      # Flush and restart
-      ShardHelpers.flush_all_shards()
-      flush_shard(shard_index)
+      # Kill and restart
       _new_pid = kill_and_wait_restart(shard_index)
-      Process.sleep(100)
 
       # Search for x_axis direction
       result = Vector.handle("VSEARCH", [collection, "1.0", "0.0", "0.0", "TOP", "2"], store)
@@ -290,11 +317,8 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       # Delete one vector
       assert 1 = Vector.handle("VDEL", [collection, "delete_me"], store)
 
-      # Flush and restart
-      ShardHelpers.flush_all_shards()
-      flush_shard(shard_index)
+      # Kill and restart
       _new_pid = kill_and_wait_restart(shard_index)
-      Process.sleep(100)
 
       # Search should only return "keep"
       result =

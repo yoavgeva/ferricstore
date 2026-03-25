@@ -1,0 +1,345 @@
+defmodule Ferricstore.Store.BitcaskWriter do
+  @moduledoc """
+  Background Bitcask writer for deferred persistence of small values.
+
+  Each shard has one BitcaskWriter process. When the StateMachine applies a
+  write for a small value (< hot_cache_max_value_size), it inserts the value
+  into ETS immediately (for instant read availability) and sends a cast to
+  this process with the key, value, and the active file path at the time of
+  the write. The BitcaskWriter accumulates writes and flushes them to Bitcask
+  in batches, then updates each ETS entry's file_id and offset via
+  `:ets.update_element/3`.
+
+  This decouples the ~50us synchronous NIF write from the ra_server process,
+  allowing it to process the next Raft command immediately. The ETS entry is
+  tagged with `file_id = :pending` until the background write completes.
+
+  ## Batching strategy
+
+  Writes are flushed when either:
+    - The pending batch reaches 100 entries, OR
+    - 1ms has elapsed since the first pending entry was queued
+
+  ## File rotation handling
+
+  The active file path is passed with each write cast, so the writer
+  automatically handles file rotations -- writes to different paths are
+  grouped and flushed separately.
+
+  ## Invariants
+
+    - A key with `file_id = :pending` in ETS has its value in ETS (non-nil).
+      MemoryGuard must NOT evict these entries.
+    - After the Bitcask write completes, the writer updates ETS positions
+      5 (file_id), 6 (offset), and 7 (value_size) via `update_element`.
+    - Large values (>= hot_cache_max_value_size) are NOT routed here -- they
+      use the synchronous path in StateMachine because their ETS value is nil
+      and cold reads need a valid disk offset immediately.
+  """
+
+  use GenServer
+
+  require Logger
+
+  alias Ferricstore.Bitcask.NIF
+
+  @batch_size_threshold 100
+  @flush_interval_ms 1
+
+  @doc "Starts a BitcaskWriter for the given shard index."
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    shard_index = Keyword.fetch!(opts, :shard_index)
+    GenServer.start_link(__MODULE__, opts, name: writer_name(shard_index))
+  end
+
+  @doc "Returns the registered name for a shard's BitcaskWriter."
+  @spec writer_name(non_neg_integer()) :: atom()
+  def writer_name(shard_index), do: :"Ferricstore.Store.BitcaskWriter.#{shard_index}"
+
+  @doc """
+  Queues a deferred Bitcask write for background processing.
+
+  Called from `StateMachine.apply/3` for small values. The write is
+  non-blocking (cast) so the ra_server process is not delayed.
+
+  ## Parameters
+
+    - `shard_index` -- zero-based shard index
+    - `active_file_path` -- the active log file path at the time of the write
+    - `active_file_id` -- the numeric file ID for the active log file
+    - `ets_table` -- the ETS table name (keydir) to update after writing
+    - `key` -- the key being written
+    - `value` -- the value to persist (always a binary, always < 64KB)
+    - `expire_at_ms` -- expiry timestamp in milliseconds (0 = no expiry)
+  """
+  @spec write(non_neg_integer(), binary(), non_neg_integer(), atom(), binary(), binary(), non_neg_integer()) :: :ok
+  def write(shard_index, active_file_path, active_file_id, ets_table, key, value, expire_at_ms) do
+    GenServer.cast(
+      writer_name(shard_index),
+      {:write, active_file_path, active_file_id, ets_table, key, value, expire_at_ms}
+    )
+  end
+
+  @doc """
+  Queues a deferred Bitcask tombstone (delete) for background processing.
+
+  Called from `Router.async_delete/2` when raft is disabled. The tombstone
+  is written in the same ordered batch as value writes, so a tombstone
+  for key K will always appear after any preceding value write for K.
+  The ETS entry has already been deleted by the caller before this cast.
+
+  ## Parameters
+
+    - `shard_index` -- zero-based shard index
+    - `active_file_path` -- the active log file path at the time of the delete
+    - `key` -- the key to tombstone
+  """
+  @spec delete(non_neg_integer(), binary(), binary()) :: :ok
+  def delete(shard_index, active_file_path, key) do
+    GenServer.cast(
+      writer_name(shard_index),
+      {:tombstone, active_file_path, key}
+    )
+  end
+
+  @doc """
+  Synchronously flushes all pending writes to Bitcask and returns.
+
+  Used in tests and before shard shutdown to ensure all deferred writes
+  are persisted.
+  """
+  @spec flush(non_neg_integer()) :: :ok
+  def flush(shard_index) do
+    GenServer.call(writer_name(shard_index), :flush, 30_000)
+  end
+
+  @doc """
+  Flushes all running BitcaskWriter processes.
+
+  Iterates through shard indices 0..N-1 (default N=4) and flushes each
+  writer that is alive. Silently ignores writers that are not running.
+  Used in tests that need all background writes to be on disk before
+  simulating eviction or verifying disk state.
+  """
+  @spec flush_all(non_neg_integer()) :: :ok
+  def flush_all(shard_count \\ 4) do
+    for i <- 0..(shard_count - 1) do
+      try do
+        flush(i)
+      rescue
+        _ -> :ok
+      catch
+        :exit, _ -> :ok
+      end
+    end
+
+    :ok
+  end
+
+  # -- Callbacks --
+
+  @impl true
+  def init(opts) do
+    shard_index = Keyword.fetch!(opts, :shard_index)
+
+    {:ok,
+     %{
+       shard_index: shard_index,
+       pending: [],
+       pending_count: 0,
+       flush_timer: nil
+     }}
+  end
+
+  @impl true
+  def handle_cast({:write, path, file_id, ets, key, value, expire_at_ms}, state) do
+    entry = {:write, path, file_id, ets, key, value, expire_at_ms}
+    maybe_flush_or_queue(entry, state)
+  end
+
+  def handle_cast({:tombstone, path, key}, state) do
+    entry = {:tombstone, path, key}
+    maybe_flush_or_queue(entry, state)
+  end
+
+  defp maybe_flush_or_queue(entry, state) do
+    new_pending = [entry | state.pending]
+    new_count = state.pending_count + 1
+
+    if new_count >= @batch_size_threshold do
+      do_flush(new_pending, state.shard_index)
+      cancel_timer(state.flush_timer)
+      {:noreply, %{state | pending: [], pending_count: 0, flush_timer: nil}}
+    else
+      timer =
+        if state.flush_timer == nil do
+          Process.send_after(self(), :flush_timer, @flush_interval_ms)
+        else
+          state.flush_timer
+        end
+
+      {:noreply, %{state | pending: new_pending, pending_count: new_count, flush_timer: timer}}
+    end
+  end
+
+  @impl true
+  def handle_call(:flush, _from, %{pending: []} = state) do
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:flush, _from, state) do
+    do_flush(state.pending, state.shard_index)
+    cancel_timer(state.flush_timer)
+    {:reply, :ok, %{state | pending: [], pending_count: 0, flush_timer: nil}}
+  end
+
+  @impl true
+  def handle_info(:flush_timer, %{pending: []} = state) do
+    {:noreply, %{state | flush_timer: nil}}
+  end
+
+  def handle_info(:flush_timer, state) do
+    do_flush(state.pending, state.shard_index)
+    {:noreply, %{state | pending: [], pending_count: 0, flush_timer: nil}}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  # -- Private --
+
+  # Flushes all pending entries (writes and tombstones), grouped by file path
+  # (handles file rotation mid-batch). For writes, uses v2_append_batch_nosync
+  # and updates ETS entries with the real file_id and offset. For tombstones,
+  # uses v2_append_tombstone. Entries within each path group are processed in
+  # insertion order, preserving the write-then-delete invariant.
+  defp do_flush(pending, shard_index) do
+    # Reverse to preserve insertion order, then group by file path.
+    entries = Enum.reverse(pending)
+
+    entries
+    |> Enum.group_by(&entry_path/1)
+    |> Enum.each(fn {path, group} ->
+      flush_path_group(path, group, shard_index)
+    end)
+  end
+
+  defp entry_path({:write, path, _fid, _ets, _key, _value, _exp}), do: path
+  defp entry_path({:tombstone, path, _key}), do: path
+  # Legacy format (6-tuple without tag) for backward compatibility with
+  # any in-flight casts that used the old format.
+  defp entry_path({path, _fid, _ets, _key, _value, _exp}), do: path
+
+  # Processes a group of entries for a single file path. Consecutive writes
+  # are batched into a single v2_append_batch_nosync call for efficiency.
+  # Tombstones are written individually via v2_append_tombstone.
+  defp flush_path_group(path, group, shard_index) do
+    # Split into contiguous runs of writes vs tombstones to maximize batching.
+    group
+    |> chunk_by_type()
+    |> Enum.each(fn
+      {:writes, write_entries} ->
+        flush_write_batch(path, write_entries, shard_index)
+
+      {:tombstones, tombstone_entries} ->
+        flush_tombstone_batch(path, tombstone_entries, shard_index)
+    end)
+  end
+
+  # Chunks entries into contiguous runs of same-type entries.
+  defp chunk_by_type(entries) do
+    entries
+    |> Enum.chunk_while(
+      nil,
+      fn entry, acc ->
+        type = entry_type(entry)
+        case acc do
+          nil -> {:cont, {type, [entry]}}
+          {^type, items} -> {:cont, {type, [entry | items]}}
+          {other_type, items} -> {:cont, {other_type, Enum.reverse(items)}, {type, [entry]}}
+        end
+      end,
+      fn
+        nil -> {:cont, nil}
+        {type, items} -> {:cont, {type, Enum.reverse(items)}, nil}
+      end
+    )
+    |> Enum.map(fn {type, items} ->
+      case type do
+        :write -> {:writes, items}
+        :tombstone -> {:tombstones, items}
+      end
+    end)
+  end
+
+  defp entry_type({:write, _, _, _, _, _, _}), do: :write
+  defp entry_type({:tombstone, _, _}), do: :tombstone
+  defp entry_type({_, _, _, _, _, _}), do: :write
+
+  defp flush_write_batch(path, write_entries, shard_index) do
+    batch = Enum.map(write_entries, fn
+      {:write, _path, _fid, _ets, key, value, exp} -> {key, value, exp}
+      {_path, _fid, _ets, key, value, exp} -> {key, value, exp}
+    end)
+
+    case NIF.v2_append_batch_nosync(path, batch) do
+      {:ok, locations} ->
+        # Update ETS entries with real file_id and offset.
+        Enum.zip(write_entries, locations)
+        |> Enum.each(fn {entry, {offset, _record_size}} ->
+          {_tag, _path, file_id, ets, key, value, _exp} = normalize_write_entry(entry)
+          vsize = byte_size(value)
+
+          # Only update if the key still exists in ETS and still has :pending.
+          # A DELETE may have removed it between the cast and now.
+          try do
+            case :ets.lookup(ets, key) do
+              [{^key, _v, _e, _lfu, :pending, 0, _vs}] ->
+                :ets.update_element(ets, key, [{5, file_id}, {6, offset}, {7, vsize}])
+
+              _ ->
+                # Key was deleted or already updated (e.g., overwritten by a
+                # newer write that completed synchronously). Skip.
+                :ok
+            end
+          rescue
+            ArgumentError -> :ok
+          end
+        end)
+
+      {:error, reason} ->
+        Logger.error(
+          "BitcaskWriter shard_#{shard_index}: flush failed for #{path}: #{inspect(reason)} — #{length(batch)} entries lost"
+        )
+    end
+  end
+
+  defp flush_tombstone_batch(path, tombstone_entries, shard_index) do
+    Enum.each(tombstone_entries, fn {:tombstone, _path, key} ->
+      case NIF.v2_append_tombstone(path, key) do
+        {:ok, _} -> :ok
+        {:error, reason} ->
+          Logger.error(
+            "BitcaskWriter shard_#{shard_index}: tombstone failed for #{path} key=#{inspect(key)}: #{inspect(reason)}"
+          )
+      end
+    end)
+  end
+
+  defp normalize_write_entry({:write, path, fid, ets, key, value, exp}),
+    do: {:write, path, fid, ets, key, value, exp}
+  defp normalize_write_entry({path, fid, ets, key, value, exp}),
+    do: {:write, path, fid, ets, key, value, exp}
+
+  defp cancel_timer(nil), do: :ok
+
+  defp cancel_timer(ref) do
+    Process.cancel_timer(ref)
+    # Flush any already-sent :flush_timer message from the mailbox.
+    receive do
+      :flush_timer -> :ok
+    after
+      0 -> :ok
+    end
+  end
+end

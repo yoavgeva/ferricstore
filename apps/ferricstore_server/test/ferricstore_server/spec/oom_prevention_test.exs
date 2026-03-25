@@ -16,6 +16,15 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
 
   alias Ferricstore.MemoryGuard
 
+  # Reset persistent_term flags after each test so that tiny-budget
+  # MemoryGuard checks don't leak KEYDIR_FULL into other tests.
+  setup do
+    on_exit(fn ->
+      :persistent_term.put(:ferricstore_keydir_full, false)
+      :persistent_term.put(:ferricstore_reject_writes, false)
+    end)
+  end
+
   # ---------------------------------------------------------------------------
   # Section 2G.7: MemoryGuard noeviction policy rejects writes
   # ---------------------------------------------------------------------------

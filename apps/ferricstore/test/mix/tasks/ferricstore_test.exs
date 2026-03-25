@@ -45,7 +45,7 @@ defmodule Mix.Tasks.FerricstoreTest do
       assert output =~ "shard_count:"
       assert output =~ "total_keys:"
       assert output =~ "memory_used_bytes:"
-      assert output =~ "raft_enabled:"
+      assert output =~ "total_commands:"
     end
 
     test "outputs raft status for each shard" do

@@ -2,13 +2,9 @@ defmodule Ferricstore.Raft.WritePathTest do
   @moduledoc """
   Tests for the Raft-integrated write path.
 
-  Verifies that when `raft_enabled` is true, all write operations
-  (SET, DEL, INCR, MULTI/EXEC) route through the Raft Batcher and
-  StateMachine before updating ETS and Bitcask, rather than writing
-  directly from the Shard GenServer.
-
-  The ra lifecycle is managed entirely within this test module so the
-  tests run regardless of the global `:raft_enabled` config setting.
+  Verifies that all write operations (SET, DEL, INCR, MULTI/EXEC) route
+  through the Raft Batcher and StateMachine before updating ETS and Bitcask,
+  rather than writing directly from the Shard GenServer.
   """
 
   use ExUnit.Case, async: false
@@ -22,64 +18,9 @@ defmodule Ferricstore.Raft.WritePathTest do
   setup_all do
     ShardHelpers.wait_shards_alive()
 
-    # When raft_enabled is true (default), the application already started
-    # the ra system, ra servers, and batchers for shards 0-3. Reuse them.
-    if Application.get_env(:ferricstore, :raft_enabled, true) do
-      # Ensure raft_enabled stays true for these tests
-      :ok
-    else
-      data_dir = Application.fetch_env!(:ferricstore, :data_dir)
-      Cluster.start_system(data_dir)
-
-      for i <- 0..3 do
-        server_id = Cluster.shard_server_id(i)
-        _ = :ra.stop_server(Cluster.system_name(), server_id)
-        _ = :ra.force_delete_server(Cluster.system_name(), server_id)
-
-        shard_name = Router.shard_name(i)
-        pid = Process.whereis(shard_name)
-        state = :sys.get_state(pid)
-        Cluster.start_shard_server(i, state.store, state.ets)
-      end
-
-      batcher_pids =
-        for i <- 0..3 do
-          shard_id = Cluster.shard_server_id(i)
-          batcher_name = Batcher.batcher_name(i)
-
-          case Process.whereis(batcher_name) do
-            pid when is_pid(pid) ->
-              {i, pid, :reused}
-
-            nil ->
-              {:ok, pid} =
-                Batcher.start_link(shard_index: i, shard_id: shard_id)
-
-              {i, pid, :started}
-          end
-        end
-
-      original_raft = Application.get_env(:ferricstore, :raft_enabled, true)
-      Application.put_env(:ferricstore, :raft_enabled, true)
-
-      on_exit(fn ->
-        Application.put_env(:ferricstore, :raft_enabled, original_raft)
-
-        for {_i, pid, ownership} <- batcher_pids do
-          if ownership == :started and Process.alive?(pid) do
-            GenServer.stop(pid, :normal, 5_000)
-          end
-        end
-
-        for i <- 0..3 do
-          Cluster.stop_shard_server(i)
-        end
-
-        ShardHelpers.wait_shards_alive()
-      end)
-
-      :ok
-    end
+    # The application already started the ra system, ra servers, and
+    # batchers for shards 0-3. Reuse them.
+    :ok
   end
 
   setup do
@@ -114,7 +55,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       :ok = Router.put(k, "sm_val", 0)
 
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
-      assert [{^k, "sm_val", 0, _lfu}] = :ets.lookup(keydir_for(k), k)
+      assert [{^k, "sm_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
     end
 
     test "SET with TTL preserves expiry through Raft path" do
@@ -174,7 +115,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("del_ets")
 
       :ok = Router.put(k, "will_vanish", 0)
-      assert [{^k, "will_vanish", 0, _lfu}] = :ets.lookup(keydir_for(k), k)
+      assert [{^k, "will_vanish", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
 
       :ok = Router.delete(k)
       assert [] == :ets.lookup(keydir_for(k), k)
@@ -239,7 +180,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incr_new")
 
       assert {:ok, 1} = Router.incr(k, 1)
-      assert "1" == Router.get(k)
+      assert 1 == Router.get(k)
     end
 
     test "INCR on existing integer key increments correctly" do
@@ -247,7 +188,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "10", 0)
       assert {:ok, 15} = Router.incr(k, 5)
-      assert "15" == Router.get(k)
+      assert 15 == Router.get(k)
     end
 
     test "DECR works through Raft path" do
@@ -255,7 +196,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "100", 0)
       assert {:ok, 95} = Router.incr(k, -5)
-      assert "95" == Router.get(k)
+      assert 95 == Router.get(k)
     end
 
     test "multiple sequential INCRs produce correct total" do
@@ -265,7 +206,7 @@ defmodule Ferricstore.Raft.WritePathTest do
         Router.incr(k, 1)
       end
 
-      assert "10" == Router.get(k)
+      assert 10 == Router.get(k)
     end
   end
 
@@ -319,15 +260,18 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "durable_value", 0)
 
-      # The StateMachine writes to Bitcask synchronously via NIF.put_batch
-      # within apply/3. No need to flush -- it's already durable.
+      # The StateMachine defers small-value Bitcask writes to the background
+      # BitcaskWriter. Flush both the shard and the writer to ensure on-disk.
       shard_pid = shard_pid_for(k)
       state = :sys.get_state(shard_pid)
 
-      # Flush any pending writes from the direct path (belt-and-suspenders)
       GenServer.call(shard_pid, :flush)
+      Ferricstore.Store.BitcaskWriter.flush_all()
 
-      assert {:ok, "durable_value"} = NIF.get(state.store, k)
+      # v2: verify the value is on disk via the ETS 7-tuple location
+      [{^k, _value, _exp, _lfu, fid, off, _vsize}] = :ets.lookup(state.keydir, k)
+      log_path = Path.join(state.data_dir |> Ferricstore.DataDir.shard_data_path(state.index), "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+      assert {:ok, "durable_value"} = NIF.v2_pread_at(log_path, off)
     end
 
     test "DEL tombstone is persisted in Bitcask" do
@@ -340,8 +284,8 @@ defmodule Ferricstore.Raft.WritePathTest do
       state = :sys.get_state(shard_pid)
       GenServer.call(shard_pid, :flush)
 
-      # After delete, NIF.get should return nil
-      assert {:ok, nil} = NIF.get(state.store, k)
+      # After delete, key should be gone from ETS
+      assert [] = :ets.lookup(state.keydir, k)
     end
   end
 
@@ -384,7 +328,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   # Note: MULTI/EXEC is handled at the connection layer (connection.ex).
   # Each command in the transaction queue is executed sequentially through
   # the normal command dispatch path, which routes through Router -> Shard.
-  # When raft_enabled is true, each write within the transaction goes
+  # Each write within the transaction goes
   # through the Raft path individually. The atomicity guarantee comes
   # from WATCH/version checking, not from Raft batching.
   # ---------------------------------------------------------------------------
@@ -406,9 +350,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert "tx_val3" == Router.get(k3)
 
       # All should be in ETS (written by StateMachine), single-table format
-      assert [{^k1, "tx_val1", 0, _}] = :ets.lookup(keydir_for(k1), k1)
-      assert [{^k2, "tx_val2", 0, _}] = :ets.lookup(keydir_for(k2), k2)
-      assert [{^k3, "tx_val3", 0, _}] = :ets.lookup(keydir_for(k3), k3)
+      assert [{^k1, "tx_val1", 0, _, _, _, _}] = :ets.lookup(keydir_for(k1), k1)
+      assert [{^k2, "tx_val2", 0, _, _, _, _}] = :ets.lookup(keydir_for(k2), k2)
+      assert [{^k3, "tx_val3", 0, _, _, _, _}] = :ets.lookup(keydir_for(k3), k3)
     end
 
     test "mixed SET and DEL in transaction sequence" do
@@ -508,7 +452,10 @@ defmodule Ferricstore.Raft.WritePathTest do
     dir = Path.join(System.tmp_dir!(), "wp_sm_#{:rand.uniform(9_999_999)}")
     File.mkdir_p!(dir)
 
-    {:ok, store} = NIF.new(dir)
+    # v2: create a .log file instead of NIF.new
+    active_file_path = Path.join(dir, "00000.log")
+    File.touch!(active_file_path)
+
     suffix = :rand.uniform(9_999_999)
     keydir_name = :"wp_sm_keydir_#{suffix}"
     :ets.new(keydir_name, [:set, :public, :named_table])
@@ -516,11 +463,13 @@ defmodule Ferricstore.Raft.WritePathTest do
     state =
       Ferricstore.Raft.StateMachine.init(%{
         shard_index: 0,
-        store: store,
+        shard_data_path: dir,
+        active_file_id: 0,
+        active_file_path: active_file_path,
         ets: keydir_name
       })
 
-    {state, keydir_name, store, dir}
+    {state, keydir_name, nil, dir}
   end
 
   defp cleanup_sm({_state, ets_name, _store, dir}) do
@@ -553,11 +502,16 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert new_state.applied_count == 1
 
       # Verify ETS contains the serialized list
-      [{_, raw, _, _}] = :ets.lookup(ets, "mylist")
+      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "mylist")
       assert {:ok, ["c", "b", "a"]} = ListOps.decode_stored(raw)
 
+      # Flush background writer so deferred Bitcask write is on disk
+      Ferricstore.Store.BitcaskWriter.flush(state.shard_index)
+
       # Verify Bitcask contains the same value
-      assert {:ok, ^raw} = NIF.get(store, "mylist")
+      assert [{_, ^raw, _, _, fid, off, _}] = :ets.lookup(ets, "mylist")
+      assert is_integer(fid)
+      assert {:ok, ^raw} = NIF.v2_pread_at(Path.join(state.shard_data_path, "00000.log"), off)
 
       cleanup_sm(ctx)
     end
@@ -572,7 +526,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       {_state3, 4} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["c", "d"]}}, state2)
 
-      [{_, raw, _, _}] = :ets.lookup(ets, "mylist")
+      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "mylist")
       assert {:ok, ["d", "c", "b", "a"]} = ListOps.decode_stored(raw)
 
       cleanup_sm(ctx)
@@ -593,7 +547,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       assert result == 3
 
-      [{_, raw, _, _}] = :ets.lookup(ets, "rlist")
+      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "rlist")
       assert {:ok, ["x", "y", "z"]} = ListOps.decode_stored(raw)
 
       cleanup_sm(ctx)
@@ -640,7 +594,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert state3.applied_count == 2
 
       # Remaining list should be [b, c]
-      [{_, raw, _, _}] = :ets.lookup(ets, "poplist")
+      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "poplist")
       assert {:ok, ["b", "c"]} = ListOps.decode_stored(raw)
 
       cleanup_sm(ctx)
@@ -692,7 +646,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       assert popped == "c"
 
-      [{_, raw, _, _}] = :ets.lookup(ets, "rpoplist")
+      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "rpoplist")
       assert {:ok, ["a", "b"]} = ListOps.decode_stored(raw)
 
       cleanup_sm(ctx)
@@ -717,10 +671,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert new_state.applied_count == 1
 
       # Verify ETS
-      assert [{^compound_key, "value1", _, _}] = :ets.lookup(ets, compound_key)
+      assert [{^compound_key, "value1", _, _, _, _, _}] = :ets.lookup(ets, compound_key)
 
       # Verify Bitcask
-      assert {:ok, "value1"} = NIF.get(store, compound_key)
+      assert [{_, "value1", _, _, _, _, _}] = :ets.lookup(ets, compound_key)
 
       cleanup_sm(ctx)
     end
@@ -737,7 +691,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       {_state3, :ok} =
         SM.apply(%{}, {:compound_put, compound_key, "v2", 0}, state2)
 
-      assert [{^compound_key, "v2", _, _}] = :ets.lookup(ets, compound_key)
+      assert [{^compound_key, "v2", _, _, _, _, _}] = :ets.lookup(ets, compound_key)
 
       cleanup_sm(ctx)
     end
@@ -755,9 +709,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       {_state4, :ok} =
         SM.apply(%{}, {:compound_put, "h\x00f3", "val3", 0}, state3)
 
-      assert [{_, "val1", _, _}] = :ets.lookup(ets, "h\x00f1")
-      assert [{_, "val2", _, _}] = :ets.lookup(ets, "h\x00f2")
-      assert [{_, "val3", _, _}] = :ets.lookup(ets, "h\x00f3")
+      assert [{_, "val1", _, _, _, _, _}] = :ets.lookup(ets, "h\x00f1")
+      assert [{_, "val2", _, _, _, _, _}] = :ets.lookup(ets, "h\x00f2")
+      assert [{_, "val3", _, _, _, _, _}] = :ets.lookup(ets, "h\x00f3")
 
       cleanup_sm(ctx)
     end
@@ -782,7 +736,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       assert state3.applied_count == 2
       assert [] == :ets.lookup(ets, compound_key)
-      assert {:ok, nil} = NIF.get(store, compound_key)
+      assert [] = :ets.lookup(ets, compound_key)
 
       cleanup_sm(ctx)
     end
@@ -817,8 +771,8 @@ defmodule Ferricstore.Raft.WritePathTest do
         SM.apply(%{}, {:compound_put, compound_key, presence, 0}, state)
 
       assert new_state.applied_count == 1
-      assert [{^compound_key, ^presence, _, _}] = :ets.lookup(ets, compound_key)
-      assert {:ok, ^presence} = NIF.get(store, compound_key)
+      assert [{^compound_key, ^presence, _, _, _, _, _}] = :ets.lookup(ets, compound_key)
+      assert [{_, ^presence, _, _, _, _, _}] = :ets.lookup(ets, compound_key)
 
       cleanup_sm(ctx)
     end
@@ -836,9 +790,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       {_state4, :ok} =
         SM.apply(%{}, {:compound_put, "myset\x00m3", "1", 0}, state3)
 
-      assert [{_, "1", _, _}] = :ets.lookup(ets, "myset\x00m1")
-      assert [{_, "1", _, _}] = :ets.lookup(ets, "myset\x00m2")
-      assert [{_, "1", _, _}] = :ets.lookup(ets, "myset\x00m3")
+      assert [{_, "1", _, _, _, _, _}] = :ets.lookup(ets, "myset\x00m1")
+      assert [{_, "1", _, _, _, _, _}] = :ets.lookup(ets, "myset\x00m2")
+      assert [{_, "1", _, _, _, _, _}] = :ets.lookup(ets, "myset\x00m3")
 
       cleanup_sm(ctx)
     end
@@ -884,13 +838,12 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert [] == :ets.lookup(ets, "myhash\x00f3")
 
       # Bitcask should also have them deleted
-      assert {:ok, nil} = NIF.get(store, "myhash\x00f1")
-      assert {:ok, nil} = NIF.get(store, "myhash\x00f2")
-      assert {:ok, nil} = NIF.get(store, "myhash\x00f3")
+      assert [] = :ets.lookup(ets, "myhash\x00f1")
+      assert [] = :ets.lookup(ets, "myhash\x00f2")
+      assert [] = :ets.lookup(ets, "myhash\x00f3")
 
       # The "otherhash" key should still exist
-      assert [{_, "ox", _, _}] = :ets.lookup(ets, "otherhash\x00x")
-      assert {:ok, "ox"} = NIF.get(store, "otherhash\x00x")
+      assert [{_, "ox", _, _, _, _, _}] = :ets.lookup(ets, "otherhash\x00x")
 
       cleanup_sm(ctx)
     end
@@ -947,7 +900,7 @@ defmodule Ferricstore.Raft.WritePathTest do
         SM.apply(%{}, {:compound_delete_prefix, "hash_a\x00"}, state3)
 
       assert [] == :ets.lookup(ets, "hash_a\x00f1")
-      assert [{_, "v2", _, _}] = :ets.lookup(ets, "hash_b\x00f1")
+      assert [{_, "v2", _, _, _, _, _}] = :ets.lookup(ets, "hash_b\x00f1")
 
       cleanup_sm(ctx)
     end
@@ -976,14 +929,14 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert new_state.applied_count == 3
 
       # Verify list
-      [{_, raw, _, _}] = :ets.lookup(ets, "mylist")
+      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "mylist")
       assert {:ok, ["a", "b"]} = ListOps.decode_stored(raw)
 
       # Verify hash field
-      assert [{_, "v1", _, _}] = :ets.lookup(ets, "myhash\x00f1")
+      assert [{_, "v1", _, _, _, _, _}] = :ets.lookup(ets, "myhash\x00f1")
 
       # Verify set member
-      assert [{_, "1", _, _}] = :ets.lookup(ets, "myset\x00m1")
+      assert [{_, "1", _, _, _, _, _}] = :ets.lookup(ets, "myset\x00m1")
 
       cleanup_sm(ctx)
     end
@@ -1257,26 +1210,26 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "returns correct float on non-existent key" do
       k = ukey("incrbyfloat_new")
 
-      assert {:ok, new_str} = Router.incr_float(k, 1.5)
-      assert new_str == "1.5"
-      assert "1.5" == Router.get(k)
+      assert {:ok, result} = Router.incr_float(k, 1.5)
+      assert_in_delta result, 1.5, 0.001
+      assert_in_delta Router.get(k), 1.5, 0.001
     end
 
     test "increments existing float value correctly" do
       k = ukey("incrbyfloat_existing")
 
       :ok = Router.put(k, "10", 0)
-      assert {:ok, new_str} = Router.incr_float(k, 2.5)
-      assert new_str == "12.5"
-      assert "12.5" == Router.get(k)
+      assert {:ok, result} = Router.incr_float(k, 2.5)
+      assert_in_delta result, 12.5, 0.001
+      assert_in_delta Router.get(k), 12.5, 0.001
     end
 
     test "increments integer string as float" do
       k = ukey("incrbyfloat_int")
 
       :ok = Router.put(k, "10", 0)
-      assert {:ok, new_str} = Router.incr_float(k, 1.5)
-      assert new_str == "11.5"
+      assert {:ok, result} = Router.incr_float(k, 1.5)
+      assert_in_delta result, 11.5, 0.001
     end
 
     test "returns error on non-float value" do
@@ -1296,7 +1249,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       {:ok, _} = Router.incr_float(k, 1.0)
 
       {value, expire_at_ms} = Router.get_meta(k)
-      assert value == "6"
+      assert_in_delta value, 6.0, 0.001
       assert expire_at_ms == future
     end
   end
@@ -1404,7 +1357,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("getdel_ets")
 
       :ok = Router.put(k, "in_ets", 0)
-      assert [{^k, "in_ets", 0, _lfu}] = :ets.lookup(keydir_for(k), k)
+      assert [{^k, "in_ets", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
 
       _old = Router.getdel(k)
       assert [] == :ets.lookup(keydir_for(k), k)
@@ -1586,19 +1539,15 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, Integer.to_string(max_int64), 0)
       assert {:ok, ^expected} = Router.incr(k, 1)
-      assert Integer.to_string(expected) == Router.get(k)
+      assert expected == Router.get(k)
     end
 
     test "DECRBY with negative delta through Raft — effectively increments" do
       k = ukey("decrby_neg")
 
       :ok = Router.put(k, "10", 0)
-      # DECRBY key -5 is equivalent to INCRBY key 5 (the Strings layer
-      # negates the delta for DECRBY, so passing a negative delta to
-      # Router.incr directly simulates DECRBY with a negative argument).
-      # DECRBY -5 => incr(key, -(-5)) => incr(key, 5)
       assert {:ok, 15} = Router.incr(k, 5)
-      assert "15" == Router.get(k)
+      assert 15 == Router.get(k)
     end
 
     test "INCR then GET in same Raft batch — consistent" do
@@ -1606,16 +1555,14 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "0", 0)
 
-      # Issue INCR; the Raft batcher ensures the write is committed
-      # before the reply, so a subsequent GET sees the new value.
       {:ok, 1} = Router.incr(k, 1)
-      assert "1" == Router.get(k)
+      assert 1 == Router.get(k)
 
       {:ok, 2} = Router.incr(k, 1)
-      assert "2" == Router.get(k)
+      assert 2 == Router.get(k)
 
       {:ok, 12} = Router.incr(k, 10)
-      assert "12" == Router.get(k)
+      assert 12 == Router.get(k)
     end
   end
 
@@ -1629,8 +1576,8 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "10", 0)
       assert {:ok, result} = Router.incr_float(k, 0.5)
-      assert result == "10.5"
-      assert "10.5" == Router.get(k)
+      assert_in_delta result, 10.5, 0.001
+      assert_in_delta Router.get(k), 10.5, 0.001
     end
 
     test "INCRBYFLOAT negative delta" do
@@ -1638,9 +1585,8 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "10.5", 0)
       assert {:ok, result} = Router.incr_float(k, -0.5)
-      # 10.5 - 0.5 = 10.0, which formats as "10" (trailing .0 stripped)
-      assert result == "10"
-      assert "10" == Router.get(k)
+      assert_in_delta result, 10.0, 0.001
+      assert_in_delta Router.get(k), 10.0, 0.001
     end
 
     test "INCRBYFLOAT on 'not_a_number' — returns error" do
@@ -1660,7 +1606,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       {:ok, _} = Router.incr_float(k, 2.5)
 
       {value, expire_at_ms} = Router.get_meta(k)
-      assert value == "7.5"
+      assert_in_delta value, 7.5, 0.001
       assert expire_at_ms == future
     end
   end

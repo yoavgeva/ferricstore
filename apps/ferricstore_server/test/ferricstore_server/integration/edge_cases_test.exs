@@ -449,6 +449,17 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   # ---------------------------------------------------------------------------
 
   describe "large value TCP round-trips" do
+    # These tests exercise values above the default 1 MB max_value_size.
+    # Temporarily raise the limit to 64 MB (the hard cap) for the duration.
+    setup do
+      original = Application.get_env(:ferricstore, :max_value_size)
+      Application.put_env(:ferricstore, :max_value_size, 64 * 1024 * 1024)
+      on_exit(fn ->
+        if original, do: Application.put_env(:ferricstore, :max_value_size, original),
+          else: Application.delete_env(:ferricstore, :max_value_size)
+      end)
+    end
+
     test "1 MB value SET and GET over TCP" do
       sock = connect()
       k = ukey("tcp_1mb")
@@ -470,7 +481,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
     test "10 MB value content is byte-exact over TCP" do
       sock = connect()
       k = ukey("tcp_10mb_exact")
-      # Non-repeating pattern — catches any truncation or offset bugs
+      # Non-repeating pattern -- catches any truncation or offset bugs
       v = for i <- 0..9_999_999, into: <<>>, do: <<rem(i, 251)>>
       assert {:simple, "OK"} == cmd(sock, ["SET", k, v], 30_000)
       result = cmd(sock, ["GET", k], 30_000)
@@ -1038,12 +1049,12 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       :gen_tcp.close(sock)
     end
 
-    test "command larger than 1MB is handled without crash" do
-      # Create a SET command with a value larger than 1MB.
-      # The server should process it (the parser has a 512MB limit).
+    test "command at max value size is handled without crash" do
+      # Create a SET command with a value at exactly the max_value_size limit (1MB).
+      # The server should process it successfully.
       sock = connect_and_hello()
       k = ukey("big_cmd")
-      big_val = :binary.copy("X", 1_100_000)
+      big_val = :binary.copy("X", 1_048_576)
 
       resp = cmd(sock, ["SET", k, big_val], 30_000)
       assert resp == {:simple, "OK"}
@@ -1052,6 +1063,19 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       assert result == big_val
 
       :gen_tcp.close(sock)
+    end
+
+    test "command exceeding max value size returns error and closes connection" do
+      # A SET with a value larger than max_value_size (default 1MB) should be
+      # rejected at the parser level with a value_too_large error.
+      sock = connect_and_hello()
+      big_val = :binary.copy("X", 1_100_000)
+
+      send_raw(sock, IO.iodata_to_binary(Encoder.encode(["SET", "over_limit", big_val])))
+
+      # Read raw response -- connection will be closed after the error
+      {:ok, data} = recv_raw(sock, 10_000)
+      assert data =~ "value too large"
     end
   end
 

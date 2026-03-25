@@ -97,7 +97,8 @@ defmodule FerricstoreServer.Spec.EdgeCasesTest do
     sock
   end
 
-  defp ukey(base), do: "edge_#{base}_#{System.unique_integer([:positive])}"
+  # Hash tag ensures all generated keys co-locate on the same shard.
+  defp ukey(base), do: "{edge}:#{base}_#{System.unique_integer([:positive])}"
 
   # ---------------------------------------------------------------------------
   # Setup

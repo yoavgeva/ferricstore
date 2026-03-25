@@ -1,15 +1,69 @@
 defmodule Ferricstore.Commands.BloomTest do
   @moduledoc """
-  Comprehensive tests for the Bloom filter command handler.
+  Comprehensive tests for the mmap-backed Bloom filter command handler.
 
   Covers BF.RESERVE, BF.ADD, BF.MADD, BF.EXISTS, BF.MEXISTS, BF.CARD,
-  and BF.INFO with happy paths, error cases, edge cases, and accuracy
-  verification.
+  BF.INFO, and nif_delete with happy paths, error cases, edge cases, and
+  accuracy verification.
+
+  Each test uses an isolated temp directory and callback-based bloom
+  registry to avoid cross-test contamination.
   """
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.Bloom
-  alias Ferricstore.Test.MockStore
+  alias Ferricstore.Bitcask.NIF
+
+  # ===========================================================================
+  # Test helpers
+  # ===========================================================================
+
+  defp make_store(opts \\ []) do
+    dir = Keyword.get(opts, :dir, make_temp_dir())
+    {:ok, reg_pid} = Agent.start_link(fn -> %{} end)
+
+    bloom_registry = %{
+      get: fn key ->
+        Agent.get(reg_pid, fn state -> Map.get(state, key) end)
+      end,
+      put: fn key, resource, metadata ->
+        Agent.update(reg_pid, fn state ->
+          Map.put(state, key, {resource, metadata})
+        end)
+      end,
+      delete: fn key ->
+        Agent.update(reg_pid, fn state -> Map.delete(state, key) end)
+      end,
+      path: fn key ->
+        safe_key = key |> String.replace(~r/[^a-zA-Z0-9_.\-]/, "_")
+        Path.join(dir, "#{safe_key}.bloom")
+      end,
+      dir: dir,
+      pid: reg_pid
+    }
+
+    %{
+      bloom_registry: bloom_registry,
+      get: fn key ->
+        Agent.get(reg_pid, fn state -> Map.get(state, key) end)
+      end,
+      put: fn key, value, _ttl ->
+        Agent.update(reg_pid, fn state -> Map.put(state, key, value) end)
+      end,
+      delete: fn key ->
+        Agent.update(reg_pid, fn state -> Map.delete(state, key) end)
+      end,
+      exists?: fn key ->
+        Agent.get(reg_pid, fn state -> Map.has_key?(state, key) end)
+      end
+    }
+  end
+
+  defp make_temp_dir do
+    dir = Path.join(System.tmp_dir!(), "bloom_test_#{:rand.uniform(1_000_000)}")
+    File.mkdir_p!(dir)
+    dir
+  end
 
   # ===========================================================================
   # BF.RESERVE
@@ -17,93 +71,96 @@ defmodule Ferricstore.Commands.BloomTest do
 
   describe "BF.RESERVE" do
     test "creates a new bloom filter with specified error rate and capacity" do
-      store = MockStore.make()
+      store = make_store()
       assert :ok = Bloom.handle("BF.RESERVE", ["mybloom", "0.01", "1000"], store)
-      assert store.exists?.("mybloom")
+
+      # Verify the .bloom file was created
+      path = store.bloom_registry.path.("mybloom")
+      assert File.exists?(path)
     end
 
     test "returns error when key already exists" do
-      store = MockStore.make()
+      store = make_store()
       assert :ok = Bloom.handle("BF.RESERVE", ["mybloom", "0.01", "100"], store)
       assert {:error, msg} = Bloom.handle("BF.RESERVE", ["mybloom", "0.01", "100"], store)
       assert msg =~ "item exists"
     end
 
     test "returns error with invalid error rate (zero)" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.RESERVE", ["bf", "0", "100"], store)
       assert msg =~ "error rate"
     end
 
     test "returns error with invalid error rate (one)" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.RESERVE", ["bf", "1", "100"], store)
       assert msg =~ "error rate"
     end
 
     test "returns error with invalid error rate (negative)" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.RESERVE", ["bf", "-0.5", "100"], store)
       assert msg =~ "error rate"
     end
 
     test "returns error with invalid error rate (greater than 1)" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.RESERVE", ["bf", "1.5", "100"], store)
       assert msg =~ "error rate"
     end
 
     test "returns error with invalid capacity (zero)" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.RESERVE", ["bf", "0.01", "0"], store)
     end
 
     test "returns error with invalid capacity (negative)" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.RESERVE", ["bf", "0.01", "-10"], store)
     end
 
     test "returns error with non-numeric error rate" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.RESERVE", ["bf", "abc", "100"], store)
     end
 
     test "returns error with non-numeric capacity" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.RESERVE", ["bf", "0.01", "abc"], store)
     end
 
     test "returns error with wrong number of arguments (too few)" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.RESERVE", ["bf", "0.01"], store)
       assert msg =~ "wrong number of arguments"
     end
 
     test "returns error with wrong number of arguments (too many)" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.RESERVE", ["bf", "0.01", "100", "extra"], store)
       assert msg =~ "wrong number of arguments"
     end
 
     test "returns error with no arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.RESERVE", [], store)
       assert msg =~ "wrong number of arguments"
     end
 
     test "accepts integer error rate string like '0'" do
-      store = MockStore.make()
+      store = make_store()
       # "0" should be parsed as 0.0 which is invalid
       assert {:error, _} = Bloom.handle("BF.RESERVE", ["bf", "0", "100"], store)
     end
 
     test "creates filter with very small error rate" do
-      store = MockStore.make()
+      store = make_store()
       assert :ok = Bloom.handle("BF.RESERVE", ["bf", "0.0001", "100"], store)
     end
 
     test "creates filter with very large capacity" do
-      store = MockStore.make()
+      store = make_store()
       assert :ok = Bloom.handle("BF.RESERVE", ["bf", "0.01", "100000"], store)
     end
   end
@@ -114,25 +171,25 @@ defmodule Ferricstore.Commands.BloomTest do
 
   describe "BF.ADD" do
     test "adds an element to a new filter (auto-creates)" do
-      store = MockStore.make()
+      store = make_store()
       assert 1 = Bloom.handle("BF.ADD", ["bf", "hello"], store)
     end
 
     test "adds an element to an existing filter" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       assert 1 = Bloom.handle("BF.ADD", ["bf", "hello"], store)
     end
 
     test "returns 0 for duplicate element (already present)" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       assert 1 = Bloom.handle("BF.ADD", ["bf", "hello"], store)
       assert 0 = Bloom.handle("BF.ADD", ["bf", "hello"], store)
     end
 
     test "multiple distinct elements all return 1" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
 
       for i <- 1..10 do
@@ -142,29 +199,29 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "returns error with wrong number of arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.ADD", ["bf"], store)
       assert msg =~ "wrong number of arguments"
     end
 
     test "returns error with too many arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.ADD", ["bf", "a", "b"], store)
       assert msg =~ "wrong number of arguments"
     end
 
     test "returns error with no arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.ADD", [], store)
     end
 
     test "handles empty string element" do
-      store = MockStore.make()
+      store = make_store()
       assert 1 = Bloom.handle("BF.ADD", ["bf", ""], store)
     end
 
     test "handles binary element with special characters" do
-      store = MockStore.make()
+      store = make_store()
       assert 1 = Bloom.handle("BF.ADD", ["bf", <<0, 1, 2, 255>>], store)
     end
   end
@@ -175,14 +232,14 @@ defmodule Ferricstore.Commands.BloomTest do
 
   describe "BF.MADD" do
     test "adds multiple elements at once" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       result = Bloom.handle("BF.MADD", ["bf", "a", "b", "c"], store)
       assert result == [1, 1, 1]
     end
 
     test "returns 0 for elements already present" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       Bloom.handle("BF.ADD", ["bf", "a"], store)
       result = Bloom.handle("BF.MADD", ["bf", "a", "b", "c"], store)
@@ -190,20 +247,19 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "auto-creates filter when key does not exist" do
-      store = MockStore.make()
+      store = make_store()
       result = Bloom.handle("BF.MADD", ["bf", "x", "y"], store)
       assert result == [1, 1]
-      assert store.exists?.("bf")
     end
 
     test "handles single element" do
-      store = MockStore.make()
+      store = make_store()
       result = Bloom.handle("BF.MADD", ["bf", "single"], store)
       assert result == [1]
     end
 
     test "handles duplicates within the same MADD call" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       result = Bloom.handle("BF.MADD", ["bf", "dup", "dup"], store)
       # First add returns 1 (new), second returns 0 (already set)
@@ -211,13 +267,13 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "returns error with only key argument (no elements)" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.MADD", ["bf"], store)
       assert msg =~ "wrong number of arguments"
     end
 
     test "returns error with no arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.MADD", [], store)
     end
   end
@@ -228,38 +284,36 @@ defmodule Ferricstore.Commands.BloomTest do
 
   describe "BF.EXISTS" do
     test "returns 1 for an element that was added" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       Bloom.handle("BF.ADD", ["bf", "hello"], store)
       assert 1 = Bloom.handle("BF.EXISTS", ["bf", "hello"], store)
     end
 
     test "returns 0 for an element that was not added (probably)" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.001", "1000"], store)
       Bloom.handle("BF.ADD", ["bf", "hello"], store)
-      # Not a guarantee (false positives exist), but with low error rate
-      # and few elements, this should be 0.
       assert 0 = Bloom.handle("BF.EXISTS", ["bf", "goodbye"], store)
     end
 
     test "returns 0 for non-existent key" do
-      store = MockStore.make()
+      store = make_store()
       assert 0 = Bloom.handle("BF.EXISTS", ["nonexistent", "hello"], store)
     end
 
     test "returns error with wrong number of arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.EXISTS", ["bf"], store)
     end
 
     test "returns error with too many arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.EXISTS", ["bf", "a", "b"], store)
     end
 
     test "returns error with no arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.EXISTS", [], store)
     end
   end
@@ -270,7 +324,7 @@ defmodule Ferricstore.Commands.BloomTest do
 
   describe "BF.MEXISTS" do
     test "checks multiple elements at once" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.001", "1000"], store)
       Bloom.handle("BF.MADD", ["bf", "a", "b", "c"], store)
       result = Bloom.handle("BF.MEXISTS", ["bf", "a", "b", "c", "d"], store)
@@ -280,25 +334,25 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "returns all zeros for non-existent key" do
-      store = MockStore.make()
+      store = make_store()
       result = Bloom.handle("BF.MEXISTS", ["nonexistent", "a", "b"], store)
       assert result == [0, 0]
     end
 
     test "handles single element" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.ADD", ["bf", "x"], store)
       result = Bloom.handle("BF.MEXISTS", ["bf", "x"], store)
       assert result == [1]
     end
 
     test "returns error with only key argument" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.MEXISTS", ["bf"], store)
     end
 
     test "returns error with no arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.MEXISTS", [], store)
     end
   end
@@ -309,18 +363,18 @@ defmodule Ferricstore.Commands.BloomTest do
 
   describe "BF.CARD" do
     test "returns 0 for non-existent key" do
-      store = MockStore.make()
+      store = make_store()
       assert 0 = Bloom.handle("BF.CARD", ["nonexistent"], store)
     end
 
     test "returns 0 for newly reserved filter" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       assert 0 = Bloom.handle("BF.CARD", ["bf"], store)
     end
 
     test "returns count after adding elements" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       Bloom.handle("BF.ADD", ["bf", "a"], store)
       Bloom.handle("BF.ADD", ["bf", "b"], store)
@@ -329,7 +383,7 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "does not count duplicates" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       Bloom.handle("BF.ADD", ["bf", "a"], store)
       Bloom.handle("BF.ADD", ["bf", "a"], store)
@@ -337,19 +391,19 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "counts MADD elements" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       Bloom.handle("BF.MADD", ["bf", "x", "y", "z"], store)
       assert 3 = Bloom.handle("BF.CARD", ["bf"], store)
     end
 
     test "returns error with wrong number of arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.CARD", [], store)
     end
 
     test "returns error with too many arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.CARD", ["a", "b"], store)
     end
   end
@@ -360,7 +414,7 @@ defmodule Ferricstore.Commands.BloomTest do
 
   describe "BF.INFO" do
     test "returns filter information" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "1000"], store)
       Bloom.handle("BF.ADD", ["bf", "hello"], store)
       result = Bloom.handle("BF.INFO", ["bf"], store)
@@ -376,19 +430,86 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "returns error for non-existent key" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, msg} = Bloom.handle("BF.INFO", ["nonexistent"], store)
       assert msg =~ "not found"
     end
 
     test "returns error with wrong number of arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.INFO", [], store)
     end
 
     test "returns error with too many arguments" do
-      store = MockStore.make()
+      store = make_store()
       assert {:error, _} = Bloom.handle("BF.INFO", ["a", "b"], store)
+    end
+  end
+
+  # ===========================================================================
+  # nif_delete
+  # ===========================================================================
+
+  describe "nif_delete" do
+    test "deletes bloom filter file from disk" do
+      store = make_store()
+      Bloom.handle("BF.RESERVE", ["deleteme", "0.01", "100"], store)
+      Bloom.handle("BF.ADD", ["deleteme", "elem"], store)
+
+      path = store.bloom_registry.path.("deleteme")
+      assert File.exists?(path)
+
+      assert :ok = Bloom.nif_delete("deleteme", store)
+      refute File.exists?(path)
+
+      # Registry should no longer have the key
+      assert nil == store.bloom_registry.get.("deleteme")
+    end
+
+    test "nif_delete on non-existent key is a no-op" do
+      store = make_store()
+      assert :ok = Bloom.nif_delete("no_such_key", store)
+    end
+  end
+
+  # ===========================================================================
+  # mmap file persistence
+  # ===========================================================================
+
+  describe "mmap file persistence" do
+    test "bloom file persists on disk after creation" do
+      dir = make_temp_dir()
+      store = make_store(dir: dir)
+
+      Bloom.handle("BF.RESERVE", ["persist_test", "0.01", "100"], store)
+      Bloom.handle("BF.ADD", ["persist_test", "elem1"], store)
+
+      path = store.bloom_registry.path.("persist_test")
+      assert File.exists?(path)
+
+      # File should be non-empty (header + bit array)
+      stat = File.stat!(path)
+      assert stat.size > 32
+    end
+
+    test "bloom filter can be reopened from file" do
+      dir = make_temp_dir()
+
+      # Phase 1: Create and populate
+      store1 = make_store(dir: dir)
+      Bloom.handle("BF.RESERVE", ["reopen", "0.01", "100"], store1)
+      Bloom.handle("BF.ADD", ["reopen", "hello"], store1)
+      Bloom.handle("BF.ADD", ["reopen", "world"], store1)
+      assert 2 = Bloom.handle("BF.CARD", ["reopen"], store1)
+
+      path = store1.bloom_registry.path.("reopen")
+
+      # Phase 2: Open via NIF directly from the same file
+      {:ok, resource2} = NIF.bloom_open(path)
+      assert 1 = NIF.bloom_exists(resource2, "hello")
+      assert 1 = NIF.bloom_exists(resource2, "world")
+      assert 0 = NIF.bloom_exists(resource2, "missing")
+      assert 2 = NIF.bloom_card(resource2)
     end
   end
 
@@ -398,7 +519,7 @@ defmodule Ferricstore.Commands.BloomTest do
 
   describe "false positive rate verification" do
     test "Bloom filter respects target false positive rate within 2x margin" do
-      store = MockStore.make()
+      store = make_store()
       error_rate = 0.05
       capacity = 1000
 
@@ -409,7 +530,7 @@ defmodule Ferricstore.Commands.BloomTest do
         Bloom.handle("BF.ADD", ["bf", "added_#{i}"], store)
       end
 
-      # Check elements that were NOT added — count false positives.
+      # Check elements that were NOT added -- count false positives.
       test_count = 10_000
       false_positives =
         Enum.count(1..test_count, fn i ->
@@ -424,7 +545,7 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "no false negatives: all added elements are found" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "500"], store)
 
       elements = for i <- 1..200, do: "element_#{i}"
@@ -444,13 +565,13 @@ defmodule Ferricstore.Commands.BloomTest do
 
   describe "cross-command interactions" do
     test "BF.ADD then BF.EXISTS returns 1" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.ADD", ["bf", "test"], store)
       assert 1 = Bloom.handle("BF.EXISTS", ["bf", "test"], store)
     end
 
     test "BF.MADD then BF.MEXISTS returns correct results" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.001", "1000"], store)
       Bloom.handle("BF.MADD", ["bf", "a", "b", "c"], store)
       result = Bloom.handle("BF.MEXISTS", ["bf", "a", "c"], store)
@@ -458,7 +579,7 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "BF.RESERVE then BF.ADD then BF.CARD tracks count" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf", "0.01", "100"], store)
       assert 0 = Bloom.handle("BF.CARD", ["bf"], store)
       Bloom.handle("BF.ADD", ["bf", "x"], store)
@@ -468,7 +589,7 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "auto-created filter has default capacity and error rate" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.ADD", ["bf", "hello"], store)
       result = Bloom.handle("BF.INFO", ["bf"], store)
       info = list_to_info_map(result)
@@ -477,7 +598,7 @@ defmodule Ferricstore.Commands.BloomTest do
     end
 
     test "multiple independent bloom filters do not interfere" do
-      store = MockStore.make()
+      store = make_store()
       Bloom.handle("BF.RESERVE", ["bf1", "0.001", "1000"], store)
       Bloom.handle("BF.RESERVE", ["bf2", "0.001", "1000"], store)
 
@@ -498,26 +619,26 @@ defmodule Ferricstore.Commands.BloomTest do
   describe "dispatcher integration" do
     test "BF.ADD is routed through dispatcher" do
       alias Ferricstore.Commands.Dispatcher
-      store = MockStore.make()
+      store = make_store()
       assert 1 = Dispatcher.dispatch("BF.ADD", ["bf", "hello"], store)
     end
 
     test "BF.EXISTS is routed through dispatcher" do
       alias Ferricstore.Commands.Dispatcher
-      store = MockStore.make()
+      store = make_store()
       Dispatcher.dispatch("BF.ADD", ["bf", "hello"], store)
       assert 1 = Dispatcher.dispatch("BF.EXISTS", ["bf", "hello"], store)
     end
 
     test "bf.add lowercase is routed through dispatcher" do
       alias Ferricstore.Commands.Dispatcher
-      store = MockStore.make()
+      store = make_store()
       assert 1 = Dispatcher.dispatch("bf.add", ["bf", "hello"], store)
     end
 
     test "Bf.Reserve mixed case is routed through dispatcher" do
       alias Ferricstore.Commands.Dispatcher
-      store = MockStore.make()
+      store = make_store()
       assert :ok = Dispatcher.dispatch("Bf.Reserve", ["bf", "0.01", "100"], store)
     end
   end
@@ -526,8 +647,6 @@ defmodule Ferricstore.Commands.BloomTest do
   # Helpers
   # ===========================================================================
 
-  # Converts the flat alternating [key, value, key, value, ...] list
-  # from BF.INFO into a map for easier assertions.
   defp list_to_info_map(list) do
     list
     |> Enum.chunk_every(2)

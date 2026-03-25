@@ -37,15 +37,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
 
     test "maybe_log records command when duration exceeds threshold" do
       # Set threshold to 0 so every command is logged.
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       SlowLog.maybe_log(["SET", "key", "value"], 100)
@@ -71,15 +67,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "maybe_log does not record when threshold is -1 (disabled)" do
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, -1)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(-1)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       SlowLog.maybe_log(["SET", "key", "value"], 999_999)
@@ -89,15 +81,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "get with count limits results" do
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       for i <- 1..5 do
@@ -113,15 +101,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "entries are returned newest first" do
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       SlowLog.maybe_log(["FIRST"], 100)
@@ -136,24 +120,15 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "ring buffer evicts oldest entries when max_len exceeded" do
-      original_threshold = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      original_max = Application.get_env(:ferricstore, :slowlog_max_len)
+      original_threshold = SlowLog.threshold()
+      original_max = SlowLog.max_len()
 
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
-      Application.put_env(:ferricstore, :slowlog_max_len, 3)
+      SlowLog.set_threshold(0)
+      SlowLog.set_max_len(3)
 
       on_exit(fn ->
-        if original_threshold do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original_threshold)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
-
-        if original_max do
-          Application.put_env(:ferricstore, :slowlog_max_len, original_max)
-        else
-          Application.delete_env(:ferricstore, :slowlog_max_len)
-        end
+        SlowLog.set_threshold(original_threshold)
+        SlowLog.set_max_len(original_max)
       end)
 
       for i <- 1..5 do
@@ -174,15 +149,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "reset clears all entries and resets ID counter" do
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       SlowLog.maybe_log(["OLD_CMD"], 100)
@@ -213,15 +184,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "returns entries after slow operations are logged" do
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       SlowLog.maybe_log(["SET", "mykey", "myval"], 15_000)
@@ -237,15 +204,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "with count limits results" do
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       for i <- 1..5 do
@@ -265,15 +228,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "entry format is [id, timestamp, duration, command_array]" do
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       SlowLog.maybe_log(["GET", "foo"], 42)
@@ -295,15 +254,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "returns correct count after logging" do
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       SlowLog.maybe_log(["A"], 10)
@@ -320,15 +275,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
     end
 
     test "clears all entries" do
-      original = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original = SlowLog.threshold()
+      SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        SlowLog.set_threshold(original)
       end)
 
       SlowLog.maybe_log(["CMD"], 100)

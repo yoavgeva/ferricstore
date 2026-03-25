@@ -18,10 +18,6 @@ defmodule Ferricstore.Store.ConcurrencyTest do
   @task_timeout 30_000
 
   setup do
-    # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
-    original = Application.get_env(:ferricstore, :raft_enabled)
-    Application.put_env(:ferricstore, :raft_enabled, false)
-    on_exit(fn -> Application.put_env(:ferricstore, :raft_enabled, original) end)
     :ok
   end
 
@@ -309,7 +305,7 @@ defmodule Ferricstore.Store.ConcurrencyTest do
       assert length(entries) == 30
 
       for i <- 0..29 do
-        [{k, v, 0, _lfu}] = :ets.lookup(ets, "ets_key_#{i}")
+        [{k, v, 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, "ets_key_#{i}")
         assert k == "ets_key_#{i}"
         assert v == "ets_val_#{i}"
       end

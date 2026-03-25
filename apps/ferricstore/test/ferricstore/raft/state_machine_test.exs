@@ -11,28 +11,50 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Raft.StateMachine
+  alias Ferricstore.Store.BitcaskWriter
 
   # ---------------------------------------------------------------------------
-  # Setup: create a temporary Bitcask store and ETS table for each test
+  # Setup: create a temporary Bitcask store and ETS table for each test.
+  # Also starts a BitcaskWriter for shard 0 so that background writes from
+  # StateMachine.apply work in isolation tests.
   # ---------------------------------------------------------------------------
 
   setup do
     dir = Path.join(System.tmp_dir!(), "sm_test_#{:rand.uniform(9_999_999)}")
     File.mkdir_p!(dir)
 
-    {:ok, store} = NIF.new(dir)
+    # v2: create a .log file instead of NIF.new
+    active_file_path = Path.join(dir, "00000.log")
+    File.touch!(active_file_path)
+
     suffix = :rand.uniform(9_999_999)
     keydir_name = :"sm_test_keydir_#{suffix}"
     :ets.new(keydir_name, [:set, :public, :named_table])
 
+    # Use a unique shard index to avoid name conflicts with other test processes.
+    shard_index = 9000 + :rand.uniform(999)
+
     state =
       StateMachine.init(%{
-        shard_index: 0,
-        store: store,
+        shard_index: shard_index,
+        shard_data_path: dir,
+        active_file_id: 0,
+        active_file_path: active_file_path,
         ets: keydir_name
       })
 
+    # Start a BitcaskWriter for this shard so deferred writes are processed.
+    {:ok, writer_pid} = BitcaskWriter.start_link(shard_index: shard_index)
+
     on_exit(fn ->
+      try do
+        if Process.alive?(writer_pid), do: GenServer.stop(writer_pid, :normal, 5000)
+      rescue
+        _ -> :ok
+      catch
+        :exit, _ -> :ok
+      end
+
       try do
         :ets.delete(keydir_name)
       rescue
@@ -42,7 +64,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       File.rm_rf!(dir)
     end)
 
-    %{state: state, ets: keydir_name, store: store, dir: dir}
+    %{state: state, ets: keydir_name, store: nil, dir: dir, active_file_path: active_file_path, shard_index: shard_index}
   end
 
   # ---------------------------------------------------------------------------
@@ -50,9 +72,10 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "init/1" do
-    test "creates initial state with expected fields", %{state: state} do
-      assert state.shard_index == 0
-      assert is_reference(state.store)
+    test "creates initial state with expected fields", %{state: state, shard_index: shard_index} do
+      assert state.shard_index == shard_index
+      assert is_binary(state.shard_data_path)
+      assert is_binary(state.active_file_path)
       assert is_atom(state.ets)
       assert state.applied_count == 0
     end
@@ -63,18 +86,24 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "apply/3 with {:put, key, value, expire_at_ms}" do
-    test "writes value to Bitcask and ETS", %{state: state, ets: ets, store: store} do
+    test "writes value to disk and ETS", %{state: state, ets: ets, shard_index: shard_index} do
       {new_state, result} =
         StateMachine.apply(%{}, {:put, "key1", "value1", 0}, state)
 
       assert result == :ok
       assert new_state.applied_count == 1
 
-      # Verify ETS (single-table format: {key, value, expire_at_ms, lfu_counter})
-      assert [{"key1", "value1", 0, _lfu}] = :ets.lookup(ets, "key1")
+      # Verify ETS (v2 7-tuple format) — value is available immediately
+      assert [{"key1", "value1", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, "key1")
 
-      # Verify Bitcask
-      assert {:ok, "value1"} = NIF.get(store, "key1")
+      # Flush background writer so disk location is materialized
+      BitcaskWriter.flush(shard_index)
+
+      # Verify disk via pread
+      [{_, _, _, _, fid, off, _}] = :ets.lookup(ets, "key1")
+      assert is_integer(fid)
+      log_path = Path.join(state.shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+      assert {:ok, "value1"} = NIF.v2_pread_at(log_path, off)
     end
 
     test "put with expiry stores expire_at_ms", %{state: state, ets: ets} do
@@ -84,7 +113,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
         StateMachine.apply(%{}, {:put, "expiring", "val", future}, state)
 
       assert result == :ok
-      assert [{"expiring", "val", ^future, _lfu}] = :ets.lookup(ets, "expiring")
+      assert [{"expiring", "val", ^future, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, "expiring")
     end
 
     test "put overwrites previous value", %{state: state, ets: ets} do
@@ -92,7 +121,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {state3, :ok} = StateMachine.apply(%{}, {:put, "k", "v2", 0}, state2)
 
       assert state3.applied_count == 2
-      assert [{"k", "v2", 0, _lfu}] = :ets.lookup(ets, "k")
+      assert [{"k", "v2", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, "k")
     end
 
     test "increments applied_count on each put", %{state: state} do
@@ -148,9 +177,9 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert new_state.applied_count == 3
 
       # All keys in ETS (single-table format)
-      assert [{"batch_a", "val_a", 0, _}] = :ets.lookup(ets, "batch_a")
-      assert [{"batch_b", "val_b", 0, _}] = :ets.lookup(ets, "batch_b")
-      assert [{"batch_c", "val_c", 0, _}] = :ets.lookup(ets, "batch_c")
+      assert [{"batch_a", "val_a", 0, _, _, _, _}] = :ets.lookup(ets, "batch_a")
+      assert [{"batch_b", "val_b", 0, _, _, _, _}] = :ets.lookup(ets, "batch_b")
+      assert [{"batch_c", "val_c", 0, _, _, _, _}] = :ets.lookup(ets, "batch_c")
     end
 
     test "mixed put and delete batch", %{state: state, ets: ets} do
@@ -169,8 +198,8 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert new_state.applied_count == 4
 
       assert [] == :ets.lookup(ets, "mix_a")
-      assert [{"mix_b", "vb", 0, _}] = :ets.lookup(ets, "mix_b")
-      assert [{"mix_c", "vc", 0, _}] = :ets.lookup(ets, "mix_c")
+      assert [{"mix_b", "vb", 0, _, _, _, _}] = :ets.lookup(ets, "mix_b")
+      assert [{"mix_c", "vc", 0, _, _, _, _}] = :ets.lookup(ets, "mix_c")
     end
 
     test "empty batch returns empty results", %{state: state} do
@@ -272,11 +301,11 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "overview/1" do
-    test "returns shard_index, keydir_size, and applied_count", %{state: state} do
+    test "returns shard_index, keydir_size, and applied_count", %{state: state, shard_index: shard_index} do
       {state2, :ok} = StateMachine.apply(%{}, {:put, "ov_k", "ov_v", 0}, state)
 
       overview = StateMachine.overview(state2)
-      assert overview.shard_index == 0
+      assert overview.shard_index == shard_index
       assert overview.keydir_size == 1
       assert overview.applied_count == 1
     end
@@ -296,7 +325,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
   describe "release_cursor log compaction" do
     test "init/1 stores release_cursor_interval from config", %{store: store, ets: ets} do
-      state = StateMachine.init(%{shard_index: 0, store: store, ets: ets})
+      state = StateMachine.init(%{shard_index: 0, shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"), ets: ets})
       assert is_integer(state.release_cursor_interval)
       assert state.release_cursor_interval > 0
     end
@@ -305,7 +334,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: store,
+          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: 500
         })
@@ -317,7 +346,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: store,
+          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: 5
         })
@@ -346,7 +375,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: store,
+          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -382,7 +411,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: store,
+          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -411,7 +440,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: store,
+          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -439,7 +468,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: store,
+          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -505,7 +534,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 2,
-          store: store,
+          shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })
@@ -525,7 +554,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       # The snapshot state should reflect the current state
       assert cursor_state.shard_index == 2
       assert cursor_state.applied_count == 3
-      assert cursor_state.store == store
+      assert is_binary(cursor_state.shard_data_path)
       assert cursor_state.ets == ets
       assert cursor_state.release_cursor_interval == interval
     end

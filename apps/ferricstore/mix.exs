@@ -1,10 +1,12 @@
 defmodule Ferricstore.MixProject do
   use Mix.Project
 
+  @version "0.1.0"
+
   def project do
     [
       app: :ferricstore,
-      version: "0.1.0",
+      version: @version,
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
@@ -13,7 +15,8 @@ defmodule Ferricstore.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       compilers: Mix.compilers(),
-      deps: deps()
+      deps: deps(),
+      package: package()
     ]
   end
 
@@ -27,9 +30,27 @@ defmodule Ferricstore.MixProject do
     ]
   end
 
+  defp package do
+    [
+      files: [
+        "lib",
+        "native/ferricstore_bitcask/.cargo",
+        "native/ferricstore_bitcask/src",
+        "native/ferricstore_bitcask/Cargo*",
+        "checksum-*.exs",
+        "mix.exs"
+      ],
+      licenses: ["MIT"],
+      links: %{
+        "GitHub" => "https://github.com/YoavGivati/ferricstore"
+      }
+    ]
+  end
+
   defp deps do
     [
-      {:rustler, "~> 0.37"},
+      {:rustler_precompiled, "~> 0.8"},
+      {:rustler, "~> 0.37", optional: true},
       {:ra, "~> 2.14"},
       {:libcluster, "~> 3.3"},
       {:telemetry, "~> 1.4"},

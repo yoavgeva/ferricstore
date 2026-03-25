@@ -1,0 +1,823 @@
+# Configuration Reference
+
+FerricStore is configured through Elixir's standard `config/config.exs` (compile-time) and `config/runtime.exs` (runtime). Some parameters can also be changed at runtime via the `CONFIG SET` Redis command.
+
+> **Mode applicability.** Each option is tagged with its scope:
+>
+> - **Both** — applies to standalone and embedded mode
+> - **Standalone only** — ignored in embedded mode (no TCP listener, no connections)
+> - **Embedded only** — only relevant when running as an in-process library
+
+## Mode
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:mode` | `:standalone \| :embedded` | `:standalone` | Both | Operational mode. `:standalone` starts TCP/TLS listeners and HTTP health endpoint. `:embedded` starts only the core engine. |
+
+```elixir
+config :ferricstore, :mode, :embedded
+```
+
+## Network
+
+*Standalone only — these options are ignored in embedded mode.*
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:port` | `integer` | `6379` | Standalone only | TCP port for the RESP3 listener. Use `0` for an OS-assigned ephemeral port (useful in tests). |
+| `:health_port` | `integer` | `4000` | Standalone only | HTTP port for health checks and Prometheus metrics. Use `0` for ephemeral. |
+
+```elixir
+config :ferricstore, :port, 6379
+config :ferricstore, :health_port, 4000
+```
+
+## Storage
+
+> See [Architecture Guide — Three-Tier Storage](architecture.md#three-tier-storage)
+> for how ETS, Bitcask, and mmap work together.
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:data_dir` | `string` | `"data"` | Both | Root directory for Bitcask data files, Raft WAL, mmap structures, and hint files. Each shard gets a subdirectory. |
+| `:shard_count` | `integer` | `4` | Both | Number of shards. Each shard is a separate ETS table, Bitcask directory, and Raft group. More shards = more write parallelism but more file descriptors. **Compile-time only.** |
+| `:hot_cache_max_value_size` | `integer` | `65_536` | Both | Maximum value size (bytes) stored in ETS hot cache. Values larger than this are stored as `nil` in ETS and read from Bitcask on access. Prevents large binaries from being copied on every ETS lookup. |
+
+```elixir
+config :ferricstore, :data_dir, "data"
+config :ferricstore, :shard_count, 4
+config :ferricstore, :hot_cache_max_value_size, 65_536
+```
+
+## Memory Management
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:max_memory_bytes` | `integer` | `nil` | Both | Maximum total ETS memory budget in bytes. When unset, no memory limit is enforced. |
+| `:eviction_policy` | `atom` | `:volatile_lru` | Both | Eviction policy when memory limit is reached. See policies below. |
+| `:memory_guard_interval_ms` | `integer` | `100` | Both | How often (ms) MemoryGuard checks memory pressure. |
+| `:keydir_max_ram` | `integer` | `268_435_456` | Both | Maximum RAM for ETS keydir metadata in bytes (default: 256 MB). |
+| `:hot_cache_max_ram` | `integer` | derived | Both | Maximum RAM for hot cache values. Default: `max_memory_bytes - keydir_max_ram`, minimum 64 MB. |
+| `:hot_cache_min_ram` | `integer` | `67_108_864` | Both | Minimum RAM for hot cache values in bytes (default: 64 MB). |
+| `:maxclients` | `integer` | `10_000` | Standalone only | Maximum simultaneous client connections. Ignored in embedded mode (no TCP connections). |
+| `:promotion_threshold` | `integer` | `100` | Both | Field/member count threshold for promoting collections (hash/set/zset) to dedicated Bitcask instances. |
+
+### Eviction: How It Works
+
+> See [Architecture Guide — LFU Eviction](architecture.md#lfu-eviction) and
+> [Architecture Guide — Memory Guard](architecture.md#memory-guard) for
+> implementation details.
+
+> **Defaults out of the box:**
+>
+> | Setting | Default | Meaning |
+> |---------|---------|---------|
+> | `:max_memory_bytes` | `nil` (no limit) | Eviction is **disabled** until you set this. Without a limit, ETS grows unbounded. |
+> | `:eviction_policy` | `:volatile_lru` | When eviction triggers, only keys with a TTL are candidates. Least-frequently-accessed go first. |
+> | `:lfu_decay_time` | `1` minute | Counter decays by 1 every minute — keys that stop being accessed lose priority within minutes. |
+> | `:lfu_log_factor` | `10` | Moderate increment curve. Matches Redis default. |
+> | `:memory_guard_interval_ms` | `100` ms | Memory checked 10 times per second. |
+>
+> **If you set nothing**, eviction never happens and RAM grows until the OS kills the process.
+> At minimum, set `:max_memory_bytes` in production.
+
+FerricStore has a three-tier storage model:
+
+```
+                 ┌─────────────────────────┐
+  Tier 1 (HOT)  │  ETS (RAM)              │  ~1-5 us reads
+                 │  key → value in memory  │
+                 └────────────┬────────────┘
+                              │ eviction moves value
+                              │ out of RAM (key stays)
+                 ┌────────────▼────────────┐
+  Tier 2 (COLD) │  ETS (RAM) metadata     │  ~50-200 us reads
+                 │  key → nil (disk loc)   │  (pread from disk)
+                 └────────────┬────────────┘
+                              │ always persisted
+                 ┌────────────▼────────────┐
+  Tier 3 (DISK) │  Bitcask (append-only)  │  source of truth
+                 │  all keys, all values   │
+                 └─────────────────────────┘
+```
+
+**Eviction does NOT delete data.** When a key is evicted, its value is removed
+from RAM (Tier 1 → Tier 2) but it stays on disk. The ETS entry keeps the key
+and disk location (`file_id`, `offset`) so the next read can fetch it. The key
+goes from "hot" (~1-5 us) to "cold" (~50-200 us) — slower but still accessible.
+
+When RAM usage reaches `max_memory_bytes`, MemoryGuard must choose which hot
+keys to make cold. This involves two things:
+
+1. **LFU scoring** — a counter on each key that tracks how often it's accessed
+2. **Eviction policy** — a filter that decides which keys are *eligible*
+
+They are **not separate systems** — they work together:
+
+```
+  RAM full → MemoryGuard triggers
+         │
+         ▼
+  ┌──────────────────────────┐
+  │  1. FILTER by policy     │  ← eviction policy controls this
+  │     volatile_lru: only   │
+  │       keys with TTL      │
+  │     allkeys_lru: all     │
+  │       keys               │
+  │     volatile_ttl: only   │
+  │       keys with TTL      │
+  │     noeviction: nobody   │
+  │       (reject writes)    │
+  └────────────┬─────────────┘
+               ▼
+  ┌──────────────────────────┐
+  │  2. SORT by score        │  ← LFU counter controls this
+  │     volatile_lru: lowest │    (except volatile_ttl which
+  │       LFU score first    │     sorts by shortest TTL)
+  │     allkeys_lru: lowest  │
+  │       LFU score first    │
+  │     volatile_ttl: shortest│
+  │       remaining TTL first│
+  └────────────┬─────────────┘
+               ▼
+  ┌──────────────────────────┐
+  │  3. EVICT                │
+  │     Set value to nil in  │
+  │     ETS. Key stays, disk │
+  │     location preserved.  │
+  └──────────────────────────┘
+```
+
+### Eviction Policies
+
+| Policy | Which keys can be evicted? | How are victims chosen? | Use when... |
+|--------|---------------------------|------------------------|-------------|
+| `:volatile_lru` | Only keys **with a TTL** | Lowest LFU score (least accessed) | You have two types of data: permanent (no TTL) that must stay hot, and cache entries (with TTL) that can go cold. **Default. Best for most apps.** |
+| `:allkeys_lru` | **Any key** | Lowest LFU score (least accessed) | All keys are cache entries, or you don't care which keys go cold — let the access pattern decide. Best RAM utilization. |
+| `:volatile_ttl` | Only keys **with a TTL** | Shortest remaining TTL (expiring soonest) | TTL duration = importance. A 5-min cache entry should be evicted before a 24-hour session. Does **not** use LFU scores. |
+| `:noeviction` | **None** | N/A — writes are rejected with OOM error | Your dataset fits in RAM and you'd rather fail writes than serve cold reads. |
+
+> **Quick decision guide:**
+>
+> - "I have cache data (with TTL) and permanent data (no TTL)" → `:volatile_lru`
+> - "Everything is cache data" or "I don't use TTLs" → `:allkeys_lru`
+> - "Short-lived keys should go first" → `:volatile_ttl`
+> - "My data fits in RAM, never evict" → `:noeviction`
+>
+> **If you're unsure, use `:volatile_lru`** (the default). Set a TTL on cache
+> entries and leave permanent data without TTL.
+
+### LFU Scoring (the counter behind `volatile_lru` and `allkeys_lru`)
+
+Every key in ETS has an LFU counter — a packed 24-bit integer stored in the
+7-tuple alongside the key and value. This counter answers: "how important is
+this key based on recent access patterns?"
+
+```
+  ┌─────────────────────────────────────┐
+  │  24-bit LFU counter                 │
+  │  ┌──────────────┬──────────────┐    │
+  │  │ ldt (16 bit) │ counter (8b) │    │
+  │  │ last decay   │ log access   │    │
+  │  │ timestamp    │ frequency    │    │
+  │  └──────────────┴──────────────┘    │
+  └─────────────────────────────────────┘
+```
+
+**How it works:**
+
+1. **On every read** (GET, HGET, etc.), the counter is **probabilistically
+   incremented**. "Probabilistically" means: the higher the counter already is,
+   the harder it is to increment. A key accessed 1 million times won't have a
+   much higher counter than one accessed 10,000 times — this prevents popular
+   keys from monopolizing RAM forever.
+
+2. **Over time, the counter decays.** Every `:lfu_decay_time` minutes (default: 1),
+   the counter drops by 1. A key that was hot an hour ago but hasn't been
+   accessed since will have a low score — even if it had millions of historical
+   accesses. This is what makes it *adaptive*: access patterns change, and the
+   counter follows.
+
+3. **On eviction**, MemoryGuard compares the **effective counter** (after
+   applying time decay) across candidate keys. The key with the lowest score
+   gets evicted first.
+
+**The two LFU config knobs:**
+
+| Option | Default | What it controls | Tuning guidance |
+|--------|---------|-----------------|-----------------|
+| `:lfu_decay_time` | `1` | Minutes between decay steps. Lower = faster decay = more responsive to changing access patterns. `0` disables decay entirely. | Leave at `1` unless your workload has very slow access cycles (e.g., keys accessed once per hour — use `10` or higher). |
+| `:lfu_log_factor` | `10` | How hard it is to increment the counter. Higher = harder to saturate = better differentiation between moderately and extremely hot keys. | Leave at `10` for most workloads. Use `100` if you have extreme hotspot keys (millions of reads/sec on a few keys) and want to distinguish them from merely popular keys. |
+
+```elixir
+config :ferricstore, :lfu_decay_time, 1
+config :ferricstore, :lfu_log_factor, 10
+```
+
+> These match Redis's `lfu-decay-time` and `lfu-log-factor` exactly — same
+> algorithm, same defaults, same behavior.
+
+### Memory Pressure Thresholds
+
+MemoryGuard monitors ETS memory at configurable intervals and takes action at
+three pressure levels. All thresholds are relative to `max_memory_bytes`:
+
+| Level | Threshold | What happens |
+|-------|-----------|--------------|
+| Normal | < 70% | Nothing. Writes proceed normally. |
+| Warning | 70% | Logs a warning. No action taken — this is an early heads-up. |
+| Pressure | 85% | Begins eviction. MemoryGuard samples keys from ETS and evicts the lowest-scored ones according to the eviction policy. Emits `:ferricstore.memory_pressure` telemetry event. |
+| Reject | 95% | With `:noeviction` policy: new writes are rejected with `-OOM` error. With other policies: eviction continues aggressively. |
+
+If `max_memory_bytes` is not set, MemoryGuard is disabled and no eviction or
+rejection occurs. This is fine for development but **not recommended for
+production** — an unbounded ETS can eventually exhaust system RAM.
+
+```elixir
+config :ferricstore, :max_memory_bytes, 4_294_967_296  # 4 GB
+config :ferricstore, :eviction_policy, :allkeys_lru
+config :ferricstore, :memory_guard_interval_ms, 100
+```
+
+## Raft Consensus & Durability
+
+> See [Architecture Guide — Raft Consensus](architecture.md#raft-consensus) for
+> the full write path, state machine internals, and batcher design.
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:raft_enabled` | `boolean` | `true` | Both | Whether writes go through Raft consensus. See below. |
+
+```elixir
+config :ferricstore, :raft_enabled, true
+```
+
+Raft controls **write durability** — whether a write is crash-safe before the
+client gets an OK response. It is **not** about read consistency (reads always
+come from ETS which is updated immediately regardless of Raft).
+
+### What Raft does
+
+When `:raft_enabled` is `true` (default), every write follows this path:
+
+```
+  Client writes SET key value
+         │
+         ▼
+  ETS updated immediately        ← reads see the new value NOW
+         │
+         ▼
+  Batcher accumulates writes     ← groups writes for throughput
+         │
+         ▼
+  ra (Raft library) commits      ← blocks until quorum confirms
+         │                          (single node = self-quorum)
+         ▼
+  v2_append_batch + fsync        ← persisted to disk
+         │
+         ▼
+  Client gets OK                 ← crash-safe at this point
+```
+
+If the node crashes **after** ETS update but **before** Raft commit, the write
+is lost. This window is typically <1ms (the group-commit batch interval).
+
+When `:raft_enabled` is `false`, writes skip Raft entirely — ETS is updated
+and the write is appended to disk in the background without fsync. Faster,
+but a crash can lose recent writes.
+
+### Two durability modes (per-namespace)
+
+Within Raft-enabled mode, each key namespace (prefix before the first `:`) can
+be configured with a different durability level:
+
+| Mode | How it works | Durability guarantee | Latency |
+|------|-------------|---------------------|---------|
+| `:quorum` | Write goes through Raft. Blocks until a **majority of nodes** have committed and fsynced the write to disk. Client gets OK only after quorum confirms. | **Crash-safe.** If you got OK, the data is on disk on a majority of nodes. Single node: fsynced locally. 3 nodes: fsynced on at least 2 — the third catches up later via Raft log replication. | ~1-5ms (group commit window + fsync) |
+| `:async` | Write bypasses Raft entirely. Sent directly to `AsyncApplyWorker` which writes to disk without fsync. Client gets OK immediately. | **NOT crash-safe.** A crash loses unfsynced writes (last ~1-100ms of data). | ~10-50us (ETS write only) |
+
+**Default:** All namespaces use `:quorum` with a 1ms group-commit window.
+
+**When to use `:async`:** For data you can afford to lose on crash — ephemeral
+counters, rate limit windows, analytics events, cache warming. The 10-100x
+latency reduction is significant for high-throughput fire-and-forget workloads.
+
+**When to use `:quorum`:** For anything that must survive a crash — user data,
+sessions, financial transactions, queue state. This is the default and the
+right choice for most data.
+
+### How Raft log replication works (multi-node)
+
+In a multi-node cluster, one node is the **leader** and the others are
+**followers**. All writes go to the leader.
+
+```
+  Client: SET key value
+         │
+         ▼
+  Leader node
+    1. Appends write to its local Raft log
+    2. Sends AppendEntries RPC to all followers (in parallel)
+    3. Followers write to their local Raft log and acknowledge
+    4. Once majority (2 of 3) have acknowledged → committed
+    5. Leader replies OK to client
+    6. Leader applies the write (ETS + Bitcask)
+    7. Followers apply the write on their side
+```
+
+Replication happens **continuously** as writes arrive — the leader streams new
+log entries to followers, piggybacked on heartbeats (every ~100-500ms). There
+is no separate "replication phase."
+
+**If a follower is down or slow**, it misses some entries. When it comes back
+online, the leader detects the gap and sends all missing entries in bulk. The
+follower replays them in order and catches up. This is automatic — no manual
+intervention needed.
+
+**Single-node mode** (the common case): the leader is its own quorum. Writes
+are committed as soon as they're fsynced locally. No network round-trips.
+
+Configure per-namespace at runtime:
+
+```bash
+# Session data: quorum durability, 1ms batch window (default)
+redis-cli FERRICSTORE.CONFIG SET session window_ms 1 durability quorum
+
+# Analytics counters: async durability, 5ms batch window (fast, lossy)
+redis-cli FERRICSTORE.CONFIG SET analytics window_ms 5 durability async
+
+# Reset to defaults
+redis-cli FERRICSTORE.CONFIG RESET analytics
+```
+
+Or in Elixir config:
+
+```elixir
+config :ferricstore, :namespace_config, %{
+  "session" => %{window_ms: 1, durability: :quorum},
+  "analytics" => %{window_ms: 5, durability: :async}
+}
+```
+
+### When to disable Raft entirely
+
+Set `:raft_enabled` to `false` only for:
+- **Benchmarking** — measure raw ETS + Bitcask throughput without Raft overhead
+- **Development** — faster startup, simpler debugging
+
+When disabled, writes go directly to the shard without fsync. Data is still
+written to disk (via OS page cache) and survives normal app restarts, but a
+sudden crash or power loss can lose the last ~1-30 seconds of writes.
+
+> **Multi-node warning:** `raft_enabled: false` **breaks multi-node clusters**.
+> With Raft disabled there is no replication — each node is independent. Writes
+> go to whichever node the client connects to and never propagate to other
+> nodes. No leader election, no failover, no data consistency across nodes.
+> Only use this in single-node setups.
+
+In production, leave Raft enabled. Use per-namespace `:async` durability
+for specific prefixes that don't need crash safety — this gives you the
+speed benefit without breaking replication.
+
+## Connection Limits
+
+Safety limits that prevent a single connection from consuming unbounded memory.
+These protect against oversized payloads, slow-drip buffer attacks, and
+runaway transactions or pipelines.
+
+| Option | Type | Default | Hard Cap | Applies to | Description |
+|--------|------|---------|----------|------------|-------------|
+| `:max_value_size` | `integer` | `1_048_576` (1 MB) | `67_108_864` (64 MB) | Both | Maximum bulk string (value) size in bytes. Enforced at RESP3 parse time and in embedded `FerricStore.set/3`. The hard cap of 64 MB is non-configurable. |
+| Buffer limit | compile-time | `134_217_728` (128 MB) | — | Standalone only | Maximum bytes accumulated in a connection's receive buffer before the connection is closed. Not configurable at runtime (module attribute in `Connection`). |
+| MULTI queue limit | compile-time | `100_000` | — | Standalone only | Maximum commands queued inside a `MULTI` transaction. When exceeded, the transaction is auto-discarded and an error is returned. |
+| Pipeline batch limit | compile-time | `100_000` | — | Standalone only | Maximum commands in a single pipeline batch. When exceeded, the entire batch is rejected with an error. |
+
+### Max value size
+
+Applied at two levels:
+
+1. **RESP3 parser** — when a bulk string header `$N\r\n` declares a length exceeding the limit, the parser returns an error immediately without reading the body. The connection receives `-ERR value too large (N bytes, max M bytes)` and is closed.
+2. **Embedded API** — `FerricStore.set/3` checks `byte_size(value)` before writing and returns `{:error, "ERR value too large ..."}` if the value exceeds the limit.
+
+```elixir
+# Allow values up to 10 MB (capped at 64 MB hard limit)
+config :ferricstore, :max_value_size, 10_485_760
+```
+
+### Buffer, MULTI queue, and pipeline limits
+
+These are compile-time module attributes in `FerricstoreServer.Connection` and
+cannot be changed at runtime. The defaults are generous enough for any
+legitimate workload while preventing pathological resource exhaustion:
+
+- **Buffer overflow** — a client sending incomplete RESP frames faster than
+  they can be parsed will accumulate data in the receive buffer. At 128 MB the
+  connection is closed with `-ERR connection buffer overflow`.
+- **MULTI queue overflow** — a client queueing more than 100K commands inside
+  `MULTI` triggers an automatic `DISCARD` with `-ERR MULTI queue overflow`.
+- **Pipeline overflow** — a pipeline batch with more than 100K commands is
+  rejected with `-ERR pipeline batch too large`.
+
+## L1 Per-Connection Cache
+
+*Standalone only — embedded mode has no TCP connections so L1 cache does not apply. In embedded mode, reads go directly to ETS (~1-5 us) which is already faster than L1 would provide.*
+
+> See [Architecture Guide — Connection Handling](architecture.md#connection-handling)
+> for how L1 cache, CLIENT TRACKING, and per-connection state work.
+
+Each TCP connection maintains a small in-process cache for repeated reads of the same keys. Invalidation is handled by CLIENT TRACKING.
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:l1_cache_enabled` | `boolean` | `true` | Standalone only | Enable per-connection L1 cache. |
+| `:l1_cache_max_entries` | `integer` | `64` | Standalone only | Maximum number of keys cached per connection. |
+| `:l1_cache_max_bytes` | `integer` | `1_048_576` | Standalone only | Maximum total bytes cached per connection (1 MB). |
+
+```elixir
+config :ferricstore, :l1_cache_enabled, true
+config :ferricstore, :l1_cache_max_entries, 64
+config :ferricstore, :l1_cache_max_bytes, 1_048_576
+```
+
+## Sendfile Zero-Copy
+
+*Standalone only — embedded mode returns values directly via ETS or `v2_pread_at`, with no socket involved.*
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:sendfile_threshold` | `integer` | `65_536` | Standalone only | Minimum value size (bytes) for sendfile zero-copy. Values larger than this are served via `:file.sendfile/5` instead of copying into BEAM memory. Only applies to cold (on-disk) keys over plain TCP. |
+
+```elixir
+config :ferricstore_server, :sendfile_threshold, 65_536
+```
+
+## TLS
+
+*Standalone only — embedded mode has no network listener so TLS does not apply.*
+
+> See [Security Guide — TLS](security.md#tls) for certificate setup and mutual
+> TLS configuration.
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:tls_port` | `integer` | `nil` | Standalone only | TLS port to bind. Not started unless configured. |
+| `:tls_cert_file` | `string` | `nil` | Standalone only | Path to PEM certificate file. |
+| `:tls_key_file` | `string` | `nil` | Standalone only | Path to PEM private key file. |
+| `:tls_ca_cert_file` | `string` | `nil` | Standalone only | Path to CA certificate bundle (optional, for mutual TLS). |
+| `:require_tls` | `boolean` | `false` | Standalone only | When `true`, reject plaintext TCP connections. |
+
+```elixir
+config :ferricstore, :tls_port, 6380
+config :ferricstore, :tls_cert_file, "/etc/ssl/ferricstore/cert.pem"
+config :ferricstore, :tls_key_file, "/etc/ssl/ferricstore/key.pem"
+config :ferricstore, :tls_ca_cert_file, "/etc/ssl/ferricstore/ca.pem"
+config :ferricstore, :require_tls, true
+```
+
+## Merge / Compaction
+
+> See [Architecture Guide — Merge / Compaction](architecture.md#merge--compaction)
+> for the compaction lifecycle, semaphore, and file selection.
+
+Bitcask files are append-only and accumulate dead entries over time. The merge scheduler periodically compacts data files by copying live entries to new files and discarding the old ones.
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:merge.check_interval_ms` | `integer` | varies | Both | How often the merge scheduler checks for fragmentation. |
+| `:merge.fragmentation_threshold` | `float` | `0.5` | Both | Fragmentation ratio (dead/total) above which a merge is triggered. |
+
+```elixir
+config :ferricstore, :merge,
+  check_interval_ms: 60_000,
+  fragmentation_threshold: 0.5
+```
+
+## Expiry Sweep
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:expiry_sweep_interval_ms` | `integer` | `1_000` | Both | How often each shard scans for expired keys. See below. |
+
+When you set a TTL on a key (`SET key value EX 60` or `FerricStore.set("key", "value", ttl: 60_000)`),
+the key doesn't disappear the instant it expires. FerricStore uses two complementary strategies to
+clean up expired keys — just like Redis:
+
+**1. Lazy expiry (on read):** When any command reads a key, it checks
+`expire_at_ms`. If the key is past its TTL, it's deleted on the spot and the
+command returns as if the key doesn't exist. This is free — it piggybacks on
+the read that was happening anyway. Hot keys are always cleaned up instantly.
+
+**2. Active expiry sweep (background):** Every `:expiry_sweep_interval_ms`
+(default: 1 second), each shard samples keys from ETS and deletes any that
+have expired. This catches keys that nobody is reading — without the sweep,
+a key set with a 5-minute TTL that nobody ever reads again would sit in ETS
+and on disk forever, wasting RAM.
+
+```
+  Lazy expiry (on read):              Active sweep (background):
+
+  GET key                             Every 1 second per shard:
+    │                                   │
+    ▼                                   ▼
+  Check expire_at_ms                  Sample keys from ETS
+    │                                   │
+    ├─ not expired → return value       ├─ expired → delete from ETS
+    │                                   │             + write tombstone to disk
+    └─ expired → delete + return nil    └─ not expired → skip
+```
+
+**Tuning guidance:**
+
+| Value | Effect |
+|-------|--------|
+| `1_000` (default) | Good balance. Expired keys linger at most ~1 second after their TTL. |
+| `100` | Aggressive cleanup. More CPU per shard but tighter TTL precision. Use if you have many short-TTL keys (sub-second) and need them gone fast. |
+| `10_000` | Lazy cleanup. Expired keys may linger up to 10 seconds. Saves CPU if you have few expiring keys or don't care about precise cleanup. |
+| `600_000` | Effectively disables active sweep (10 minutes). Only lazy expiry on read. Good for tests or when you don't use TTLs at all. |
+
+The sweep also writes tombstones to Bitcask for expired keys, so they're
+cleaned from disk on the next compaction cycle.
+
+> See [Architecture Guide — Recovery](architecture.md#recovery) for how expired
+> keys are handled during shard restart.
+
+```elixir
+config :ferricstore, :expiry_sweep_interval_ms, 1_000
+```
+
+## Sync Flush
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:sync_flush_timeout_ms` | `integer` | `5_000` | Both | Maximum time to wait for an in-flight disk flush to complete. See below. |
+
+FerricStore has two disk write modes that work together:
+
+**Async flush (normal writes):** During regular operation, writes accumulate in
+a pending list and are flushed to disk periodically via `v2_append_batch_nosync`
+(page cache only, ~1us). A separate async fsync is then submitted to Tokio
+to make the data durable. This async fsync runs in the background — the shard
+GenServer continues processing commands while the disk syncs.
+
+**Sync flush (durability-critical operations):** Certain operations need to
+guarantee that ALL pending data is on disk before they can proceed. These
+include: DEL (tombstone must be durable), KEYS/SCAN (must reflect latest
+state), shutdown (must not lose data), and any explicit flush request. For
+these, the shard calls `flush_pending_sync` which:
+
+1. Writes all pending entries to disk via `v2_append_batch` (includes fsync)
+2. If an async fsync is already in-flight from a previous batch, **waits** for
+   it to complete before proceeding
+
+The `sync_flush_timeout_ms` controls step 2 — how long the shard GenServer
+will block waiting for an in-flight async fsync to finish. If the timeout
+expires (disk is very slow, I/O stall), the shard logs an error and proceeds
+anyway to avoid permanently blocking the GenServer.
+
+```
+  Normal write path (async):
+
+  pending list → v2_append_batch_nosync → page cache
+                                            │
+                                            └─ v2_fsync_async → Tokio → disk
+                                                (background, non-blocking)
+
+  Durability-critical path (sync):
+
+  flush_pending_sync
+    │
+    ├─ 1. Write pending → v2_append_batch (includes fsync)
+    │
+    └─ 2. If async fsync in-flight from previous batch:
+           wait up to sync_flush_timeout_ms for it to complete
+           │
+           ├─ completed → proceed (data is durable)
+           └─ timeout → log error, proceed anyway (avoid GenServer deadlock)
+```
+
+**Tuning guidance:**
+
+| Value | When to use |
+|-------|-------------|
+| `5_000` (default) | Good for most deployments. NVMe/SSD fsync completes in 1-10ms. The 5s timeout is a safety net for edge cases (I/O queue depth spikes, slow cloud disks). |
+| `1_000` | Fast-fail on slow I/O. If fsync takes >1s something is seriously wrong — better to log and move on than block the shard for 5s. Good for NVMe-only deployments. |
+| `10_000` | Tolerant of slow I/O. Use on network-attached storage (EBS, GCE PD) or spinning disks where fsync can occasionally take seconds under load. |
+| `30_000` | Very tolerant. Only for extremely slow storage or debugging I/O issues. |
+
+> **If this timeout fires in production**, it means your disk can't keep up with
+> write throughput. Check: I/O utilization (`iostat`), disk queue depth, whether
+> the filesystem journal is creating write amplification. Consider fewer shards
+> or faster storage.
+
+> See [Architecture Guide — Write Path](architecture.md#write-path) for the full
+> write pipeline and how async/sync flushes interact with Raft group commit.
+
+```elixir
+config :ferricstore, :sync_flush_timeout_ms, 5_000
+```
+
+## Large Value Warning
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:embedded_large_value_warning_bytes` | `integer` | `524_288` | Embedded only | At startup, scan ETS for values exceeding this threshold and log a warning. Helps catch accidental large-value storage in embedded mode. In standalone mode, large values are served via sendfile zero-copy instead. |
+
+```elixir
+config :ferricstore, :embedded_large_value_warning_bytes, 512 * 1024
+```
+
+## Node Discovery (libcluster)
+
+FerricStore uses [libcluster](https://hexdocs.pm/libcluster/) for automatic node discovery in multi-node deployments.
+
+```elixir
+# Local development: Gossip (multicast)
+config :libcluster,
+  topologies: [
+    ferricstore: [
+      strategy: Cluster.Strategy.Gossip,
+      config: [
+        port: 45892,
+        if_addr: "0.0.0.0",
+        multicast_addr: "230.1.1.251"
+      ]
+    ]
+  ]
+
+# Kubernetes: DNS
+config :libcluster,
+  topologies: [
+    ferricstore: [
+      strategy: Cluster.Strategy.Kubernetes.DNS,
+      config: [
+        service: "ferricstore-headless",
+        application_name: "ferricstore"
+      ]
+    ]
+  ]
+
+# Disable (tests, single-node)
+config :libcluster, topologies: :disabled
+```
+
+## Example: Development Configuration
+
+```elixir
+# config/dev.exs
+config :ferricstore, :port, 6379
+config :ferricstore, :data_dir, "data"
+config :ferricstore, :max_memory_bytes, 1_073_741_824  # 1 GB
+config :ferricstore, :eviction_policy, :volatile_lru
+
+config :libcluster,
+  topologies: [
+    ferricstore: [
+      strategy: Cluster.Strategy.Gossip
+    ]
+  ]
+```
+
+## Example: Test Configuration
+
+```elixir
+# config/test.exs
+config :ferricstore, :port, 0
+config :ferricstore, :health_port, 0
+config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.getpid()}"
+config :ferricstore, :sync_flush_timeout_ms, 1_000
+config :ferricstore, :max_memory_bytes, 1_073_741_824
+config :ferricstore, :eviction_policy, :volatile_lru
+config :ferricstore, :memory_guard_interval_ms, 5_000
+config :ferricstore, :merge, check_interval_ms: 600_000, fragmentation_threshold: 0.99
+config :ferricstore, :expiry_sweep_interval_ms, 600_000
+config :ferricstore, :raft_enabled, true
+config :libcluster, topologies: :disabled
+```
+
+## Example: Production Configuration
+
+```elixir
+# config/runtime.exs
+config :ferricstore, :port, String.to_integer(System.get_env("FERRICSTORE_PORT", "6379"))
+config :ferricstore, :data_dir, System.get_env("FERRICSTORE_DATA_DIR", "/var/lib/ferricstore")
+config :ferricstore, :max_memory_bytes, 8_589_934_592  # 8 GB
+config :ferricstore, :eviction_policy, :allkeys_lru
+
+config :ferricstore, :tls_port, 6380
+config :ferricstore, :tls_cert_file, System.get_env("TLS_CERT_FILE")
+config :ferricstore, :tls_key_file, System.get_env("TLS_KEY_FILE")
+config :ferricstore, :require_tls, true
+
+config :libcluster,
+  topologies: [
+    ferricstore: [
+      strategy: Cluster.Strategy.Kubernetes.DNS,
+      config: [
+        service: "ferricstore-headless",
+        application_name: "ferricstore"
+      ]
+    ]
+  ]
+```
+
+## Runtime Configuration (CONFIG SET)
+
+Some parameters can be changed at runtime **without restarting FerricStore**.
+This works in both standalone and embedded mode — same parameters, same
+behavior, different API.
+
+### Standalone mode (Redis protocol)
+
+```bash
+redis-cli CONFIG SET maxmemory-policy allkeys-lru
+redis-cli CONFIG GET maxmemory
+redis-cli CONFIG GET *             # get all parameters
+```
+
+### Embedded mode (Elixir API)
+
+```elixir
+# Set a parameter
+:ok = Ferricstore.Config.set("maxmemory-policy", "allkeys-lru")
+
+# Get a single parameter (fast ETS read, ~100ns)
+"allkeys-lru" = Ferricstore.Config.get_value("maxmemory-policy")
+
+# Get parameters matching a pattern (returns list of {key, value} pairs)
+pairs = Ferricstore.Config.get("*")            # all parameters
+pairs = Ferricstore.Config.get("maxmemory*")   # matching pattern
+
+# Read-only parameter
+{:error, "ERR Unsupported CONFIG parameter: maxmemory (read-only)"} =
+  Ferricstore.Config.set("maxmemory", "999")
+```
+
+Changes take effect immediately. A `[:ferricstore, :config, :changed]`
+telemetry event is emitted on every successful `CONFIG SET`.
+
+### Read-Write Parameters
+
+| Parameter | Description | Applies to |
+|-----------|-------------|------------|
+| `maxmemory-policy` | Eviction policy (`volatile-lru`, `allkeys-lru`, `volatile-ttl`, `noeviction`) | Both |
+| `notify-keyspace-events` | Keyspace notification flag string | Standalone only |
+| `slowlog-log-slower-than` | Slowlog threshold in microseconds | Both |
+| `slowlog-max-len` | Maximum slowlog entries | Both |
+| `hz` | Server tick frequency (1-500) | Standalone only |
+| `keydir-max-ram` | Maximum RAM for ETS keydir in bytes (default: 256 MB) | Both |
+| `hot-cache-max-ram` | Maximum RAM for hot cache values in bytes | Both |
+| `hot-cache-min-ram` | Minimum RAM for hot cache values in bytes (default: 64 MB) | Both |
+| `hot-cache-max-value-size` | Maximum value size stored hot in ETS (default: 65536). Values above this are stored cold. | Both |
+
+### Read-Only Parameters (CONFIG GET only)
+
+These reflect the startup configuration and cannot be changed at runtime.
+
+| Parameter | Description | Applies to |
+|-----------|-------------|------------|
+| `maxmemory` | Max memory budget in bytes | Both |
+| `maxclients` | Maximum simultaneous client connections | Standalone only |
+| `tcp-port` | TCP port | Standalone only |
+| `data-dir` | Bitcask data directory | Both |
+| `raft-enabled` | Whether Raft is active | Both |
+| `tls-port` | TLS port | Standalone only |
+| `tls-cert-file` | PEM certificate path | Standalone only |
+| `tls-key-file` | PEM key path | Standalone only |
+| `tls-ca-cert-file` | CA certificate bundle path | Standalone only |
+| `require-tls` | Whether plaintext is rejected | Standalone only |
+
+### Namespace-Specific Configuration
+
+FerricStore supports per-namespace tuning for group commit windows and durability
+modes. The namespace is derived from the key prefix (everything before the first `:`).
+
+**Standalone mode:**
+
+```bash
+# Session keys: quorum durability, 1ms batch window
+redis-cli FERRICSTORE.CONFIG SET session window_ms 1 durability quorum
+
+# Analytics counters: async durability, 5ms batch window
+redis-cli FERRICSTORE.CONFIG SET analytics window_ms 5 durability async
+
+# Reset to defaults
+redis-cli FERRICSTORE.CONFIG RESET analytics
+```
+
+**Embedded mode:**
+
+```elixir
+# Same thing via Elixir — call the Config command handler directly
+alias Ferricstore.Commands.Server
+
+# Set namespace config (builds a store map for the handler)
+Server.handle("FERRICSTORE.CONFIG", ["SET", "session", "window_ms", "1", "durability", "quorum"], %{})
+Server.handle("FERRICSTORE.CONFIG", ["SET", "analytics", "window_ms", "5", "durability", "async"], %{})
+
+# Reset
+Server.handle("FERRICSTORE.CONFIG", ["RESET", "analytics"], %{})
+```
+
+> See [Raft Consensus & Durability](#raft-consensus--durability) for what `:quorum`
+> vs `:async` durability means, and the
+> [Architecture Guide](architecture.md) for how namespace-aware group commit works.

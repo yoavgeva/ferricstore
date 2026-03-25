@@ -3,34 +3,17 @@ defmodule Ferricstore.Commands.TopK do
   Handles Top-K commands: TOPK.RESERVE, TOPK.ADD, TOPK.INCRBY,
   TOPK.QUERY, TOPK.LIST, TOPK.INFO.
 
-  Top-K maintains the K most frequent elements seen, using a Count-Min Sketch
-  for frequency estimation and a min-heap of size K. When an element is added,
-  the sketch is updated. If the element's estimated frequency exceeds the
-  minimum frequency in the heap, it replaces that element. TOPK.ADD returns
-  the evicted element (if any) for each input -- useful for tracking what just
-  fell out of the top-K.
+  ## Storage architecture (mmap-backed)
 
-  ## Storage format
+  Each TopK structure is stored as an mmap file at
+  `prob/shard_N/key.topk`. The Bitcask value for the key is just the
+  file path string (no data duplication). On creation the file is
+  created and mmap'd; on subsequent operations the mmap handle is
+  retrieved from a per-process cache (ETS) or re-opened from the
+  stored path.
 
-  Top-K structures are stored as tagged tuples via the injected store map:
-
-      {:topk, %{
-        k: k,
-        width: w,
-        depth: d,
-        decay: decay,
-        sketch: cms_sketch,
-        heap: [{element, count}, ...]
-      }}
-
-  The heap is a list of `{element, estimated_count}` tuples. The heap size
-  never exceeds `k`.
-
-  ## Decay
-
-  The `decay` parameter (0.0 to 1.0) controls how quickly old elements age out.
-  A decay of 1.0 means no decay (pure frequency). Lower values cause older
-  items to lose weight over time.
+  On restart the keydir is rebuilt from Bitcask, the path is recovered,
+  and the mmap file is re-opened on first access.
 
   ## Supported commands
 
@@ -39,10 +22,11 @@ defmodule Ferricstore.Commands.TopK do
     * `TOPK.INCRBY key element count [element count ...]` -- increment by amount
     * `TOPK.QUERY key element [element ...]` -- check if elements are in top-K
     * `TOPK.LIST key [WITHCOUNT]` -- list top-K elements
+    * `TOPK.COUNT key element [element ...]` -- return CMS count estimate
     * `TOPK.INFO key` -- return structure metadata
   """
 
-  alias Ferricstore.Commands.CMS
+  alias Ferricstore.Bitcask.NIF
 
   # Default CMS dimensions for Top-K when not specified
   @default_width 8
@@ -56,7 +40,7 @@ defmodule Ferricstore.Commands.TopK do
 
     - `cmd` -- uppercased command name (e.g. `"TOPK.RESERVE"`)
     - `args` -- list of string arguments
-    - `store` -- injected store map with `get`, `put`, `exists?` callbacks
+    - `store` -- injected store map with `get`, `put`, `exists?`, `prob_dir` callbacks
 
   ## Returns
 
@@ -90,11 +74,8 @@ defmodule Ferricstore.Commands.TopK do
   # ---------------------------------------------------------------------------
 
   def handle("TOPK.ADD", [key | elements], store) when elements != [] do
-    with {:ok, topk} <- get_topk(store, key) do
-      pairs = Enum.map(elements, &{&1, 1})
-      {updated, evicted_list} = apply_increments(topk, pairs)
-      store.put.(key, {:topk, updated}, 0)
-      evicted_list
+    with {:ok, ref} <- open_topk(store, key) do
+      NIF.topk_file_add(ref, elements)
     end
   end
 
@@ -108,10 +89,8 @@ defmodule Ferricstore.Commands.TopK do
 
   def handle("TOPK.INCRBY", [key | rest], store) when rest != [] do
     with {:ok, pairs} <- parse_element_count_pairs(rest),
-         {:ok, topk} <- get_topk(store, key) do
-      {updated, evicted_list} = apply_increments(topk, pairs)
-      store.put.(key, {:topk, updated}, 0)
-      evicted_list
+         {:ok, ref} <- open_topk(store, key) do
+      NIF.topk_file_incrby(ref, pairs)
     end
   end
 
@@ -124,9 +103,8 @@ defmodule Ferricstore.Commands.TopK do
   # ---------------------------------------------------------------------------
 
   def handle("TOPK.QUERY", [key | elements], store) when elements != [] do
-    with {:ok, topk} <- get_topk(store, key) do
-      heap_set = MapSet.new(topk.heap, fn {elem, _count} -> elem end)
-      Enum.map(elements, &membership_flag(heap_set, &1))
+    with {:ok, ref} <- open_topk(store, key) do
+      NIF.topk_file_query(ref, elements)
     end
   end
 
@@ -139,18 +117,16 @@ defmodule Ferricstore.Commands.TopK do
   # ---------------------------------------------------------------------------
 
   def handle("TOPK.LIST", [key], store) do
-    with {:ok, topk} <- get_topk(store, key) do
-      topk.heap
-      |> sort_by_count_desc()
-      |> Enum.map(fn {elem, _count} -> elem end)
+    with {:ok, ref} <- open_topk(store, key) do
+      NIF.topk_file_list(ref)
     end
   end
 
   def handle("TOPK.LIST", [key, "WITHCOUNT"], store) do
-    with {:ok, topk} <- get_topk(store, key) do
-      topk.heap
-      |> sort_by_count_desc()
-      |> Enum.flat_map(fn {elem, count} -> [elem, count] end)
+    with {:ok, ref} <- open_topk(store, key) do
+      items = NIF.topk_file_list(ref)
+      counts = NIF.topk_file_count(ref, items)
+      Enum.zip(items, counts) |> Enum.flat_map(fn {elem, count} -> [elem, count] end)
     end
   end
 
@@ -163,8 +139,9 @@ defmodule Ferricstore.Commands.TopK do
   # ---------------------------------------------------------------------------
 
   def handle("TOPK.INFO", [key], store) do
-    with {:ok, topk} <- get_topk(store, key) do
-      ["k", topk.k, "width", topk.width, "depth", topk.depth, "decay", topk.decay]
+    with {:ok, ref} <- open_topk(store, key) do
+      {k, width, depth, decay} = NIF.topk_file_info(ref)
+      ["k", k, "width", width, "depth", depth, "decay", decay]
     end
   end
 
@@ -173,31 +150,60 @@ defmodule Ferricstore.Commands.TopK do
   end
 
   # ---------------------------------------------------------------------------
-  # Private: structure operations
+  # Private: mmap lifecycle
   # ---------------------------------------------------------------------------
-
-  defp get_topk(store, key) do
-    case store.get.(key) do
-      nil -> {:error, "ERR TOPK: key does not exist"}
-      {:topk, topk} -> {:ok, topk}
-      _ -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-    end
-  end
 
   defp do_reserve(key, k_str, width, depth, decay, store) do
     with {:ok, k} <- parse_pos_integer(k_str, "k"),
          :ok <- check_not_exists(store, key) do
-      topk = %{
-        k: k,
-        width: width,
-        depth: depth,
-        decay: decay,
-        sketch: CMS.new_sketch(width, depth),
-        heap: []
-      }
+      # Build the mmap file path
+      prob_dir = store.prob_dir.()
+      path = Path.join(prob_dir, key <> ".topk")
 
-      store.put.(key, {:topk, topk}, 0)
-      :ok
+      case NIF.topk_create_file(path, k, width, depth, decay * 1.0) do
+        {:ok, ref} ->
+          # Store path as Bitcask value
+          store.put.(key, {:topk_path, path}, 0)
+          # Cache the resource handle
+          cache_put(key, ref)
+          :ok
+
+        {:error, reason} ->
+          {:error, "ERR TOPK: #{reason}"}
+      end
+    end
+  end
+
+  defp open_topk(store, key) do
+    # Check cache first
+    case cache_get(key) do
+      nil ->
+        # Read path from Bitcask
+        case store.get.(key) do
+          nil ->
+            # Key not in store -- check if another type's registry owns it
+            if key_held_by_other_type?(key, store) do
+              {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+            else
+              {:error, "ERR TOPK: key does not exist"}
+            end
+
+          {:topk_path, path} ->
+            case NIF.topk_open_file(path) do
+              {:ok, ref} ->
+                cache_put(key, ref)
+                {:ok, ref}
+
+              {:error, reason} ->
+                {:error, "ERR TOPK: #{reason}"}
+            end
+
+          _ ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+
+      ref ->
+        {:ok, ref}
     end
   end
 
@@ -205,64 +211,56 @@ defmodule Ferricstore.Commands.TopK do
     if store.exists?.(key), do: {:error, "ERR item already exists"}, else: :ok
   end
 
-  defp apply_increments(topk, pairs) do
-    Enum.reduce(pairs, {topk, []}, fn {element, count}, {tk, evictions} ->
-      {new_tk, evicted} = add_element(tk, element, count)
-      {new_tk, evictions ++ [evicted]}
-    end)
-  end
+  # Checks whether a key is held by another probabilistic data structure type
+  defp key_held_by_other_type?(key, store) do
+    # Check CMS registry
+    cms_found =
+      case Map.get(store, :cms_registry) do
+        %{get: get_fn} ->
+          case get_fn.(key) do
+            nil -> false
+            _ -> true
+          end
+        _ -> false
+      end
 
-  # Adds an element with the given count. Returns `{updated_topk, evicted}`
-  # where `evicted` is `nil` (no eviction) or the evicted element's name.
-  defp add_element(topk, element, count) do
-    %{sketch: sketch} = topk
-    {updated_sketch, estimated_count} = CMS.increment(sketch, element, count)
-    updated_topk = %{topk | sketch: updated_sketch}
-    update_heap(updated_topk, element, estimated_count)
-  end
-
-  defp update_heap(topk, element, estimated_count) do
-    %{k: k, heap: heap} = topk
-    already_in_heap = Enum.any?(heap, fn {elem, _} -> elem == element end)
-
-    cond do
-      already_in_heap ->
-        new_heap = Enum.map(heap, fn
-          {^element, _} -> {element, estimated_count}
-          other -> other
-        end)
-
-        {%{topk | heap: new_heap}, nil}
-
-      length(heap) < k ->
-        {%{topk | heap: [{element, estimated_count} | heap]}, nil}
-
-      true ->
-        maybe_evict(topk, element, estimated_count)
-    end
-  end
-
-  defp maybe_evict(topk, element, estimated_count) do
-    {min_elem, min_count} = Enum.min_by(topk.heap, fn {_, c} -> c end)
-
-    if estimated_count > min_count do
-      new_heap =
-        topk.heap
-        |> Enum.reject(fn {elem, _} -> elem == min_elem end)
-        |> then(fn h -> [{element, estimated_count} | h] end)
-
-      {%{topk | heap: new_heap}, min_elem}
+    if cms_found do
+      true
     else
-      {topk, nil}
+      # Check TDigest path in main store
+      case store.get.(key) do
+        {:tdigest_path, _} -> true
+        _ -> false
+      end
     end
   end
 
-  defp membership_flag(set, element) do
-    if MapSet.member?(set, element), do: 1, else: 0
+  # ---------------------------------------------------------------------------
+  # Private: per-process ETS cache for mmap handles
+  # ---------------------------------------------------------------------------
+
+  @cache_table :ferricstore_topk_cache
+
+  defp cache_get(key) do
+    case :ets.whereis(@cache_table) do
+      :undefined -> nil
+      _ref ->
+        case :ets.lookup(@cache_table, key) do
+          [{^key, ref}] -> ref
+          [] -> nil
+        end
+    end
   end
 
-  defp sort_by_count_desc(heap) do
-    Enum.sort_by(heap, fn {_elem, count} -> count end, :desc)
+  defp cache_put(key, ref) do
+    case :ets.whereis(@cache_table) do
+      :undefined ->
+        :ets.new(@cache_table, [:set, :public, :named_table, {:read_concurrency, true}])
+        :ets.insert(@cache_table, {key, ref})
+
+      _ref ->
+        :ets.insert(@cache_table, {key, ref})
+    end
   end
 
   # ---------------------------------------------------------------------------

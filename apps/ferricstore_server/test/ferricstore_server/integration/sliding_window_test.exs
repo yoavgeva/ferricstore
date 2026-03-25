@@ -46,7 +46,7 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
     end
   end
 
-  defp do_recv_response(sock, buf) do
+  defp do_recv_response(sock, buf, retries \\ 1) do
     case Parser.parse(buf) do
       {:ok, [val | rest], remaining_bin} ->
         Process.put(@buffered_key, rest)
@@ -54,8 +54,17 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
         val
 
       {:ok, [], _} ->
-        {:ok, data} = :gen_tcp.recv(sock, 0, 10_000)
-        do_recv_response(sock, buf <> data)
+        case :gen_tcp.recv(sock, 0, 10_000) do
+          {:ok, data} ->
+            do_recv_response(sock, buf <> data, retries)
+
+          {:error, :timeout} when retries > 0 ->
+            # Under full suite load, the server may be slow. Retry once.
+            do_recv_response(sock, buf, retries - 1)
+
+          {:error, :timeout} ->
+            raise "TCP recv timed out after retries (buf size: #{byte_size(buf)})"
+        end
     end
   end
 
@@ -71,19 +80,27 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
 
   defp do_recv_n(_sock, 0, _buf, acc), do: acc
 
-  defp do_recv_n(sock, remaining, buf, acc) when remaining > 0 do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 10_000)
-    buf2 = buf <> data
+  defp do_recv_n(sock, remaining, buf, acc, retries \\ 1) when remaining > 0 do
+    case :gen_tcp.recv(sock, 0, 10_000) do
+      {:ok, data} ->
+        buf2 = buf <> data
 
-    case Parser.parse(buf2) do
-      {:ok, [_ | _] = vals, rest} ->
-        taken = Enum.take(vals, remaining)
-        new_acc = acc ++ taken
-        new_remaining = remaining - length(taken)
-        do_recv_n(sock, new_remaining, rest, new_acc)
+        case Parser.parse(buf2) do
+          {:ok, [_ | _] = vals, rest} ->
+            taken = Enum.take(vals, remaining)
+            new_acc = acc ++ taken
+            new_remaining = remaining - length(taken)
+            do_recv_n(sock, new_remaining, rest, new_acc)
 
-      {:ok, [], _} ->
-        do_recv_n(sock, remaining, buf2, acc)
+          {:ok, [], _} ->
+            do_recv_n(sock, remaining, buf2, acc)
+        end
+
+      {:error, :timeout} when retries > 0 ->
+        do_recv_n(sock, remaining, buf, acc, retries - 1)
+
+      {:error, :timeout} ->
+        raise "TCP recv timed out in recv_n (remaining: #{remaining}, buf: #{byte_size(buf)} bytes)"
     end
   end
 
@@ -141,11 +158,10 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
     %{port: Listener.port()}
   end
 
-  setup %{port: port} do
-    sock = connect_and_hello(port)
-    send_cmd(sock, ["FLUSHDB"])
-    recv_response(sock)
-    :gen_tcp.close(sock)
+  setup do
+    # Use direct GenServer calls to flush keys instead of FLUSHDB over TCP.
+    # FLUSHDB iterates all keys and can time out under heavy test load.
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
     :ok
   end
 

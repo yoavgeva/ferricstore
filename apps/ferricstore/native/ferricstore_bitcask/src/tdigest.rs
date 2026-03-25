@@ -882,6 +882,11 @@ pub fn register_resource(env: Env) {
     let _ = rustler::resource!(TDigestResource, env);
 }
 
+/// Stub for mmap-backed tdigest resource registration (not yet implemented).
+pub fn register_mmap_resource(_env: Env) {
+    // No-op: file-backed TDigest resources are not yet implemented.
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

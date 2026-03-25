@@ -9,6 +9,7 @@ on:
 env:
   MIX_ENV: test
   RUSTFLAGS: "-D warnings"
+  FERRICSTORE_BUILD_NIF: "1"
 
 jobs:
   test:

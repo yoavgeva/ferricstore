@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Compaction — merges old log files into a single file, removes stale and
 //! deleted entries, and writes a hint file for fast startup.
 //!
@@ -23,6 +21,8 @@ impl std::fmt::Display for CompactionError {
         write!(f, "CompactionError: {}", self.0)
     }
 }
+
+impl std::error::Error for CompactionError {}
 
 impl From<crate::log::LogError> for CompactionError {
     fn from(e: crate::log::LogError) -> Self {

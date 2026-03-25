@@ -535,7 +535,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
     test "incr on non-existent key initializes to delta" do
       key = ukey("incr_new")
       assert {:ok, 5} = Router.incr(key, 5)
-      assert "5" == Router.get(key)
+      assert 5 == Router.get(key)
     end
 
     test "value is unchanged after failed incr" do

@@ -325,7 +325,11 @@ defmodule Ferricstore.Commands.TDigest do
   defp get_digest(store, key) do
     case store.get.(key) do
       nil ->
-        {:error, "ERR TDIGEST: key does not exist"}
+        if key_held_by_other_registry?(key, store) do
+          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        else
+          {:error, "ERR TDIGEST: key does not exist"}
+        end
 
       {:tdigest, centroids, metadata} ->
         {:ok, deserialize(centroids, metadata)}
@@ -333,6 +337,16 @@ defmodule Ferricstore.Commands.TDigest do
       _ ->
         {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
     end
+  end
+
+  # Checks whether a key is held by another probabilistic registry (CMS, Cuckoo, Bloom).
+  defp key_held_by_other_registry?(key, store) do
+    Enum.any?([:cms_registry, :cuckoo_registry, :bloom_registry], fn reg_key ->
+      case Map.get(store, reg_key) do
+        %{get: get_fn} -> get_fn.(key) != nil
+        _ -> false
+      end
+    end)
   end
 
   defp persist!(key, %Core{} = digest, store) do

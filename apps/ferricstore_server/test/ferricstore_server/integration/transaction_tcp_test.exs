@@ -49,7 +49,8 @@ defmodule FerricstoreServer.Integration.TransactionTcpTest do
     sock
   end
 
-  defp ukey(name), do: "tcp_txn_#{name}_#{:rand.uniform(999_999)}"
+  # Hash tag ensures all generated keys co-locate on the same shard.
+  defp ukey(name), do: "{tcp_txn}:#{name}_#{:rand.uniform(999_999)}"
 
   # ---------------------------------------------------------------------------
   # Setup

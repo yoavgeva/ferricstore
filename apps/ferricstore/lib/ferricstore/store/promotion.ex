@@ -43,7 +43,7 @@ defmodule Ferricstore.Store.Promotion do
   """
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.{CompoundKey, LFU}
 
   require Logger
 
@@ -51,7 +51,9 @@ defmodule Ferricstore.Store.Promotion do
 
   @spec threshold() :: non_neg_integer()
   def threshold do
-    Application.get_env(:ferricstore, :promotion_threshold, 100)
+    :persistent_term.get(:ferricstore_promotion_threshold, 100)
+  rescue
+    ArgumentError -> Application.get_env(:ferricstore, :promotion_threshold, 100)
   end
 
   @spec dedicated_path(binary(), non_neg_integer(), atom(), binary()) :: binary()
@@ -65,14 +67,18 @@ defmodule Ferricstore.Store.Promotion do
   def marker_key(redis_key), do: @promotion_marker_prefix <> redis_key
 
   @spec open_dedicated(binary(), non_neg_integer(), atom(), binary()) ::
-          {:ok, reference()} | {:error, term()}
+          {:ok, binary()} | {:error, term()}
   def open_dedicated(data_dir, shard_index, type, redis_key) do
     path = dedicated_path(data_dir, shard_index, type, redis_key)
     File.mkdir_p!(path)
-    NIF.new(path)
-  end
+    active_file = Path.join(path, "00000.log")
 
-  @lfu_initial_counter 5
+    unless File.exists?(active_file) do
+      File.touch!(active_file)
+    end
+
+    {:ok, path}
+  end
 
   @spec promote_hash!(binary(), reference(), atom(), binary(), non_neg_integer()) ::
           {:ok, reference()} | {:error, term()}
@@ -80,9 +86,9 @@ defmodule Ferricstore.Store.Promotion do
     promote_collection!(:hash, redis_key, shared_store, keydir, data_dir, shard_index)
   end
 
-  @spec promote_collection!(atom(), binary(), reference(), atom(), binary(), non_neg_integer()) ::
+  @spec promote_collection!(atom(), binary(), binary(), atom(), binary(), non_neg_integer()) ::
           {:ok, reference()} | {:error, term()}
-  def promote_collection!(type, redis_key, shared_store, keydir, data_dir, shard_index) do
+  def promote_collection!(type, redis_key, shard_data_path, keydir, data_dir, shard_index) do
     prefix = compound_prefix_for(type, redis_key)
     type_str = CompoundKey.encode_type(type)
     type_label = type_label(type)
@@ -90,7 +96,7 @@ defmodule Ferricstore.Store.Promotion do
 
     entries =
       :ets.foldl(
-        fn {key, value, exp, _lfu}, acc ->
+        fn {key, value, exp, _lfu, _fid, _off, _vsize}, acc ->
           if is_binary(key) and value != nil and String.starts_with?(key, prefix) and (exp == 0 or exp > now) do
             [{key, value, exp} | acc]
           else
@@ -102,27 +108,42 @@ defmodule Ferricstore.Store.Promotion do
       )
 
     case open_dedicated(data_dir, shard_index, type, redis_key) do
-      {:ok, dedicated_store} ->
+      {:ok, dedicated_path} ->
         if entries != [] do
           batch = Enum.map(entries, fn {k, v, exp} -> {k, v, exp} end)
-          NIF.put_batch(dedicated_store, batch)
+          dedicated_active = find_active_file(dedicated_path)
+
+          case NIF.v2_append_batch(dedicated_active, batch) do
+            {:ok, _locations} -> :ok
+
+            {:error, reason} ->
+              Logger.error("Promotion: v2_append_batch failed for #{inspect(redis_key)}: #{inspect(reason)}")
+          end
         end
 
+        # v2: write tombstones to the shared Bitcask log for migrated keys.
+        # Entries STAY in ETS so compound_scan/compound_count/compound_get
+        # continue to work immediately after promotion.
+        active_path = find_active_file(shard_data_path)
+
         Enum.each(entries, fn {key, _value, _exp} ->
-          :ets.delete(keydir, key)
-          NIF.delete(shared_store, key)
+          case NIF.v2_append_tombstone(active_path, key) do
+            {:ok, _} -> :ok
+            {:error, reason} ->
+              Logger.warning("Promotion: tombstone write failed for #{inspect(key)}: #{inspect(reason)}")
+          end
         end)
 
         mk = marker_key(redis_key)
-        NIF.put(shared_store, mk, type_str, 0)
-        :ets.insert(keydir, {mk, type_str, 0, @lfu_initial_counter})
+        NIF.v2_append_record(active_path, mk, type_str, 0)
+        :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), 0, 0, 0})
 
         Logger.info(
           "Promoted #{type_label} #{inspect(redis_key)} to dedicated Bitcask " <>
             "(#{length(entries)} entries, shard #{shard_index})"
         )
 
-        {:ok, dedicated_store}
+        {:ok, dedicated_path}
 
       {:error, reason} = err ->
         Logger.error(
@@ -133,53 +154,74 @@ defmodule Ferricstore.Store.Promotion do
     end
   end
 
-  @spec recover_promoted(reference(), atom(), binary(), non_neg_integer()) :: map()
-  def recover_promoted(shared_store, keydir, data_dir, shard_index) do
-    markers =
-      :ets.foldl(
-        fn {key, value, _exp, _lfu}, acc ->
-          case key do
-            <<"PM:", redis_key::binary>> when value != nil ->
-              [{redis_key, value} | acc]
+  @spec recover_promoted(binary(), atom(), binary(), non_neg_integer()) :: map()
+  def recover_promoted(shard_data_path, keydir, data_dir, shard_index) do
+    # v2: promotion markers are recovered from ETS (populated by recover_keydir).
+    # Use :ets.select with a match spec bound to the "PM:" prefix instead of
+    # scanning every key in the keydir via :ets.foldl (memory audit L6).
+    pm_prefix = "PM:"
+    pm_len = byte_size(pm_prefix)
 
-            _ ->
-              acc
-          end
-        end,
-        [],
-        keydir
-      )
-
-    bitcask_keys = NIF.keys(shared_store)
-
-    bitcask_markers =
-      Enum.filter(bitcask_keys, &String.starts_with?(&1, @promotion_marker_prefix))
-      |> Enum.map(fn <<"PM:", redis_key::binary>> ->
-        {:ok, type_str} = NIF.get_zero_copy(shared_store, marker_key(redis_key))
-        :ets.insert(keydir, {marker_key(redis_key), type_str, 0, @lfu_initial_counter})
-        {redis_key, type_str}
-      end)
+    match_spec = [
+      {{:"$1", :"$2", :_, :_, :_, :_, :_},
+       [{:andalso,
+         {:is_binary, :"$1"},
+         {:andalso,
+           {:>=, {:byte_size, :"$1"}, pm_len},
+           {:andalso,
+             {:==, {:binary_part, :"$1", 0, pm_len}, pm_prefix},
+             {:is_binary, :"$2"}}}}],
+       [{{:"$1", :"$2"}}]}
+    ]
 
     all_markers =
-      (markers ++ bitcask_markers)
+      :ets.select(keydir, match_spec)
+      |> Enum.map(fn {full_key, value} ->
+        <<"PM:", redis_key::binary>> = full_key
+        {redis_key, value}
+      end)
       |> Enum.uniq_by(fn {redis_key, _} -> redis_key end)
 
     Enum.reduce(all_markers, %{}, fn {redis_key, type_str}, acc ->
       type = CompoundKey.decode_type(type_str)
 
       case open_dedicated(data_dir, shard_index, type, redis_key) do
-        {:ok, dedicated_store} ->
-          case NIF.get_all(dedicated_store) do
-            {:ok, pairs} ->
-              Enum.each(pairs, fn {k, v} ->
-                :ets.insert(keydir, {k, v, 0, @lfu_initial_counter})
+        {:ok, dedicated_path} ->
+          # v2: scan dedicated log files to recover entries into ETS
+          dedicated_active = find_active_file(dedicated_path)
+
+          case NIF.v2_scan_file(dedicated_active) do
+            {:ok, records} ->
+              # Build a map of the latest state per key (last-writer-wins)
+              final_state =
+                Enum.reduce(records, %{}, fn {key, offset, value_size, expire_at_ms, is_tombstone}, acc ->
+                  if is_tombstone do
+                    Map.put(acc, key, :tombstone)
+                  else
+                    Map.put(acc, key, {:live, offset, value_size, expire_at_ms})
+                  end
+                end)
+
+              Enum.each(final_state, fn
+                {key, :tombstone} ->
+                  :ets.delete(keydir, key)
+
+                {key, {:live, offset, _value_size, expire_at_ms}} ->
+                  # Read the actual value from disk so compound_scan finds it
+                  value =
+                    case NIF.v2_pread_at(dedicated_active, offset) do
+                      {:ok, v} when v != nil -> v
+                      _ -> nil
+                    end
+
+                  :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), 0, offset, 0})
               end)
 
             _ ->
               :ok
           end
 
-          Map.put(acc, redis_key, dedicated_store)
+          Map.put(acc, redis_key, dedicated_path)
 
         {:error, reason} ->
           Logger.error(
@@ -191,25 +233,30 @@ defmodule Ferricstore.Store.Promotion do
     end)
   end
 
-  @spec cleanup_promoted!(binary(), reference(), atom(), binary(), non_neg_integer()) :: :ok
-  def cleanup_promoted!(redis_key, shared_store, keydir, data_dir, shard_index) do
+  @spec cleanup_promoted!(binary(), binary(), atom(), binary(), non_neg_integer()) :: :ok
+  def cleanup_promoted!(redis_key, shard_data_path, keydir, data_dir, shard_index) do
     mk = marker_key(redis_key)
 
     type =
       case :ets.lookup(keydir, mk) do
-        [{^mk, type_str, _exp, _lfu}] when type_str != nil ->
+        [{^mk, type_str, _exp, _lfu, _fid, _off, _vsize}] when type_str != nil ->
           CompoundKey.decode_type(type_str)
 
         _ ->
-          case NIF.get_zero_copy(shared_store, mk) do
-            {:ok, type_str} when is_binary(type_str) -> CompoundKey.decode_type(type_str)
-            _ -> :hash
-          end
+          :hash
       end
 
     type_label = type_label(type)
 
-    NIF.delete(shared_store, mk)
+    # v2: write tombstone for the marker key
+    active_path = find_active_file(shard_data_path)
+
+    case NIF.v2_append_tombstone(active_path, mk) do
+      {:ok, _} -> :ok
+      {:error, reason} ->
+        Logger.warning("Promotion cleanup: tombstone write failed for marker #{inspect(mk)}: #{inspect(reason)}")
+    end
+
     :ets.delete(keydir, mk)
 
     path = dedicated_path(data_dir, shard_index, type, redis_key)
@@ -234,4 +281,21 @@ defmodule Ferricstore.Store.Promotion do
   defp type_label(:hash), do: "hash"
   defp type_label(:set), do: "set"
   defp type_label(:zset), do: "zset"
+
+  # Finds the active (highest numbered) .log file in a shard data directory.
+  defp find_active_file(shard_data_path) do
+    case File.ls(shard_data_path) do
+      {:ok, files} ->
+        max_id =
+          files
+          |> Enum.filter(&String.ends_with?(&1, ".log"))
+          |> Enum.map(fn name -> name |> String.trim_trailing(".log") |> String.to_integer() end)
+          |> Enum.max(fn -> 0 end)
+
+        Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(max_id), 5, "0")}.log")
+
+      _ ->
+        Path.join(shard_data_path, "00000.log")
+    end
+  end
 end

@@ -121,15 +121,14 @@ defmodule Ferricstore.Commands.CuckooNifTest do
     test "filter persisted to store and reloaded" do
       store = MockStore.make()
 
-      # Add via command handler (persists to store)
+      # Add via command handler (persists to mmap-backed registry)
       Cuckoo.handle("CF.RESERVE", ["mykey", "512"], store)
       Cuckoo.handle("CF.ADD", ["mykey", "stored_item"], store)
 
-      # Verify the store has a binary blob (not an Elixir term)
-      blob = store.get.("mykey")
-      assert is_binary(blob)
-      # Cuckoo NIF format starts with magic bytes 0xCF 0x01
-      assert <<0xCF, 0x01, _rest::binary>> = blob
+      # With mmap-backed storage, the filter data lives in the registry
+      # (not the regular key-value store). Verify through the command interface.
+      info = Cuckoo.handle("CF.INFO", ["mykey"], store)
+      assert is_list(info), "CF.INFO should return filter metadata"
 
       # Verify we can reload and query
       assert 1 = Cuckoo.handle("CF.EXISTS", ["mykey", "stored_item"], store)

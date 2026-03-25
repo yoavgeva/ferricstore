@@ -14,10 +14,6 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   alias Ferricstore.Store.Shard
 
   setup do
-    # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
-    original = Application.get_env(:ferricstore, :raft_enabled)
-    Application.put_env(:ferricstore, :raft_enabled, false)
-    on_exit(fn -> Application.put_env(:ferricstore, :raft_enabled, original) end)
     :ok
   end
 
@@ -533,7 +529,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   # ===================================================================
 
   describe "Shard: ETS warm on cache miss from NIF" do
-    test "get from NIF populates ETS when entry is not cached" do
+    test "cold key (value=nil in ETS) gets warmed on read" do
       {pid, index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
@@ -545,13 +541,21 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       # Put via GenServer (writes to both NIF and ETS)
       :ok = GenServer.call(pid, {:put, "warm_test", "warm_value", 0})
 
-      # Manually evict from ETS to simulate a cache miss
-      :ets.delete(keydir, "warm_test")
-      assert [] == :ets.lookup(keydir, "warm_test")
+      # Flush to disk so the cold read path has data to find
+      GenServer.call(pid, :flush)
 
-      # Get should warm ETS from NIF (single-table format)
+      # Simulate a cold key by setting value to nil while preserving disk location.
+      # In v2, ETS IS the keydir -- deleting the entry entirely means the key is gone.
+      # Cold keys have value=nil but retain {file_id, offset, value_size} in the 7-tuple.
+      [{_, _val, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, "warm_test")
+      :ets.insert(keydir, {"warm_test", nil, exp, lfu, fid, off, vsize})
+
+      # Confirm value is nil (cold)
+      [{_, nil, _, _, _, _, _}] = :ets.lookup(keydir, "warm_test")
+
+      # Get should warm ETS from disk via cold read path
       assert "warm_value" == GenServer.call(pid, {:get, "warm_test"})
-      assert [{"warm_test", "warm_value", 0, _lfu}] = :ets.lookup(keydir, "warm_test")
+      assert [{"warm_test", "warm_value", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "warm_test")
     end
   end
 
@@ -571,7 +575,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
       # Confirm it's in ETS
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
-      assert [{"lazy_exp", "temp_val", ^expire_at, _lfu}] = :ets.lookup(keydir, "lazy_exp")
+      assert [{"lazy_exp", "temp_val", ^expire_at, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "lazy_exp")
 
       # Wait for expiry
       Process.sleep(200)
@@ -621,8 +625,8 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
     end
   end
 
-  describe "Shard: get_meta from NIF fallback (cache miss)" do
-    test "get_meta warms ETS and returns {value, 0} on cache miss" do
+  describe "Shard: get_meta from cold read fallback" do
+    test "get_meta warms ETS and returns {value, 0} on cold key" do
       {pid, index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
@@ -633,12 +637,16 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
       :ok = GenServer.call(pid, {:put, "meta_warm", "mw_val", 0})
 
-      # Clear ETS to force NIF fallback
-      :ets.delete(keydir, "meta_warm")
+      # Flush to disk so the cold read path has data
+      GenServer.call(pid, :flush)
+
+      # Simulate cold key: set value to nil, preserve disk location
+      [{_, _val, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, "meta_warm")
+      :ets.insert(keydir, {"meta_warm", nil, exp, lfu, fid, off, vsize})
 
       assert {"mw_val", 0} == GenServer.call(pid, {:get_meta, "meta_warm"})
       # Verify ETS was warmed (single-table format)
-      assert [{"meta_warm", "mw_val", 0, _lfu}] = :ets.lookup(keydir, "meta_warm")
+      assert [{"meta_warm", "mw_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "meta_warm")
     end
   end
 

@@ -93,15 +93,26 @@ defmodule Ferricstore.Resp.ParserTest do
       assert {:error, :bulk_crlf_missing} = Parser.parse("$5\r\nhelloXXXXX")
     end
 
-    test "rejects bulk string whose declared length exceeds 512 MiB" do
-      # 536_870_913 = 512 MiB + 1 byte
-      assert {:error, {:bulk_too_large, 536_870_913}} =
-               Parser.parse("$536870913\r\n")
+    test "rejects bulk string whose declared length exceeds hard cap (64 MB)" do
+      hard_cap = Parser.hard_cap_bytes()
+      over = hard_cap + 1
+      # Use parse/2 with a max above the hard cap to isolate the hard cap check
+      assert {:error, {:value_too_large, ^over, ^hard_cap}} =
+               Parser.parse("$#{over}\r\n", hard_cap * 2)
     end
 
-    test "accepts bulk string at exactly 512 MiB boundary (incomplete data returns :ok [])" do
-      # 536_870_912 = exactly 512 MiB — allowed; no body bytes present so incomplete
-      assert {:ok, [], _rest} = Parser.parse("$536870912\r\n")
+    test "rejects bulk string whose declared length exceeds max_value_size" do
+      # With default 1 MB limit, a 1 MB + 1 byte bulk string is rejected
+      max = Parser.default_max_value_size()
+      over = max + 1
+      assert {:error, {:value_too_large, ^over, ^max}} =
+               Parser.parse("$#{over}\r\n")
+    end
+
+    test "accepts bulk string at exactly max_value_size (incomplete data returns :ok [])" do
+      max = Parser.default_max_value_size()
+      # Exactly at limit -- allowed; no body bytes present so incomplete
+      assert {:ok, [], _rest} = Parser.parse("$#{max}\r\n")
     end
   end
 

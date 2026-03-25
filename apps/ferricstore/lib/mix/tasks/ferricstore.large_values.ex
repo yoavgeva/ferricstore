@@ -99,7 +99,7 @@ defmodule Mix.Tasks.Ferricstore.LargeValues do
 
       try do
         :ets.foldl(
-          fn {key, value, _exp, _lfu}, acc when is_binary(value) ->
+          fn {key, value, _exp, _lfu, _fid, _off, _vsize}, acc when is_binary(value) ->
             size = byte_size(value)
 
             if size > threshold do
@@ -108,7 +108,7 @@ defmodule Mix.Tasks.Ferricstore.LargeValues do
               acc
             end
 
-            {_key, nil, _exp, _lfu}, acc ->
+            {_key, nil, _exp, _lfu, _fid, _off, _vsize}, acc ->
               # Cold key (value evicted) -- skip
               acc
           end,

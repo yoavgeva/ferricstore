@@ -64,16 +64,6 @@ impl CountMinSketch {
         min_count
     }
 
-    /// Query the estimated count of an element (minimum across rows).
-    fn estimate(&self, element: &[u8]) -> i64 {
-        let indices = self.hash_indices(element);
-        indices
-            .iter()
-            .enumerate()
-            .map(|(row, &col)| self.counters[row * self.width + col])
-            .min()
-            .unwrap_or(0)
-    }
 }
 
 /// FNV-1a hash with a configurable offset basis for double hashing.
@@ -192,20 +182,19 @@ impl TopK {
     }
 
     /// Update the count of an element already in the heap.
+    ///
+    /// L-5 fix: use `into_vec()` to get the underlying Vec without allocation,
+    /// mutate the target element in place, then reconstruct the heap via `From`.
+    /// This avoids the intermediate `drain().collect()` allocation.
     fn update_existing(&mut self, element: &str, new_count: i64) {
-        // Rebuild the heap with the updated count.
-        // For small k this is fast enough.
-        let items: Vec<HeapItem> = self
-            .heap
-            .drain()
-            .map(|mut item| {
-                if item.element == element {
-                    item.count = new_count;
-                }
-                item
-            })
-            .collect();
-        self.heap.extend(items);
+        let mut items = std::mem::take(&mut self.heap).into_vec();
+        for item in &mut items {
+            if item.element == element {
+                item.count = new_count;
+                break;
+            }
+        }
+        self.heap = BinaryHeap::from(items);
     }
 
     /// Check if an element is currently in the top-K.
@@ -525,6 +514,631 @@ pub fn topk_from_bytes<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<'a>
         }
         Err(msg) => Ok((atoms::error(), msg).encode(env)),
     }
+}
+
+// ===========================================================================
+// Memory-mapped file-backed TopK
+// ===========================================================================
+//
+// File layout (little-endian):
+//
+// ```text
+// [header: 64 bytes]
+// [CMS counters: width * depth * 8 bytes (i64 each)]
+// [heap entries: k * HEAP_ENTRY_SIZE bytes]
+// ```
+//
+// Header (64 bytes):
+//   bytes  0..7:  magic (0x544F504B_4D4D5031 = "TOPKMMP1")
+//   bytes  8..11: k (u32)
+//   bytes 12..15: width (u32)
+//   bytes 16..19: depth (u32)
+//   bytes 20..27: decay (f64)
+//   bytes 28..31: heap_len (u32) — number of items currently in heap
+//   bytes 32..63: reserved (zero)
+//
+// Each heap entry (HEAP_ENTRY_SIZE = 264 bytes):
+//   bytes 0..7:   count (i64)
+//   bytes 8..11:  element_len (u32)
+//   bytes 12..263: element bytes (max 252 bytes, zero-padded)
+
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+const TOPK_MAGIC: u64 = 0x544F_504B_4D4D_5031; // "TOPKMMP1"
+const TOPK_HEADER_SIZE: usize = 64;
+const HEAP_ENTRY_SIZE: usize = 264; // 8 (count) + 4 (len) + 252 (element)
+const MAX_ELEMENT_LEN: usize = 252;
+
+/// A memory-mapped TopK data structure.
+///
+/// The mmap region covers the entire file: header + CMS counters + heap entries.
+pub struct MmapTopK {
+    mmap: *mut u8,
+    mmap_len: usize,
+    k: usize,
+    width: usize,
+    depth: usize,
+    decay: f64,
+    path: PathBuf,
+    /// In-memory fingerprint set for fast membership checks.
+    /// Rebuilt from heap entries on open.
+    fingerprints: HashSet<String>,
+}
+
+// SAFETY: The mmap pointer is protected by a Mutex in MmapTopKResource.
+unsafe impl Send for MmapTopK {}
+unsafe impl Sync for MmapTopK {}
+
+impl MmapTopK {
+    fn file_size(k: usize, width: usize, depth: usize) -> usize {
+        TOPK_HEADER_SIZE + (width * depth * 8) + (k * HEAP_ENTRY_SIZE)
+    }
+
+    fn cms_offset() -> usize {
+        TOPK_HEADER_SIZE
+    }
+
+    fn heap_offset(width: usize, depth: usize) -> usize {
+        TOPK_HEADER_SIZE + (width * depth * 8)
+    }
+
+    pub fn create(
+        path: &Path,
+        k: usize,
+        width: usize,
+        depth: usize,
+        decay: f64,
+    ) -> Result<Self, String> {
+        if k == 0 {
+            return Err("k must be > 0".into());
+        }
+        if width == 0 {
+            return Err("width must be > 0".into());
+        }
+        if depth == 0 {
+            return Err("depth must be > 0".into());
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+        }
+
+        let file_size = Self::file_size(k, width, depth);
+
+        let mut file = File::create(path).map_err(|e| format!("create: {e}"))?;
+        let mut header = [0u8; TOPK_HEADER_SIZE];
+        header[0..8].copy_from_slice(&TOPK_MAGIC.to_le_bytes());
+        header[8..12].copy_from_slice(&(k as u32).to_le_bytes());
+        header[12..16].copy_from_slice(&(width as u32).to_le_bytes());
+        header[16..20].copy_from_slice(&(depth as u32).to_le_bytes());
+        header[20..28].copy_from_slice(&decay.to_le_bytes());
+        // heap_len = 0, reserved = 0 (already zeroed)
+        file.write_all(&header)
+            .map_err(|e| format!("write header: {e}"))?;
+        let zeros = vec![0u8; file_size - TOPK_HEADER_SIZE];
+        file.write_all(&zeros)
+            .map_err(|e| format!("write body: {e}"))?;
+        file.sync_all().map_err(|e| format!("fsync: {e}"))?;
+        drop(file);
+
+        Self::open(path, file_size, k, width, depth, decay)
+    }
+
+    pub fn open_existing(path: &Path) -> Result<Self, String> {
+        let meta = fs::metadata(path).map_err(|e| format!("stat: {e}"))?;
+        let file_size = meta.len() as usize;
+        if file_size < TOPK_HEADER_SIZE {
+            return Err("file too small for topk header".into());
+        }
+
+        // Read header to get params
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open: {e}"))?;
+
+        let mmap = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        if mmap == libc::MAP_FAILED {
+            return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
+        }
+        let ptr = mmap as *mut u8;
+
+        let magic = u64::from_le_bytes(unsafe {
+            let mut buf = [0u8; 8];
+            std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 8);
+            buf
+        });
+        if magic != TOPK_MAGIC {
+            unsafe { libc::munmap(mmap, file_size); }
+            return Err("invalid topk file magic".into());
+        }
+
+        let k = u32::from_le_bytes(unsafe {
+            let mut buf = [0u8; 4];
+            std::ptr::copy_nonoverlapping(ptr.add(8), buf.as_mut_ptr(), 4);
+            buf
+        }) as usize;
+        let width = u32::from_le_bytes(unsafe {
+            let mut buf = [0u8; 4];
+            std::ptr::copy_nonoverlapping(ptr.add(12), buf.as_mut_ptr(), 4);
+            buf
+        }) as usize;
+        let depth = u32::from_le_bytes(unsafe {
+            let mut buf = [0u8; 4];
+            std::ptr::copy_nonoverlapping(ptr.add(16), buf.as_mut_ptr(), 4);
+            buf
+        }) as usize;
+        let decay = f64::from_le_bytes(unsafe {
+            let mut buf = [0u8; 8];
+            std::ptr::copy_nonoverlapping(ptr.add(20), buf.as_mut_ptr(), 8);
+            buf
+        });
+
+        let expected = Self::file_size(k, width, depth);
+        if file_size < expected {
+            unsafe { libc::munmap(mmap, file_size); }
+            return Err(format!(
+                "file too small: expected {expected}, got {file_size}"
+            ));
+        }
+
+        // Build fingerprints from heap entries
+        let heap_len = u32::from_le_bytes(unsafe {
+            let mut buf = [0u8; 4];
+            std::ptr::copy_nonoverlapping(ptr.add(28), buf.as_mut_ptr(), 4);
+            buf
+        }) as usize;
+
+        let mut fingerprints = HashSet::with_capacity(k + 1);
+        let heap_base = Self::heap_offset(width, depth);
+        for i in 0..heap_len {
+            let entry_ptr = unsafe { ptr.add(heap_base + i * HEAP_ENTRY_SIZE) };
+            let elem_len = u32::from_le_bytes(unsafe {
+                let mut buf = [0u8; 4];
+                std::ptr::copy_nonoverlapping(entry_ptr.add(8), buf.as_mut_ptr(), 4);
+                buf
+            }) as usize;
+            if elem_len <= MAX_ELEMENT_LEN {
+                let elem_bytes = unsafe {
+                    std::slice::from_raw_parts(entry_ptr.add(12), elem_len)
+                };
+                if let Ok(s) = std::str::from_utf8(elem_bytes) {
+                    fingerprints.insert(s.to_string());
+                }
+            }
+        }
+
+        // Don't munmap - we reuse it
+        Ok(Self {
+            mmap: ptr,
+            mmap_len: file_size,
+            k,
+            width,
+            depth,
+            decay,
+            path: path.to_path_buf(),
+            fingerprints,
+        })
+    }
+
+    fn open(
+        path: &Path,
+        file_size: usize,
+        k: usize,
+        width: usize,
+        depth: usize,
+        decay: f64,
+    ) -> Result<Self, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open: {e}"))?;
+
+        let mmap = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        if mmap == libc::MAP_FAILED {
+            return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
+        }
+
+        Ok(Self {
+            mmap: mmap as *mut u8,
+            mmap_len: file_size,
+            k,
+            width,
+            depth,
+            decay,
+            path: path.to_path_buf(),
+            fingerprints: HashSet::with_capacity(k + 1),
+        })
+    }
+
+    // -- Header accessors --
+
+    fn heap_len(&self) -> usize {
+        u32::from_le_bytes(unsafe {
+            let mut buf = [0u8; 4];
+            std::ptr::copy_nonoverlapping(self.mmap.add(28), buf.as_mut_ptr(), 4);
+            buf
+        }) as usize
+    }
+
+    fn set_heap_len(&self, len: usize) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (len as u32).to_le_bytes().as_ptr(),
+                self.mmap.add(28),
+                4,
+            );
+        }
+    }
+
+    // -- CMS accessors --
+
+    fn cms_get(&self, row: usize, col: usize) -> i64 {
+        let offset = Self::cms_offset() + (row * self.width + col) * 8;
+        i64::from_le_bytes(unsafe {
+            let mut buf = [0u8; 8];
+            std::ptr::copy_nonoverlapping(self.mmap.add(offset), buf.as_mut_ptr(), 8);
+            buf
+        })
+    }
+
+    fn cms_set(&self, row: usize, col: usize, val: i64) {
+        let offset = Self::cms_offset() + (row * self.width + col) * 8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                val.to_le_bytes().as_ptr(),
+                self.mmap.add(offset),
+                8,
+            );
+        }
+    }
+
+    fn cms_increment(&self, element: &[u8], count: i64) -> i64 {
+        let h1 = fnv1a(element, 0x811c_9dc5);
+        let h2 = fnv1a(element, 0x050c_5d1f);
+        let mut min_count = i64::MAX;
+        for i in 0..self.depth {
+            let h = h1.wrapping_add((i as u64).wrapping_mul(h2));
+            let col = (h % self.width as u64) as usize;
+            let val = self.cms_get(i, col) + count;
+            self.cms_set(i, col, val);
+            min_count = min_count.min(val);
+        }
+        min_count
+    }
+
+    fn cms_estimate(&self, element: &[u8]) -> i64 {
+        let h1 = fnv1a(element, 0x811c_9dc5);
+        let h2 = fnv1a(element, 0x050c_5d1f);
+        let mut min_count = i64::MAX;
+        for i in 0..self.depth {
+            let h = h1.wrapping_add((i as u64).wrapping_mul(h2));
+            let col = (h % self.width as u64) as usize;
+            min_count = min_count.min(self.cms_get(i, col));
+        }
+        min_count
+    }
+
+    // -- Heap accessors --
+
+    fn heap_entry_count(&self, idx: usize) -> i64 {
+        let offset = Self::heap_offset(self.width, self.depth) + idx * HEAP_ENTRY_SIZE;
+        i64::from_le_bytes(unsafe {
+            let mut buf = [0u8; 8];
+            std::ptr::copy_nonoverlapping(self.mmap.add(offset), buf.as_mut_ptr(), 8);
+            buf
+        })
+    }
+
+    fn heap_entry_element(&self, idx: usize) -> String {
+        let base = Self::heap_offset(self.width, self.depth) + idx * HEAP_ENTRY_SIZE;
+        let elem_len = u32::from_le_bytes(unsafe {
+            let mut buf = [0u8; 4];
+            std::ptr::copy_nonoverlapping(self.mmap.add(base + 8), buf.as_mut_ptr(), 4);
+            buf
+        }) as usize;
+        let clamped = elem_len.min(MAX_ELEMENT_LEN);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.mmap.add(base + 12), clamped)
+        };
+        String::from_utf8_lossy(bytes).to_string()
+    }
+
+    fn set_heap_entry(&self, idx: usize, element: &str, count: i64) {
+        let base = Self::heap_offset(self.width, self.depth) + idx * HEAP_ENTRY_SIZE;
+        unsafe {
+            // Write count
+            std::ptr::copy_nonoverlapping(
+                count.to_le_bytes().as_ptr(),
+                self.mmap.add(base),
+                8,
+            );
+            // Write element length
+            let elem_bytes = element.as_bytes();
+            let len = elem_bytes.len().min(MAX_ELEMENT_LEN);
+            std::ptr::copy_nonoverlapping(
+                (len as u32).to_le_bytes().as_ptr(),
+                self.mmap.add(base + 8),
+                4,
+            );
+            // Write element bytes (zero-padded)
+            std::ptr::write_bytes(self.mmap.add(base + 12), 0, MAX_ELEMENT_LEN);
+            std::ptr::copy_nonoverlapping(
+                elem_bytes.as_ptr(),
+                self.mmap.add(base + 12),
+                len,
+            );
+        }
+    }
+
+    /// Find the index of the min-count entry in the heap, or None if empty.
+    fn find_min_heap_idx(&self) -> Option<(usize, i64)> {
+        let len = self.heap_len();
+        if len == 0 {
+            return None;
+        }
+        let mut min_idx = 0;
+        let mut min_count = self.heap_entry_count(0);
+        for i in 1..len {
+            let c = self.heap_entry_count(i);
+            if c < min_count {
+                min_count = c;
+                min_idx = i;
+            }
+        }
+        Some((min_idx, min_count))
+    }
+
+    /// Add a single element with the given increment. Returns the displaced
+    /// element name if an eviction occurred, or `None`.
+    pub fn add(&mut self, element: &str, count: i64) -> Option<String> {
+        let estimated = self.cms_increment(element.as_bytes(), count);
+
+        // Already tracked? Update count in-place.
+        if self.fingerprints.contains(element) {
+            let len = self.heap_len();
+            for i in 0..len {
+                if self.heap_entry_element(i) == element {
+                    self.set_heap_entry(i, element, estimated);
+                    break;
+                }
+            }
+            return None;
+        }
+
+        let len = self.heap_len();
+
+        // Heap has room
+        if len < self.k {
+            self.set_heap_entry(len, element, estimated);
+            self.set_heap_len(len + 1);
+            self.fingerprints.insert(element.to_string());
+            return None;
+        }
+
+        // Heap full: check if new element beats the minimum
+        if let Some((min_idx, min_count)) = self.find_min_heap_idx() {
+            if estimated > min_count {
+                let evicted = self.heap_entry_element(min_idx);
+                self.fingerprints.remove(&evicted);
+                self.set_heap_entry(min_idx, element, estimated);
+                self.fingerprints.insert(element.to_string());
+                return Some(evicted);
+            }
+        }
+
+        None
+    }
+
+    pub fn query(&self, element: &str) -> bool {
+        self.fingerprints.contains(element)
+    }
+
+    pub fn count(&self, element: &str) -> i64 {
+        self.cms_estimate(element.as_bytes())
+    }
+
+    pub fn list(&self) -> Vec<(String, i64)> {
+        let len = self.heap_len();
+        let mut items: Vec<(String, i64)> = (0..len)
+            .map(|i| (self.heap_entry_element(i), self.heap_entry_count(i)))
+            .collect();
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        items
+    }
+
+    pub fn info(&self) -> (usize, usize, usize, f64) {
+        (self.k, self.width, self.depth, self.decay)
+    }
+
+    pub fn msync(&self) -> Result<(), String> {
+        let ret = unsafe {
+            libc::msync(self.mmap as *mut libc::c_void, self.mmap_len, libc::MS_ASYNC)
+        };
+        if ret != 0 {
+            Err(format!("msync failed: {}", std::io::Error::last_os_error()))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for MmapTopK {
+    fn drop(&mut self) {
+        if !self.mmap.is_null() {
+            unsafe {
+                libc::msync(self.mmap as *mut libc::c_void, self.mmap_len, libc::MS_ASYNC);
+                libc::munmap(self.mmap as *mut libc::c_void, self.mmap_len);
+            }
+        }
+    }
+}
+
+/// Resource wrapper for MmapTopK.
+pub struct MmapTopKResource {
+    pub topk: Mutex<MmapTopK>,
+}
+
+// -- Mmap TopK NIF functions --
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_create_file(
+    env: Env,
+    path: String,
+    k: usize,
+    width: usize,
+    depth: usize,
+    decay: f64,
+) -> NifResult<Term> {
+    if !(0.0..=1.0).contains(&decay) {
+        return Ok((atoms::error(), "decay must be between 0 and 1").encode(env));
+    }
+    match MmapTopK::create(Path::new(&path), k, width, depth, decay) {
+        Ok(topk) => {
+            let resource = ResourceArc::new(MmapTopKResource {
+                topk: Mutex::new(topk),
+            });
+            Ok((atoms::ok(), resource).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_open_file(env: Env, path: String) -> NifResult<Term> {
+    match MmapTopK::open_existing(Path::new(&path)) {
+        Ok(topk) => {
+            let resource = ResourceArc::new(MmapTopKResource {
+                topk: Mutex::new(topk),
+            });
+            Ok((atoms::ok(), resource).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_add(
+    env: Env,
+    resource: ResourceArc<MmapTopKResource>,
+    items: Vec<String>,
+) -> NifResult<Term> {
+    let mut topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
+    let results: Vec<Term> = items
+        .iter()
+        .map(|item| match topk.add(item, 1) {
+            Some(evicted) => evicted.encode(env),
+            None => atoms::nil().encode(env),
+        })
+        .collect();
+    let _ = topk.msync();
+    Ok(results.encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_incrby(
+    env: Env,
+    resource: ResourceArc<MmapTopKResource>,
+    pairs: Vec<(String, i64)>,
+) -> NifResult<Term> {
+    let mut topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
+    let results: Vec<Term> = pairs
+        .iter()
+        .map(|(item, count)| match topk.add(item, *count) {
+            Some(evicted) => evicted.encode(env),
+            None => atoms::nil().encode(env),
+        })
+        .collect();
+    let _ = topk.msync();
+    Ok(results.encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_query(
+    env: Env,
+    resource: ResourceArc<MmapTopKResource>,
+    items: Vec<String>,
+) -> NifResult<Term> {
+    let topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
+    let results: Vec<i32> = items
+        .iter()
+        .map(|item| if topk.query(item) { 1 } else { 0 })
+        .collect();
+    Ok(results.encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_list(env: Env, resource: ResourceArc<MmapTopKResource>) -> NifResult<Term> {
+    let topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
+    let items: Vec<String> = topk.list().into_iter().map(|(elem, _)| elem).collect();
+    Ok(items.encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_count(
+    env: Env,
+    resource: ResourceArc<MmapTopKResource>,
+    items: Vec<String>,
+) -> NifResult<Term> {
+    let topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
+    let results: Vec<i64> = items.iter().map(|item| topk.count(item)).collect();
+    Ok(results.encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_info(env: Env, resource: ResourceArc<MmapTopKResource>) -> NifResult<Term> {
+    let topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
+    let (k, width, depth, decay) = topk.info();
+    Ok((k, width, depth, decay).encode(env))
+}
+
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn topk_file_close(env: Env, resource: ResourceArc<MmapTopKResource>) -> NifResult<Term> {
+    let mut topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
+    if !topk.mmap.is_null() {
+        unsafe {
+            libc::msync(topk.mmap as *mut libc::c_void, topk.mmap_len, libc::MS_SYNC);
+            libc::munmap(topk.mmap as *mut libc::c_void, topk.mmap_len);
+        }
+        topk.mmap = std::ptr::null_mut();
+        topk.mmap_len = 0;
+    }
+    Ok(atoms::ok().encode(env))
 }
 
 // ---------------------------------------------------------------------------
@@ -903,5 +1517,228 @@ mod tests {
         let guard = topk.lock().unwrap();
         let list = guard.list();
         assert_eq!(list.len(), 10);
+    }
+
+    // ==================================================================
+    // Mmap-backed TopK tests
+    // ==================================================================
+
+    #[test]
+    fn mmap_topk_create_add_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.topk");
+
+        let mut topk = MmapTopK::create(&path, 3, 8, 7, 0.9).unwrap();
+        assert!(!topk.query("a"));
+        topk.add("a", 10);
+        assert!(topk.query("a"));
+        assert_eq!(topk.heap_len(), 1);
+    }
+
+    #[test]
+    fn mmap_topk_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persist.topk");
+
+        {
+            let mut topk = MmapTopK::create(&path, 5, 8, 7, 0.9).unwrap();
+            topk.add("alpha", 10);
+            topk.add("beta", 20);
+            topk.add("gamma", 30);
+            topk.msync().unwrap();
+        }
+
+        let topk = MmapTopK::open_existing(&path).unwrap();
+        assert!(topk.query("alpha"));
+        assert!(topk.query("beta"));
+        assert!(topk.query("gamma"));
+        assert_eq!(topk.heap_len(), 3);
+
+        let list = topk.list();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].0, "gamma");
+    }
+
+    #[test]
+    fn mmap_topk_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evict.topk");
+
+        let mut topk = MmapTopK::create(&path, 2, 8, 7, 0.9).unwrap();
+        topk.add("a", 100);
+        topk.add("b", 50);
+        let evicted = topk.add("c", 200);
+        assert!(evicted.is_some());
+        assert_eq!(topk.heap_len(), 2);
+        assert!(topk.query("c"));
+    }
+
+    #[test]
+    fn mmap_topk_no_eviction_low_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_evict.topk");
+
+        let mut topk = MmapTopK::create(&path, 2, 8, 7, 0.9).unwrap();
+        topk.add("a", 100);
+        topk.add("b", 100);
+        assert_eq!(topk.add("c", 1), None);
+        assert_eq!(topk.heap_len(), 2);
+    }
+
+    #[test]
+    fn mmap_topk_update_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.topk");
+
+        let mut topk = MmapTopK::create(&path, 5, 8, 7, 0.9).unwrap();
+        topk.add("x", 10);
+        topk.add("x", 10);
+        topk.add("x", 10);
+        assert!(topk.query("x"));
+        assert_eq!(topk.heap_len(), 1);
+    }
+
+    #[test]
+    fn mmap_topk_list_sorted_desc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sorted.topk");
+
+        let mut topk = MmapTopK::create(&path, 5, 8, 7, 0.9).unwrap();
+        topk.add("low", 1);
+        topk.add("mid", 50);
+        topk.add("high", 100);
+
+        let items = topk.list();
+        let counts: Vec<i64> = items.iter().map(|(_, c)| *c).collect();
+        for i in 1..counts.len() {
+            assert!(counts[i - 1] >= counts[i], "list not sorted desc: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn mmap_topk_count_via_cms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count.topk");
+
+        let mut topk = MmapTopK::create(&path, 5, 100, 7, 0.9).unwrap();
+        topk.add("item", 42);
+        let est = topk.count("item");
+        assert_eq!(est, 42);
+    }
+
+    #[test]
+    fn mmap_topk_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("info.topk");
+
+        let topk = MmapTopK::create(&path, 10, 200, 5, 0.8).unwrap();
+        let (k, w, d, decay) = topk.info();
+        assert_eq!(k, 10);
+        assert_eq!(w, 200);
+        assert_eq!(d, 5);
+        assert!((decay - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn mmap_topk_open_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.topk");
+        std::fs::write(&path, &[0xFF; 128]).unwrap();
+        let result = MmapTopK::open_existing(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mmap_topk_open_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.topk");
+        let result = MmapTopK::open_existing(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mmap_topk_nested_dir_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a").join("b").join("c").join("test.topk");
+        let topk = MmapTopK::create(&path, 3, 8, 7, 0.9).unwrap();
+        assert!(path.exists());
+        assert_eq!(topk.heap_len(), 0);
+    }
+
+    #[test]
+    fn mmap_topk_many_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.topk");
+
+        let mut topk = MmapTopK::create(&path, 10, 200, 7, 0.9).unwrap();
+        for i in 0..100 {
+            topk.add(&format!("item_{i}"), (i + 1) as i64);
+        }
+        assert_eq!(topk.list().len(), 10);
+    }
+
+    #[test]
+    fn mmap_topk_reopen_after_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopen.topk");
+
+        {
+            let mut topk = MmapTopK::create(&path, 2, 100, 7, 0.9).unwrap();
+            topk.add("stay_high", 1000);
+            topk.add("stay_mid", 500);
+            topk.add("evict_me", 1); // should not evict (count too low)
+            topk.msync().unwrap();
+        }
+
+        let topk = MmapTopK::open_existing(&path).unwrap();
+        assert!(topk.query("stay_high"));
+        assert!(topk.query("stay_mid"));
+        assert_eq!(topk.heap_len(), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // L-5: update_existing uses into_vec + in-place mutation (no extra alloc)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn l5_update_existing_preserves_heap_invariant() {
+        let mut topk = TopK::new(5, 128, 4, 1.0);
+
+        // Add 5 items with increasing counts
+        for i in 0..5 {
+            topk.add(&format!("item_{i}"), (i + 1) as i64);
+        }
+
+        // All 5 should be in the top-K
+        for i in 0..5 {
+            assert!(
+                topk.query(&format!("item_{i}")),
+                "item_{i} should be in top-K"
+            );
+        }
+
+        // Update item_0 many times to increase its count
+        for _ in 0..50 {
+            topk.add("item_0", 1);
+        }
+
+        // item_0 should still be in the heap with an updated count
+        assert!(topk.query("item_0"), "item_0 must still be in top-K");
+
+        // Verify heap ordering: list() returns sorted desc
+        let list = topk.list();
+        assert_eq!(list.len(), 5);
+        for i in 0..list.len() - 1 {
+            assert!(
+                list[i].1 >= list[i + 1].1,
+                "list must be sorted descending by count"
+            );
+        }
+
+        // item_0 should be near the top since its count was incremented 50+ times
+        assert_eq!(
+            list[0].0, "item_0",
+            "item_0 must be the highest count after 50 increments"
+        );
     }
 }

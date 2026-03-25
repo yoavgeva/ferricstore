@@ -19,10 +19,10 @@ defmodule Ferricstore.Commands.Generic do
     * `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` -- cursor-based key iteration
     * `EXPIRETIME key` -- absolute Unix timestamp (seconds) when key expires (-1 / -2)
     * `PEXPIRETIME key` -- absolute Unix timestamp (milliseconds) when key expires (-1 / -2)
-    * `OBJECT ENCODING key` -- returns "raw" (FerricStore internal encoding)
+    * `OBJECT ENCODING key` -- returns actual encoding based on key type
     * `OBJECT HELP` -- returns list of OBJECT subcommands
-    * `OBJECT FREQ key` -- returns 0 (stub, no LFU tracking)
-    * `OBJECT IDLETIME key` -- returns 0 (stub)
+    * `OBJECT FREQ key` -- returns decayed LFU access frequency counter
+    * `OBJECT IDLETIME key` -- returns idle seconds derived from LFU ldt
     * `OBJECT REFCOUNT key` -- always returns 1
     * `WAIT numreplicas timeout` -- returns 0 immediately (no replication)
   """
@@ -127,9 +127,7 @@ defmodule Ferricstore.Commands.Generic do
   # COPY
   # ---------------------------------------------------------------------------
 
-  def handle("COPY", args, store) when length(args) >= 2 do
-    [source, destination | opts] = args
-
+  def handle("COPY", [source, destination | opts], store) do
     case parse_copy_opts(opts) do
       {:ok, replace?} ->
         do_copy(source, destination, replace?, store)
@@ -235,7 +233,17 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_object("ENCODING", [key], store) do
     if store.exists?.(key) do
-      "raw"
+      case Ferricstore.Store.TypeRegistry.get_type(key, store) do
+        "hash" -> "hashtable"
+        "list" -> "quicklist"
+        "set" -> "hashtable"
+        "zset" -> "skiplist"
+        "stream" -> "stream"
+        "string" ->
+          value = store.get.(key)
+          if value != nil and byte_size(value) <= 44, do: "embstr", else: "raw"
+        _other -> "raw"
+      end
     else
       {:error, "ERR no such key"}
     end
@@ -259,7 +267,16 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_object("FREQ", [key], store) do
     if store.exists?.(key) do
-      0
+      idx = Ferricstore.Store.Router.shard_for(key)
+      keydir = :"keydir_#{idx}"
+
+      case :ets.lookup(keydir, key) do
+        [{^key, _val, _exp, packed_lfu, _fid, _off, _vsize}] ->
+          Ferricstore.Store.LFU.effective_counter(packed_lfu)
+
+        _ ->
+          0
+      end
     else
       {:error, "ERR no such key"}
     end
@@ -267,7 +284,19 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_object("IDLETIME", [key], store) do
     if store.exists?.(key) do
-      0
+      idx = Ferricstore.Store.Router.shard_for(key)
+      keydir = :"keydir_#{idx}"
+
+      case :ets.lookup(keydir, key) do
+        [{^key, _val, _exp, packed_lfu, _fid, _off, _vsize}] ->
+          {ldt, _counter} = Ferricstore.Store.LFU.unpack(packed_lfu)
+          now_min = Ferricstore.Store.LFU.now_minutes()
+          elapsed = Ferricstore.Store.LFU.elapsed_minutes(now_min, ldt)
+          elapsed * 60
+
+        _ ->
+          0
+      end
     else
       {:error, "ERR no such key"}
     end
@@ -364,19 +393,19 @@ defmodule Ferricstore.Commands.Generic do
           case PrefixIndex.detect_prefix_pattern(pattern) do
             {:prefix_match, prefix} when is_map_key(store, :keys_with_prefix) ->
               store.keys_with_prefix.(prefix)
-              |> Enum.reject(&CompoundKey.internal_key?/1)
+              |> CompoundKey.user_visible_keys()
               |> Enum.sort()
 
             _ ->
               store.keys.()
-              |> Enum.reject(&CompoundKey.internal_key?/1)
+              |> CompoundKey.user_visible_keys()
               |> filter_by_match(match_pattern)
               |> Enum.sort()
           end
 
         _ ->
           store.keys.()
-          |> Enum.reject(&CompoundKey.internal_key?/1)
+          |> CompoundKey.user_visible_keys()
           |> filter_by_type(type_filter, store)
           |> filter_by_match(match_pattern)
           |> Enum.sort()
@@ -384,30 +413,20 @@ defmodule Ferricstore.Commands.Generic do
 
     # Cursor "0" means start from the beginning. Otherwise, cursor is the last
     # key seen -- find the first key strictly after it alphabetically.
-    {start_index, _} =
+    remaining =
       if cursor_str == "0" do
-        {0, nil}
+        all_keys
       else
-        idx = Enum.find_index(all_keys, fn k -> k > cursor_str end)
-        {idx || length(all_keys), nil}
+        Enum.drop_while(all_keys, fn k -> k <= cursor_str end)
       end
 
-    batch = Enum.slice(all_keys, start_index, count)
+    {batch, rest} = Enum.split(remaining, count)
 
     next_cursor =
-      case batch do
-        [] ->
-          "0"
-
-        _ ->
-          last_key = List.last(batch)
-          # If the last key in the batch is also the last key overall, iteration
-          # is complete -- return cursor "0".
-          if last_key == List.last(all_keys) do
-            "0"
-          else
-            last_key
-          end
+      case {batch, rest} do
+        {[], _} -> "0"
+        {_, []} -> "0"
+        _ -> List.last(batch)
       end
 
     [next_cursor, batch]
@@ -426,21 +445,6 @@ defmodule Ferricstore.Commands.Generic do
   defp filter_by_match(keys, nil), do: keys
 
   defp filter_by_match(keys, pattern) do
-    regex = glob_to_regex(pattern)
-    Enum.filter(keys, &Regex.match?(regex, &1))
+    Enum.filter(keys, &Ferricstore.GlobMatcher.match?(&1, pattern))
   end
-
-  # Reuses the same glob-to-regex approach as Server.handle("KEYS", ...).
-  defp glob_to_regex(pattern) do
-    regex_str =
-      pattern
-      |> String.graphemes()
-      |> Enum.map_join(&escape_glob_char/1)
-
-    Regex.compile!("^#{regex_str}$")
-  end
-
-  defp escape_glob_char("*"), do: ".*"
-  defp escape_glob_char("?"), do: "."
-  defp escape_glob_char(char), do: Regex.escape(char)
 end

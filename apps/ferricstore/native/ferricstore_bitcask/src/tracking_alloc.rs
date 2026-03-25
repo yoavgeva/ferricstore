@@ -39,21 +39,48 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 static GLOBAL: TrackingAllocator = TrackingAllocator;
 
 /// Returns the current number of live Rust-heap bytes (approximate).
+///
+/// In the cdylib (NIF), the tracking allocator is NOT installed (the BEAM's
+/// allocator is the global allocator), so this always returns 0 — which is
+/// misleading.  Use `tracked_allocated_bytes()` in NIF code, which returns
+/// `None` when tracking is disabled.
 pub fn allocated_bytes() -> u64 {
     ALLOCATED.load(Ordering::Relaxed) as u64
+}
+
+/// Returns `Some(bytes)` when the tracking allocator is active (tests),
+/// or `None` when it is not installed (cdylib / production NIF).
+///
+/// L-1 fix: callers can distinguish "0 bytes allocated" from "tracking
+/// is not available" instead of always seeing a misleading 0.
+pub fn tracked_allocated_bytes() -> Option<u64> {
+    if cfg!(test) {
+        Some(ALLOCATED.load(Ordering::Relaxed) as u64)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
 // NIF function: expose allocated_bytes to Elixir
 // ---------------------------------------------------------------------------
 
-/// Returns the current tracked allocation count as a u64.
+/// Returns the current tracked allocation count.
+///
+/// L-1 fix: returns `-1` when the tracking allocator is not installed
+/// (cdylib / production NIF) so callers can distinguish "tracking disabled"
+/// from "0 bytes allocated".  Returns a non-negative `i64` when tracking
+/// is active (tests).
+///
 /// This is a cheap atomic read -- runs on Normal scheduler.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::unnecessary_wraps)]
 pub fn rust_allocated_bytes(env: rustler::Env) -> rustler::NifResult<rustler::Term> {
     use rustler::Encoder;
-    Ok(allocated_bytes().encode(env))
+    match tracked_allocated_bytes() {
+        Some(bytes) => Ok((bytes as i64).encode(env)),
+        None => Ok((-1i64).encode(env)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +269,25 @@ mod tests {
         assert!(
             after_drop < before_drop + 500_000,
             "dropping 1MB vec should decrease tracked bytes: before_drop={before_drop}, after_drop={after_drop}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // L-1: tracked_allocated_bytes returns Some in test mode
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn l1_tracked_allocated_bytes_returns_some_in_test() {
+        // In test mode, the tracking allocator is installed as the global
+        // allocator, so tracked_allocated_bytes() must return Some.
+        let result = tracked_allocated_bytes();
+        assert!(
+            result.is_some(),
+            "tracked_allocated_bytes() must return Some in test mode"
+        );
+        assert!(
+            result.unwrap() > 0,
+            "tracked bytes should be > 0 (runtime has already allocated)"
         );
     }
 }

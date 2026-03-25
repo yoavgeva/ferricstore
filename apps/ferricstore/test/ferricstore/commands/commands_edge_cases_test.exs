@@ -1366,4 +1366,242 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
       assert "v" == store.get.("k")
     end
   end
+
+  # ===========================================================================
+  # Strings — SET EXAT / PXAT / GET / KEEPTTL (RESP3 handler level)
+  # ===========================================================================
+
+  describe "SET EXAT" do
+    test "sets key with absolute Unix timestamp in seconds" do
+      store = MockStore.make()
+      future_ts = div(System.os_time(:millisecond), 1000) + 120
+      assert :ok = Strings.handle("SET", ["k", "v", "EXAT", Integer.to_string(future_ts)], store)
+      assert "v" == store.get.("k")
+
+      # Verify expire_at_ms was set to ts * 1000
+      {_val, exp} = store.get_meta.("k")
+      assert exp == future_ts * 1000
+    end
+
+    test "EXAT with negative timestamp returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("SET", ["k", "v", "EXAT", "-1"], store)
+      assert msg =~ "invalid expire"
+    end
+
+    test "EXAT with zero timestamp returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("SET", ["k", "v", "EXAT", "0"], store)
+      assert msg =~ "invalid expire"
+    end
+
+    test "EXAT with non-numeric value returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("SET", ["k", "v", "EXAT", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+
+    test "EXAT missing value returns error" do
+      store = MockStore.make()
+      assert {:error, _} = Strings.handle("SET", ["k", "v", "EXAT"], store)
+    end
+  end
+
+  describe "SET PXAT" do
+    test "sets key with absolute Unix timestamp in milliseconds" do
+      store = MockStore.make()
+      future_ms = System.os_time(:millisecond) + 120_000
+      assert :ok = Strings.handle("SET", ["k", "v", "PXAT", Integer.to_string(future_ms)], store)
+      assert "v" == store.get.("k")
+
+      {_val, exp} = store.get_meta.("k")
+      assert exp == future_ms
+    end
+
+    test "PXAT with negative timestamp returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("SET", ["k", "v", "PXAT", "-1"], store)
+      assert msg =~ "invalid expire"
+    end
+
+    test "PXAT with zero timestamp returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("SET", ["k", "v", "PXAT", "0"], store)
+      assert msg =~ "invalid expire"
+    end
+
+    test "PXAT with non-numeric value returns error" do
+      store = MockStore.make()
+      assert {:error, msg} = Strings.handle("SET", ["k", "v", "PXAT", "abc"], store)
+      assert msg =~ "not an integer"
+    end
+  end
+
+  describe "SET GET" do
+    test "returns nil when key does not exist" do
+      store = MockStore.make()
+      assert nil == Strings.handle("SET", ["k", "v", "GET"], store)
+    end
+
+    test "returns old value when key exists" do
+      store = MockStore.make(%{"k" => {"old", 0}})
+      assert "old" == Strings.handle("SET", ["k", "new", "GET"], store)
+      assert "new" == store.get.("k")
+    end
+
+    test "GET with NX returns old value when key exists (write skipped)" do
+      store = MockStore.make(%{"k" => {"existing", 0}})
+      assert "existing" == Strings.handle("SET", ["k", "new", "NX", "GET"], store)
+      # Value unchanged
+      assert "existing" == store.get.("k")
+    end
+
+    test "GET with NX returns nil when key does not exist (write succeeds)" do
+      store = MockStore.make()
+      assert nil == Strings.handle("SET", ["k", "v", "NX", "GET"], store)
+      assert "v" == store.get.("k")
+    end
+
+    test "GET with XX returns nil when key does not exist (write skipped)" do
+      store = MockStore.make()
+      assert nil == Strings.handle("SET", ["k", "v", "XX", "GET"], store)
+      assert nil == store.get.("k")
+    end
+
+    test "GET with XX returns old value when key exists (write succeeds)" do
+      store = MockStore.make(%{"k" => {"old", 0}})
+      assert "old" == Strings.handle("SET", ["k", "new", "XX", "GET"], store)
+      assert "new" == store.get.("k")
+    end
+
+    test "GET with EX returns old value and sets expiry" do
+      store = MockStore.make(%{"k" => {"old", 0}})
+      assert "old" == Strings.handle("SET", ["k", "new", "EX", "60", "GET"], store)
+      assert "new" == store.get.("k")
+      {_val, exp} = store.get_meta.("k")
+      assert exp > 0
+    end
+  end
+
+  describe "SET KEEPTTL" do
+    test "preserves existing TTL when overwriting" do
+      future_exp = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"k" => {"old", future_exp}})
+      assert :ok = Strings.handle("SET", ["k", "new", "KEEPTTL"], store)
+      assert "new" == store.get.("k")
+
+      {_val, exp} = store.get_meta.("k")
+      assert exp == future_exp
+    end
+
+    test "key without TTL remains without TTL" do
+      store = MockStore.make(%{"k" => {"old", 0}})
+      assert :ok = Strings.handle("SET", ["k", "new", "KEEPTTL"], store)
+      assert "new" == store.get.("k")
+
+      {_val, exp} = store.get_meta.("k")
+      assert exp == 0
+    end
+
+    test "KEEPTTL on nonexistent key sets no TTL" do
+      store = MockStore.make()
+      assert :ok = Strings.handle("SET", ["k", "v", "KEEPTTL"], store)
+      assert "v" == store.get.("k")
+
+      {_val, exp} = store.get_meta.("k")
+      assert exp == 0
+    end
+
+    test "KEEPTTL combined with GET returns old value and preserves TTL" do
+      future_exp = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"k" => {"old", future_exp}})
+      assert "old" == Strings.handle("SET", ["k", "new", "KEEPTTL", "GET"], store)
+      assert "new" == store.get.("k")
+
+      {_val, exp} = store.get_meta.("k")
+      assert exp == future_exp
+    end
+
+    test "KEEPTTL combined with XX on existing key" do
+      future_exp = System.os_time(:millisecond) + 60_000
+      store = MockStore.make(%{"k" => {"old", future_exp}})
+      assert :ok = Strings.handle("SET", ["k", "new", "KEEPTTL", "XX"], store)
+      assert "new" == store.get.("k")
+
+      {_val, exp} = store.get_meta.("k")
+      assert exp == future_exp
+    end
+  end
+
+  describe "SET mutual exclusion errors" do
+    test "EXAT + EX returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "EXAT", "9999999999", "EX", "10"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "PXAT + PX returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "PXAT", "9999999999000", "PX", "10000"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "EXAT + PXAT returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "EXAT", "9999999999", "PXAT", "9999999999000"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "EX + EXAT returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "EX", "10", "EXAT", "9999999999"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "KEEPTTL + EX returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "KEEPTTL", "EX", "10"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "KEEPTTL + PX returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "KEEPTTL", "PX", "10000"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "EX + KEEPTTL returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "EX", "10", "KEEPTTL"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "PX + KEEPTTL returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "PX", "10000", "KEEPTTL"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "KEEPTTL + EXAT returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "KEEPTTL", "EXAT", "9999999999"], store)
+      assert msg =~ "syntax error"
+    end
+
+    test "KEEPTTL + PXAT returns syntax error" do
+      store = MockStore.make()
+      assert {:error, msg} =
+               Strings.handle("SET", ["k", "v", "KEEPTTL", "PXAT", "9999999999000"], store)
+      assert msg =~ "syntax error"
+    end
+  end
 end

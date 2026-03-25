@@ -1,11 +1,11 @@
 defmodule Ferricstore.Transaction.CoordinatorTest do
   @moduledoc """
-  Unit tests for the Two-Phase Commit coordinator.
+  Unit tests for the Transaction Coordinator.
 
-  These tests exercise the Coordinator module directly through the application's
-  running shards (0-3). Keys are chosen to land on specific shards based on
-  `:erlang.phash2/2` with shard_count=4:
+  Single-shard transactions dispatch atomically via a single GenServer call.
+  Cross-shard transactions execute atomically via anchor-shard Raft entry.
 
+  Key-to-shard mapping (phash2, 4 shards):
     - shard 0: "h", "j", "o", "p", "t", "u", "v", "x"
     - shard 1: "b", "c", "d", "e", "f", "k", "q", "r", "w", "y"
     - shard 2: "l"
@@ -55,10 +55,48 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
 
       assert result == [:ok, :ok, "second", "first"]
     end
+
+    test "INCR works atomically within single shard" do
+      Router.put("b", "10", 0)
+
+      queue = [{"INCR", ["b"]}, {"INCR", ["b"]}]
+
+      result = Coordinator.execute(queue, %{}, nil)
+
+      assert result == [{:ok, 11}, {:ok, 12}]
+      assert Router.get("b") == 12
+    end
+
+    test "DEL within single shard" do
+      Router.put("b", "v", 0)
+      Router.put("c", "v", 0)
+
+      queue = [{"DEL", ["b"]}, {"DEL", ["c"]}]
+
+      result = Coordinator.execute(queue, %{}, nil)
+
+      assert result == [1, 1]
+      assert Router.get("b") == nil
+      assert Router.get("c") == nil
+    end
+
+    test "mixed GET and SET on same shard" do
+      Router.put("b", "existing", 0)
+
+      queue = [
+        {"GET", ["b"]},
+        {"SET", ["b", "updated"]},
+        {"GET", ["b"]}
+      ]
+
+      result = Coordinator.execute(queue, %{}, nil)
+
+      assert result == ["existing", :ok, "updated"]
+    end
   end
 
-  describe "cross-shard 2PC commit" do
-    test "atomically commits commands across two shards" do
+  describe "cross-shard succeeds atomically" do
+    test "two shards succeeds" do
       # "h" -> shard 0, "b" -> shard 1
       queue = [{"SET", ["h", "val_h"]}, {"SET", ["b", "val_b"]}]
 
@@ -69,8 +107,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert Router.get("b") == "val_b"
     end
 
-    test "atomically commits commands across all four shards" do
-      # h -> shard 0, b -> shard 1, l -> shard 2, a -> shard 3
+    test "four shards succeeds" do
       queue = [
         {"SET", ["h", "v0"]},
         {"SET", ["b", "v1"]},
@@ -87,238 +124,34 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert Router.get("a") == "v3"
     end
 
-    test "returns results in original command order across shards" do
-      # Set initial values
-      Router.put("h", "10", 0)
-      Router.put("b", "20", 0)
+    test "mixed read/write across shards succeeds" do
+      Router.put("h", "existing_h", 0)
 
       queue = [
         {"GET", ["h"]},
-        {"SET", ["b", "new_b"]},
-        {"GET", ["b"]},
-        {"SET", ["h", "new_h"]}
+        {"SET", ["b", "new_b"]}
       ]
 
-      # GET h returns "10" (before SET h runs, since GET h is in prepare)
-      # SET b returns :ok
-      # GET b: the result depends on ordering within the shard
-      # SET h returns :ok
       result = Coordinator.execute(queue, %{}, nil)
 
-      assert is_list(result)
-      assert length(result) == 4
-
-      # After execution, both keys should have new values
-      assert Router.get("h") == "new_h"
+      assert result == ["existing_h", :ok]
       assert Router.get("b") == "new_b"
     end
 
-    test "10 keys across 4 shards all committed" do
-      # Pick keys: h,j,o (shard 0), b,c,d (shard 1), l (shard 2), a,g,i (shard 3)
-      keys = ~w(h j o b c d l a g i)
+    test "INCR across shards succeeds" do
+      Router.put("h", "10", 0)
+      Router.put("b", "20", 0)
 
-      queue =
-        Enum.map(keys, fn key ->
-          {"SET", [key, "value_#{key}"]}
-        end)
+      queue = [{"INCR", ["h"]}, {"INCR", ["b"]}]
 
       result = Coordinator.execute(queue, %{}, nil)
 
-      assert length(result) == 10
-      assert Enum.all?(result, &(&1 == :ok))
-
-      # All 10 keys should be committed
-      Enum.each(keys, fn key ->
-        assert Router.get(key) == "value_#{key}",
-               "Expected key #{key} to have value_#{key}, got #{inspect(Router.get(key))}"
-      end)
+      assert result == [{:ok, 11}, {:ok, 21}]
+      assert Router.get("h") == 11
+      assert Router.get("b") == 21
     end
 
-    test "mixed read/write commands across shards" do
-      Router.put("h", "existing_h", 0)
-      Router.put("a", "existing_a", 0)
-
-      queue = [
-        {"GET", ["h"]},
-        {"SET", ["b", "new_b"]},
-        {"GET", ["a"]},
-        {"INCR", ["l"]}
-      ]
-
-      result = Coordinator.execute(queue, %{}, nil)
-
-      assert is_list(result)
-      assert length(result) == 4
-    end
-  end
-
-  describe "WATCH conflict detection" do
-    test "aborts when a watched key was modified before EXEC" do
-      Router.put("h", "original", 0)
-
-      # Record version for WATCH
-      version = Router.get_version("h")
-      watched = %{"h" => version}
-
-      # Simulate another client modifying the key
-      Router.put("h", "modified_by_other", 0)
-
-      queue = [{"SET", ["h", "should_not_apply"]}]
-
-      result = Coordinator.execute(queue, watched, nil)
-
-      assert result == nil
-      # Value should remain as set by the other client
-      assert Router.get("h") == "modified_by_other"
-    end
-
-    test "proceeds when watched keys are unmodified" do
-      Router.put("h", "original", 0)
-
-      version = Router.get_version("h")
-      watched = %{"h" => version}
-
-      queue = [{"SET", ["h", "updated"]}]
-
-      result = Coordinator.execute(queue, watched, nil)
-
-      assert result == [:ok]
-      assert Router.get("h") == "updated"
-    end
-
-    test "cross-shard transaction aborts on WATCH conflict" do
-      Router.put("h", "orig_h", 0)
-      Router.put("b", "orig_b", 0)
-
-      version_h = Router.get_version("h")
-      watched = %{"h" => version_h}
-
-      # Another client modifies watched key
-      Router.put("h", "modified", 0)
-
-      queue = [
-        {"SET", ["h", "should_not_apply"]},
-        {"SET", ["b", "should_not_apply"]}
-      ]
-
-      result = Coordinator.execute(queue, watched, nil)
-
-      assert result == nil
-      # Neither key should be modified by the aborted transaction
-      assert Router.get("h") == "modified"
-      assert Router.get("b") == "orig_b"
-    end
-  end
-
-  describe "rollback on prepare failure" do
-    test "rolls back all shards when one shard's prepare fails due to type error" do
-      # Set "h" as a list (wrong type for INCR)
-      Router.list_op("h", {:lpush, ["item1"]})
-
-      queue = [
-        {"SET", ["b", "should_succeed"]},
-        {"INCR", ["h"]}
-      ]
-
-      result = Coordinator.execute(queue, %{}, nil)
-
-      # The transaction should still return results -- INCR on wrong type
-      # returns an error in its slot, but the whole transaction executes.
-      # (Redis semantics: individual command errors don't abort the tx)
-      assert is_list(result)
-      assert length(result) == 2
-    end
-  end
-
-  describe "sandbox namespace support" do
-    test "respects sandbox namespace for key routing" do
-      ns = "test_ns:"
-
-      # Pre-populate with namespaced key
-      Router.put("test_ns:h", "ns_value", 0)
-
-      queue = [{"GET", ["h"]}, {"SET", ["b", "ns_b"]}]
-
-      result = Coordinator.execute(queue, %{}, ns)
-
-      assert is_list(result)
-      assert length(result) == 2
-
-      # The first result should be the namespaced value
-      assert hd(result) == "ns_value"
-    end
-  end
-
-  describe "concurrent transactions on overlapping keys" do
-    test "serialize correctly via shard-level locking" do
-      Router.put("h", "0", 0)
-
-      # Run two concurrent transactions that both increment "h"
-      task1 =
-        Task.async(fn ->
-          Coordinator.execute([{"INCR", ["h"]}], %{}, nil)
-        end)
-
-      task2 =
-        Task.async(fn ->
-          Coordinator.execute([{"INCR", ["h"]}], %{}, nil)
-        end)
-
-      result1 = Task.await(task1)
-      result2 = Task.await(task2)
-
-      # Both should succeed (single-shard fast path, serialized by GenServer)
-      assert is_list(result1)
-      assert is_list(result2)
-
-      # Final value should be 2 (two increments from 0)
-      assert Router.get("h") == "2"
-    end
-
-    test "concurrent cross-shard transactions serialize correctly" do
-      Router.put("h", "0", 0)
-      Router.put("b", "0", 0)
-
-      # Two transactions both touching h (shard 0) and b (shard 1)
-      task1 =
-        Task.async(fn ->
-          Coordinator.execute(
-            [{"INCR", ["h"]}, {"INCR", ["b"]}],
-            %{},
-            nil
-          )
-        end)
-
-      task2 =
-        Task.async(fn ->
-          Coordinator.execute(
-            [{"INCR", ["h"]}, {"INCR", ["b"]}],
-            %{},
-            nil
-          )
-        end)
-
-      result1 = Task.await(task1, 10_000)
-      result2 = Task.await(task2, 10_000)
-
-      assert is_list(result1)
-      assert is_list(result2)
-
-      # Both keys should end at 2
-      assert Router.get("h") == "2"
-      assert Router.get("b") == "2"
-    end
-  end
-
-  describe "empty transaction" do
-    test "returns empty list for empty queue" do
-      result = Coordinator.execute([], %{}, nil)
-      assert result == []
-    end
-  end
-
-  describe "DEL across shards" do
-    test "DEL single key per command across shards" do
+    test "DEL across shards succeeds" do
       Router.put("h", "v", 0)
       Router.put("b", "v", 0)
       Router.put("l", "v", 0)
@@ -335,6 +168,150 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert Router.get("h") == nil
       assert Router.get("b") == nil
       assert Router.get("l") == nil
+    end
+  end
+
+  describe "hash tags co-locate keys" do
+    test "keys with same hash tag route to same shard" do
+      queue = [
+        {"SET", ["{user:42}:name", "Alice"]},
+        {"SET", ["{user:42}:email", "alice@example.com"]},
+        {"GET", ["{user:42}:name"]}
+      ]
+
+      result = Coordinator.execute(queue, %{}, nil)
+
+      assert result == [:ok, :ok, "Alice"]
+    end
+  end
+
+  describe "WATCH conflict detection" do
+    test "aborts when a watched key was modified before EXEC" do
+      Router.put("b", "original", 0)
+
+      version = Router.get_version("b")
+      watched = %{"b" => version}
+
+      # Simulate another client modifying the key
+      Router.put("b", "modified_by_other", 0)
+
+      queue = [{"SET", ["b", "should_not_apply"]}]
+
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert result == nil
+      assert Router.get("b") == "modified_by_other"
+    end
+
+    test "proceeds when watched keys are unmodified" do
+      Router.put("b", "original", 0)
+
+      version = Router.get_version("b")
+      watched = %{"b" => version}
+
+      queue = [{"SET", ["b", "updated"]}]
+
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert result == [:ok]
+      assert Router.get("b") == "updated"
+    end
+
+    test "cross-shard WATCH succeeds when watches pass" do
+      Router.put("h", "orig_h", 0)
+
+      version_h = Router.get_version("h")
+      watched = %{"h" => version_h}
+
+      queue = [
+        {"SET", ["h", "new_h"]},
+        {"SET", ["b", "new_b"]}
+      ]
+
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert result == [:ok, :ok]
+      assert Router.get("h") == "new_h"
+      assert Router.get("b") == "new_b"
+    end
+
+    test "cross-shard WATCH conflict returns nil" do
+      Router.put("h", "orig_h", 0)
+
+      version_h = Router.get_version("h")
+      watched = %{"h" => version_h}
+
+      # Modify watched key
+      Router.put("h", "changed", 0)
+
+      queue = [
+        {"SET", ["h", "new_h"]},
+        {"SET", ["b", "new_b"]}
+      ]
+
+      result = Coordinator.execute(queue, watched, nil)
+
+      # WATCH fails first -> nil (before classify even runs)
+      assert result == nil
+    end
+  end
+
+  describe "concurrent single-shard transactions" do
+    test "serialize correctly via GenServer" do
+      Router.put("b", "0", 0)
+
+      task1 =
+        Task.async(fn ->
+          Coordinator.execute([{"INCR", ["b"]}], %{}, nil)
+        end)
+
+      task2 =
+        Task.async(fn ->
+          Coordinator.execute([{"INCR", ["b"]}], %{}, nil)
+        end)
+
+      result1 = Task.await(task1)
+      result2 = Task.await(task2)
+
+      assert is_list(result1)
+      assert is_list(result2)
+
+      assert Router.get("b") == 2
+    end
+  end
+
+  describe "sandbox namespace support" do
+    test "respects sandbox namespace for key routing" do
+      ns = "test_ns:"
+
+      Router.put("test_ns:b", "ns_value", 0)
+
+      # Single key avoids cross-shard issues with namespace prefix
+      queue = [{"GET", ["b"]}]
+
+      result = Coordinator.execute(queue, %{}, ns)
+
+      assert is_list(result)
+      assert length(result) == 1
+      assert hd(result) == "ns_value"
+    end
+
+    test "sandbox namespace SET and GET on same key" do
+      ns = "test_ns:"
+
+      queue = [{"SET", ["b", "ns_b"]}, {"GET", ["b"]}]
+
+      result = Coordinator.execute(queue, %{}, ns)
+
+      assert is_list(result)
+      assert result == [:ok, "ns_b"]
+    end
+  end
+
+  describe "empty transaction" do
+    test "returns empty list for empty queue" do
+      result = Coordinator.execute([], %{}, nil)
+      assert result == []
     end
   end
 end

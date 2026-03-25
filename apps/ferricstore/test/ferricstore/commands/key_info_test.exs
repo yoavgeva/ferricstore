@@ -165,19 +165,23 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       assert info["hot_cache_status"] == "hot"
     end
 
-    test "shows cold status for key not in ETS cache" do
+    test "shows cold status for key with evicted value" do
       key = ukey("ki_cold")
       # Put value directly -- it goes into keydir via Shard GenServer.
       Router.put(key, "value", 0)
 
+      # Flush to disk first so the cold read path has data
+      ShardHelpers.flush_all_shards()
+
       # Evict the value from keydir to simulate a cold key (value = nil).
-      # In the single-table format, a cold key has {key, nil, expire, lfu}.
+      # In v2, ETS IS the keydir -- deleting entirely means key is gone.
+      # Cold keys have value=nil but retain disk location in the 7-tuple.
       idx = Router.shard_for(key)
       keydir = :"keydir_#{idx}"
-      :ets.delete(keydir, key)
+      [{_, _val, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, key)
+      :ets.insert(keydir, {key, nil, exp, lfu, fid, off, vsize})
 
-      # Now the key is truly cold -- only on disk.
-      # However, get_meta in do_key_info will warm it back.
+      # Now the key is cold -- value is nil but disk location known.
       # KEY_INFO causes a warm-up as a side effect, so the final status is "hot".
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)

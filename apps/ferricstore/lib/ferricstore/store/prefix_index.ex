@@ -68,7 +68,7 @@ defmodule Ferricstore.Store.PrefixIndex do
 
     case :ets.whereis(table_name) do
       :undefined ->
-        :ets.new(table_name, [:bag, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
+        :ets.new(table_name, [:duplicate_bag, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
 
       _ref ->
         :ets.delete_all_objects(table_name)
@@ -96,8 +96,8 @@ defmodule Ferricstore.Store.PrefixIndex do
         :ok
 
       prefix ->
-        # Delete existing entry first to prevent duplicates in the bag.
-        :ets.delete_object(prefix_table, {prefix, key})
+        # duplicate_bag: O(1) insert, no scan needed.
+        # Duplicates are harmless — keys_for_prefix deduplicates via keydir lookup.
         :ets.insert(prefix_table, {prefix, key})
         :ok
     end
@@ -141,19 +141,24 @@ defmodule Ferricstore.Store.PrefixIndex do
 
     try do
       :ets.lookup(prefix_table, prefix)
-      |> Enum.reduce([], fn {_prefix, key}, acc ->
-        case :ets.lookup(keydir, key) do
-          # Single-table format: {key, value | nil, expire_at_ms, lfu_counter}
-          # No expiry set -- live
-          [{^key, _value, 0, _lfu}] -> [key | acc]
-          # Has TTL, not yet expired -- live
-          [{^key, _value, exp, _lfu}] when exp > now -> [key | acc]
-          # Has TTL, expired -- skip
-          [{^key, _value, _exp, _lfu}] -> acc
-          # Not in keydir -- considered live (may be in Bitcask)
-          [] -> [key | acc]
+      |> Enum.reduce(MapSet.new(), fn {_prefix, key}, seen ->
+        if MapSet.member?(seen, key) do
+          seen
+        else
+          case :ets.lookup(keydir, key) do
+            # 7-tuple format: {key, value | nil, expire_at_ms, lfu_counter, file_id, offset, value_size}
+            # No expiry set -- live
+            [{^key, _value, 0, _lfu, _fid, _off, _vsize}] -> MapSet.put(seen, key)
+            # Has TTL, not yet expired -- live
+            [{^key, _value, exp, _lfu, _fid, _off, _vsize}] when exp > now -> MapSet.put(seen, key)
+            # Has TTL, expired -- skip
+            [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] -> seen
+            # Not in keydir -- considered live (may be in Bitcask)
+            [] -> MapSet.put(seen, key)
+          end
         end
       end)
+      |> MapSet.to_list()
     rescue
       ArgumentError -> []
     end
@@ -169,7 +174,7 @@ defmodule Ferricstore.Store.PrefixIndex do
   @spec rebuild_from_keydir(atom(), atom()) :: :ok
   def rebuild_from_keydir(prefix_table, keydir) do
     :ets.foldl(
-      fn {key, _value, _exp, _lfu}, :ok ->
+      fn {key, _value, _exp, _lfu, _fid, _off, _vsize}, :ok ->
         case extract_prefix(key) do
           nil -> :ok
           prefix ->

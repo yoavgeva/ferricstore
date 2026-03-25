@@ -72,6 +72,10 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       GenServer.stop(pid)
       :telemetry.detach(handler_id)
+
+      # Reset global persistent_term keys contaminated by the dedicated instance.
+      :persistent_term.put(:ferricstore_reject_writes, false)
+      :persistent_term.put(:ferricstore_keydir_full, false)
     end
   end
 
@@ -119,6 +123,10 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       GenServer.stop(pid)
       :telemetry.detach(handler_id)
+
+      # Reset global persistent_term keys contaminated by the dedicated instance.
+      :persistent_term.put(:ferricstore_reject_writes, false)
+      :persistent_term.put(:ferricstore_keydir_full, false)
     end
 
     test "not emitted when transitioning from :warning to :ok" do
@@ -381,7 +389,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       :telemetry.execute(
         [:ferricstore, :node, :startup_complete],
         %{duration_ms: 42},
-        %{shard_count: 4, port: 0, raft_enabled: false}
+        %{shard_count: 4, port: 0, mode: :standalone}
       )
 
       assert_receive {:telemetry, [:ferricstore, :node, :startup_complete], measurements,
@@ -390,7 +398,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       assert measurements.duration_ms == 42
       assert metadata.shard_count == 4
-      assert metadata.raft_enabled == false
+      assert metadata.mode == :standalone
 
       :telemetry.detach(handler_id)
     end
@@ -431,24 +439,16 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       handler_id = attach_handler([:ferricstore, :slow_log, :near_full])
 
       # Set slowlog-max-len to 10 so we can fill it easily.
-      original_max = Application.get_env(:ferricstore, :slowlog_max_len)
-      original_threshold = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_max_len, 10)
+      # Use SlowLog.set_*/1 to update both Application env and persistent_term.
+      original_max = Ferricstore.SlowLog.max_len()
+      original_threshold = Ferricstore.SlowLog.threshold()
+      Ferricstore.SlowLog.set_max_len(10)
       # Set threshold to 0 so every command is logged.
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      Ferricstore.SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original_max do
-          Application.put_env(:ferricstore, :slowlog_max_len, original_max)
-        else
-          Application.delete_env(:ferricstore, :slowlog_max_len)
-        end
-
-        if original_threshold do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original_threshold)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        Ferricstore.SlowLog.set_max_len(original_max)
+        Ferricstore.SlowLog.set_threshold(original_threshold)
 
         Ferricstore.SlowLog.reset()
         :telemetry.detach(handler_id)
@@ -479,23 +479,14 @@ defmodule FerricstoreServer.TelemetryEventsTest do
     test "not emitted when slowlog is well below 90% capacity" do
       handler_id = attach_handler([:ferricstore, :slow_log, :near_full])
 
-      original_max = Application.get_env(:ferricstore, :slowlog_max_len)
-      original_threshold = Application.get_env(:ferricstore, :slowlog_log_slower_than_us)
-      Application.put_env(:ferricstore, :slowlog_max_len, 100)
-      Application.put_env(:ferricstore, :slowlog_log_slower_than_us, 0)
+      original_max = Ferricstore.SlowLog.max_len()
+      original_threshold = Ferricstore.SlowLog.threshold()
+      Ferricstore.SlowLog.set_max_len(100)
+      Ferricstore.SlowLog.set_threshold(0)
 
       on_exit(fn ->
-        if original_max do
-          Application.put_env(:ferricstore, :slowlog_max_len, original_max)
-        else
-          Application.delete_env(:ferricstore, :slowlog_max_len)
-        end
-
-        if original_threshold do
-          Application.put_env(:ferricstore, :slowlog_log_slower_than_us, original_threshold)
-        else
-          Application.delete_env(:ferricstore, :slowlog_log_slower_than_us)
-        end
+        Ferricstore.SlowLog.set_max_len(original_max)
+        Ferricstore.SlowLog.set_threshold(original_threshold)
 
         Ferricstore.SlowLog.reset()
         :telemetry.detach(handler_id)
@@ -549,6 +540,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       shard_idx = Router.shard_for(key)
       shard_name = Router.shard_name(shard_idx)
       :ok = GenServer.call(shard_name, :flush)
+      Ferricstore.Store.BitcaskWriter.flush_all()
 
       # Evict the value from the hot cache (set value to nil) to force a
       # cold read. This mirrors the MemoryGuard eviction mechanism: the keydir

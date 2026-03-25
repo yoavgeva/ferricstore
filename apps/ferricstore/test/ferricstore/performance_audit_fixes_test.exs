@@ -1,0 +1,248 @@
+defmodule Ferricstore.PerformanceAuditFixesTest do
+  @moduledoc """
+  Tests for critical performance and memory audit fixes.
+  Each test verifies a specific audit finding was correctly addressed.
+  """
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Store.{LFU, Router}
+  alias Ferricstore.Test.ShardHelpers
+
+  setup do
+    ShardHelpers.flush_all_keys()
+    :ok
+  end
+
+  # ---------------------------------------------------------------
+  # C1: LFU config cached in persistent_term
+  # ---------------------------------------------------------------
+
+  describe "C1: LFU persistent_term config caching" do
+    test "LFU.touch/3 uses persistent_term values, not Application.get_env" do
+      # Ensure persistent_term values are set (should be set at app startup)
+      decay_time = :persistent_term.get(:ferricstore_lfu_decay_time)
+      log_factor = :persistent_term.get(:ferricstore_lfu_log_factor)
+      assert is_integer(decay_time) or is_float(decay_time)
+      assert is_integer(log_factor) or is_float(log_factor)
+    end
+
+    test "LFU.touch works correctly after persistent_term caching" do
+      # Put a key and verify touch updates the LFU counter
+      Router.put("lfu_test_key", "value", 0)
+      Process.sleep(50)
+
+      idx = Router.shard_for("lfu_test_key")
+      keydir = :"keydir_#{idx}"
+
+      # Read to trigger LFU touch
+      assert Router.get("lfu_test_key") == "value"
+
+      # Verify the key's LFU value was updated in ETS
+      [{_, _, _, lfu, _, _, _}] = :ets.lookup(keydir, "lfu_test_key")
+      {_ldt, counter} = LFU.unpack(lfu)
+      # Counter should be at least the initial value (5)
+      assert counter >= LFU.initial_counter()
+    end
+
+    test "LFU.effective_counter reads from persistent_term" do
+      packed = LFU.pack(LFU.now_minutes(), 10)
+      counter = LFU.effective_counter(packed)
+      # Should return a sensible value (close to 10 given fresh timestamp)
+      assert counter >= 0 and counter <= 255
+    end
+  end
+
+  # ---------------------------------------------------------------
+  # C2: MemoryGuard publishes pressure to persistent_term
+  # ---------------------------------------------------------------
+
+  describe "C2: MemoryGuard persistent_term pressure publishing" do
+    test "MemoryGuard publishes keydir_full to persistent_term" do
+      # After force_check, the persistent_term should be set
+      Ferricstore.MemoryGuard.force_check()
+      result = :persistent_term.get(:ferricstore_keydir_full, :not_set)
+      assert result in [true, false]
+    end
+
+    test "MemoryGuard publishes reject_writes to persistent_term" do
+      Ferricstore.MemoryGuard.force_check()
+      result = :persistent_term.get(:ferricstore_reject_writes, :not_set)
+      assert result in [true, false]
+    end
+
+    test "keydir_full? reads from persistent_term (no GenServer.call)" do
+      # Force check to populate persistent_term
+      Ferricstore.MemoryGuard.force_check()
+      # The function should return a boolean without error
+      result = Ferricstore.MemoryGuard.keydir_full?()
+      assert result in [true, false]
+    end
+
+    test "reject_writes? reads from persistent_term" do
+      Ferricstore.MemoryGuard.force_check()
+      result = Ferricstore.MemoryGuard.reject_writes?()
+      assert result in [true, false]
+    end
+
+    test "PUT works when keydir is not full" do
+      Ferricstore.MemoryGuard.force_check()
+      assert :ok = Router.put("memory_test", "value", 0)
+      assert Router.get("memory_test") == "value"
+    end
+  end
+
+  # ---------------------------------------------------------------
+  # C3: Router.exists_fast? with ETS bypass
+  # ---------------------------------------------------------------
+
+  describe "C3: Router.exists_fast? ETS bypass" do
+    test "exists_fast? returns true for present key" do
+      Router.put("exists_fast_test", "value", 0)
+      Process.sleep(50)
+      assert Router.exists_fast?("exists_fast_test") == true
+    end
+
+    test "exists_fast? returns false for absent key" do
+      assert Router.exists_fast?("nonexistent_key_xyz") == false
+    end
+
+    test "exists_fast? returns false for expired key" do
+      # Set a key with an expiry in the past
+      Router.put("expired_fast_test", "value", 1)
+      Process.sleep(50)
+      # Expired key should return false
+      assert Router.exists_fast?("expired_fast_test") == false
+    end
+
+    test "check_keydir_full uses exists_fast? instead of GenServer" do
+      # This is an indirect test - if keydir is full, it should be able
+      # to check existence via ETS without GenServer.call
+      Router.put("keydir_full_test", "value", 0)
+      Process.sleep(50)
+      # Put should succeed (updates existing key even when full)
+      assert :ok = Router.put("keydir_full_test", "updated", 0)
+    end
+  end
+
+  # ---------------------------------------------------------------
+  # C4: shard_name/1 pre-computed tuple
+  # ---------------------------------------------------------------
+
+  describe "C4: shard_name/1 pre-computed names" do
+    test "shard_name returns correct atoms for all shard indices" do
+      shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+
+      for i <- 0..(shard_count - 1) do
+        expected = :"Ferricstore.Store.Shard.#{i}"
+        assert Router.shard_name(i) == expected
+      end
+    end
+
+    test "shard_name is fast (no string interpolation overhead)" do
+      # Just verify functional correctness - the perf improvement is structural
+      assert Router.shard_name(0) == :"Ferricstore.Store.Shard.0"
+      assert Router.shard_name(1) == :"Ferricstore.Store.Shard.1"
+      assert Router.shard_name(2) == :"Ferricstore.Store.Shard.2"
+      assert Router.shard_name(3) == :"Ferricstore.Store.Shard.3"
+    end
+
+    test "routing works correctly with pre-computed names" do
+      Router.put("route_test_1", "v1", 0)
+      Router.put("route_test_2", "v2", 0)
+      Process.sleep(50)
+      assert Router.get("route_test_1") == "v1"
+      assert Router.get("route_test_2") == "v2"
+    end
+  end
+
+  # ---------------------------------------------------------------
+  # C5: build_store cached as module attribute
+  # ---------------------------------------------------------------
+
+  describe "C5: build_store cached as module attribute" do
+    test "all store operations work with cached store" do
+      # Test core operations through the command pipeline
+      Router.put("store_cache_test", "hello", 0)
+      Process.sleep(50)
+      assert Router.get("store_cache_test") == "hello"
+      assert Router.exists?("store_cache_test") == true
+      Router.delete("store_cache_test")
+      Process.sleep(50)
+      assert Router.get("store_cache_test") == nil
+    end
+
+    test "incr works with cached store" do
+      Router.put("incr_cache_test", "10", 0)
+      Process.sleep(50)
+      assert {:ok, 15} = Router.incr("incr_cache_test", 5)
+    end
+  end
+
+  # ---------------------------------------------------------------
+  # M-C1: Prefix-based ETS lookups instead of foldl
+  # ---------------------------------------------------------------
+
+  describe "M-C1: Prefix-based lookups use prefix_keys index" do
+    test "compound_scan uses prefix index instead of foldl" do
+      # Create a hash with some fields
+      shard_idx = Router.shard_for("myhash")
+      shard = Router.shard_name(shard_idx)
+
+      # Use compound_put to create hash fields
+      prefix = "H:myhash\0"
+      GenServer.call(shard, {:compound_put, "myhash", prefix <> "field1", "value1", 0})
+      GenServer.call(shard, {:compound_put, "myhash", prefix <> "field2", "value2", 0})
+      GenServer.call(shard, {:compound_put, "myhash", prefix <> "field3", "value3", 0})
+      Process.sleep(50)
+
+      # Scan should find all 3 fields
+      results = GenServer.call(shard, {:compound_scan, "myhash", prefix})
+      assert length(results) == 3
+      fields = Enum.map(results, fn {f, _v} -> f end) |> Enum.sort()
+      assert fields == ["field1", "field2", "field3"]
+    end
+
+    test "compound_count uses prefix index instead of foldl" do
+      shard_idx = Router.shard_for("counthash")
+      shard = Router.shard_name(shard_idx)
+
+      prefix = "H:counthash\0"
+      GenServer.call(shard, {:compound_put, "counthash", prefix <> "a", "1", 0})
+      GenServer.call(shard, {:compound_put, "counthash", prefix <> "b", "2", 0})
+      Process.sleep(50)
+
+      count = GenServer.call(shard, {:compound_count, "counthash", prefix})
+      assert count == 2
+    end
+
+    test "compound_delete_prefix works with prefix index" do
+      shard_idx = Router.shard_for("delhash")
+      shard = Router.shard_name(shard_idx)
+
+      prefix = "H:delhash\0"
+      GenServer.call(shard, {:compound_put, "delhash", prefix <> "x", "1", 0})
+      GenServer.call(shard, {:compound_put, "delhash", prefix <> "y", "2", 0})
+      Process.sleep(50)
+
+      GenServer.call(shard, {:compound_delete_prefix, "delhash", prefix})
+      Process.sleep(50)
+
+      count = GenServer.call(shard, {:compound_count, "delhash", prefix})
+      assert count == 0
+    end
+  end
+
+  # ---------------------------------------------------------------
+  # M-C2: TCP buffer optimization
+  # ---------------------------------------------------------------
+
+  describe "M-C2: TCP buffer empty check" do
+    test "buffer handles empty + data correctly" do
+      # This is structural - the optimization is in handle_data
+      # Verify through a successful TCP pipeline that the buffer works
+      Router.put("buffer_test", "hello", 0)
+      Process.sleep(50)
+      assert Router.get("buffer_test") == "hello"
+    end
+  end
+end

@@ -28,6 +28,15 @@ defmodule Ferricstore.Acl do
   5. **ACL LOG denials** -- command denials are logged to the AuditLog with
      username, command, client IP, and client ID.
 
+  ## File persistence (Phase 2)
+
+  ACL state can be saved to and loaded from `data_dir/acl.conf`:
+
+  - **ACL SAVE** -- atomic write (tmp + fsync + rename), 0600 permissions
+  - **ACL LOAD** -- all-or-nothing validation, rejects plaintext passwords
+  - **Auto-load on startup** -- loads from file if it exists
+  - **Auto-save** -- configurable debounced save on ACL mutations
+
   ## Command categories
 
   Commands can be granted or revoked by category using `+@category` / `-@category`:
@@ -46,7 +55,7 @@ defmodule Ferricstore.Acl do
         password: binary() | nil,
         commands: :all | MapSet.t(binary()),
         denied_commands: MapSet.t(binary()),
-        keys: :all | [binary()]
+        keys: :all | [key_pattern()]
       }}
 
   ## Usage
@@ -66,6 +75,8 @@ defmodule Ferricstore.Acl do
   """
 
   use GenServer
+
+  require Logger
 
   alias Ferricstore.AuditLog
 
@@ -133,14 +144,33 @@ defmodule Ferricstore.Acl do
   # Types
   # ---------------------------------------------------------------------------
 
+  @typedoc """
+  A compiled key pattern: {original_glob, access_mode, compiled_regex}.
+
+  Access modes:
+    - `:rw`    -- full read+write access (from `~pattern`)
+    - `:read`  -- read-only access (from `%R~pattern`)
+    - `:write` -- write-only access (from `%W~pattern`)
+  """
+  @type key_pattern :: {binary(), :rw | :read | :write, Regex.t()}
+
   @typedoc "A user record stored in the ACL table."
   @type user :: %{
           enabled: boolean(),
           password: binary() | nil,
           commands: :all | MapSet.t(binary()),
           denied_commands: MapSet.t(binary()),
-          keys: :all | [binary()]
+          keys: :all | [key_pattern()]
         }
+
+  # ---------------------------------------------------------------------------
+  # Constants -- file persistence
+  # ---------------------------------------------------------------------------
+
+  @acl_filename "acl.conf"
+  @max_line_length 1_048_576
+  @max_file_size 50_000_000
+  @auto_save_debounce_ms 1_000
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -149,7 +179,9 @@ defmodule Ferricstore.Acl do
   @doc """
   Starts the ACL GenServer and creates the backing ETS table.
 
-  Initialises the "default" user with full access.
+  Initialises the "default" user with full access. If an ACL file exists
+  at `data_dir/acl.conf`, it is loaded on startup. If the file is invalid,
+  a warning is logged and the server starts with the default user only.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -423,6 +455,130 @@ defmodule Ferricstore.Acl do
   end
 
   @doc """
+  Checks if the given user is allowed to access the given key with the given
+  access type (`:read` or `:write`).
+
+  Returns `:ok` if access is permitted, or `{:error, reason}` with a NOPERM
+  prefix if denied.
+
+  ## Parameters
+
+    - `username`    -- the username
+    - `key`         -- the key to check (binary)
+    - `access_type` -- `:read` or `:write`
+
+  ## Examples
+
+      Ferricstore.Acl.check_key_access("default", "mykey", :read)
+      #=> :ok
+
+      Ferricstore.Acl.check_key_access("reader", "forbidden:key", :write)
+      #=> {:error, "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+  """
+  @spec check_key_access(binary(), binary(), :read | :write) :: :ok | {:error, binary()}
+  def check_key_access(username, key, access_type) do
+    case get_user(username) do
+      nil ->
+        {:error, "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+
+      %{enabled: false} ->
+        {:error, "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+
+      %{keys: :all} ->
+        :ok
+
+      %{keys: patterns} ->
+        if key_matches_any?(key, access_type, patterns) do
+          :ok
+        else
+          {:error, "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+        end
+    end
+  end
+
+  @doc """
+  Checks if a key matches any of the given compiled key patterns for the
+  given access type. Used by the cached ACL check in connection handlers.
+
+  ## Parameters
+
+    - `key`         -- the key to check
+    - `access_type` -- `:read` or `:write`
+    - `patterns`    -- list of `{glob, access_mode, regex}` tuples
+
+  ## Returns
+
+    - `true` if any pattern matches
+    - `false` otherwise
+  """
+  @spec key_matches_any?(binary(), :read | :write, [key_pattern()]) :: boolean()
+  def key_matches_any?(_key, _access_type, []), do: false
+
+  def key_matches_any?(key, access_type, [{_glob, mode, regex} | rest]) do
+    if access_permitted?(mode, access_type) and Regex.match?(regex, key) do
+      true
+    else
+      key_matches_any?(key, access_type, rest)
+    end
+  end
+
+  # Check if the pattern's access mode permits the requested access type.
+  @spec access_permitted?(:rw | :read | :write, :read | :write) :: boolean()
+  defp access_permitted?(:rw, _access_type), do: true
+  defp access_permitted?(:read, :read), do: true
+  defp access_permitted?(:write, :write), do: true
+  defp access_permitted?(_, _), do: false
+
+  @doc """
+  Compiles a glob pattern string into a `Regex`.
+
+  Supports:
+    - `*` -- matches any sequence of characters
+    - `?` -- matches any single character
+    - `[abc]` -- matches any character in the set
+
+  All other characters are escaped for literal matching.
+
+  ## Examples
+
+      Ferricstore.Acl.compile_glob("cache:*")
+      #=> ~r/\\Acache:.*\\z/s
+
+      Ferricstore.Acl.compile_glob("user:?:profile")
+      #=> ~r/\\Auser:..:profile\\z/s
+  """
+  @spec compile_glob(binary()) :: Regex.t()
+  def compile_glob(pattern) do
+    regex_str =
+      pattern
+      |> String.graphemes()
+      |> compile_glob_chars([])
+      |> IO.iodata_to_binary()
+
+    # The \\A and \\z anchors ensure full-string match. The 's' flag makes
+    # '.' match newlines (though keys shouldn't contain them).
+    Regex.compile!("\\A" <> regex_str <> "\\z", "s")
+  end
+
+  defp compile_glob_chars([], acc), do: Enum.reverse(acc)
+  defp compile_glob_chars(["*" | rest], acc), do: compile_glob_chars(rest, [".*" | acc])
+  defp compile_glob_chars(["?" | rest], acc), do: compile_glob_chars(rest, ["." | acc])
+
+  defp compile_glob_chars(["[" | rest], acc) do
+    # Pass through character class: collect until ']'
+    {class_chars, remaining} = collect_char_class(rest, [])
+    compile_glob_chars(remaining, [["[", class_chars, "]"] | acc])
+  end
+
+  defp compile_glob_chars([ch | rest], acc) do
+    compile_glob_chars(rest, [Regex.escape(ch) | acc])
+  end
+
+  defp collect_char_class([], acc), do: {Enum.reverse(acc), []}
+  defp collect_char_class(["]" | rest], acc), do: {Enum.reverse(acc), rest}
+  defp collect_char_class([ch | rest], acc), do: collect_char_class(rest, [ch | acc])
+
+  @doc """
   Returns the map of command categories.
 
   Each key is an uppercase category name (e.g. `"READ"`, `"WRITE"`, `"ADMIN"`,
@@ -444,6 +600,71 @@ defmodule Ferricstore.Acl do
   @spec reset!() :: :ok
   def reset! do
     GenServer.call(__MODULE__, :reset)
+  end
+
+  # ---------------------------------------------------------------------------
+  # File persistence API (ACL SAVE / ACL LOAD)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Serializes all ACL users to the ACL file (`data_dir/acl.conf`).
+
+  Uses atomic write (write to temp file, fsync, rename) to prevent
+  corruption on crash. File permissions are set to 0600 (owner read/write
+  only) to protect password hashes.
+
+  The `data_dir` is read from application env `:ferricstore, :data_dir`.
+
+  Returns `:ok` on success, `{:error, reason}` on failure.
+  """
+  @spec save() :: :ok | {:error, binary()}
+  def save do
+    GenServer.call(__MODULE__, :acl_save)
+  end
+
+  @doc """
+  Saves ACL state to the given directory path.
+
+  Same as `save/0` but with an explicit data directory.
+  """
+  @spec save(binary()) :: :ok | {:error, binary()}
+  def save(data_dir) do
+    GenServer.call(__MODULE__, {:acl_save, data_dir})
+  end
+
+  @doc """
+  Reads the ACL file (`data_dir/acl.conf`) and replaces the current ACL state.
+
+  Validates every line before applying. If any line is invalid, the entire
+  file is rejected and the current ACL state is preserved (all-or-nothing).
+
+  The `default` user must be defined in the file. If it is missing, the
+  load is rejected.
+
+  Returns `:ok` on success, `{:error, reason}` on failure (including the
+  line number of the first error when applicable).
+  """
+  @spec load() :: :ok | {:error, binary()}
+  def load do
+    GenServer.call(__MODULE__, :acl_load)
+  end
+
+  @doc """
+  Loads ACL state from the given directory path.
+
+  Same as `load/0` but with an explicit data directory.
+  """
+  @spec load(binary()) :: :ok | {:error, binary()}
+  def load(data_dir) do
+    GenServer.call(__MODULE__, {:acl_load, data_dir})
+  end
+
+  @doc """
+  Returns the path to the ACL file for the given data directory.
+  """
+  @spec acl_file_path(binary()) :: binary()
+  def acl_file_path(data_dir) do
+    Path.join(data_dir, @acl_filename)
   end
 
   # ---------------------------------------------------------------------------
@@ -594,7 +815,27 @@ defmodule Ferricstore.Acl do
   def init(_opts) do
     table = :ets.new(@table, [:set, :public, :named_table])
     insert_default_user()
-    {:ok, %{table: table}}
+
+    # Auto-load from file on startup (design doc section 7 startup sequence)
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    state = %{table: table, save_timer: nil}
+
+    state =
+      case auto_load_from_file(data_dir) do
+        :ok ->
+          Logger.info("ACL loaded from #{acl_file_path(data_dir)}")
+          state
+
+        {:error, :enoent} ->
+          # No file -- start with default user only (normal for fresh installs)
+          state
+
+        {:error, reason} ->
+          Logger.warning("ACL file load failed on startup, using defaults: #{reason}")
+          state
+      end
+
+    {:ok, state}
   end
 
   @impl true
@@ -623,7 +864,7 @@ defmodule Ferricstore.Acl do
       case apply_rules(base, rules) do
         {:ok, updated} ->
           :ets.insert(@table, {username, updated})
-          {:reply, :ok, state}
+          {:reply, :ok, maybe_schedule_auto_save(state)}
 
         {:error, _reason} = err ->
           {:reply, err, state}
@@ -642,7 +883,7 @@ defmodule Ferricstore.Acl do
 
       _ ->
         :ets.delete(@table, username)
-        {:reply, :ok, state}
+        {:reply, :ok, maybe_schedule_auto_save(state)}
     end
   end
 
@@ -651,6 +892,42 @@ defmodule Ferricstore.Acl do
     insert_default_user()
     {:reply, :ok, state}
   end
+
+  # --- ACL SAVE ---
+
+  def handle_call(:acl_save, _from, state) do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    {:reply, do_save(data_dir), state}
+  end
+
+  def handle_call({:acl_save, data_dir}, _from, state) do
+    {:reply, do_save(data_dir), state}
+  end
+
+  # --- ACL LOAD ---
+
+  def handle_call(:acl_load, _from, state) do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    {:reply, do_load(data_dir), state}
+  end
+
+  def handle_call({:acl_load, data_dir}, _from, state) do
+    {:reply, do_load(data_dir), state}
+  end
+
+  @impl true
+  def handle_info(:auto_save, state) do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+
+    case do_save(data_dir) do
+      :ok -> :ok
+      {:error, reason} -> Logger.warning("ACL auto-save failed: #{reason}")
+    end
+
+    {:noreply, %{state | save_timer: nil}}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
 
   # ---------------------------------------------------------------------------
   # Private -- password hashing (Fix 1)
@@ -706,13 +983,22 @@ defmodule Ferricstore.Acl do
   defp parse_rule(user, "nopass"), do: {:ok, %{user | password: nil}}
   defp parse_rule(user, "resetpass"), do: {:ok, %{user | password: nil}}
 
-  defp parse_rule(user, "~" <> pattern) do
-    case user.keys do
-      :all -> {:ok, %{user | keys: [pattern]}}
-      patterns -> {:ok, %{user | keys: patterns ++ [pattern]}}
-    end
+  defp parse_rule(user, "%R~" <> pattern) do
+    compiled = {pattern, :read, compile_glob(pattern)}
+    add_key_pattern(user, compiled)
   end
 
+  defp parse_rule(user, "%W~" <> pattern) do
+    compiled = {pattern, :write, compile_glob(pattern)}
+    add_key_pattern(user, compiled)
+  end
+
+  defp parse_rule(user, "~" <> pattern) do
+    compiled = {pattern, :rw, compile_glob(pattern)}
+    add_key_pattern(user, compiled)
+  end
+
+  defp parse_rule(user, "resetkeys"), do: {:ok, %{user | keys: []}}
   defp parse_rule(user, "allkeys"), do: {:ok, %{user | keys: :all}}
 
   defp parse_rule(user, "allcommands") do
@@ -802,8 +1088,18 @@ defmodule Ferricstore.Acl do
     {:error, "ERR Error in ACL SETUSER modifier '#{rule}': Syntax error"}
   end
 
+  # Appends a compiled key pattern to the user's key list.
+  # If the user currently has :all keys access, replaces it with just this pattern.
+  @spec add_key_pattern(user(), key_pattern()) :: {:ok, user()}
+  defp add_key_pattern(user, compiled_pattern) do
+    case user.keys do
+      :all -> {:ok, %{user | keys: [compiled_pattern]}}
+      patterns -> {:ok, %{user | keys: patterns ++ [compiled_pattern]}}
+    end
+  end
+
   # ---------------------------------------------------------------------------
-  # Private -- formatting
+  # Private -- formatting (for ACL LIST display)
   # ---------------------------------------------------------------------------
 
   @spec format_user_rule({binary(), user()}) :: binary()
@@ -824,11 +1120,15 @@ defmodule Ferricstore.Acl do
     |> Enum.map_join(" ", &"+#{String.downcase(&1)}")
   end
 
-  @spec format_keys(:all | [binary()]) :: binary()
+  @spec format_keys(:all | [key_pattern()]) :: binary()
   defp format_keys(:all), do: "~*"
 
   defp format_keys(patterns) when is_list(patterns) do
-    Enum.map_join(patterns, " ", &"~#{&1}")
+    Enum.map_join(patterns, " ", fn
+      {glob, :rw, _regex} -> "~#{glob}"
+      {glob, :read, _regex} -> "%R~#{glob}"
+      {glob, :write, _regex} -> "%W~#{glob}"
+    end)
   end
 
   # Displays the stored password hash as a SHA-256 hex digest (for ACL GETUSER).
@@ -853,4 +1153,501 @@ defmodule Ferricstore.Acl do
       keys: :all
     }})
   end
+
+  # ---------------------------------------------------------------------------
+  # Private -- file persistence (ACL SAVE / LOAD)
+  # ---------------------------------------------------------------------------
+
+  # Performs the actual save to disk. Called inside GenServer to serialize
+  # concurrent SAVE requests.
+  #
+  # Security: atomic write (tmp + fsync + rename), 0600 permissions,
+  # path traversal validation, never writes plaintext passwords.
+  @spec do_save(binary()) :: :ok | {:error, binary()}
+  defp do_save(data_dir) do
+    path = acl_file_path(data_dir)
+    tmp = path <> ".tmp.#{System.unique_integer([:positive])}"
+
+    case validate_acl_path(path, data_dir) do
+      :ok -> :ok
+      {:error, _} = err -> throw(err)
+    end
+
+    header =
+      "# FerricStore ACL configuration\n" <>
+        "# Generated by ACL SAVE at #{DateTime.utc_now() |> DateTime.to_iso8601()}\n\n"
+
+    lines =
+      @table
+      |> :ets.tab2list()
+      |> Enum.sort_by(fn {name, _} -> name end)
+      |> Enum.map(&format_user_for_file/1)
+      |> Enum.join("\n")
+
+    contents = header <> lines <> "\n"
+
+    with :ok <- File.mkdir_p(data_dir),
+         :ok <- File.write(tmp, contents),
+         :ok <- File.chmod(tmp, 0o600),
+         :ok <- fsync_file(tmp),
+         :ok <- File.rename(tmp, path) do
+      :ok
+    else
+      {:error, reason} ->
+        File.rm(tmp)
+        {:error, "ERR ACL save failed: #{inspect(reason)}"}
+    end
+  catch
+    {:error, _} = err -> err
+  end
+
+  # Performs the actual load from disk. Called inside GenServer to serialize
+  # concurrent LOAD requests and prevent race conditions with in-flight
+  # commands. All-or-nothing: current state is preserved on any error.
+  @spec do_load(binary()) :: :ok | {:error, binary()}
+  defp do_load(data_dir) do
+    path = acl_file_path(data_dir)
+
+    case validate_acl_path(path, data_dir) do
+      :ok -> :ok
+      {:error, _} = err -> throw(err)
+    end
+
+    case File.read(path) do
+      {:ok, contents} ->
+        if byte_size(contents) > @max_file_size do
+          {:error, "ERR ACL file too large (#{byte_size(contents)} bytes, max #{@max_file_size})"}
+        else
+          case parse_acl_file(contents) do
+            {:ok, users} ->
+              unless Enum.any?(users, fn {name, _} -> name == "default" end) do
+                throw({:error, "ERR ACL file must contain a 'default' user definition"})
+              end
+
+              # All-or-nothing: only replace ETS if everything validated
+              :ets.delete_all_objects(@table)
+
+              Enum.each(users, fn {name, user_map} ->
+                :ets.insert(@table, {name, user_map})
+              end)
+
+              :ok
+
+            {:error, _} = err ->
+              err
+          end
+        end
+
+      {:error, :enoent} ->
+        {:error, "ERR There is no ACL file to load"}
+
+      {:error, :eacces} ->
+        {:error, "ERR Permission denied reading ACL file"}
+
+      {:error, reason} ->
+        {:error, "ERR Cannot read ACL file: #{inspect(reason)}"}
+    end
+  catch
+    {:error, _} = err -> err
+  end
+
+  # Auto-load from file on startup. Returns :ok, {:error, :enoent}, or
+  # {:error, reason}. Called directly from init (not through GenServer call).
+  @spec auto_load_from_file(binary()) :: :ok | {:error, :enoent} | {:error, binary()}
+  defp auto_load_from_file(data_dir) do
+    path = acl_file_path(data_dir)
+
+    case File.read(path) do
+      {:ok, contents} ->
+        if byte_size(contents) > @max_file_size do
+          {:error, "ACL file too large"}
+        else
+          case parse_acl_file(contents) do
+            {:ok, users} ->
+              if Enum.any?(users, fn {name, _} -> name == "default" end) do
+                :ets.delete_all_objects(@table)
+
+                Enum.each(users, fn {name, user_map} ->
+                  :ets.insert(@table, {name, user_map})
+                end)
+
+                :ok
+              else
+                {:error, "ACL file missing 'default' user"}
+              end
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end
+
+      {:error, :enoent} ->
+        {:error, :enoent}
+
+      {:error, reason} ->
+        {:error, "Cannot read ACL file: #{inspect(reason)}"}
+    end
+  end
+
+  # Schedules a debounced auto-save if :acl_auto_save is enabled.
+  @spec maybe_schedule_auto_save(map()) :: map()
+  defp maybe_schedule_auto_save(state) do
+    if Application.get_env(:ferricstore, :acl_auto_save, false) do
+      if state.save_timer, do: Process.cancel_timer(state.save_timer)
+      timer = Process.send_after(self(), :auto_save, @auto_save_debounce_ms)
+      %{state | save_timer: timer}
+    else
+      state
+    end
+  end
+
+  # Validates that the ACL file path stays within the data directory.
+  # Prevents path traversal (CVE-2023-45145 pattern).
+  @spec validate_acl_path(binary(), binary()) :: :ok | {:error, binary()}
+  defp validate_acl_path(path, data_dir) do
+    abs_path = Path.expand(path)
+    abs_dir = Path.expand(data_dir)
+
+    cond do
+      not (String.starts_with?(abs_path, abs_dir <> "/") or abs_path == abs_dir) ->
+        {:error, "ERR ACL file path escapes data directory"}
+
+      symlink?(path) ->
+        {:error, "ERR ACL file path is a symlink, refusing for security"}
+
+      true ->
+        :ok
+    end
+  end
+
+  # Checks if a path is a symlink. Returns false if the path does not exist.
+  @spec symlink?(binary()) :: boolean()
+  defp symlink?(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :symlink}} -> true
+      _ -> false
+    end
+  end
+
+  # Fsyncs a file to ensure data is flushed to disk before rename.
+  @spec fsync_file(binary()) :: :ok | {:error, term()}
+  defp fsync_file(path) do
+    case :file.open(String.to_charlist(path), [:read, :write]) do
+      {:ok, fd} ->
+        result = :file.sync(fd)
+        :file.close(fd)
+        result
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private -- ACL file serialization (SAVE)
+  # ---------------------------------------------------------------------------
+
+  # Formats a single user for file output. Password hashes use # prefix.
+  # Denied commands are serialized as -command after +@all.
+  @spec format_user_for_file({binary(), user()}) :: binary()
+  defp format_user_for_file({name, user}) do
+    parts = ["user", name]
+    parts = parts ++ [if(user.enabled, do: "on", else: "off")]
+
+    # Password: nopass or #<hash> (never plaintext)
+    parts =
+      case user.password do
+        nil -> parts ++ ["nopass"]
+        hash -> parts ++ ["#" <> hash]
+      end
+
+    # Key patterns with access mode prefixes
+    parts =
+      case user.keys do
+        :all ->
+          parts ++ ["~*"]
+
+        patterns ->
+          parts ++
+            Enum.map(patterns, fn
+              {glob, :rw, _regex} -> "~#{glob}"
+              {glob, :read, _regex} -> "%R~#{glob}"
+              {glob, :write, _regex} -> "%W~#{glob}"
+            end)
+      end
+
+    # Channels (always &* for now)
+    parts = parts ++ ["&*"]
+
+    # Commands and denied commands
+    parts =
+      case user.commands do
+        :all ->
+          denied = user.denied_commands
+
+          if MapSet.size(denied) == 0 do
+            parts ++ ["+@all"]
+          else
+            parts ++
+              ["+@all"] ++
+              (denied
+               |> MapSet.to_list()
+               |> Enum.sort()
+               |> Enum.map(&("-#{String.downcase(&1)}")))
+          end
+
+        cmds ->
+          if MapSet.size(cmds) == 0 do
+            parts
+          else
+            parts ++
+              (cmds
+               |> MapSet.to_list()
+               |> Enum.sort()
+               |> Enum.map(&("+#{String.downcase(&1)}")))
+          end
+      end
+
+    Enum.join(parts, " ")
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private -- ACL file parsing (LOAD)
+  # ---------------------------------------------------------------------------
+
+  # Parses an ACL file's contents into a list of {username, user_map} tuples.
+  # All-or-nothing: returns {:ok, users} or {:error, reason} with line number.
+  # Duplicate usernames: last definition wins (matches Redis behavior).
+  @spec parse_acl_file(binary()) :: {:ok, [{binary(), user()}]} | {:error, binary()}
+  defp parse_acl_file(contents) do
+    contents = strip_bom(contents)
+
+    lines =
+      contents
+      |> String.split(~r/\r?\n/)
+      |> Enum.with_index(1)
+
+    result =
+      Enum.reduce_while(lines, {:ok, %{}}, fn {line, line_num}, {:ok, acc} ->
+        line = String.trim_trailing(line)
+
+        cond do
+          line == "" ->
+            {:cont, {:ok, acc}}
+
+          String.starts_with?(line, "#") ->
+            {:cont, {:ok, acc}}
+
+          byte_size(line) > @max_line_length ->
+            {:halt, {:error, "ERR Invalid ACL line #{line_num}: line exceeds maximum length"}}
+
+          true ->
+            case parse_acl_line(line, line_num) do
+              {:ok, {username, user_map}} ->
+                {:cont, {:ok, Map.put(acc, username, user_map)}}
+
+              {:error, _} = err ->
+                {:halt, err}
+            end
+        end
+      end)
+
+    case result do
+      {:ok, users_map} -> {:ok, Enum.to_list(users_map)}
+      {:error, _} = err -> err
+    end
+  end
+
+  # Parses a single "user <name> <rules...>" line.
+  @spec parse_acl_line(binary(), pos_integer()) ::
+          {:ok, {binary(), user()}} | {:error, binary()}
+  defp parse_acl_line(line, line_num) do
+    tokens = String.split(line, ~r/\s+/, trim: true)
+
+    case tokens do
+      ["user", username | rule_tokens] ->
+        # Security: reject plaintext passwords in file (>password)
+        if Enum.any?(rule_tokens, &String.starts_with?(&1, ">")) do
+          {:error,
+           "ERR Invalid ACL line #{line_num}: plaintext passwords (>) are not allowed in ACL files, use #<hash>"}
+        else
+          parse_file_rules(username, rule_tokens, line_num)
+        end
+
+      _ ->
+        {:error, "ERR Invalid ACL line #{line_num}: expected 'user <username> <rules...>'"}
+    end
+  end
+
+  # Parses file-format rules into a user map.
+  @spec parse_file_rules(binary(), [binary()], pos_integer()) ::
+          {:ok, {binary(), user()}} | {:error, binary()}
+  defp parse_file_rules(username, tokens, line_num) do
+    base = %{
+      enabled: false,
+      password: nil,
+      commands: MapSet.new(),
+      denied_commands: MapSet.new(),
+      keys: []
+    }
+
+    result =
+      Enum.reduce_while(tokens, {:ok, base}, fn token, {:ok, user} ->
+        case parse_file_token(user, token) do
+          {:ok, updated} ->
+            {:cont, {:ok, updated}}
+
+          {:error, reason} ->
+            {:halt, {:error, "ERR Invalid ACL line #{line_num}: #{reason}"}}
+        end
+      end)
+
+    case result do
+      {:ok, user_map} -> {:ok, {username, user_map}}
+      {:error, _} = err -> err
+    end
+  end
+
+  # Token parsers for ACL file format. Similar to parse_rule/2 but uses
+  # #<hash> for passwords instead of ><plaintext>.
+  @spec parse_file_token(user(), binary()) :: {:ok, user()} | {:error, binary()}
+  defp parse_file_token(user, "on"), do: {:ok, %{user | enabled: true}}
+  defp parse_file_token(user, "off"), do: {:ok, %{user | enabled: false}}
+  defp parse_file_token(user, "nopass"), do: {:ok, %{user | password: nil}}
+  defp parse_file_token(user, "resetpass"), do: {:ok, %{user | password: nil}}
+
+  # Pre-hashed password from file (#<base64_hash>)
+  defp parse_file_token(user, "#" <> hash) do
+    case Base.decode64(hash) do
+      {:ok, decoded} when byte_size(decoded) == 48 ->
+        {:ok, %{user | password: hash}}
+
+      {:ok, _} ->
+        {:error, "invalid password hash length"}
+
+      :error ->
+        {:error, "invalid password hash encoding"}
+    end
+  end
+
+  defp parse_file_token(user, "~*"), do: {:ok, %{user | keys: :all}}
+  defp parse_file_token(user, "allkeys"), do: {:ok, %{user | keys: :all}}
+  defp parse_file_token(user, "resetkeys"), do: {:ok, %{user | keys: []}}
+
+  defp parse_file_token(user, "%R~" <> pattern) do
+    compiled = {pattern, :read, compile_glob(pattern)}
+    file_add_key_pattern(user, compiled)
+  end
+
+  defp parse_file_token(user, "%W~" <> pattern) do
+    compiled = {pattern, :write, compile_glob(pattern)}
+    file_add_key_pattern(user, compiled)
+  end
+
+  defp parse_file_token(user, "~" <> pattern) do
+    compiled = {pattern, :rw, compile_glob(pattern)}
+    file_add_key_pattern(user, compiled)
+  end
+
+  # Channel patterns (accepted but not enforced beyond &*)
+  defp parse_file_token(user, "&" <> _pattern), do: {:ok, user}
+
+  defp parse_file_token(user, "allcommands") do
+    {:ok, %{user | commands: :all, denied_commands: MapSet.new()}}
+  end
+
+  defp parse_file_token(user, "nocommands") do
+    {:ok, %{user | commands: MapSet.new(), denied_commands: MapSet.new()}}
+  end
+
+  defp parse_file_token(user, "+@all") do
+    {:ok, %{user | commands: :all, denied_commands: MapSet.new()}}
+  end
+
+  defp parse_file_token(user, "-@all") do
+    {:ok, %{user | commands: MapSet.new(), denied_commands: MapSet.new()}}
+  end
+
+  defp parse_file_token(user, "+@" <> category) do
+    cat = String.upcase(category)
+
+    case Map.fetch(@category_map, cat) do
+      {:ok, cat_cmds} ->
+        case user.commands do
+          :all ->
+            new_denied = MapSet.difference(user.denied_commands, cat_cmds)
+            {:ok, %{user | denied_commands: new_denied}}
+
+          cmds ->
+            {:ok, %{user | commands: MapSet.union(cmds, cat_cmds)}}
+        end
+
+      :error ->
+        {:error, "unknown command category '@#{category}'"}
+    end
+  end
+
+  defp parse_file_token(user, "-@" <> category) do
+    cat = String.upcase(category)
+
+    case Map.fetch(@category_map, cat) do
+      {:ok, cat_cmds} ->
+        case user.commands do
+          :all ->
+            new_denied = MapSet.union(user.denied_commands, cat_cmds)
+            {:ok, %{user | denied_commands: new_denied}}
+
+          cmds ->
+            {:ok, %{user | commands: MapSet.difference(cmds, cat_cmds)}}
+        end
+
+      :error ->
+        {:error, "unknown command category '@#{category}'"}
+    end
+  end
+
+  defp parse_file_token(user, "+" <> command) do
+    cmd = String.upcase(command)
+
+    case user.commands do
+      :all ->
+        new_denied = MapSet.delete(user.denied_commands, cmd)
+        {:ok, %{user | denied_commands: new_denied}}
+
+      cmds ->
+        {:ok, %{user | commands: MapSet.put(cmds, cmd)}}
+    end
+  end
+
+  defp parse_file_token(user, "-" <> command) do
+    cmd = String.upcase(command)
+
+    case user.commands do
+      :all ->
+        new_denied = MapSet.put(user.denied_commands, cmd)
+        {:ok, %{user | denied_commands: new_denied}}
+
+      cmds ->
+        {:ok, %{user | commands: MapSet.delete(cmds, cmd)}}
+    end
+  end
+
+  defp parse_file_token(_user, token) do
+    {:error, "unknown token '#{token}'"}
+  end
+
+  # Adds a key pattern during file parsing. If keys is already :all,
+  # additional specific patterns after ~* don't downgrade -- :all is kept.
+  @spec file_add_key_pattern(user(), key_pattern()) :: {:ok, user()}
+  defp file_add_key_pattern(user, compiled_pattern) do
+    case user.keys do
+      :all -> {:ok, %{user | keys: :all}}
+      patterns -> {:ok, %{user | keys: patterns ++ [compiled_pattern]}}
+    end
+  end
+
+  # Strips UTF-8 BOM from the beginning of a string.
+  @spec strip_bom(binary()) :: binary()
+  defp strip_bom(<<0xEF, 0xBB, 0xBF, rest::binary>>), do: rest
+  defp strip_bom(contents), do: contents
 end

@@ -401,7 +401,7 @@ defmodule Ferricstore.Stats do
     # without going through this GenServer.
     case :ets.whereis(@hotness_table) do
       :undefined ->
-        :ets.new(@hotness_table, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
+        :ets.new(@hotness_table, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
 
       _ref ->
         :ets.delete_all_objects(@hotness_table)

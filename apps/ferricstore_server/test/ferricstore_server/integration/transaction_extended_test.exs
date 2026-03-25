@@ -61,7 +61,9 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
     sock
   end
 
-  defp ukey(name), do: "txn_ext_#{name}_#{:rand.uniform(999_999)}"
+  # Hash tag ensures all generated keys co-locate on the same shard,
+  # avoiding CROSSSLOT errors in MULTI/EXEC.
+  defp ukey(name), do: "{txn_ext}:#{name}_#{:rand.uniform(999_999)}"
 
   # ---------------------------------------------------------------------------
   # Setup
@@ -419,9 +421,9 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       assert Enum.at(result, 2) == 11
       assert Enum.at(result, 3) == 12
 
-      # Final value should be 12
+      # Final value should be 12 (native integer after INCR/DECR)
       send_cmd(sock, ["GET", k])
-      assert recv_response(sock) == "12"
+      assert recv_response(sock) == 12
 
       :gen_tcp.close(sock)
     end
@@ -495,7 +497,7 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       assert Enum.at(result, 0) == 6       # INCR 5 -> 6
       assert Enum.at(result, 1) == 6       # APPEND "foobar" = 6 bytes
       assert Enum.at(result, 2) == 7       # INCR 6 -> 7
-      assert Enum.at(result, 3) == "7"     # GET k_num
+      assert Enum.at(result, 3) == 7       # GET k_num (native int after INCR)
       assert Enum.at(result, 4) == "foobar" # GET k_str
 
       :gen_tcp.close(sock)
@@ -697,9 +699,9 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       expected = Enum.to_list(1..100)
       assert result == expected
 
-      # Final value should be "100"
+      # Final value should be 100 (native integer after INCR)
       send_cmd(sock, ["GET", k])
-      assert recv_response(sock) == "100"
+      assert recv_response(sock) == 100
 
       :gen_tcp.close(sock)
     end
@@ -755,8 +757,8 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       # Third INCR succeeds: 6 -> 7
       assert Enum.at(result, 2) == 7
 
-      # GET returns final value
-      assert Enum.at(result, 3) == "7"
+      # GET returns final value (native integer after INCR)
+      assert Enum.at(result, 3) == 7
 
       :gen_tcp.close(sock)
     end
@@ -877,9 +879,7 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       send_cmd(sock, ["MULTI"])
       assert recv_response(sock) == {:simple, "OK"}
 
-      # Use individual DEL commands per key to avoid cross-shard multi-key
-      # DEL issues in the 2PC transaction path (each DEL is routed to the
-      # correct shard independently).
+      # Use individual DEL commands per key (each DEL targets one key).
       send_cmd(sock, ["DEL", k1])
       assert recv_response(sock) == {:simple, "QUEUED"}
 

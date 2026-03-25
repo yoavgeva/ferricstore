@@ -85,13 +85,16 @@ defmodule Ferricstore.Raft.Cluster do
     * `:ok` on success
     * `{:error, reason}` on failure
   """
-  @spec start_shard_server(non_neg_integer(), reference(), atom()) :: :ok | {:error, term()}
-  def start_shard_server(shard_index, store, ets) do
+  @spec start_shard_server(non_neg_integer(), binary(), non_neg_integer(), binary(), atom()) ::
+          :ok | {:error, term()}
+  def start_shard_server(shard_index, shard_data_path, active_file_id, active_file_path, ets) do
     server_id = shard_server_id(shard_index)
 
     machine_config = %{
       shard_index: shard_index,
-      store: store,
+      shard_data_path: shard_data_path,
+      active_file_id: active_file_id,
+      active_file_path: active_file_path,
       ets: ets
     }
 

@@ -47,11 +47,8 @@ defmodule FerricstoreServer.Spec.ConfigRewriteTest do
 
       if orig_eviction, do: Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
 
-      if orig_slowlog_us,
-        do: Application.put_env(:ferricstore, :slowlog_log_slower_than_us, orig_slowlog_us)
-
-      if orig_slowlog_max,
-        do: Application.put_env(:ferricstore, :slowlog_max_len, orig_slowlog_max)
+      if orig_slowlog_us, do: Ferricstore.SlowLog.set_threshold(orig_slowlog_us)
+      if orig_slowlog_max, do: Ferricstore.SlowLog.set_max_len(orig_slowlog_max)
 
       # Clean up config file and any .tmp leftover
       if File.exists?(path), do: File.rm(path)

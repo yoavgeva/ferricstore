@@ -10,7 +10,7 @@ defmodule Ferricstore.Commands.Strings do
   ## Supported commands
 
     * `GET key` — returns the value or `nil`
-    * `SET key value [EX secs | PX ms] [NX | XX]` — sets a key with optional expiry/conditions
+    * `SET key value [EX secs | PX ms | EXAT unix-sec | PXAT unix-ms] [NX | XX] [GET] [KEEPTTL]` — sets a key with optional expiry/conditions
     * `DEL key [key ...]` — deletes keys, returns count deleted
     * `EXISTS key [key ...]` — returns count of existing keys
     * `MGET key [key ...]` — returns list of values (nil for missing)
@@ -190,17 +190,17 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   def handle("MSET", args, store) do
-    if rem(length(args), 2) != 0 do
+    if not even_length?(args) do
       {:error, "ERR wrong number of arguments for 'mset' command"}
     else
-      pairs = Enum.chunk_every(args, 2)
-      bad_key = Enum.find(pairs, fn [k, _v] -> k == "" or byte_size(k) > @max_key_bytes end)
+      # Direct recursive processing avoids chunked enumeration intermediate lists.
+      case mset_validate(args) do
+        :ok ->
+          mset_exec(args, store)
+          :ok
 
-      if bad_key do
-        {:error, "ERR key too large or empty"}
-      else
-        Enum.each(pairs, fn [k, v] -> store.put.(k, v, 0) end)
-        :ok
+        {:error, _} = err ->
+          err
       end
     end
   end
@@ -243,7 +243,9 @@ defmodule Ferricstore.Commands.Strings do
     case parse_float_arg(delta_str) do
       {:ok, delta} ->
         case store.incr_float.(key, delta) do
-          {:ok, new_str} -> new_str
+          {:ok, new_val} when is_float(new_val) ->
+            Ferricstore.Store.ValueCodec.format_float(new_val)
+          {:ok, new_str} when is_binary(new_str) -> new_str
           {:error, _} = err -> err
         end
 
@@ -274,7 +276,9 @@ defmodule Ferricstore.Commands.Strings do
   def handle("STRLEN", [key], store) do
     case store.get.(key) do
       nil -> 0
-      value -> byte_size(value)
+      v when is_integer(v) -> byte_size(Integer.to_string(v))
+      v when is_float(v) -> byte_size(Float.to_string(v))
+      v -> byte_size(v)
     end
   end
 
@@ -372,6 +376,8 @@ defmodule Ferricstore.Commands.Strings do
          {end_idx, ""} <- Integer.parse(end_str) do
       case store.get.(key) do
         nil -> ""
+        v when is_integer(v) -> do_getrange(Integer.to_string(v), start_idx, end_idx)
+        v when is_float(v) -> do_getrange(Float.to_string(v), start_idx, end_idx)
         value -> do_getrange(value, start_idx, end_idx)
       end
     else
@@ -411,17 +417,14 @@ defmodule Ferricstore.Commands.Strings do
     do: {:error, "ERR wrong number of arguments for 'msetnx' command"}
 
   def handle("MSETNX", args, store) do
-    if rem(length(args), 2) != 0 do
+    if not even_length?(args) do
       {:error, "ERR wrong number of arguments for 'msetnx' command"}
     else
-      pairs = Enum.chunk_every(args, 2)
-      keys = Enum.map(pairs, fn [k, _v] -> k end)
-
       # Check ALL keys first — if any exist, set none
-      if Enum.any?(keys, fn k -> store.exists?.(k) end) do
+      if msetnx_any_exists?(args, store) do
         0
       else
-        Enum.each(pairs, fn [k, v] -> store.put.(k, v, 0) end)
+        mset_exec(args, store)
         1
       end
     end
@@ -554,50 +557,167 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   defp do_set(key, value, opts, store) do
-    with {:ok, expire_at_ms, nx?, xx?} <- parse_set_opts(opts) do
-      cond do
-        nx? and store.exists?.(key) -> nil
-        xx? and not store.exists?.(key) -> nil
-        true -> store.put.(key, value, expire_at_ms)
+    with {:ok, parsed} <- parse_set_opts(opts) do
+      %{expire_at_ms: expire_at_ms, nx: nx?, xx: xx?, get: get?, keepttl: keepttl?} = parsed
+
+      # Read old value/meta when GET or KEEPTTL is requested.
+      # We need old_meta for KEEPTTL (to preserve the existing expire_at_ms)
+      # and the old value for GET (to return it).
+      {old_value, effective_expire} =
+        if get? or keepttl? do
+          case store.get_meta.(key) do
+            nil ->
+              {nil, expire_at_ms}
+
+            {old_val, old_exp} ->
+              # KEEPTTL: use the old expiry when no explicit expiry was set
+              eff_exp = if keepttl?, do: old_exp, else: expire_at_ms
+              {old_val, eff_exp}
+          end
+        else
+          {nil, expire_at_ms}
+        end
+
+      # Condition check: NX (only if not exists) / XX (only if exists)
+      skip? =
+        cond do
+          nx? and store.exists?.(key) -> true
+          xx? and not store.exists?.(key) -> true
+          true -> false
+        end
+
+      if skip? do
+        # When GET is set, return old value even if NX/XX prevented the write
+        if get?, do: old_value, else: nil
+      else
+        store.put.(key, value, effective_expire)
+        if get?, do: old_value, else: :ok
       end
     end
   end
 
-  defp parse_set_opts(opts), do: parse_set_opts(opts, 0, false, false)
+  # Accumulator map for SET option parsing. All fields start at their defaults.
+  @set_opts_default %{expire_at_ms: 0, nx: false, xx: false, get: false, keepttl: false, has_expiry: false}
 
-  defp parse_set_opts([], exp, nx?, xx?), do: {:ok, exp, nx?, xx?}
+  defp parse_set_opts(opts), do: parse_set_opts(opts, @set_opts_default)
 
-  defp parse_set_opts(["NX" | rest], exp, _nx?, xx?) do
-    parse_set_opts(rest, exp, true, xx?)
+  defp parse_set_opts([], acc), do: {:ok, acc}
+
+  defp parse_set_opts(["NX" | rest], acc) do
+    parse_set_opts(rest, %{acc | nx: true})
   end
 
-  defp parse_set_opts(["XX" | rest], exp, nx?, _xx?) do
-    parse_set_opts(rest, exp, nx?, true)
+  defp parse_set_opts(["XX" | rest], acc) do
+    parse_set_opts(rest, %{acc | xx: true})
   end
 
-  defp parse_set_opts(["EX", secs_str | rest], _exp, nx?, xx?) do
-    with {secs, ""} <- Integer.parse(secs_str),
-         true <- secs > 0 do
-      parse_set_opts(rest, Ferricstore.HLC.now_ms() + secs * 1000, nx?, xx?)
+  defp parse_set_opts(["GET" | rest], acc) do
+    parse_set_opts(rest, %{acc | get: true})
+  end
+
+  defp parse_set_opts(["KEEPTTL" | rest], acc) do
+    if acc.has_expiry do
+      {:error, "ERR syntax error"}
     else
-      false -> {:error, "ERR invalid expire time in 'set' command"}
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      parse_set_opts(rest, %{acc | keepttl: true, has_expiry: true})
     end
   end
 
-  defp parse_set_opts(["PX", ms_str | rest], _exp, nx?, xx?) do
-    with {ms, ""} <- Integer.parse(ms_str),
-         true <- ms > 0 do
-      parse_set_opts(rest, Ferricstore.HLC.now_ms() + ms, nx?, xx?)
+  defp parse_set_opts(["EX", secs_str | rest], acc) do
+    if acc.has_expiry do
+      {:error, "ERR syntax error"}
     else
-      false -> {:error, "ERR invalid expire time in 'set' command"}
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      with {secs, ""} <- Integer.parse(secs_str),
+           true <- secs > 0 do
+        parse_set_opts(rest, %{acc | expire_at_ms: Ferricstore.HLC.now_ms() + secs * 1000, has_expiry: true})
+      else
+        false -> {:error, "ERR invalid expire time in 'set' command"}
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
     end
   end
 
-  defp parse_set_opts([unknown | _rest], _exp, _nx?, _xx?) do
+  defp parse_set_opts(["PX", ms_str | rest], acc) do
+    if acc.has_expiry do
+      {:error, "ERR syntax error"}
+    else
+      with {ms, ""} <- Integer.parse(ms_str),
+           true <- ms > 0 do
+        parse_set_opts(rest, %{acc | expire_at_ms: Ferricstore.HLC.now_ms() + ms, has_expiry: true})
+      else
+        false -> {:error, "ERR invalid expire time in 'set' command"}
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
+    end
+  end
+
+  defp parse_set_opts(["EXAT", ts_str | rest], acc) do
+    if acc.has_expiry do
+      {:error, "ERR syntax error"}
+    else
+      with {ts, ""} <- Integer.parse(ts_str),
+           true <- ts > 0 do
+        parse_set_opts(rest, %{acc | expire_at_ms: ts * 1000, has_expiry: true})
+      else
+        false -> {:error, "ERR invalid expire time in 'set' command"}
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
+    end
+  end
+
+  defp parse_set_opts(["PXAT", ts_str | rest], acc) do
+    if acc.has_expiry do
+      {:error, "ERR syntax error"}
+    else
+      with {ts, ""} <- Integer.parse(ts_str),
+           true <- ts > 0 do
+        parse_set_opts(rest, %{acc | expire_at_ms: ts, has_expiry: true})
+      else
+        false -> {:error, "ERR invalid expire time in 'set' command"}
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
+    end
+  end
+
+  defp parse_set_opts([unknown | _rest], _acc) do
     {:error, "ERR syntax error, option '#{unknown}' not recognized"}
   end
+
+  # ---------------------------------------------------------------------------
+  # Private — MSET/MSETNX helpers (direct recursion, no chunked enumeration)
+  # ---------------------------------------------------------------------------
+
+  # Validates all keys in a flat [k, v, k, v, ...] list without creating
+  # intermediate chunk lists.
+  defp mset_validate([]), do: :ok
+
+  defp mset_validate([k, _v | rest]) do
+    if k == "" or byte_size(k) > @max_key_bytes do
+      {:error, "ERR key too large or empty"}
+    else
+      mset_validate(rest)
+    end
+  end
+
+  # Executes MSET by walking the flat [k, v, k, v, ...] list directly.
+  defp mset_exec([], _store), do: :ok
+
+  defp mset_exec([k, v | rest], store) do
+    store.put.(k, v, 0)
+    mset_exec(rest, store)
+  end
+
+  # Checks if any key in a flat [k, v, k, v, ...] list already exists.
+  defp msetnx_any_exists?([], _store), do: false
+
+  defp msetnx_any_exists?([k, _v | rest], store) do
+    if store.exists?.(k), do: true, else: msetnx_any_exists?(rest, store)
+  end
+
+  # O(n/2) parity check without computing full length.
+  defp even_length?([]), do: true
+  defp even_length?([_, _ | rest]), do: even_length?(rest)
+  defp even_length?(_), do: false
 
   # ---------------------------------------------------------------------------
   # Private — type checking for GET
@@ -607,19 +727,45 @@ defmodule Ferricstore.Commands.Strings do
   # (list, hash, set, zset). If so, returns WRONGTYPE error instead of the
   # raw binary. This matches Redis behaviour where GET on a non-string key
   # returns a WRONGTYPE error.
-  defp maybe_check_type(<<131, _rest::binary>> = value) do
-    try do
-      case :erlang.binary_to_term(value) do
-        {:list, _} -> @wrongtype_error
-        {:hash, _} -> @wrongtype_error
-        {:set, _} -> @wrongtype_error
-        {:zset, _} -> @wrongtype_error
-        _ -> value
-      end
-    rescue
-      ArgumentError -> value
+  #
+  # Peeks at the ETF header bytes to identify tuple tags without deserializing
+  # the entire payload. This avoids multi-MB heap spikes for large data
+  # structures (e.g., a hash with 10K fields stored as ETF).
+  #
+  # ETF format for a 2-tuple like {:list, payload}:
+  #   131 = ETF version tag
+  #   104 = SMALL_TUPLE_EXT (arity < 256)
+  #   2   = arity (2-tuple)
+  #   100 = ATOM_EXT (followed by 2-byte length + atom bytes)
+  #         or 119 = SMALL_ATOM_UTF8_EXT (1-byte length + atom bytes)
+  #         or 118 = ATOM_UTF8_EXT (2-byte length + atom bytes)
+  #         or 115 = SMALL_ATOM_EXT (1-byte length + atom bytes)
+  defp maybe_check_type(<<131, 104, 2, rest::binary>> = value) do
+    case extract_etf_atom_name(rest) do
+      name when name in ["list", "hash", "set", "zset"] -> @wrongtype_error
+      _ -> value
+    end
+  end
+
+  # LARGE_TUPLE_EXT (arity 2) - same check for large tuples
+  defp maybe_check_type(<<131, 105, 0, 0, 0, 2, rest::binary>> = value) do
+    case extract_etf_atom_name(rest) do
+      name when name in ["list", "hash", "set", "zset"] -> @wrongtype_error
+      _ -> value
     end
   end
 
   defp maybe_check_type(value), do: value
+
+  # Extracts the atom name from the beginning of an ETF-encoded atom.
+  # Returns the atom name as a string, or nil if unrecognized format.
+  # ATOM_EXT (tag 100): 2-byte big-endian length + atom bytes (Latin1)
+  defp extract_etf_atom_name(<<100, len::16, name::binary-size(len), _::binary>>), do: name
+  # SMALL_ATOM_UTF8_EXT (tag 119): 1-byte length + atom bytes (UTF8)
+  defp extract_etf_atom_name(<<119, len::8, name::binary-size(len), _::binary>>), do: name
+  # ATOM_UTF8_EXT (tag 118): 2-byte length + atom bytes (UTF8)
+  defp extract_etf_atom_name(<<118, len::16, name::binary-size(len), _::binary>>), do: name
+  # SMALL_ATOM_EXT (tag 115): 1-byte length + atom bytes (Latin1)
+  defp extract_etf_atom_name(<<115, len::8, name::binary-size(len), _::binary>>), do: name
+  defp extract_etf_atom_name(_), do: nil
 end

@@ -201,7 +201,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # Verify ETS has the entry in single-table format.
       ets_name = :keydir_2
-      assert [{^key, "ets_test", 0, _lfu}] = :ets.lookup(ets_name, key)
+      assert [{^key, "ets_test", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets_name, key)
 
       # Flush and crash shard 2.
       :ok = GenServer.call(Router.shard_name(2), :flush)
@@ -221,7 +221,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       assert "ets_test" == Router.get(key)
 
       # Now it should be back in ETS.
-      assert [{^key, "ets_test", 0, _lfu}] = :ets.lookup(ets_name, key)
+      assert [{^key, "ets_test", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets_name, key)
     end
   end
 
@@ -290,9 +290,6 @@ defmodule FerricstoreServer.NodeLifecycleTest do
     @tag :capture_log
     test "isolated shard: write, stop gracefully, verify data on disk" do
       # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
-      original = Application.get_env(:ferricstore, :raft_enabled)
-      Application.put_env(:ferricstore, :raft_enabled, false)
-
       tmp_dir =
         Path.join(
           System.tmp_dir!(),
@@ -301,7 +298,6 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       File.mkdir_p!(tmp_dir)
       on_exit(fn ->
-        Application.put_env(:ferricstore, :raft_enabled, original)
         File.rm_rf(tmp_dir)
       end)
 

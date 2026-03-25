@@ -48,22 +48,14 @@ defmodule Ferricstore.Commands.Hash do
   # HSET key field value [field value ...]
   # ---------------------------------------------------------------------------
 
-  def handle("HSET", [key | field_value_pairs], store) when length(field_value_pairs) >= 2 do
-    if rem(length(field_value_pairs), 2) != 0 do
+  def handle("HSET", [key, _f, _v | _] = args, store) do
+    [_ | field_value_pairs] = args
+
+    if not even_length?(field_value_pairs) do
       {:error, "ERR wrong number of arguments for 'hset' command"}
     else
       with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
-        pairs = Enum.chunk_every(field_value_pairs, 2)
-
-        added =
-          Enum.reduce(pairs, 0, fn [field, value], acc ->
-            compound_key = CompoundKey.hash_field(key, field)
-            existing = store.compound_get.(key, compound_key)
-            store.compound_put.(key, compound_key, value, 0)
-            if existing == nil, do: acc + 1, else: acc
-          end)
-
-        added
+        hset_pairs(field_value_pairs, key, store, 0)
       end
     end
   end
@@ -587,26 +579,16 @@ defmodule Ferricstore.Commands.Hash do
 
   # Sets field-value pairs in a hash with a per-field TTL in seconds.
   # Returns the number of NEW fields added (not updated).
-  def handle("HSETEX", [key, seconds_str | field_value_pairs], store)
-      when length(field_value_pairs) >= 2 do
+  def handle("HSETEX", [key, seconds_str, _f, _v | _] = args, store) do
+    [_, _ | field_value_pairs] = args
+
     with {:ok, seconds} <- parse_positive_integer(seconds_str, "seconds") do
-      if rem(length(field_value_pairs), 2) != 0 do
+      if not even_length?(field_value_pairs) do
         {:error, "ERR wrong number of arguments for 'hsetex' command"}
       else
         with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
           expire_at_ms = System.os_time(:millisecond) + seconds * 1000
-
-          pairs = Enum.chunk_every(field_value_pairs, 2)
-
-          new_count =
-            Enum.reduce(pairs, 0, fn [field, value], acc ->
-              compound_key = CompoundKey.hash_field(key, field)
-              existing = store.compound_get.(key, compound_key)
-              store.compound_put.(key, compound_key, value, expire_at_ms)
-              if existing == nil, do: acc + 1, else: acc
-            end)
-
-          new_count
+          hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, 0)
         end
       end
     end
@@ -652,8 +634,7 @@ defmodule Ferricstore.Commands.Hash do
             pairs
 
           pattern ->
-            regex = glob_to_regex(pattern)
-            Enum.filter(pairs, fn {field, _value} -> Regex.match?(regex, field) end)
+            Enum.filter(pairs, fn {field, _value} -> Ferricstore.GlobMatcher.match?(field, pattern) end)
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
@@ -753,6 +734,34 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
+  # Walk flat [field, value, field, value, ...] list directly without
+  # Enum.chunk_every intermediate allocation.
+  defp hset_pairs([], _key, _store, acc), do: acc
+
+  defp hset_pairs([field, value | rest], key, store, acc) do
+    compound_key = CompoundKey.hash_field(key, field)
+    existing = store.compound_get.(key, compound_key)
+    store.compound_put.(key, compound_key, value, 0)
+    new_acc = if existing == nil, do: acc + 1, else: acc
+    hset_pairs(rest, key, store, new_acc)
+  end
+
+  # Same as hset_pairs but with per-field TTL.
+  defp hset_pairs_with_ttl([], _key, _store, _expire_at_ms, acc), do: acc
+
+  defp hset_pairs_with_ttl([field, value | rest], key, store, expire_at_ms, acc) do
+    compound_key = CompoundKey.hash_field(key, field)
+    existing = store.compound_get.(key, compound_key)
+    store.compound_put.(key, compound_key, value, expire_at_ms)
+    new_acc = if existing == nil, do: acc + 1, else: acc
+    hset_pairs_with_ttl(rest, key, store, expire_at_ms, new_acc)
+  end
+
+  # O(n/2) parity check without computing full length.
+  defp even_length?([]), do: true
+  defp even_length?([_, _ | rest]), do: even_length?(rest)
+  defp even_length?(_), do: false
+
   defp parse_integer_value(nil), do: {:ok, 0}
 
   defp parse_integer_value(str) when is_binary(str) do
@@ -825,13 +834,9 @@ defmodule Ferricstore.Commands.Hash do
     end
   end
 
-  defp validate_field_count(count, fields) do
-    if count == length(fields) do
-      :ok
-    else
-      {:error, "ERR number of fields does not match the count argument"}
-    end
-  end
+  defp validate_field_count(0, []), do: :ok
+  defp validate_field_count(n, [_ | rest]) when n > 0, do: validate_field_count(n - 1, rest)
+  defp validate_field_count(_, _), do: {:error, "ERR number of fields does not match the count argument"}
 
   # ---------------------------------------------------------------------------
   # HSCAN helpers
@@ -869,34 +874,21 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   defp paginate(items, cursor, count) do
-    total = length(items)
+    rest = Enum.drop(items, cursor)
 
-    if cursor >= total do
-      {"0", []}
-    else
-      batch = Enum.slice(items, cursor, count)
-      next_pos = cursor + length(batch)
+    case rest do
+      [] ->
+        {"0", []}
 
-      if next_pos >= total do
-        {"0", batch}
-      else
-        {Integer.to_string(next_pos), batch}
-      end
+      _ ->
+        {batch, remainder} = Enum.split(rest, count)
+
+        case remainder do
+          [] -> {"0", batch}
+          _ -> {Integer.to_string(cursor + length(batch)), batch}
+        end
     end
   end
-
-  defp glob_to_regex(pattern) do
-    regex_str =
-      pattern
-      |> String.graphemes()
-      |> Enum.map_join(&escape_glob_char/1)
-
-    Regex.compile!("^#{regex_str}$")
-  end
-
-  defp escape_glob_char("*"), do: ".*"
-  defp escape_glob_char("?"), do: "."
-  defp escape_glob_char(char), do: Regex.escape(char)
 
   defp select_random_fields(pairs, count, with_values) do
     cond do
@@ -918,7 +910,10 @@ defmodule Ferricstore.Commands.Hash do
         if pairs == [] do
           []
         else
-          selected = for _ <- 1..abs_count, do: Enum.random(pairs)
+          # Convert to tuple for O(1) random access instead of O(n) Enum.random on list
+          tuple = List.to_tuple(pairs)
+          size = tuple_size(tuple)
+          selected = for _ <- 1..abs_count, do: elem(tuple, :rand.uniform(size) - 1)
 
           if with_values do
             Enum.flat_map(selected, fn {field, value} -> [field, value] end)

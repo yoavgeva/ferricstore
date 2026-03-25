@@ -4,9 +4,14 @@
 //! but supporting deletion and approximate counting. Stores fingerprints of
 //! elements in a hash table with two candidate bucket positions per element.
 //!
-//! ## Storage format
+//! ## Storage modes
 //!
-//! The filter serializes to a compact byte array for Bitcask storage:
+//! - **In-memory** (`cuckoo_create`): backed by a `Vec<u8>`, suitable for
+//!   ephemeral filters or Bitcask serialize/deserialize.
+//! - **Mmap file** (`cuckoo_create_file` / `cuckoo_open_file`): backed by
+//!   `libc::mmap()` on a file, persistent across restarts.
+//!
+//! ## File layout (mmap mode)
 //!
 //! ```text
 //! [magic: 2B][version: 1B][capacity: 4B][bucket_size: 1B]
@@ -14,8 +19,11 @@
 //! [buckets: capacity * bucket_size * fingerprint_size bytes]
 //! ```
 //!
-//! Total header size: 27 bytes.
+//! Total header size: 27 bytes (same as serialization format).
 
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
@@ -38,22 +46,114 @@ const DEFAULT_BUCKET_SIZE: usize = 4;
 const DEFAULT_MAX_KICKS: u32 = 500;
 
 // ---------------------------------------------------------------------------
+// Storage enum — in-memory Vec or mmap'd file
+// ---------------------------------------------------------------------------
+
+/// Backing storage for the cuckoo filter's bucket array.
+enum Storage {
+    /// In-memory storage backed by a heap-allocated Vec.
+    InMemory(Vec<u8>),
+    /// Memory-mapped file storage.
+    Mmap {
+        /// Pointer to the start of the mmap'd region (header + buckets).
+        ptr: *mut u8,
+        /// Total length of the mmap'd region in bytes.
+        len: usize,
+        /// File descriptor (kept open for the lifetime of the mapping).
+        fd: i32,
+        /// Path to the backing file.
+        path: PathBuf,
+    },
+}
+
+// SAFETY: The mmap pointer is protected by a Mutex in CuckooResource. All
+// access is serialized — only one thread touches the pointer at a time.
+unsafe impl Send for Storage {}
+unsafe impl Sync for Storage {}
+
+impl Storage {
+    /// Get a pointer to the start of the bucket data (past the header).
+    fn bucket_ptr(&self) -> *const u8 {
+        match self {
+            Storage::InMemory(v) => v.as_ptr(),
+            Storage::Mmap { ptr, .. } => unsafe { ptr.add(HEADER_SIZE) },
+        }
+    }
+
+    /// Get a mutable pointer to the start of the bucket data.
+    fn bucket_ptr_mut(&mut self) -> *mut u8 {
+        match self {
+            Storage::InMemory(v) => v.as_mut_ptr(),
+            Storage::Mmap { ptr, .. } => unsafe { ptr.add(HEADER_SIZE) },
+        }
+    }
+
+    /// Get a byte slice of the bucket data.
+    fn bucket_slice(&self, len: usize) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.bucket_ptr(), len) }
+    }
+
+    /// Get a mutable byte slice of the bucket data.
+    fn bucket_slice_mut(&mut self, len: usize) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.bucket_ptr_mut(), len) }
+    }
+
+    /// Whether this is mmap-backed.
+    fn is_mmap(&self) -> bool {
+        matches!(self, Storage::Mmap { .. })
+    }
+
+    /// Call msync(MS_ASYNC) if mmap-backed.
+    fn msync_async(&self) {
+        if let Storage::Mmap { ptr, len, .. } = self {
+            unsafe {
+                libc::msync(*ptr as *mut libc::c_void, *len, libc::MS_ASYNC);
+            }
+        }
+    }
+
+    /// Call msync(MS_SYNC) if mmap-backed.
+    fn msync_sync(&self) {
+        if let Storage::Mmap { ptr, len, .. } = self {
+            unsafe {
+                libc::msync(*ptr as *mut libc::c_void, *len, libc::MS_SYNC);
+            }
+        }
+    }
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        if let Storage::Mmap { ptr, len, fd, .. } = self {
+            if !ptr.is_null() {
+                unsafe {
+                    libc::msync(*ptr as *mut libc::c_void, *len, libc::MS_SYNC);
+                    libc::munmap(*ptr as *mut libc::c_void, *len);
+                    libc::close(*fd);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CuckooFilter
 // ---------------------------------------------------------------------------
 
 /// A cuckoo filter storing fingerprints in a flat bucket array.
 pub struct CuckooFilter {
-    /// Flat byte array: `num_buckets * bucket_size * fingerprint_size` bytes.
-    buckets: Vec<u8>,
+    /// Backing storage (in-memory Vec or mmap'd file).
+    storage: Storage,
     /// Number of buckets.
     num_buckets: usize,
     /// Number of fingerprint slots per bucket.
     bucket_size: usize,
     /// Fingerprint size in bytes.
     fingerprint_size: usize,
-    /// Number of items currently inserted.
+    /// Number of items currently inserted (only used for in-memory mode;
+    /// for mmap mode, read/written from the header).
     num_items: u64,
-    /// Number of items that have been deleted.
+    /// Number of items that have been deleted (same caveat as num_items).
     num_deletes: u64,
     /// Maximum kick attempts before declaring the filter full.
     max_kicks: u32,
@@ -61,12 +161,13 @@ pub struct CuckooFilter {
 
 impl CuckooFilter {
     /// Create a new empty cuckoo filter with the given capacity (number of buckets).
+    /// Uses in-memory storage.
     #[must_use]
     pub fn new(capacity: usize, bucket_size: usize, max_kicks: u32) -> Self {
         let fingerprint_size = DEFAULT_FINGERPRINT_SIZE;
         let total_bytes = capacity * bucket_size * fingerprint_size;
         Self {
-            buckets: vec![0u8; total_bytes],
+            storage: Storage::InMemory(vec![0u8; total_bytes]),
             num_buckets: capacity,
             bucket_size,
             fingerprint_size,
@@ -76,30 +177,233 @@ impl CuckooFilter {
         }
     }
 
-    /// Compute the MD5 hash of `data`.
-    fn md5(data: &[u8]) -> [u8; 16] {
-        // We implement MD5 ourselves to avoid external dependencies.
-        // This uses the standard RFC 1321 algorithm.
-        md5_hash(data)
+    /// Create a new mmap-backed cuckoo filter file at `path`.
+    pub fn create_file(path: &Path, capacity: usize, bucket_size: usize) -> Result<Self, String> {
+        if capacity == 0 {
+            return Err("capacity must be > 0".into());
+        }
+        if bucket_size == 0 {
+            return Err("bucket_size must be > 0".into());
+        }
+
+        let fingerprint_size = DEFAULT_FINGERPRINT_SIZE;
+        let max_kicks = DEFAULT_MAX_KICKS;
+        let bucket_bytes = capacity * bucket_size * fingerprint_size;
+        let file_size = HEADER_SIZE + bucket_bytes;
+
+        // Ensure parent directory exists.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+        }
+
+        // Write the file: header + zeroed buckets.
+        let mut file = File::create(path).map_err(|e| format!("create: {e}"))?;
+        let mut header = [0u8; HEADER_SIZE];
+        header[0..2].copy_from_slice(&MAGIC);
+        header[2] = VERSION;
+        header[3..7].copy_from_slice(&(capacity as u32).to_le_bytes());
+        header[7] = bucket_size as u8;
+        header[8] = fingerprint_size as u8;
+        header[9..11].copy_from_slice(&(max_kicks as u16).to_le_bytes());
+        // num_items (8B) = 0 at bytes 11..19
+        // num_deletes (8B) = 0 at bytes 19..27
+        file.write_all(&header)
+            .map_err(|e| format!("write header: {e}"))?;
+        let zeros = vec![0u8; bucket_bytes];
+        file.write_all(&zeros)
+            .map_err(|e| format!("write buckets: {e}"))?;
+        file.sync_all().map_err(|e| format!("fsync: {e}"))?;
+        drop(file);
+
+        // Now mmap the file.
+        Self::open_mmap(path, file_size)
     }
 
-    /// Compute the fingerprint for an element.
-    /// Returns the first `fingerprint_size` bytes of MD5, ensuring it is never all zeros.
-    fn fingerprint(&self, element: &[u8]) -> Vec<u8> {
-        let hash = Self::md5(element);
-        let mut fp = hash[..self.fingerprint_size].to_vec();
+    /// Open an existing mmap-backed cuckoo filter file.
+    pub fn open_file(path: &Path) -> Result<Self, String> {
+        let meta = fs::metadata(path).map_err(|e| format!("stat: {e}"))?;
+        let file_size = meta.len() as usize;
+        if file_size < HEADER_SIZE {
+            return Err("file too small for cuckoo header".into());
+        }
+        Self::open_mmap(path, file_size)
+    }
 
-        // Ensure fingerprint is never all zeros (zero = empty slot sentinel).
+    /// Internal: mmap an existing cuckoo file and validate its header.
+    fn open_mmap(path: &Path, file_size: usize) -> Result<Self, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open: {e}"))?;
+
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+
+        let mmap = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+
+        if mmap == libc::MAP_FAILED {
+            return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
+        }
+
+        let ptr = mmap as *mut u8;
+
+        // Validate magic.
+        let magic = unsafe {
+            let mut buf = [0u8; 2];
+            std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 2);
+            buf
+        };
+        if magic != MAGIC {
+            unsafe {
+                libc::munmap(mmap, file_size);
+            }
+            return Err("invalid cuckoo file magic".into());
+        }
+
+        // Validate version.
+        let version = unsafe { *ptr.add(2) };
+        if version != VERSION {
+            unsafe {
+                libc::munmap(mmap, file_size);
+            }
+            return Err(format!("unsupported cuckoo version {version}"));
+        }
+
+        // Read header fields.
+        let num_buckets = u32::from_le_bytes(unsafe {
+            let mut buf = [0u8; 4];
+            std::ptr::copy_nonoverlapping(ptr.add(3), buf.as_mut_ptr(), 4);
+            buf
+        }) as usize;
+
+        let bucket_size = unsafe { *ptr.add(7) } as usize;
+        let fingerprint_size = unsafe { *ptr.add(8) } as usize;
+
+        let max_kicks = u16::from_le_bytes(unsafe {
+            let mut buf = [0u8; 2];
+            std::ptr::copy_nonoverlapping(ptr.add(9), buf.as_mut_ptr(), 2);
+            buf
+        }) as u32;
+
+        let num_items = u64::from_le_bytes(unsafe {
+            let mut buf = [0u8; 8];
+            std::ptr::copy_nonoverlapping(ptr.add(11), buf.as_mut_ptr(), 8);
+            buf
+        });
+
+        let num_deletes = u64::from_le_bytes(unsafe {
+            let mut buf = [0u8; 8];
+            std::ptr::copy_nonoverlapping(ptr.add(19), buf.as_mut_ptr(), 8);
+            buf
+        });
+
+        let expected_size = HEADER_SIZE + num_buckets * bucket_size * fingerprint_size;
+        if file_size < expected_size {
+            unsafe {
+                libc::munmap(mmap, file_size);
+            }
+            return Err(format!(
+                "file too small: expected {expected_size}, got {file_size}"
+            ));
+        }
+
+        // Hint the kernel that access is random (hash-determined bucket positions).
+        unsafe {
+            libc::madvise(mmap, file_size, libc::MADV_RANDOM);
+        }
+
+        // Dup the fd so we own it independently of the File object.
+        let owned_fd = unsafe { libc::dup(fd) };
+        if owned_fd < 0 {
+            unsafe {
+                libc::munmap(mmap, file_size);
+            }
+            return Err(format!("dup fd failed: {}", std::io::Error::last_os_error()));
+        }
+        // Drop the File — we keep owned_fd.
+        drop(file);
+
+        Ok(Self {
+            storage: Storage::Mmap {
+                ptr,
+                len: file_size,
+                fd: owned_fd,
+                path: path.to_path_buf(),
+            },
+            num_buckets,
+            bucket_size,
+            fingerprint_size,
+            num_items,
+            num_deletes,
+            max_kicks,
+        })
+    }
+
+    /// Close an mmap-backed filter (munmap + close fd). For in-memory, this is a no-op.
+    pub fn close(&mut self) {
+        // Write header counters before extracting fields.
+        self.write_header_counters();
+        if let Storage::Mmap { ptr, len, fd, .. } = &mut self.storage {
+            if !ptr.is_null() {
+                unsafe {
+                    libc::msync(*ptr as *mut libc::c_void, *len, libc::MS_SYNC);
+                    libc::munmap(*ptr as *mut libc::c_void, *len);
+                    libc::close(*fd);
+                }
+                *ptr = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// Write num_items and num_deletes to the mmap header.
+    fn write_header_counters(&self) {
+        if let Storage::Mmap { ptr, .. } = &self.storage {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.num_items.to_le_bytes().as_ptr(),
+                    ptr.add(11),
+                    8,
+                );
+                std::ptr::copy_nonoverlapping(
+                    self.num_deletes.to_le_bytes().as_ptr(),
+                    ptr.add(19),
+                    8,
+                );
+            }
+        }
+    }
+
+    /// Total number of bytes in the bucket array.
+    fn bucket_data_len(&self) -> usize {
+        self.num_buckets * self.bucket_size * self.fingerprint_size
+    }
+
+    /// Compute a 16-byte hash of `data` using xxh3.
+    fn hash128(data: &[u8]) -> [u8; 16] {
+        let h = xxhash_rust::xxh3::xxh3_128(data);
+        h.to_le_bytes()
+    }
+
+    /// Compute the fingerprint and primary bucket from a single hash of the element.
+    fn fingerprint_and_bucket(&self, element: &[u8]) -> (Vec<u8>, usize) {
+        let hash = Self::hash128(element);
+
+        // Fingerprint: first `fingerprint_size` bytes, ensuring non-zero.
+        let mut fp = hash[..self.fingerprint_size].to_vec();
         if fp.iter().all(|&b| b == 0) {
             fp[0] = 1;
         }
-        fp
-    }
 
-    /// Compute the primary bucket index for an element.
-    fn primary_bucket(&self, element: &[u8]) -> usize {
-        let hash = Self::md5(element);
-        // Skip first `fingerprint_size` bytes (used for fingerprint), then read 8 bytes LE.
+        // Primary bucket: next 8 bytes after fingerprint.
         let start = self.fingerprint_size;
         let hash_val = u64::from_le_bytes([
             hash[start],
@@ -111,12 +415,21 @@ impl CuckooFilter {
             hash[start + 6],
             hash[start + 7],
         ]);
-        (hash_val as usize) % self.num_buckets
+        let bucket = (hash_val as usize) % self.num_buckets;
+
+        (fp, bucket)
+    }
+
+    /// Compute the fingerprint for an element (standalone, used in tests).
+    #[cfg(test)]
+    fn fingerprint(&self, element: &[u8]) -> Vec<u8> {
+        let (fp, _) = self.fingerprint_and_bucket(element);
+        fp
     }
 
     /// Compute the alternate bucket: `bucket XOR hash(fingerprint)`.
     fn alternate_bucket(&self, bucket: usize, fp: &[u8]) -> usize {
-        let hash = Self::md5(fp);
+        let hash = Self::hash128(fp);
         let fp_hash = u64::from_le_bytes([
             hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
         ]);
@@ -131,21 +444,22 @@ impl CuckooFilter {
     /// Read the fingerprint at a given bucket and slot.
     fn get_slot(&self, bucket_idx: usize, slot_idx: usize) -> &[u8] {
         let offset = self.slot_offset(bucket_idx, slot_idx);
-        &self.buckets[offset..offset + self.fingerprint_size]
+        let data = self.storage.bucket_slice(self.bucket_data_len());
+        &data[offset..offset + self.fingerprint_size]
     }
 
     /// Write a fingerprint at a given bucket and slot.
     fn set_slot(&mut self, bucket_idx: usize, slot_idx: usize, fp: &[u8]) {
         let offset = self.slot_offset(bucket_idx, slot_idx);
-        self.buckets[offset..offset + self.fingerprint_size].copy_from_slice(fp);
+        let fp_size = self.fingerprint_size;
+        let data_len = self.bucket_data_len();
+        let data = self.storage.bucket_slice_mut(data_len);
+        data[offset..offset + fp_size].copy_from_slice(fp);
     }
 
     /// Check if a slot is empty (all zeros).
     fn is_slot_empty(&self, bucket_idx: usize, slot_idx: usize) -> bool {
-        let offset = self.slot_offset(bucket_idx, slot_idx);
-        self.buckets[offset..offset + self.fingerprint_size]
-            .iter()
-            .all(|&b| b == 0)
+        self.get_slot(bucket_idx, slot_idx).iter().all(|&b| b == 0)
     }
 
     /// Find the first empty slot in a bucket. Returns `Some(slot_idx)` or `None`.
@@ -160,14 +474,14 @@ impl CuckooFilter {
 
     /// Add an element to the filter. Returns `Ok(())` on success, `Err(())` if full.
     pub fn add(&mut self, element: &[u8]) -> Result<(), ()> {
-        let fp = self.fingerprint(element);
-        let b1 = self.primary_bucket(element);
+        let (fp, b1) = self.fingerprint_and_bucket(element);
         let b2 = self.alternate_bucket(b1, &fp);
 
         // Try primary bucket.
         if let Some(slot) = self.find_empty_slot(b1) {
             self.set_slot(b1, slot, &fp);
             self.num_items += 1;
+            self.flush_counters();
             return Ok(());
         }
 
@@ -175,6 +489,7 @@ impl CuckooFilter {
         if let Some(slot) = self.find_empty_slot(b2) {
             self.set_slot(b2, slot, &fp);
             self.num_items += 1;
+            self.flush_counters();
             return Ok(());
         }
 
@@ -200,6 +515,7 @@ impl CuckooFilter {
             if let Some(empty_slot) = self.find_empty_slot(alt) {
                 self.set_slot(alt, empty_slot, &evicted);
                 self.num_items += 1;
+                self.flush_counters();
                 return Ok(());
             }
 
@@ -223,8 +539,7 @@ impl CuckooFilter {
 
     /// Check if an element may exist in the filter.
     pub fn exists(&self, element: &[u8]) -> bool {
-        let fp = self.fingerprint(element);
-        let b1 = self.primary_bucket(element);
+        let (fp, b1) = self.fingerprint_and_bucket(element);
         let b2 = self.alternate_bucket(b1, &fp);
 
         self.bucket_contains(b1, &fp) || self.bucket_contains(b2, &fp)
@@ -250,18 +565,19 @@ impl CuckooFilter {
 
     /// Delete one occurrence of an element. Returns 1 if deleted, 0 if not found.
     pub fn delete(&mut self, element: &[u8]) -> u64 {
-        let fp = self.fingerprint(element);
-        let b1 = self.primary_bucket(element);
+        let (fp, b1) = self.fingerprint_and_bucket(element);
         let b2 = self.alternate_bucket(b1, &fp);
 
-        let empty = vec![0u8; self.fingerprint_size];
+        let empty_buf = [0u8; 8]; // fingerprint_size is always <= 8
+        let empty = &empty_buf[..self.fingerprint_size];
 
         // Try primary bucket first.
         for slot in 0..self.bucket_size {
             if self.get_slot(b1, slot) == fp.as_slice() {
-                self.set_slot(b1, slot, &empty);
+                self.set_slot(b1, slot, empty);
                 self.num_items -= 1;
                 self.num_deletes += 1;
+                self.flush_counters();
                 return 1;
             }
         }
@@ -269,9 +585,10 @@ impl CuckooFilter {
         // Try alternate bucket.
         for slot in 0..self.bucket_size {
             if self.get_slot(b2, slot) == fp.as_slice() {
-                self.set_slot(b2, slot, &empty);
+                self.set_slot(b2, slot, empty);
                 self.num_items -= 1;
                 self.num_deletes += 1;
+                self.flush_counters();
                 return 1;
             }
         }
@@ -281,8 +598,7 @@ impl CuckooFilter {
 
     /// Count occurrences of an element's fingerprint across both candidate buckets.
     pub fn count(&self, element: &[u8]) -> u64 {
-        let fp = self.fingerprint(element);
-        let b1 = self.primary_bucket(element);
+        let (fp, b1) = self.fingerprint_and_bucket(element);
         let b2 = self.alternate_bucket(b1, &fp);
 
         let mut total = 0u64;
@@ -299,10 +615,19 @@ impl CuckooFilter {
         total
     }
 
+    /// Flush header counters and msync_async after writes (mmap mode only).
+    fn flush_counters(&mut self) {
+        if self.storage.is_mmap() {
+            self.write_header_counters();
+            self.storage.msync_async();
+        }
+    }
+
     /// Serialize the filter to a byte array for Bitcask storage.
     #[must_use]
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(HEADER_SIZE + self.buckets.len());
+        let data = self.storage.bucket_slice(self.bucket_data_len());
+        let mut buf = Vec::with_capacity(HEADER_SIZE + data.len());
 
         // Magic (2 bytes)
         buf.extend_from_slice(&MAGIC);
@@ -321,16 +646,12 @@ impl CuckooFilter {
         // Num deletes (8 bytes, LE)
         buf.extend_from_slice(&self.num_deletes.to_le_bytes());
         // Bucket data
-        buf.extend_from_slice(&self.buckets);
+        buf.extend_from_slice(data);
 
         buf
     }
 
-    /// Deserialize a filter from a byte array.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the data is too short, has wrong magic, or wrong version.
+    /// Deserialize a filter from a byte array (in-memory mode).
     pub fn deserialize(data: &[u8]) -> Result<Self, String> {
         if data.len() < HEADER_SIZE {
             return Err("cuckoo: data too short".to_string());
@@ -365,7 +686,7 @@ impl CuckooFilter {
         let buckets = data[HEADER_SIZE..HEADER_SIZE + expected_bucket_bytes].to_vec();
 
         Ok(Self {
-            buckets,
+            storage: Storage::InMemory(buckets),
             num_buckets,
             bucket_size,
             fingerprint_size,
@@ -397,10 +718,10 @@ mod atoms {
 }
 
 // ---------------------------------------------------------------------------
-// NIF functions
+// NIF functions — in-memory
 // ---------------------------------------------------------------------------
 
-/// Create a new cuckoo filter.
+/// Create a new cuckoo filter (in-memory).
 /// Returns `{:ok, resource}` or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
@@ -432,6 +753,62 @@ pub fn cuckoo_create(
 
     Ok((atoms::ok(), resource).encode(env))
 }
+
+// ---------------------------------------------------------------------------
+// NIF functions — mmap file-backed
+// ---------------------------------------------------------------------------
+
+/// Create a new mmap-backed cuckoo filter file.
+/// Returns `{:ok, resource}` or `{:error, reason}`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn cuckoo_create_file(env: Env, path: String, capacity: u64, bucket_size: u64) -> NifResult<Term> {
+    let bs = if bucket_size == 0 {
+        DEFAULT_BUCKET_SIZE
+    } else {
+        bucket_size as usize
+    };
+
+    match CuckooFilter::create_file(Path::new(&path), capacity as usize, bs) {
+        Ok(filter) => {
+            let resource = ResourceArc::new(CuckooResource {
+                filter: Mutex::new(filter),
+            });
+            Ok((atoms::ok(), resource).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+/// Open an existing mmap-backed cuckoo filter file.
+/// Returns `{:ok, resource}` or `{:error, reason}`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn cuckoo_open_file(env: Env, path: String) -> NifResult<Term> {
+    match CuckooFilter::open_file(Path::new(&path)) {
+        Ok(filter) => {
+            let resource = ResourceArc::new(CuckooResource {
+                filter: Mutex::new(filter),
+            });
+            Ok((atoms::ok(), resource).encode(env))
+        }
+        Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+/// Close an mmap-backed cuckoo filter (munmap + close fd).
+/// Returns `:ok`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+pub fn cuckoo_close(env: Env, resource: ResourceArc<CuckooResource>) -> NifResult<Term> {
+    let mut filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
+    filter.close();
+    Ok(atoms::ok().encode(env))
+}
+
+// ---------------------------------------------------------------------------
+// NIF functions — operations (work on both in-memory and mmap)
+// ---------------------------------------------------------------------------
 
 /// Add an element to the filter.
 /// Returns `:ok` or `{:error, "filter is full"}`.
@@ -559,7 +936,7 @@ pub fn cuckoo_serialize<'a>(
     Ok((atoms::ok(), Binary::from_owned(bin, env)).encode(env))
 }
 
-/// Deserialize a filter from a binary blob.
+/// Deserialize a filter from a binary blob (in-memory).
 /// Returns `{:ok, resource}` or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
@@ -576,143 +953,6 @@ pub fn cuckoo_deserialize<'a>(env: Env<'a>, data: Binary<'a>) -> NifResult<Term<
 }
 
 // ---------------------------------------------------------------------------
-// MD5 implementation (RFC 1321)
-// ---------------------------------------------------------------------------
-
-/// Standard MD5 per-round shift amounts.
-const S: [u32; 64] = [
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
-    14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15,
-    21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-];
-
-/// Pre-computed table: T[i] = floor(2^32 * |sin(i+1)|).
-const K: [u32; 64] = [
-    0xd76a_a478,
-    0xe8c7_b756,
-    0x2420_70db,
-    0xc1bd_ceee,
-    0xf57c_0faf,
-    0x4787_c62a,
-    0xa830_4613,
-    0xfd46_9501,
-    0x6980_98d8,
-    0x8b44_f7af,
-    0xffff_5bb1,
-    0x895c_d7be,
-    0x6b90_1122,
-    0xfd98_7193,
-    0xa679_438e,
-    0x49b4_0821,
-    0xf61e_2562,
-    0xc040_b340,
-    0x265e_5a51,
-    0xe9b6_c7aa,
-    0xd62f_105d,
-    0x0244_1453,
-    0xd8a1_e681,
-    0xe7d3_fbc8,
-    0x21e1_cde6,
-    0xc337_07d6,
-    0xf4d5_0d87,
-    0x455a_14ed,
-    0xa9e3_e905,
-    0xfcef_a3f8,
-    0x676f_02d9,
-    0x8d2a_4c8a,
-    0xfffa_3942,
-    0x8771_f681,
-    0x6d9d_6122,
-    0xfde5_380c,
-    0xa4be_ea44,
-    0x4bde_cfa9,
-    0xf6bb_4b60,
-    0xbebf_bc70,
-    0x289b_7ec6,
-    0xeaa1_27fa,
-    0xd4ef_3085,
-    0x0488_1d05,
-    0xd9d4_d039,
-    0xe6db_99e5,
-    0x1fa2_7cf8,
-    0xc4ac_5665,
-    0xf429_2244,
-    0x432a_ff97,
-    0xab94_23a7,
-    0xfc93_a039,
-    0x655b_59c3,
-    0x8f0c_cc92,
-    0xffef_f47d,
-    0x8584_5dd1,
-    0x6fa8_7e4f,
-    0xfe2c_e6e0,
-    0xa301_4314,
-    0x4e08_11a1,
-    0xf753_7e82,
-    0xbd3a_f235,
-    0x2ad7_d2bb,
-    0xeb86_d391,
-];
-
-/// Compute MD5 hash of `input`, returning the 16-byte digest.
-fn md5_hash(input: &[u8]) -> [u8; 16] {
-    // Step 1: Padding.
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let mut msg = input.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_le_bytes());
-
-    // Step 2: Process each 64-byte block.
-    let mut a0: u32 = 0x6745_2301;
-    let mut b0: u32 = 0xefcd_ab89;
-    let mut c0: u32 = 0x98ba_dcfe;
-    let mut d0: u32 = 0x1032_5476;
-
-    for chunk in msg.chunks_exact(64) {
-        let mut m = [0u32; 16];
-        for (i, word) in m.iter_mut().enumerate() {
-            let off = i * 4;
-            *word =
-                u32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
-        }
-
-        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
-
-        for i in 0..64 {
-            let (f, g) = match i {
-                0..=15 => ((b & c) | ((!b) & d), i),
-                16..=31 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
-                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | (!d)), (7 * i) % 16),
-            };
-
-            let temp = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(
-                (a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g])).rotate_left(S[i]),
-            );
-            a = temp;
-        }
-
-        a0 = a0.wrapping_add(a);
-        b0 = b0.wrapping_add(b);
-        c0 = c0.wrapping_add(c);
-        d0 = d0.wrapping_add(d);
-    }
-
-    let mut digest = [0u8; 16];
-    digest[0..4].copy_from_slice(&a0.to_le_bytes());
-    digest[4..8].copy_from_slice(&b0.to_le_bytes());
-    digest[8..12].copy_from_slice(&c0.to_le_bytes());
-    digest[12..16].copy_from_slice(&d0.to_le_bytes());
-    digest
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -721,27 +961,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn md5_empty() {
-        let digest = md5_hash(b"");
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "d41d8cd98f00b204e9800998ecf8427e");
-    }
-
-    #[test]
-    fn md5_hello() {
-        let digest = md5_hash(b"hello");
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "5d41402abc4b2a76b9719d911017c592");
-    }
-
-    #[test]
     fn new_filter_empty() {
         let f = CuckooFilter::new(1024, 4, 500);
         assert_eq!(f.num_buckets, 1024);
         assert_eq!(f.bucket_size, 4);
         assert_eq!(f.num_items, 0);
         assert_eq!(f.num_deletes, 0);
-        assert_eq!(f.buckets.len(), 1024 * 4 * 2);
+        assert_eq!(f.bucket_data_len(), 1024 * 4 * 2);
     }
 
     #[test]
@@ -845,7 +1071,141 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Edge-case tests
+    // Mmap file-backed tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mmap_create_add_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.cuckoo");
+
+        let mut f = CuckooFilter::create_file(&path, 1024, 4).unwrap();
+        assert!(!f.exists(b"hello"));
+        assert!(f.add(b"hello").is_ok());
+        assert!(f.exists(b"hello"));
+        assert_eq!(f.num_items, 1);
+    }
+
+    #[test]
+    fn mmap_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persist.cuckoo");
+
+        {
+            let mut f = CuckooFilter::create_file(&path, 1024, 4).unwrap();
+            f.add(b"persisted").unwrap();
+            f.add(b"also_persisted").unwrap();
+            f.storage.msync_sync();
+        }
+
+        // Reopen and verify.
+        let f = CuckooFilter::open_file(&path).unwrap();
+        assert!(f.exists(b"persisted"));
+        assert!(f.exists(b"also_persisted"));
+        assert_eq!(f.num_items, 2);
+    }
+
+    #[test]
+    fn mmap_delete_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("del.cuckoo");
+
+        {
+            let mut f = CuckooFilter::create_file(&path, 1024, 4).unwrap();
+            f.add(b"keep").unwrap();
+            f.add(b"remove").unwrap();
+            f.delete(b"remove");
+            f.storage.msync_sync();
+        }
+
+        let f = CuckooFilter::open_file(&path).unwrap();
+        assert!(f.exists(b"keep"));
+        assert!(!f.exists(b"remove"));
+        assert_eq!(f.num_items, 1);
+        assert_eq!(f.num_deletes, 1);
+    }
+
+    #[test]
+    fn mmap_close_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("close.cuckoo");
+
+        {
+            let mut f = CuckooFilter::create_file(&path, 1024, 4).unwrap();
+            f.add(b"test_close").unwrap();
+            f.close();
+        }
+
+        let f = CuckooFilter::open_file(&path).unwrap();
+        assert!(f.exists(b"test_close"));
+    }
+
+    #[test]
+    fn mmap_open_nonexistent_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.cuckoo");
+        let result = CuckooFilter::open_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mmap_open_garbage_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.cuckoo");
+        std::fs::write(&path, b"this is not a cuckoo file").unwrap();
+        // File is only 25 bytes, too short for header
+        let result = CuckooFilter::open_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mmap_open_bad_magic_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("badmagic.cuckoo");
+        let mut data = vec![0xFF; 64];
+        // Set a plausible file size but bad magic
+        data[0] = 0xFF;
+        data[1] = 0xFF;
+        std::fs::write(&path, &data).unwrap();
+        let result = CuckooFilter::open_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mmap_many_items_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.cuckoo");
+
+        {
+            let mut f = CuckooFilter::create_file(&path, 4096, 4).unwrap();
+            for i in 0..1000 {
+                let _ = f.add(format!("item_{i}").as_bytes());
+            }
+            f.storage.msync_sync();
+        }
+
+        let f = CuckooFilter::open_file(&path).unwrap();
+        // Verify all items present (no false negatives).
+        for i in 0..1000 {
+            assert!(
+                f.exists(format!("item_{i}").as_bytes()),
+                "false negative for item_{i} after reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn mmap_nested_dir_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deep").join("nested").join("filter.cuckoo");
+        let mut f = CuckooFilter::create_file(&path, 256, 4).unwrap();
+        f.add(b"nested").unwrap();
+        assert!(f.exists(b"nested"));
+        assert!(path.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge-case tests (in-memory)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -912,8 +1272,6 @@ mod tests {
             .filter(|i| f.exists(format!("probe_{i}").as_bytes()))
             .count();
         let fpr = fp as f64 / test_count as f64;
-        // Cuckoo filter with 2-byte fingerprints should have FPR ~ 2/(2^16) * bucket_size
-        // Expect < 5% even when nearly full
         assert!(
             fpr < 0.05,
             "FPR at 95% capacity: {fpr:.4} (inserted {inserted} items)"
@@ -1088,5 +1446,146 @@ mod tests {
         bytes.extend_from_slice(&[0; HEADER_SIZE - 3]);
         let result = CuckooFilter::deserialize(&bytes);
         assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // H-4 + H-7: xxh3 replaces MD5, single hash per exists()
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn h4_h7_no_false_negatives_10k_items() {
+        let mut f = CuckooFilter::new(4096, 4, 500);
+
+        // Insert 10K items
+        for i in 0..10_000 {
+            let _ = f.add(format!("h4_item_{i}").as_bytes());
+        }
+
+        // Verify zero false negatives for all inserted items
+        for i in 0..10_000 {
+            assert!(
+                f.exists(format!("h4_item_{i}").as_bytes()),
+                "false negative for h4_item_{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn h7_exists_correctness_5k_present_5k_absent() {
+        let mut f = CuckooFilter::new(4096, 4, 500);
+
+        // Add 5K items
+        for i in 0..5_000 {
+            let _ = f.add(format!("present_{i}").as_bytes());
+        }
+
+        // Check 5K present items - zero false negatives
+        for i in 0..5_000 {
+            assert!(
+                f.exists(format!("present_{i}").as_bytes()),
+                "false negative for present_{i}"
+            );
+        }
+
+        // Check 5K absent items - track false positives
+        let fp_count = (0..5_000)
+            .filter(|i| f.exists(format!("absent_{i}").as_bytes()))
+            .count();
+
+        // With 2-byte fingerprints, FPR should be reasonable
+        let fpr = fp_count as f64 / 5_000.0;
+        assert!(
+            fpr < 0.05,
+            "False positive rate {fpr:.4} too high for 2-byte fingerprints"
+        );
+    }
+
+    #[test]
+    fn h7_serialization_roundtrip_after_hash_change() {
+        let mut f = CuckooFilter::new(2048, 4, 500);
+        for i in 0..200 {
+            f.add(format!("serial_{i}").as_bytes()).unwrap();
+        }
+
+        let bytes = f.serialize();
+        let f2 = CuckooFilter::deserialize(&bytes).unwrap();
+
+        // All items should still be found after deserialization
+        for i in 0..200 {
+            assert!(
+                f2.exists(format!("serial_{i}").as_bytes()),
+                "serial_{i} missing after deserialize"
+            );
+        }
+        assert_eq!(f2.num_items, 200);
+    }
+
+    #[test]
+    fn h7_delete_correctness_after_hash_change() {
+        let mut f = CuckooFilter::new(2048, 4, 500);
+
+        // Add items
+        for i in 0..100 {
+            f.add(format!("del_{i}").as_bytes()).unwrap();
+        }
+
+        // Delete even-numbered items
+        for i in (0..100).step_by(2) {
+            let result = f.delete(format!("del_{i}").as_bytes());
+            assert_eq!(result, 1, "delete must succeed for del_{i}");
+        }
+
+        // Odd items should still exist
+        for i in (1..100).step_by(2) {
+            assert!(
+                f.exists(format!("del_{i}").as_bytes()),
+                "del_{i} must still exist after deleting even items"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // L-6: stack-allocated empty sentinel in delete()
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn l6_delete_many_times_no_leak() {
+        let mut f = CuckooFilter::new(2048, 4, 500);
+        for i in 0..500 {
+            f.add(format!("del_test_{i}").as_bytes()).unwrap();
+        }
+        assert_eq!(f.num_items, 500);
+
+        // Delete all items
+        for i in 0..500 {
+            let result = f.delete(format!("del_test_{i}").as_bytes());
+            assert_eq!(result, 1, "delete must succeed for del_test_{i}");
+        }
+
+        assert_eq!(f.num_items, 0, "all items should be deleted");
+        assert_eq!(f.num_deletes, 500, "delete count should match");
+
+        // Verify no item is found
+        for i in 0..500 {
+            assert!(
+                !f.exists(format!("del_test_{i}").as_bytes()),
+                "del_test_{i} should not exist after deletion"
+            );
+        }
+    }
+
+    #[test]
+    fn l6_delete_nonexistent_returns_zero_stack_sentinel() {
+        let mut f = CuckooFilter::new(1024, 4, 500);
+        // Delete from empty filter must return 0 and not corrupt the filter
+        for i in 0..100 {
+            assert_eq!(
+                f.delete(format!("ghost_{i}").as_bytes()),
+                0,
+                "deleting non-existent item must return 0"
+            );
+        }
+        assert_eq!(f.num_items, 0);
+        assert_eq!(f.num_deletes, 0);
     }
 }

@@ -256,16 +256,12 @@ defmodule Ferricstore.Commands.StringsTest do
       assert nil == Strings.handle("SET", ["key", "val", "NX", "XX"], store_present)
     end
 
-    test "SET with EX and PX both specified uses last one" do
+    test "SET with EX and PX both specified returns syntax error" do
       store = MockStore.make()
-      before_ms = System.os_time(:millisecond)
 
-      # PX 60000 is specified last — should override EX 1
-      assert :ok = Strings.handle("SET", ["k", "v", "EX", "1", "PX", "60000"], store)
-
-      {_value, expire_at_ms} = store.get_meta.("k")
-      # The stored expiry should be ~60s from now, not ~1s
-      assert expire_at_ms >= before_ms + 50_000
+      # Conflicting expiry options are rejected (Redis 7+ behaviour)
+      assert {:error, "ERR syntax error"} =
+               Strings.handle("SET", ["k", "v", "EX", "1", "PX", "60000"], store)
     end
 
     test "SET stores binary value with null bytes" do

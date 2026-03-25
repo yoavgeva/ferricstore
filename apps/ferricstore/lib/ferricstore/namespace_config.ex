@@ -321,31 +321,29 @@ defmodule Ferricstore.NamespaceConfig do
     now = System.os_time(:second)
 
     try do
-      old_durability =
+      # Single ETS lookup for both old_durability and current values.
+      {old_durability, entry} =
         case :ets.lookup(@table, prefix) do
-          [{^prefix, _wms, dur, _cat, _cby}] -> dur
-          [] -> @default_durability
+          [{^prefix, window_ms, durability, _changed_at, _changed_by}] ->
+            new_entry =
+              case field do
+                :window_ms -> {prefix, value, durability, now, changed_by}
+                :durability -> {prefix, window_ms, value, now, changed_by}
+              end
+
+            {durability, new_entry}
+
+          [] ->
+            new_entry =
+              case field do
+                :window_ms -> {prefix, value, @default_durability, now, changed_by}
+                :durability -> {prefix, @default_window_ms, value, now, changed_by}
+              end
+
+            {@default_durability, new_entry}
         end
 
-      case :ets.lookup(@table, prefix) do
-        [{^prefix, window_ms, durability, _changed_at, _changed_by}] ->
-          entry =
-            case field do
-              :window_ms -> {prefix, value, durability, now, changed_by}
-              :durability -> {prefix, window_ms, value, now, changed_by}
-            end
-
-          :ets.insert(@table, entry)
-
-        [] ->
-          entry =
-            case field do
-              :window_ms -> {prefix, value, @default_durability, now, changed_by}
-              :durability -> {prefix, @default_window_ms, value, now, changed_by}
-            end
-
-          :ets.insert(@table, entry)
-      end
+      :ets.insert(@table, entry)
 
       # Emit durability weakening telemetry when changing from quorum to async
       if field == :durability and old_durability == :quorum and value == :async do

@@ -312,7 +312,6 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
       {:port, 0},
       {:health_port, 0},
       {:shard_count, shards},
-      {:raft_enabled, true},
       {:memory_guard_interval_ms, 60_000},
       {:max_memory_bytes, 1_073_741_824},
       {:merge, [check_interval_ms: 600_000, fragmentation_threshold: 0.99]}

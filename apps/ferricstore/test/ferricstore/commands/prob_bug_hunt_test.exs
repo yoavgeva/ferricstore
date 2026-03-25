@@ -614,7 +614,8 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
     test "BF.ADD on non-existent key auto-creates filter" do
       store = MockStore.make()
       assert 1 = Bloom.handle("BF.ADD", ["nokey", "elem"], store)
-      assert store.exists?.("nokey")
+      # Verify the filter was created by checking existence through the command
+      assert 1 = Bloom.handle("BF.EXISTS", ["nokey", "elem"], store)
     end
 
     # --- Cuckoo ---
@@ -648,7 +649,8 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
     test "CF.ADD on non-existent key auto-creates filter" do
       store = MockStore.make()
       assert 1 = Cuckoo.handle("CF.ADD", ["nokey", "elem"], store)
-      assert store.exists?.("nokey")
+      # Verify the filter was created by checking existence through the command
+      assert 1 = Cuckoo.handle("CF.EXISTS", ["nokey", "elem"], store)
     end
 
     # --- CMS ---

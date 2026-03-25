@@ -14,20 +14,17 @@
 # :jepsen — Jepsen-style durability and consistency tests that spin up multi-node
 #   `:peer` clusters and inject faults. Excluded by default; run with
 #   `mix test test/ferricstore/jepsen/ --include jepsen`.
-# :bloom_nif_mmap — tests for the NIF-backed mmap Bloom filter persistence
-#   feature which is not yet integrated into the pure-Elixir Bloom module.
-#   Run with `mix test --include bloom_nif_mmap`.
 # :legacy_hot_cache — tests that verify the old two-table (keydir + hot_cache)
 #   eviction model. The codebase migrated to a single-table LFU format.
 #   The replacement suite is spec/single_table_lfu_test.exs.
 #   Run with `mix test --include legacy_hot_cache`.
-ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen, :bloom_nif_mmap, :legacy_hot_cache])
+# :bench — long-running throughput benchmarks (30s+ per test). Excluded by default.
+#   Run with `mix test test/ferricstore/cluster/throughput_bench_test.exs --include bench`.
+ExUnit.start(exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen, :legacy_hot_cache, :bench])
 
-# Clean up the test data directory after the suite finishes.
-# Each run uses a unique dir (ferricstore_test_<pid>) so parallel runs don't
-# collide, but without cleanup they accumulate on disk indefinitely.
-# ExUnit.after_suite runs before the BEAM exits, while the application is still
-# running and the shard NIF file handles are still open — File.rm_rf works
-# on macOS/Linux even with open handles (unlink-while-open semantics).
-data_dir = Application.fetch_env!(:ferricstore, :data_dir)
-ExUnit.after_suite(fn _result -> File.rm_rf(data_dir) end)
+# NOTE: data directory cleanup is handled by the ferricstore_server app's
+# test_helper.exs which runs last in the umbrella. We must NOT delete the
+# data directory here because in umbrella `mix test`, after_suite callbacks
+# fire between apps while the application supervisor (and its shards) are
+# still running. Deleting the data directory here causes "No such file or
+# directory" errors for all shard writes in the ferricstore_server test suite.

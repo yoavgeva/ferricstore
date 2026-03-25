@@ -423,7 +423,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   # ------------------------------------------------------------------
 
   describe "performance" do
-    @tag :performance
+    @tag :perf
     test "100 concurrent cold reads complete faster than sequential" do
       dir = tmp_dir()
       on_exit(fn -> File.rm_rf!(dir) end)
@@ -461,7 +461,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
              "Concurrent (#{concurrent_us}us) should not be much slower than sequential (#{sequential_us}us)"
     end
 
-    @tag :performance
+    @tag :perf
     test "throughput: 1000 async gets complete within 10 seconds" do
       dir = tmp_dir()
       on_exit(fn -> File.rm_rf!(dir) end)

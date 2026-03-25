@@ -1,0 +1,83 @@
+name: Build precompiled NIFs
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  NIF_DIRECTORY: "apps/ferricstore/native/ferricstore_bitcask"
+  PROJECT_NAME: "ferricstore_bitcask"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build_release:
+    name: NIF ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        nif: ["2.16"]
+        job:
+          # macOS
+          - { target: aarch64-apple-darwin,        os: macos-14 }
+          - { target: x86_64-apple-darwin,         os: macos-13 }
+          # Linux glibc
+          - { target: aarch64-unknown-linux-gnu,   os: ubuntu-22.04, use-cross: true }
+          - { target: x86_64-unknown-linux-gnu,    os: ubuntu-22.04, use-cross: true }
+          # Linux musl
+          - { target: aarch64-unknown-linux-musl,  os: ubuntu-22.04, use-cross: true }
+          - { target: x86_64-unknown-linux-musl,   os: ubuntu-22.04, use-cross: true }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract project version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/.*@version "\(.*\)"/\1/p' apps/ferricstore/mix.exs)
+          echo "PROJECT_VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.job.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-precomp
+          shared-key: ${{ matrix.job.target }}-${{ matrix.nif }}
+          workspaces: ${{ env.NIF_DIRECTORY }}
+
+      - name: Build precompiled NIF
+        uses: philss/rustler-precompiled-action@v1.1.4
+        id: build
+        with:
+          project-name: ${{ env.PROJECT_NAME }}
+          project-version: ${{ env.PROJECT_VERSION }}
+          target: ${{ matrix.job.target }}
+          nif-version: ${{ matrix.nif }}
+          use-cross: ${{ matrix.job.use-cross || false }}
+          project-dir: ${{ env.NIF_DIRECTORY }}
+
+      - name: Artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ steps.build.outputs.file-path }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.file-name }}
+          path: ${{ steps.build.outputs.file-path }}
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ steps.build.outputs.file-path }}

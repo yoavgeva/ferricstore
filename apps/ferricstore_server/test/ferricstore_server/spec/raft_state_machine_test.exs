@@ -72,7 +72,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       # Verify the keydir ETS table has the key in single-table format
       # {key, value, expire_at_ms, lfu_counter}
       keydir = :"keydir_#{shard_index}"
-      assert [{^key, "cached_value", 0, _lfu}] = :ets.lookup(keydir, key)
+      assert [{^key, "cached_value", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, key)
     end
 
     test "SET with expiry populates keydir with correct expire_at_ms" do
@@ -83,7 +83,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       :ok = Batcher.write(shard_index, {:put, key, "ttl_value", future})
 
       keydir = :"keydir_#{shard_index}"
-      assert [{^key, "ttl_value", ^future, _lfu}] = :ets.lookup(keydir, key)
+      assert [{^key, "ttl_value", ^future, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, key)
     end
 
     test "overwrite updates ETS to new value" do
@@ -94,7 +94,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       :ok = Batcher.write(shard_index, {:put, key, "new_value", 0})
 
       keydir = :"keydir_#{shard_index}"
-      assert [{^key, "new_value", 0, _lfu}] = :ets.lookup(keydir, key)
+      assert [{^key, "new_value", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, key)
     end
 
     test "GET reads from ETS without GenServer call (hot path)" do
@@ -267,7 +267,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
       # Check keydir ETS directly
       keydir = :"keydir_#{shard_index}"
-      [{^key, _value, ets_expire, _lfu}] = :ets.lookup(keydir, key)
+      [{^key, _value, ets_expire, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, key)
 
       # Check via get_meta
       {_value, meta_expire} = Router.get_meta(key)
@@ -604,7 +604,11 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       dir = Path.join(System.tmp_dir!(), "sn001_test_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(dir)
 
-      {:ok, store} = NIF.new(dir)
+      # v2: create the active log file directly (no NIF store reference)
+      active_file_id = 0
+      active_file_path = Path.join(dir, "00000.log")
+      File.touch!(active_file_path)
+
       suffix = :rand.uniform(9_999_999)
       keydir_name = :"sn001_keydir_#{suffix}"
       :ets.new(keydir_name, [:set, :public, :named_table])
@@ -619,7 +623,13 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
         File.rm_rf!(dir)
       end)
 
-      %{store: store, keydir: keydir_name, dir: dir}
+      %{
+        shard_data_path: dir,
+        active_file_id: active_file_id,
+        active_file_path: active_file_path,
+        keydir: keydir_name,
+        dir: dir
+      }
     end
 
     test "release_cursor emitted exactly at the configured interval", ctx do
@@ -628,7 +638,9 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: ctx.store,
+          shard_data_path: ctx.shard_data_path,
+          active_file_id: ctx.active_file_id,
+          active_file_path: ctx.active_file_path,
           ets: ctx.keydir,
 
           release_cursor_interval: interval
@@ -670,7 +682,9 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: ctx.store,
+          shard_data_path: ctx.shard_data_path,
+          active_file_id: ctx.active_file_id,
+          active_file_path: ctx.active_file_path,
           ets: ctx.keydir,
 
           release_cursor_interval: interval
@@ -699,7 +713,9 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: ctx.store,
+          shard_data_path: ctx.shard_data_path,
+          active_file_id: ctx.active_file_id,
+          active_file_path: ctx.active_file_path,
           ets: ctx.keydir,
 
           release_cursor_interval: interval
@@ -728,7 +744,9 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: ctx.store,
+          shard_data_path: ctx.shard_data_path,
+          active_file_id: ctx.active_file_id,
+          active_file_path: ctx.active_file_path,
           ets: ctx.keydir,
 
           release_cursor_interval: interval

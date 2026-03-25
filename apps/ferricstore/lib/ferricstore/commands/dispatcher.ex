@@ -110,7 +110,15 @@ defmodule Ferricstore.Commands.Dispatcher do
   """
   @spec dispatch(binary(), [binary()], map()) :: term()
   def dispatch(name, args, store) do
-    cmd = String.upcase(name)
+    # The command name is expected to be already uppercase from normalise_cmd
+    # in the connection layer. For defensive compatibility with embedded/test
+    # callers that may pass lowercase, fall back to String.upcase only when
+    # the name is not found in the dispatch map (rare cold path).
+    cmd =
+      if Map.has_key?(@cmd_dispatch_map, name),
+        do: name,
+        else: String.upcase(name)
+
     start = System.monotonic_time(:microsecond)
 
     result =
@@ -195,4 +203,5 @@ defmodule Ferricstore.Commands.Dispatcher do
   # FERRICSTORE.* commands: upcase the first arg (subcommand) only.
   defp upcase_subcommand_ferricstore([subcmd | rest]), do: [String.upcase(subcmd) | rest]
   defp upcase_subcommand_ferricstore([]), do: []
+
 end

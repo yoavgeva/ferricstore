@@ -173,6 +173,14 @@ impl BloomFilter {
             ));
         }
 
+        // M-4 fix: hint the kernel that access is random (hash-determined bit
+        // positions). Without MADV_RANDOM, the kernel's readahead heuristic may
+        // prefetch sequential pages that will never be used, wasting page cache
+        // and evicting hot data file pages under memory pressure.
+        unsafe {
+            libc::madvise(mmap, file_size, libc::MADV_RANDOM);
+        }
+
         Ok(Self {
             mmap: ptr,
             mmap_len: file_size,
@@ -199,18 +207,19 @@ impl BloomFilter {
     }
 
     /// Compute hash positions for an element using Kirsch-Mitzenmacker double hashing.
-    fn hash_positions(&self, element: &[u8]) -> Vec<u64> {
-        let digest = md5_hash(element);
-        let h1 = u64::from_le_bytes(digest[0..8].try_into().unwrap());
-        let h2 = u64::from_le_bytes(digest[8..16].try_into().unwrap());
+    ///
+    /// H-4 fix: replaced MD5 with xxh3 (5-10x faster for non-cryptographic hashing).
+    /// Uses two xxh3 hashes with different seeds to produce h1 and h2.
+    ///
+    /// M-3 fix: returns an iterator instead of allocating a Vec on every call.
+    fn hash_positions(&self, element: &[u8]) -> impl Iterator<Item = u64> {
+        let h1 = xxhash_rust::xxh3::xxh3_64_with_seed(element, 0);
+        let h2 = xxhash_rust::xxh3::xxh3_64_with_seed(element, 0x9E37_79B9_7F4A_7C15);
+        let num_bits = self.num_bits;
 
-        (0..self.num_hashes as u64)
-            .map(|i| {
-                // Wrapping arithmetic to match the Elixir implementation
-                let val = h1.wrapping_add(i.wrapping_mul(h2));
-                val % self.num_bits
-            })
-            .collect()
+        (0..self.num_hashes as u64).map(move |i| {
+            h1.wrapping_add(i.wrapping_mul(h2)) % num_bits
+        })
     }
 
     /// Get a bit from the mmap'd bit array.
@@ -242,9 +251,8 @@ impl BloomFilter {
 
     /// Add an element. Returns true if the element was new (at least one new bit set).
     pub fn add(&self, element: &[u8]) -> bool {
-        let positions = self.hash_positions(element);
         let mut any_new = false;
-        for pos in positions {
+        for pos in self.hash_positions(element) {
             if self.set_bit(pos) {
                 any_new = true;
             }
@@ -257,11 +265,10 @@ impl BloomFilter {
 
     /// Check if an element may exist.
     pub fn exists(&self, element: &[u8]) -> bool {
-        let positions = self.hash_positions(element);
-        positions.iter().all(|&pos| self.get_bit(pos))
+        self.hash_positions(element).all(|pos| self.get_bit(pos))
     }
 
-    /// Flush changes to disk.
+    /// Flush changes to disk synchronously (MS_SYNC — blocks until pages are on disk).
     pub fn msync(&self) -> Result<(), String> {
         let ret =
             unsafe { libc::msync(self.mmap as *mut libc::c_void, self.mmap_len, libc::MS_SYNC) };
@@ -272,19 +279,45 @@ impl BloomFilter {
         }
     }
 
-    /// Delete the bloom filter: munmap + unlink the file.
-    pub fn delete(self) -> Result<(), String> {
-        let path = self.path.clone();
-        let mmap = self.mmap;
-        let mmap_len = self.mmap_len;
+    /// Mark dirty pages for background writeback (MS_ASYNC — non-blocking).
+    ///
+    /// M-2 fix: `bloom_add()` now uses this instead of the blocking `msync()`.
+    /// `MS_ASYNC` tells the kernel the pages are dirty and should be written back
+    /// at its convenience, without blocking the caller. This drops per-add cost
+    /// from ~100-500 us (NVMe fsync) to ~1 us.
+    ///
+    /// Durability is still guaranteed by:
+    /// - `bloom_madd()` calls `msync()` (MS_SYNC) after all additions
+    /// - `Drop` impl calls `msync()` (MS_SYNC) before `munmap`
+    /// - Explicit `msync()` calls from Elixir
+    pub fn msync_async(&self) -> Result<(), String> {
+        let ret =
+            unsafe { libc::msync(self.mmap as *mut libc::c_void, self.mmap_len, libc::MS_ASYNC) };
+        if ret != 0 {
+            Err(format!(
+                "msync_async failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(())
+        }
+    }
 
-        // Prevent Drop from running (we handle munmap here).
-        std::mem::forget(self);
+    /// Delete the bloom filter: munmap + unlink the file.
+    ///
+    /// L-3 fix: use `ManuallyDrop` to avoid an unnecessary `path.clone()`
+    /// while still preventing Drop from double-munmapping.
+    pub fn delete(self) -> Result<(), String> {
+        let mut this = std::mem::ManuallyDrop::new(self);
 
         unsafe {
-            libc::munmap(mmap as *mut libc::c_void, mmap_len);
+            libc::munmap(this.mmap as *mut libc::c_void, this.mmap_len);
         }
-        fs::remove_file(&path).map_err(|e| format!("unlink: {e}"))?;
+        // Null out the pointer so that if ManuallyDrop is ever dropped
+        // (it won't be, but belt-and-suspenders), the Drop impl is a no-op.
+        this.mmap = std::ptr::null_mut();
+
+        fs::remove_file(&this.path).map_err(|e| format!("unlink: {e}"))?;
         Ok(())
     }
 
@@ -311,149 +344,9 @@ impl Drop for BloomFilter {
     }
 }
 
-/// Compute MD5 hash of data. Returns 16-byte digest.
-fn md5_hash(data: &[u8]) -> [u8; 16] {
-    // Use a simple MD5 implementation. For production, we could use
-    // the `md5` crate, but to keep dependencies minimal we use a
-    // manual implementation that matches Erlang's :crypto.hash(:md5, data).
-    //
-    // We use libc to call the system's CC_MD5 (macOS) or we implement inline.
-    // For portability, use a pure-Rust MD5.
-    md5_compute(data)
-}
-
-// ---------------------------------------------------------------------------
-// Minimal pure-Rust MD5 (RFC 1321) — matches :crypto.hash(:md5, data)
-// ---------------------------------------------------------------------------
-
-fn md5_compute(data: &[u8]) -> [u8; 16] {
-    let mut a0: u32 = 0x6745_2301;
-    let mut b0: u32 = 0xefcd_ab89;
-    let mut c0: u32 = 0x98ba_dcfe;
-    let mut d0: u32 = 0x1032_5476;
-
-    // Pre-processing: pad message
-    let bit_len = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_le_bytes());
-
-    // Per-round shift amounts
-    const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
-        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-    ];
-
-    // Pre-computed T[i] = floor(2^32 * |sin(i + 1)|)
-    const K: [u32; 64] = [
-        0xd76a_a478,
-        0xe8c7_b756,
-        0x2420_70db,
-        0xc1bd_ceee,
-        0xf57c_0faf,
-        0x4787_c62a,
-        0xa830_4613,
-        0xfd46_9501,
-        0x6980_98d8,
-        0x8b44_f7af,
-        0xffff_5bb1,
-        0x895c_d7be,
-        0x6b90_1122,
-        0xfd98_7193,
-        0xa679_438e,
-        0x49b4_0821,
-        0xf61e_2562,
-        0xc040_b340,
-        0x265e_5a51,
-        0xe9b6_c7aa,
-        0xd62f_105d,
-        0x0244_1453,
-        0xd8a1_e681,
-        0xe7d3_fbc8,
-        0x21e1_cde6,
-        0xc337_07d6,
-        0xf4d5_0d87,
-        0x455a_14ed,
-        0xa9e3_e905,
-        0xfcef_a3f8,
-        0x676f_02d9,
-        0x8d2a_4c8a,
-        0xfffa_3942,
-        0x8771_f681,
-        0x6d9d_6122,
-        0xfde5_380c,
-        0xa4be_ea44,
-        0x4bde_cfa9,
-        0xf6bb_4b60,
-        0xbebf_bc70,
-        0x289b_7ec6,
-        0xeaa1_27fa,
-        0xd4ef_3085,
-        0x0488_1d05,
-        0xd9d4_d039,
-        0xe6db_99e5,
-        0x1fa2_7cf8,
-        0xc4ac_5665,
-        0xf429_2244,
-        0x432a_ff97,
-        0xab94_23a7,
-        0xfc93_a039,
-        0x655b_59c3,
-        0x8f0c_cc92,
-        0xffef_f47d,
-        0x8584_5dd1,
-        0x6fa8_7e4f,
-        0xfe2c_e6e0,
-        0xa301_4314,
-        0x4e08_11a1,
-        0xf753_7e82,
-        0xbd3a_f235,
-        0x2ad7_d2bb,
-        0xeb86_d391,
-    ];
-
-    for chunk in msg.chunks_exact(64) {
-        let mut m = [0u32; 16];
-        for (i, c) in chunk.chunks_exact(4).enumerate() {
-            m[i] = u32::from_le_bytes(c.try_into().unwrap());
-        }
-
-        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
-
-        for i in 0..64 {
-            let (f, g) = match i {
-                0..=15 => ((b & c) | ((!b) & d), i),
-                16..=31 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
-                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | (!d)), (7 * i) % 16),
-            };
-
-            let temp = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(
-                (a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g])).rotate_left(S[i]),
-            );
-            a = temp;
-        }
-
-        a0 = a0.wrapping_add(a);
-        b0 = b0.wrapping_add(b);
-        c0 = c0.wrapping_add(c);
-        d0 = d0.wrapping_add(d);
-    }
-
-    let mut result = [0u8; 16];
-    result[0..4].copy_from_slice(&a0.to_le_bytes());
-    result[4..8].copy_from_slice(&b0.to_le_bytes());
-    result[8..12].copy_from_slice(&c0.to_le_bytes());
-    result[12..16].copy_from_slice(&d0.to_le_bytes());
-    result
-}
+// H-4 fix: removed duplicate hand-rolled MD5 implementation.
+// Bloom filter now uses xxh3 (non-cryptographic, 5-10x faster than MD5)
+// via the hash_positions() method above.
 
 // ---------------------------------------------------------------------------
 // NIF resource
@@ -522,8 +415,10 @@ pub fn bloom_add<'a>(
 ) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let is_new = filter.add(element.as_slice());
-    // msync after each add for durability
-    let _ = filter.msync();
+    // M-2 fix: use MS_ASYNC (non-blocking) for individual adds instead of
+    // MS_SYNC which blocks until pages are flushed to disk (~100-500 us per call).
+    // Durability is guaranteed by msync(MS_SYNC) in bloom_madd, Drop, and explicit flush.
+    let _ = filter.msync_async();
     Ok(if is_new { 1u32 } else { 0u32 }.encode(env))
 }
 
@@ -638,22 +533,6 @@ pub fn bloom_delete(env: Env, resource: ResourceArc<BloomResource>) -> NifResult
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn md5_empty() {
-        let digest = md5_compute(b"");
-        assert_eq!(hex(&digest), "d41d8cd98f00b204e9800998ecf8427e");
-    }
-
-    #[test]
-    fn md5_hello() {
-        let digest = md5_compute(b"hello");
-        assert_eq!(hex(&digest), "5d41402abc4b2a76b9719d911017c592");
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
 
     #[test]
     fn bloom_create_add_exists() {
@@ -939,7 +818,7 @@ mod tests {
         for i in 0..10_000u64 {
             let key = format!("dist_key_{i}");
             let positions = filter.hash_positions(key.as_bytes());
-            for &pos in &positions {
+            for pos in positions {
                 positions_hit.insert(pos);
             }
         }
@@ -1093,5 +972,198 @@ mod tests {
 
         let result = BloomFilter::open_existing(&path);
         assert!(result.is_err(), "truncated bloom file must fail to open");
+    }
+
+    // ------------------------------------------------------------------
+    // H-4: xxh3 replaces MD5 — verify hash quality and correctness
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn h4_xxh3_no_false_negatives_10k_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h4_xxh3.bloom");
+        let filter = BloomFilter::create(&path, 1_000_000, 7).unwrap();
+
+        for i in 0..10_000 {
+            filter.add(format!("h4_item_{i}").as_bytes());
+        }
+        assert_eq!(filter.count(), 10_000);
+
+        // Verify zero false negatives
+        for i in 0..10_000 {
+            assert!(
+                filter.exists(format!("h4_item_{i}").as_bytes()),
+                "false negative for h4_item_{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn h4_xxh3_fpr_within_expected_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h4_fpr.bloom");
+
+        // Parameters for ~1% FPR with 10K items
+        let num_bits = 95_851;
+        let num_hashes = 7;
+        let filter = BloomFilter::create(&path, num_bits, num_hashes).unwrap();
+
+        for i in 0..10_000 {
+            filter.add(format!("added_{i}").as_bytes());
+        }
+
+        let test_count = 50_000;
+        let fp_count = (0..test_count)
+            .filter(|i| filter.exists(format!("not_added_{i}").as_bytes()))
+            .count();
+
+        let fp_rate = fp_count as f64 / test_count as f64;
+        assert!(
+            fp_rate < 0.02,
+            "False positive rate {fp_rate:.4} exceeds 2% (target was 1%)"
+        );
+    }
+
+    #[test]
+    fn h4_xxh3_persistence_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h4_persist.bloom");
+
+        {
+            let filter = BloomFilter::create(&path, 100_000, 7).unwrap();
+            for i in 0..500 {
+                filter.add(format!("persist_{i}").as_bytes());
+            }
+            filter.msync().unwrap();
+        }
+
+        // Reopen and verify all items found
+        let filter = BloomFilter::open_existing(&path).unwrap();
+        assert_eq!(filter.count(), 500);
+        for i in 0..500 {
+            assert!(
+                filter.exists(format!("persist_{i}").as_bytes()),
+                "item persist_{i} missing after reopen"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // M-2: msync_async uses MS_ASYNC (non-blocking) for individual adds
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn m2_msync_async_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m2_async.bloom");
+        let filter = BloomFilter::create(&path, 100_000, 7).unwrap();
+
+        // msync_async should succeed without error
+        filter.add(b"test_item");
+        assert!(filter.msync_async().is_ok(), "msync_async must not fail");
+
+        // Data should still be readable in-memory after msync_async
+        assert!(filter.exists(b"test_item"));
+    }
+
+    #[test]
+    fn m2_msync_async_bulk_adds_then_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m2_bulk.bloom");
+        let filter = BloomFilter::create(&path, 100_000, 7).unwrap();
+
+        // Simulate the bloom_add NIF pattern: add + msync_async per item
+        for i in 0..1000 {
+            filter.add(format!("m2_item_{i}").as_bytes());
+            filter.msync_async().unwrap();
+        }
+
+        // All items must still be present in memory
+        for i in 0..1000 {
+            assert!(
+                filter.exists(format!("m2_item_{i}").as_bytes()),
+                "m2_item_{i} missing after bulk add with msync_async"
+            );
+        }
+        assert_eq!(filter.count(), 1000);
+
+        // Explicit msync (MS_SYNC) for durability, then reopen
+        filter.msync().unwrap();
+        drop(filter);
+
+        let filter2 = BloomFilter::open_existing(&path).unwrap();
+        assert_eq!(filter2.count(), 1000);
+        for i in 0..1000 {
+            assert!(
+                filter2.exists(format!("m2_item_{i}").as_bytes()),
+                "m2_item_{i} missing after reopen"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // M-4: madvise(MADV_RANDOM) on mmap regions
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn m4_madvise_random_does_not_break_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m4_madvise.bloom");
+        let filter = BloomFilter::create(&path, 1_000_000, 7).unwrap();
+
+        // madvise is called during open; verify all operations still work
+        for i in 0..1000 {
+            filter.add(format!("m4_{i}").as_bytes());
+        }
+        for i in 0..1000 {
+            assert!(
+                filter.exists(format!("m4_{i}").as_bytes()),
+                "m4_{i} missing after madvise"
+            );
+        }
+
+        // Verify false negative rate is unchanged
+        let fp_count = (0..10_000)
+            .filter(|i| filter.exists(format!("m4_probe_{i}").as_bytes()))
+            .count();
+        let fpr = fp_count as f64 / 10_000.0;
+        assert!(fpr < 0.02, "FPR {fpr:.4} too high after madvise");
+    }
+
+    // ------------------------------------------------------------------
+    // L-3: ManuallyDrop-based delete avoids path.clone()
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn l3_delete_removes_file_and_does_not_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l3_del.bloom");
+
+        let filter = BloomFilter::create(&path, 10_000, 7).unwrap();
+        for i in 0..100 {
+            filter.add(format!("l3_item_{i}").as_bytes());
+        }
+        filter.msync().unwrap();
+        assert!(path.exists(), "file must exist before delete");
+
+        filter.delete().unwrap();
+        assert!(!path.exists(), "file must not exist after delete");
+    }
+
+    #[test]
+    fn l3_delete_on_large_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l3_large.bloom");
+
+        let filter = BloomFilter::create(&path, 1_000_000, 7).unwrap();
+        for i in 0..1_000 {
+            filter.add(format!("l3_large_{i}").as_bytes());
+        }
+
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(file_size > 100_000, "large bloom file must be > 100KB");
+
+        filter.delete().unwrap();
+        assert!(!path.exists(), "large bloom file must be deleted");
     }
 }

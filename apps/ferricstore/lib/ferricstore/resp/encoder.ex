@@ -136,7 +136,8 @@ defmodule Ferricstore.Resp.Encoder do
   end
 
   def encode({:push, elements}) when is_list(elements) do
-    [">", Integer.to_string(length(elements)), @crlf | encode_list_elements(elements)]
+    {count, encoded} = encode_list_counted(elements, 0, [])
+    [">", Integer.to_string(count), @crlf | encoded]
   end
 
   def encode({:verbatim, encoding, data}) when is_binary(encoding) and is_binary(data) do
@@ -145,12 +146,14 @@ defmodule Ferricstore.Resp.Encoder do
   end
 
   def encode(values) when is_list(values) do
-    ["*", Integer.to_string(length(values)), @crlf | encode_list_elements(values)]
+    {count, encoded} = encode_list_counted(values, 0, [])
+    ["*", Integer.to_string(count), @crlf | encoded]
   end
 
   def encode(%MapSet{} = set) do
     elements = MapSet.to_list(set)
-    ["~", Integer.to_string(length(elements)), @crlf | encode_list_elements(elements)]
+    {count, encoded} = encode_list_counted(elements, 0, [])
+    ["~", Integer.to_string(count), @crlf | encoded]
   end
 
   def encode(map) when is_map(map) and not is_struct(map) do
@@ -159,8 +162,12 @@ defmodule Ferricstore.Resp.Encoder do
 
   # -- Private helpers --------------------------------------------------------
 
-  defp encode_list_elements(elements) do
-    Enum.map(elements, &encode/1)
+  # Counts and encodes list elements in a single pass (avoids double-traversal
+  # from separate length/1 + Enum.map).
+  defp encode_list_counted([], count, acc), do: {count, Enum.reverse(acc)}
+
+  defp encode_list_counted([h | t], count, acc) do
+    encode_list_counted(t, count + 1, [encode(h) | acc])
   end
 
   defp encode_map_pairs(map) do

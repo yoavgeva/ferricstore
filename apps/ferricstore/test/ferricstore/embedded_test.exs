@@ -230,43 +230,10 @@ defmodule Ferricstore.EmbeddedTest do
   end
 
   # ===========================================================================
-  # Hash encoding/decoding internals
+  # Hash storage via compound keys
   # ===========================================================================
-
-  describe "hash encoding/decoding" do
-    test "round-trips an empty map" do
-      encoded = FerricStore.encode_hash(%{})
-      assert FerricStore.decode_hash(encoded) == %{}
-    end
-
-    test "round-trips a single field" do
-      original = %{"key" => "value"}
-      encoded = FerricStore.encode_hash(original)
-      assert FerricStore.decode_hash(encoded) == original
-    end
-
-    test "round-trips multiple fields" do
-      original = %{"a" => "1", "b" => "2", "c" => "3"}
-      encoded = FerricStore.encode_hash(original)
-      assert FerricStore.decode_hash(encoded) == original
-    end
-
-    test "round-trips fields with binary data" do
-      original = %{"bin" => <<0, 1, 255>>}
-      encoded = FerricStore.encode_hash(original)
-      assert FerricStore.decode_hash(encoded) == original
-    end
-
-    test "round-trips empty string field and value" do
-      original = %{"" => ""}
-      encoded = FerricStore.encode_hash(original)
-      assert FerricStore.decode_hash(encoded) == original
-    end
-
-    test "decode_hash of empty binary returns empty map" do
-      assert FerricStore.decode_hash(<<>>) == %{}
-    end
-  end
+  # encode_hash/decode_hash were removed in favour of compound-key storage.
+  # The HSET/HGET/HGETALL tests above cover the new path.
 
   # ===========================================================================
   # TTL — expire and ttl

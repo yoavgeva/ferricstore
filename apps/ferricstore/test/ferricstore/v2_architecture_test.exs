@@ -623,6 +623,7 @@ defmodule Ferricstore.V2ArchitectureTest do
       :ets.delete(keydir)
     end
 
+    @tag :perf
     test "31. 100 concurrent cold reads faster than serialized", %{dir: dir} do
       path = data_file(dir, 1)
 

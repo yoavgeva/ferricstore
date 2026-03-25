@@ -193,8 +193,8 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
         :ok = AsyncApplyWorker.apply_batch(shard_idx, commands)
       end
 
-      # Wait for all to be visible
-      Process.sleep(100)
+      # Drain all shard workers to ensure async writes are applied.
+      for shard_idx <- 0..3, do: AsyncApplyWorker.drain(shard_idx)
 
       for k <- keys do
         assert "val_#{k}" == Router.get(k),
@@ -225,7 +225,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
              "apply_batch took #{elapsed_us}us, expected < 1000us (non-blocking)"
 
       # Wait for it to actually be written
-      Process.sleep(50)
+      AsyncApplyWorker.drain(shard_index)
       assert "fast" == Router.get(k)
     end
   end
@@ -245,7 +245,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
       shard_index = Router.shard_for(k)
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k, "survived", 0}])
-      Process.sleep(100)
+      AsyncApplyWorker.drain(shard_index)
 
       # Worker should still be alive
       pid = Process.whereis(AsyncApplyWorker.worker_name(shard_index))
@@ -260,7 +260,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
         |> then(fn i -> "async_survive2_#{i}" end)
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k2, "still_works", 0}])
-      Process.sleep(100)
+      AsyncApplyWorker.drain(shard_index)
       assert "still_works" == Router.get(k2)
     end
   end
@@ -284,7 +284,9 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
         end
 
       key_shard_pairs = Task.await_many(tasks, 5_000)
-      Process.sleep(100)
+
+      # Drain all shard workers to ensure async batches are applied before reading.
+      for shard_idx <- 0..3, do: AsyncApplyWorker.drain(shard_idx)
 
       for {k, _shard} <- key_shard_pairs do
         assert Router.get(k) != nil,
@@ -311,7 +313,10 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
         end
 
       results = Task.await_many(tasks, 5_000)
-      Process.sleep(100)
+
+      # Drain all 4 shard workers to ensure async batches are applied before reading.
+      # Process.sleep(100) is insufficient under heavy load; drain/1 is a proper barrier.
+      for shard_idx <- 0..3, do: AsyncApplyWorker.drain(shard_idx)
 
       for {k, shard_idx} <- results do
         assert "shard_val_#{shard_idx}" == Router.get(k),

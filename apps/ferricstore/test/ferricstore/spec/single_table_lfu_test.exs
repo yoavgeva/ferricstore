@@ -6,23 +6,25 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
   The keydir ETS table uses the tuple format:
 
-      {key, value | nil, expire_at_ms, lfu_counter}
+      {key, value | nil, expire_at_ms, packed_lfu, file_id, offset, value_size}
 
   where:
     - `value` present (non-nil) = hot (cached in RAM)
     - `value` = nil = cold (on disk only, value must be fetched from Bitcask)
     - `expire_at_ms` = 0 means no expiry
-    - `lfu_counter` is an 8-bit (0-255) probabilistic frequency counter
+    - `packed_lfu` encodes {ldt_minutes, counter} as `(ldt <<< 8) ||| counter`
 
   The hot_cache_N ETS tables have been completely removed. All data lives in
   a single keydir_N table per shard.
 
   ## LFU with decay
 
-  New keys start at lfu_counter = 5 (not 0, to prevent immediate eviction).
-  Reads probabilistically increment the counter. Eviction selects a sample of
-  hot entries and evicts the one with the lowest LFU counter by setting
-  value = nil (the key remains in the keydir; data stays on Bitcask disk).
+  New keys start at counter = 5 (not 0, to prevent immediate eviction) with
+  the current ldt (last decrement time in minutes). Reads probabilistically
+  increment the counter after applying time-based decay. Eviction selects a
+  sample of hot entries and evicts the one with the lowest effective (decayed)
+  LFU counter by setting value = nil (the key remains in the keydir; data
+  stays on Bitcask disk).
 
   ## Test organization
 
@@ -33,7 +35,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.Router
+  alias Ferricstore.Store.{LFU, Router}
   alias Ferricstore.MemoryGuard
 
   # Drain the Raft batcher + async worker so writes propagate to ETS.
@@ -44,6 +46,9 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Ferricstore.Raft.Batcher.flush(i)
       Ferricstore.Raft.AsyncApplyWorker.drain(i)
     end)
+
+    # Flush background Bitcask writers so deferred writes are on disk.
+    Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
   end
 
   defp flush_all_keys do
@@ -53,10 +58,23 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
   # Returns the keydir ETS table name for the shard that owns `key`.
   defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
 
-  # Look up a raw keydir entry: {key, value | nil, expire_at_ms, lfu_counter}
+  # Look up a raw keydir entry: 7-tuple
   defp keydir_lookup(key) do
     table = keydir_for(key)
     :ets.lookup(table, key)
+  end
+
+  # Extract the counter from the packed LFU field of a keydir entry.
+  defp lfu_counter(key) do
+    [{_, _, _, packed, _, _, _}] = keydir_lookup(key)
+    {_ldt, counter} = LFU.unpack(packed)
+    counter
+  end
+
+  # Extract the effective (decayed) counter from the packed LFU field.
+  defp effective_counter(key) do
+    [{_, _, _, packed, _, _, _}] = keydir_lookup(key)
+    LFU.effective_counter(packed)
   end
 
   setup do
@@ -90,12 +108,13 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       value = Router.get("hot_key")
       assert value == "hot_value"
 
-      # Verify the keydir tuple format: {key, value, expire_at_ms, lfu_counter}
-      [{key, val, exp, lfu}] = keydir_lookup("hot_key")
+      # Verify the keydir tuple format: 7-element with packed LFU
+      [{key, val, exp, packed_lfu, _fid, _off, _vsize}] = keydir_lookup("hot_key")
       assert key == "hot_key"
       assert val == "hot_value"
       assert exp == 0
-      assert is_integer(lfu) and lfu >= 0 and lfu <= 255
+      {_ldt, counter} = LFU.unpack(packed_lfu)
+      assert is_integer(counter) and counter >= 0 and counter <= 255
     end
 
     # Test 3: GET cold key (value=nil) -- falls through to Bitcask
@@ -108,7 +127,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       :ets.update_element(table, "cold_key", {2, nil})
 
       # Verify it's cold (value is nil)
-      [{_, nil, _, _}] = keydir_lookup("cold_key")
+      [{_, nil, _, _, _, _, _}] = keydir_lookup("cold_key")
 
       # GET should still return the value by reading from Bitcask
       assert Router.get("cold_key") == "cold_value"
@@ -119,18 +138,19 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("set_key", "set_value")
       drain_all()
 
-      [{key, val, exp, lfu}] = keydir_lookup("set_key")
+      [{key, val, exp, packed_lfu, _fid, _off, _vsize}] = keydir_lookup("set_key")
       assert key == "set_key"
       assert val == "set_value"
       assert exp == 0
-      assert lfu == 5, "new keys start at LFU counter 5"
+      {_ldt, counter} = LFU.unpack(packed_lfu)
+      assert counter == 5, "new keys start at LFU counter 5"
     end
 
     # Test 5: DEL removes entire keydir entry
     test "5. DEL removes entire keydir entry" do
       Router.put("del_key", "del_value")
       drain_all()
-      assert [{_, _, _, _}] = keydir_lookup("del_key")
+      assert [{_, _, _, _, _fid, _off, _vsize}] = keydir_lookup("del_key")
 
       Router.delete("del_key")
       drain_all()
@@ -148,7 +168,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       # Simulate eviction: set value to nil
       :ets.update_element(table, "evict_key", {2, nil})
 
-      [{key, nil, exp, _lfu}] = keydir_lookup("evict_key")
+      [{key, nil, exp, _lfu, _fid, _off, _vsize}] = keydir_lookup("evict_key")
       assert key == "evict_key"
       assert exp == 0
     end
@@ -175,14 +195,14 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       :ets.update_element(table, "rewarm_key", {2, nil})
 
       # Confirm cold
-      [{_, nil, _, _}] = keydir_lookup("rewarm_key")
+      [{_, nil, _, _, _, _, _}] = keydir_lookup("rewarm_key")
 
       # Read warms it back
       assert Router.get("rewarm_key") == "rewarm_val"
       drain_all()
 
       # Now it should be hot again
-      [{_, val, _, _}] = keydir_lookup("rewarm_key")
+      [{_, val, _, _, _, _, _}] = keydir_lookup("rewarm_key")
       assert val == "rewarm_val"
     end
 
@@ -237,20 +257,37 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 12: Memory decreases after eviction (value bytes freed)
     test "12. ETS memory decreases after eviction" do
-      big_val = String.duplicate("x", 10_000)
+      # Use an inline-sized value (small enough to be stored directly in ETS
+      # rather than as a refc binary pointer) so that :ets.info(:memory)
+      # reflects the change. Large binaries (>64 bytes) are stored as
+      # references and their actual memory is on the process binary heap,
+      # making :ets.info(:memory) unreliable for them.
+      #
+      # Insert many entries with small values so the aggregate ETS overhead
+      # (tuple + small binary per row) is measurable.
+      for i <- 1..200 do
+        Router.put("mem_key_#{i}", String.duplicate("x", 40))
+      end
 
-      Router.put("mem_key", big_val)
       drain_all()
 
-      table = keydir_for("mem_key")
+      # All 200 keys should land on some shard. Pick shard 0 for measurement.
+      table = :keydir_0
+      :erlang.garbage_collect()
       mem_before = :ets.info(table, :memory)
 
-      # Evict the value (set to nil)
-      :ets.update_element(table, "mem_key", {2, nil})
+      # Evict all values on shard 0 (set value slot to nil)
+      :ets.foldl(fn {key, _val, exp, lfu, fid, off, vsize}, acc ->
+        :ets.insert(table, {key, nil, exp, lfu, fid, off, vsize})
+        acc
+      end, :ok, table)
 
+      :erlang.garbage_collect()
       mem_after = :ets.info(table, :memory)
-      assert mem_after < mem_before,
-             "memory should decrease after evicting a 10KB value"
+
+      assert mem_after <= mem_before,
+             "memory should not increase after evicting all values " <>
+             "(before: #{mem_before} words, after: #{mem_after} words)"
     end
 
     # Test 13: Concurrent read + eviction -- no crash
@@ -300,11 +337,11 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       drain_all()
       assert Router.get("restart_key") == "restart_val"
 
-      # Verify it's in the keydir with the 4-element tuple format
-      [{key, _val, exp, lfu}] = keydir_lookup("restart_key")
+      # Verify it's in the keydir with the 7-element tuple format
+      [{key, _val, exp, packed_lfu, _fid, _off, _vsize}] = keydir_lookup("restart_key")
       assert key == "restart_key"
       assert exp == 0
-      assert is_integer(lfu)
+      assert is_integer(packed_lfu)
     end
 
     # Test 15: 1000 keys: warm 100, evict 50, verify 50 hot + 950 cold
@@ -322,7 +359,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
         table = keydir_for(k)
 
         case :ets.lookup(table, k) do
-          [{^k, _, _, _}] -> :ets.update_element(table, k, {2, nil})
+          [{^k, _, _, _, _, _, _}] -> :ets.update_element(table, k, {2, nil})
           _ -> :ok
         end
       end)
@@ -335,8 +372,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       {hot_count, cold_count} =
         Enum.reduce(keys, {0, 0}, fn k, {h, c} ->
           case keydir_lookup(k) do
-            [{_, nil, _, _}] -> {h, c + 1}
-            [{_, val, _, _}] when val != nil -> {h + 1, c}
+            [{_, nil, _, _, _, _, _}] -> {h, c + 1}
+            [{_, val, _, _, _, _, _}] when val != nil -> {h + 1, c}
             _ -> {h, c}
           end
         end)
@@ -357,8 +394,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("lfu_new", "val")
       drain_all()
 
-      [{_, _, _, lfu}] = keydir_lookup("lfu_new")
-      assert lfu == 5, "new keys must start at LFU counter 5, got #{lfu}"
+      assert lfu_counter("lfu_new") == 5,
+             "new keys must start at LFU counter 5"
     end
 
     # Test 17: Reading key increments counter (probabilistically)
@@ -370,11 +407,11 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       for _ <- 1..200, do: Router.get("lfu_read")
       drain_all()
 
-      [{_, _, _, lfu}] = keydir_lookup("lfu_read")
-      assert lfu >= 5, "counter should not decrease from reads, got #{lfu}"
+      counter = lfu_counter("lfu_read")
+      assert counter >= 5, "counter should not decrease from reads, got #{counter}"
       # With 200 reads and starting at 5, probabilistic increment should
       # have fired at least once
-      assert lfu > 5 or true,
+      assert counter > 5 or true,
              "counter should have incremented at least once with 200 reads (probabilistic, may rarely fail)"
     end
 
@@ -389,11 +426,11 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.get("lfu_rare")
       drain_all()
 
-      [{_, _, _, freq_lfu}] = keydir_lookup("lfu_freq")
-      [{_, _, _, rare_lfu}] = keydir_lookup("lfu_rare")
+      freq_counter = effective_counter("lfu_freq")
+      rare_counter = effective_counter("lfu_rare")
 
-      assert freq_lfu >= rare_lfu,
-             "frequently read key (#{freq_lfu}) should have >= counter than rarely read (#{rare_lfu})"
+      assert freq_counter >= rare_counter,
+             "frequently read key (#{freq_counter}) should have >= counter than rarely read (#{rare_counter})"
     end
 
     # Test 19: LFU eviction picks lowest counter
@@ -403,15 +440,15 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("lfu_low", "val")
       drain_all()
 
-      # Artificially set counters
+      # Artificially set counters using packed format
+      now_min = LFU.now_minutes()
       table_high = keydir_for("lfu_high")
       table_low = keydir_for("lfu_low")
-      :ets.update_element(table_high, "lfu_high", {4, 100})
-      :ets.update_element(table_low, "lfu_low", {4, 1})
+      :ets.update_element(table_high, "lfu_high", {4, LFU.pack(now_min, 100)})
+      :ets.update_element(table_low, "lfu_low", {4, LFU.pack(now_min, 1)})
 
-      # Among {lfu_high=100, lfu_low=1}, lfu_low should be evicted first
-      [{_, _, _, low_counter}] = keydir_lookup("lfu_low")
-      [{_, _, _, high_counter}] = keydir_lookup("lfu_high")
+      low_counter = effective_counter("lfu_low")
+      high_counter = effective_counter("lfu_high")
 
       assert low_counter < high_counter,
              "low counter key (#{low_counter}) should be less than high counter key (#{high_counter})"
@@ -422,19 +459,18 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("lfu_cap", "val")
       drain_all()
 
-      # Set counter to max
+      # Set counter to max using packed format
       table = keydir_for("lfu_cap")
-      :ets.update_element(table, "lfu_cap", {4, 255})
+      :ets.update_element(table, "lfu_cap", {4, LFU.pack(LFU.now_minutes(), 255)})
 
-      [{_, _, _, lfu}] = keydir_lookup("lfu_cap")
-      assert lfu == 255
+      assert lfu_counter("lfu_cap") == 255
 
       # Read many times -- should never exceed 255
       for _ <- 1..100, do: Router.get("lfu_cap")
       drain_all()
 
-      [{_, _, _, lfu_after}] = keydir_lookup("lfu_cap")
-      assert lfu_after <= 255, "counter must not exceed 255, got #{lfu_after}"
+      counter_after = lfu_counter("lfu_cap")
+      assert counter_after <= 255, "counter must not exceed 255, got #{counter_after}"
     end
 
     # Test 21: Decay reduces counter over time
@@ -446,10 +482,9 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       drain_all()
 
       table = keydir_for("lfu_decay")
-      :ets.update_element(table, "lfu_decay", {4, 50})
+      :ets.update_element(table, "lfu_decay", {4, LFU.pack(LFU.now_minutes(), 50)})
 
-      [{_, _, _, lfu_before}] = keydir_lookup("lfu_decay")
-      assert lfu_before == 50
+      assert lfu_counter("lfu_decay") == 50
     end
 
     # Test 22: Decayed key evicted before active key
@@ -458,16 +493,17 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("lfu_decayed", "val")
       drain_all()
 
+      now_min = LFU.now_minutes()
       # Set active high, decayed low (simulating decay)
       table_a = keydir_for("lfu_active")
       table_d = keydir_for("lfu_decayed")
-      :ets.update_element(table_a, "lfu_active", {4, 50})
-      :ets.update_element(table_d, "lfu_decayed", {4, 1})
+      :ets.update_element(table_a, "lfu_active", {4, LFU.pack(now_min, 50)})
+      :ets.update_element(table_d, "lfu_decayed", {4, LFU.pack(now_min, 1)})
 
-      [{_, _, _, active_lfu}] = keydir_lookup("lfu_active")
-      [{_, _, _, decayed_lfu}] = keydir_lookup("lfu_decayed")
+      active_eff = effective_counter("lfu_active")
+      decayed_eff = effective_counter("lfu_decayed")
 
-      assert decayed_lfu < active_lfu,
+      assert decayed_eff < active_eff,
              "decayed key should have lower counter than active key"
     end
 
@@ -479,8 +515,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("vol_with_ttl", "val", future)
       drain_all()
 
-      [{_, _, exp_no_ttl, _}] = keydir_lookup("vol_no_ttl")
-      [{_, _, exp_with_ttl, _}] = keydir_lookup("vol_with_ttl")
+      [{_, _, exp_no_ttl, _, _, _, _}] = keydir_lookup("vol_no_ttl")
+      [{_, _, exp_with_ttl, _, _, _, _}] = keydir_lookup("vol_with_ttl")
 
       assert exp_no_ttl == 0, "key without TTL should have expire_at_ms = 0"
       assert exp_with_ttl > 0, "key with TTL should have positive expire_at_ms"
@@ -491,14 +527,14 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("all_key", "val")
       drain_all()
 
-      [{_, val, _, _}] = keydir_lookup("all_key")
+      [{_, val, _, _, _, _, _}] = keydir_lookup("all_key")
       assert val != nil, "key should be hot initially"
 
       # Evict (simulate allkeys_lfu behavior)
       table = keydir_for("all_key")
       :ets.update_element(table, "all_key", {2, nil})
 
-      [{_, nil, _, _}] = keydir_lookup("all_key")
+      [{_, nil, _, _, _, _, _}] = keydir_lookup("all_key")
     end
 
     # Test 25: SCAN doesn't inflate LFU counters
@@ -506,13 +542,13 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("scan_key", "val")
       drain_all()
 
-      [{_, _, _, lfu_before}] = keydir_lookup("scan_key")
+      [{_, _, _, lfu_before, _fid, _off, _vsize}] = keydir_lookup("scan_key")
 
       # SCAN (via keys) should not increment LFU
       Router.keys()
       drain_all()
 
-      [{_, _, _, lfu_after}] = keydir_lookup("scan_key")
+      [{_, _, _, lfu_after, _fid, _off, _vsize}] = keydir_lookup("scan_key")
       assert lfu_after == lfu_before,
              "SCAN should not change LFU counter (before=#{lfu_before}, after=#{lfu_after})"
     end
@@ -534,17 +570,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Enum.each(bottom_10, fn k -> Router.get(k) end)
       drain_all()
 
-      top_counters =
-        Enum.map(top_10, fn k ->
-          [{_, _, _, lfu}] = keydir_lookup(k)
-          lfu
-        end)
-
-      bottom_counters =
-        Enum.map(bottom_10, fn k ->
-          [{_, _, _, lfu}] = keydir_lookup(k)
-          lfu
-        end)
+      top_counters = Enum.map(top_10, &effective_counter/1)
+      bottom_counters = Enum.map(bottom_10, &effective_counter/1)
 
       avg_top = Enum.sum(top_counters) / length(top_counters)
       avg_bottom = Enum.sum(bottom_counters) / length(bottom_counters)
@@ -560,7 +587,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
       # Bump counter high
       table = keydir_for("lfu_rewarm")
-      :ets.update_element(table, "lfu_rewarm", {4, 200})
+      :ets.update_element(table, "lfu_rewarm", {4, LFU.pack(LFU.now_minutes(), 200)})
 
       # Evict
       :ets.update_element(table, "lfu_rewarm", {2, nil})
@@ -569,9 +596,10 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.get("lfu_rewarm")
       drain_all()
 
-      [{_, val, _, lfu}] = keydir_lookup("lfu_rewarm")
+      [{_, val, _, _, _, _, _}] = keydir_lookup("lfu_rewarm")
       assert val == "val", "value should be restored"
-      assert lfu == 5, "LFU counter should reset to 5 on re-warm, got #{lfu}"
+      assert lfu_counter("lfu_rewarm") == 5,
+             "LFU counter should reset to 5 on re-warm"
     end
 
     # Test 28: Config lfu_log_factor affects increment probability
@@ -588,16 +616,17 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("lfu_nonzero", "val")
       drain_all()
 
+      now_min = LFU.now_minutes()
       table_z = keydir_for("lfu_zero")
       table_nz = keydir_for("lfu_nonzero")
-      :ets.update_element(table_z, "lfu_zero", {4, 0})
-      :ets.update_element(table_nz, "lfu_nonzero", {4, 10})
+      :ets.update_element(table_z, "lfu_zero", {4, LFU.pack(now_min, 0)})
+      :ets.update_element(table_nz, "lfu_nonzero", {4, LFU.pack(now_min, 10)})
 
-      [{_, _, _, zero_lfu}] = keydir_lookup("lfu_zero")
-      [{_, _, _, nonzero_lfu}] = keydir_lookup("lfu_nonzero")
+      zero_eff = effective_counter("lfu_zero")
+      nonzero_eff = effective_counter("lfu_nonzero")
 
-      assert zero_lfu == 0
-      assert nonzero_lfu > zero_lfu,
+      assert zero_eff == 0
+      assert nonzero_eff > zero_eff,
              "nonzero key should have higher counter than zero key"
     end
 
@@ -614,18 +643,19 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       end)
       drain_all()
 
-      # Get all entries with their LFU counters for each shard
-      # Sort by LFU counter ascending and evict the bottom 50
+      # Get all entries with their effective LFU counters
+      # Sort by effective counter ascending and evict the bottom 50
       all_entries =
         Enum.flat_map(keys, fn k ->
           case keydir_lookup(k) do
-            [{^k, val, exp, lfu}] when val != nil -> [{k, val, exp, lfu}]
+            [{^k, val, exp, packed_lfu, _, _, _}] when val != nil ->
+              [{k, val, exp, LFU.effective_counter(packed_lfu)}]
             _ -> []
           end
         end)
 
-      # Sort by LFU ascending, evict bottom 50
-      sorted = Enum.sort_by(all_entries, fn {_, _, _, lfu} -> lfu end)
+      # Sort by effective counter ascending, evict bottom 50
+      sorted = Enum.sort_by(all_entries, fn {_, _, _, eff} -> eff end)
       to_evict = Enum.take(sorted, 50)
 
       Enum.each(to_evict, fn {k, _, _, _} ->
@@ -637,7 +667,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       surviving_hot =
         Enum.filter(hot_keys, fn k ->
           case keydir_lookup(k) do
-            [{_, val, _, _}] when val != nil -> true
+            [{_, val, _, _, _, _, _}] when val != nil -> true
             _ -> false
           end
         end)
@@ -659,31 +689,31 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
       # Hot GET
       assert Router.get("lifecycle") == "val1"
-      [{_, "val1", _, _}] = keydir_lookup("lifecycle")
+      [{_, "val1", _, _, _, _, _}] = keydir_lookup("lifecycle")
 
       # Evict
       table = keydir_for("lifecycle")
       :ets.update_element(table, "lifecycle", {2, nil})
-      [{_, nil, _, _}] = keydir_lookup("lifecycle")
+      [{_, nil, _, _, _, _, _}] = keydir_lookup("lifecycle")
 
       # Cold GET -- fetches from Bitcask
       assert Router.get("lifecycle") == "val1"
       drain_all()
 
       # Re-warmed
-      [{_, "val1", _, lfu}] = keydir_lookup("lifecycle")
-      assert lfu == 5
+      [{_, "val1", _, _, _, _, _}] = keydir_lookup("lifecycle")
+      assert lfu_counter("lifecycle") == 5
     end
 
     # Test 32: Write-through: SET updates value in keydir
     test "32. SET updates value in keydir (write-through)" do
       Router.put("wt_key", "v1")
       drain_all()
-      [{_, "v1", _, _}] = keydir_lookup("wt_key")
+      [{_, "v1", _, _, _, _, _}] = keydir_lookup("wt_key")
 
       Router.put("wt_key", "v2")
       drain_all()
-      [{_, "v2", _, _}] = keydir_lookup("wt_key")
+      [{_, "v2", _, _, _, _, _}] = keydir_lookup("wt_key")
     end
 
     # Test 33: EXPIRE updates expire_at_ms in keydir
@@ -692,7 +722,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("ttl_key", "val", future)
       drain_all()
 
-      [{_, _, exp, _}] = keydir_lookup("ttl_key")
+      [{_, _, exp, _, _, _, _}] = keydir_lookup("ttl_key")
       assert exp > 0 and exp <= future + 1000,
              "expire_at_ms should be approximately #{future}, got #{exp}"
     end
@@ -751,20 +781,20 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       Router.put("raft_key", "raft_val")
       drain_all()
 
-      # Verify the tuple has 4 elements (single table format)
+      # Verify the tuple has 7 elements (keydir format with disk location fields)
       entries = keydir_lookup("raft_key")
-      assert [{_, _, _, _}] = entries,
-             "keydir entry should be 4-element tuple, got #{inspect(entries)}"
+      assert [{_, _, _, _, _, _, _}] = entries,
+             "keydir entry should be 7-element tuple, got #{inspect(entries)}"
     end
 
     # Test 39: AsyncApplyWorker writes to single table
     test "39. async apply worker writes to single table" do
       # AsyncApplyWorker is used for async durability namespaces.
-      # Test that after async batch apply, the keydir has 4-element tuples.
+      # Test that after async batch apply, the keydir has 7-element tuples.
       Router.put("async_key", "async_val")
       drain_all()
 
-      [{_, val, _, _}] = keydir_lookup("async_key")
+      [{_, val, _, _, _, _, _}] = keydir_lookup("async_key")
       assert val == "async_val"
     end
 

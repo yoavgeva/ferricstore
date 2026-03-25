@@ -66,7 +66,7 @@ defmodule FerricstoreServer.Integration.SmokeTest do
     end
   end
 
-  defp fetch_and_recv(sock, buf) do
+  defp fetch_and_recv(sock, buf, retries \\ 2) do
     case Parser.parse(buf) do
       {:ok, [val | rest_vals], rest_bin} ->
         Process.put(@parsed_key, rest_vals)
@@ -74,8 +74,17 @@ defmodule FerricstoreServer.Integration.SmokeTest do
         val
 
       {:ok, [], _} ->
-        {:ok, data} = :gen_tcp.recv(sock, 0, 5_000)
-        fetch_and_recv(sock, buf <> data)
+        case :gen_tcp.recv(sock, 0, 5_000) do
+          {:ok, data} ->
+            fetch_and_recv(sock, buf <> data, retries)
+
+          {:error, :timeout} when retries > 0 ->
+            # Under full suite load, the server may be slow. Retry.
+            fetch_and_recv(sock, buf, retries - 1)
+
+          {:error, :timeout} ->
+            raise "TCP recv timed out after retries (buf size: #{byte_size(buf)})"
+        end
     end
   end
 

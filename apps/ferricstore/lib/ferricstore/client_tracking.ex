@@ -97,11 +97,11 @@ defmodule Ferricstore.ClientTracking do
   @spec init_tables() :: :ok
   def init_tables do
     if :ets.whereis(@tracking_table) == :undefined do
-      :ets.new(@tracking_table, [:bag, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
+      :ets.new(@tracking_table, [:bag, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
     end
 
     if :ets.whereis(@connections_table) == :undefined do
-      :ets.new(@connections_table, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
+      :ets.new(@connections_table, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
     end
 
     :ok
@@ -302,15 +302,16 @@ defmodule Ferricstore.ClientTracking do
 
   `:ok` always.
   """
-  @spec notify_key_modified(binary(), pid(), (pid(), iodata() -> :ok)) :: :ok
+  @spec notify_key_modified(binary(), pid(), (pid(), iodata(), [binary()] -> :ok)) :: :ok
   def notify_key_modified(key, writer_pid, socket_sender) do
-    invalidation_msg = encode_invalidation([key])
+    keys = [key]
+    invalidation_msg = encode_invalidation(keys)
 
     # Default mode: exact key match
-    notify_default_mode(key, writer_pid, invalidation_msg, socket_sender)
+    notify_default_mode(key, writer_pid, invalidation_msg, keys, socket_sender)
 
     # BCAST mode: prefix match
-    notify_bcast_mode(key, writer_pid, invalidation_msg, socket_sender)
+    notify_bcast_mode(key, writer_pid, invalidation_msg, keys, socket_sender)
 
     :ok
   end
@@ -394,13 +395,13 @@ defmodule Ferricstore.ClientTracking do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp notify_default_mode(key, writer_pid, invalidation_msg, socket_sender) do
+  defp notify_default_mode(key, writer_pid, invalidation_msg, keys, socket_sender) do
     tracked_pids = :ets.lookup(@tracking_table, key)
 
     Enum.each(tracked_pids, fn {^key, tracked_pid} ->
       if should_send_invalidation?(tracked_pid, writer_pid) do
         target = resolve_target(tracked_pid)
-        safe_send(target, invalidation_msg, socket_sender)
+        safe_send(target, invalidation_msg, keys, socket_sender)
       end
     end)
 
@@ -412,15 +413,26 @@ defmodule Ferricstore.ClientTracking do
     ArgumentError -> :ok
   end
 
-  defp notify_bcast_mode(key, writer_pid, invalidation_msg, socket_sender) do
-    all_connections = :ets.tab2list(@connections_table)
+  defp notify_bcast_mode(key, writer_pid, invalidation_msg, keys, socket_sender) do
+    # Use :ets.select with a match spec to filter only BCAST-enabled connections
+    # directly in ETS, avoiding copying the entire connections table into a list.
+    match_spec = [
+      {{:"$1", :"$2"},
+       [{:andalso,
+         {:is_map, :"$2"},
+         {:andalso,
+           {:==, {:map_get, :enabled, :"$2"}, true},
+           {:==, {:map_get, :mode, :"$2"}, :bcast}}}],
+       [{{:"$1", :"$2"}}]}
+    ]
 
-    Enum.each(all_connections, fn {conn_pid, config} ->
-      if config.enabled and config.mode == :bcast and
-           prefix_matches?(key, config.prefixes) and
+    bcast_connections = :ets.select(@connections_table, match_spec)
+
+    Enum.each(bcast_connections, fn {conn_pid, config} ->
+      if prefix_matches?(key, config.prefixes) and
            should_send_invalidation_config?(conn_pid, writer_pid, config) do
         target = resolve_target_config(conn_pid, config)
-        safe_send(target, invalidation_msg, socket_sender)
+        safe_send(target, invalidation_msg, keys, socket_sender)
       end
     end)
   rescue
@@ -465,10 +477,14 @@ defmodule Ferricstore.ClientTracking do
     Enum.any?(prefixes, fn prefix -> String.starts_with?(key, prefix) end)
   end
 
-  defp safe_send(target_pid, message, socket_sender) do
+  # Sends the invalidation message (iodata) alongside the pre-extracted key
+  # list to the target connection process. Passing keys directly avoids the
+  # need to re-parse RESP iodata for L1 cache invalidation (~500-1000ns saved
+  # per invalidation push).
+  defp safe_send(target_pid, message, keys, socket_sender) do
     if Process.alive?(target_pid) do
       try do
-        socket_sender.(target_pid, message)
+        socket_sender.(target_pid, message, keys)
       rescue
         _ -> :ok
       end

@@ -10,8 +10,8 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 - **Q2 (Per-key Bitcask):** Using compound keys in shared Bitcask + promotion for large collections — implemented.
 - **Q3 (ra version):** Using ra ~> 2.14 — compatible.
 - **Q4 (NIF scheduling):** ALL NIFs now on Normal scheduler with yielding via enif_schedule_nif — FIXED.
-- **Q6 (Two-table ETS):** IMPLEMENTED — keydir_N + hot_cache_N per shard.
-- **Q8 (ETS split blocked):** IMPLEMENTED — 5146 tests pass, CI green.
+- **Q6 (Two-table ETS):** SUPERSEDED — migrated to single-table keydir with LFU (v2 architecture).
+- **Q8 (ETS split blocked):** SUPERSEDED — single-table keydir replaces two-table split.
 - **Q10 (Raft not in write path):** FIXED — all 15+ write operations route through Raft.
 - **Q11 (active:once):** FIXED — connections use active:once sockets.
 - **Q12 (Merge supervisor):** FIXED — started in application.ex.
@@ -30,16 +30,15 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 - Auto-rebalance on node join/leave
 **Status:** Deferred — requires cluster management layer.
 
-### F2: Umbrella Package Split
+### F2: Umbrella Package Split — DONE
 **Problem:** Embedded users get Ranch/TCP deps they don't need.
 **Design:** Split into `ferricstore` (core) + `ferricstore_server` (TCP/HTTP).
-**Current:** Config-based `:mode` approach works as interim solution.
-**Status:** Deferred — packaging change, not code change.
+**Status:** IMPLEMENTED — umbrella project with `apps/ferricstore/` (core, no TCP deps) + `apps/ferricstore_server/` (standalone TCP/HTTP with Ranch).
 
-### F3: ACL v2 Implementation
+### F3: ACL v2 Implementation — IN PROGRESS
 **Problem:** Key patterns stored but not enforced, plaintext passwords, missing categories.
 **Design:** See `docs/acl-design.md` — comprehensive 3-phase plan with user stories.
-**Status:** Design complete, implementation deferred.
+**Status:** Passwords upgraded to PBKDF2-SHA256 (100K iterations). Key pattern enforcement at dispatch time in progress. ACL SAVE/LOAD deferred.
 
 ## STILL OPEN
 
@@ -75,50 +74,51 @@ Questions where the spec does NOT provide a clear answer. Everything else follow
 
 ---
 
-## Implementation Status — 5146 tests, 0 failures, CI green
+## Implementation Status
 
-### Complete:
+### Core (complete):
 - All 250+ Redis commands (Strings, Hash, List, Set, ZSet, Stream, Geo, JSON, Bitmap, HyperLogLog, Bloom, Cuckoo, CMS, TopK, Vector)
 - RESP3 protocol (parser + encoder, HELLO 3 only)
 - Raft consensus (ra library, all writes through Raft)
-- Two-table ETS (keydir_N + hot_cache_N per shard)
+- Single-table ETS keydir with LFU eviction (v2 architecture)
+- Umbrella project: `apps/ferricstore/` (core) + `apps/ferricstore_server/` (TCP/HTTP)
 - Collection promotion (Hash/Set/ZSet to dedicated Bitcask)
 - Merge/compaction (scheduler, manifest, semaphore)
-- NIF yielding (all NIFs on Normal scheduler)
+- NIF yielding (all NIFs on Normal scheduler, consume_timeslice)
 - Sliding window pipeline dispatch (active:once)
-- CLIENT TRACKING (module complete)
-- ACL (SETUSER/DELUSER/LIST/GETUSER/WHOAMI)
+- CLIENT TRACKING invalidation wiring
+- ACL (SETUSER/DELUSER/LIST/GETUSER/WHOAMI, PBKDF2-SHA256 passwords)
 - TLS listener (Ranch SSL)
 - Audit logging (ETS ring buffer)
 - Health checks + HTML dashboard
 - Prometheus metrics
 - Embedded Elixir API
 - Sandbox isolation
-
-### All Implemented:
-- Two-table ETS split (spec 2.4) — keydir_N + hot_cache_N
-- CLIENT TRACKING invalidation wiring — track_key + notify_key_modified
-- SCAN TYPE filtering for all types (hash/list/set/zset/string)
-- TLS require-tls enforcement
+- L1 per-connection cache (~5ns reads, CLIENT TRACKING invalidation)
+- Hybrid Logical Clock (spec 2G.6) — :atomics-based, lock-free
 - Namespace-aware group commit batcher (spec 2F.3)
-- FERRICSTORE.CONFIG SET/GET/RESET commands
-- CONFIG SET LOCAL / CONFIG REWRITE / CONFIG RESETSTAT
-- Dashboard Page 9 (namespace config visualization)
-- Hybrid Logical Clock (spec 2G.6) — monotonic timestamps
-- AsyncApplyWorker (async durability path)
 - Cross-shard 2PC Transaction Coordinator
-- ClusterHelper + multi-node :peer tests (21 cluster tests)
-- /health/live endpoint + /metrics on HTTP port
-- XREAD BLOCK support with stream waiters
-- INFO namespace_config section
-- 5950+ tests, all test plan sections covered (S2-S18)
+- ClusterHelper + multi-node :peer tests
 
-### Deferred (external tooling, not core logic):
+### v2 Architecture (in progress):
+- mmap-backed probabilistic structures (Bloom, Cuckoo, CMS, TopK, TDigest) — DONE
+- mmap-backed HNSW vector index (.v + .hnsw files) — DONE
+- v2 pure stateless Rust NIFs (append_record, pread_at, scan_file, hint files, copy_records) — DONE
+- 7-tuple ETS keydir {key, value|nil, expire, lfu, file_id, offset, value_size} — IN PROGRESS
+- Wire v2 NIFs into Shard GenServer — IN PROGRESS
+- Remove Rust keydir HashMap + Mutex (~80MB RAM savings) — IN PROGRESS
+- Tokio async IO for cold reads — IN PROGRESS
+- ResourceBinary zero-copy for embedded mode — IN PROGRESS
+- Sendfile for large GETs (>64KB) in standalone mode — IN PROGRESS
+- ACL key pattern enforcement at dispatch — IN PROGRESS
+
+### Deferred:
 - Encryption at rest (Q7) — requires Rust NIF encrypt/decrypt
-- Full async Tokio IO NIFs (Q9) — all IO NIFs still synchronous on Normal scheduler
 - Phoenix LiveView dashboard — current HTML dashboard works
 - Kubernetes Helm chart
 - Jepsen-style testing
 - Client libraries (Python, Go, Node.js)
+- ACL SAVE/LOAD file persistence
+- Shard rebalance (F1) — requires cluster management layer
 
 *Only add questions here if the spec does not provide a clear answer.*

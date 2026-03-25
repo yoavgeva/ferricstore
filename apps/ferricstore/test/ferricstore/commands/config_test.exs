@@ -24,8 +24,8 @@ defmodule Ferricstore.Commands.ConfigTest do
 
       # Restore Application env
       if orig_eviction, do: Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
-      if orig_slowlog_us, do: Application.put_env(:ferricstore, :slowlog_log_slower_than_us, orig_slowlog_us)
-      if orig_slowlog_max, do: Application.put_env(:ferricstore, :slowlog_max_len, orig_slowlog_max)
+      if orig_slowlog_us, do: Ferricstore.SlowLog.set_threshold(orig_slowlog_us)
+      if orig_slowlog_max, do: Ferricstore.SlowLog.set_max_len(orig_slowlog_max)
     end)
 
     :ok
@@ -489,14 +489,8 @@ defmodule Ferricstore.Commands.ConfigTest do
       assert [{"maxmemory", ^expected}] = Config.get("maxmemory")
     end
 
-    test "raft-enabled reflects :raft_enabled Application env" do
-      expected =
-        case Application.get_env(:ferricstore, :raft_enabled, true) do
-          true -> "true"
-          false -> "false"
-        end
-
-      assert [{"raft-enabled", ^expected}] = Config.get("raft-enabled")
+    test "raft-enabled config parameter was removed (Raft always on)" do
+      assert [] = Config.get("raft-enabled")
     end
   end
 

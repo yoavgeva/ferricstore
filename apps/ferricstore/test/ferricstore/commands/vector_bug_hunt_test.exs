@@ -297,7 +297,8 @@ defmodule Ferricstore.Commands.VectorBugHuntTest do
       :ok = Vector.handle("VADD", ["test_col", "same", "1.0", "2.0", "3.0"], store)
       result = Vector.handle("VSEARCH", ["test_col", "2.0", "4.0", "6.0", "TOP", "1"], store)
       [dist] = extract_distances(result)
-      assert_in_delta dist, 0.0, 1.0e-9
+      # f32 cosine distance has limited precision (~1e-7)
+      assert_in_delta dist, 0.0, 1.0e-6
     end
 
     test "opposite direction yields distance ~2.0" do

@@ -293,14 +293,14 @@ defmodule Ferricstore.Bitcask.ProbNIFSafetyTest do
     end
 
     test "add 100K items, delete structure — memory freed", %{dir: dir} do
-      :erlang.garbage_collect()
-      mem_baseline = :erlang.memory(:total)
-
-      {filter, _path} = create_bloom(dir, num_bits: 1_000_000, name: "memfree")
+      {filter, path} = create_bloom(dir, num_bits: 1_000_000, name: "memfree")
       for i <- 1..100_000, do: NIF.bloom_add(filter, "item_#{i}")
 
-      mem_with_bloom = :erlang.memory(:total)
-      assert mem_with_bloom > mem_baseline, "bloom should use memory"
+      # Bloom is mmap'd: check the backing file exists and has a reasonable
+      # size rather than :erlang.memory/1 which doesn't include mmap regions.
+      assert File.exists?(path), "bloom backing file should exist"
+      stat = File.stat!(path)
+      assert stat.size > 100_000, "bloom backing file should be > 100KB"
 
       NIF.bloom_delete(filter)
       # Clear references
@@ -308,11 +308,8 @@ defmodule Ferricstore.Bitcask.ProbNIFSafetyTest do
       :erlang.garbage_collect()
       Process.sleep(50)
 
-      mem_after_delete = :erlang.memory(:total)
-      # Memory should return close to baseline (within 5MB)
-      growth = mem_after_delete - mem_baseline
-      assert growth < 5_000_000,
-        "memory still #{growth} bytes above baseline after bloom_delete"
+      # After bloom_delete the backing file should be removed.
+      refute File.exists?(path), "bloom backing file should be deleted"
     end
 
     test "NIF resource destructor fires on GC", %{dir: dir} do

@@ -55,6 +55,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   require Logger
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.LFU
 
   @typedoc "A write command to be applied asynchronously."
   @type command ::
@@ -189,30 +190,38 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   # For puts, we batch all consecutive puts together and flush them in a
   # single `NIF.put_batch/2` call for efficiency. Deletes are applied
   # individually since they don't benefit from batching.
-  @lfu_initial_counter 5
-
   @spec apply_commands(non_neg_integer(), [command()]) :: :ok
   defp apply_commands(shard_index, commands) do
     alias Ferricstore.Store.PrefixIndex
 
-    store = get_store(shard_index)
+    {active_file_id, active_file_path} = get_active_file(shard_index)
     keydir = :"keydir_#{shard_index}"
     prefix_table = PrefixIndex.table_name(shard_index)
 
     # Separate puts (which can be batched) from other commands
     {puts, others} = split_puts_and_others(commands)
 
-    # Apply puts in a single batch
+    # Apply puts in a single batch via v2 append
     if puts != [] do
-      batch_entries = Enum.map(puts, fn {:put, key, value, expire_at_ms} ->
-        {key, value, expire_at_ms}
-      end)
+      batch_entries =
+        Enum.map(puts, fn {:put, key, value, expire_at_ms} ->
+          {key, value, expire_at_ms}
+        end)
 
-      case NIF.put_batch(store, batch_entries) do
-        :ok ->
-          # Update ETS and prefix index for each put
-          Enum.each(puts, fn {:put, key, value, expire_at_ms} ->
-            :ets.insert(keydir, {key, value, expire_at_ms, @lfu_initial_counter})
+      case NIF.v2_append_batch(active_file_path, batch_entries) do
+        {:ok, results} ->
+          # Update ETS (7-tuple) and prefix index for each put.
+          # Values exceeding the hot_cache_max_value_size threshold are stored
+          # as nil (cold) to avoid expensive binary copies on :ets.lookup.
+          puts
+          |> Enum.zip(results)
+          |> Enum.each(fn {{:put, key, value, expire_at_ms}, {offset, value_size}} ->
+            value_for_ets = value_for_ets(value)
+
+            :ets.insert(
+              keydir,
+              {key, value_for_ets, expire_at_ms, LFU.initial(), active_file_id, offset, value_size}
+            )
 
             try do
               PrefixIndex.track(prefix_table, key, shard_index)
@@ -223,21 +232,28 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
 
         {:error, reason} ->
           Logger.error(
-            "AsyncApplyWorker: put_batch failed for shard #{shard_index}: #{inspect(reason)}"
+            "AsyncApplyWorker: v2_append_batch failed for shard #{shard_index}: #{inspect(reason)}"
           )
       end
     end
 
-    # Apply deletes individually
+    # Apply deletes individually via v2 tombstone append
     Enum.each(others, fn
       {:delete, key} ->
-        NIF.delete(store, key)
-        :ets.delete(keydir, key)
+        case NIF.v2_append_tombstone(active_file_path, key) do
+          {:ok, _} ->
+            :ets.delete(keydir, key)
 
-        try do
-          PrefixIndex.untrack(prefix_table, key, shard_index)
-        rescue
-          ArgumentError -> :ok
+            try do
+              PrefixIndex.untrack(prefix_table, key, shard_index)
+            rescue
+              ArgumentError -> :ok
+            end
+
+          {:error, reason} ->
+            Logger.error(
+              "AsyncApplyWorker: tombstone write failed for shard #{shard_index}, key #{inspect(key)}: #{inspect(reason)}"
+            )
         end
     end)
 
@@ -253,12 +269,24 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
     end)
   end
 
-  # Retrieves the Bitcask store reference from the Shard's GenServer state.
-  # The store reference is obtained via :sys.get_state for the shard process.
-  @spec get_store(non_neg_integer()) :: reference()
-  defp get_store(shard_index) do
+  # Retrieves the active log file info from the Shard via a lightweight
+  # GenServer.call instead of :sys.get_state (which copies the entire state).
+  @spec get_active_file(non_neg_integer()) :: {non_neg_integer(), binary()}
+  defp get_active_file(shard_index) do
     shard_name = Ferricstore.Store.Router.shard_name(shard_index)
-    state = :sys.get_state(shard_name)
-    state.store
+    GenServer.call(shard_name, :get_active_file)
+  end
+
+  # Returns nil for values exceeding the hot cache max value size threshold,
+  # or the value itself if it fits. Prevents large values from being stored
+  # in ETS, avoiding expensive binary copies on every :ets.lookup.
+  @compile {:inline, value_for_ets: 1}
+  defp value_for_ets(nil), do: nil
+  defp value_for_ets(value) when is_binary(value) do
+    if byte_size(value) > :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536) do
+      nil
+    else
+      value
+    end
   end
 end

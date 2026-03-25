@@ -450,9 +450,9 @@ defmodule Ferricstore.Commands.GenericTest do
   # ---------------------------------------------------------------------------
 
   describe "OBJECT ENCODING" do
-    test "OBJECT ENCODING returns 'raw' for existing key" do
+    test "OBJECT ENCODING returns 'embstr' for short string key" do
       store = MockStore.make(%{"k" => {"v", 0}})
-      assert "raw" == Generic.handle("OBJECT", ["ENCODING", "k"], store)
+      assert "embstr" == Generic.handle("OBJECT", ["ENCODING", "k"], store)
     end
 
     test "OBJECT ENCODING returns error for missing key" do
@@ -462,7 +462,7 @@ defmodule Ferricstore.Commands.GenericTest do
 
     test "OBJECT encoding is case-insensitive" do
       store = MockStore.make(%{"k" => {"v", 0}})
-      assert "raw" == Generic.handle("OBJECT", ["encoding", "k"], store)
+      assert "embstr" == Generic.handle("OBJECT", ["encoding", "k"], store)
     end
   end
 

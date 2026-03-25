@@ -77,7 +77,7 @@ defmodule Ferricstore.Commands.Server do
     alias Ferricstore.Store.CompoundKey
 
     store.keys.()
-    |> Enum.reject(&CompoundKey.internal_key?/1)
+    |> CompoundKey.user_visible_keys()
     |> length()
   end
 
@@ -97,14 +97,12 @@ defmodule Ferricstore.Commands.Server do
     case PrefixIndex.detect_prefix_pattern(pattern) do
       {:prefix_match, prefix} when is_map_key(store, :keys_with_prefix) ->
         store.keys_with_prefix.(prefix)
-        |> Enum.reject(&CompoundKey.internal_key?/1)
+        |> CompoundKey.user_visible_keys()
 
       _ ->
-        regex = glob_to_regex(pattern)
-
         store.keys.()
-        |> Enum.reject(&CompoundKey.internal_key?/1)
-        |> Enum.filter(&Regex.match?(regex, &1))
+        |> CompoundKey.user_visible_keys()
+        |> Enum.filter(&Ferricstore.GlobMatcher.match?(&1, pattern))
     end
   end
 
@@ -306,6 +304,13 @@ defmodule Ferricstore.Commands.Server do
 
   @all_sections ["server", "clients", "memory", "keyspace", "stats", "persistence", "replication", "cpu", "namespace_config", "raft", "bitcask", "ferricstore", "keydir_analysis"]
 
+  # Read shard_count from persistent_term (set by application.ex) with
+  # Application.get_env fallback for early startup / test environments.
+  defp shard_count do
+    :persistent_term.get(:ferricstore_shard_count, nil) ||
+      Application.get_env(:ferricstore, :shard_count, 4)
+  end
+
   defp info_string(section, store) when section in ["all", "everything"] do
     @all_sections
     |> Enum.map(fn s -> build_section(s, store) end)
@@ -387,7 +392,7 @@ defmodule Ferricstore.Commands.Server do
   defp build_section("memory", _store) do
     total = :erlang.memory(:total)
     process_mem = :erlang.memory(:processes)
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    shard_count = shard_count()
 
     # Sum ETS memory across keydir tables per shard.
     keydir_bytes =
@@ -529,7 +534,7 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   defp build_section("raft", _store) do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    shard_count = shard_count()
 
     fields =
       Enum.flat_map(0..(shard_count - 1), fn i ->
@@ -608,7 +613,7 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   defp build_section("bitcask", _store) do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    shard_count = shard_count()
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
 
     fields =
@@ -656,7 +661,7 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   defp build_section("ferricstore", _store) do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    shard_count = shard_count()
 
     raft_committed =
       Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
@@ -697,14 +702,14 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   defp build_section("keydir_analysis", _store) do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    shard_count = shard_count()
 
     # Collect all keys from all keydir ETS tables and group by prefix
     prefix_data =
       Enum.reduce(0..(shard_count - 1), %{}, fn i, acc ->
         table = :"keydir_#{i}"
         try do
-          :ets.foldl(fn {key, _value, _exp, _lfu}, inner_acc ->
+          :ets.foldl(fn {key, _value, _exp, _lfu, _fid, _off, _vsize}, inner_acc ->
             prefix = Ferricstore.Stats.extract_prefix(key)
             # Estimate per-key bytes: key binary + value + expire_at + LFU + ETS tuple overhead
             key_bytes = byte_size(key) + 8 + 8 + 64
@@ -736,12 +741,10 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp format_section(header, fields) do
-    lines =
-      fields
-      |> Enum.map(fn {k, v} -> "#{k}:#{v}" end)
-      |> Enum.join("\r\n")
+    lines = Enum.map(fields, fn {k, v} -> [k, ":", v] end)
 
-    "# #{header}\r\n#{lines}\r\n"
+    ["# ", header, "\r\n", Enum.intersperse(lines, "\r\n"), "\r\n"]
+    |> IO.iodata_to_binary()
   end
 
   defp safe_ets_size(table) do
@@ -945,22 +948,4 @@ defmodule Ferricstore.Commands.Server do
     end)
   end
 
-  # ---------------------------------------------------------------------------
-  # Private — glob-to-regex conversion
-  # ---------------------------------------------------------------------------
-
-  defp glob_to_regex(pattern) do
-    regex_str =
-      pattern
-      |> String.graphemes()
-      |> Enum.map_join(&escape_glob_char/1)
-
-    Regex.compile!("^#{regex_str}$")
-  end
-
-  defp escape_glob_char("*"), do: ".*"
-  defp escape_glob_char("?"), do: "."
-  defp escape_glob_char(char) do
-    Regex.escape(char)
-  end
 end

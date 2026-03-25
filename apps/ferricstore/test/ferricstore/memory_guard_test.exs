@@ -116,6 +116,10 @@ defmodule Ferricstore.MemoryGuardTest do
 
       GenServer.stop(pid)
       :telemetry.detach(handler_id)
+
+      # Reset global persistent_term keys contaminated by the dedicated instance.
+      :persistent_term.put(:ferricstore_reject_writes, false)
+      :persistent_term.put(:ferricstore_keydir_full, false)
     end
   end
 
@@ -176,7 +180,7 @@ defmodule Ferricstore.MemoryGuardTest do
         end
 
       Enum.each(large_entries, fn {key, value, expire} ->
-        :ets.insert(keydir, {key, value, expire, 5})
+        :ets.insert(keydir, {key, value, expire, 5, 0, 0, 0})
       end)
 
       stats_after = MemoryGuard.stats()
@@ -233,6 +237,12 @@ defmodule Ferricstore.MemoryGuardTest do
       assert result == true
 
       GenServer.stop(pid)
+
+      # Reset the global persistent_term that the dedicated instance contaminated.
+      # The perform_check/1 in MemoryGuard writes to global :persistent_term keys
+      # regardless of which instance runs it, so we must restore them.
+      :persistent_term.put(:ferricstore_reject_writes, false)
+      :persistent_term.put(:ferricstore_keydir_full, false)
     end
   end
 

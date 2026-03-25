@@ -187,7 +187,7 @@ defmodule Ferricstore.ClientTrackingTest do
       # Writer modifies the key
       writer_pid = spawn(fn -> :timer.sleep(1000) end)
 
-      sender = fn pid, msg ->
+      sender = fn pid, msg, _keys ->
         send(pid, {:send_invalidation, msg})
         :ok
       end
@@ -261,7 +261,7 @@ defmodule Ferricstore.ClientTrackingTest do
       assert length(entries) == 2
 
       writer = spawn(fn -> :timer.sleep(1000) end)
-      sender = fn pid, msg -> send(pid, {:send_invalidation, msg}) && :ok end
+      sender = fn pid, msg, _keys -> send(pid, {:send_invalidation, msg}) && :ok end
 
       ClientTracking.notify_key_modified("shared_key", writer, sender)
 
@@ -291,7 +291,7 @@ defmodule Ferricstore.ClientTrackingTest do
         ClientTracking.enable(conn, config, mode: :bcast, prefixes: ["user:"])
 
       writer = spawn(fn -> :timer.sleep(1000) end)
-      sender = fn pid, msg -> send(pid, {:send_invalidation, msg}) && :ok end
+      sender = fn pid, msg, _keys -> send(pid, {:send_invalidation, msg}) && :ok end
 
       # Write a key that matches the prefix
       ClientTracking.notify_key_modified("user:42", writer, sender)
@@ -317,7 +317,7 @@ defmodule Ferricstore.ClientTrackingTest do
         ClientTracking.enable(conn, config, mode: :bcast, prefixes: ["user:"])
 
       writer = spawn(fn -> :timer.sleep(1000) end)
-      sender = fn pid, msg -> send(pid, {:send_invalidation, msg}) && :ok end
+      sender = fn pid, msg, _keys -> send(pid, {:send_invalidation, msg}) && :ok end
 
       # Write a key that does NOT match the prefix
       ClientTracking.notify_key_modified("order:99", writer, sender)
@@ -339,7 +339,7 @@ defmodule Ferricstore.ClientTrackingTest do
       {:ok, _enabled} = ClientTracking.enable(conn, config, mode: :bcast, prefixes: [])
 
       writer = spawn(fn -> :timer.sleep(1000) end)
-      sender = fn pid, msg -> send(pid, {:send_invalidation, msg}) && :ok end
+      sender = fn pid, msg, _keys -> send(pid, {:send_invalidation, msg}) && :ok end
 
       ClientTracking.notify_key_modified("anything:here", writer, sender)
 
@@ -461,7 +461,7 @@ defmodule Ferricstore.ClientTrackingTest do
       # conn tracks a key and then modifies it itself
       ClientTracking.track_key(conn, "my_key", enabled)
 
-      sender = fn pid, msg -> send(pid, {:send_invalidation, msg}) && :ok end
+      sender = fn pid, msg, _keys -> send(pid, {:send_invalidation, msg}) && :ok end
 
       # conn is both the tracker and the writer
       ClientTracking.notify_key_modified("my_key", conn, sender)
@@ -486,7 +486,7 @@ defmodule Ferricstore.ClientTrackingTest do
 
       ClientTracking.track_key(conn, "my_key", enabled)
 
-      sender = fn pid, msg -> send(pid, {:send_invalidation, msg}) && :ok end
+      sender = fn pid, msg, _keys -> send(pid, {:send_invalidation, msg}) && :ok end
 
       ClientTracking.notify_key_modified("my_key", conn, sender)
 
@@ -516,7 +516,7 @@ defmodule Ferricstore.ClientTrackingTest do
       {:ok, _enabled} =
         ClientTracking.enable(conn, config, mode: :bcast, noloop: true, prefixes: ["user:"])
 
-      sender = fn pid, msg -> send(pid, {:send_invalidation, msg}) && :ok end
+      sender = fn pid, msg, _keys -> send(pid, {:send_invalidation, msg}) && :ok end
 
       # conn writes a key matching its own prefix
       ClientTracking.notify_key_modified("user:42", conn, sender)

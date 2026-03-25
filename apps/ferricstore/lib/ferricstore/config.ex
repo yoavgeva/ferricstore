@@ -14,7 +14,6 @@ defmodule Ferricstore.Config do
     * `"maxclients"` -- maximum simultaneous client connections
     * `"tcp-port"` -- TCP port the server is listening on
     * `"data-dir"` -- Bitcask data directory path
-    * `"raft-enabled"` -- whether Raft consensus is active (`"true"` / `"false"`)
     * `"tls-port"` -- TLS port the server is listening on (`"0"` if not configured)
     * `"tls-cert-file"` -- path to PEM certificate file
     * `"tls-key-file"` -- path to PEM private key file
@@ -63,7 +62,6 @@ defmodule Ferricstore.Config do
     "maxclients",
     "tcp-port",
     "data-dir",
-    "raft-enabled",
     "tls-port",
     "tls-cert-file",
     "tls-key-file",
@@ -81,7 +79,8 @@ defmodule Ferricstore.Config do
     "hz",
     "keydir-max-ram",
     "hot-cache-max-ram",
-    "hot-cache-min-ram"
+    "hot-cache-min-ram",
+    "hot-cache-max-value-size"
   ])
 
   # Valid eviction policy names (string form used by Redis CONFIG SET)
@@ -195,11 +194,21 @@ defmodule Ferricstore.Config do
   @doc """
   Returns the current value for a single config key, or `nil` if not set.
 
-  This is a convenience for internal use (e.g. checking `requirepass`).
+  Reads directly from ETS (~100ns) instead of GenServer.call (~1-5us).
+  The ETS table is updated on every CONFIG SET and at init. This eliminates
+  the Config GenServer as a contention point for `requires_auth?` checks
+  which run on every command.
   """
   @spec get_value(binary()) :: binary() | nil
   def get_value(key) do
-    GenServer.call(__MODULE__, {:get_value, key})
+    case :ets.lookup(:ferricstore_config, key) do
+      [{^key, value}] -> value
+      [] -> nil
+    end
+  rescue
+    ArgumentError ->
+      # ETS table not yet created (early startup); fall back to GenServer.
+      GenServer.call(__MODULE__, {:get_value, key})
   end
 
   @doc """
@@ -246,18 +255,32 @@ defmodule Ferricstore.Config do
 
   @impl true
   def init(:ok) do
-    {:ok, build_initial_state()}
+    # Create a public ETS table for lock-free reads via get_value/1.
+    # Connection processes read `requirepass` on every command; routing
+    # through GenServer.call serialized all connections through this process.
+    if :ets.whereis(:ferricstore_config) == :undefined do
+      :ets.new(:ferricstore_config, [
+        :set,
+        :public,
+        :named_table,
+        {:read_concurrency, true}
+      ])
+    end
+
+    state = build_initial_state()
+    sync_ets(state)
+    {:ok, state}
   end
 
   @impl true
   def handle_call({:get, pattern}, _from, state) do
     # Refresh read-only params from live sources before returning
     state = refresh_read_only(state)
-    regex = glob_to_regex(pattern)
+    sync_ets(state)
 
     result =
       state
-      |> Enum.filter(fn {key, _val} -> Regex.match?(regex, key) end)
+      |> Enum.filter(fn {key, _val} -> Ferricstore.GlobMatcher.match?(key, pattern) end)
       |> Enum.sort_by(fn {key, _val} -> key end)
 
     {:reply, result, state}
@@ -275,6 +298,7 @@ defmodule Ferricstore.Config do
             new_state = Map.put(state, key, value)
             apply_side_effect(key, value)
             emit_config_changed(key, value, old_value)
+            sync_ets_key(key, value)
             {:reply, :ok, new_state}
 
           {:error, reason} ->
@@ -285,6 +309,7 @@ defmodule Ferricstore.Config do
         old_value = Map.get(state, key, "")
         new_state = Map.put(state, key, value)
         emit_config_changed(key, value, old_value)
+        sync_ets_key(key, value)
         {:reply, :ok, new_state}
 
       true ->
@@ -315,14 +340,15 @@ defmodule Ferricstore.Config do
     remaining_keys = MapSet.new(Map.keys(state))
 
     # Process existing lines: preserve comments/blanks, update known keys, keep unknowns
-    {output_lines, written_keys} =
+    # Use cons + reverse to avoid O(n^2) from repeated ++ [line] appends.
+    {reversed_lines, written_keys} =
       Enum.reduce(existing_lines, {[], MapSet.new()}, fn line, {lines_acc, written_acc} ->
         trimmed = String.trim(line)
 
         cond do
           # Comment line or blank line -- preserve as-is
           trimmed == "" or String.starts_with?(trimmed, "#") ->
-            {lines_acc ++ [line], written_acc}
+            {[line | lines_acc], written_acc}
 
           # Config line: extract key
           true ->
@@ -331,17 +357,19 @@ defmodule Ferricstore.Config do
                 if Map.has_key?(state, key) do
                   # Known key -- write with live value
                   value = Map.get(state, key, "")
-                  {lines_acc ++ ["#{key} #{value}"], MapSet.put(written_acc, key)}
+                  {["#{key} #{value}" | lines_acc], MapSet.put(written_acc, key)}
                 else
                   # Unknown key -- preserve verbatim
-                  {lines_acc ++ [line], written_acc}
+                  {[line | lines_acc], written_acc}
                 end
 
               _ ->
-                {lines_acc ++ [line], written_acc}
+                {[line | lines_acc], written_acc}
             end
         end
       end)
+
+    output_lines = Enum.reverse(reversed_lines)
 
     # Append keys from state that weren't already in the file
     new_keys =
@@ -392,7 +420,6 @@ defmodule Ferricstore.Config do
       "maxclients" => read_maxclients(),
       "tcp-port" => read_tcp_port(),
       "data-dir" => read_data_dir(),
-      "raft-enabled" => read_raft_enabled(),
       "tls-port" => read_tls_port(),
       "tls-cert-file" => read_tls_cert_file(),
       "tls-key-file" => read_tls_key_file(),
@@ -408,7 +435,8 @@ defmodule Ferricstore.Config do
       "hz" => "10",
       "keydir-max-ram" => Integer.to_string(Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)),
       "hot-cache-max-ram" => read_hot_cache_max_ram(),
-      "hot-cache-min-ram" => Integer.to_string(Application.get_env(:ferricstore, :hot_cache_min_ram, 64 * 1024 * 1024))
+      "hot-cache-min-ram" => Integer.to_string(Application.get_env(:ferricstore, :hot_cache_min_ram, 64 * 1024 * 1024)),
+      "hot-cache-max-value-size" => Integer.to_string(Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536))
     }
 
     Map.merge(@legacy_rw_defaults, Map.merge(read_only, read_write))
@@ -420,7 +448,6 @@ defmodule Ferricstore.Config do
     |> Map.put("maxclients", read_maxclients())
     |> Map.put("tcp-port", read_tcp_port())
     |> Map.put("data-dir", read_data_dir())
-    |> Map.put("raft-enabled", read_raft_enabled())
     |> Map.put("tls-port", read_tls_port())
     |> Map.put("tls-cert-file", read_tls_cert_file())
     |> Map.put("tls-key-file", read_tls_key_file())
@@ -449,13 +476,6 @@ defmodule Ferricstore.Config do
 
   defp read_data_dir do
     Application.get_env(:ferricstore, :data_dir, "data")
-  end
-
-  defp read_raft_enabled do
-    case Application.get_env(:ferricstore, :raft_enabled, true) do
-      true -> "true"
-      false -> "false"
-    end
   end
 
   defp read_hot_cache_max_ram do
@@ -560,6 +580,13 @@ defmodule Ferricstore.Config do
     end
   end
 
+  defp validate_param("hot-cache-max-value-size", value) do
+    case Integer.parse(value) do
+      {n, ""} when n >= 0 -> :ok
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'hot-cache-max-value-size'"}
+    end
+  end
+
   defp validate_param(_key, _value), do: :ok
 
   # -------------------------------------------------------------------
@@ -580,12 +607,12 @@ defmodule Ferricstore.Config do
 
   defp apply_side_effect("slowlog-log-slower-than", value) do
     {n, ""} = Integer.parse(value)
-    Application.put_env(:ferricstore, :slowlog_log_slower_than_us, n)
+    Ferricstore.SlowLog.set_threshold(n)
   end
 
   defp apply_side_effect("slowlog-max-len", value) do
     {n, ""} = Integer.parse(value)
-    Application.put_env(:ferricstore, :slowlog_max_len, n)
+    Ferricstore.SlowLog.set_max_len(n)
   end
 
   defp apply_side_effect("keydir-max-ram", value) do
@@ -618,6 +645,17 @@ defmodule Ferricstore.Config do
     end
   end
 
+  defp apply_side_effect("hot-cache-max-value-size", value) do
+    {n, ""} = Integer.parse(value)
+    Application.put_env(:ferricstore, :hot_cache_max_value_size, n)
+    :persistent_term.put(:ferricstore_hot_cache_max_value_size, n)
+  end
+
+  defp apply_side_effect("notify-keyspace-events", value) do
+    # Update persistent_term cache for KeyspaceNotifications.notify/3.
+    :persistent_term.put(:ferricstore_keyspace_events, value)
+  end
+
   defp apply_side_effect(_key, _value), do: :ok
 
   # -------------------------------------------------------------------
@@ -633,19 +671,23 @@ defmodule Ferricstore.Config do
   end
 
   # -------------------------------------------------------------------
-  # Private -- glob-to-regex conversion
+  # Private -- ETS sync for lock-free get_value/1 reads
   # -------------------------------------------------------------------
 
-  defp glob_to_regex(pattern) do
-    regex_str =
-      pattern
-      |> String.graphemes()
-      |> Enum.map_join(&escape_glob_char/1)
-
-    Regex.compile!("^#{regex_str}$")
+  defp sync_ets(state) do
+    try do
+      entries = Enum.map(state, fn {k, v} -> {k, v} end)
+      :ets.insert(:ferricstore_config, entries)
+    rescue
+      ArgumentError -> :ok
+    end
   end
 
-  defp escape_glob_char("*"), do: ".*"
-  defp escape_glob_char("?"), do: "."
-  defp escape_glob_char(char), do: Regex.escape(char)
+  defp sync_ets_key(key, value) do
+    try do
+      :ets.insert(:ferricstore_config, {key, value})
+    rescue
+      ArgumentError -> :ok
+    end
+  end
 end

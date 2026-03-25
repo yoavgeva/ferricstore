@@ -119,19 +119,19 @@ defmodule Ferricstore.Commands.Native do
     ]
   end
 
-  # Single-table keydir lookup: {key, value | nil, expire_at_ms, lfu_counter}
+  # 7-tuple keydir lookup: {key, value | nil, expire_at_ms, lfu_counter, file_id, offset, value_size}
   defp ets_key_info(keydir, key, now) do
     try do
       case :ets.lookup(keydir, key) do
-        [{^key, value, 0, _lfu}] when value != nil ->
+        [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           {value, 0, "hot"}
-        [{^key, nil, 0, _lfu}] ->
+        [{^key, nil, 0, _lfu, _fid, _off, _vsize}] ->
           {nil, 0, "cold"}
-        [{^key, value, exp, _lfu}] when exp > now and value != nil ->
+        [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           {value, exp, "hot"}
-        [{^key, nil, exp, _lfu}] when exp > now ->
+        [{^key, nil, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
           {nil, exp, "cold"}
-        [{^key, _value, _exp, _lfu}] ->
+        [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
           {nil, 0, "cold"}
         [] ->
           {nil, 0, "cold"}

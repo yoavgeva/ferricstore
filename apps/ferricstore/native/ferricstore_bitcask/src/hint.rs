@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Hint files accelerate startup by storing the keydir index without values.
 //!
 //! A hint file mirrors the corresponding data file but omits value bytes.
@@ -42,6 +40,8 @@ impl std::fmt::Display for HintError {
         write!(f, "HintError: {}", self.0)
     }
 }
+
+impl std::error::Error for HintError {}
 
 impl From<io::Error> for HintError {
     fn from(e: io::Error) -> Self {
@@ -272,20 +272,15 @@ fn read_hint_entry(reader: &mut impl Read) -> Result<Option<HintEntry>> {
     }))
 }
 
-/// CRC-32/ISO-HDLC (same polynomial used by `log.rs`).
+/// CRC-32/ISO-HDLC — delegates to `crc32fast::hash` for hardware-accelerated
+/// CRC computation (SSE 4.2 / ARMv8 CRC instructions when available).
+///
+/// H-REMAIN-1 fix: replaced byte-at-a-time hand-rolled CRC32 with
+/// `crc32fast::hash()`. Both use the same CRC-32/ISO-HDLC polynomial
+/// (0xEDB88320), so existing hint files remain compatible with no
+/// migration needed.
 fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            if crc & 1 == 1 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    crc ^ 0xFFFF_FFFF
+    crc32fast::hash(data)
 }
 
 #[cfg(test)]
@@ -898,6 +893,117 @@ mod tests {
         assert!(
             reader.load_into(&mut kd).is_err(),
             "load_into on corrupt hint must return Err"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // H-REMAIN-1: crc32fast backward compatibility
+    // ------------------------------------------------------------------
+
+    /// Verify that `crc32fast::hash()` produces the same output as the
+    /// old hand-rolled CRC-32/ISO-HDLC implementation. This ensures
+    /// existing hint files written with the old code remain readable.
+    #[test]
+    fn crc32fast_matches_old_hand_rolled_implementation() {
+        /// Original hand-rolled CRC-32/ISO-HDLC for reference.
+        fn old_crc32(data: &[u8]) -> u32 {
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for &byte in data {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    if crc & 1 == 1 {
+                        crc = (crc >> 1) ^ 0xEDB8_8320;
+                    } else {
+                        crc >>= 1;
+                    }
+                }
+            }
+            crc ^ 0xFFFF_FFFF
+        }
+
+        // Empty data
+        assert_eq!(crc32(&[]), old_crc32(&[]));
+
+        // Small data
+        assert_eq!(crc32(b"hello"), old_crc32(b"hello"));
+        assert_eq!(crc32(b"ferricstore"), old_crc32(b"ferricstore"));
+
+        // Binary data
+        let binary_data: Vec<u8> = (0u8..=255).collect();
+        assert_eq!(crc32(&binary_data), old_crc32(&binary_data));
+
+        // Large data (simulating a hint entry body)
+        let large_data = vec![0xABu8; 10_000];
+        assert_eq!(crc32(&large_data), old_crc32(&large_data));
+    }
+
+    /// Write 1000 hint entries and verify all round-trip correctly with
+    /// hardware-accelerated CRC. Exercises the hot path that H-REMAIN-1 fixes.
+    #[test]
+    fn hint_1000_entries_round_trip_with_crc32fast() {
+        let dir = tmp();
+        let path = dir.path().join("large.hint");
+
+        let entries_in: Vec<HintEntry> = (0u64..1000)
+            .map(|i| HintEntry {
+                file_id: i % 10,
+                offset: i * 256,
+                value_size: (i as u32) * 3 + 1,
+                expire_at_ms: if i % 3 == 0 { 0 } else { i * 5000 },
+                key: format!("key_{i:06}").into_bytes(),
+            })
+            .collect();
+
+        {
+            let mut writer = HintWriter::open(&path).unwrap();
+            for e in &entries_in {
+                writer.write_entry(e).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+
+        let mut reader = HintReader::open(&path).unwrap();
+        let entries_out = reader.read_all().unwrap();
+        assert_eq!(entries_out.len(), 1000);
+        for (a, b) in entries_in.iter().zip(entries_out.iter()) {
+            assert_eq!(a, b, "entry must survive round-trip with crc32fast CRC");
+        }
+    }
+
+    /// Corrupted CRC detection still works after switching to crc32fast.
+    #[test]
+    fn crc32fast_detects_corruption() {
+        let dir = tmp();
+        let path = dir.path().join("corrupt_detect.hint");
+
+        let entry = sample_entry(b"detect_me", 42, 1024);
+        {
+            let mut writer = HintWriter::open(&path).unwrap();
+            writer.write_entry(&entry).unwrap();
+            writer.commit().unwrap();
+        }
+
+        // Clean read succeeds.
+        {
+            let mut reader = HintReader::open(&path).unwrap();
+            let entries = reader.read_all().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0], entry);
+        }
+
+        // Corrupt the value_size field (starts at byte 4+8+8=20).
+        {
+            use std::fs::OpenOptions;
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(20)).unwrap();
+            f.write_all(&[0xFF, 0xFF]).unwrap();
+        }
+
+        let mut reader = HintReader::open(&path).unwrap();
+        assert!(
+            reader.read_all().is_err(),
+            "corruption must still be detected after crc32fast migration"
         );
     }
 }

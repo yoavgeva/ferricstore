@@ -46,7 +46,9 @@ defmodule FerricstoreServer.Commands.TransactionTest do
     sock
   end
 
-  defp ukey(name), do: "txn_#{name}_#{:rand.uniform(999_999)}"
+  # Hash tag ensures all generated keys co-locate on the same shard,
+  # avoiding CROSSSLOT errors in MULTI/EXEC.
+  defp ukey(name), do: "{txn}:#{name}_#{:rand.uniform(999_999)}"
 
   # ---------------------------------------------------------------------------
   # Setup

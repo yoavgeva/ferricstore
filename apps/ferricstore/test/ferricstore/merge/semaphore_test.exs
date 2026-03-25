@@ -70,13 +70,13 @@ defmodule Ferricstore.Merge.SemaphoreTest do
         # Exit immediately.
       end)
 
-      assert_receive :acquired, 1000
+      assert_receive :acquired, 2000
 
-      # Give the monitor DOWN message time to be processed.
-      Process.sleep(50)
-
-      # Semaphore should be free now.
-      assert :free = Semaphore.status(sem)
+      # Poll until the semaphore is free (DOWN message processed).
+      # Under heavy load the scheduler may delay message processing,
+      # so we poll instead of relying on a fixed sleep.
+      assert poll_until(fn -> Semaphore.status(sem) == :free end, 2000),
+             "Semaphore did not auto-release within 2s after holder process exited"
     end
 
     test "another shard can acquire after holder crashes", %{semaphore: sem} do
@@ -87,12 +87,33 @@ defmodule Ferricstore.Merge.SemaphoreTest do
         send(test_pid, :acquired)
       end)
 
-      assert_receive :acquired, 1000
-      Process.sleep(50)
+      assert_receive :acquired, 2000
+
+      # Poll until the semaphore is free before attempting acquire.
+      assert poll_until(fn -> Semaphore.status(sem) == :free end, 2000),
+             "Semaphore did not auto-release within 2s"
 
       # Now we can acquire from this process.
       assert :ok = Semaphore.acquire(1, sem)
     end
+  end
+
+  # Polls a predicate function every 20ms until it returns true or timeout.
+  defp poll_until(fun, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    Enum.reduce_while(Stream.repeatedly(fn -> :ok end), false, fn _, _ ->
+      if fun.() do
+        {:halt, true}
+      else
+        if System.monotonic_time(:millisecond) > deadline do
+          {:halt, false}
+        else
+          Process.sleep(20)
+          {:cont, false}
+        end
+      end
+    end)
   end
 
   describe "acquire-release cycle" do

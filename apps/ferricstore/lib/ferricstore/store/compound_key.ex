@@ -351,4 +351,30 @@ defmodule Ferricstore.Store.CompoundKey do
   def internal_key?(<<"PM:", _rest::binary>>), do: true
   def internal_key?(<<"LM:", _rest::binary>>), do: true
   def internal_key?(_), do: false
+
+  @doc """
+  Filters a list of raw ETS/store keys to only user-visible logical keys.
+
+  - Rejects all internal compound keys (`H:`, `L:`, `S:`, `Z:`, `V:`, `VM:`, `PM:`, `LM:`)
+  - Extracts logical keys from type registry entries (`T:key` -> `key`)
+  - Keeps plain string keys as-is
+  - Deduplicates (a key may exist both as a plain entry and a `T:` entry)
+  """
+  @spec user_visible_keys([binary()]) :: [binary()]
+  def user_visible_keys(raw_keys) do
+    {type_keys, other_keys} =
+      Enum.reduce(raw_keys, {[], []}, fn key, {tk, ok} ->
+        case key do
+          <<"T:", logical::binary>> -> {[logical | tk], ok}
+          _ -> {tk, [key | ok]}
+        end
+      end)
+
+    plain_keys = Enum.reject(other_keys, &internal_key?/1)
+
+    case type_keys do
+      [] -> plain_keys
+      _ -> Enum.uniq(type_keys ++ plain_keys)
+    end
+  end
 end

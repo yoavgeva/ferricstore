@@ -102,13 +102,21 @@ defmodule Ferricstore.Store.HnswRegistry do
     * `shard_index` -- the shard index
     * `get_fn` -- function `(key) -> value | nil` to read from Bitcask
   """
-  @spec rebuild_for_shard(reference(), non_neg_integer(), (binary() -> binary() | nil)) :: :ok
-  def rebuild_for_shard(store, shard_index, get_fn) do
+  @spec rebuild_for_shard(binary(), non_neg_integer(), (binary() -> binary() | nil)) :: :ok
+  def rebuild_for_shard(_shard_data_path, shard_index, get_fn) do
     create_table()
     clear_shard(shard_index)
 
-    # Discover all keys in this shard's Bitcask
-    all_keys = NIF.keys(store)
+    # v2: discover all keys from the ETS keydir (populated by recover_keydir
+    # before this function is called). No NIF store reference in v2.
+    keydir = :"keydir_#{shard_index}"
+
+    all_keys =
+      :ets.foldl(
+        fn {key, _value, _exp, _lfu, _fid, _off, _vsize}, acc -> [key | acc] end,
+        [],
+        keydir
+      )
 
     # Find shard-local metadata sentinel keys.
     # These are compound keys of the form: V:collection\0__hnsw_meta__

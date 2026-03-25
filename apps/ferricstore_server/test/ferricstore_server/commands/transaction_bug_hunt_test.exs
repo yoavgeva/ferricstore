@@ -65,7 +65,8 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
     sock
   end
 
-  defp ukey(name), do: "bughunt_#{name}_#{:rand.uniform(999_999)}"
+  # Hash tag ensures all generated keys co-locate on the same shard.
+  defp ukey(name), do: "{bughunt}:#{name}_#{:rand.uniform(999_999)}"
 
   # ---------------------------------------------------------------------------
   # Setup
@@ -759,7 +760,7 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
       assert Enum.at(result, 0) == {:simple, "OK"},  "SET -> OK"
       assert Enum.at(result, 1) == 11,                "INCR 10 -> 11"
-      assert Enum.at(result, 2) == "11",              "GET -> '11'"
+      assert Enum.at(result, 2) == 11,                "GET -> 11 (native int after INCR)"
       assert Enum.at(result, 3) == 1,                 "EXISTS -> 1"
       assert Enum.at(result, 4) == 1,                 "DEL -> 1"
       assert Enum.at(result, 5) == nil,               "GET deleted -> nil"

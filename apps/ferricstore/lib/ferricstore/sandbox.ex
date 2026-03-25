@@ -185,15 +185,18 @@ defmodule FerricStore.Sandbox do
 
       try do
         # Scan the single keydir table for keys with the namespace prefix
-        # and delete them. Format: {key, value, expire_at_ms, lfu_counter}
+        # and delete them. Format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
+        # Compound keys embed the namespace AFTER the type prefix (e.g. "H:ns_key\0field",
+        # "T:ns_key"), so we must also match those.
         keys =
           :ets.tab2list(keydir)
-          |> Enum.filter(fn {key, _value, _exp, _lfu} -> String.starts_with?(key, namespace) end)
-          |> Enum.map(fn {key, _value, _exp, _lfu} -> key end)
+          |> Enum.filter(fn {key, _value, _exp, _lfu, _fid, _off, _vsize} ->
+            owns_namespace?(key, namespace)
+          end)
+          |> Enum.map(fn {key, _value, _exp, _lfu, _fid, _off, _vsize} -> key end)
 
         Enum.each(keys, fn key ->
           :ets.delete(keydir, key)
-          # Also delete from the underlying Bitcask store via Router.delete
           Router.delete(key)
         end)
       rescue
@@ -203,4 +206,23 @@ defmodule FerricStore.Sandbox do
       end
     end)
   end
+
+  # Returns true if `key` belongs to the given sandbox namespace, accounting
+  # for both plain keys ("ns_foo") and compound keys where the namespace
+  # follows a type prefix ("H:ns_foo\0field", "T:ns_foo", "S:ns_foo\0member").
+  defp owns_namespace?(key, namespace) do
+    String.starts_with?(key, namespace) or
+      compound_has_namespace?(key, namespace)
+  end
+
+  defp compound_has_namespace?(<<"H:", rest::binary>>, ns), do: String.starts_with?(rest, ns)
+  defp compound_has_namespace?(<<"L:", rest::binary>>, ns), do: String.starts_with?(rest, ns)
+  defp compound_has_namespace?(<<"S:", rest::binary>>, ns), do: String.starts_with?(rest, ns)
+  defp compound_has_namespace?(<<"Z:", rest::binary>>, ns), do: String.starts_with?(rest, ns)
+  defp compound_has_namespace?(<<"T:", rest::binary>>, ns), do: String.starts_with?(rest, ns)
+  defp compound_has_namespace?(<<"V:", rest::binary>>, ns), do: String.starts_with?(rest, ns)
+  defp compound_has_namespace?(<<"VM:", rest::binary>>, ns), do: String.starts_with?(rest, ns)
+  defp compound_has_namespace?(<<"PM:", rest::binary>>, ns), do: String.starts_with?(rest, ns)
+  defp compound_has_namespace?(<<"LM:", rest::binary>>, ns), do: String.starts_with?(rest, ns)
+  defp compound_has_namespace?(_, _), do: false
 end

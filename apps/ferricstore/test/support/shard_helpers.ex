@@ -25,6 +25,10 @@ defmodule Ferricstore.Test.ShardHelpers do
         nil -> :ok
       end
     end)
+
+    # Also flush background BitcaskWriter processes so deferred writes
+    # from StateMachine.apply are on disk before tests verify disk state.
+    Ferricstore.Store.BitcaskWriter.flush_all()
   end
 
   @doc """
@@ -50,6 +54,10 @@ defmodule Ferricstore.Test.ShardHelpers do
       AsyncApplyWorker.drain(i)
     end)
 
+    # Flush background BitcaskWriter so deferred writes are on disk
+    # before we snapshot keys for deletion.
+    Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
+
     # Delete every key on each shard directly via that shard's GenServer.
     # We must NOT use Router.delete/1 because it re-hashes the key, which
     # routes compound keys (H:, S:, Z:, T: prefixed) to the wrong shard —
@@ -72,9 +80,19 @@ defmodule Ferricstore.Test.ShardHelpers do
     # After the per-shard deletes and drain above this should be a no-op,
     # but guards against edge cases where NIF tombstones haven't propagated.
     Enum.each(0..(shard_count - 1), fn i ->
-      # Single-table keydir has 4-element tuples {key, value, expire_at_ms, lfu_counter}
+      # Single-table keydir has 7-element tuples {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
       try do
-        :ets.select_delete(:"keydir_#{i}", [{{:"$1", :_, :_, :_}, [], [true]}])
+        :ets.select_delete(:"keydir_#{i}", [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [true]}])
+      rescue
+        ArgumentError -> :ok
+      end
+
+      # Also clear the prefix index bag table. Without this, stale
+      # {prefix, key} entries accumulate across tests and cause
+      # keys_for_prefix to return duplicates for keys that were
+      # deleted from the keydir but not untracked from the prefix bag.
+      try do
+        :ets.delete_all_objects(:"prefix_keys_#{i}")
       rescue
         ArgumentError -> :ok
       end
@@ -114,10 +132,18 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   @doc """
-  Waits until all 4 application-supervised shards (0–3) are alive.
+  Waits until all 4 application-supervised shards (0–3) are alive and have
+  completed their `init/1` (ETS warmed from Bitcask, Raft server started).
 
   Polls every 20ms up to `timeout_ms`. Raises if any shard hasn't restarted
   in time. Call this in `on_exit` callbacks after tests that kill shards.
+
+  After confirming each process is registered and alive, makes a synchronous
+  `GenServer.call(name, :flush)` to each shard. Because `GenServer.start_link`
+  registers the name before `init/1` returns, Process.whereis can succeed while
+  init is still running. The GenServer.call blocks until init completes,
+  guaranteeing that ETS is fully warmed from Bitcask and the shard is ready
+  to serve reads.
   """
   @spec wait_shards_alive(non_neg_integer()) :: :ok
   def wait_shards_alive(timeout_ms \\ 5_000) do
@@ -148,11 +174,29 @@ defmodule Ferricstore.Test.ShardHelpers do
       end
     end)
 
+    # Make a synchronous GenServer.call to each shard to confirm init/1 has
+    # completed. The name is registered before init returns, so Process.whereis
+    # can succeed while init is still running (warming ETS from Bitcask, setting
+    # up the Raft server). The :flush call blocks until init completes and is
+    # harmless (flushes the empty pending list on a fresh shard).
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 1_000)
+
+    Enum.each(0..3, fn i ->
+      name = :"Ferricstore.Store.Shard.#{i}"
+
+      try do
+        GenServer.call(name, :flush, remaining_ms)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
     # When Raft is enabled, also wait for each shard's ra server to have
     # an elected leader. Without a leader, Batcher.write calls will fail.
-    if Application.get_env(:ferricstore, :raft_enabled, true) do
-      wait_raft_leaders(deadline)
-    end
+    # This check runs AFTER the GenServer.call ping above, so the ra server
+    # started inside Shard.init is guaranteed to exist (the old ra server
+    # has already been force-deleted and replaced).
+    wait_raft_leaders(deadline)
   end
 
   # Polls ra.members/1 for each shard until all 4 ra servers report a leader.

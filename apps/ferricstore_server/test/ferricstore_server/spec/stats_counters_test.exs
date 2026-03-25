@@ -22,6 +22,14 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
   setup do
     ShardHelpers.flush_all_keys()
     Stats.reset()
+
+    on_exit(fn ->
+      # Reset persistent_term flags so tiny-budget MemoryGuard checks
+      # don't leak KEYDIR_FULL into other tests.
+      :persistent_term.put(:ferricstore_keydir_full, false)
+      :persistent_term.put(:ferricstore_reject_writes, false)
+    end)
+
     :ok
   end
 

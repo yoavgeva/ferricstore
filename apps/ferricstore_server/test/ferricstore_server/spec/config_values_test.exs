@@ -50,11 +50,8 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
       # Restore Application env
       if orig_eviction, do: Application.put_env(:ferricstore, :eviction_policy, orig_eviction)
 
-      if orig_slowlog_us,
-        do: Application.put_env(:ferricstore, :slowlog_log_slower_than_us, orig_slowlog_us)
-
-      if orig_slowlog_max,
-        do: Application.put_env(:ferricstore, :slowlog_max_len, orig_slowlog_max)
+      if orig_slowlog_us, do: Ferricstore.SlowLog.set_threshold(orig_slowlog_us)
+      if orig_slowlog_max, do: Ferricstore.SlowLog.set_max_len(orig_slowlog_max)
 
       ConfigLocal.reset_all()
       Logger.configure(level: orig_log_level)
@@ -145,28 +142,10 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
     end
   end
 
-  describe "read-only param: raft-enabled" do
-    test "CONFIG GET raft-enabled returns 'true' or 'false'", %{store: store} do
+  describe "removed param: raft-enabled" do
+    test "CONFIG GET raft-enabled returns empty (Raft always on)", %{store: store} do
       result = Server.handle("CONFIG", ["GET", "raft-enabled"], store)
-      assert ["raft-enabled", value] = result
-      assert value in ["true", "false"]
-    end
-
-    test "CONFIG GET raft-enabled matches Application env", %{store: store} do
-      ["raft-enabled", value] = Server.handle("CONFIG", ["GET", "raft-enabled"], store)
-
-      expected =
-        case Application.get_env(:ferricstore, :raft_enabled, true) do
-          true -> "true"
-          false -> "false"
-        end
-
-      assert value == expected
-    end
-
-    test "CONFIG SET raft-enabled is rejected as read-only", %{store: store} do
-      assert {:error, msg} = Server.handle("CONFIG", ["SET", "raft-enabled", "false"], store)
-      assert msg =~ "read-only"
+      assert result == []
     end
   end
 
@@ -543,7 +522,7 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
       assert "maxclients" in keys
       assert "tcp-port" in keys
       assert "data-dir" in keys
-      assert "raft-enabled" in keys
+      # raft-enabled was removed — Raft is always on
       assert "tls-port" in keys
       assert "tls-cert-file" in keys
       assert "tls-key-file" in keys

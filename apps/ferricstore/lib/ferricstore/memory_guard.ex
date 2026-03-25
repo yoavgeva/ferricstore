@@ -95,21 +95,30 @@ defmodule Ferricstore.MemoryGuard do
     GenServer.call(__MODULE__, :eviction_policy)
   end
 
-  @doc "Returns true if memory pressure is at or above the reject threshold."
+  @doc """
+  Returns true if memory pressure is at or above the reject threshold.
+
+  Reads from `:persistent_term` (~5ns) instead of GenServer.call (~1-5us).
+  The value is updated by `perform_check/1` every 100ms.
+  """
   @spec reject_writes?() :: boolean()
   def reject_writes? do
-    GenServer.call(__MODULE__, :reject_writes?)
+    :persistent_term.get(:ferricstore_reject_writes, false)
   end
 
   @doc """
   Returns true if keydir memory usage is at or above 95% of `keydir_max_ram`.
+
+  Reads from `:persistent_term` (~5ns) instead of GenServer.call (~1-5us).
+  The value is updated by `perform_check/1` every 100ms. The staleness
+  window (100ms) is acceptable since memory pressure changes slowly.
 
   When true, new key writes should be rejected, but updates to existing keys
   are still allowed.
   """
   @spec keydir_full?() :: boolean()
   def keydir_full? do
-    GenServer.call(__MODULE__, :keydir_full?)
+    :persistent_term.get(:ferricstore_keydir_full, false)
   end
 
   @doc """
@@ -261,6 +270,13 @@ defmodule Ferricstore.MemoryGuard do
         maybe_evict(state)
     end
 
+    # Publish pressure levels to persistent_term for lock-free hot-path reads.
+    # Callers (Router.check_keydir_full, Shard.put) read these instead of
+    # GenServer.call, eliminating the MemoryGuard process as a contention point.
+    :persistent_term.put(:ferricstore_keydir_full, stats.keydir_pressure_level == :reject)
+    :persistent_term.put(:ferricstore_reject_writes,
+      stats.pressure_level == :reject and state.eviction_policy == :noeviction)
+
     %{state | last_pressure_level: stats.pressure_level, keydir_pressure_level: stats.keydir_pressure_level}
   end
 
@@ -275,18 +291,20 @@ defmodule Ferricstore.MemoryGuard do
         now = System.os_time(:millisecond)
 
         try do
-          # Sample hot entries (value != nil) eligible for eviction
-          eligible =
-            :ets.foldl(fn {key, value, exp, lfu}, found ->
+          # Sample hot entries (value != nil) eligible for eviction.
+          # Use {count, list} accumulator to avoid O(n) length/1 on every iteration.
+          {_count, eligible} =
+            :ets.foldl(fn {key, value, exp, lfu, fid, _off, _vsize}, {count, found} ->
               cond do
-                length(found) >= 10 -> found
-                value == nil -> found  # Already cold, skip
-                policy in [:volatile_lfu, :volatile_lru] and exp > 0 and exp > now -> [{key, exp, lfu} | found]
-                policy == :volatile_ttl and exp > 0 and exp > now -> [{key, exp, lfu} | found]
-                policy in [:allkeys_lfu, :allkeys_lru] -> [{key, exp, lfu} | found]
-                true -> found
+                count >= 10 -> {count, found}
+                value == nil -> {count, found}  # Already cold, skip
+                fid == :pending -> {count, found}  # Background write pending, skip
+                policy in [:volatile_lfu, :volatile_lru] and exp > 0 and exp > now -> {count + 1, [{key, exp, lfu} | found]}
+                policy == :volatile_ttl and exp > 0 and exp > now -> {count + 1, [{key, exp, lfu} | found]}
+                policy in [:allkeys_lfu, :allkeys_lru] -> {count + 1, [{key, exp, lfu} | found]}
+                true -> {count, found}
               end
-            end, [], keydir)
+            end, {0, []}, keydir)
 
           if eligible != [] do
             to_evict =
@@ -295,8 +313,10 @@ defmodule Ferricstore.MemoryGuard do
                   # Sort by TTL ascending (evict shortest TTL first)
                   eligible |> Enum.sort_by(fn {_k, exp, _lfu} -> exp end) |> Enum.take(5)
                 p when p in [:volatile_lfu, :allkeys_lfu] ->
-                  # Sort by LFU counter ascending (evict lowest frequency first)
-                  eligible |> Enum.sort_by(fn {_k, _exp, lfu} -> lfu end) |> Enum.take(5)
+                  # Sort by effective (decayed) LFU counter ascending
+                  eligible
+                  |> Enum.sort_by(fn {_k, _exp, lfu} -> Ferricstore.Store.LFU.effective_counter(lfu) end)
+                  |> Enum.take(5)
                 _ ->
                   # LRU fallback: take first 5 from sample
                   Enum.take(eligible, 5)
@@ -304,11 +324,13 @@ defmodule Ferricstore.MemoryGuard do
 
             # Eviction = set value to nil. Key stays in keydir, data stays on disk.
             # Next GET: keydir hit with nil value -> fall through to Bitcask -> re-warm.
-            Enum.each(to_evict, fn {key, _exp, _lfu} ->
-              :ets.update_element(keydir, key, {2, nil})
-            end)
+            evict_count =
+              Enum.reduce(to_evict, 0, fn {key, _exp, _lfu}, cnt ->
+                :ets.update_element(keydir, key, {2, nil})
+                cnt + 1
+              end)
 
-            acc + length(to_evict)
+            acc + evict_count
           else
             acc
           end

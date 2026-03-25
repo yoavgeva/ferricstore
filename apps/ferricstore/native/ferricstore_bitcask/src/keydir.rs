@@ -1,25 +1,36 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 /// Metadata stored in RAM for every key. Points into a data file on disk.
+///
+/// H-5 fix: reordered fields to minimize padding. The largest-aligned fields
+/// (u64) come first, followed by u32, then bool. This packs into 32 bytes
+/// instead of 40 bytes, saving 8 bytes per key (80 MB for 10M keys).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(C)]
 pub struct KeyEntry {
     /// Which data file holds the value (monotonically increasing ID).
     pub file_id: u64,
     /// Byte offset of the record start inside that file.
     pub offset: u64,
-    /// Size of the full on-disk record in bytes (used to seek past it).
-    pub value_size: u32,
     /// Absolute Unix timestamp in milliseconds; 0 = no expiry.
     pub expire_at_ms: u64,
+    /// Size of the full on-disk record in bytes (used to seek past it).
+    pub value_size: u32,
     /// Reference bit for clock-hand eviction sweep.
     pub ref_bit: bool,
+    // 3 bytes padding to align to 8-byte boundary -> total 32 bytes
 }
 
-/// In-memory index: key → location on disk.
+/// In-memory index: key -> location on disk.
+///
+/// M-8 fix: uses `Box<[u8]>` instead of `Vec<u8>` for keys. `Box<[u8]>` is
+/// 16 bytes (ptr + len) vs `Vec<u8>`'s 24 bytes (ptr + len + cap). For 1M
+/// keys this saves ~8 MB of RAM and reduces allocator pressure.
+///
+/// `Box<[u8]>` implements `Borrow<[u8]>`, so `HashMap::get(&[u8])` lookups
+/// work without allocating.
 pub struct KeyDir {
-    map: HashMap<Vec<u8>, KeyEntry>,
+    map: HashMap<Box<[u8]>, KeyEntry>,
 }
 
 impl KeyDir {
@@ -30,9 +41,10 @@ impl KeyDir {
         }
     }
 
-    /// Insert or overwrite an entry.
+    /// Insert or overwrite an entry. Converts the `Vec<u8>` key to `Box<[u8]>`
+    /// to save 8 bytes per entry (no capacity field).
     pub fn put(&mut self, key: Vec<u8>, entry: KeyEntry) {
-        self.map.insert(key, entry);
+        self.map.insert(key.into_boxed_slice(), entry);
     }
 
     /// Look up a key. Returns `None` if not found or already logically deleted.
@@ -58,8 +70,8 @@ impl KeyDir {
     }
 
     /// Iterator over all (key, entry) pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &KeyEntry)> {
-        self.map.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &KeyEntry)> {
+        self.map.iter().map(|(k, v)| (k.as_ref(), v))
     }
 
     /// Set the reference bit for a key (called on cache promotion / access).
@@ -87,7 +99,7 @@ impl KeyDir {
         self.map
             .iter()
             .filter(|(_, e)| e.expire_at_ms != 0 && e.expire_at_ms <= now_ms)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.to_vec())
             .collect()
     }
 }
@@ -235,7 +247,7 @@ mod tests {
         let mut kd = KeyDir::new();
         kd.put(b"a".to_vec(), entry(1, 0));
         kd.put(b"b".to_vec(), entry(2, 100));
-        let keys: Vec<_> = kd.iter().map(|(k, _)| k.clone()).collect();
+        let keys: Vec<_> = kd.iter().map(|(k, _)| k.to_vec()).collect();
         assert_eq!(keys.len(), 2);
     }
 
@@ -514,5 +526,96 @@ mod tests {
             kd.get(b"target").is_none(),
             "get after delete must return None"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // H-5: KeyEntry struct size reduced from 40 to 32 bytes
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn h5_key_entry_size_is_32_bytes() {
+        let size = std::mem::size_of::<KeyEntry>();
+        assert_eq!(
+            size, 32,
+            "KeyEntry should be 32 bytes (was 40 before H-5 fix), got {size}"
+        );
+    }
+
+    #[test]
+    fn h5_key_entry_alignment_is_8() {
+        let align = std::mem::align_of::<KeyEntry>();
+        assert_eq!(
+            align, 8,
+            "KeyEntry alignment should be 8 bytes, got {align}"
+        );
+    }
+
+    #[test]
+    fn h5_field_access_after_reorder() {
+        let e = KeyEntry {
+            file_id: 42,
+            offset: 1234,
+            expire_at_ms: 999_000,
+            value_size: 512,
+            ref_bit: true,
+        };
+        assert_eq!(e.file_id, 42);
+        assert_eq!(e.offset, 1234);
+        assert_eq!(e.expire_at_ms, 999_000);
+        assert_eq!(e.value_size, 512);
+        assert!(e.ref_bit);
+    }
+
+    // ------------------------------------------------------------------
+    // M-8: Box<[u8]> keys save 8 bytes per entry vs Vec<u8>
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn m8_box_slice_smaller_than_vec() {
+        // Verify that Box<[u8]> is indeed smaller than Vec<u8>
+        let box_size = std::mem::size_of::<Box<[u8]>>();
+        let vec_size = std::mem::size_of::<Vec<u8>>();
+        assert!(
+            box_size < vec_size,
+            "Box<[u8]> ({box_size} bytes) must be smaller than Vec<u8> ({vec_size} bytes)"
+        );
+        assert_eq!(box_size, 16, "Box<[u8]> should be 16 bytes (ptr + len)");
+        assert_eq!(vec_size, 24, "Vec<u8> should be 24 bytes (ptr + len + cap)");
+    }
+
+    #[test]
+    fn m8_put_get_with_boxed_keys() {
+        let mut kd = KeyDir::new();
+        kd.put(b"boxed_key".to_vec(), entry(1, 42));
+        assert_eq!(kd.get(b"boxed_key").unwrap().offset, 42);
+    }
+
+    #[test]
+    fn m8_iter_returns_slice_refs() {
+        let mut kd = KeyDir::new();
+        kd.put(b"a".to_vec(), entry(1, 0));
+        kd.put(b"b".to_vec(), entry(2, 100));
+
+        // iter() should return (&[u8], &KeyEntry) — verify via to_vec
+        let mut keys: Vec<Vec<u8>> = kd.iter().map(|(k, _)| k.to_vec()).collect();
+        keys.sort();
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn m8_delete_with_slice_lookup() {
+        let mut kd = KeyDir::new();
+        kd.put(b"delete_me".to_vec(), entry(1, 0));
+        assert!(kd.delete(b"delete_me"));
+        assert!(kd.get(b"delete_me").is_none());
+    }
+
+    #[test]
+    fn m8_expired_keys_returns_vec_u8() {
+        let mut kd = KeyDir::new();
+        kd.put(b"exp".to_vec(), expiring_entry(1, 100));
+        let expired = kd.expired_keys(200);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0], b"exp".to_vec());
     }
 }

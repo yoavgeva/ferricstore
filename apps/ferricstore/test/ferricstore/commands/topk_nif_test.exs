@@ -16,10 +16,10 @@ defmodule Ferricstore.Commands.TopKNifTest do
       store = MockStore.make()
       :ok = TopK.handle("TOPK.RESERVE", ["hot_keys", "5"], store)
       raw = store.get.("hot_keys")
-      assert {:topk, topk} = raw
-      # The topk is a map containing a NIF CMS sketch reference
-      assert is_map(topk)
-      assert is_reference(topk.sketch)
+      # TopK now uses mmap-backed files; the store holds a path reference
+      assert {:topk_path, path} = raw
+      assert is_binary(path)
+      assert String.ends_with?(path, ".topk")
     end
 
     test "NIF resource persists through add, incrby, query operations" do

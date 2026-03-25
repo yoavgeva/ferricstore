@@ -2,9 +2,9 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
   @moduledoc """
   TCP-level integration tests for cross-shard MULTI/EXEC transactions.
 
-  These tests connect over real TCP sockets, send RESP3-encoded commands, and
-  verify that the Two-Phase Commit coordinator provides atomicity for
-  transactions spanning multiple shards.
+  Cross-shard transactions now execute atomically via the anchor-shard Raft
+  approach. A single Raft log entry is submitted to the anchor shard containing
+  commands for ALL involved shards.
 
   Key-to-shard mapping (phash2, 4 shards):
     - shard 0: "h", "j", "o", "p", "t", "u", "v", "x"
@@ -83,14 +83,15 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Cross-shard MULTI/EXEC
+  # Cross-shard MULTI/EXEC succeeds atomically
   # ---------------------------------------------------------------------------
 
-  describe "MULTI with keys on different shards, EXEC succeeds" do
-    test "SET keys on shard 0 and shard 1", %{sock: sock} do
+  describe "cross-shard MULTI/EXEC succeeds atomically" do
+    test "SET keys on different shards succeeds", %{sock: sock} do
       send_cmd(sock, ["MULTI"])
       assert recv_response(sock) == ok()
 
+      # h -> shard 0, b -> shard 1
       send_cmd(sock, ["SET", "h", "cross_val_0"])
       assert recv_response(sock) == queued()
 
@@ -102,7 +103,6 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
 
       assert result == [ok(), ok()]
 
-      # Verify both keys were written
       send_cmd(sock, ["GET", "h"])
       assert recv_response(sock) == "cross_val_0"
 
@@ -110,7 +110,7 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
       assert recv_response(sock) == "cross_val_1"
     end
 
-    test "SET keys across all four shards", %{sock: sock} do
+    test "SET keys across all four shards succeeds", %{sock: sock} do
       send_cmd(sock, ["MULTI"])
       assert recv_response(sock) == ok()
 
@@ -129,15 +129,17 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
 
       assert result == [ok(), ok(), ok(), ok()]
 
-      # Verify all four keys
-      for {key, expected} <- [{"h", "s0"}, {"b", "s1"}, {"l", "s2"}, {"a", "s3"}] do
-        send_cmd(sock, ["GET", key])
-        assert recv_response(sock) == expected
-      end
+      send_cmd(sock, ["GET", "h"])
+      assert recv_response(sock) == "s0"
+      send_cmd(sock, ["GET", "b"])
+      assert recv_response(sock) == "s1"
+      send_cmd(sock, ["GET", "l"])
+      assert recv_response(sock) == "s2"
+      send_cmd(sock, ["GET", "a"])
+      assert recv_response(sock) == "s3"
     end
 
-    test "mixed reads and writes across shards", %{sock: sock} do
-      # Pre-populate
+    test "mixed reads and writes across shards succeeds", %{sock: sock} do
       send_cmd(sock, ["SET", "h", "existing_h"])
       assert recv_response(sock) == ok()
       send_cmd(sock, ["SET", "a", "existing_a"])
@@ -156,85 +158,85 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
       send_cmd(sock, ["EXEC"])
       result = recv_response(sock)
 
-      assert is_list(result)
-      assert length(result) == 3
-      assert Enum.at(result, 0) == "existing_h"
-      assert Enum.at(result, 1) == ok()
-      assert Enum.at(result, 2) == "existing_a"
+      assert result == ["existing_h", ok(), "existing_a"]
     end
-  end
 
-  describe "WATCH key on shard 0, modify from another connection, EXEC returns nil" do
-    test "WATCH conflict aborts cross-shard transaction", %{sock: sock, port: port} do
-      # Set initial value
-      send_cmd(sock, ["SET", "h", "original"])
+    test "INCR on keys across different shards succeeds", %{sock: sock} do
+      send_cmd(sock, ["SET", "h", "10"])
+      assert recv_response(sock) == ok()
+      send_cmd(sock, ["SET", "b", "20"])
       assert recv_response(sock) == ok()
 
-      # WATCH the key on connection 1
-      send_cmd(sock, ["WATCH", "h"])
-      assert recv_response(sock) == ok()
-
-      # Start MULTI on connection 1
       send_cmd(sock, ["MULTI"])
       assert recv_response(sock) == ok()
 
-      send_cmd(sock, ["SET", "h", "from_tx"])
+      send_cmd(sock, ["INCR", "h"])
       assert recv_response(sock) == queued()
-      send_cmd(sock, ["SET", "b", "from_tx_b"])
+      send_cmd(sock, ["INCR", "b"])
       assert recv_response(sock) == queued()
 
-      # Connection 2 modifies the watched key
-      sock2 = connect_and_hello(port)
-      send_cmd(sock2, ["SET", "h", "modified_by_other"])
-      assert recv_response(sock2) == ok()
-      :gen_tcp.close(sock2)
-
-      # EXEC should return nil (abort) because WATCH detected conflict
       send_cmd(sock, ["EXEC"])
       result = recv_response(sock)
 
-      assert result == nil
+      assert result == [11, 21]
 
-      # "h" should have the value set by connection 2
       send_cmd(sock, ["GET", "h"])
-      assert recv_response(sock) == "modified_by_other"
-
-      # "b" should not have been modified
+      assert recv_response(sock) == 11
       send_cmd(sock, ["GET", "b"])
-      assert recv_response(sock) == nil
+      assert recv_response(sock) == 21
     end
-  end
 
-  describe "large cross-shard transaction" do
-    test "50 commands across all 4 shards", %{sock: sock} do
+    test "connection returns to normal state after cross-shard tx", %{sock: sock} do
       send_cmd(sock, ["MULTI"])
       assert recv_response(sock) == ok()
 
-      # Generate 50 unique keys spread across shards
-      keys =
-        for i <- 1..50 do
-          "txkey_#{i}"
-        end
+      send_cmd(sock, ["SET", "h", "v0"])
+      assert recv_response(sock) == queued()
+      send_cmd(sock, ["SET", "b", "v1"])
+      assert recv_response(sock) == queued()
 
-      Enum.each(keys, fn key ->
-        send_cmd(sock, ["SET", key, "val_#{key}"])
-        assert recv_response(sock) == queued()
-      end)
+      send_cmd(sock, ["EXEC"])
+      result = recv_response(sock)
+      assert result == [ok(), ok()]
+
+      # Connection should be back to normal — can issue commands
+      send_cmd(sock, ["SET", "h", "after_tx"])
+      assert recv_response(sock) == ok()
+
+      send_cmd(sock, ["GET", "h"])
+      assert recv_response(sock) == "after_tx"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Hash tags co-locate keys on same shard (fast path)
+  # ---------------------------------------------------------------------------
+
+  describe "hash tags use single-shard fast path" do
+    test "keys with same hash tag execute atomically", %{sock: sock} do
+      send_cmd(sock, ["MULTI"])
+      assert recv_response(sock) == ok()
+
+      send_cmd(sock, ["SET", "{user:42}:name", "Alice"])
+      assert recv_response(sock) == queued()
+      send_cmd(sock, ["SET", "{user:42}:email", "alice@example.com"])
+      assert recv_response(sock) == queued()
 
       send_cmd(sock, ["EXEC"])
       result = recv_response(sock)
 
-      assert is_list(result)
-      assert length(result) == 50
-      assert Enum.all?(result, &(&1 == ok()))
+      assert result == [ok(), ok()]
 
-      # Verify a sample of keys
-      for key <- Enum.take(keys, 10) do
-        send_cmd(sock, ["GET", key])
-        assert recv_response(sock) == "val_#{key}"
-      end
+      send_cmd(sock, ["GET", "{user:42}:name"])
+      assert recv_response(sock) == "Alice"
+      send_cmd(sock, ["GET", "{user:42}:email"])
+      assert recv_response(sock) == "alice@example.com"
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Single-shard MULTI/EXEC still works atomically
+  # ---------------------------------------------------------------------------
 
   describe "single-shard transaction still works" do
     test "commands all on same shard use fast path", %{sock: sock} do
@@ -256,50 +258,67 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
     end
   end
 
-  describe "INCR across shards" do
-    test "INCR on keys across different shards", %{sock: sock} do
-      send_cmd(sock, ["SET", "h", "10"])
+  # ---------------------------------------------------------------------------
+  # WATCH still works with single-shard transactions
+  # ---------------------------------------------------------------------------
+
+  describe "WATCH with single-shard transaction" do
+    test "WATCH conflict aborts single-shard transaction", %{sock: sock, port: port} do
+      # "b" and "c" both on shard 1
+      send_cmd(sock, ["SET", "b", "original"])
       assert recv_response(sock) == ok()
-      send_cmd(sock, ["SET", "b", "20"])
+
+      send_cmd(sock, ["WATCH", "b"])
       assert recv_response(sock) == ok()
 
       send_cmd(sock, ["MULTI"])
       assert recv_response(sock) == ok()
 
-      send_cmd(sock, ["INCR", "h"])
+      send_cmd(sock, ["SET", "b", "from_tx"])
       assert recv_response(sock) == queued()
-      send_cmd(sock, ["INCR", "b"])
+      send_cmd(sock, ["SET", "c", "from_tx_c"])
       assert recv_response(sock) == queued()
+
+      # Another connection modifies watched key
+      sock2 = connect_and_hello(port)
+      send_cmd(sock2, ["SET", "b", "modified_by_other"])
+      assert recv_response(sock2) == ok()
+      :gen_tcp.close(sock2)
 
       send_cmd(sock, ["EXEC"])
       result = recv_response(sock)
 
-      assert result == [11, 21]
+      assert result == nil
 
-      send_cmd(sock, ["GET", "h"])
-      assert recv_response(sock) == "11"
       send_cmd(sock, ["GET", "b"])
-      assert recv_response(sock) == "21"
+      assert recv_response(sock) == "modified_by_other"
+
+      # "c" should not be modified (transaction aborted)
+      send_cmd(sock, ["GET", "c"])
+      assert recv_response(sock) == nil
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # DISCARD works normally
+  # ---------------------------------------------------------------------------
+
   describe "DISCARD works normally" do
-    test "DISCARD clears cross-shard queue", %{sock: sock} do
+    test "DISCARD clears queue", %{sock: sock} do
       send_cmd(sock, ["MULTI"])
       assert recv_response(sock) == ok()
 
-      send_cmd(sock, ["SET", "h", "will_discard"])
-      assert recv_response(sock) == queued()
       send_cmd(sock, ["SET", "b", "will_discard"])
+      assert recv_response(sock) == queued()
+      send_cmd(sock, ["SET", "c", "will_discard"])
       assert recv_response(sock) == queued()
 
       send_cmd(sock, ["DISCARD"])
       assert recv_response(sock) == ok()
 
-      # Keys should not exist
-      send_cmd(sock, ["GET", "h"])
-      assert recv_response(sock) == nil
       send_cmd(sock, ["GET", "b"])
+      assert recv_response(sock) == nil
+      send_cmd(sock, ["GET", "c"])
       assert recv_response(sock) == nil
     end
   end

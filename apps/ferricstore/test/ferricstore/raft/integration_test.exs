@@ -12,7 +12,8 @@ defmodule Ferricstore.Raft.IntegrationTest do
   - Consistent across all layers
 
   The ra lifecycle is managed entirely within this test module so the tests
-  run regardless of the global `:raft_enabled` config setting.
+  The application starts the ra system, ra servers, and batchers for
+  shards 0-3 before these tests run.
   """
 
   use ExUnit.Case, async: false
@@ -25,35 +26,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
   setup_all do
     ShardHelpers.wait_shards_alive()
 
-    # When raft_enabled is true (default), the application already started
-    # the ra system and ra servers for shards 0-3. Reuse them.
-    if Application.get_env(:ferricstore, :raft_enabled, true) do
-      :ok
-    else
-      data_dir = Application.fetch_env!(:ferricstore, :data_dir)
-      Cluster.start_system(data_dir)
-
-      for i <- 0..3 do
-        server_id = Cluster.shard_server_id(i)
-        _ = :ra.stop_server(Cluster.system_name(), server_id)
-        _ = :ra.force_delete_server(Cluster.system_name(), server_id)
-
-        shard_name = Router.shard_name(i)
-        pid = Process.whereis(shard_name)
-        state = :sys.get_state(pid)
-        Cluster.start_shard_server(i, state.store, state.ets)
-      end
-
-      on_exit(fn ->
-        for i <- 0..3 do
-          Cluster.stop_shard_server(i)
-        end
-
-        ShardHelpers.wait_shards_alive()
-      end)
-
-      :ok
-    end
+    :ok
   end
 
   setup do
@@ -88,16 +61,22 @@ defmodule Ferricstore.Raft.IntegrationTest do
 
       # ETS should have the value
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
-      assert [{^k, "dual_val", 0, _lfu}] = :ets.lookup(keydir_for(k), k)
+      assert [{^k, "dual_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
 
       # Flush pending writes to Bitcask before checking NIF directly
       shard_name = Router.shard_name(Router.shard_for(k))
       GenServer.call(shard_name, :flush)
 
-      # Bitcask should also have it (check via NIF directly)
+      # Flush background BitcaskWriter so deferred writes are on disk
+      Ferricstore.Store.BitcaskWriter.flush_all()
+
+      # v2: verify value is on disk via ETS 7-tuple location + pread
+      [{^k, _, _, _, fid, off, _}] = :ets.lookup(keydir_for(k), k)
       shard_pid = shard_pid_for(k)
       state = :sys.get_state(shard_pid)
-      assert {:ok, "dual_val"} = NIF.get(state.store, k)
+      sp = Ferricstore.DataDir.shard_data_path(state.data_dir, state.index)
+      log_path = Path.join(sp, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+      assert {:ok, "dual_val"} = NIF.v2_pread_at(log_path, off)
     end
 
     test "DEL removes from ETS and Bitcask" do

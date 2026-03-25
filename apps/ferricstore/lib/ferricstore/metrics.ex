@@ -220,7 +220,7 @@ defmodule Ferricstore.Metrics do
       Enum.reduce(0..(shard_count - 1), %{}, fn i, acc ->
         table = :"keydir_#{i}"
         try do
-          :ets.foldl(fn {key, _value, exp, _lfu}, inner_acc ->
+          :ets.foldl(fn {key, _value, exp, _lfu, _fid, _off, _vsize}, inner_acc ->
             # Skip expired keys (exp > 0 means has TTL, skip if past)
             if exp > 0 and exp <= now do
               inner_acc

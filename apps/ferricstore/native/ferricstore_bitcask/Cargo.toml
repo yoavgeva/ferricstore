@@ -8,17 +8,28 @@ name = "ferricstore_bitcask"
 crate-type = ["cdylib"]
 
 [dependencies]
+crc32fast = "1"
 libc = "0.2"
-rustler = "0.37"
+rustler = { version = "0.37", default-features = false, features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "fs"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # io_uring is Linux-only. On macOS/Windows these deps are completely absent —
 # Cargo does not download, compile, or link them. Falls back to SyncBackend.
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
+[features]
+default = ["nif_version_2_16"]
+nif_version_2_15 = ["rustler/nif_version_2_15"]
+nif_version_2_16 = ["rustler/nif_version_2_16"]
+nif_version_2_17 = ["rustler/nif_version_2_17"]
+
 [dev-dependencies]
 tempfile = "3"
 
 [profile.release]
 opt-level = 3
+lto = "thin"          # Cross-crate inlining for crc32fast, xxhash
+codegen-units = 1     # Maximum optimization (single codegen unit)
+strip = true          # Strip debug symbols for smaller binaries

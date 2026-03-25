@@ -235,8 +235,9 @@ defmodule Ferricstore.Commands.DataStructuresTest do
       store = MockStore.make()
       base_size = Dispatcher.dispatch("DBSIZE", [], store)
       Dispatcher.dispatch("HSET", ["hash", "f1", "v1", "f2", "v2"], store)
-      # DBSIZE should not increase because hash fields are internal keys
-      assert base_size == Dispatcher.dispatch("DBSIZE", [], store)
+      # HSET creates compound keys (H:hash\0f1, H:hash\0f2, T:hash) but
+      # DBSIZE should only count the logical hash key, not the internal fields.
+      assert base_size + 1 == Dispatcher.dispatch("DBSIZE", [], store)
     end
   end
 end

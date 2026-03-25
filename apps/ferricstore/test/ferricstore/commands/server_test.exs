@@ -147,7 +147,7 @@ defmodule Ferricstore.Commands.ServerTest do
   # ---------------------------------------------------------------------------
 
   describe "KEYS edge cases" do
-    test "KEYS with [abc] character class is escaped (not supported as glob class)" do
+    test "KEYS with [abc] character class matches any of a, b, or c" do
       store =
         MockStore.make(%{
           "a" => {"v", 0},
@@ -156,10 +156,10 @@ defmodule Ferricstore.Commands.ServerTest do
           "d" => {"v", 0}
         })
 
-      # The glob_to_regex implementation escapes each grapheme individually,
-      # so [abc] is treated as the literal string "[abc]" — no match.
-      result = Server.handle("KEYS", ["[abc]"], store)
-      assert result == []
+      # The GlobMatcher supports [abc] character classes, matching Redis
+      # behaviour where [abc] matches any single char in the set.
+      result = Server.handle("KEYS", ["[abc]"], store) |> Enum.sort()
+      assert result == ["a", "b", "c"]
     end
 
     test "KEYS with dot in pattern matches literal dot" do

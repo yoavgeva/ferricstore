@@ -64,13 +64,17 @@ defmodule FerricstoreServer.StartupTest do
       key = "startup_keydir_test_#{:rand.uniform(9_999_999)}"
       Router.put(key, "persisted_value", 0)
 
-      # Flush to ensure data is on disk.
+      # Flush to ensure data is on disk (shard pending + background writer).
       shard_idx = Router.shard_for(key)
       shard_name = Router.shard_name(shard_idx)
       :ok = GenServer.call(shard_name, :flush)
+      Ferricstore.Store.BitcaskWriter.flush_all()
 
-      # Clear the ETS cache entry to force a Bitcask read.
-      :ets.delete(:"keydir_#{shard_idx}", key)
+      # Simulate cold key by setting value to nil but preserving disk location.
+      # In v2, ETS IS the keydir -- deleting entirely means the key is gone.
+      keydir = :"keydir_#{shard_idx}"
+      [{_, _val, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, key)
+      :ets.insert(keydir, {key, nil, exp, lfu, fid, off, vsize})
 
       # The get must warm from Bitcask -- keydir must be valid.
       assert "persisted_value" == Router.get(key)

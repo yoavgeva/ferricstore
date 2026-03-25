@@ -1,25 +1,18 @@
 defmodule Ferricstore.Bitcask.Async do
   @moduledoc """
-  Elixir wrappers around the Tokio-backed async IO NIFs.
+  Elixir wrappers around the Tokio-backed async IO NIFs (v2 path-based).
 
   Each function submits IO work to a Tokio runtime thread pool, then
   suspends the calling Elixir process on `receive` until the result
   arrives. While suspended, the BEAM scheduler is FREE to run other
   processes — this is the key benefit over synchronous NIFs.
 
-  ## Message protocol
+  ## Message protocol (v2)
 
-  The NIF returns `{:pending, :ok}` immediately. The Tokio worker thread
-  sends `{:tokio_complete, :ok | :error, result}` back to the calling process
-  when the IO completes.
-
-  ## Usage
-
-      # Instead of blocking a BEAM scheduler:
-      {:ok, value} = NIF.get(store, key)
-
-      # Use async (BEAM scheduler stays free):
-      {:ok, value} = Ferricstore.Bitcask.Async.get(store, key)
+  The v2 async NIFs use correlation IDs in the message protocol:
+  `{:tokio_complete, correlation_id, :ok | :error, result}`.
+  This prevents LIFO ordering bugs when multiple async operations are
+  submitted concurrently.
 
   ## Timeout
 
@@ -33,13 +26,16 @@ defmodule Ferricstore.Bitcask.Async do
 
   @default_timeout 5_000
 
+  # -------------------------------------------------------------------
+  # v1 async IO functions (Store resource based)
+  #
+  # These use the older message protocol:
+  # {:tokio_complete, :ok, result} or {:tokio_complete, :error, reason}
+  # -------------------------------------------------------------------
+
   @doc """
-  Async GET — reads a value by key from the Bitcask store.
-
-  Returns `{:ok, value}`, `{:ok, nil}`, or `{:error, reason}`.
-
-  The calling process suspends on `receive` while the BEAM scheduler is
-  free to run other processes.
+  Async get from a v1 Store resource.
+  Returns `{:ok, value | nil}` or `{:error, reason}`.
   """
   @spec get(reference(), binary(), timeout()) :: {:ok, binary() | nil} | {:error, term()}
   def get(store, key, timeout \\ @default_timeout) do
@@ -52,16 +48,14 @@ defmodule Ferricstore.Bitcask.Async do
           timeout -> {:error, :timeout}
         end
 
-      {:error, _} = err ->
-        err
+      other ->
+        {:error, {:nif_error, other}}
     end
   end
 
   @doc """
-  Async DELETE — writes a tombstone for the given key.
-
-  Returns `{:ok, true}` (key existed), `{:ok, false}` (not found), or
-  `{:error, reason}`.
+  Async delete from a v1 Store resource.
+  Returns `{:ok, boolean}` or `{:error, reason}`.
   """
   @spec delete(reference(), binary(), timeout()) :: {:ok, boolean()} | {:error, term()}
   def delete(store, key, timeout \\ @default_timeout) do
@@ -74,37 +68,33 @@ defmodule Ferricstore.Bitcask.Async do
           timeout -> {:error, :timeout}
         end
 
-      {:error, _} = err ->
-        err
+      other ->
+        {:error, {:nif_error, other}}
     end
   end
 
   @doc """
-  Async PUT_BATCH — writes multiple key-value pairs with a single fsync.
-
-  `batch` is a list of `{key, value, expire_at_ms}` tuples.
+  Async put_batch on a v1 Store resource.
   Returns `:ok` or `{:error, reason}`.
   """
-  @spec put_batch(reference(), [{binary(), binary(), non_neg_integer()}], timeout()) ::
-          :ok | {:error, term()}
+  @spec put_batch(reference(), list(), timeout()) :: :ok | {:error, term()}
   def put_batch(store, batch, timeout \\ @default_timeout) do
     case NIF.put_batch_tokio_async(store, batch) do
       {:pending, :ok} ->
         receive do
-          {:tokio_complete, :ok, :ok} -> :ok
+          {:tokio_complete, :ok, _} -> :ok
           {:tokio_complete, :error, reason} -> {:error, reason}
         after
           timeout -> {:error, :timeout}
         end
 
-      {:error, _} = err ->
-        err
+      other ->
+        {:error, {:nif_error, other}}
     end
   end
 
   @doc """
-  Async WRITE_HINT — writes the hint file for fast keydir rebuild.
-
+  Async write_hint on a v1 Store resource.
   Returns `:ok` or `{:error, reason}`.
   """
   @spec write_hint(reference(), timeout()) :: :ok | {:error, term()}
@@ -112,20 +102,19 @@ defmodule Ferricstore.Bitcask.Async do
     case NIF.write_hint_async(store) do
       {:pending, :ok} ->
         receive do
-          {:tokio_complete, :ok, :ok} -> :ok
+          {:tokio_complete, :ok, _} -> :ok
           {:tokio_complete, :error, reason} -> {:error, reason}
         after
           timeout -> {:error, :timeout}
         end
 
-      {:error, _} = err ->
-        err
+      other ->
+        {:error, {:nif_error, other}}
     end
   end
 
   @doc """
-  Async PURGE_EXPIRED — purges all logically expired keys.
-
+  Async purge_expired on a v1 Store resource.
   Returns `{:ok, count}` or `{:error, reason}`.
   """
   @spec purge_expired(reference(), timeout()) :: {:ok, non_neg_integer()} | {:error, term()}
@@ -139,30 +128,90 @@ defmodule Ferricstore.Bitcask.Async do
           timeout -> {:error, :timeout}
         end
 
-      {:error, _} = err ->
-        err
+      other ->
+        {:error, {:nif_error, other}}
     end
   end
 
-  @doc """
-  Async RUN_COMPACTION — runs compaction on the given file IDs.
+  # -------------------------------------------------------------------
+  # v2 async IO functions (path-based, no Store resource)
+  #
+  # These use correlation IDs in the message protocol:
+  # {:tokio_complete, correlation_id, :ok | :error, result}
+  # -------------------------------------------------------------------
 
-  Returns `{:ok, {written, dropped, reclaimed}}` or `{:error, reason}`.
+  @doc """
+  Async pread at a specific offset in a data file.
+
+  Returns `{:ok, value}`, `{:ok, nil}` (tombstone), or `{:error, reason}`.
+  Uses a unique correlation_id to match the response.
   """
-  @spec run_compaction(reference(), [non_neg_integer()], timeout()) ::
-          {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | {:error, term()}
-  def run_compaction(store, file_ids, timeout \\ @default_timeout) do
-    case NIF.run_compaction_async(store, file_ids) do
-      {:pending, :ok} ->
+  @spec v2_pread_at(String.t(), non_neg_integer(), timeout()) ::
+          {:ok, binary() | nil} | {:error, term()}
+  def v2_pread_at(path, offset, timeout \\ @default_timeout) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case NIF.v2_pread_at_async(self(), corr_id, path, offset) do
+      :ok ->
         receive do
-          {:tokio_complete, :ok, result} -> {:ok, result}
-          {:tokio_complete, :error, reason} -> {:error, reason}
+          {:tokio_complete, ^corr_id, :ok, value} -> {:ok, value}
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
         after
           timeout -> {:error, :timeout}
         end
 
-      {:error, _} = err ->
-        err
+      other ->
+        {:error, {:nif_error, other}}
+    end
+  end
+
+  @doc """
+  Async batch pread from multiple file locations concurrently.
+
+  `locations` is a list of `{path, offset}` tuples. Returns
+  `{:ok, [value | nil, ...]}` or `{:error, reason}`.
+  All reads run concurrently on Tokio worker threads.
+  """
+  @spec v2_pread_batch([{String.t(), non_neg_integer()}], timeout()) ::
+          {:ok, [binary() | nil]} | {:error, term()}
+  def v2_pread_batch(locations, timeout \\ @default_timeout) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case NIF.v2_pread_batch_async(self(), corr_id, locations) do
+      :ok ->
+        receive do
+          {:tokio_complete, ^corr_id, :ok, values} -> {:ok, values}
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
+        after
+          timeout -> {:error, :timeout}
+        end
+
+      other ->
+        {:error, {:nif_error, other}}
+    end
+  end
+
+  @doc """
+  Async fsync a data file.
+
+  Returns `:ok` or `{:error, reason}`. Offloads the potentially blocking
+  fsync syscall to a Tokio worker thread.
+  """
+  @spec v2_fsync(String.t(), timeout()) :: :ok | {:error, term()}
+  def v2_fsync(path, timeout \\ @default_timeout) do
+    corr_id = System.unique_integer([:positive, :monotonic])
+
+    case NIF.v2_fsync_async(self(), corr_id, path) do
+      :ok ->
+        receive do
+          {:tokio_complete, ^corr_id, :ok, :ok} -> :ok
+          {:tokio_complete, ^corr_id, :error, reason} -> {:error, reason}
+        after
+          timeout -> {:error, :timeout}
+        end
+
+      other ->
+        {:error, {:nif_error, other}}
     end
   end
 end

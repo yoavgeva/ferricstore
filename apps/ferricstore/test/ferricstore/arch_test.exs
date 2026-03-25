@@ -26,8 +26,8 @@ defmodule Ferricstore.ArchTest do
     modules_matching("Ferricstore.Store.**")
     |> should_not_depend_on(modules_matching("Ferricstore.Resp.**"))
 
-    # Shard depends on Commands.Dispatcher for 2PC transaction execution.
-    # This is an intentional coupling: prepare_tx must dispatch queued
+    # Shard depends on Commands.Dispatcher for tx_execute (MULTI/EXEC).
+    # This is an intentional coupling: tx_execute must dispatch queued
     # commands within the shard's handle_call for atomicity.
     modules_matching("Ferricstore.Store.**")
     |> excluding("Ferricstore.Store.Shard")
@@ -48,6 +48,15 @@ defmodule Ferricstore.ArchTest do
   test "command handlers do not depend on protocol internals" do
     modules_matching("Ferricstore.Commands.**")
     |> should_not_depend_on(modules_matching("Ferricstore.Resp.**"))
+  end
+
+  test "raft state machine may depend on Commands.Dispatcher for cross-shard tx" do
+    # StateMachine depends on Commands.Dispatcher for cross-shard atomic
+    # MULTI/EXEC transactions. This is intentional: the StateMachine's apply/3
+    # must dispatch queued commands through Dispatcher to build store results.
+    modules_matching("Ferricstore.Raft.**")
+    |> excluding("Ferricstore.Raft.StateMachine")
+    |> should_not_depend_on(modules_matching("Ferricstore.Commands.**"))
   end
 
   test "no circular dependencies in Ferricstore" do

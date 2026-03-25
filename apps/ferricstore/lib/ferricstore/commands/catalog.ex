@@ -143,6 +143,10 @@ defmodule Ferricstore.Commands.Catalog do
 
   @commands_by_name Map.new(@commands, fn cmd -> {cmd.name, cmd} end)
 
+  # Uppercase lookup map: avoids String.downcase on hot path when caller
+  # already has an uppercased command name (e.g. from normalise_cmd).
+  @commands_by_upper Map.new(@commands, fn cmd -> {String.upcase(cmd.name), cmd} end)
+
   @doc "Returns the full list of command entries."
   @spec all() :: [command_entry()]
   def all, do: @commands
@@ -163,6 +167,22 @@ defmodule Ferricstore.Commands.Catalog do
   @spec lookup(binary()) :: {:ok, command_entry()} | :error
   def lookup(name) when is_binary(name) do
     case Map.fetch(@commands_by_name, String.downcase(name)) do
+      {:ok, _} = ok -> ok
+      :error -> :error
+    end
+  end
+
+  @doc """
+  Looks up a command entry by an already-uppercase name.
+
+  Avoids the `String.downcase/1` call in `lookup/1` when the caller
+  already has an uppercase command name (e.g. from `normalise_cmd`).
+
+  Returns `{:ok, entry}` or `:error`.
+  """
+  @spec lookup_upper(binary()) :: {:ok, command_entry()} | :error
+  def lookup_upper(name) when is_binary(name) do
+    case Map.fetch(@commands_by_upper, name) do
       {:ok, _} = ok -> ok
       :error -> :error
     end
@@ -193,21 +213,44 @@ defmodule Ferricstore.Commands.Catalog do
         {:ok, []}
 
       {:ok, %{first_key: first, last_key: last, step: step}} ->
-        # Arguments are 0-indexed in our list, but first_key is 1-indexed
-        # (position 1 = first arg after the command name).
-        first_idx = first - 1
-        last_idx = if last == -1, do: length(args) - 1, else: last - 1
-        step_val = max(step, 1)
-
-        keys =
-          first_idx..last_idx//step_val
-          |> Enum.map(fn i -> Enum.at(args, i) end)
-          |> Enum.reject(&is_nil/1)
-
-        {:ok, keys}
+        extract_keys(first, last, step, args)
 
       :error ->
         {:error, "ERR Invalid command specified"}
     end
+  end
+
+  @doc """
+  Same as `get_keys/2` but accepts an already-uppercase command name,
+  avoiding the `String.downcase/1` call inside `lookup/1`.
+  """
+  @spec get_keys_upper(binary(), [binary()]) :: {:ok, [binary()]} | {:error, binary()}
+  def get_keys_upper(name, args) when is_binary(name) and is_list(args) do
+    case lookup_upper(name) do
+      {:ok, %{first_key: 0}} ->
+        {:ok, []}
+
+      {:ok, %{first_key: first, last_key: last, step: step}} ->
+        extract_keys(first, last, step, args)
+
+      :error ->
+        {:error, "ERR Invalid command specified"}
+    end
+  end
+
+  # Shared key extraction logic.
+  defp extract_keys(first, last, step, args) do
+    # Arguments are 0-indexed in our list, but first_key is 1-indexed
+    # (position 1 = first arg after the command name).
+    first_idx = first - 1
+    last_idx = if last == -1, do: length(args) - 1, else: last - 1
+    step_val = max(step, 1)
+
+    keys =
+      first_idx..last_idx//step_val
+      |> Enum.map(fn i -> Enum.at(args, i) end)
+      |> Enum.reject(&is_nil/1)
+
+    {:ok, keys}
   end
 end

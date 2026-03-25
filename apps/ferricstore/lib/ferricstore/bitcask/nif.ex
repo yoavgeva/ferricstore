@@ -1,6 +1,8 @@
 defmodule Ferricstore.Bitcask.NIF do
   @moduledoc false
+
   use Rustler, otp_app: :ferricstore, crate: "ferricstore_bitcask", skip_compilation?: true
+
   def new(_path), do: :erlang.nif_error(:nif_not_loaded)
   def get(_store, _key), do: :erlang.nif_error(:nif_not_loaded)
   def get_zero_copy(_store, _key), do: :erlang.nif_error(:nif_not_loaded)
@@ -38,7 +40,6 @@ defmodule Ferricstore.Bitcask.NIF do
   def topk_info(_topk), do: :erlang.nif_error(:nif_not_loaded)
   def topk_to_bytes(_topk), do: :erlang.nif_error(:nif_not_loaded)
   def topk_from_bytes(_data), do: :erlang.nif_error(:nif_not_loaded)
-  def cuckoo_create(_a, _b, _c, _d), do: :erlang.nif_error(:nif_not_loaded)
   def cuckoo_add(_f, _i), do: :erlang.nif_error(:nif_not_loaded)
   def cuckoo_addnx(_f, _i), do: :erlang.nif_error(:nif_not_loaded)
   def cuckoo_del(_f, _i), do: :erlang.nif_error(:nif_not_loaded)
@@ -46,8 +47,9 @@ defmodule Ferricstore.Bitcask.NIF do
   def cuckoo_mexists(_f, _i), do: :erlang.nif_error(:nif_not_loaded)
   def cuckoo_count(_f, _i), do: :erlang.nif_error(:nif_not_loaded)
   def cuckoo_info(_f), do: :erlang.nif_error(:nif_not_loaded)
-  def cuckoo_serialize(_f), do: :erlang.nif_error(:nif_not_loaded)
-  def cuckoo_deserialize(_d), do: :erlang.nif_error(:nif_not_loaded)
+  def cuckoo_create(_capacity, _bucket_size, _max_kicks, _expansion), do: :erlang.nif_error(:nif_not_loaded)
+  def cuckoo_serialize(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  def cuckoo_deserialize(_data), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- Tokio async IO NIFs --
   def get_async(_store, _key), do: :erlang.nif_error(:nif_not_loaded)
@@ -58,11 +60,11 @@ defmodule Ferricstore.Bitcask.NIF do
   def run_compaction_async(_store, _file_ids), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- Count-Min Sketch NIFs --
-  def cms_create(_width, _depth), do: :erlang.nif_error(:nif_not_loaded)
   def cms_incrby(_resource, _items), do: :erlang.nif_error(:nif_not_loaded)
   def cms_query(_resource, _elements), do: :erlang.nif_error(:nif_not_loaded)
   def cms_merge(_dest, _sources), do: :erlang.nif_error(:nif_not_loaded)
   def cms_info(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  def cms_create(_width, _depth), do: :erlang.nif_error(:nif_not_loaded)
   def cms_to_bytes(_resource), do: :erlang.nif_error(:nif_not_loaded)
   def cms_from_bytes(_data), do: :erlang.nif_error(:nif_not_loaded)
 
@@ -77,7 +79,7 @@ defmodule Ferricstore.Bitcask.NIF do
   def bloom_info(_resource), do: :erlang.nif_error(:nif_not_loaded)
   def bloom_delete(_resource), do: :erlang.nif_error(:nif_not_loaded)
 
-  # -- TDigest NIFs --
+  # -- TDigest NIFs (in-memory) --
   def tdigest_create(_compression), do: :erlang.nif_error(:nif_not_loaded)
   def tdigest_add(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
   def tdigest_quantile(_resource, _quantiles), do: :erlang.nif_error(:nif_not_loaded)
@@ -95,6 +97,41 @@ defmodule Ferricstore.Bitcask.NIF do
   def tdigest_serialize(_resource), do: :erlang.nif_error(:nif_not_loaded)
   def tdigest_deserialize(_data), do: :erlang.nif_error(:nif_not_loaded)
 
+  # -- TDigest mmap file-backed NIFs --
+  def tdigest_create_file(_path, _compression), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_open_file(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_close(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_add(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_quantile(_resource, _quantiles), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_cdf(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_trimmed_mean(_resource, _lo, _hi), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_min(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_max(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_info(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_rank(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
+  def tdigest_file_reset(_resource), do: :erlang.nif_error(:nif_not_loaded)
+
+  # -- TopK mmap file-backed NIFs --
+  def topk_create_file(_path, _k, _width, _depth, _decay), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_open_file(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_close(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_add(_resource, _items), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_incrby(_resource, _pairs), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_query(_resource, _items), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_list(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_count(_resource, _items), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_info(_resource), do: :erlang.nif_error(:nif_not_loaded)
+
+  # -- HNSW mmap file-backed NIFs --
+  def hnsw_create_file(_vec_path, _hnsw_path, _dims, _m, _ef_construction, _metric, _max_capacity), do: :erlang.nif_error(:nif_not_loaded)
+  def hnsw_open_file(_vec_path, _hnsw_path), do: :erlang.nif_error(:nif_not_loaded)
+  def hnsw_file_close(_resource), do: :erlang.nif_error(:nif_not_loaded)
+  def hnsw_file_add(_resource, _key, _vector), do: :erlang.nif_error(:nif_not_loaded)
+  def hnsw_file_delete(_resource, _key), do: :erlang.nif_error(:nif_not_loaded)
+  def hnsw_file_search(_resource, _query, _k, _ef), do: :erlang.nif_error(:nif_not_loaded)
+  def hnsw_file_vsearch(_resource, _query, _k, _ef), do: :erlang.nif_error(:nif_not_loaded)
+  def hnsw_file_count(_resource), do: :erlang.nif_error(:nif_not_loaded)
+
   # -- Tracking allocator --
   def rust_allocated_bytes, do: :erlang.nif_error(:nif_not_loaded)
 
@@ -109,4 +146,23 @@ defmodule Ferricstore.Bitcask.NIF do
   def v2_write_hint_file(_path, _entries), do: :erlang.nif_error(:nif_not_loaded)
   def v2_read_hint_file(_path), do: :erlang.nif_error(:nif_not_loaded)
   def v2_copy_records(_source_path, _dest_path, _offsets), do: :erlang.nif_error(:nif_not_loaded)
+
+  # -- v2 nosync write NIF (page cache only, no fsync) --
+  def v2_append_batch_nosync(_path, _records), do: :erlang.nif_error(:nif_not_loaded)
+
+  # -- v2 Tokio async IO NIFs (path-based, no Store resource) --
+  def v2_pread_at_async(_caller_pid, _correlation_id, _path, _offset), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_pread_batch_async(_caller_pid, _correlation_id, _locations), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_fsync_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
+  def v2_append_batch_async(_caller_pid, _correlation_id, _path, _records), do: :erlang.nif_error(:nif_not_loaded)
+
+  # -- CMS mmap file-backed NIFs --
+  def cms_create_file(_path, _width, _depth), do: :erlang.nif_error(:nif_not_loaded)
+  def cms_open_file(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def cms_close(_resource), do: :erlang.nif_error(:nif_not_loaded)
+
+  # -- Cuckoo mmap file-backed NIFs --
+  def cuckoo_create_file(_path, _capacity, _bucket_size), do: :erlang.nif_error(:nif_not_loaded)
+  def cuckoo_open_file(_path), do: :erlang.nif_error(:nif_not_loaded)
+  def cuckoo_close(_resource), do: :erlang.nif_error(:nif_not_loaded)
 end

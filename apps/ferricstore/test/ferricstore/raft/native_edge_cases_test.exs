@@ -30,63 +30,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
   setup_all do
     ShardHelpers.wait_shards_alive()
 
-    # When raft_enabled is true (default), the application already started
-    # the ra system, ra servers, and batchers for shards 0-3. Reuse them.
-    if Application.get_env(:ferricstore, :raft_enabled, true) do
-      :ok
-    else
-      data_dir = Application.fetch_env!(:ferricstore, :data_dir)
-      Cluster.start_system(data_dir)
-
-      for i <- 0..3 do
-        server_id = Cluster.shard_server_id(i)
-        _ = :ra.stop_server(Cluster.system_name(), server_id)
-        _ = :ra.force_delete_server(Cluster.system_name(), server_id)
-
-        shard_name = Router.shard_name(i)
-        pid = Process.whereis(shard_name)
-        state = :sys.get_state(pid)
-        Cluster.start_shard_server(i, state.store, state.ets)
-      end
-
-      batcher_pids =
-        for i <- 0..3 do
-          shard_id = Cluster.shard_server_id(i)
-          batcher_name = Batcher.batcher_name(i)
-
-          case Process.whereis(batcher_name) do
-            pid when is_pid(pid) ->
-              {i, pid, :reused}
-
-            nil ->
-              {:ok, pid} =
-                Batcher.start_link(shard_index: i, shard_id: shard_id)
-
-              {i, pid, :started}
-          end
-        end
-
-      original_raft = Application.get_env(:ferricstore, :raft_enabled, true)
-      Application.put_env(:ferricstore, :raft_enabled, true)
-
-      on_exit(fn ->
-        Application.put_env(:ferricstore, :raft_enabled, original_raft)
-
-        for {_i, pid, ownership} <- batcher_pids do
-          if ownership == :started and Process.alive?(pid) do
-            GenServer.stop(pid, :normal, 5_000)
-          end
-        end
-
-        for i <- 0..3 do
-          Cluster.stop_shard_server(i)
-        end
-
-        ShardHelpers.wait_shards_alive()
-      end)
-
-      :ok
-    end
+    :ok
   end
 
   setup do
@@ -372,7 +316,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
              "All INCR calls should succeed, got: #{inspect(results)}"
 
       # The final value should be exactly 10
-      assert "10" == Router.get(k)
+      assert 10 == Router.get(k)
 
       # The individual results should be some permutation of 1..10
       values = Enum.map(results, fn {:ok, n} -> n end)

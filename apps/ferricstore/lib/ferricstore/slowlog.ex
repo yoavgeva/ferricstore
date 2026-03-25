@@ -108,19 +108,51 @@ defmodule Ferricstore.SlowLog do
   Returns the configured threshold in microseconds.
 
   A value of `-1` means slow logging is disabled.
+
+  Reads from `persistent_term` (~5ns) rather than `Application.get_env`
+  (~100-200ns ETS lookup). The persistent_term is initialized at GenServer
+  startup and updated whenever the threshold changes via `set_threshold/1`
+  or CONFIG SET.
   """
   @spec threshold() :: integer()
   def threshold do
-    Application.get_env(:ferricstore, :slowlog_log_slower_than_us, @default_threshold_us)
+    :persistent_term.get(:ferricstore_slowlog_threshold, @default_threshold_us)
+  end
+
+  @doc """
+  Updates the slowlog threshold in both Application env and persistent_term.
+
+  Called by CONFIG SET and may be called from tests.
+  """
+  @spec set_threshold(integer()) :: :ok
+  def set_threshold(value) when is_integer(value) do
+    Application.put_env(:ferricstore, :slowlog_log_slower_than_us, value)
+    :persistent_term.put(:ferricstore_slowlog_threshold, value)
+    :ok
   end
 
   @doc """
   Returns the configured maximum number of entries.
+
+  Reads from `persistent_term` (~5ns) rather than `Application.get_env`.
   """
   @spec max_len() :: pos_integer()
   def max_len do
-    Application.get_env(:ferricstore, :slowlog_max_len, @default_max_len)
+    :persistent_term.get(:ferricstore_slowlog_max_len, @default_max_len)
   end
+
+  @doc """
+  Updates the slowlog max length in both Application env and persistent_term.
+
+  Called by CONFIG SET and may be called from tests.
+  """
+  @spec set_max_len(non_neg_integer()) :: :ok
+  def set_max_len(value) when is_integer(value) and value >= 0 do
+    Application.put_env(:ferricstore, :slowlog_max_len, value)
+    :persistent_term.put(:ferricstore_slowlog_max_len, value)
+    :ok
+  end
+
 
   # -------------------------------------------------------------------------
   # GenServer callbacks
@@ -129,6 +161,20 @@ defmodule Ferricstore.SlowLog do
   @impl true
   def init(_opts) do
     table = :ets.new(@table, [:set, :public, :named_table])
+
+    # Cache slowlog threshold and max_len in persistent_term for hot-path reads.
+    # This runs once at startup; values can be updated via CONFIG SET which calls
+    # update_threshold/1 and update_max_len/1.
+    :persistent_term.put(
+      :ferricstore_slowlog_threshold,
+      Application.get_env(:ferricstore, :slowlog_log_slower_than_us, @default_threshold_us)
+    )
+
+    :persistent_term.put(
+      :ferricstore_slowlog_max_len,
+      Application.get_env(:ferricstore, :slowlog_max_len, @default_max_len)
+    )
+
     {:ok, %{table: table, next_id: 0}}
   end
 

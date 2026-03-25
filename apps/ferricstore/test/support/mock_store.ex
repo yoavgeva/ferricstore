@@ -13,8 +13,26 @@ defmodule Ferricstore.Test.MockStore do
   @spec make(map()) :: map()
   def make(initial \\ %{}) do
     {:ok, pid} = Agent.start_link(fn -> initial end)
+    tmp_dir = System.tmp_dir!() <> "/ferricstore_mock_#{:erlang.unique_integer([:positive])}"
+    prob_dir = Path.join(tmp_dir, "prob")
+    vectors_dir = Path.join(tmp_dir, "vectors")
+    File.mkdir_p!(prob_dir)
+    File.mkdir_p!(vectors_dir)
+
+    # Per-type resource registries for probabilistic data structures.
+    # Each registry is an Agent holding a map of key => {resource, meta}.
+    {:ok, cms_pid} = Agent.start_link(fn -> %{} end)
+    {:ok, cuckoo_pid} = Agent.start_link(fn -> %{} end)
+    {:ok, bloom_pid} = Agent.start_link(fn -> %{} end)
+
+    cms_registry = make_registry(cms_pid, prob_dir, ".cms")
+    cuckoo_registry = make_registry(cuckoo_pid, prob_dir, ".cuckoo")
+    bloom_registry = make_registry(bloom_pid, prob_dir, ".bloom")
 
     %{
+      cms_registry: cms_registry,
+      cuckoo_registry: cuckoo_registry,
+      bloom_registry: bloom_registry,
       get: fn key -> Agent.get(pid, &read_value(&1, key)) end,
       get_meta: fn key -> Agent.get(pid, &read_meta(&1, key)) end,
       put: fn key, value, expire_at_ms ->
@@ -252,7 +270,9 @@ defmodule Ferricstore.Test.MockStore do
           new_state = Map.put(state, key, {new_val, exp})
           {{:ok, byte_size(new_val)}, new_state}
         end)
-      end
+      end,
+      prob_dir: fn -> prob_dir end,
+      vectors_dir: fn -> vectors_dir end
     }
   end
 
@@ -304,4 +324,24 @@ defmodule Ferricstore.Test.MockStore do
     do: :erlang.float_to_binary(f, [:compact, decimals: 17])
 
   def fmt_float(f) when is_integer(f), do: "#{f}.0"
+
+  defp make_registry(reg_pid, base_dir, extension) do
+    %{
+      get: fn key ->
+        Agent.get(reg_pid, fn state -> Map.get(state, key) end)
+      end,
+      put: fn key, resource, meta ->
+        Agent.update(reg_pid, fn state -> Map.put(state, key, {resource, meta}) end)
+        :ok
+      end,
+      delete: fn key ->
+        Agent.update(reg_pid, fn state -> Map.delete(state, key) end)
+        :ok
+      end,
+      path: fn key ->
+        safe = String.replace(key, ~r/[^a-zA-Z0-9_.\-]/, "_")
+        Path.join(base_dir, "#{safe}#{extension}")
+      end
+    }
+  end
 end

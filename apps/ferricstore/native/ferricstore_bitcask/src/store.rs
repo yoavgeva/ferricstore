@@ -1,11 +1,10 @@
-#![allow(dead_code)]
-
 //! `Store` — the public Bitcask API.
 //!
 //! Ties together the keydir (in-memory index), log writer (disk appends),
 //! and hint files (fast startup). All writes go through the log first, then
 //! update the keydir. Reads consult the keydir then do a single pread.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +28,8 @@ impl std::fmt::Display for StoreError {
         write!(f, "StoreError: {}", self.0)
     }
 }
+
+impl std::error::Error for StoreError {}
 
 impl From<crate::log::LogError> for StoreError {
     fn from(e: crate::log::LogError) -> Self {
@@ -55,6 +56,10 @@ pub struct Store {
     writer: LogWriter,
     data_dir: PathBuf,
     active_file_id: u64,
+    /// L-2 fix: pre-computed path for the active log file. Avoids a
+    /// `format!("{file_id:020}.log")` allocation on every GET/PUT when the
+    /// entry happens to live in the active file (common case).
+    cached_active_log_path: PathBuf,
 }
 
 impl Store {
@@ -64,10 +69,25 @@ impl Store {
         self.active_file_id
     }
 
+    /// L-2 fix: return the log path for a given file ID, reusing the cached
+    /// active log path when `file_id == active_file_id` to avoid a
+    /// `format!` allocation on the hot path.
+    #[inline]
+    fn log_path_for(&self, file_id: u64) -> PathBuf {
+        if file_id == self.active_file_id {
+            self.cached_active_log_path.clone()
+        } else {
+            log_path(&self.data_dir, file_id)
+        }
+    }
+
     /// Returns the path to the currently active log file.
+    ///
+    /// L-2 fix: returns the pre-computed cached path instead of
+    /// allocating a new `String` via `format!` on every call.
     #[must_use]
     pub fn active_log_path(&self) -> PathBuf {
-        log_path(&self.data_dir, self.active_file_id)
+        self.cached_active_log_path.clone()
     }
 
     /// Open a store at `data_dir`.
@@ -131,7 +151,7 @@ impl Store {
                         .unwrap_or(0);
 
                     for (key, entry) in staging.iter() {
-                        keydir.put(key.clone(), entry.clone());
+                        keydir.put(key.to_vec(), entry.clone());
                     }
 
                     // Replay log tail past the hint's last known offset to pick
@@ -154,13 +174,15 @@ impl Store {
         }
 
         let active_file_id = file_ids.last().copied().unwrap_or(1);
-        let writer = LogWriter::open(&log_path(data_dir, active_file_id), active_file_id)?;
+        let active_path = log_path(data_dir, active_file_id);
+        let writer = LogWriter::open(&active_path, active_file_id)?;
 
         Ok(Self {
             keydir,
             writer,
             data_dir: data_dir.to_path_buf(),
             active_file_id,
+            cached_active_log_path: active_path,
         })
     }
 
@@ -223,7 +245,7 @@ impl Store {
             return Ok(None);
         }
 
-        let file = log_path(&self.data_dir, entry.file_id);
+        let file = self.log_path_for(entry.file_id);
         let value_offset = entry.offset + HEADER_SIZE as u64 + key.len() as u64;
         Ok(Some((file, value_offset, entry.value_size)))
     }
@@ -253,7 +275,7 @@ impl Store {
             return Ok(None);
         }
 
-        let log_file = log_path(&self.data_dir, entry.file_id);
+        let log_file = self.log_path_for(entry.file_id);
         let mut reader = LogReader::open(&log_file)?;
         let record = reader.read_at(entry.offset)?;
         Ok(record.and_then(|r| r.value))
@@ -304,6 +326,42 @@ impl Store {
                     offset,
                     value_size: value_len as u32,
                     expire_at_ms,
+                    ref_bit: false,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Write a batch of pre-encoded records to the log and update the keydir.
+    ///
+    /// M-6 fix: accepts pre-encoded record buffers (already serialized via
+    /// `log::encode_record`) along with the key/value_size/expire metadata.
+    /// This avoids re-encoding records that were already encoded on the NIF
+    /// thread, and allows `put_batch_tokio_async` to send only encoded bytes
+    /// across the thread boundary instead of cloning raw key+value data.
+    ///
+    /// `metadata[i]` is `(key, value_size, expire_at_ms)` for `encoded[i]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StoreError` if any write or the final sync fails.
+    pub fn put_batch_preencoded(
+        &mut self,
+        encoded: &[Vec<u8>],
+        metadata: &[(Vec<u8>, u32, u64)],
+    ) -> Result<()> {
+        let buf_refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+        let offsets = self.writer.write_batch_preencoded(&buf_refs)?;
+
+        for (off, (key, value_size, expire_at_ms)) in offsets.into_iter().zip(metadata.iter()) {
+            self.keydir.put(
+                key.clone(),
+                KeyEntry {
+                    file_id: self.active_file_id,
+                    offset: off,
+                    value_size: *value_size,
+                    expire_at_ms: *expire_at_ms,
                     ref_bit: false,
                 },
             );
@@ -405,7 +463,7 @@ impl Store {
         self.keydir
             .iter()
             .filter(|(_, e)| e.expire_at_ms == 0 || e.expire_at_ms > now_ms)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.to_vec())
             .collect()
     }
 
@@ -454,7 +512,7 @@ impl Store {
                     offset: entry.offset,
                     value_size: entry.value_size,
                     expire_at_ms: entry.expire_at_ms,
-                    key: key.clone(),
+                    key: key.to_vec(),
                 })?;
             }
         }
@@ -467,21 +525,33 @@ impl Store {
     /// # Errors
     ///
     /// Returns a `StoreError` if any data file cannot be read.
+    /// H-3 fix: group reads by file_id so each data file is opened once,
+    /// not once per key. For 10K keys across 5 files this reduces open/close
+    /// from 10K pairs to 5.
     pub fn get_all(&mut self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let now = now_ms();
         let entries: Vec<(Vec<u8>, crate::keydir::KeyEntry)> = self
             .keydir
             .iter()
             .filter(|(_, e)| e.expire_at_ms == 0 || e.expire_at_ms > now)
-            .map(|(k, e)| (k.clone(), e.clone()))
+            .map(|(k, e)| (k.to_vec(), e.clone()))
             .collect();
-        let mut result = Vec::with_capacity(entries.len());
+
+        // Group entries by file_id to open each file once.
+        let mut by_file: HashMap<u64, Vec<(Vec<u8>, crate::keydir::KeyEntry)>> = HashMap::new();
         for (key, entry) in entries {
-            let log_file = log_path(&self.data_dir, entry.file_id);
+            by_file.entry(entry.file_id).or_default().push((key, entry));
+        }
+
+        let mut result = Vec::new();
+        for (file_id, file_entries) in by_file {
+            let log_file = self.log_path_for(file_id);
             let mut reader = LogReader::open(&log_file)?;
-            if let Some(record) = reader.read_at(entry.offset)? {
-                if let Some(value) = record.value {
-                    result.push((key, value));
+            for (key, entry) in file_entries {
+                if let Some(record) = reader.read_at(entry.offset)? {
+                    if let Some(value) = record.value {
+                        result.push((key, value));
+                    }
                 }
             }
         }
@@ -493,9 +563,13 @@ impl Store {
     /// # Errors
     ///
     /// Returns a `StoreError` if any data file cannot be read.
+    /// H-3 fix: cache LogReaders by file_id to avoid opening the same file
+    /// repeatedly when multiple keys live in the same data file.
     pub fn get_batch(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         let now = now_ms();
         let mut results = Vec::with_capacity(keys.len());
+        let mut reader_cache: HashMap<u64, LogReader> = HashMap::new();
+
         for &key in keys {
             let entry = if let Some(e) = self.keydir.get(key) {
                 e.clone()
@@ -507,8 +581,15 @@ impl Store {
                 results.push(None);
                 continue;
             }
-            let log_file = log_path(&self.data_dir, entry.file_id);
-            let mut reader = LogReader::open(&log_file)?;
+            let reader = match reader_cache.get_mut(&entry.file_id) {
+                Some(r) => r,
+                None => {
+                    let log_file = self.log_path_for(entry.file_id);
+                    let r = LogReader::open(&log_file)?;
+                    reader_cache.insert(entry.file_id, r);
+                    reader_cache.get_mut(&entry.file_id).unwrap()
+                }
+            };
             let val = reader.read_at(entry.offset)?.and_then(|r| r.value);
             results.push(val);
         }
@@ -534,17 +615,26 @@ impl Store {
             .keydir
             .iter()
             .filter(|(k, e)| {
-                let ks = k.as_slice();
-                ks >= min_key && ks <= max_key && (e.expire_at_ms == 0 || e.expire_at_ms > now)
+                *k >= min_key && *k <= max_key && (e.expire_at_ms == 0 || e.expire_at_ms > now)
             })
-            .map(|(k, e)| (k.clone(), e.clone()))
+            .map(|(k, e)| (k.to_vec(), e.clone()))
             .collect();
         matching.sort_by(|a, b| a.0.cmp(&b.0));
         matching.truncate(max_count);
+
+        // H-3 fix: cache LogReaders by file_id.
+        let mut reader_cache: HashMap<u64, LogReader> = HashMap::new();
         let mut result = Vec::with_capacity(matching.len());
         for (key, entry) in matching {
-            let log_file = log_path(&self.data_dir, entry.file_id);
-            let mut reader = LogReader::open(&log_file)?;
+            let reader = match reader_cache.get_mut(&entry.file_id) {
+                Some(r) => r,
+                None => {
+                    let log_file = self.log_path_for(entry.file_id);
+                    let r = LogReader::open(&log_file)?;
+                    reader_cache.insert(entry.file_id, r);
+                    reader_cache.get_mut(&entry.file_id).unwrap()
+                }
+            };
             if let Some(record) = reader.read_at(entry.offset)? {
                 if let Some(value) = record.value {
                     result.push((key, value));
@@ -565,7 +655,7 @@ impl Store {
             Some(e) if e.expire_at_ms != 0 && e.expire_at_ms <= now => (Vec::new(), 0),
             Some(e) => {
                 let entry = e.clone();
-                let log_file = log_path(&self.data_dir, entry.file_id);
+                let log_file = self.log_path_for(entry.file_id);
                 let mut reader = LogReader::open(&log_file)?;
                 let val = reader
                     .read_at(entry.offset)?
@@ -746,22 +836,23 @@ impl Store {
             .keydir
             .iter()
             .filter(|(_, e)| compacted_set.contains(&e.file_id))
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.to_vec())
             .collect();
         for key in &keys_in_old {
             self.keydir.delete(key);
         }
         for (key, entry) in new_kd.iter() {
-            self.keydir.put(key.clone(), entry.clone());
+            self.keydir.put(key.to_vec(), entry.clone());
         }
         crate::compaction::remove_old_files(&self.data_dir, file_ids)
             .map_err(|e| StoreError(e.to_string()))?;
         if compacted_set.contains(&self.active_file_id) {
             self.active_file_id = new_file_id;
-            self.writer = LogWriter::open(&log_path(&self.data_dir, new_file_id), new_file_id)?;
+            self.cached_active_log_path = log_path(&self.data_dir, new_file_id);
+            self.writer = LogWriter::open(&self.cached_active_log_path, new_file_id)?;
         }
         let mut bytes_after: u64 = 0;
-        let new_path = log_path(&self.data_dir, new_file_id);
+        let new_path = self.log_path_for(new_file_id);
         if new_path.exists() {
             bytes_after = fs::metadata(&new_path).map(|m| m.len()).unwrap_or(0);
         }
@@ -875,11 +966,23 @@ fn available_disk_space_for_path(path: &Path) -> Result<u64> {
 // ---------------------------------------------------------------------------
 
 fn log_path(data_dir: &Path, file_id: u64) -> PathBuf {
-    data_dir.join(format!("{file_id:020}.log"))
+    // v1 uses 20-char zero-padded names, v2 uses 5-char zero-padded names.
+    // Try the v2 short name first; fall back to v1 long name if it doesn't exist.
+    let short = data_dir.join(format!("{file_id:05}.log"));
+    if short.exists() {
+        short
+    } else {
+        data_dir.join(format!("{file_id:020}.log"))
+    }
 }
 
 fn hint_path(data_dir: &Path, file_id: u64) -> PathBuf {
-    data_dir.join(format!("{file_id:020}.hint"))
+    let short = data_dir.join(format!("{file_id:05}.hint"));
+    if short.exists() {
+        short
+    } else {
+        data_dir.join(format!("{file_id:020}.hint"))
+    }
 }
 
 /// Scan `data_dir` for `*.log` files and return their numeric IDs.
@@ -890,10 +993,12 @@ fn collect_file_ids(data_dir: &Path) -> Result<Vec<u64>> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if let Some(stem) = name.strip_suffix(".log") {
-            if let Ok(id) = stem.trim_start_matches('0').parse::<u64>() {
-                ids.push(id);
-            } else if stem == "00000000000000000000" {
+            let trimmed = stem.trim_start_matches('0');
+            if trimmed.is_empty() {
+                // All zeros (e.g. "00000", "00000000000000000000") => file_id 0
                 ids.push(0);
+            } else if let Ok(id) = trimmed.parse::<u64>() {
+                ids.push(id);
             }
         }
     }
@@ -2823,5 +2928,129 @@ mod tests {
         let key = vec![0x00; 256];
         store.put(&key, b"allzero", 0).unwrap();
         assert_eq!(store.get(&key).unwrap(), Some(b"allzero".to_vec()));
+    }
+
+    // ------------------------------------------------------------------
+    // H-3: get_all/get_batch/get_range group reads by file_id
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn h3_get_all_groups_by_file_id() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+
+        // Write 100 keys — all in the same file since we don't rotate.
+        for i in 0u32..100 {
+            let key = format!("key_{i:03}");
+            let val = format!("val_{i:03}");
+            store.put(key.as_bytes(), val.as_bytes(), 0).unwrap();
+        }
+
+        let all = store.get_all().unwrap();
+        assert_eq!(all.len(), 100);
+
+        // Verify all values are correct (order may vary since HashMap)
+        let mut found = std::collections::HashSet::new();
+        for (key, value) in &all {
+            found.insert(key.clone());
+            let key_str = std::str::from_utf8(key).unwrap();
+            let i: u32 = key_str[4..].parse().unwrap();
+            assert_eq!(value, format!("val_{i:03}").as_bytes());
+        }
+        assert_eq!(found.len(), 100);
+    }
+
+    #[test]
+    fn h3_get_batch_groups_by_file_id() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+
+        for i in 0u32..50 {
+            let key = format!("batch_{i:02}");
+            let val = format!("bval_{i:02}");
+            store.put(key.as_bytes(), val.as_bytes(), 0).unwrap();
+        }
+
+        // Look up 50 existing + 10 non-existing
+        let keys: Vec<Vec<u8>> = (0u32..60)
+            .map(|i| format!("batch_{i:02}").into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let results = store.get_batch(&key_refs).unwrap();
+        assert_eq!(results.len(), 60);
+
+        // First 50 should have values, last 10 should be None
+        for i in 0..50 {
+            assert!(results[i].is_some(), "key batch_{i:02} should exist");
+        }
+        for i in 50..60 {
+            assert!(results[i].is_none(), "key batch_{i:02} should not exist");
+        }
+    }
+
+    #[test]
+    fn h3_get_range_groups_by_file_id() {
+        let dir = tmp();
+        let mut store = Store::open(dir.path()).unwrap();
+
+        for i in 0u32..100 {
+            let key = format!("range_{i:03}");
+            let val = format!("rval_{i:03}");
+            store.put(key.as_bytes(), val.as_bytes(), 0).unwrap();
+        }
+
+        let result = store
+            .get_range(b"range_010", b"range_020", 100)
+            .unwrap();
+
+        // Should get keys 010..=020 = 11 keys
+        assert_eq!(result.len(), 11);
+
+        // Verify sorted order
+        for i in 0..result.len() - 1 {
+            assert!(result[i].0 <= result[i + 1].0, "results must be sorted");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // L-2: cached active log path avoids format! allocation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn l2_cached_active_log_path_matches_computed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+
+        // The cached path must match what log_path() computes.
+        let expected = log_path(&store.data_dir, store.active_file_id);
+        assert_eq!(
+            store.cached_active_log_path, expected,
+            "cached active log path must match computed path"
+        );
+        assert_eq!(store.active_log_path(), expected);
+
+        // After a put, the active file ID is still the same, and the
+        // cached path still matches.
+        store.put(b"key1", b"val1", 0).unwrap();
+        assert_eq!(store.cached_active_log_path, expected);
+    }
+
+    #[test]
+    fn l2_log_path_for_active_uses_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let fid = store.active_file_id;
+        let cached = store.cached_active_log_path.clone();
+
+        // log_path_for with active_file_id should return the cached path.
+        assert_eq!(store.log_path_for(fid), cached);
+
+        // log_path_for with a different file ID should still produce a valid path.
+        let other_path = store.log_path_for(fid + 1);
+        assert_ne!(other_path, cached);
+        assert!(
+            other_path.to_string_lossy().ends_with(".log"),
+            "path must end with .log"
+        );
     }
 }

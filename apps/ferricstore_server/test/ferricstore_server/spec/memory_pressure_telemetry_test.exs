@@ -37,6 +37,15 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
     handler_id
   end
 
+  # Reset persistent_term flags after each test so that tiny-budget
+  # MemoryGuard checks don't leak KEYDIR_FULL into other tests.
+  setup do
+    on_exit(fn ->
+      :persistent_term.put(:ferricstore_keydir_full, false)
+      :persistent_term.put(:ferricstore_reject_writes, false)
+    end)
+  end
+
   defp start_guard(opts) do
     defaults = [interval_ms: 60_000, shard_count: 4, eviction_policy: :volatile_lru]
     merged = Keyword.merge(defaults, opts)

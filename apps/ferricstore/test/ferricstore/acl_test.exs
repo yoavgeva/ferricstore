@@ -19,6 +19,11 @@ defmodule Ferricstore.AclTest do
     :ok
   end
 
+  # Helper: extracts the glob strings from compiled key patterns.
+  defp key_globs(patterns) when is_list(patterns) do
+    Enum.map(patterns, fn {glob, _mode, _regex} -> glob end)
+  end
+
   # ---------------------------------------------------------------------------
   # init/0 — default user
   # ---------------------------------------------------------------------------
@@ -172,13 +177,13 @@ defmodule Ferricstore.AclTest do
     test "~pattern adds a key pattern" do
       assert :ok = Acl.set_user("alice", ["on", "~cache:*"])
       user = Acl.get_user("alice")
-      assert user.keys == ["cache:*"]
+      assert key_globs(user.keys) == ["cache:*"]
     end
 
     test "multiple key patterns accumulate" do
       assert :ok = Acl.set_user("alice", ["on", "~cache:*", "~session:*"])
       user = Acl.get_user("alice")
-      assert user.keys == ["cache:*", "session:*"]
+      assert key_globs(user.keys) == ["cache:*", "session:*"]
     end
 
     test "allkeys sets keys to :all" do
@@ -192,7 +197,7 @@ defmodule Ferricstore.AclTest do
       assert :ok = Acl.set_user("alice", ["on", "~*"])
       user = Acl.get_user("alice")
       # When keys is :all and we add a pattern, it becomes a list
-      assert user.keys == ["*"]
+      assert key_globs(user.keys) == ["*"]
     end
   end
 
@@ -271,7 +276,7 @@ defmodule Ferricstore.AclTest do
       refute user.password == "s3cret"
       assert is_binary(user.password)
       assert {:ok, "alice"} = Acl.authenticate("alice", "s3cret")
-      assert user.keys == ["cache:*"]
+      assert key_globs(user.keys) == ["cache:*"]
       assert MapSet.member?(user.commands, "GET")
       assert MapSet.member?(user.commands, "SET")
       assert MapSet.size(user.commands) == 2
@@ -670,8 +675,150 @@ defmodule Ferricstore.AclTest do
       # Password is hashed
       assert is_binary(user.password)
       assert {:ok, "alice"} = Acl.authenticate("alice", "pass")
-      assert user.keys == ["prefix:*", "other:*"]
+      assert key_globs(user.keys) == ["prefix:*", "other:*"]
       assert MapSet.size(user.commands) == 3
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # check_key_access/3 — key pattern enforcement
+  # ---------------------------------------------------------------------------
+
+  describe "check_key_access/3" do
+    test "default user (~*) allows all keys" do
+      assert :ok = Acl.check_key_access("default", "any:key", :read)
+      assert :ok = Acl.check_key_access("default", "any:key", :write)
+    end
+
+    test "user with ~cache:* allows matching keys" do
+      Acl.set_user("alice", ["on", "~cache:*", "+@all"])
+      assert :ok = Acl.check_key_access("alice", "cache:foo", :read)
+      assert :ok = Acl.check_key_access("alice", "cache:bar:baz", :write)
+    end
+
+    test "user with ~cache:* denies non-matching keys" do
+      Acl.set_user("alice", ["on", "~cache:*", "+@all"])
+
+      assert {:error, "NOPERM" <> _} =
+               Acl.check_key_access("alice", "session:foo", :read)
+    end
+
+    test "multiple patterns — any match allows" do
+      Acl.set_user("alice", ["on", "~cache:*", "~session:*", "+@all"])
+      assert :ok = Acl.check_key_access("alice", "cache:x", :read)
+      assert :ok = Acl.check_key_access("alice", "session:y", :write)
+
+      assert {:error, _} = Acl.check_key_access("alice", "user:z", :read)
+    end
+
+    test "%R~ pattern allows reads but denies writes" do
+      Acl.set_user("alice", ["on", "%R~readonly:*", "+@all"])
+      assert :ok = Acl.check_key_access("alice", "readonly:key1", :read)
+
+      assert {:error, "NOPERM" <> _} =
+               Acl.check_key_access("alice", "readonly:key1", :write)
+    end
+
+    test "%W~ pattern allows writes but denies reads" do
+      Acl.set_user("alice", ["on", "%W~writeonly:*", "+@all"])
+      assert :ok = Acl.check_key_access("alice", "writeonly:key1", :write)
+
+      assert {:error, "NOPERM" <> _} =
+               Acl.check_key_access("alice", "writeonly:key1", :read)
+    end
+
+    test "combined %R~ and %W~ patterns" do
+      Acl.set_user("alice", ["on", "%R~read:*", "%W~write:*", "+@all"])
+      assert :ok = Acl.check_key_access("alice", "read:x", :read)
+      assert :ok = Acl.check_key_access("alice", "write:x", :write)
+
+      assert {:error, _} = Acl.check_key_access("alice", "read:x", :write)
+      assert {:error, _} = Acl.check_key_access("alice", "write:x", :read)
+    end
+
+    test "~* explicit pattern allows all keys" do
+      Acl.set_user("alice", ["on", "~*", "+@all"])
+      assert :ok = Acl.check_key_access("alice", "anything:at:all", :read)
+      assert :ok = Acl.check_key_access("alice", "anything:at:all", :write)
+    end
+
+    test "disabled user is denied" do
+      Acl.set_user("alice", ["off", "~*", "+@all"])
+
+      assert {:error, "NOPERM" <> _} =
+               Acl.check_key_access("alice", "key", :read)
+    end
+
+    test "nonexistent user is denied" do
+      assert {:error, "NOPERM" <> _} =
+               Acl.check_key_access("nobody", "key", :read)
+    end
+
+    test "? glob matches single character" do
+      Acl.set_user("alice", ["on", "~user:?", "+@all"])
+      assert :ok = Acl.check_key_access("alice", "user:a", :read)
+      assert {:error, _} = Acl.check_key_access("alice", "user:ab", :read)
+    end
+
+    test "[abc] glob matches character set" do
+      Acl.set_user("alice", ["on", "~key:[abc]", "+@all"])
+      assert :ok = Acl.check_key_access("alice", "key:a", :read)
+      assert :ok = Acl.check_key_access("alice", "key:b", :read)
+      assert {:error, _} = Acl.check_key_access("alice", "key:d", :read)
+    end
+
+    test "resetkeys clears all patterns" do
+      Acl.set_user("alice", ["on", "~cache:*", "resetkeys", "+@all"])
+      user = Acl.get_user("alice")
+      assert user.keys == []
+
+      assert {:error, _} = Acl.check_key_access("alice", "cache:foo", :read)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # compile_glob/1 — glob pattern compilation
+  # ---------------------------------------------------------------------------
+
+  describe "compile_glob/1" do
+    test "* matches everything" do
+      regex = Acl.compile_glob("*")
+      assert Regex.match?(regex, "anything")
+      assert Regex.match?(regex, "")
+    end
+
+    test "prefix:* matches prefix keys" do
+      regex = Acl.compile_glob("cache:*")
+      assert Regex.match?(regex, "cache:foo")
+      assert Regex.match?(regex, "cache:")
+      refute Regex.match?(regex, "session:foo")
+    end
+
+    test "? matches single character" do
+      regex = Acl.compile_glob("k?y")
+      assert Regex.match?(regex, "key")
+      assert Regex.match?(regex, "kxy")
+      refute Regex.match?(regex, "keey")
+    end
+
+    test "[abc] matches character class" do
+      regex = Acl.compile_glob("[abc]")
+      assert Regex.match?(regex, "a")
+      assert Regex.match?(regex, "b")
+      refute Regex.match?(regex, "d")
+    end
+
+    test "literal special regex chars are escaped" do
+      regex = Acl.compile_glob("foo.bar")
+      assert Regex.match?(regex, "foo.bar")
+      refute Regex.match?(regex, "fooXbar")
+    end
+
+    test "exact key match (no wildcards)" do
+      regex = Acl.compile_glob("mykey")
+      assert Regex.match?(regex, "mykey")
+      refute Regex.match?(regex, "mykey2")
+      refute Regex.match?(regex, "xmykey")
     end
   end
 end

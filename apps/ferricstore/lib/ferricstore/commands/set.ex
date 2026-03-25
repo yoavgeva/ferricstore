@@ -207,8 +207,7 @@ defmodule Ferricstore.Commands.Set do
             members
 
           pattern ->
-            regex = glob_to_regex(pattern)
-            Enum.filter(members, fn m -> Regex.match?(regex, m) end)
+            Enum.filter(members, fn m -> Ferricstore.GlobMatcher.match?(m, pattern) end)
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
@@ -285,13 +284,15 @@ defmodule Ferricstore.Commands.Set do
           members = get_members_list(key, store)
           selected = Enum.take_random(members, count)
 
-          Enum.each(selected, fn member ->
-            compound_key = CompoundKey.set_member(key, member)
-            store.compound_delete.(key, compound_key)
-          end)
+          removed =
+            Enum.reduce(selected, 0, fn member, acc ->
+              compound_key = CompoundKey.set_member(key, member)
+              store.compound_delete.(key, compound_key)
+              acc + 1
+            end)
 
-          if selected != [] do
-            maybe_cleanup_empty_set(key, length(selected), store)
+          if removed > 0 do
+            maybe_cleanup_empty_set(key, removed, store)
           end
 
           selected
@@ -387,7 +388,10 @@ defmodule Ferricstore.Commands.Set do
         if members == [] do
           []
         else
-          for _ <- 1..abs_count, do: Enum.random(members)
+          # Convert to tuple for O(1) random access instead of O(n) Enum.random on list
+          tuple = List.to_tuple(members)
+          size = tuple_size(tuple)
+          for _ <- 1..abs_count, do: elem(tuple, :rand.uniform(size) - 1)
         end
     end
   end
@@ -428,32 +432,19 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp paginate(items, cursor, count) do
-    total = length(items)
+    rest = Enum.drop(items, cursor)
 
-    if cursor >= total do
-      {"0", []}
-    else
-      batch = Enum.slice(items, cursor, count)
-      next_pos = cursor + length(batch)
+    case rest do
+      [] ->
+        {"0", []}
 
-      if next_pos >= total do
-        {"0", batch}
-      else
-        {Integer.to_string(next_pos), batch}
-      end
+      _ ->
+        {batch, remainder} = Enum.split(rest, count)
+
+        case remainder do
+          [] -> {"0", batch}
+          _ -> {Integer.to_string(cursor + length(batch)), batch}
+        end
     end
   end
-
-  defp glob_to_regex(pattern) do
-    regex_str =
-      pattern
-      |> String.graphemes()
-      |> Enum.map_join(&escape_glob_char/1)
-
-    Regex.compile!("^#{regex_str}$")
-  end
-
-  defp escape_glob_char("*"), do: ".*"
-  defp escape_glob_char("?"), do: "."
-  defp escape_glob_char(char), do: Regex.escape(char)
 end

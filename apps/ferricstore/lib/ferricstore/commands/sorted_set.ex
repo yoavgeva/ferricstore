@@ -437,8 +437,7 @@ defmodule Ferricstore.Commands.SortedSet do
             pairs
 
           pattern ->
-            regex = glob_to_regex(pattern)
-            Enum.filter(pairs, fn {member, _score} -> Regex.match?(regex, member) end)
+            Enum.filter(pairs, fn {member, _score} -> Ferricstore.GlobMatcher.match?(member, pattern) end)
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
@@ -804,7 +803,8 @@ defmodule Ferricstore.Commands.SortedSet do
       {"0", []}
     else
       batch = Enum.slice(items, cursor, count)
-      next_pos = cursor + length(batch)
+      batch_len = min(count, total - cursor)
+      next_pos = cursor + batch_len
 
       if next_pos >= total do
         {"0", batch}
@@ -813,19 +813,6 @@ defmodule Ferricstore.Commands.SortedSet do
       end
     end
   end
-
-  defp glob_to_regex(pattern) do
-    regex_str =
-      pattern
-      |> String.graphemes()
-      |> Enum.map_join(&escape_glob_char/1)
-
-    Regex.compile!("^#{regex_str}$")
-  end
-
-  defp escape_glob_char("*"), do: ".*"
-  defp escape_glob_char("?"), do: "."
-  defp escape_glob_char(char), do: Regex.escape(char)
 
   defp select_random_zset_members(pairs, count, with_scores) do
     cond do

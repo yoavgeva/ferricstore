@@ -55,7 +55,8 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
 
   @shard_count Application.compile_env(:ferricstore, :shard_count, 4)
 
-  defp ukey(name), do: "spec5_#{name}_#{:rand.uniform(999_999)}"
+  # Hash tag ensures all generated keys co-locate on the same shard.
+  defp ukey(name), do: "{spec5}:#{name}_#{:rand.uniform(999_999)}"
 
   # Route two keys to the same shard by brute-forcing suffixes.
   # Returns two keys guaranteed to hash to the same shard index.
@@ -398,9 +399,9 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
 
       Task.await_many(tasks, 15_000)
 
-      # Final value should be exactly concurrency * incrs_per_task
+      # Final value should be exactly concurrency * incrs_per_task (native integer)
       result = Router.get(k)
-      assert result == Integer.to_string(concurrency * incrs_per_task)
+      assert result == concurrency * incrs_per_task
 
       # Cleanup
       Router.delete(k)

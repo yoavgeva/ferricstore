@@ -19,7 +19,15 @@ defmodule Ferricstore.Store.PromotionTest do
   setup do
     # Store the original threshold (if any) and set a low one for tests.
     original = Application.get_env(:ferricstore, :promotion_threshold)
+    original_pt =
+      try do
+        :persistent_term.get(:ferricstore_promotion_threshold)
+      rescue
+        ArgumentError -> :not_set
+      end
+
     Application.put_env(:ferricstore, :promotion_threshold, @test_threshold)
+    :persistent_term.put(:ferricstore_promotion_threshold, @test_threshold)
 
     ShardHelpers.flush_all_keys()
 
@@ -29,6 +37,11 @@ defmodule Ferricstore.Store.PromotionTest do
         Application.put_env(:ferricstore, :promotion_threshold, original)
       else
         Application.delete_env(:ferricstore, :promotion_threshold)
+      end
+
+      case original_pt do
+        :not_set -> :persistent_term.erase(:ferricstore_promotion_threshold)
+        val -> :persistent_term.put(:ferricstore_promotion_threshold, val)
       end
 
       ShardHelpers.wait_shards_alive()

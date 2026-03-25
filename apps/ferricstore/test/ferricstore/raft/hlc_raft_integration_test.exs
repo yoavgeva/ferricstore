@@ -27,7 +27,9 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     dir = Path.join(System.tmp_dir!(), "hlc_raft_test_#{:rand.uniform(9_999_999)}")
     File.mkdir_p!(dir)
 
-    {:ok, store} = NIF.new(dir)
+    active_file_path = Path.join(dir, "00000.log")
+    File.touch!(active_file_path)
+
     suffix = :rand.uniform(9_999_999)
     keydir_name = :"hlc_raft_keydir_#{suffix}"
     :ets.new(keydir_name, [:set, :public, :named_table])
@@ -35,7 +37,9 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     state =
       StateMachine.init(%{
         shard_index: 0,
-        store: store,
+        shard_data_path: dir,
+        active_file_id: 0,
+        active_file_path: active_file_path,
         ets: keydir_name
       })
 
@@ -57,7 +61,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     %{
       state: state,
       ets: keydir_name,
-      store: store,
+      store: nil,
       dir: dir
     }
   end
@@ -69,8 +73,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
   describe "apply/3 with HLC-wrapped commands" do
     test "unwraps and processes a put command with hlc_ts metadata", %{
       state: state,
-      ets: ets,
-      store: store
+      ets: ets
     } do
       hlc_ts = HLC.now()
       wrapped = {{:put, "hlc_key", "hlc_val", 0}, %{hlc_ts: hlc_ts}}
@@ -80,10 +83,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       assert result == :ok
       assert new_state.applied_count == 1
 
-      # Verify the inner command was processed correctly
-      # Single-table format: {key, value, expire_at_ms, lfu_counter}
-      assert [{"hlc_key", "hlc_val", 0, _lfu}] = :ets.lookup(ets, "hlc_key")
-      assert {:ok, "hlc_val"} = NIF.get(store, "hlc_key")
+      # Verify the inner command was processed correctly (v2 7-tuple)
+      assert [{"hlc_key", "hlc_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, "hlc_key")
     end
 
     test "unwraps and processes a delete command with hlc_ts metadata", %{
@@ -115,8 +116,8 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
       assert results == [:ok, :ok]
       assert new_state.applied_count == 2
-      assert [{"b1", "v1", 0, _}] = :ets.lookup(ets, "b1")
-      assert [{"b2", "v2", 0, _}] = :ets.lookup(ets, "b2")
+      assert [{"b1", "v1", 0, _, _, _, _}] = :ets.lookup(ets, "b1")
+      assert [{"b2", "v2", 0, _, _, _, _}] = :ets.lookup(ets, "b2")
     end
 
     test "unwraps and processes an incr_float command with hlc_ts metadata", %{
@@ -125,10 +126,10 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       hlc_ts = HLC.now()
       wrapped = {{:incr_float, "counter", 10.0}, %{hlc_ts: hlc_ts}}
 
-      {new_state, {:ok, result_str}} = StateMachine.apply(%{}, wrapped, state)
+      {new_state, {:ok, result}} = StateMachine.apply(%{}, wrapped, state)
 
       assert new_state.applied_count == 1
-      assert result_str == "10"
+      assert_in_delta result, 10.0, 0.001
     end
 
     test "unwraps and processes an append command with hlc_ts metadata", %{
@@ -153,7 +154,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
       assert result == :ok
       assert new_state.applied_count == 1
-      assert [{"legacy", "val", 0, _lfu}] = :ets.lookup(ets, "legacy")
+      assert [{"legacy", "val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, "legacy")
     end
   end
 
@@ -236,15 +237,17 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
   describe "release_cursor with HLC-wrapped commands" do
     test "release_cursor is emitted at interval boundary for wrapped commands", %{
-      store: store,
-      ets: ets
+      ets: ets,
+      dir: dir
     } do
       interval = 3
 
       state =
         StateMachine.init(%{
           shard_index: 0,
-          store: store,
+          shard_data_path: dir,
+          active_file_id: 0,
+          active_file_path: Path.join(dir, "00000.log"),
           ets: ets,
           release_cursor_interval: interval
         })

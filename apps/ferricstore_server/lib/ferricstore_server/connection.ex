@@ -74,6 +74,14 @@ defmodule FerricstoreServer.Connection do
   # Values larger than this threshold are never cached in L1.
   @l1_large_value_skip 262_144
 
+  # Connection safety limits -- prevent unbounded memory growth per connection.
+  # Maximum receive buffer size before the connection is closed (128 MB).
+  @max_buffer_size 134_217_728
+  # Maximum commands queued inside a MULTI transaction (100K).
+  @max_multi_queue_size 100_000
+  # Maximum commands in a single pipeline batch (100K).
+  @max_pipeline_size 100_000
+
   # Connection state
   defstruct [
     :socket,
@@ -85,19 +93,21 @@ defmodule FerricstoreServer.Connection do
     buffer: "",
     multi_state: :none,
     multi_queue: [],
+    multi_queue_count: 0,
     watched_keys: %{},
     authenticated: false,
     username: "default",
     sandbox_namespace: nil,
-    pubsub_channels: MapSet.new(),
-    pubsub_patterns: MapSet.new(),
+    pubsub_channels: nil,
+    pubsub_patterns: nil,
     tracking: nil,
     read_mode: :consistent,
     acl_cache: nil,
     # L1 per-connection cache fields
     l1_cache: %{},
     l1_size_bytes: 0,
-    l1_enabled: true
+    l1_enabled: true,
+    active_mode: true
   ]
 
   @type multi_state :: :none | :queuing
@@ -110,7 +120,7 @@ defmodule FerricstoreServer.Connection do
   @type acl_cache :: %{
           commands: :all | MapSet.t(binary()),
           denied_commands: MapSet.t(binary()),
-          keys: :all | [binary()],
+          keys: :all | [Ferricstore.Acl.key_pattern()],
           enabled: boolean()
         }
         | nil
@@ -145,6 +155,10 @@ defmodule FerricstoreServer.Connection do
     GETSET GETDEL
     CAS LOCK UNLOCK EXTEND)
 
+  # O(1) MapSet lookups for hot-path classification (replaces linear `in` scans).
+  @read_cmds_set MapSet.new(@read_cmds)
+  @write_cmds_set MapSet.new(@write_cmds)
+
   @typedoc """
   A single L1 cache entry: the cached value, its absolute expiry timestamp
   (0 = no expiry), and a saturating hit counter for eviction priority.
@@ -161,6 +175,7 @@ defmodule FerricstoreServer.Connection do
           peer: {:inet.ip_address(), :inet.port_number()} | nil,
           multi_state: multi_state(),
           multi_queue: [{binary(), [binary()]}],
+          multi_queue_count: non_neg_integer(),
           watched_keys: %{binary() => non_neg_integer()},
           tracking: ClientTracking.tracking_config() | nil,
           read_mode: read_mode(),
@@ -200,10 +215,12 @@ defmodule FerricstoreServer.Connection do
     # Enforce require-tls: reject plaintext connections when TLS is required.
     if transport == :ranch_tcp and require_tls?() do
       error_msg = Encoder.encode({:error, "ERR TLS required: plaintext connections are not permitted"})
-      transport.send(socket, IO.iodata_to_binary(error_msg))
+      # transport.send accepts iodata directly; no need to flatten to binary.
+      transport.send(socket, error_msg)
       transport.close(socket)
     else
-      :ok = transport.setopts(socket, active: :once)
+      active_mode = Application.get_env(:ferricstore, :socket_active_mode, true)
+      :ok = transport.setopts(socket, active: active_mode)
 
       Stats.incr_connections()
 
@@ -218,7 +235,8 @@ defmodule FerricstoreServer.Connection do
       case Ferricstore.Acl.check_protected_mode(peer) do
         {:error, reason} ->
           error_msg = Encoder.encode({:error, reason})
-          transport.send(socket, IO.iodata_to_binary(error_msg))
+          # transport.send accepts iodata directly; no need to flatten to binary.
+          transport.send(socket, error_msg)
           Stats.decr_connections()
           transport.close(socket)
 
@@ -240,7 +258,8 @@ defmodule FerricstoreServer.Connection do
             peer: peer,
             tracking: ClientTracking.new_config(),
             acl_cache: default_cache,
-            l1_enabled: Application.get_env(:ferricstore, :l1_cache_enabled, true)
+            l1_enabled: Application.get_env(:ferricstore, :l1_cache_enabled, true),
+            active_mode: active_mode
           }
 
           AuditLog.log(:connection_open, %{
@@ -257,84 +276,136 @@ defmodule FerricstoreServer.Connection do
   # Receive loop (active: :once, event-driven)
   # ---------------------------------------------------------------------------
 
-  defp loop(%__MODULE__{socket: socket, transport: transport} = state) do
-    if in_pubsub_mode?(state) do
-      pubsub_loop(state)
-    else
-      # Re-arm active: :once so the kernel delivers exactly one more data message.
-      # This is idempotent — safe to call even if already in :once mode (e.g. on
-      # first entry from init/3).
+  # Normal receive loop — active: :once is rearmed AFTER processing data,
+  # not before entering receive. This saves one setopts syscall when the
+  # process wakes up from non-TCP messages (tracking, ACL invalidation).
+  #
+  # Pubsub mode uses a separate loop (pubsub_loop) to avoid checking
+  # a mode flag on every iteration of the hot path.
+  defp loop(%__MODULE__{socket: socket, transport: transport, active_mode: active_mode} = state) do
+    # Re-arm socket for :once mode. For true/N modes, kernel delivers
+    # continuously — no re-arm needed (N mode re-arms on {:tcp_passive}).
+    if active_mode == :once do
       transport.setopts(socket, active: :once)
+    end
 
-      receive do
-        # TCP active-mode data — the kernel delivered exactly one chunk
-        {:tcp, ^socket, data} ->
-          state
-          |> handle_data(data)
+    receive do
+      {:tcp, ^socket, data} ->
+        handle_data(state, data)
 
-        # TLS active-mode data
-        {:ssl, ^socket, data} ->
-          state
-          |> handle_data(data)
+      {:ssl, ^socket, data} ->
+        handle_data(state, data)
 
-        # TCP close / error
-        {:tcp_closed, ^socket} ->
-          cleanup_connection(state)
+      # Active N mode: socket went passive after N messages, re-arm
+      {:tcp_passive, ^socket} ->
+        transport.setopts(socket, active: active_mode)
+        loop(state)
 
-        {:tcp_error, ^socket, _reason} ->
-          cleanup_connection(state)
-          transport.close(socket)
+      {:ssl_passive, ^socket} ->
+        transport.setopts(socket, active: active_mode)
+        loop(state)
 
-        # TLS close / error
-        {:ssl_closed, ^socket} ->
-          cleanup_connection(state)
+      {:tcp_closed, ^socket} ->
+        cleanup_connection(state)
 
-        {:ssl_error, ^socket, _reason} ->
-          cleanup_connection(state)
-          transport.close(socket)
+      {:tcp_error, ^socket, _reason} ->
+        cleanup_connection(state)
+        transport.close(socket)
 
-        # Client tracking invalidation push — sent by notify_key_modified when
-        # another connection writes a key this connection is tracking.
-        # Also clears invalidated keys from the L1 cache so the next read
-        # fetches fresh data from L2.
-        {:tracking_invalidation, iodata} ->
-          new_state = l1_invalidate_from_push(state, iodata)
-          transport.send(socket, iodata)
-          loop(new_state)
+      {:ssl_closed, ^socket} ->
+        cleanup_connection(state)
 
-        # ACL invalidation — an admin changed a user's permissions via
-        # ACL SETUSER or ACL DELUSER. Refresh the local cache from ETS.
-        {:acl_invalidate, username} ->
-          loop(maybe_refresh_acl_cache(state, username))
-      end
+      {:ssl_error, ^socket, _reason} ->
+        cleanup_connection(state)
+        transport.close(socket)
+
+      {:tracking_invalidation, iodata, keys} ->
+        new_state = l1_invalidate_keys(state, keys)
+        transport.send(socket, iodata)
+        loop(new_state)
+
+      {:acl_invalidate, username} ->
+        loop(maybe_refresh_acl_cache(state, username))
     end
   end
 
   defp handle_data(%__MODULE__{socket: socket, transport: transport} = state, data) do
-    buffer = state.buffer <> data
+    # Avoid binary concatenation when buffer is empty (common case for
+    # non-pipelined workloads). Saves one binary allocation + copy per TCP frame.
+    buffer = if state.buffer == "", do: data, else: state.buffer <> data
 
-    case Parser.parse(buffer) do
-      {:ok, [], rest} ->
-        loop(%{state | buffer: rest})
+    # Connection buffer limit: reject connections that accumulate too much
+    # unparsed data (e.g. sending huge incomplete frames to exhaust memory).
+    if byte_size(buffer) > @max_buffer_size do
+      send_response(
+        socket,
+        transport,
+        Encoder.encode(
+          {:error,
+           "ERR connection buffer overflow (max #{@max_buffer_size} bytes)"}
+        )
+      )
 
-      {:ok, commands, rest} ->
-        handle_parsed(%{state | buffer: rest}, commands)
+      cleanup_connection(state)
+      transport.close(socket)
+    else
+      case Parser.parse(buffer) do
+        {:ok, [], rest} ->
+          loop(%{state | buffer: rest})
 
-      {:error, _reason} ->
-        send_response(socket, transport, Encoder.encode({:error, "ERR protocol error"}))
-        cleanup_connection(state)
-        transport.close(socket)
+        {:ok, commands, rest} ->
+          handle_parsed(%{state | buffer: rest}, commands)
+
+        {:error, {:value_too_large, len, max}} ->
+          send_response(
+            socket,
+            transport,
+            Encoder.encode(
+              {:error,
+               "ERR value too large (#{len} bytes, max #{max} bytes)"}
+            )
+          )
+
+          cleanup_connection(state)
+          transport.close(socket)
+
+        {:error, _reason} ->
+          send_response(socket, transport, Encoder.encode({:error, "ERR protocol error"}))
+          cleanup_connection(state)
+          transport.close(socket)
+      end
     end
   end
 
   defp handle_parsed(%__MODULE__{socket: socket, transport: transport} = state, commands) do
-    case pipeline_dispatch(commands, state) do
-      {:quit, quit_state} ->
-        cleanup_connection(quit_state)
-        transport.close(socket)
+    # Pipeline batch limit: reject batches with too many commands to prevent
+    # unbounded memory from accumulated Task results and response buffers.
+    if length(commands) > @max_pipeline_size do
+      send_response(
+        socket,
+        transport,
+        Encoder.encode(
+          {:error,
+           "ERR pipeline batch too large (#{length(commands)} commands, max #{@max_pipeline_size})"}
+        )
+      )
 
-      {:continue, new_state} ->
-        loop(new_state)
+      loop(state)
+    else
+      case pipeline_dispatch(commands, state) do
+        {:quit, quit_state} ->
+          cleanup_connection(quit_state)
+          transport.close(socket)
+
+        {:continue, new_state} ->
+          # If SUBSCRIBE was dispatched, switch to the pubsub loop.
+          # in_pubsub_mode? is a nil check (O(1)) for non-pubsub connections.
+          if in_pubsub_mode?(new_state) do
+            pubsub_loop(new_state)
+          else
+            loop(new_state)
+          end
+      end
     end
   end
 
@@ -367,22 +438,15 @@ defmodule FerricstoreServer.Connection do
   # Returns true if the command must be handled sequentially (it reads or
   # mutates connection state, or we are in a mode where all commands are
   # stateful -- e.g. MULTI queuing, pub/sub, pre-auth).
-  defp stateful_command?(cmd, state) do
-    case normalise_cmd(cmd) do
-      :unknown ->
-        true
+  # Variant that accepts a pre-normalised command to avoid redundant String.upcase.
+  defp stateful_command_normalised?(:unknown, _state), do: true
 
-      {name, _args} ->
-        # In MULTI queuing mode, every command is stateful (queued or passthrough).
-        state.multi_state == :queuing or
-          in_pubsub_mode?(state) or
-          requires_auth?(state) or
-          name in @stateful_cmds or
-          # CLIENT subcommand form: "CLIENT" is already in @stateful_cmds,
-          # but two-word forms like ["CLIENT", "HELLO", ...] need to match
-          # on the first token.
-          String.starts_with?(name, "CLIENT")
-    end
+  defp stateful_command_normalised?({name, _args}, state) do
+    state.multi_state == :queuing or
+      in_pubsub_mode?(state) or
+      requires_auth?(state) or
+      name in @stateful_cmds or
+      String.starts_with?(name, "CLIENT")
   end
 
   # Dispatches a pipeline of commands using a sliding window.
@@ -417,13 +481,15 @@ defmodule FerricstoreServer.Connection do
   # (or the list ends), the current pure group is flushed via the sliding window
   # and the stateful command is executed synchronously.
   defp sliding_window_dispatch(commands, state) do
-    # Accumulate consecutive pure commands into a buffer
-    do_sliding_window(commands, [], state)
+    # Accumulate consecutive pure commands into a buffer.
+    # Track normalised forms and all_reads? flag during accumulation to
+    # avoid redundant normalise_cmd calls and a separate all_pure_reads? pass.
+    do_sliding_window(commands, [], true, state)
   end
 
   # Base case: no more commands, flush any remaining pure group.
-  defp do_sliding_window([], pure_acc, state) do
-    case flush_pure_group(Enum.reverse(pure_acc), state) do
+  defp do_sliding_window([], pure_acc, all_reads?, state) do
+    case flush_pure_group_pre(Enum.reverse(pure_acc), all_reads?, state) do
       {:quit, _quit_state} = quit -> quit
       {:continue, new_state} -> {:continue, new_state}
     end
@@ -431,11 +497,17 @@ defmodule FerricstoreServer.Connection do
 
   # Classify current command and either accumulate it (pure) or flush + execute
   # (stateful or barrier).
-  defp do_sliding_window([cmd | rest], pure_acc, state) do
+  #
+  # Normalise once and pass the result through to avoid redundant String.upcase
+  # calls in stateful_command?, barrier_command?, and command_shard_key.
+  # Track all_reads? flag during accumulation (optimization #8).
+  defp do_sliding_window([cmd | rest], pure_acc, all_reads?, state) do
+    normalised = normalise_cmd(cmd)
+
     cond do
-      stateful_command?(cmd, state) ->
+      stateful_command_normalised?(normalised, state) ->
         # Stateful: flush pure group, execute synchronously, may change state.
-        case flush_pure_group(Enum.reverse(pure_acc), state) do
+        case flush_pure_group_pre(Enum.reverse(pure_acc), all_reads?, state) do
           {:quit, _quit_state} = quit ->
             quit
 
@@ -449,27 +521,29 @@ defmodule FerricstoreServer.Connection do
                 send_response(new_state.socket, new_state.transport, response)
                 # After a stateful command, re-classify the remaining commands
                 # because state may have changed (e.g. entered MULTI mode).
-                do_sliding_window(rest, [], new_state)
+                do_sliding_window(rest, [], true, new_state)
             end
         end
 
-      barrier_command?(cmd) ->
+      barrier_command_normalised?(normalised) ->
         # Barrier: flush pure group (so all prior commands complete first),
         # then include this barrier command as the start of a new pure group.
-        # The barrier command itself is safe to dispatch concurrently with
-        # SUBSEQUENT commands on different shards.
-        case flush_pure_group(Enum.reverse(pure_acc), state) do
+        case flush_pure_group_pre(Enum.reverse(pure_acc), all_reads?, state) do
           {:quit, _quit_state} = quit ->
             quit
 
           {:continue, flushed_state} ->
             # Start a new pure group with the barrier command.
-            do_sliding_window(rest, [cmd], flushed_state)
+            # Barrier commands are not reads, so all_reads? = false.
+            is_read = is_read_cmd?(normalised)
+            do_sliding_window(rest, [{cmd, normalised}], is_read, flushed_state)
         end
 
       true ->
         # Pure command -- accumulate for concurrent dispatch.
-        do_sliding_window(rest, [cmd | pure_acc], state)
+        # Track whether this command is a read for the all_reads? flag.
+        is_read = is_read_cmd?(normalised)
+        do_sliding_window(rest, [{cmd, normalised} | pure_acc], all_reads? and is_read, state)
     end
   end
 
@@ -484,9 +558,12 @@ defmodule FerricstoreServer.Connection do
   #
   # An empty group is a no-op.
   # A single-command group skips Task overhead and dispatches inline.
-  defp flush_pure_group([], state), do: {:continue, state}
+  # flush_pure_group_pre accepts pre-normalised {cmd, normalised} pairs and
+  # a pre-computed all_reads? flag from do_sliding_window accumulation.
+  # This eliminates the separate Enum.reverse + all_pure_reads? pass.
+  defp flush_pure_group_pre([], _all_reads?, state), do: {:continue, state}
 
-  defp flush_pure_group([single_cmd], state) do
+  defp flush_pure_group_pre([{single_cmd, _norm}], _all_reads?, state) do
     case handle_command(single_cmd, state) do
       {:quit, response, quit_state} ->
         send_response(quit_state.socket, quit_state.transport, response)
@@ -498,9 +575,34 @@ defmodule FerricstoreServer.Connection do
     end
   end
 
-  defp flush_pure_group(commands, state) do
+  defp flush_pure_group_pre(normalised, all_reads?, state) do
     store = build_store(state.sandbox_namespace)
 
+    # Fast path: if ALL commands are pure reads (tracked during accumulation),
+    # skip the sliding window entirely. No Task spawning, no shard grouping,
+    # no Map buffer. Just dispatch sequentially and send each response immediately.
+    if all_reads? do
+      flush_pure_reads_fast_normalised(normalised, store, state)
+    else
+      flush_pure_group_sliding_window_normalised(normalised, store, state)
+    end
+  end
+
+  defp flush_pure_reads_fast_normalised(normalised, store, state) do
+    Enum.reduce_while(normalised, {:continue, state}, fn {_cmd, norm}, {:continue, acc_state} ->
+      case dispatch_pure_command_normalised(norm, store, acc_state) do
+        {:quit, response} ->
+          send_response(acc_state.socket, acc_state.transport, response)
+          {:halt, {:quit, acc_state}}
+
+        {:continue, response} ->
+          send_response(acc_state.socket, acc_state.transport, response)
+          {:cont, {:continue, acc_state}}
+      end
+    end)
+  end
+
+  defp flush_pure_group_sliding_window_normalised(normalised, store, state) do
     # Shard-aware concurrent dispatch with sliding-window response delivery.
     #
     # Commands are grouped by shard lane. Each lane gets its own Task that
@@ -513,15 +615,17 @@ defmodule FerricstoreServer.Connection do
     # sliding window to send response N as soon as responses 0..N are ready.
 
     # Step 1: Assign each command an index and shard lane.
+    # Uses pre-normalised commands to avoid redundant normalise_cmd calls
+    # in command_shard_key.
     indexed_cmds =
-      commands
+      normalised
       |> Enum.with_index()
-      |> Enum.map(fn {cmd, idx} -> {cmd, idx, command_shard_key(cmd)} end)
+      |> Enum.map(fn {{_cmd, norm}, idx} -> {norm, idx, command_shard_key_normalised(norm)} end)
 
     # Step 2: Group by shard lane (preserving original order within each lane).
-    lanes = Enum.group_by(indexed_cmds, fn {_cmd, _idx, shard_key} -> shard_key end)
+    lanes = Enum.group_by(indexed_cmds, fn {_norm, _idx, shard_key} -> shard_key end)
 
-    total = length(commands)
+    total = length(normalised)
     conn_pid = self()
 
     # Step 3: Spawn one Task per shard lane. Each task executes its commands
@@ -529,8 +633,8 @@ defmodule FerricstoreServer.Connection do
     lane_tasks =
       Enum.map(lanes, fn {_shard_key, lane_cmds} ->
         Task.async(fn ->
-          Enum.each(lane_cmds, fn {cmd, idx, _shard_key} ->
-            result = dispatch_pure_command(cmd, store, state)
+          Enum.each(lane_cmds, fn {norm, idx, _shard_key} ->
+            result = dispatch_pure_command_normalised(norm, store, state)
             send(conn_pid, {:lane_result, idx, result})
           end)
         end)
@@ -608,16 +712,19 @@ defmodule FerricstoreServer.Connection do
   # Server-level commands that span all shards and must act as barriers.
   @barrier_server_cmds ~w(DBSIZE FLUSHDB FLUSHALL KEYS SCAN RANDOMKEY)
 
+  # Returns true if a normalised command is a read command (O(1) MapSet lookup).
+  defp is_read_cmd?({name, _args}), do: MapSet.member?(@read_cmds_set, name)
+  defp is_read_cmd?(:unknown), do: false
+
   # Returns true if the command is a cross-shard barrier that must wait
   # for all preceding pipeline commands to complete before executing.
-  defp barrier_command?(cmd) do
-    case normalise_cmd(cmd) do
-      :unknown -> false
-      {name, args} ->
-        name in @always_multi_cmds or
-          name in @barrier_server_cmds or
-          (name in @variadic_key_cmds and length(args) > 1)
-    end
+  # Variant that accepts a pre-normalised command to avoid redundant String.upcase.
+  defp barrier_command_normalised?(:unknown), do: false
+
+  defp barrier_command_normalised?({name, args}) do
+    name in @always_multi_cmds or
+      name in @barrier_server_cmds or
+      (name in @variadic_key_cmds and match?([_, _ | _], args))
   end
 
   # Server-level commands that don't target a specific key.
@@ -631,78 +738,78 @@ defmodule FerricstoreServer.Connection do
   #   - `:barrier` for multi-key/multi-shard commands (global ordering barrier)
   #   - `:server` for server-level commands with no key
   defp command_shard_key(cmd) do
-    case normalise_cmd(cmd) do
-      :unknown ->
+    command_shard_key_normalised(normalise_cmd(cmd))
+  end
+
+  # Variant that accepts pre-normalised commands to avoid redundant normalise_cmd.
+  defp command_shard_key_normalised(:unknown), do: :server
+
+  defp command_shard_key_normalised({name, args}) do
+    cond do
+      name in @always_multi_cmds ->
+        :barrier
+
+      name in @variadic_key_cmds ->
+        case args do
+          # Single key: route to that key's shard lane.
+          [single_key] -> {:shard, Router.shard_for(single_key)}
+          # Multiple keys: global barrier.
+          _ -> :barrier
+        end
+
+      name in @server_cmds_no_key ->
         :server
 
-      {name, args} ->
-        cond do
-          name in @always_multi_cmds ->
-            :barrier
+      # Single-key commands: first arg is the key
+      args != [] ->
+        {:shard, Router.shard_for(hd(args))}
 
-          name in @variadic_key_cmds ->
-            case args do
-              # Single key: route to that key's shard lane.
-              [single_key] -> {:shard, Router.shard_for(single_key)}
-              # Multiple keys: global barrier.
-              _ -> :barrier
-            end
-
-          name in @server_cmds_no_key ->
-            :server
-
-          # Single-key commands: first arg is the key
-          args != [] ->
-            {:shard, Router.shard_for(hd(args))}
-
-          # No args
-          true ->
-            :server
-        end
+      # No args
+      true ->
+        :server
     end
   end
 
   # Dispatches a single pure command inside a Task. Returns {action, encoded_response}.
   # Pure commands don't modify connection state, so we don't thread state through.
   # ACL command-level checks are applied here for pipelined commands.
-  defp dispatch_pure_command(cmd, store, state) do
-    case normalise_cmd(cmd) do
-      :unknown ->
-        {:continue, Encoder.encode({:error, "ERR unknown command format"})}
+  # Accepts a pre-normalised {name, args} tuple to avoid redundant String.upcase.
+  defp dispatch_pure_command_normalised(:unknown, _store, _state) do
+    {:continue, Encoder.encode({:error, "ERR unknown command format"})}
+  end
 
-      {name, args} ->
-        # ACL command-level check for pipelined commands (cached, no ETS lookup)
-        case check_command_cached(state.acl_cache, name) do
-          {:error, _reason} = err ->
-            # Fix 5: Log command denials to the audit log.
-            Ferricstore.Acl.log_command_denied(
-              state.username,
-              name,
-              format_peer(state.peer),
-              state.client_id
-            )
+  defp dispatch_pure_command_normalised({name, args}, store, state) do
+    # ACL command-level + key pattern check for pipelined commands (cached, no ETS lookup)
+    with :ok <- check_command_cached(state.acl_cache, name),
+         :ok <- check_keys_cached(state.acl_cache, name, args) do
+      Stats.incr_commands()
 
-            {:continue, Encoder.encode(err)}
+      result =
+        try do
+          Dispatcher.dispatch(name, args, store)
+        catch
+          :exit, {:noproc, _} ->
+            {:error, "ERR server not ready, shard process unavailable"}
 
-          :ok ->
-            Stats.incr_commands()
-
-            result =
-              try do
-                Dispatcher.dispatch(name, args, store)
-              catch
-                :exit, {:noproc, _} ->
-                  {:error, "ERR server not ready, shard process unavailable"}
-
-                :exit, {reason, _} ->
-                  {:error, "ERR internal error: #{inspect(reason)}"}
-              end
-
-            maybe_notify_keyspace(name, args, result)
-            # Client tracking: notify writes from pipelined commands
-            maybe_notify_tracking(name, args, result, state)
-            {:continue, Encoder.encode(result)}
+          :exit, {reason, _} ->
+            {:error, "ERR internal error: #{inspect(reason)}"}
         end
+
+      maybe_notify_keyspace(name, args, result)
+      # Client tracking: notify writes from pipelined commands
+      maybe_notify_tracking(name, args, result, state)
+      {:continue, Encoder.encode(result)}
+    else
+      {:error, _reason} = err ->
+        # Fix 5: Log command denials to the audit log.
+        Ferricstore.Acl.log_command_denied(
+          state.username,
+          name,
+          format_peer(state.peer),
+          state.client_id
+        )
+
+        {:continue, Encoder.encode(err)}
     end
   end
 
@@ -729,11 +836,11 @@ defmodule FerricstoreServer.Connection do
         {:continue, Encoder.encode({:error, "NOAUTH Authentication required."}), state}
 
       cmd not in @acl_bypass_cmds ->
-        case check_command_cached(state.acl_cache, cmd) do
-          :ok ->
-            Stats.incr_commands()
-            dispatch(cmd, args, state)
-
+        with :ok <- check_command_cached(state.acl_cache, cmd),
+             :ok <- check_keys_cached(state.acl_cache, cmd, args) do
+          Stats.incr_commands()
+          dispatch(cmd, args, state)
+        else
           {:error, _reason} = err ->
             # Fix 5: Log command denials to the audit log.
             Ferricstore.Acl.log_command_denied(
@@ -835,7 +942,7 @@ defmodule FerricstoreServer.Connection do
     {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
   end
 
-  defp dispatch("AUTH", args, state) when length(args) > 2 do
+  defp dispatch("AUTH", [_, _, _ | _], state) do
     {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
   end
 
@@ -1020,14 +1127,15 @@ defmodule FerricstoreServer.Connection do
     new_state = %{state |
       multi_state: :none,
       multi_queue: [],
+      multi_queue_count: 0,
       watched_keys: %{},
       sandbox_namespace: nil,
       tracking: ClientTracking.new_config(),
       read_mode: :consistent,
       authenticated: false,
       username: "default",
-      pubsub_channels: MapSet.new(),
-      pubsub_patterns: MapSet.new(),
+      pubsub_channels: nil,
+      pubsub_patterns: nil,
       acl_cache: build_acl_cache("default"),
       l1_cache: %{},
       l1_size_bytes: 0
@@ -1123,7 +1231,7 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch("MULTI", _args, state) do
-    new_state = %{state | multi_state: :queuing, multi_queue: []}
+    new_state = %{state | multi_state: :queuing, multi_queue: [], multi_queue_count: 0}
     {:continue, Encoder.encode(:ok), new_state}
   end
 
@@ -1133,7 +1241,7 @@ defmodule FerricstoreServer.Connection do
 
   defp dispatch("EXEC", _args, state) do
     result = execute_transaction(state)
-    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}}
+    new_state = %{state | multi_state: :none, multi_queue: [], multi_queue_count: 0, watched_keys: %{}}
     {:continue, Encoder.encode(result), new_state}
   end
 
@@ -1142,7 +1250,7 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch("DISCARD", _args, state) do
-    new_state = %{state | multi_state: :none, multi_queue: [], watched_keys: %{}}
+    new_state = %{state | multi_state: :none, multi_queue: [], multi_queue_count: 0, watched_keys: %{}}
     {:continue, Encoder.encode(:ok), new_state}
   end
 
@@ -1183,6 +1291,9 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch("SUBSCRIBE", channels, state) do
+    # Lazily initialize MapSets on first subscribe (memory audit L3).
+    state = ensure_pubsub_sets(state)
+
     {responses, new_state} =
       Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
         PS.subscribe(ch, self())
@@ -1199,10 +1310,16 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch("UNSUBSCRIBE", [], state) do
-    dispatch("UNSUBSCRIBE", MapSet.to_list(state.pubsub_channels), state)
+    if state.pubsub_channels == nil do
+      {:continue, [], state}
+    else
+      dispatch("UNSUBSCRIBE", MapSet.to_list(state.pubsub_channels), state)
+    end
   end
 
   defp dispatch("UNSUBSCRIBE", channels, state) do
+    state = ensure_pubsub_sets(state)
+
     {responses, new_state} =
       Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
         PS.unsubscribe(ch, self())
@@ -1222,6 +1339,8 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch("PSUBSCRIBE", patterns, state) do
+    state = ensure_pubsub_sets(state)
+
     {responses, new_state} =
       Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
         PS.psubscribe(pat, self())
@@ -1237,10 +1356,16 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch("PUNSUBSCRIBE", [], state) do
-    dispatch("PUNSUBSCRIBE", MapSet.to_list(state.pubsub_patterns), state)
+    if state.pubsub_patterns == nil do
+      {:continue, [], state}
+    else
+      dispatch("PUNSUBSCRIBE", MapSet.to_list(state.pubsub_patterns), state)
+    end
   end
 
   defp dispatch("PUNSUBSCRIBE", patterns, state) do
+    state = ensure_pubsub_sets(state)
+
     {responses, new_state} =
       Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
         PS.punsubscribe(pat, self())
@@ -1259,17 +1384,31 @@ defmodule FerricstoreServer.Connection do
 
   defp dispatch(cmd, args, %{multi_state: :queuing} = state)
        when cmd not in @multi_passthrough_cmds do
-    # Validate command syntax at queue time. If the dispatcher returns an
-    # error, send it immediately but stay in MULTI mode.
-    store = build_store(state.sandbox_namespace)
+    # MULTI queue limit: auto-DISCARD if queue grows beyond the limit.
+    # Uses tracked count (O(1)) instead of length/1 (O(N)) on every command.
+    if state.multi_queue_count >= @max_multi_queue_size do
+      new_state = %{state | multi_state: :none, multi_queue: [], multi_queue_count: 0, watched_keys: %{}}
 
-    case validate_command(cmd, args, store) do
-      :ok ->
-        new_queue = state.multi_queue ++ [{cmd, args}]
-        {:continue, Encoder.encode({:simple, "QUEUED"}), %{state | multi_queue: new_queue}}
+      {:continue,
+       Encoder.encode(
+         {:error,
+          "ERR MULTI queue overflow (max #{@max_multi_queue_size} commands), transaction discarded"}
+       ), new_state}
+    else
+      # Validate command syntax at queue time. If the dispatcher returns an
+      # error, send it immediately but stay in MULTI mode.
+      store = build_store(state.sandbox_namespace)
 
-      {:error, _msg} = err ->
-        {:continue, Encoder.encode(err), state}
+      case validate_command(cmd, args, store) do
+        :ok ->
+          # Prepend + reverse at EXEC time: O(1) per queue vs O(N) for ++ append.
+          new_queue = [{cmd, args} | state.multi_queue]
+          new_count = state.multi_queue_count + 1
+          {:continue, Encoder.encode({:simple, "QUEUED"}), %{state | multi_queue: new_queue, multi_queue_count: new_count}}
+
+        {:error, _msg} = err ->
+          {:continue, Encoder.encode(err), state}
+      end
     end
   end
 
@@ -1565,7 +1704,11 @@ defmodule FerricstoreServer.Connection do
   #
   # If any condition fails, we fall through to the normal dispatch path.
 
-  @sendfile_threshold_bytes 65_536
+  @sendfile_threshold_bytes Application.compile_env(
+                              :ferricstore_server,
+                              :sendfile_threshold,
+                              65_536
+                            )
 
   defp dispatch("GET", [key], %{transport: :ranch_tcp} = state)
        when byte_size(key) > 0 and byte_size(key) <= 65_535 do
@@ -1582,6 +1725,13 @@ defmodule FerricstoreServer.Connection do
         :fallback ->
           # Sendfile not applicable — use normal dispatch.
           dispatch_normal("GET", [key], state)
+
+        {:error_after_header, _reason} ->
+          # The RESP header ($<len>\r\n) was already written to the socket but
+          # the sendfile or trailer write failed. The protocol stream is now
+          # corrupted — we cannot fall back to dispatch_normal (that would send
+          # a second RESP header). The only safe option is to close the connection.
+          {:quit, "", state}
       end
     end
   end
@@ -1618,6 +1768,11 @@ defmodule FerricstoreServer.Connection do
 
           case :gen_tcp.send(socket, header) do
             :ok ->
+              # IMPORTANT: once the RESP header has been sent, we CANNOT fall
+              # back to dispatch_normal — that would send a second $<len>\r\n
+              # and corrupt the protocol stream. If sendfile or the trailer
+              # fails at this point, the connection is unrecoverable and must
+              # be closed.
               case :file.sendfile(fd, socket, offset, size, []) do
                 {:ok, _sent} ->
                   case :gen_tcp.send(socket, trailer) do
@@ -1626,14 +1781,14 @@ defmodule FerricstoreServer.Connection do
                       new_state = maybe_track_read_sendfile("GET", [key], state)
                       {:sent, new_state}
 
-                    {:error, _} ->
+                    {:error, reason} ->
                       set_cork(socket, false)
-                      :fallback
+                      {:error_after_header, reason}
                   end
 
-                {:error, _} ->
+                {:error, reason} ->
                   set_cork(socket, false)
-                  :fallback
+                  {:error_after_header, reason}
               end
 
             {:error, _} ->
@@ -1839,7 +1994,9 @@ defmodule FerricstoreServer.Connection do
   # and cross-shard (2PC) transactions. WATCH conflict detection is also handled
   # by the Coordinator.
   defp execute_transaction(%{watched_keys: watched, multi_queue: queue, sandbox_namespace: ns}) do
-    Ferricstore.Transaction.Coordinator.execute(queue, watched, ns)
+    # Queue is stored in reverse order (prepend during MULTI) for O(1)
+    # queuing. Reverse here at EXEC time to restore command ordering.
+    Ferricstore.Transaction.Coordinator.execute(Enum.reverse(queue), watched, ns)
   end
 
   # ---------------------------------------------------------------------------
@@ -1911,19 +2068,32 @@ defmodule FerricstoreServer.Connection do
   # Store builder — wraps Router functions into the store map contract
   # ---------------------------------------------------------------------------
 
-  defp build_store(nil) do
-    build_raw_store()
-  end
-
-  defp build_store(ns) when is_binary(ns) do
-    raw = build_raw_store()
-    %{raw |
-      get: fn key -> raw.get.(ns <> key) end,
-      get_meta: fn key -> raw.get_meta.(ns <> key) end,
-      put: fn key, val, exp -> raw.put.(ns <> key, val, exp) end,
-      delete: fn key -> raw.delete.(ns <> key) end,
-      exists?: fn key -> raw.exists?.(ns <> key) end
-    }
+  # The raw store map is identical for every non-sandbox command dispatch.
+  # Built once lazily via persistent_term to eliminate ~25 closure allocations
+  # per command. Subsequent calls are a single pointer deref (~5ns).
+  #
+  # Audit C3 note: this is a plain map rather than a struct. A struct would
+  # give OTP 26+ type inference transparent field types, but converting would
+  # require touching every command handler (~25 modules) since they all
+  # access `store.get.()` etc. The practical impact is negligible:
+  #   - The non-sandbox path reads from persistent_term (one pointer deref).
+  #   - The sandbox path rebuilds only 5 namespace-wrapping closures; the
+  #     remaining ~20 fields are shared from the cached raw store.
+  #   - Each closure call is a direct function dispatch (~10ns); the type
+  #     opacity only prevents the JIT from inlining across the store boundary,
+  #     which would save <5ns per call — well below the GenServer/ETS cost
+  #     that dominates every operation.
+  # The struct conversion is tracked as a future cleanup but is not worth the
+  # risk of a cross-cutting refactor for the marginal type inference benefit.
+  defp raw_store do
+    case :persistent_term.get(:ferricstore_raw_store, nil) do
+      nil ->
+        store = build_raw_store()
+        :persistent_term.put(:ferricstore_raw_store, store)
+        store
+      store ->
+        store
+    end
   end
 
   defp build_raw_store do
@@ -1936,14 +2106,8 @@ defmodule FerricstoreServer.Connection do
       keys: &Router.keys/0,
       keys_with_prefix: &Router.keys_with_prefix/1,
       flush: fn ->
-        # Drain async apply workers so any fire-and-forget writes from async-
-        # durability namespaces land in ETS before we snapshot keys for deletion.
-        # We do NOT flush Raft batchers here because quorum-path writes block
-        # their callers until applied, and flushing all batchers would add
-        # significant latency (raft consensus per shard) to every FLUSHDB.
         shard_count = Application.get_env(:ferricstore, :shard_count, 4)
         Enum.each(0..(shard_count - 1), &Ferricstore.Raft.AsyncApplyWorker.drain/1)
-
         Enum.each(Router.keys(), &Router.delete/1)
         :ok
       end,
@@ -1989,6 +2153,19 @@ defmodule FerricstoreServer.Connection do
         shard = Router.shard_name(Router.shard_for(redis_key))
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
+    }
+  end
+
+  defp build_store(nil), do: raw_store()
+
+  defp build_store(ns) when is_binary(ns) do
+    raw = raw_store()
+    %{raw |
+      get: fn key -> raw.get.(ns <> key) end,
+      get_meta: fn key -> raw.get_meta.(ns <> key) end,
+      put: fn key, val, exp -> raw.put.(ns <> key, val, exp) end,
+      delete: fn key -> raw.delete.(ns <> key) end,
+      exists?: fn key -> raw.exists?.(ns <> key) end
     }
   end
 
@@ -2070,9 +2247,10 @@ defmodule FerricstoreServer.Connection do
         transport.send(socket, Encoder.encode(push))
         pubsub_loop(state)
 
-      # Client tracking invalidation push — can arrive while in pub/sub mode
-      {:tracking_invalidation, iodata} ->
-        new_state = l1_invalidate_from_push(state, iodata)
+      # Client tracking invalidation push — can arrive while in pub/sub mode.
+      # Keys are passed directly to avoid RESP re-parsing.
+      {:tracking_invalidation, iodata, keys} ->
+        new_state = l1_invalidate_keys(state, keys)
         transport.send(socket, iodata)
         pubsub_loop(new_state)
 
@@ -2082,9 +2260,16 @@ defmodule FerricstoreServer.Connection do
     end
   end
 
-  defp in_pubsub_mode?(state) do
-    MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
+  defp in_pubsub_mode?(%{pubsub_channels: nil}), do: false
+  defp in_pubsub_mode?(state), do: MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
+
+  # Lazily initializes pubsub_channels and pubsub_patterns MapSets.
+  # Called on first SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE to avoid allocating
+  # ~80 bytes of empty MapSets on every connection (memory audit L3).
+  defp ensure_pubsub_sets(%{pubsub_channels: nil} = state) do
+    %{state | pubsub_channels: MapSet.new(), pubsub_patterns: MapSet.new()}
   end
+  defp ensure_pubsub_sets(state), do: state
 
   # ---------------------------------------------------------------------------
   # L1 per-connection cache helpers
@@ -2309,40 +2494,14 @@ defmodule FerricstoreServer.Connection do
     end
   end
 
-  # Parses invalidation push iodata to extract key names, then removes them from L1.
-  # The invalidation message format is RESP3 push:
-  #   >2\r\n+invalidate\r\n*N\r\n$len\r\nkey\r\n...
-  @spec l1_invalidate_from_push(t(), iodata()) :: t()
-  defp l1_invalidate_from_push(state, iodata) do
+  # Removes the given keys from L1 cache directly, without re-parsing RESP.
+  # Used when the invalidation message sender passes keys alongside iodata.
+  @spec l1_invalidate_keys(t(), [binary()]) :: t()
+  defp l1_invalidate_keys(state, keys) do
     if map_size(state.l1_cache) == 0 do
       state
     else
-      keys = l1_parse_invalidation_keys(iodata)
       Enum.reduce(keys, state, fn key, s -> l1_remove(s, key) end)
-    end
-  end
-
-  # Extracts key names from a RESP3 invalidation push message.
-  # The push message structure: >2\r\n+invalidate\r\n*N\r\n$len\r\nkey\r\n...
-  # Parser returns: {:push, [{:simple, "invalidate"}, ["key1", "key2", ...]]}
-  defp l1_parse_invalidation_keys(iodata) do
-    binary = IO.iodata_to_binary(iodata)
-
-    case Parser.parse(binary) do
-      {:ok, [parsed], _rest} ->
-        case parsed do
-          {:push, [{:simple, "invalidate"}, keys]} when is_list(keys) ->
-            keys
-
-          {:push, ["invalidate", keys]} when is_list(keys) ->
-            keys
-
-          _ ->
-            []
-        end
-
-      _ ->
-        []
     end
   end
 
@@ -2409,11 +2568,12 @@ defmodule FerricstoreServer.Connection do
 
   # The socket_sender callback passed to ClientTracking.notify_key_modified/3.
   # Sends a message to the target connection process, which will write the
-  # invalidation push to its socket in its main loop.
-  @spec tracking_socket_sender() :: (pid(), iodata() -> :ok)
+  # invalidation push to its socket in its main loop. Includes the pre-extracted
+  # key list alongside the iodata to avoid RESP re-parsing for L1 invalidation.
+  @spec tracking_socket_sender() :: (pid(), iodata(), [binary()] -> :ok)
   defp tracking_socket_sender do
-    fn target_pid, iodata ->
-      send(target_pid, {:tracking_invalidation, iodata})
+    fn target_pid, iodata, keys ->
+      send(target_pid, {:tracking_invalidation, iodata, keys})
       :ok
     end
   end
@@ -2471,55 +2631,58 @@ defmodule FerricstoreServer.Connection do
   @spec maybe_notify_tracking(binary(), [binary()], term(), t()) :: :ok
   defp maybe_notify_tracking(_cmd, _args, {:error, _}, _state), do: :ok
 
-  defp maybe_notify_tracking(cmd, args, _result, _state) when cmd in @write_cmds do
-    writer_pid = self()
-    sender = tracking_socket_sender()
+  defp maybe_notify_tracking(cmd, args, _result, _state) do
+    # O(1) MapSet check replaces linear `when cmd in @write_cmds` guard (~55 chained ==).
+    if MapSet.member?(@write_cmds_set, cmd) do
+      writer_pid = self()
+      sender = tracking_socket_sender()
 
-    case cmd do
-      c when c in ~w(MSET MSETNX) ->
-        keys =
-          args
-          |> Enum.chunk_every(2)
-          |> Enum.map(fn [key | _] -> key end)
+      case cmd do
+        c when c in ~w(MSET MSETNX) ->
+          keys =
+            args
+            |> Enum.chunk_every(2)
+            |> Enum.map(fn [key | _] -> key end)
 
-        ClientTracking.notify_keys_modified(keys, writer_pid, sender)
+          ClientTracking.notify_keys_modified(keys, writer_pid, sender)
 
-      c when c in ~w(DEL UNLINK) ->
-        ClientTracking.notify_keys_modified(args, writer_pid, sender)
+        c when c in ~w(DEL UNLINK) ->
+          ClientTracking.notify_keys_modified(args, writer_pid, sender)
 
-      "RENAME" ->
-        # RENAME source destination — both keys are affected
-        case args do
-          [src, dst | _] ->
-            ClientTracking.notify_keys_modified([src, dst], writer_pid, sender)
+        "RENAME" ->
+          # RENAME source destination — both keys are affected
+          case args do
+            [src, dst | _] ->
+              ClientTracking.notify_keys_modified([src, dst], writer_pid, sender)
 
-          _ ->
-            :ok
-        end
+            _ ->
+              :ok
+          end
 
-      "COPY" ->
-        # COPY source destination — destination is modified
-        case args do
-          [_src, dst | _] ->
-            ClientTracking.notify_key_modified(dst, writer_pid, sender)
+        "COPY" ->
+          # COPY source destination — destination is modified
+          case args do
+            [_src, dst | _] ->
+              ClientTracking.notify_key_modified(dst, writer_pid, sender)
 
-          _ ->
-            :ok
-        end
+            _ ->
+              :ok
+          end
 
-      _ ->
-        # Single-key commands: first arg is the key
-        case args do
-          [key | _] ->
-            ClientTracking.notify_key_modified(key, writer_pid, sender)
+        _ ->
+          # Single-key commands: first arg is the key
+          case args do
+            [key | _] ->
+              ClientTracking.notify_key_modified(key, writer_pid, sender)
 
-          _ ->
-            :ok
-        end
+            _ ->
+              :ok
+          end
+      end
+    else
+      :ok
     end
   end
-
-  defp maybe_notify_tracking(_cmd, _args, _result, _state), do: :ok
 
   defp cleanup_connection(state) do
     duration_ms = System.monotonic_time(:millisecond) - state.created_at
@@ -2537,8 +2700,8 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp cleanup_pubsub(state) do
-    Enum.each(state.pubsub_channels, &PS.unsubscribe(&1, self()))
-    Enum.each(state.pubsub_patterns, &PS.punsubscribe(&1, self()))
+    if state.pubsub_channels, do: Enum.each(state.pubsub_channels, &PS.unsubscribe(&1, self()))
+    if state.pubsub_patterns, do: Enum.each(state.pubsub_patterns, &PS.punsubscribe(&1, self()))
   end
 
   # Formats a peer tuple `{ip, port}` into a human-readable string.
@@ -2563,51 +2726,148 @@ defmodule FerricstoreServer.Connection do
 
   # Builds a cached ACL permission snapshot for the given username.
   # Does a single ETS lookup and extracts the fields needed for command checks.
-  # Returns nil if the user does not exist.
-  @spec build_acl_cache(binary()) :: acl_cache()
+  # Returns nil if the user does not exist, `:full_access` for unrestricted
+  # users (commands: :all, no denied commands, keys: :all, enabled: true),
+  # or a map with the ACL fields for restricted users.
+  #
+  # The `:full_access` atom enables O(1) fast-path checks in
+  # `check_command_cached/2` and `check_keys_cached/3`, skipping all MapSet
+  # and Catalog operations for the common default-user case.
+  @spec build_acl_cache(binary()) :: acl_cache() | :full_access
   defp build_acl_cache(username) do
     case Ferricstore.Acl.get_user(username) do
       nil ->
         nil
 
       user ->
-        %{
-          commands: user.commands,
-          denied_commands: Map.get(user, :denied_commands, MapSet.new()),
-          keys: user.keys,
-          enabled: user.enabled
-        }
+        denied = Map.get(user, :denied_commands, MapSet.new())
+
+        if user.enabled and user.commands == :all and
+             MapSet.size(denied) == 0 and user.keys == :all do
+          :full_access
+        else
+          %{
+            commands: user.commands,
+            denied_commands: denied,
+            keys: user.keys,
+            enabled: user.enabled
+          }
+        end
     end
   end
 
   # Pure function: checks if a command is permitted using the cached ACL data.
   # No ETS lookup, no process call — just pattern matching on local state.
+  # The `cmd` argument is expected to be already uppercase (from normalise_cmd).
   # Returns `:ok` if permitted, `{:error, reason}` if denied.
-  @spec check_command_cached(acl_cache(), binary()) :: :ok | {:error, binary()}
+  @spec check_command_cached(acl_cache() | :full_access, binary()) :: :ok | {:error, binary()}
   defp check_command_cached(nil, _cmd), do: :ok
 
-  defp check_command_cached(cache, cmd) do
-    cmd_up = String.upcase(cmd)
+  # Fast path: unrestricted user — single atom comparison, zero MapSet/map ops.
+  # Covers the common default-user case (commands: :all, no denied, keys: :all).
+  defp check_command_cached(:full_access, _cmd), do: :ok
 
+  # Fast path: full-access user with no denied commands — skip all MapSet ops.
+  # This covers the case where build_acl_cache returned a map (e.g. user has
+  # keys restrictions but commands: :all with no denied commands).
+  defp check_command_cached(%{commands: :all, denied_commands: %MapSet{map: denied_map}, enabled: true}, _cmd)
+       when map_size(denied_map) == 0 do
+    :ok
+  end
+
+  defp check_command_cached(cache, cmd) do
     cond do
       not cache.enabled ->
         {:error,
-         "NOPERM this user has no permissions to run the '#{String.downcase(cmd_up)}' command"}
+         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
 
-      cache.commands == :all and not MapSet.member?(cache.denied_commands, cmd_up) ->
+      cache.commands == :all and not MapSet.member?(cache.denied_commands, cmd) ->
         :ok
 
       cache.commands == :all ->
         {:error,
-         "NOPERM this user has no permissions to run the '#{String.downcase(cmd_up)}' command"}
+         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
 
-      MapSet.member?(cache.commands, cmd_up) and
-          not MapSet.member?(cache.denied_commands, cmd_up) ->
+      MapSet.member?(cache.commands, cmd) and
+          not MapSet.member?(cache.denied_commands, cmd) ->
         :ok
 
       true ->
         {:error,
-         "NOPERM this user has no permissions to run the '#{String.downcase(cmd_up)}' command"}
+         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
+    end
+  end
+
+  # Pure function: checks if the cached ACL key patterns allow access to
+  # all keys touched by a command. Uses Catalog.get_keys/2 to extract keys
+  # from the command arguments, then checks each key against the user's
+  # compiled patterns.
+  #
+  # Returns `:ok` if all keys pass, `{:error, reason}` if any key is denied.
+  # Commands with no keys (PING, INFO, etc.) always pass.
+  @spec check_keys_cached(acl_cache() | :full_access, binary(), [binary()]) :: :ok | {:error, binary()}
+  defp check_keys_cached(nil, _cmd, _args), do: :ok
+  defp check_keys_cached(:full_access, _cmd, _args), do: :ok
+  defp check_keys_cached(%{keys: :all}, _cmd, _args), do: :ok
+
+  defp check_keys_cached(%{keys: patterns}, cmd, args) do
+    alias Ferricstore.Commands.Catalog
+
+    # cmd is already uppercase from normalise_cmd — use get_keys_upper to
+    # skip the String.downcase inside Catalog.lookup.
+    case Catalog.get_keys_upper(cmd, args) do
+      {:ok, []} ->
+        :ok
+
+      {:ok, keys} ->
+        access_type = command_access_type(cmd)
+        check_all_keys(keys, access_type, patterns)
+
+      {:error, _} ->
+        # Unknown command — let the dispatcher handle the error later.
+        :ok
+    end
+  end
+
+  # Check every key against the patterns. Short-circuits on first denial.
+  @spec check_all_keys([binary()], :read | :write | :rw, [Ferricstore.Acl.key_pattern()]) ::
+          :ok | {:error, binary()}
+  defp check_all_keys([], _access_type, _patterns), do: :ok
+
+  defp check_all_keys([key | rest], access_type, patterns) do
+    # For :rw access (both read and write), the key must pass BOTH read and write checks.
+    types_to_check =
+      case access_type do
+        :rw -> [:read, :write]
+        other -> [other]
+      end
+
+    all_pass =
+      Enum.all?(types_to_check, fn t ->
+        Ferricstore.Acl.key_matches_any?(key, t, patterns)
+      end)
+
+    if all_pass do
+      check_all_keys(rest, access_type, patterns)
+    else
+      {:error,
+       "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
+    end
+  end
+
+  # Determines the access type for a command: :read, :write, or :rw (both).
+  # Commands that both read and write (GETSET, GETDEL, GETEX, CAS) require
+  # both read and write key permissions.
+  # The `cmd` argument is expected to be already uppercase (from normalise_cmd).
+  @read_write_cmds_set MapSet.new(~w(GETSET GETDEL GETEX CAS))
+  @spec command_access_type(binary()) :: :read | :write | :rw
+  defp command_access_type(cmd) do
+    cond do
+      MapSet.member?(@read_write_cmds_set, cmd) -> :rw
+      MapSet.member?(@read_cmds_set, cmd) -> :read
+      MapSet.member?(@write_cmds_set, cmd) -> :write
+      # Default to :rw for unknown commands — most conservative.
+      true -> :rw
     end
   end
 

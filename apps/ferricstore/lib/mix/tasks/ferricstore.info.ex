@@ -40,7 +40,6 @@ defmodule Mix.Tasks.Ferricstore.Info do
     ensure_started()
 
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-    raft_enabled? = Application.get_env(:ferricstore, :raft_enabled, true)
     uptime = Ferricstore.Stats.uptime_seconds()
     keys = Ferricstore.Store.Router.keys()
     total_keys = length(keys)
@@ -51,7 +50,6 @@ defmodule Mix.Tasks.Ferricstore.Info do
     Mix.shell().info("shard_count: #{shard_count}")
     Mix.shell().info("total_keys: #{total_keys}")
     Mix.shell().info("memory_used_bytes: #{memory}")
-    Mix.shell().info("raft_enabled: #{raft_enabled?}")
     Mix.shell().info("total_connections: #{Ferricstore.Stats.total_connections()}")
     Mix.shell().info("total_commands: #{Ferricstore.Stats.total_commands()}")
     Mix.shell().info("run_id: #{Ferricstore.Stats.run_id()}")
@@ -72,18 +70,12 @@ defmodule Mix.Tasks.Ferricstore.Info do
         end
 
       raft_info =
-        if raft_enabled? do
-          server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+        case safe_ra_members(Ferricstore.Raft.Cluster.shard_server_id(i)) do
+          {:ok, _members, leader} ->
+            "leader=#{inspect(leader)}"
 
-          case safe_ra_members(server_id) do
-            {:ok, _members, leader} ->
-              "leader=#{inspect(leader)}"
-
-            _ ->
-              "no_leader"
-          end
-        else
-          "disabled"
+          _ ->
+            "no_leader"
         end
 
       Mix.shell().info("shard_#{i}: status=#{status} keys=#{key_count} raft=#{raft_info}")

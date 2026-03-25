@@ -15,10 +15,6 @@ defmodule Ferricstore.Store.ShardAsyncTest do
   alias Ferricstore.Store.Shard
 
   setup do
-    # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
-    original = Application.get_env(:ferricstore, :raft_enabled)
-    Application.put_env(:ferricstore, :raft_enabled, false)
-    on_exit(fn -> Application.put_env(:ferricstore, :raft_enabled, original) end)
     :ok
   end
 
@@ -294,7 +290,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
       :ok = GenServer.call(pid, {:put, "ets_sync", "val", 0})
 
       # ETS must have the value immediately (sync write in put handler)
-      assert [{"ets_sync", "val", 0, _lfu}] = :ets.lookup(ets, "ets_sync")
+      assert [{"ets_sync", "val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, "ets_sync")
     end
 
     test "delete clears ETS entry" do

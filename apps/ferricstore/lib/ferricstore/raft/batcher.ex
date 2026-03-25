@@ -19,8 +19,29 @@ defmodule Ferricstore.Raft.Batcher do
   5. On the first write to an empty slot, a timer is started using the
      namespace's `window_ms`.
   6. When the timer fires (`:flush_slot`), only that slot's commands are
-     submitted.
-  7. Each caller receives their individual result from the batch.
+     submitted to Raft via `ra:pipeline_command/3`.
+  7. Each caller receives their individual result from the batch once the
+     ra command commits and the batcher receives the `ra_event` notification.
+
+  ## Pipelined ra submission (non-blocking)
+
+  To avoid serializing all writers through one GenServer while the previous
+  batch is in-flight through Raft consensus, the batcher uses
+  `ra:pipeline_command/3` instead of the blocking `ra:process_command/2`.
+
+  `pipeline_command` is a cast -- it returns immediately with `:ok`, and
+  the batcher receives an async `{ra_event, Leader, {applied, [...]}}` message
+  when the command is committed and applied by the state machine.
+
+  The batcher maintains a `pending` map keyed by correlation reference, which
+  maps each in-flight batch to the list of callers (`froms`) that are waiting
+  for a reply. When the `ra_event` arrives, the batcher extracts the result
+  and calls `GenServer.reply/2` for each caller.
+
+  This means the GenServer never blocks on Raft. During the time a batch is
+  in-flight, the batcher continues to accept new writes and accumulate them
+  into fresh slots. This eliminates the throughput bottleneck where 50 writers
+  were serialized through one blocked GenServer.
 
   ## Namespace configuration
 
@@ -40,7 +61,8 @@ defmodule Ferricstore.Raft.Batcher do
   `window_ms = 1`, `durability = :quorum`.
 
   For `:quorum` durability, commands are submitted to ra via
-  `:ra.process_command/2`, which blocks until quorum acknowledgement.
+  `:ra.pipeline_command/3` with a correlation reference. Callers are replied to
+  when the `ra_event` notification arrives confirming the command was applied.
 
   For `:async` durability (spec 2F.3), commands bypass Raft consensus
   entirely and are sent to `Ferricstore.Raft.AsyncApplyWorker`, which
@@ -73,12 +95,20 @@ defmodule Ferricstore.Raft.Batcher do
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
           | {:delete, binary()}
+          | {:incr, binary(), integer()}
           | {:incr_float, binary(), float()}
           | {:append, binary(), binary()}
           | {:getset, binary(), binary()}
           | {:getdel, binary()}
           | {:getex, binary(), non_neg_integer()}
           | {:setrange, binary(), non_neg_integer(), binary()}
+          | {:cas, binary(), binary(), binary(), non_neg_integer() | nil}
+          | {:lock, binary(), binary(), non_neg_integer()}
+          | {:unlock, binary(), binary()}
+          | {:extend, binary(), binary(), non_neg_integer()}
+          | {:ratelimit_add, binary(), pos_integer(), pos_integer(), pos_integer()}
+          | {:ratelimit_add, binary(), pos_integer(), pos_integer(), pos_integer(), non_neg_integer()}
+          | {:list_op, binary(), term()}
 
   @typedoc """
   A slot key identifies a unique batching bucket by namespace prefix and
@@ -104,7 +134,11 @@ defmodule Ferricstore.Raft.Batcher do
     :shard_index,
     :max_batch_size,
     slots: %{},
-    ns_cache: %{}
+    ns_cache: %{},
+    # Map from correlation ref -> {froms, :single | :batch} for in-flight ra commands
+    pending: %{},
+    # List of {from} callers waiting for all in-flight to drain (flush barrier)
+    flush_waiters: []
   ]
 
   # ---------------------------------------------------------------------------
@@ -153,6 +187,28 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
+  Submits a write command asynchronously, replying directly to `reply_to`.
+
+  Unlike `write/2`, this function does not block the calling process.
+  The batcher accepts the command via `GenServer.cast` (non-blocking) and
+  will call `GenServer.reply(reply_to, result)` when the command is committed.
+
+  This is used by the Shard GenServer to avoid blocking on Raft consensus.
+  The Shard returns `{:noreply, state}` and the Batcher replies directly
+  to the original caller (Router/connection process).
+
+  ## Parameters
+
+    * `shard_index` -- zero-based shard index
+    * `command` -- a write command tuple
+    * `reply_to` -- the `from` ref from the caller's `GenServer.call`
+  """
+  @spec write_async(non_neg_integer(), command(), GenServer.from()) :: :ok
+  def write_async(shard_index, command, reply_to) do
+    GenServer.cast(batcher_name(shard_index), {:write, command, reply_to})
+  end
+
+  @doc """
   Returns the registered process name for the batcher at `shard_index`.
 
   ## Examples
@@ -167,6 +223,7 @@ defmodule Ferricstore.Raft.Batcher do
   Synchronously flushes all pending writes across all namespace slots.
 
   Used in tests and before shard shutdown to ensure all writes are committed.
+  Waits for all in-flight pipelined ra commands to complete before returning.
   """
   @spec flush(non_neg_integer()) :: :ok
   def flush(shard_index) do
@@ -225,41 +282,25 @@ defmodule Ferricstore.Raft.Batcher do
 
   @impl true
   def handle_call({:write, command}, from, state) do
-    prefix = extract_prefix(command)
-    {{window_ms, durability}, state} = lookup_ns_config(prefix, state)
-    slot_key = {prefix, durability}
-
-    slot = Map.get(state.slots, slot_key, new_slot(window_ms))
-
-    updated_slot = %{
-      slot
-      | cmds: [command | slot.cmds],
-        froms: [from | slot.froms],
-        window_ms: window_ms
-    }
-
-    # Start timer on first write to this slot
-    updated_slot =
-      if updated_slot.timer_ref == nil do
-        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
-        %{updated_slot | timer_ref: ref}
-      else
-        updated_slot
-      end
-
-    new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
-
-    # Flush immediately if slot is full
-    if length(updated_slot.cmds) >= state.max_batch_size do
-      do_flush_slot(new_state, slot_key)
-    else
-      {:noreply, new_state}
-    end
+    enqueue_write(command, from, state)
   end
 
-  def handle_call(:flush, _from, state) do
+  @impl true
+  def handle_cast({:write, command, reply_to}, state) do
+    enqueue_write(command, reply_to, state)
+  end
+
+  def handle_call(:flush, from, state) do
+    # Flush all pending slots (submits pipelined ra commands)
     new_state = flush_all_slots(state)
-    {:reply, :ok, new_state}
+
+    # If there are in-flight pipelined commands, defer the reply until they
+    # all complete. Otherwise reply immediately.
+    if map_size(new_state.pending) == 0 do
+      {:reply, :ok, new_state}
+    else
+      {:noreply, %{new_state | flush_waiters: [from | new_state.flush_waiters]}}
+    end
   end
 
   @impl true
@@ -279,6 +320,68 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
+  # Handle ra_event notifications from pipeline_command.
+  # Applied commands: {ra_event, Leader, {applied, [{correlation, result}]}}
+  def handle_info({:ra_event, _leader, {:applied, applied_list}}, state) do
+    new_state =
+      Enum.reduce(applied_list, state, fn {corr, result}, acc ->
+        case Map.pop(acc.pending, corr) do
+          {nil, _pending} ->
+            # Unknown correlation -- ignore (could be stale after leader change)
+            acc
+
+          {{froms, :single}, new_pending} ->
+            # Single command: result is the direct apply result
+            [from] = froms
+            GenServer.reply(from, result)
+            %{acc | pending: new_pending}
+
+          {{froms, :batch}, new_pending} ->
+            # Batch command: result should be {:ok, results_list}
+            case result do
+              {:ok, results} when is_list(results) ->
+                Enum.zip(froms, results)
+                |> Enum.each(fn {from, r} -> GenServer.reply(from, r) end)
+
+              other ->
+                # Unexpected shape -- reply to all with the raw result
+                Enum.each(froms, fn from -> GenServer.reply(from, other) end)
+            end
+
+            %{acc | pending: new_pending}
+        end
+      end)
+
+    new_state = maybe_reply_flush_waiters(new_state)
+    {:noreply, new_state}
+  end
+
+  # Handle rejected commands (not_leader). This can happen if the ra leader
+  # changes during a pipeline submission. Re-submit using process_command
+  # (blocking, but this is a rare recovery path) with the correct leader.
+  def handle_info({:ra_event, _from_id, {:rejected, {not_leader, maybe_leader, corr}}}, state) do
+    case Map.pop(state.pending, corr) do
+      {nil, _pending} ->
+        {:noreply, state}
+
+      {{froms, _kind}, new_pending} ->
+        new_state = %{state | pending: new_pending}
+
+        leader =
+          case {not_leader, maybe_leader} do
+            {:not_leader, leader} when leader != :undefined and leader != nil -> leader
+            _ -> state.shard_id
+          end
+
+        # Reply with error so callers can retry through the correct leader.
+        Enum.each(froms, fn from ->
+          GenServer.reply(from, {:error, {:not_leader, leader}})
+        end)
+
+        {:noreply, maybe_reply_flush_waiters(new_state)}
+    end
+  end
+
   # Handle legacy :flush messages (e.g. from cancel_timer race conditions)
   def handle_info(:flush, state) do
     {:noreply, state}
@@ -288,6 +391,54 @@ defmodule Ferricstore.Raft.Batcher do
   # Sent by NamespaceConfig after any set/reset operation.
   def handle_info(:ns_config_changed, state) do
     {:noreply, %{state | ns_cache: %{}}}
+  end
+
+  # Catch-all for unexpected messages (e.g. stale Task results, DOWN messages
+  # from previous implementation). Silently discard.
+  def handle_info(_msg, state) do
+    {:noreply, state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: write enqueue (shared by handle_call and handle_cast)
+  # ---------------------------------------------------------------------------
+
+  # Enqueues a write command into the appropriate namespace slot.
+  # Returns `{:noreply, state}` -- the caller is replied to later when the
+  # batch is flushed and committed.
+  @spec enqueue_write(command(), GenServer.from(), %__MODULE__{}) :: {:noreply, %__MODULE__{}}
+  defp enqueue_write(command, from, state) do
+    prefix = extract_prefix(command)
+    {{window_ms, durability}, state} = lookup_ns_config(prefix, state)
+    slot_key = {prefix, durability}
+
+    slot = Map.get(state.slots, slot_key, new_slot(window_ms))
+
+    updated_slot = %{
+      slot
+      | cmds: [command | slot.cmds],
+        froms: [from | slot.froms],
+        window_ms: window_ms,
+        count: Map.get(slot, :count, 0) + 1
+    }
+
+    # Start timer on first write to this slot
+    updated_slot =
+      if updated_slot.timer_ref == nil do
+        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
+        %{updated_slot | timer_ref: ref}
+      else
+        updated_slot
+      end
+
+    new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+
+    # Flush immediately if slot is full (O(1) count check instead of O(n) length)
+    if updated_slot.count >= state.max_batch_size do
+      do_flush_slot(new_state, slot_key)
+    else
+      {:noreply, new_state}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -322,69 +473,43 @@ defmodule Ferricstore.Raft.Batcher do
 
         {_prefix, durability} = slot_key
 
-        case durability do
-          :async ->
-            # Async durability path (spec 2F.3): write directly to the shard
-            # via AsyncApplyWorker and reply to callers immediately without
-            # waiting for Raft consensus.
-            submit_async(state.shard_index, batch, froms)
+        new_state =
+          case durability do
+            :async ->
+              # Async durability path (spec 2F.3): write directly to the shard
+              # via AsyncApplyWorker and reply to callers immediately without
+              # waiting for Raft consensus. Non-blocking, no pipeline needed.
+              submit_async(state.shard_index, batch, froms)
+              state
 
-          :quorum ->
-            # Quorum durability path: submit through Raft for consensus.
-            # For single commands, submit directly without batch wrapper.
-            # For multiple commands, wrap in a batch.
-            case batch do
-              [single_cmd] ->
-                submit_single(state.shard_id, single_cmd, froms)
-
-              _multiple ->
-                submit_batch(state.shard_id, batch, froms)
-            end
-        end
+            :quorum ->
+              # Quorum durability path: submit via ra:pipeline_command/3 which
+              # is non-blocking (cast). The ra_event callback will deliver
+              # results and trigger GenServer.reply to all callers.
+              pipeline_submit(state, batch, froms)
+          end
 
         # Remove the slot entirely once flushed (clean up empty slots)
-        new_slots = Map.delete(state.slots, slot_key)
-        {:noreply, %{state | slots: new_slots}}
+        new_slots = Map.delete(new_state.slots, slot_key)
+        {:noreply, %{new_state | slots: new_slots}}
     end
   end
 
-  defp submit_single(shard_id, command, [from]) do
-    case :ra.process_command(shard_id, command) do
-      {:ok, result, _leader} ->
-        GenServer.reply(from, result)
-
-      {:error, reason} ->
-        GenServer.reply(from, {:error, reason})
-
-      {:timeout, _leader} ->
-        GenServer.reply(from, {:error, :ra_timeout})
-    end
+  # Submit a batch via ra:pipeline_command/3 with a correlation ref.
+  # For single commands, submit directly (no batch wrapper).
+  # For multiple commands, wrap in {:batch, commands}.
+  # Returns updated state with the correlation tracked in `pending`.
+  @spec pipeline_submit(%__MODULE__{}, [command()], [GenServer.from()]) :: %__MODULE__{}
+  defp pipeline_submit(state, [single_cmd], froms) do
+    corr = make_ref()
+    :ra.pipeline_command(state.shard_id, single_cmd, corr, :normal)
+    %{state | pending: Map.put(state.pending, corr, {froms, :single})}
   end
 
-  defp submit_batch(shard_id, batch, froms) do
-    case :ra.process_command(shard_id, {:batch, batch}) do
-      {:ok, {:ok, results}, _leader} ->
-        Enum.zip(froms, results)
-        |> Enum.each(fn {from, result} ->
-          GenServer.reply(from, result)
-        end)
-
-      {:ok, result, _leader} ->
-        # Unexpected result shape -- reply to all with the raw result
-        Enum.each(froms, fn from ->
-          GenServer.reply(from, result)
-        end)
-
-      {:error, reason} ->
-        Enum.each(froms, fn from ->
-          GenServer.reply(from, {:error, reason})
-        end)
-
-      {:timeout, _leader} ->
-        Enum.each(froms, fn from ->
-          GenServer.reply(from, {:error, :ra_timeout})
-        end)
-    end
+  defp pipeline_submit(state, batch, froms) do
+    corr = make_ref()
+    :ra.pipeline_command(state.shard_id, {:batch, batch}, corr, :normal)
+    %{state | pending: Map.put(state.pending, corr, {froms, :batch})}
   end
 
   # Async durability path: sends commands to the AsyncApplyWorker (fire-and-forget)
@@ -399,6 +524,17 @@ defmodule Ferricstore.Raft.Batcher do
     Enum.each(froms, fn from ->
       GenServer.reply(from, :ok)
     end)
+  end
+
+  # Reply to flush waiters when all in-flight pipelined commands have completed.
+  @spec maybe_reply_flush_waiters(%__MODULE__{}) :: %__MODULE__{}
+  defp maybe_reply_flush_waiters(%{pending: pending, flush_waiters: waiters} = state) do
+    if map_size(pending) == 0 and waiters != [] do
+      Enum.each(waiters, fn from -> GenServer.reply(from, :ok) end)
+      %{state | flush_waiters: []}
+    else
+      state
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -426,18 +562,14 @@ defmodule Ferricstore.Raft.Batcher do
 
   @spec new_slot(pos_integer()) :: slot()
   defp new_slot(window_ms) do
-    %{cmds: [], froms: [], timer_ref: nil, window_ms: window_ms}
+    %{cmds: [], froms: [], timer_ref: nil, window_ms: window_ms, count: 0}
   end
 
   defp cancel_timer(nil), do: :ok
 
-  defp cancel_timer(ref) do
-    Process.cancel_timer(ref)
-    # Flush any pending :flush_slot message that might have arrived
-    receive do
-      {:flush_slot, _} -> :ok
-    after
-      0 -> :ok
-    end
-  end
+  # Uses `info: false` to avoid a return-value message, and skips the
+  # selective receive that scanned the entire mailbox (~1-5us under load).
+  # Stale {:flush_slot, _} messages are harmless: handle_info already
+  # handles the case where the slot no longer exists (returns {:noreply, state}).
+  defp cancel_timer(ref), do: Process.cancel_timer(ref, info: false)
 end

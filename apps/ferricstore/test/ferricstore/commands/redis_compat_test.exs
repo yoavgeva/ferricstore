@@ -1238,11 +1238,11 @@ defmodule Ferricstore.Commands.RedisCompatTest do
   # ===========================================================================
 
   describe "OBJECT command edge cases" do
-    test "OBJECT ENCODING on existing key returns 'raw'" do
+    test "OBJECT ENCODING on existing short string key returns 'embstr'" do
       store = MockStore.make()
       Strings.handle("SET", ["k", "v"], store)
 
-      assert "raw" = Generic.handle("OBJECT", ["ENCODING", "k"], store)
+      assert "embstr" = Generic.handle("OBJECT", ["ENCODING", "k"], store)
     end
 
     test "OBJECT ENCODING on missing key returns error" do

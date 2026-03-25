@@ -80,6 +80,7 @@ defmodule FerricstoreServer.ShutdownTest do
       shard_idx = Router.shard_for(key)
       shard_name = Router.shard_name(shard_idx)
       :ok = GenServer.call(shard_name, :flush)
+      Ferricstore.Store.BitcaskWriter.flush_all()
 
       # Verify the shard's data directory exists and has files.
       shard_dir = DataDir.shard_data_path(data_dir, shard_idx)
@@ -111,13 +112,37 @@ defmodule FerricstoreServer.ShutdownTest do
       # Flush all shards to guarantee writes are on disk.
       ShardHelpers.flush_all_shards()
 
-      # Verify each key is recoverable from its shard's Bitcask directory.
+      # Verify each key is recoverable by scanning the v2 data files directly.
       for {k, v} <- keys_and_values do
         shard_idx = Router.shard_for(k)
         shard_dir = DataDir.shard_data_path(data_dir, shard_idx)
-        {:ok, store} = NIF.new(shard_dir)
-        {:ok, recovered} = NIF.get(store, k)
-        assert recovered == v, "Key #{k} should be recoverable from Bitcask"
+
+        # Scan all log files in the shard directory to find the key
+        {:ok, files} = File.ls(shard_dir)
+        log_files = Enum.filter(files, &String.ends_with?(&1, ".log")) |> Enum.sort()
+
+        found =
+          Enum.any?(log_files, fn log_name ->
+            log_path = Path.join(shard_dir, log_name)
+            case NIF.v2_scan_file(log_path) do
+              {:ok, records} ->
+                # Find the last non-tombstone entry for this key
+                last = records
+                  |> Enum.filter(fn {rk, _, _, _, _} -> rk == k end)
+                  |> List.last()
+                case last do
+                  {^k, offset, _, _, false} ->
+                    case NIF.v2_pread_at(log_path, offset) do
+                      {:ok, ^v} -> true
+                      _ -> false
+                    end
+                  _ -> false
+                end
+              _ -> false
+            end
+          end)
+
+        assert found, "Key #{k} should be recoverable from Bitcask"
       end
     end
 
@@ -156,8 +181,7 @@ defmodule FerricstoreServer.ShutdownTest do
     @tag :capture_log
     test "starting and stopping an isolated shard preserves written data" do
       # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
-      original = Application.get_env(:ferricstore, :raft_enabled)
-      Application.put_env(:ferricstore, :raft_enabled, false)
+
 
       # Start a shard outside the application supervisor tree with a
       # unique index and temporary directory to avoid conflicts.
@@ -165,7 +189,7 @@ defmodule FerricstoreServer.ShutdownTest do
       File.mkdir_p!(tmp_dir)
 
       on_exit(fn ->
-        Application.put_env(:ferricstore, :raft_enabled, original)
+
         File.rm_rf(tmp_dir)
       end)
 
@@ -203,15 +227,14 @@ defmodule FerricstoreServer.ShutdownTest do
     @tag :capture_log
     test "after shutdown signal, pending writes are flushed" do
       # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
-      original = Application.get_env(:ferricstore, :raft_enabled)
-      Application.put_env(:ferricstore, :raft_enabled, false)
+
 
       # Start an isolated shard so we can stop it without affecting the
       # application supervisor tree.
       tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_flush_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(tmp_dir)
       on_exit(fn ->
-        Application.put_env(:ferricstore, :raft_enabled, original)
+
         File.rm_rf(tmp_dir)
       end)
 
@@ -245,13 +268,12 @@ defmodule FerricstoreServer.ShutdownTest do
     @tag :capture_log
     test "after shutdown, hint files exist on disk" do
       # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
-      original = Application.get_env(:ferricstore, :raft_enabled)
-      Application.put_env(:ferricstore, :raft_enabled, false)
+
 
       tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_hint_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(tmp_dir)
       on_exit(fn ->
-        Application.put_env(:ferricstore, :raft_enabled, original)
+
         File.rm_rf(tmp_dir)
       end)
 
@@ -279,13 +301,12 @@ defmodule FerricstoreServer.ShutdownTest do
     @tag :capture_log
     test "shard terminate/2 emits [:ferricstore, :shard, :shutdown] telemetry" do
       # Isolated shard tests bypass Raft (no ra system for ad-hoc indices)
-      original = Application.get_env(:ferricstore, :raft_enabled)
-      Application.put_env(:ferricstore, :raft_enabled, false)
+
 
       tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_term_telem_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(tmp_dir)
       on_exit(fn ->
-        Application.put_env(:ferricstore, :raft_enabled, original)
+
         File.rm_rf(tmp_dir)
       end)
 
