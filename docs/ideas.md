@@ -13,12 +13,6 @@ Store integers and floats natively in ETS instead of strings. Would enable:
 
 **If revisited:** Convert at the NIF boundary (`to_disk_binary`), not at `value_for_ets`. ETS keeps native types, disk gets strings. Design doc at `docs/typed-ets-values-design.md`.
 
-## Multi-Node Async Replication Channel
-
-Currently async durability writes ETS + Bitcask locally but doesn't replicate to followers via Raft (fire-and-forget `ra:pipeline_command` submits to the log but ordering conflicts with quorum commands). A dedicated replication channel outside the Raft log would allow true async replication without ordering issues.
-
-**Why deferred:** Single-node async works perfectly. Multi-node requires a separate replication protocol (batch changes, send to followers, apply). Complex to get right without re-inventing Raft.
-
 ## RESP2 Fallback
 
 Support RESP2 protocol for old Redis clients that don't speak RESP3. Would require a protocol negotiation layer in the connection handler.
