@@ -1473,37 +1473,11 @@ defmodule FerricstoreServer.Connection do
     alias Ferricstore.Commands.List
     alias Ferricstore.Waiters
 
-    # Register as waiter for all watched keys
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
 
-    # Re-arm active: :once so we can detect client disconnect during the block.
-    # The client should not send commands while blocked, but if the connection
-    # is closed we need to know.
-    state.transport.setopts(state.socket, active: :once)
+    result = block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
 
-    result =
-      receive do
-        {:waiter_notify, notified_key} ->
-          # A push happened on one of our keys — try to pop
-          case List.handle(pop_cmd, [notified_key], store) do
-            nil -> nil
-            {:error, _} -> nil
-            value -> {:ok, [notified_key, value]}
-          end
-
-        # Client disconnected while blocked — clean up and stop.
-        {:tcp_closed, _socket} ->
-          :client_closed
-
-        {:tcp_error, _socket, _reason} ->
-          :client_closed
-      after
-        timeout_ms ->
-          nil
-      end
-
-    # Cleanup: unregister from all keys
     Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
 
     case result do
@@ -1517,6 +1491,55 @@ defmodule FerricstoreServer.Connection do
 
       nil ->
         {:continue, Encoder.encode(nil), state}
+    end
+  end
+
+  # Blocking wait loop that handles TCP messages arriving during the block.
+  # With active: true, TCP data keeps flowing — we buffer it and re-enter
+  # the wait. Only waiter notifications, close, and timeout are acted on.
+  defp block_wait_loop(state, deadline, timeout_ms, pop_cmd, store) do
+    alias Ferricstore.Commands.List
+    remaining = max(0, deadline - System.monotonic_time(:millisecond))
+
+    receive do
+      {:waiter_notify, notified_key} ->
+        case List.handle(pop_cmd, [notified_key], store) do
+          nil -> nil
+          {:error, _} -> nil
+          value -> {:ok, [notified_key, value]}
+        end
+
+      # TCP data arriving during block — buffer it and keep waiting.
+      # The client shouldn't send commands while blocked, but with
+      # active: true the kernel delivers any pending data.
+      {:tcp, _socket, _data} ->
+        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
+
+      {:ssl, _socket, _data} ->
+        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
+
+      {:tcp_passive, _socket} ->
+        state.transport.setopts(state.socket, active: state.active_mode)
+        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
+
+      {:ssl_passive, _socket} ->
+        state.transport.setopts(state.socket, active: state.active_mode)
+        block_wait_loop(state, deadline, timeout_ms, pop_cmd, store)
+
+      {:tcp_closed, _socket} ->
+        :client_closed
+
+      {:tcp_error, _socket, _reason} ->
+        :client_closed
+
+      {:ssl_closed, _socket} ->
+        :client_closed
+
+      {:ssl_error, _socket, _reason} ->
+        :client_closed
+    after
+      remaining ->
+        nil
     end
   end
 
@@ -2204,23 +2227,28 @@ defmodule FerricstoreServer.Connection do
   # Pub/Sub mode loop
   # ---------------------------------------------------------------------------
 
-  defp pubsub_loop(%__MODULE__{socket: socket, transport: transport} = state) do
-    # Re-arm active: :once — needed both for the next TCP chunk and so that
-    # the kernel can deliver :tcp_closed while we wait for pub/sub pushes.
-    transport.setopts(socket, active: :once)
+  defp pubsub_loop(%__MODULE__{socket: socket, transport: transport, active_mode: active_mode} = state) do
+    # No setopts needed — active mode (true/N/:once) is maintained from
+    # the main loop. TCP data keeps arriving and is handled below.
+    if active_mode == :once do
+      transport.setopts(socket, active: :once)
+    end
 
     receive do
-      # TCP active-mode data — client sent a command while in pub/sub mode
-      # (only SUBSCRIBE/UNSUBSCRIBE/PING/QUIT/RESET are allowed).
-      # handle_data flows back through loop -> pubsub_loop, which re-arms.
       {:tcp, ^socket, data} ->
         handle_data(state, data)
 
-      # TLS active-mode data
       {:ssl, ^socket, data} ->
         handle_data(state, data)
 
-      # TCP close / error
+      {:tcp_passive, ^socket} ->
+        transport.setopts(socket, active: active_mode)
+        pubsub_loop(state)
+
+      {:ssl_passive, ^socket} ->
+        transport.setopts(socket, active: active_mode)
+        pubsub_loop(state)
+
       {:tcp_closed, ^socket} ->
         cleanup_connection(state)
 
@@ -2228,7 +2256,6 @@ defmodule FerricstoreServer.Connection do
         cleanup_connection(state)
         transport.close(socket)
 
-      # TLS close / error
       {:ssl_closed, ^socket} ->
         cleanup_connection(state)
 
@@ -2236,7 +2263,6 @@ defmodule FerricstoreServer.Connection do
         cleanup_connection(state)
         transport.close(socket)
 
-      # Pub/Sub messages from the internal PubSub engine
       {:pubsub_message, channel, message} ->
         push = {:push, ["message", channel, message]}
         transport.send(socket, Encoder.encode(push))
@@ -2247,14 +2273,11 @@ defmodule FerricstoreServer.Connection do
         transport.send(socket, Encoder.encode(push))
         pubsub_loop(state)
 
-      # Client tracking invalidation push — can arrive while in pub/sub mode.
-      # Keys are passed directly to avoid RESP re-parsing.
       {:tracking_invalidation, iodata, keys} ->
         new_state = l1_invalidate_keys(state, keys)
         transport.send(socket, iodata)
         pubsub_loop(new_state)
 
-      # ACL invalidation — refresh cache even while in pub/sub mode
       {:acl_invalidate, username} ->
         pubsub_loop(maybe_refresh_acl_cache(state, username))
     end
