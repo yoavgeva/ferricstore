@@ -1,10 +1,16 @@
 defmodule FerricstoreNebulex.AdapterTest do
-  use ExUnit.Case, async: true
-  use FerricStore.Sandbox.Case
+  use ExUnit.Case, async: false
 
   alias FerricstoreNebulex.TestCache
 
   setup do
+    # Flush all keys to prevent cross-test pollution.
+    # Nebulex Cache runs in its own GenServer (no sandbox isolation).
+    # Double flush: first clears ETS, wait for Raft replays, then clear again.
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    Process.sleep(200)
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+
     {:ok, pid} = TestCache.start_link()
 
     on_exit(fn ->

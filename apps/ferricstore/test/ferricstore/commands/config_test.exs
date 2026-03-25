@@ -76,11 +76,7 @@ defmodule Ferricstore.Commands.ConfigTest do
       assert String.length(value) > 0
     end
 
-    test "CONFIG GET raft-enabled returns true or false" do
-      result = Server.handle("CONFIG", ["GET", "raft-enabled"], MockStore.make())
-      assert ["raft-enabled", value] = result
-      assert value in ["true", "false"]
-    end
+    # raft-enabled was removed — Raft is always on
   end
 
   # ---------------------------------------------------------------------------
@@ -139,7 +135,7 @@ defmodule Ferricstore.Commands.ConfigTest do
       assert "maxclients" in keys
       assert "tcp-port" in keys
       assert "data-dir" in keys
-      assert "raft-enabled" in keys
+      # raft-enabled removed — Raft always on
       assert "maxmemory-policy" in keys
       assert "notify-keyspace-events" in keys
       assert "slowlog-log-slower-than" in keys
@@ -295,11 +291,7 @@ defmodule Ferricstore.Commands.ConfigTest do
       assert msg =~ "read-only"
     end
 
-    test "CONFIG SET raft-enabled returns error" do
-      result = Server.handle("CONFIG", ["SET", "raft-enabled", "true"], MockStore.make())
-      assert {:error, msg} = result
-      assert msg =~ "read-only"
-    end
+    # raft-enabled removed — Raft always on
 
     test "CONFIG SET maxclients returns error" do
       result = Server.handle("CONFIG", ["SET", "maxclients", "5000"], MockStore.make())
