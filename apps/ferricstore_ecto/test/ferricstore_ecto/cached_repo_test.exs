@@ -9,11 +9,14 @@ defmodule FerricstoreEcto.CachedRepoTest do
   import Ecto.Query
 
   setup do
-    # SQL Sandbox
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(TestRepo)
 
     # FerricStore Sandbox
     namespace = FerricStore.Sandbox.checkout()
+
+    # Also flush to ensure no stale Raft entries from previous app tests
+    FerricStore.flushall()
+
     on_exit(fn -> FerricStore.Sandbox.checkin(namespace) end)
 
     :ok

@@ -18,7 +18,12 @@ Ecto.Migrator.up(FerricstoreEcto.TestRepo, 1, FerricstoreEcto.Test.Migrations, l
 # Set sandbox mode
 Ecto.Adapters.SQL.Sandbox.mode(FerricstoreEcto.TestRepo, :manual)
 
-# Flush all FerricStore keys via Raft (writes tombstones, prevents resurrection)
+# Flush FerricStore: Raft tombstones + direct ETS clear
 FerricStore.flushall()
+shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+for i <- 0..(shard_count - 1) do
+  try do :ets.delete_all_objects(:"keydir_#{i}") catch :error, :badarg -> :ok end
+  try do :ets.delete_all_objects(:"prefix_keys_#{i}") catch :error, :badarg -> :ok end
+end
 
 ExUnit.start()
