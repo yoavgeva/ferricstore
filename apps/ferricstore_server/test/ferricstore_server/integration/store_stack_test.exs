@@ -2,6 +2,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
   @moduledoc false
 
   use ExUnit.Case, async: false
+  @moduletag :cluster
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Commands.{Dispatcher, Expiry, Server, Strings}

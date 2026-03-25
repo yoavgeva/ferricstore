@@ -197,7 +197,30 @@ defmodule FerricstoreEcto.CachedRepoTest do
       {:ok, _} = user |> Ecto.Changeset.change(%{name: "alice2"}) |> TestRepo.update()
 
       # Cache should be invalidated (DEL)
-      {:ok, fields_after} = FerricStore.hgetall(entity_cache_key("users", user.id))
+      cache_key = entity_cache_key("users", user.id)
+      {:ok, fields_after} = FerricStore.hgetall(cache_key)
+
+      if map_size(fields_after) > 0 do
+        IO.puts("\n=== DEBUG: cache not cleared after update ===")
+        IO.puts("  cache_key: #{inspect(cache_key)}")
+        IO.puts("  fields_after: #{inspect(fields_after)}")
+        IO.puts("  sandbox: #{inspect(Process.get(:ferricstore_sandbox))}")
+
+        shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+        for i <- 0..(shard_count - 1) do
+          keydir = :"keydir_#{i}"
+          try do
+            entries = :ets.foldl(fn {k, v, _, _, _, _, _}, acc ->
+              if String.contains?(to_string(k), "user") or String.contains?(to_string(k), "cache"), do: [{k, v} | acc], else: acc
+            end, [], keydir)
+            if entries != [], do: IO.puts("  keydir_#{i}: #{inspect(entries, limit: 10)}")
+          rescue
+            _ -> :ok
+          end
+        end
+        IO.puts("=== END DEBUG ===\n")
+      end
+
       assert map_size(fields_after) == 0
 
       # Next get should fetch from DB with new value
