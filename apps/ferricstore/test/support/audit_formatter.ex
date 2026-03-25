@@ -13,29 +13,24 @@ defmodule Ferricstore.Test.AuditFormatter do
 
   use GenServer
 
-  @log_path "/tmp/ferricstore_test_audit.log"
+  @log_dir "/tmp/ferricstore_test_audit"
 
   # -- GenServer callbacks (ExUnit formatter protocol) --
 
   @impl true
   def init(_opts) do
-    # Clear log if it's from a previous run (>10s old) or doesn't exist.
-    # Within the same umbrella run, apps start within seconds of each other.
-    stale? = case File.stat(@log_path) do
-      {:ok, %{mtime: mtime}} ->
-        now = :calendar.local_time() |> :calendar.datetime_to_gregorian_seconds()
-        file_time = :calendar.datetime_to_gregorian_seconds(mtime)
-        now - file_time > 10
-      _ -> true
+    File.mkdir_p!(@log_dir)
+
+    # Detect which app we're in from the mix project
+    app_name = case Mix.Project.config()[:app] do
+      nil -> "unknown"
+      app -> Atom.to_string(app)
     end
 
-    if stale? do
-      File.write!(@log_path, "=== Suite started #{timestamp()} ===\n")
-    else
-      File.write!(@log_path, "\n=== App started #{timestamp()} ===\n", [:append])
-    end
+    log_path = Path.join(@log_dir, "#{app_name}.log")
+    File.write!(log_path, "=== #{app_name} started #{timestamp()} ===\n")
 
-    {:ok, %{}}
+    {:ok, %{log_path: log_path}}
   end
 
   @impl true
@@ -74,7 +69,7 @@ defmodule Ferricstore.Test.AuditFormatter do
         "ns=#{sandbox_ns} ets=#{ets_count} prefix=#{prefix_count} pt=#{pt_count} procs=#{proc_count} " <>
         "disk_files=#{bitcask_files} disk_bytes=#{bitcask_bytes}#{leak_tag}\n"
 
-    File.write!(@log_path, line, [:append])
+    File.write!(state.log_path, line, [:append])
 
     {:noreply, state}
   end
