@@ -4092,8 +4092,13 @@ defmodule FerricStore.Pipe do
   Pipeline accumulator for batching multiple FerricStore commands.
 
   Used with `FerricStore.pipeline/1` to batch multiple operations into a single
-  group-commit entry. Commands are accumulated in reverse order and executed
-  sequentially when the pipeline completes.
+  Raft entry per shard. Commands are accumulated in reverse order and on execute,
+  converted to RESP tuples and dispatched through the Coordinator. Single-shard
+  pipelines commit in one Raft round-trip; cross-shard pipelines use the
+  anchor-shard mechanism.
+
+  Results are normalized to match the FerricStore public API format (e.g.
+  `{:ok, value}` for GET, `:ok` for DEL) rather than raw Dispatcher values.
 
   ## Usage
 
@@ -4201,30 +4206,128 @@ defmodule FerricStore.Pipe do
   end
 
   @doc """
-  Executes all accumulated pipeline commands in order and returns results.
+  Executes all accumulated pipeline commands as a single batch Raft entry
+  per shard via the Coordinator.
 
-  This is called internally by `FerricStore.pipeline/1`. Each command returns
-  its result in the same format as the standalone API function.
+  This is called internally by `FerricStore.pipeline/1`. Commands are converted
+  to RESP-style tuples and dispatched through `Ferricstore.Transaction.Coordinator`,
+  which groups them by shard and submits each group as a single `{:batch}` or
+  `{:tx_execute}` Raft entry. Single-shard pipelines commit in one Raft round-trip;
+  cross-shard pipelines use the anchor-shard mechanism.
+
+  Results are returned in the original command order.
   """
   @spec execute(t()) :: [term()]
+  def execute(%__MODULE__{commands: []}), do: []
+
   def execute(%__MODULE__{commands: commands}) do
-    commands
-    |> Enum.reverse()
-    |> Enum.map(&execute_command/1)
+    ordered = Enum.reverse(commands)
+
+    queue = Enum.map(ordered, &to_resp_command/1)
+
+    sandbox_namespace =
+      case Process.get(:ferricstore_sandbox) do
+        nil -> nil
+        ns -> ns
+      end
+
+    raw_results = Ferricstore.Transaction.Coordinator.execute(queue, %{}, sandbox_namespace)
+
+    ordered
+    |> Enum.zip(raw_results)
+    |> Enum.map(fn {cmd, raw} -> normalize_result(cmd, raw) end)
   end
 
-  defp execute_command({:set, key, value, opts}), do: FerricStore.set(key, value, opts)
-  defp execute_command({:get, key}), do: FerricStore.get(key)
-  defp execute_command({:del, key}), do: FerricStore.del(key)
-  defp execute_command({:incr, key}), do: FerricStore.incr(key)
-  defp execute_command({:incr_by, key, amount}), do: FerricStore.incr_by(key, amount)
-  defp execute_command({:hset, key, fields}), do: FerricStore.hset(key, fields)
-  defp execute_command({:hget, key, field}), do: FerricStore.hget(key, field)
-  defp execute_command({:lpush, key, elements}), do: FerricStore.lpush(key, elements)
-  defp execute_command({:rpush, key, elements}), do: FerricStore.rpush(key, elements)
-  defp execute_command({:sadd, key, members}), do: FerricStore.sadd(key, members)
-  defp execute_command({:zadd, key, pairs}), do: FerricStore.zadd(key, pairs)
-  defp execute_command({:expire, key, ttl_ms}), do: FerricStore.expire(key, ttl_ms)
+  # The Coordinator returns raw Dispatcher results (RESP-level values).
+  # Pipeline callers expect the same format as FerricStore public API calls.
+  # This maps Dispatcher results back to the public API format.
+  defp normalize_result({:get, _}, {:error, _} = err), do: err
+  defp normalize_result({:get, _}, value), do: {:ok, value}
+
+  defp normalize_result({:hget, _, _}, {:error, _} = err), do: err
+  defp normalize_result({:hget, _, _}, value), do: {:ok, value}
+
+  defp normalize_result({:del, _}, {:error, _} = err), do: err
+  defp normalize_result({:del, _}, _count), do: :ok
+
+  defp normalize_result({:hset, _, _}, {:error, _} = err), do: err
+  defp normalize_result({:hset, _, _}, _count), do: :ok
+
+  defp normalize_result({:lpush, _, _}, {:error, _} = err), do: err
+  defp normalize_result({:lpush, _, _}, count) when is_integer(count), do: {:ok, count}
+
+  defp normalize_result({:rpush, _, _}, {:error, _} = err), do: err
+  defp normalize_result({:rpush, _, _}, count) when is_integer(count), do: {:ok, count}
+
+  defp normalize_result({:sadd, _, _}, {:error, _} = err), do: err
+  defp normalize_result({:sadd, _, _}, count) when is_integer(count), do: {:ok, count}
+
+  defp normalize_result({:zadd, _, _}, {:error, _} = err), do: err
+  defp normalize_result({:zadd, _, _}, count) when is_integer(count), do: {:ok, count}
+
+  defp normalize_result({:expire, _, _}, {:error, _} = err), do: err
+  defp normalize_result({:expire, _, _}, 1), do: {:ok, true}
+  defp normalize_result({:expire, _, _}, 0), do: {:ok, false}
+
+  # SET, INCR, INCR_BY already return the correct format from Dispatcher
+  defp normalize_result(_, result), do: result
+
+  defp to_resp_command({:set, key, value, opts}) do
+    args = [key, value]
+
+    args =
+      case Keyword.get(opts, :ttl) do
+        nil -> args
+        0 -> args
+        ms -> args ++ ["PX", Integer.to_string(ms)]
+      end
+
+    args =
+      case Keyword.get(opts, :ex) do
+        nil -> args
+        seconds -> args ++ ["EX", Integer.to_string(seconds)]
+      end
+
+    args =
+      case Keyword.get(opts, :px) do
+        nil -> args
+        ms -> args ++ ["PX", Integer.to_string(ms)]
+      end
+
+    args =
+      if Keyword.get(opts, :nx, false), do: args ++ ["NX"], else: args
+
+    args =
+      if Keyword.get(opts, :xx, false), do: args ++ ["XX"], else: args
+
+    {"SET", args}
+  end
+
+  defp to_resp_command({:get, key}), do: {"GET", [key]}
+  defp to_resp_command({:del, key}), do: {"DEL", [key]}
+  defp to_resp_command({:incr, key}), do: {"INCR", [key]}
+  defp to_resp_command({:incr_by, key, amount}), do: {"INCRBY", [key, Integer.to_string(amount)]}
+
+  defp to_resp_command({:hset, key, fields}) do
+    flat = Enum.flat_map(fields, fn {k, v} -> [to_string(k), to_string(v)] end)
+    {"HSET", [key | flat]}
+  end
+
+  defp to_resp_command({:hget, key, field}), do: {"HGET", [key, field]}
+  defp to_resp_command({:lpush, key, elements}), do: {"LPUSH", [key | elements]}
+  defp to_resp_command({:rpush, key, elements}), do: {"RPUSH", [key | elements]}
+  defp to_resp_command({:sadd, key, members}), do: {"SADD", [key | members]}
+
+  defp to_resp_command({:zadd, key, pairs}) do
+    flat = Enum.flat_map(pairs, fn {score, member} ->
+      [to_string(score), member]
+    end)
+    {"ZADD", [key | flat]}
+  end
+
+  defp to_resp_command({:expire, key, ttl_ms}) do
+    {"PEXPIRE", [key, Integer.to_string(ttl_ms)]}
+  end
 end
 
 defmodule FerricStore.Tx do
