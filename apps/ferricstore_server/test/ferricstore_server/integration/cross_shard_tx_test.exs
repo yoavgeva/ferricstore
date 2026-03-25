@@ -181,9 +181,9 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
       assert result == [11, 21]
 
       send_cmd(sock, ["GET", "h"])
-      assert recv_response(sock) == 11
+      assert recv_response(sock) == "11"
       send_cmd(sock, ["GET", "b"])
-      assert recv_response(sock) == 21
+      assert recv_response(sock) == "21"
     end
 
     test "connection returns to normal state after cross-shard tx", %{sock: sock} do

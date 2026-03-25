@@ -399,9 +399,8 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
 
       Task.await_many(tasks, 15_000)
 
-      # Final value should be exactly concurrency * incrs_per_task (native integer)
       result = Router.get(k)
-      assert result == concurrency * incrs_per_task
+      assert result == Integer.to_string(concurrency * incrs_per_task)
 
       # Cleanup
       Router.delete(k)

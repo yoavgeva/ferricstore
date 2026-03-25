@@ -421,9 +421,8 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       assert Enum.at(result, 2) == 11
       assert Enum.at(result, 3) == 12
 
-      # Final value should be 12 (native integer after INCR/DECR)
       send_cmd(sock, ["GET", k])
-      assert recv_response(sock) == 12
+      assert recv_response(sock) == "12"
 
       :gen_tcp.close(sock)
     end
@@ -497,7 +496,7 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       assert Enum.at(result, 0) == 6       # INCR 5 -> 6
       assert Enum.at(result, 1) == 6       # APPEND "foobar" = 6 bytes
       assert Enum.at(result, 2) == 7       # INCR 6 -> 7
-      assert Enum.at(result, 3) == 7       # GET k_num (native int after INCR)
+      assert Enum.at(result, 3) == "7"     # GET k_num (string after INCR)
       assert Enum.at(result, 4) == "foobar" # GET k_str
 
       :gen_tcp.close(sock)
@@ -701,7 +700,7 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
 
       # Final value should be 100 (native integer after INCR)
       send_cmd(sock, ["GET", k])
-      assert recv_response(sock) == 100
+      assert recv_response(sock) == "100"
 
       :gen_tcp.close(sock)
     end
@@ -757,8 +756,7 @@ defmodule FerricstoreServer.Integration.TransactionExtendedTest do
       # Third INCR succeeds: 6 -> 7
       assert Enum.at(result, 2) == 7
 
-      # GET returns final value (native integer after INCR)
-      assert Enum.at(result, 3) == 7
+      assert Enum.at(result, 3) == "7"
 
       :gen_tcp.close(sock)
     end
