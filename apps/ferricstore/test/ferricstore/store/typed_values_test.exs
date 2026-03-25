@@ -9,27 +9,27 @@ defmodule Ferricstore.Store.TypedValuesTest do
     :ok
   end
 
-  describe "INCR stores native integer" do
-    test "INCR on nonexistent key creates integer in ETS" do
+  describe "INCR stores string representation" do
+    test "INCR on nonexistent key creates string in ETS" do
       assert {:ok, 1} = Router.incr("typed:incr_new", 1)
       value = Router.get("typed:incr_new")
-      assert is_integer(value)
-      assert value == 1
+      assert is_binary(value)
+      assert value == "1"
     end
 
-    test "INCR on string parses and stores integer" do
+    test "INCR on string parses and stores string" do
       Router.put("typed:incr_str", "10", 0)
       assert {:ok, 11} = Router.incr("typed:incr_str", 1)
       value = Router.get("typed:incr_str")
-      assert is_integer(value)
-      assert value == 11
+      assert is_binary(value)
+      assert value == "11"
     end
 
     test "multiple INCRs accumulate correctly" do
       assert {:ok, 1} = Router.incr("typed:incr_multi", 1)
       assert {:ok, 3} = Router.incr("typed:incr_multi", 2)
       assert {:ok, 13} = Router.incr("typed:incr_multi", 10)
-      assert Router.get("typed:incr_multi") == 13
+      assert Router.get("typed:incr_multi") == "13"
     end
 
     test "INCR on non-integer returns error, value unchanged" do
@@ -40,33 +40,33 @@ defmodule Ferricstore.Store.TypedValuesTest do
 
     test "INCR on float returns error" do
       Router.put("typed:incr_on_float", "3.14", 0)
-      # INCR on "3.14" should fail since it's not an integer
       assert {:error, _} = Router.incr("typed:incr_on_float", 1)
     end
   end
 
-  describe "INCRBYFLOAT stores native float" do
-    test "INCRBYFLOAT on nonexistent key creates float in ETS" do
+  describe "INCRBYFLOAT stores string representation" do
+    test "INCRBYFLOAT on nonexistent key creates string in ETS" do
       assert {:ok, result} = Router.incr_float("typed:float_new", 3.14)
       assert is_float(result)
       assert_in_delta result, 3.14, 0.001
 
       value = Router.get("typed:float_new")
-      assert is_float(value)
-      assert_in_delta value, 3.14, 0.001
+      assert is_binary(value)
+      {parsed, _} = Float.parse(value)
+      assert_in_delta parsed, 3.14, 0.001
     end
 
-    test "INCRBYFLOAT on integer produces float" do
+    test "INCRBYFLOAT on integer produces string" do
       Router.incr("typed:float_from_int", 10)
       assert {:ok, result} = Router.incr_float("typed:float_from_int", 0.5)
       assert is_float(result)
       assert_in_delta result, 10.5, 0.001
 
       value = Router.get("typed:float_from_int")
-      assert is_float(value)
+      assert is_binary(value)
     end
 
-    test "INCRBYFLOAT on string parses and stores float" do
+    test "INCRBYFLOAT on string parses and stores string" do
       Router.put("typed:float_str", "10.5", 0)
       assert {:ok, result} = Router.incr_float("typed:float_str", 2.5)
       assert is_float(result)
@@ -82,27 +82,28 @@ defmodule Ferricstore.Store.TypedValuesTest do
       assert value == "hello"
     end
 
-    test "SET overwrites integer with string" do
+    test "SET overwrites INCR result with string" do
       Router.incr("typed:set_overwrite", 42)
-      assert Router.get("typed:set_overwrite") == 42
+      assert Router.get("typed:set_overwrite") == "42"
       Router.put("typed:set_overwrite", "hello", 0)
       assert Router.get("typed:set_overwrite") == "hello"
     end
   end
 
-  describe "GET returns native types" do
-    test "GET returns integer unchanged" do
+  describe "GET always returns binary" do
+    test "GET returns string after INCR" do
       Router.incr("typed:get_int", 42)
       value = Router.get("typed:get_int")
-      assert is_integer(value)
-      assert value == 42
+      assert is_binary(value)
+      assert value == "42"
     end
 
-    test "GET returns float unchanged" do
+    test "GET returns string after INCRBYFLOAT" do
       Router.incr_float("typed:get_float", 3.14)
       value = Router.get("typed:get_float")
-      assert is_float(value)
-      assert_in_delta value, 3.14, 0.001
+      assert is_binary(value)
+      {parsed, _} = Float.parse(value)
+      assert_in_delta parsed, 3.14, 0.001
     end
 
     test "GET returns binary unchanged" do
@@ -111,8 +112,8 @@ defmodule Ferricstore.Store.TypedValuesTest do
     end
   end
 
-  describe "string commands handle typed values" do
-    test "APPEND on integer converts to string" do
+  describe "string commands handle values" do
+    test "APPEND on INCR result works" do
       Router.incr("typed:append_int", 42)
       assert {:ok, 3} = Router.append("typed:append_int", "!")
       value = Router.get("typed:append_int")
@@ -120,15 +121,14 @@ defmodule Ferricstore.Store.TypedValuesTest do
       assert value == "42!"
     end
 
-    test "STRLEN on integer counts string representation length" do
+    test "STRLEN on INCR result counts string representation length" do
       Router.incr("typed:strlen_int", 42)
-      # STRLEN dispatches to the commands layer which handles conversion
       store = build_store()
       result = Ferricstore.Commands.Strings.handle("STRLEN", ["typed:strlen_int"], store)
       assert result == 2
     end
 
-    test "GETRANGE on integer extracts from string representation" do
+    test "GETRANGE on INCR result extracts from string representation" do
       Router.incr("typed:getrange_int", 12345)
       store = build_store()
       result = Ferricstore.Commands.Strings.handle("GETRANGE", ["typed:getrange_int", "0", "2"], store)
@@ -137,22 +137,18 @@ defmodule Ferricstore.Store.TypedValuesTest do
   end
 
   describe "type transitions" do
-    test "String -> Integer -> String (via APPEND)" do
-      # Start as string
+    test "String -> INCR -> APPEND (all strings)" do
       Router.put("typed:transition", "42", 0)
       assert is_binary(Router.get("typed:transition"))
 
-      # INCR converts to integer
       assert {:ok, 43} = Router.incr("typed:transition", 1)
-      assert is_integer(Router.get("typed:transition"))
+      assert Router.get("typed:transition") == "43"
 
-      # APPEND converts back to string
       assert {:ok, 3} = Router.append("typed:transition", "!")
       value = Router.get("typed:transition")
       assert is_binary(value)
       assert value == "43!"
 
-      # INCR on "43!" should fail
       assert {:error, _} = Router.incr("typed:transition", 1)
     end
   end
@@ -162,17 +158,17 @@ defmodule Ferricstore.Store.TypedValuesTest do
       Router.incr("typed:disk_int", 42)
       Router.incr_float("typed:disk_float", 3.14)
 
-      # Flush to disk
       Ferricstore.Store.BitcaskWriter.flush_all()
       ShardHelpers.flush_all_shards()
 
-      # Verify values are still readable
-      assert Router.get("typed:disk_int") == 42
-      assert_in_delta Router.get("typed:disk_float"), 3.14, 0.001
+      assert Router.get("typed:disk_int") == "42"
+      value = Router.get("typed:disk_float")
+      assert is_binary(value)
+      {parsed, _} = Float.parse(value)
+      assert_in_delta parsed, 3.14, 0.001
     end
   end
 
-  # Build a store map for testing commands layer directly
   defp build_store do
     %{
       get: &Router.get/1,

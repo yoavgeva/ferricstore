@@ -575,7 +575,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       key = ukey("qw")
       Router.put(key, "10.5", 0)
       assert {:ok, result} = Router.incr_float(key, 1.5)
-      assert result == "12"
+      assert_in_delta result, 12.0, 0.001
     end
 
     test "APPEND through bypass" do

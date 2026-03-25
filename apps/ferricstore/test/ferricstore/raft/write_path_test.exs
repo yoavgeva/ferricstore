@@ -180,7 +180,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incr_new")
 
       assert {:ok, 1} = Router.incr(k, 1)
-      assert 1 == Router.get(k)
+      assert "1" == Router.get(k)
     end
 
     test "INCR on existing integer key increments correctly" do
@@ -188,7 +188,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "10", 0)
       assert {:ok, 15} = Router.incr(k, 5)
-      assert 15 == Router.get(k)
+      assert "15" == Router.get(k)
     end
 
     test "DECR works through Raft path" do
@@ -196,7 +196,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "100", 0)
       assert {:ok, 95} = Router.incr(k, -5)
-      assert 95 == Router.get(k)
+      assert "95" == Router.get(k)
     end
 
     test "multiple sequential INCRs produce correct total" do
@@ -206,7 +206,7 @@ defmodule Ferricstore.Raft.WritePathTest do
         Router.incr(k, 1)
       end
 
-      assert 10 == Router.get(k)
+      assert "10" == Router.get(k)
     end
   end
 
@@ -1212,7 +1212,8 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       assert {:ok, result} = Router.incr_float(k, 1.5)
       assert_in_delta result, 1.5, 0.001
-      assert_in_delta Router.get(k), 1.5, 0.001
+      {parsed, _} = Float.parse(Router.get(k))
+      assert_in_delta parsed, 1.5, 0.001
     end
 
     test "increments existing float value correctly" do
@@ -1221,7 +1222,8 @@ defmodule Ferricstore.Raft.WritePathTest do
       :ok = Router.put(k, "10", 0)
       assert {:ok, result} = Router.incr_float(k, 2.5)
       assert_in_delta result, 12.5, 0.001
-      assert_in_delta Router.get(k), 12.5, 0.001
+      {parsed, _} = Float.parse(Router.get(k))
+      assert_in_delta parsed, 12.5, 0.001
     end
 
     test "increments integer string as float" do
@@ -1249,7 +1251,8 @@ defmodule Ferricstore.Raft.WritePathTest do
       {:ok, _} = Router.incr_float(k, 1.0)
 
       {value, expire_at_ms} = Router.get_meta(k)
-      assert_in_delta value, 6.0, 0.001
+      {parsed, _} = Float.parse(value)
+      assert_in_delta parsed, 6.0, 0.001
       assert expire_at_ms == future
     end
   end
@@ -1539,7 +1542,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, Integer.to_string(max_int64), 0)
       assert {:ok, ^expected} = Router.incr(k, 1)
-      assert expected == Router.get(k)
+      assert Integer.to_string(expected) == Router.get(k)
     end
 
     test "DECRBY with negative delta through Raft — effectively increments" do
@@ -1547,7 +1550,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(k, "10", 0)
       assert {:ok, 15} = Router.incr(k, 5)
-      assert 15 == Router.get(k)
+      assert "15" == Router.get(k)
     end
 
     test "INCR then GET in same Raft batch — consistent" do
@@ -1556,13 +1559,13 @@ defmodule Ferricstore.Raft.WritePathTest do
       :ok = Router.put(k, "0", 0)
 
       {:ok, 1} = Router.incr(k, 1)
-      assert 1 == Router.get(k)
+      assert "1" == Router.get(k)
 
       {:ok, 2} = Router.incr(k, 1)
-      assert 2 == Router.get(k)
+      assert "2" == Router.get(k)
 
       {:ok, 12} = Router.incr(k, 10)
-      assert 12 == Router.get(k)
+      assert "12" == Router.get(k)
     end
   end
 
@@ -1577,7 +1580,8 @@ defmodule Ferricstore.Raft.WritePathTest do
       :ok = Router.put(k, "10", 0)
       assert {:ok, result} = Router.incr_float(k, 0.5)
       assert_in_delta result, 10.5, 0.001
-      assert_in_delta Router.get(k), 10.5, 0.001
+      {parsed, _} = Float.parse(Router.get(k))
+      assert_in_delta parsed, 10.5, 0.001
     end
 
     test "INCRBYFLOAT negative delta" do
@@ -1586,7 +1590,8 @@ defmodule Ferricstore.Raft.WritePathTest do
       :ok = Router.put(k, "10.5", 0)
       assert {:ok, result} = Router.incr_float(k, -0.5)
       assert_in_delta result, 10.0, 0.001
-      assert_in_delta Router.get(k), 10.0, 0.001
+      {parsed, _} = Float.parse(Router.get(k))
+      assert_in_delta parsed, 10.0, 0.001
     end
 
     test "INCRBYFLOAT on 'not_a_number' — returns error" do
@@ -1606,7 +1611,8 @@ defmodule Ferricstore.Raft.WritePathTest do
       {:ok, _} = Router.incr_float(k, 2.5)
 
       {value, expire_at_ms} = Router.get_meta(k)
-      assert_in_delta value, 7.5, 0.001
+      {parsed, _} = Float.parse(value)
+      assert_in_delta parsed, 7.5, 0.001
       assert expire_at_ms == future
     end
   end

@@ -405,7 +405,7 @@ defmodule Ferricstore.Raft.AsyncWalTest do
 
       Task.await_many(tasks, 30_000)
 
-      assert Router.get(k) == 5000
+      assert Router.get(k) == "5000"
     end
 
     test "CAS is linearizable through async WAL" do
@@ -460,7 +460,7 @@ defmodule Ferricstore.Raft.AsyncWalTest do
       Task.await(writer, 30_000)
       Task.await(reader, 30_000)
 
-      assert Router.get(k) == total
+      assert Router.get(k) == Integer.to_string(total)
     end
 
     test "CAS retry loop converges" do

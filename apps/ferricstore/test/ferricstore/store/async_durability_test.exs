@@ -42,7 +42,7 @@ defmodule Ferricstore.Store.AsyncDurabilityTest do
     test "INCR works on async namespace" do
       Router.put("async_test:counter", "10", 0)
       assert {:ok, 11} = Router.incr("async_test:counter", 1)
-      assert Router.get("async_test:counter") == 11
+      assert Router.get("async_test:counter") == "11"
     end
 
     test "multiple keys across shards" do
@@ -94,7 +94,7 @@ defmodule Ferricstore.Store.AsyncDurabilityTest do
   describe "async namespace read-modify-write operations" do
     test "INCR on nonexistent key starts from delta" do
       assert {:ok, 5} = Router.incr("async_test:incr_new", 5)
-      assert Router.get("async_test:incr_new") == 5
+      assert Router.get("async_test:incr_new") == "5"
     end
 
     test "INCR multiple times" do
@@ -102,7 +102,7 @@ defmodule Ferricstore.Store.AsyncDurabilityTest do
       assert {:ok, 1} = Router.incr("async_test:incr_multi", 1)
       assert {:ok, 3} = Router.incr("async_test:incr_multi", 2)
       assert {:ok, 13} = Router.incr("async_test:incr_multi", 10)
-      assert Router.get("async_test:incr_multi") == 13
+      assert Router.get("async_test:incr_multi") == "13"
     end
 
     test "INCR_FLOAT works" do

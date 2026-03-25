@@ -65,7 +65,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       Router.put("incr_float_test", "10.5", 0)
       Process.sleep(50)
       assert {:ok, result} = Router.incr_float("incr_float_test", 1.5)
-      assert result == "12"
+      assert_in_delta result, 12.0, 0.001
     end
   end
 

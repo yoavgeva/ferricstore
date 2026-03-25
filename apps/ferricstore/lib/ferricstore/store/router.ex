@@ -168,8 +168,8 @@ defmodule Ferricstore.Store.Router do
   defp async_write(idx, {:put, key, value, expire_at_ms}) do
     keydir = :"keydir_#{idx}"
     value_for_ets = case value do
-      v when is_integer(v) -> v
-      v when is_float(v) -> v
+      v when is_integer(v) -> Integer.to_string(v)
+      v when is_float(v) -> Float.to_string(v)
       v when is_binary(v) ->
         max_hot = :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536)
         if byte_size(v) > max_hot, do: nil, else: v

@@ -3015,8 +3015,8 @@ defmodule Ferricstore.Store.Shard do
   # stored in ETS, avoiding expensive binary copies on every :ets.lookup.
   @compile {:inline, value_for_ets: 1}
   defp value_for_ets(nil), do: nil
-  defp value_for_ets(value) when is_integer(value), do: value
-  defp value_for_ets(value) when is_float(value), do: value
+  defp value_for_ets(value) when is_integer(value), do: Integer.to_string(value)
+  defp value_for_ets(value) when is_float(value), do: Float.to_string(value)
   defp value_for_ets(value) when is_binary(value) do
     if byte_size(value) > :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536) do
       nil

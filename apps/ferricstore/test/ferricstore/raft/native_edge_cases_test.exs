@@ -316,7 +316,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
              "All INCR calls should succeed, got: #{inspect(results)}"
 
       # The final value should be exactly 10
-      assert 10 == Router.get(k)
+      assert "10" == Router.get(k)
 
       # The individual results should be some permutation of 1..10
       values = Enum.map(results, fn {:ok, n} -> n end)

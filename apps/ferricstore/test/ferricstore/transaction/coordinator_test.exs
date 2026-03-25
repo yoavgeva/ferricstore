@@ -64,7 +64,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [{:ok, 11}, {:ok, 12}]
-      assert Router.get("b") == 12
+      assert Router.get("b") == "12"
     end
 
     test "DEL within single shard" do
@@ -147,8 +147,8 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [{:ok, 11}, {:ok, 21}]
-      assert Router.get("h") == 11
-      assert Router.get("b") == 21
+      assert Router.get("h") == "11"
+      assert Router.get("b") == "21"
     end
 
     test "DEL across shards succeeds" do
@@ -276,7 +276,7 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
       assert is_list(result1)
       assert is_list(result2)
 
-      assert Router.get("b") == 2
+      assert Router.get("b") == "2"
     end
   end
 

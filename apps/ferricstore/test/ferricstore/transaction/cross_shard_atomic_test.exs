@@ -117,8 +117,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [{:ok, 11}, {:ok, 21}]
-      assert Router.get("h") == 11
-      assert Router.get("b") == 21
+      assert Router.get("h") == "11"
+      assert Router.get("b") == "21"
     end
 
     test "DEL across shards — all deleted" do
@@ -410,8 +410,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       assert is_list(result2)
 
       # Final values should reflect both increments
-      assert Router.get("h") == 2
-      assert Router.get("b") == 2
+      assert Router.get("h") == "2"
+      assert Router.get("b") == "2"
     end
   end
 end

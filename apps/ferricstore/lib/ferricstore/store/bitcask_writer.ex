@@ -278,8 +278,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
 
   defp flush_write_batch(path, write_entries, shard_index) do
     batch = Enum.map(write_entries, fn
-      {:write, _path, _fid, _ets, key, value, exp} -> {key, value, exp}
-      {_path, _fid, _ets, key, value, exp} -> {key, value, exp}
+      {:write, _path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
+      {_path, _fid, _ets, key, value, exp} -> {key, to_binary(value), exp}
     end)
 
     case NIF.v2_append_batch_nosync(path, batch) do
@@ -288,7 +288,8 @@ defmodule Ferricstore.Store.BitcaskWriter do
         Enum.zip(write_entries, locations)
         |> Enum.each(fn {entry, {offset, _record_size}} ->
           {_tag, _path, file_id, ets, key, value, _exp} = normalize_write_entry(entry)
-          vsize = byte_size(value)
+          bin_value = to_binary(value)
+          vsize = byte_size(bin_value)
 
           # Only update if the key still exists in ETS and still has :pending.
           # A DELETE may have removed it between the cast and now.
@@ -330,6 +331,10 @@ defmodule Ferricstore.Store.BitcaskWriter do
     do: {:write, path, fid, ets, key, value, exp}
   defp normalize_write_entry({path, fid, ets, key, value, exp}),
     do: {:write, path, fid, ets, key, value, exp}
+
+  defp to_binary(v) when is_binary(v), do: v
+  defp to_binary(v) when is_integer(v), do: Integer.to_string(v)
+  defp to_binary(v) when is_float(v), do: Float.to_string(v)
 
   defp cancel_timer(nil), do: :ok
 

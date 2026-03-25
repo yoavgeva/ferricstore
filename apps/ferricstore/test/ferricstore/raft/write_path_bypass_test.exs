@@ -100,13 +100,13 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
       k = ukey("incr_basic")
       :ok = Router.put(k, "10", 0)
       assert {:ok, 11} = Router.incr(k, 1)
-      assert 11 == Router.get(k)
+      assert "11" == Router.get(k)
     end
 
     test "INCR on non-existent key initializes to delta" do
       k = ukey("incr_new")
       assert {:ok, 5} = Router.incr(k, 5)
-      assert 5 == Router.get(k)
+      assert "5" == Router.get(k)
     end
 
     test "INCR on non-integer returns error" do
@@ -119,7 +119,7 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
       k = ukey("decr")
       :ok = Router.put(k, "10", 0)
       assert {:ok, 7} = Router.incr(k, -3)
-      assert 7 == Router.get(k)
+      assert "7" == Router.get(k)
     end
 
     test "INCR then DEL then INCR starts from 0 again" do
@@ -127,7 +127,7 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
       assert {:ok, 5} = Router.incr(k, 5)
       :ok = Router.delete(k)
       assert {:ok, 1} = Router.incr(k, 1)
-      assert 1 == Router.get(k)
+      assert "1" == Router.get(k)
     end
   end
 
@@ -349,7 +349,7 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
       results = Task.await_many(tasks, 30_000)
       assert Enum.all?(results, fn {:ok, _} -> true; _ -> false end)
 
-      assert 50 == Router.get(k)
+      assert "50" == Router.get(k)
     end
 
     test "50 concurrent CAS on same key -- exactly 1 succeeds" do
@@ -411,10 +411,10 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
       assert "my_write" == Router.get(k)
     end
 
-    test "INCR then GET sees correct integer" do
+    test "INCR then GET sees correct value" do
       k = ukey("ryow_incr")
       assert {:ok, 42} = Router.incr(k, 42)
-      assert 42 == Router.get(k)
+      assert "42" == Router.get(k)
     end
 
     test "GETSET returns old value correctly" do

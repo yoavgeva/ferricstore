@@ -554,6 +554,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     local_put = fn key, value, expire_at_ms ->
       value_for = value_for_ets(value)
+      disk_val = to_disk_binary(value)
       :ets.insert(ctx.keydir, {key, value_for, expire_at_ms, LFU.initial(), 0, 0, 0})
       try do
         PrefixIndex.track(ctx.prefix_keys, key, ctx.index)
@@ -570,7 +571,7 @@ defmodule Ferricstore.Raft.StateMachine do
         ctx.active_file_id,
         ctx.keydir,
         key,
-        value,
+        disk_val,
         expire_at_ms
       )
       :ok
@@ -1087,8 +1088,8 @@ defmodule Ferricstore.Raft.StateMachine do
   # in ETS, avoiding expensive binary copies on every :ets.lookup.
   @compile {:inline, value_for_ets: 1}
   defp value_for_ets(nil), do: nil
-  defp value_for_ets(value) when is_integer(value), do: value
-  defp value_for_ets(value) when is_float(value), do: value
+  defp value_for_ets(value) when is_integer(value), do: Integer.to_string(value)
+  defp value_for_ets(value) when is_float(value), do: Float.to_string(value)
   defp value_for_ets(value) when is_binary(value) do
     if byte_size(value) > :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536) do
       nil
