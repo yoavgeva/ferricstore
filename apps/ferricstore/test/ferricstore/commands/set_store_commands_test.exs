@@ -302,4 +302,65 @@ defmodule Ferricstore.Commands.SetStoreCommandsTest do
       assert 1 == Set.handle("SINTERCARD", ["2", "s1", "s2", "limit", "1"], store)
     end
   end
+
+  # ===========================================================================
+  # SMISMEMBER
+  # ===========================================================================
+
+  describe "SMISMEMBER" do
+    test "mixed membership — 2 exist, 1 does not" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a", "b", "c"], store)
+
+      assert [1, 1, 0] == Set.handle("SMISMEMBER", ["myset", "a", "c", "z"], store)
+    end
+
+    test "all members exist" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "x", "y", "z"], store)
+
+      assert [1, 1, 1] == Set.handle("SMISMEMBER", ["myset", "x", "y", "z"], store)
+    end
+
+    test "no members exist" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+
+      assert [0, 0, 0] == Set.handle("SMISMEMBER", ["myset", "x", "y", "z"], store)
+    end
+
+    test "key does not exist — all zeros" do
+      store = MockStore.make()
+
+      assert [0, 0] == Set.handle("SMISMEMBER", ["nosuch", "a", "b"], store)
+    end
+
+    test "single member present" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+
+      assert [1] == Set.handle("SMISMEMBER", ["myset", "a"], store)
+    end
+
+    test "single member absent" do
+      store = MockStore.make()
+      Set.handle("SADD", ["myset", "a"], store)
+
+      assert [0] == Set.handle("SMISMEMBER", ["myset", "z"], store)
+    end
+
+    test "wrong type returns WRONGTYPE error" do
+      store = MockStore.make()
+      store.put.("strkey", "hello", 0)
+
+      assert {:error, "WRONGTYPE" <> _} = Set.handle("SMISMEMBER", ["strkey", "a", "b"], store)
+    end
+
+    test "wrong number of arguments — no members" do
+      store = MockStore.make()
+
+      assert {:error, _} = Set.handle("SMISMEMBER", ["myset"], store)
+      assert {:error, _} = Set.handle("SMISMEMBER", [], store)
+    end
+  end
 end

@@ -1,8 +1,8 @@
 defmodule Ferricstore.Commands.Set do
   @moduledoc """
-  Handles Redis set commands: SADD, SREM, SMEMBERS, SISMEMBER, SCARD,
-  SINTER, SUNION, SDIFF, SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD,
-  SRANDMEMBER, SPOP, SMOVE, SSCAN.
+  Handles Redis set commands: SADD, SREM, SMEMBERS, SISMEMBER, SMISMEMBER,
+  SCARD, SINTER, SUNION, SDIFF, SDIFFSTORE, SINTERSTORE, SUNIONSTORE,
+  SINTERCARD, SRANDMEMBER, SPOP, SMOVE, SSCAN.
 
   Each set member is stored as a compound key:
 
@@ -118,6 +118,23 @@ defmodule Ferricstore.Commands.Set do
 
   def handle("SISMEMBER", _args, _store) do
     {:error, "ERR wrong number of arguments for 'sismember' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # SMISMEMBER key member [member ...]
+  # ---------------------------------------------------------------------------
+
+  def handle("SMISMEMBER", [key | members], store) when members != [] do
+    with :ok <- TypeRegistry.check_type(key, :set, store) do
+      Enum.map(members, fn member ->
+        compound_key = CompoundKey.set_member(key, member)
+        if store.compound_get.(key, compound_key) != nil, do: 1, else: 0
+      end)
+    end
+  end
+
+  def handle("SMISMEMBER", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'smismember' command"}
   end
 
   # ---------------------------------------------------------------------------
