@@ -51,7 +51,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store, dir: dir}
     end
 
@@ -102,7 +102,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -161,7 +161,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
   describe "ResourceArc lifecycle" do
     test "store resource survives owning process termination" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Open store in a spawned process that immediately dies
       parent = self()
@@ -188,7 +188,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
 
     test "resource is valid after multiple GC cycles" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "gc_test", "survives", 0)
@@ -201,7 +201,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
 
     test "opening the same directory from two processes is safe" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store1 = open_store(dir)
       :ok = NIF.put(store1, "shared_dir_key", "from_store1", 0)
@@ -224,7 +224,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -314,7 +314,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -407,7 +407,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
   describe "store error recovery" do
     test "open on non-existent nested path creates it" do
       dir = Path.join(System.tmp_dir!(), "nif_safety_deep/nested/path_#{:rand.uniform(999_999)}")
-      on_exit(fn -> File.rm_rf!(Path.join(System.tmp_dir!(), "nif_safety_deep")) end)
+      on_exit(fn -> File.rm_rf(Path.join(System.tmp_dir!(), "nif_safety_deep")) end)
 
       assert {:ok, store} = NIF.new(dir)
       :ok = NIF.put(store, "deep", "value", 0)
@@ -416,7 +416,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
 
     test "store recovers gracefully when data file is truncated" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "trunc_key", "trunc_val", 0)
@@ -451,7 +451,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
 
     test "store handles corrupt hint file by falling back to log replay" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "hint_corrupt_key", "value", 0)
@@ -484,7 +484,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -586,7 +586,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
           dir
         end)
 
-      on_exit(fn -> Enum.each(dirs, &File.rm_rf!/1) end)
+      on_exit(fn -> Enum.each(dirs, &File.rm_rf/1) end)
 
       for dir <- dirs do
         store = open_store(dir)
@@ -604,7 +604,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
 
     test "rapidly opening the same directory 50 times" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       stores =
         Enum.map(1..50, fn _ ->
@@ -628,7 +628,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -698,7 +698,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
   describe "interleaved operation stress" do
     test "rapid interleaved put/get/delete/keys/batch does not crash" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -746,7 +746,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
   describe "maintenance operations after errors" do
     test "write_hint works after failed writes" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       oversized_key = :binary.copy("H", 65_536)
@@ -764,7 +764,7 @@ defmodule Ferricstore.Bitcask.NIFSafetyTest do
 
     test "purge_expired works after failed writes" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       past = System.os_time(:millisecond) - 1000

@@ -204,7 +204,7 @@ defmodule Ferricstore.Bitcask.AllNifYieldBenchmarkTest do
   describe "bloom yield benchmarks" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 
@@ -440,7 +440,7 @@ defmodule Ferricstore.Bitcask.AllNifYieldBenchmarkTest do
   describe "iteration NIF yield benchmarks" do
     setup do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -560,7 +560,7 @@ defmodule Ferricstore.Bitcask.AllNifYieldBenchmarkTest do
     test "get_async 100 concurrent cold reads - zero scheduler impact" do
       # This is the gold standard: Tokio threads do IO, schedulers stay free
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Write 100 keys with 10KB values (cold reads = likely disk IO)
       batch =
@@ -625,11 +625,11 @@ defmodule Ferricstore.Bitcask.AllNifYieldBenchmarkTest do
     test "throughput comparison: all NIFs" do
       # --- Setup resources ---
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       populate(store, 1_000, pad: 4)
 
       bloom_dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(bloom_dir) end)
+      on_exit(fn -> File.rm_rf(bloom_dir) end)
       bloom_path = bloom_path(bloom_dir, "throughput")
       {:ok, bloom} = NIF.bloom_create(bloom_path, 1_000_000, 7)
       NIF.bloom_madd(bloom, Enum.map(1..1_000, fn i -> "bloom_key_#{i}" end))

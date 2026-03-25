@@ -139,7 +139,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
         fn _ ->
           dir = tmp_dir("new")
           {:ok, _store} = NIF.new(dir)
-          File.rm_rf!(dir)
+          File.rm_rf(dir)
         end,
         100
       )
@@ -149,7 +149,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     test "put" do
       dir = tmp_dir("put")
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "put",
@@ -167,7 +167,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       dir = tmp_dir("get_hot")
       store = open_store(dir)
       :ok = NIF.put(store, "hot_key", String.duplicate("x", 100), 0)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get (hot)",
@@ -181,7 +181,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       dir = tmp_dir("get_zc")
       store = open_store(dir)
       :ok = NIF.put(store, "hot_key", String.duplicate("x", 100), 0)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get_zero_copy (hot)",
@@ -194,7 +194,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     test "get (miss)" do
       dir = tmp_dir("get_miss")
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get (miss)",
@@ -208,7 +208,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       dir = tmp_dir("get_file_ref")
       store = open_store(dir)
       :ok = NIF.put(store, "ref_key", "ref_value", 0)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get_file_ref",
@@ -232,7 +232,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       |> Enum.chunk_every(500)
       |> Enum.each(fn chunk -> :ok = NIF.put_batch(store, chunk) end)
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       counter = :atomics.new(1, [])
 
       benchmark_nif(
@@ -250,7 +250,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     test "put_batch (10 items)" do
       dir = tmp_dir("put_batch_10")
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch_10 =
         Enum.map(1..10, fn i ->
@@ -269,7 +269,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     test "put_batch (100 items)" do
       dir = tmp_dir("put_batch_100")
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch_100 =
         Enum.map(1..100, fn i ->
@@ -288,7 +288,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     test "put_batch_async (10 items, uring/fallback)" do
       dir = tmp_dir("put_batch_async")
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch_10 =
         Enum.map(1..10, fn i ->
@@ -322,7 +322,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       dir = tmp_dir("rmw")
       store = open_store(dir)
       :ok = NIF.put(store, "counter", "0", 0)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "read_modify_write (incr)",
@@ -337,7 +337,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       dir = tmp_dir("rmw_append")
       store = open_store(dir)
       :ok = NIF.put(store, "appendkey", "", 0)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "read_modify_write (append)",
@@ -352,7 +352,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       dir = tmp_dir("rmw_setrange")
       store = open_store(dir)
       :ok = NIF.put(store, "rangekey", String.duplicate("\0", 100), 0)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "read_modify_write (set_range)",
@@ -367,7 +367,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       dir = tmp_dir("rmw_setbit")
       store = open_store(dir)
       :ok = NIF.put(store, "bitkey", "\0", 0)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "read_modify_write (set_bit)",
@@ -382,7 +382,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       dir = tmp_dir("rmw_float")
       store = open_store(dir)
       :ok = NIF.put(store, "floatkey", "0.0", 0)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "read_modify_write (incr_float)",
@@ -401,7 +401,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "keys (1K)" do
       {store, dir} = open_store_with_n(1_000, "keys1k")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "keys (1K)",
@@ -414,7 +414,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "keys (10K)" do
       {store, dir} = open_store_with_n(10_000, "keys10k")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "keys (10K)",
@@ -427,7 +427,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "get_all (1K)" do
       {store, dir} = open_store_with_n(1_000, "getall1k")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get_all (1K)",
@@ -440,7 +440,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "get_all_zero_copy (1K)" do
       {store, dir} = open_store_with_n(1_000, "getallzc1k")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get_all_zero_copy (1K)",
@@ -454,7 +454,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     test "get_batch (100 keys)" do
       {store, dir} = open_store_with_n(1_000, "getbatch100")
       keys = Enum.map(1..100, fn i -> "key:#{String.pad_leading(Integer.to_string(i), 8, "0")}" end)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get_batch (100)",
@@ -468,7 +468,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     test "get_batch_zero_copy (100 keys)" do
       {store, dir} = open_store_with_n(1_000, "getbatchzc100")
       keys = Enum.map(1..100, fn i -> "key:#{String.pad_leading(Integer.to_string(i), 8, "0")}" end)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get_batch_zero_copy (100)",
@@ -481,7 +481,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "get_range (100 results)" do
       {store, dir} = open_store_with_n(1_000, "getrange100")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get_range (100)",
@@ -494,7 +494,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "get_range_zero_copy (100 results)" do
       {store, dir} = open_store_with_n(1_000, "getrangezc100")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get_range_zero_copy (100)",
@@ -513,7 +513,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "shard_stats" do
       {store, dir} = open_store_with_n(100, "stats")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "shard_stats",
@@ -525,7 +525,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "file_sizes" do
       {store, dir} = open_store_with_n(100, "filesizes")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "file_sizes",
@@ -537,7 +537,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "available_disk_space" do
       {store, dir} = open_store_with_n(10, "diskspace")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "available_disk_space",
@@ -550,7 +550,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "write_hint" do
       {store, dir} = open_store_with_n(100, "hint")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "write_hint",
@@ -571,7 +571,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
         :ok = NIF.put(store, "exp:#{i}", "v", now_ms - 1000)
       end
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "purge_expired",
@@ -590,7 +590,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
         :ok = NIF.put(store, "comp:#{i}", String.duplicate("x", 100), 0)
       end
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Get file sizes to know which files exist
       {:ok, file_sizes} = NIF.file_sizes(store)
@@ -617,7 +617,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       dir = tmp_dir("get_async")
       store = open_store(dir)
       :ok = NIF.put(store, "async_key", String.duplicate("x", 100), 0)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "get_async (submit)",
@@ -650,7 +650,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
       |> Enum.chunk_every(500)
       |> Enum.each(fn chunk -> :ok = NIF.put_batch(store, chunk) end)
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       counter = :atomics.new(1, [])
 
       benchmark_nif(
@@ -674,7 +674,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     test "put_batch_tokio_async (10 items)" do
       dir = tmp_dir("pbt_async")
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch =
         Enum.map(1..10, fn i ->
@@ -700,7 +700,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     @tag timeout: 120_000
     test "write_hint_async" do
       {store, dir} = open_store_with_n(100, "hint_async")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "write_hint_async (submit+recv)",
@@ -722,7 +722,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
     test "purge_expired_async" do
       dir = tmp_dir("purge_async")
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       benchmark_nif(
         "purge_expired_async (submit+recv)",
@@ -749,7 +749,7 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
         :ok = NIF.put(store, "casync:#{i}", String.duplicate("x", 100), 0)
       end
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {:ok, file_sizes} = NIF.file_sizes(store)
       file_ids = Enum.map(file_sizes, fn {id, _size} -> id end)

@@ -35,7 +35,7 @@ defmodule Ferricstore.Bitcask.ZeroCopyEdgeCasesTest do
   defp setup_store do
     dir = tmp_dir()
     store = open_store(dir)
-    on_exit(fn -> File.rm_rf!(dir) end)
+    on_exit(fn -> File.rm_rf(dir) end)
     %{store: store, dir: dir}
   end
 

@@ -49,7 +49,7 @@ defmodule Ferricstore.Bitcask.ZeroCopySchedulerTest do
   defp setup_store do
     dir = tmp_dir()
     {:ok, store} = NIF.new(dir)
-    on_exit(fn -> File.rm_rf!(dir) end)
+    on_exit(fn -> File.rm_rf(dir) end)
     store
   end
 

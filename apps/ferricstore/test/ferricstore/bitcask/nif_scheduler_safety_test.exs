@@ -66,7 +66,7 @@ defmodule Ferricstore.Bitcask.NIFSchedulerSafetyTest do
 
   defp setup_store do
     {store, dir} = open_store()
-    on_exit(fn -> File.rm_rf!(dir) end)
+    on_exit(fn -> File.rm_rf(dir) end)
     store
   end
 
@@ -662,7 +662,7 @@ defmodule Ferricstore.Bitcask.NIFSchedulerSafetyTest do
         end
 
       on_exit(fn ->
-        for {_store, dir} <- stores, do: File.rm_rf!(dir)
+        for {_store, dir} <- stores, do: File.rm_rf(dir)
       end)
 
       # Populate each store

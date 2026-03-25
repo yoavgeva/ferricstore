@@ -52,7 +52,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: key with all 256 byte values (0x00-0xFF)" do
     test "round-trips a key containing every byte value" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Build a 256-byte key with every byte value from 0 to 255
@@ -68,7 +68,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: very large value (512KB)" do
     test "put and get round-trip for 512KB value" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       large_value = :crypto.strong_rand_bytes(512 * 1024)
@@ -80,7 +80,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: unicode multibyte keys" do
     test "CJK characters in key" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       key = "键-鍵-キー-열쇠"
@@ -91,7 +91,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
     test "emoji characters in key" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       key = "\u{1F600}\u{1F4A9}\u{1F680}"
@@ -101,7 +101,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
     test "mixed ASCII and 4-byte UTF-8 codepoints" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       key = "user:\u{10FFFF}:profile"
@@ -113,7 +113,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: value with embedded null bytes" do
     test "value consisting entirely of null bytes" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # 100 null bytes is a non-empty value, distinct from the empty-string tombstone
@@ -124,7 +124,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
     test "value with null bytes interspersed with text" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       value = "hello\0world\0foo\0"
@@ -136,7 +136,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: put_batch with 1000 entries" do
     test "all 1000 entries are stored and retrievable" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       batch =
@@ -159,7 +159,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: put_batch with duplicate keys (last wins)" do
     test "when the same key appears multiple times, the last value wins" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       batch = [
@@ -174,7 +174,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
     test "duplicate keys with different expiry values, last wins" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       past = System.os_time(:millisecond) - 1000
@@ -193,7 +193,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: open same path twice" do
     test "second open on an existing store succeeds and sees prior data" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store1 = open_store(dir)
       :ok = NIF.put(store1, "persist_twice", "val", 0)
@@ -215,7 +215,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       # Use a subdirectory that does not yet exist
       base = tmp_dir()
       new_path = Path.join(base, "brand_new_subdir")
-      on_exit(fn -> File.rm_rf!(base) end)
+      on_exit(fn -> File.rm_rf(base) end)
 
       refute File.exists?(new_path)
       assert {:ok, store} = NIF.new(new_path)
@@ -227,7 +227,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: write_hint on empty store" do
     test "write_hint succeeds even with zero keys" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert :ok == NIF.write_hint(store)
@@ -237,7 +237,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: purge_expired selective behavior" do
     test "purges only expired keys, live keys remain intact" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       past = System.os_time(:millisecond) - 1000
@@ -278,7 +278,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
     test "purge_expired on empty store returns {:ok, 0}" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert {:ok, 0} == NIF.purge_expired(store)
@@ -286,7 +286,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
     test "purge_expired twice in a row: second returns 0" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       past = System.os_time(:millisecond) - 1000
@@ -300,7 +300,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: overwrite key then check keys/1 has no duplicates" do
     test "overwriting a key does not create duplicate entries in keys/1" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       :ok = NIF.put(store, "unique", "v1", 0)
@@ -316,7 +316,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "NIF: put then delete then re-put" do
     test "re-putting a deleted key makes it accessible again" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       :ok = NIF.put(store, "phoenix", "v1", 0)
@@ -336,7 +336,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "Recovery: write N keys, crash (reopen), all keys present" do
     test "200 keys survive simulated crash via process exit" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       test_pid = self()
 
@@ -368,7 +368,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "Recovery: key with TTL, reopen after TTL passed" do
     test "expired key is gone after reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Set expire_at to 100ms from now
       expire_at = System.os_time(:millisecond) + 100
@@ -392,7 +392,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "Recovery: tombstone (delete) survives reopen" do
     test "deleted key absent after reopen even with no purge" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "tomb_test", "alive", 0)
@@ -409,7 +409,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "Recovery: large put_batch survives reopen" do
     test "1000 batch-written entries survive reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -435,7 +435,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "Recovery: multiple reopen cycles" do
     test "data written across 5 open-write-close cycles is all present" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Cycle 1: write keys 1-10
       store = open_store(dir)
@@ -496,7 +496,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "Recovery: 512KB value survives reopen" do
     test "large binary value is intact after reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       large_value = :crypto.strong_rand_bytes(512 * 1024)
       store = open_store(dir)
@@ -511,7 +511,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "Recovery: binary key with all byte values survives reopen" do
     test "256-byte key with all byte values is intact after reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       key = :binary.list_to_bin(Enum.to_list(0..255))
       store = open_store(dir)
@@ -533,7 +533,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       keydir = :"keydir_#{index}"
@@ -564,7 +564,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       keydir = :"keydir_#{index}"
@@ -591,7 +591,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       assert nil == GenServer.call(pid, {:get_meta, "nonexistent_meta"})
@@ -603,7 +603,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       :ok = GenServer.call(pid, {:put, "meta_no_ttl", "persistent", 0})
@@ -616,7 +616,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       future = System.os_time(:millisecond) + 120_000
@@ -630,7 +630,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       keydir = :"keydir_#{index}"
@@ -655,7 +655,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       :ok = GenServer.call(pid, {:put, "del_flow", "alive", 0})
@@ -671,7 +671,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       :ok = GenServer.call(pid, {:put, "concurrent_read", "shared_val", 0})
@@ -693,7 +693,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       tasks =
@@ -722,7 +722,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
   describe "Shard: GenServer handles unknown messages gracefully" do
     test "unknown call causes the GenServer to crash with FunctionClauseError" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Trap exits so the linked GenServer crash does not kill the test process
       Process.flag(:trap_exit, true)
@@ -739,7 +739,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
 
     test "unknown cast causes the GenServer to crash with RuntimeError" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Trap exits so the linked GenServer crash does not kill the test process
       Process.flag(:trap_exit, true)
@@ -761,7 +761,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       :ok = GenServer.call(pid, {:put, "zero_ttl_meta", "ztm_val", 0})
@@ -775,7 +775,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       :ok = GenServer.call(pid, {:put, "exist_del", "val", 0})
@@ -791,7 +791,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       past = System.os_time(:millisecond) - 1000
@@ -816,7 +816,7 @@ defmodule Ferricstore.Bitcask.BitcaskEdgeCasesTest do
       {pid, _index, dir} = start_shard()
       on_exit(fn ->
         if Process.alive?(pid), do: GenServer.stop(pid)
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       :ok = GenServer.call(pid, {:put, "revive", "v1", 0})

@@ -140,7 +140,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   describe "scheduler safety: bloom NIFs run on Normal scheduler" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 
@@ -343,7 +343,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   describe "yield: bloom bulk add yields to scheduler" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 
@@ -455,7 +455,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   describe "memory: bloom NIF resources freed on GC" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 
@@ -562,7 +562,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   describe "cross-NIF: bloom + CMS + TopK used together -- no interference" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 
@@ -601,7 +601,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   describe "cross-NIF: HNSW search during bloom adds -- no deadlock" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 
@@ -643,7 +643,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   describe "cross-NIF: all probabilistic NIFs concurrent -- no contention" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 
@@ -796,7 +796,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   describe "serialization: bloom persistence roundtrip" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 
@@ -828,7 +828,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   describe "error handling: bloom" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 
@@ -886,7 +886,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   describe "correctness: bloom empty key and null bytes" do
     setup do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end
 

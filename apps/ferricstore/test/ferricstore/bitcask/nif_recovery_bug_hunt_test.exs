@@ -43,7 +43,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "write_hint then reopen" do
     test "all keys are recovered from hint file after reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -75,7 +75,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "deleted keys are not resurrected after hint-based recovery" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -100,7 +100,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "write_hint with expired keys" do
     test "expired keys written to hint do not appear on reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -125,7 +125,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "expired keys are excluded from keys/1 after hint-based reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -152,7 +152,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "purge_expired with 0 expired" do
     test "returns {:ok, 0} when no keys are expired" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -164,7 +164,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "returns {:ok, 0} on empty store" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       assert {:ok, 0} == NIF.purge_expired(store)
@@ -172,7 +172,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "returns {:ok, 0} when all keys have future expiry" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       future = System.os_time(:millisecond) + 60_000
@@ -191,7 +191,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "purge_expired with 1000 expired keys" do
     test "all 1000 expired keys are removed" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -231,7 +231,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "purge_expired is idempotent — second call returns {:ok, 0}" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -256,7 +256,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "purge_expired does not touch live keys" do
     test "live keys with no expiry survive purge" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -285,7 +285,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "live keys with future expiry survive purge" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -305,7 +305,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "purge_expired tombstones persist across reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -333,7 +333,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "crash mid-write (truncated log)" do
     test "recovery skips corrupt tail and preserves earlier records" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -362,7 +362,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "recovery with truncated header at tail" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -381,7 +381,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "completely corrupted log file results in empty store" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "will_be_lost", "val", 0)
@@ -404,7 +404,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "reopen after clean close" do
     test "all data intact after clean close and reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -443,7 +443,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "binary keys and values survive clean close/reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -465,7 +465,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "reopen after write_hint — correctness" do
     test "hint-based recovery produces same data as log replay" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -493,7 +493,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "hint file is used on reopen (hint file exists)" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -519,7 +519,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "multiple close/reopen cycles" do
     test "no data corruption across 10 close/reopen cycles" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Cycle 1: initial data
       store = open_store(dir)
@@ -561,7 +561,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "no data corruption with write_hint between cycles" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -597,7 +597,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "overwrite same key across cycles preserves latest value" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for cycle <- 1..5 do
         store = open_store(dir)
@@ -618,7 +618,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "concurrent put + write_hint" do
     test "concurrent puts and write_hint do not crash the NIF" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -657,7 +657,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "write_hint during rapid puts does not corrupt data" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -690,7 +690,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   describe "purge_expired + concurrent get" do
     test "concurrent gets during purge_expired do not crash" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -732,7 +732,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "purge_expired does not interfere with concurrent puts" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -786,7 +786,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
       #
       # Impact: Keys deleted after the last write_hint will reappear on reopen.
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -825,7 +825,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
       # This verifies the workaround: as long as you don't reopen the store,
       # in-memory keydir is correct. The bug only manifests on reopen.
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -853,7 +853,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
     test "write_hint after deletes produces correct recovery" do
       # Workaround: always call write_hint after any deletes before closing.
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -886,7 +886,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "corrupt hint file falls back to log replay without data loss" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -916,7 +916,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
 
     test "orphaned hint file (no corresponding log) is skipped" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "orphan_test", "val", 0)

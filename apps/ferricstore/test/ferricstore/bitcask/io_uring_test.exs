@@ -100,7 +100,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "single-entry batch returns {:pending, op_id}" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert {:pending, op_id} = NIF.put_batch_async(store, [{"k", "v", 0}])
       assert is_integer(op_id) and op_id >= 0
@@ -111,7 +111,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "op_ids are strictly monotonically increasing" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       ids =
         for i <- 1..10 do
@@ -131,7 +131,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "empty batch returns {:pending, op_id} and immediately completes" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Empty batch: the NIF may return {:pending, _} or :ok depending on
       # implementation. On io_uring path the agent sends ok immediately.
@@ -147,7 +147,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "each call returns a unique op_id" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       ids =
         for i <- 1..20 do
@@ -168,7 +168,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "io_complete message is sent to the calling process" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       op_id = submit_async!(store, [{"msg_k", "msg_v", 0}])
       assert_receive {:io_complete, ^op_id, :ok}, 5_000
@@ -177,7 +177,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "completion message is {io_complete, op_id, :ok} tuple" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       op_id = submit_async!(store, [{"shape_k", "v", 0}])
 
@@ -192,7 +192,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "no extra messages arrive after one batch" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       op_id = submit_async!(store, [{"extra_k", "v", 0}])
       assert_receive {:io_complete, ^op_id, :ok}, 5_000
@@ -202,7 +202,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "completion arrives to the submitting process not others" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       parent = self()
 
@@ -225,7 +225,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "3 sequential batches each produce exactly one completion" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for i <- 1..3 do
         op_id = submit_async!(store, [{"seq3_#{i}", "v#{i}", 0}])
@@ -243,7 +243,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "value readable immediately after completion" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"s1_k", "s1_v", 0}])
       assert {:ok, "s1_v"} == NIF.get(store, "s1_k")
@@ -252,7 +252,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "key appears in NIF.keys after completion" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"keys_k", "v", 0}])
       assert "keys_k" in NIF.keys(store)
@@ -261,7 +261,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "binary value with all byte values 0x00–0xFF is preserved" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       all_bytes = :binary.list_to_bin(Enum.to_list(0..255))
       assert :ok == submit_and_await!(store, [{"allbytes", all_bytes, 0}])
@@ -271,7 +271,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "large value (512 KB) survives async round-trip" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       big = :crypto.strong_rand_bytes(512 * 1024)
       assert :ok == submit_and_await!(store, [{"big_k", big, 0}], 10_000)
@@ -287,7 +287,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "10-entry batch: all values readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..10, do: {"m10_k#{i}", "m10_v#{i}", 0}
       assert :ok == submit_and_await!(store, batch)
@@ -297,7 +297,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "50-entry batch: all values readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..50, do: {"m50_k#{i}", "m50_v#{i}", 0}
       assert :ok == submit_and_await!(store, batch)
@@ -307,7 +307,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "mixed expiry batch: expired nil, live readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past   = System.os_time(:millisecond) - 1_000
       future = System.os_time(:millisecond) + 60_000
@@ -330,7 +330,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "last write wins for duplicate keys in one batch" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Two entries with the same key — last write should win in keydir
       batch = [{"dup_k", "first", 0}, {"dup_k", "second", 0}]
@@ -353,7 +353,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
       test "batch of #{n} entries: all readable after completion" do
         dir = tmp_dir()
         store = open_store(dir)
-        on_exit(fn -> File.rm_rf!(dir) end)
+        on_exit(fn -> File.rm_rf(dir) end)
 
         batch = for i <- 1..@n, do: {"bsz#{@n}_k#{i}", "v#{i}", 0}
         assert :ok == submit_and_await!(store, batch, 15_000)
@@ -370,7 +370,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "5 tasks each submit their own batch concurrently" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       tasks =
         for i <- 1..5 do
@@ -390,7 +390,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "20 tasks submit concurrently — no data loss" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       tasks =
         for i <- 1..20 do
@@ -406,7 +406,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "parallel submissions produce distinct op_ids" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Collect op_ids before any await to maximise overlap
       parent = self()
@@ -432,7 +432,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "50 concurrent single-key batches all complete :ok" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       tasks =
         for i <- 1..50 do
@@ -454,7 +454,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "values from two sequential batches are both readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"off_a", "va", 0}])
       assert :ok == submit_and_await!(store, [{"off_b", "vb", 0}])
@@ -466,7 +466,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "10 sequential batches: no offset corruption" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for i <- 1..10 do
         assert :ok == submit_and_await!(store, [{"seq10_k#{i}", "seq10_v#{i}", 0}])
@@ -478,7 +478,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "overwrite via successive batches: last value wins" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"ov_k", "first", 0}])
       assert :ok == submit_and_await!(store, [{"ov_k", "second", 0}])
@@ -496,7 +496,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "key written with past expiry is nil immediately" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 1_000
       assert :ok == submit_and_await!(store, [{"past_k", "v", past}])
@@ -506,7 +506,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "key written with future expiry is readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       future = System.os_time(:millisecond) + 60_000
       assert :ok == submit_and_await!(store, [{"fut_k", "v", future}])
@@ -516,7 +516,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "key expires after sleep" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       exp = System.os_time(:millisecond) + 200
       assert :ok == submit_and_await!(store, [{"ttl_k", "v", exp}])
@@ -529,7 +529,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "expired keys not in NIF.keys" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 1_000
       assert :ok == submit_and_await!(store, [{"exp_key", "v", past}, {"live_key", "v", 0}])
@@ -548,7 +548,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "sync put followed by async batch: async value wins" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "ow_k", "sync_v", 0)
       assert :ok == submit_and_await!(store, [{"ow_k", "async_v", 0}])
@@ -558,7 +558,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "async batch followed by sync put: sync value wins" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"ow2_k", "async_v", 0}])
       :ok = NIF.put(store, "ow2_k", "sync_v", 0)
@@ -568,7 +568,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "async then async: second value wins" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"aa_k", "first", 0}])
       assert :ok == submit_and_await!(store, [{"aa_k", "second", 0}])
@@ -584,7 +584,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "single key survives reopen" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store1, [{"dur1_k", "dur1_v", 0}])
       _ = store1; :erlang.garbage_collect()
@@ -596,7 +596,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "50-entry batch survives reopen" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..50, do: {"dr50_k#{i}", "dr50_v#{i}", 0}
       assert :ok == submit_and_await!(store1, batch, 10_000)
@@ -609,7 +609,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "three sequential batches all survive reopen" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store1, [{"b1_k", "b1_v", 0}])
       assert :ok == submit_and_await!(store1, [{"b2_k", "b2_v", 0}])
@@ -625,7 +625,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "overwritten value (latest) survives reopen" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store1, [{"reopen_ov", "old", 0}])
       assert :ok == submit_and_await!(store1, [{"reopen_ov", "new", 0}])
@@ -638,7 +638,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "deleted key is absent after reopen" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store1, [{"del_dur", "v", 0}])
       {:ok, true} = NIF.delete(store1, "del_dur")
@@ -657,7 +657,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "sync put_batch then async: both readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put_batch(store, [{"int_sync", "sv", 0}])
       assert :ok == submit_and_await!(store, [{"int_async", "av", 0}])
@@ -669,7 +669,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "async then sync put_batch: both readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"ias_a", "av", 0}])
       :ok = NIF.put_batch(store, [{"ias_s", "sv", 0}])
@@ -681,7 +681,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "alternating sync and async 5 times: all readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for i <- 1..5 do
         :ok = NIF.put_batch(store, [{"alt_s#{i}", "sv#{i}", 0}])
@@ -703,7 +703,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "key with null bytes" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       key = <<0, 1, 2, 3, 0>>
       assert :ok == submit_and_await!(store, [{key, "null_key_val", 0}])
@@ -713,7 +713,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "value with null bytes" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       val = <<0, 255, 0, 127, 0>>
       assert :ok == submit_and_await!(store, [{"null_val_k", val, 0}])
@@ -723,7 +723,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "very long key (10 KB)" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       long_key = :crypto.strong_rand_bytes(10_000)
       assert :ok == submit_and_await!(store, [{long_key, "long_key_val", 0}])
@@ -733,7 +733,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "very long value (1 MB)" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       big_val = :crypto.strong_rand_bytes(1_024 * 1_024)
       assert :ok == submit_and_await!(store, [{"big_val_k", big_val, 0}], 15_000)
@@ -743,7 +743,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "unicode key and value" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       key = "résumé_日本語_🚀"
       val = "Ünïcödë välüë ✓"
@@ -754,7 +754,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "batch with varying value sizes (1B to 10KB)" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       sizes = [1, 10, 100, 1_000, 5_000, 10_000]
       batch = for {sz, i} <- Enum.with_index(sizes, 1) do
@@ -784,7 +784,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "shard put → flush → get via GenServer directly" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "shard_k", "shard_v", 0})
       :ok = GenServer.call(pid, :flush)
@@ -793,7 +793,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "shard :keys returns written key after flush" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "sk_present", "v", 0})
       keys = GenServer.call(pid, :keys)
@@ -802,7 +802,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "shard :keys excludes deleted key after delete" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "sk_del", "v", 0})
       :ok = GenServer.call(pid, {:put, "sk_keep", "v", 0})
@@ -821,7 +821,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "shard flush_in_flight lifecycle" do
     test "flush_in_flight transitions nil → op_id → nil" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       # Pause the GenServer's timer by calling flush synchronously
       # so we can observe flush_in_flight in transit.
@@ -837,7 +837,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "pending is empty after flush" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "pending_k", "v", 0})
       :ok = GenServer.call(pid, :flush)
@@ -848,7 +848,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "injected :io_complete with correct op_id clears flush_in_flight" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :sys.replace_state(pid, fn s -> %{s | flush_in_flight: 1234} end)
       send(pid, {:io_complete, 1234, :ok})
@@ -858,7 +858,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "injected :io_complete with wrong op_id leaves flush_in_flight unchanged" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :sys.replace_state(pid, fn s -> %{s | flush_in_flight: 9999} end)
       send(pid, {:io_complete, 0000, :ok})
@@ -868,7 +868,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "error completion still clears flush_in_flight" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :sys.replace_state(pid, fn s -> %{s | flush_in_flight: 777} end)
       send(pid, {:io_complete, 777, {:error, "simulated"}})
@@ -884,7 +884,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "shard delete awaits in-flight" do
     test "delete returns :ok and key is gone" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "del_iou", "v", 0})
       :ok = GenServer.call(pid, {:delete, "del_iou"})
@@ -893,7 +893,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "delete while flush is in-flight still completes correctly" do
       {pid, idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       # Simulate an in-flight op: inject a fake op_id and a pending batch,
       # then immediately send the completion so delete's await_in_flight returns fast.
@@ -909,7 +909,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "sibling keys survive when one key is deleted" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "sibling_a", "va", 0})
       :ok = GenServer.call(pid, {:put, "sibling_b", "vb", 0})
@@ -927,7 +927,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "shard :keys and :flush await in-flight" do
     test ":keys after put reflects written key" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "kf_k", "v", 0})
       keys = GenServer.call(pid, :keys)
@@ -936,7 +936,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test ":flush with simulated in-flight completes once completion arrives" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :sys.replace_state(pid, fn s -> %{s | flush_in_flight: 55} end)
       # Send the completion asynchronously so flush can receive it
@@ -956,7 +956,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "timer-driven background flush" do
     test "value is durable after 10ms without explicit flush" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "timer_k", "timer_v", 0})
       # Wait for two 1ms timer ticks plus io_uring async latency
@@ -968,7 +968,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "pending is eventually empty without explicit flush" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "bg_k", "v", 0})
       :timer.sleep(100)
@@ -980,7 +980,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "10 rapid puts all visible after 50ms" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       for i <- 1..10, do: GenServer.call(pid, {:put, "rapid_k#{i}", "rapid_v#{i}", 0})
       :timer.sleep(100)
@@ -999,7 +999,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "500 sequential single-entry batches all complete :ok" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for i <- 1..500 do
         assert :ok == submit_and_await!(store, [{"stress_#{i}", "v#{i}", 0}], 10_000)
@@ -1013,7 +1013,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "10 tasks × 50 entries each: 500 total writes, all durable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       tasks =
         for t <- 1..10 do
@@ -1034,7 +1034,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "1000-entry batch completes and all values are readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..1_000, do: {"k1k_#{i}", "v#{i}", 0}
       assert :ok == submit_and_await!(store, batch, 30_000)
@@ -1055,7 +1055,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
       # their values must not be swapped.
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       op_a = submit_async!(store, [{"ord_a", "A", 0}])
       op_b = submit_async!(store, [{"ord_b", "B", 0}])
@@ -1078,7 +1078,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "edge case: mailbox pollution" do
     test "stray io_complete messages sent to a shard are ignored" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       # Send 10 stray completions with random op_ids that the shard never issued
       for i <- 1..10 do
@@ -1100,8 +1100,8 @@ defmodule Ferricstore.Bitcask.IoUringTest do
       on_exit(fn ->
         if Process.alive?(pid1), do: GenServer.stop(pid1)
         if Process.alive?(pid2), do: GenServer.stop(pid2)
-        File.rm_rf!(dir1)
-        File.rm_rf!(dir2)
+        File.rm_rf(dir1)
+        File.rm_rf(dir2)
       end)
 
       # Put something in shard1 to get a real op_id in-flight
@@ -1128,7 +1128,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
       # pid. The send must not crash the NIF thread or the shard.
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       parent = self()
 
@@ -1151,7 +1151,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "edge case: shard crash and restart" do
     test "data written before crash survives and new shard is functional" do
       {pid, idx, dir} = start_shard()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "pre_crash", "safe", 0})
       :ok = GenServer.call(pid, :flush)
@@ -1177,7 +1177,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "ETS is empty on new shard; cold key warms from Bitcask" do
       {pid, idx, dir} = start_shard()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "warm_me", "wval", 0})
       :ok = GenServer.call(pid, :flush)
@@ -1203,7 +1203,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "edge case: rapid put then delete" do
     test "put followed immediately by delete leaves key absent" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "pd_k", "v", 0})
       :ok = GenServer.call(pid, {:delete, "pd_k"})
@@ -1213,7 +1213,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "put → delete → put: key has latest value" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "pdp_k", "first", 0})
       :ok = GenServer.call(pid, {:delete, "pdp_k"})
@@ -1226,7 +1226,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "put → delete → put survives store reopen" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"pdp_dur", "first", 0}])
       {:ok, true} = NIF.delete(store, "pdp_dur")
@@ -1241,7 +1241,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "edge case: TTL boundary conditions" do
     test "key written with expire_at_ms = now+1 expires very soon" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       exp = System.os_time(:millisecond) + 1
       :ok = GenServer.call(pid, {:put, "ttl_edge", "v", exp})
@@ -1253,7 +1253,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "key written with expire_at_ms = 1 (distant past) is immediately nil" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"epoch1", "v", 1}])
       assert {:ok, nil} == NIF.get(store, "epoch1")
@@ -1261,7 +1261,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "overwrite with no-expiry resurrects an expired key" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       exp = System.os_time(:millisecond) + 50
       :ok = GenServer.call(pid, {:put, "resurrect", "v1", exp})
@@ -1279,7 +1279,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "second batch's value is final" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"sk_seq", "v1", 0}])
       assert :ok == submit_and_await!(store, [{"sk_seq", "v2", 0}])
@@ -1289,7 +1289,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "second batch's value survives reopen" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"sk_dur", "v1", 0}])
       assert :ok == submit_and_await!(store, [{"sk_dur", "v2", 0}])
@@ -1303,7 +1303,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "edge case: exists? under async flush" do
     test "exists? returns true for key in ETS before flush completes" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "ex_before", "v", 0})
       # ETS is written synchronously — exists? must see it immediately
@@ -1312,7 +1312,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "exists? returns false after delete" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "ex_del", "v", 0})
       :ok = GenServer.call(pid, {:delete, "ex_del"})
@@ -1321,7 +1321,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "exists? returns false for expired key" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 500
       :ok = GenServer.call(pid, {:put, "ex_exp", "v", past})
@@ -1354,7 +1354,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "edge case: GC of store resource during in-flight op" do
     test "GC of store resource does not crash — completion message is silently dropped" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Submit from a short-lived scope
       op_id =
@@ -1383,7 +1383,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "NIF.keys excludes expired entries, includes live ones" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past   = System.os_time(:millisecond) - 1_000
       future = System.os_time(:millisecond) + 60_000
@@ -1406,7 +1406,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
 
     test "shard :keys after async flush excludes expired" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 500
       :ok = GenServer.call(pid, {:put, "sk_exp", "v", past})
@@ -1421,7 +1421,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "edge case: flush timeout recovery" do
     test "shard recovers after simulated flush timeout — subsequent puts work" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       # Inject an in-flight op that will never complete (simulates a lost CQE)
       # and set a very short timeout by directly replacing state.
@@ -1448,7 +1448,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "single-byte value (1 byte) survives async round-trip" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok == submit_and_await!(store, [{"one_byte", <<42>>, 0}])
       assert {:ok, <<42>>} == NIF.get(store, "one_byte")
@@ -1457,7 +1457,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "all-zeros value is preserved" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       val = <<0, 0, 0, 0>>
       assert :ok == submit_and_await!(store, [{"zeros", val, 0}])
@@ -1467,7 +1467,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "all-0xFF value is preserved" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       val = <<255, 255, 255, 255>>
       assert :ok == submit_and_await!(store, [{"maxbytes", val, 0}])
@@ -1478,7 +1478,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
   describe "edge case: rapid shard restart during in-flight" do
     test "shard restart while writes are pending — data is durable" do
       {pid, idx, dir} = start_shard()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Write and flush so data is definitely on disk
       :ok = GenServer.call(pid, {:put, "before_restart", "safe", 0})
@@ -1503,7 +1503,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "two processes submit async batches to same store — no corruption" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       parent = self()
 
@@ -1532,7 +1532,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "batch where all entries expire together — all nil after sleep" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       exp = System.os_time(:millisecond) + 150
       batch = for i <- 1..5, do: {"same_exp_#{i}", "v#{i}", exp}
@@ -1550,7 +1550,7 @@ defmodule Ferricstore.Bitcask.IoUringTest do
     test "100 single-entry batches in a tight loop all complete" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       op_ids =
         for i <- 1..100 do

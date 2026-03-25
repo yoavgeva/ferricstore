@@ -30,7 +30,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
   describe "get_zero_copy/2 basic" do
     test "returns same value as regular get" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "hello", "world", 0)
@@ -41,7 +41,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "returns {:ok, nil} for missing key" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       assert {:ok, nil} = NIF.get_zero_copy(store, "nonexistent")
@@ -49,7 +49,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "empty value is treated as tombstone (nil)" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       # In Bitcask, value_size == 0 is a tombstone — both get and
@@ -62,7 +62,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "works with large value (1 MB)" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       large_value = :crypto.strong_rand_bytes(1_048_576)
@@ -73,7 +73,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "works with binary key" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       key = <<0, 1, 2, 255>>
@@ -91,7 +91,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
   describe "get_zero_copy/2 binary validity" do
     test "returned binary supports byte_size/1" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "k", "value123", 0)
@@ -102,7 +102,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "returned binary supports pattern matching" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "k", "hello world", 0)
@@ -113,7 +113,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "returned binary supports Enum/String operations" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "k", "ABCDEF", 0)
@@ -126,7 +126,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "returned binary can be used as map key" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "k", "mapkey", 0)
@@ -138,7 +138,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "returned binary is identical to regular get binary" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       payload = :crypto.strong_rand_bytes(4096)
@@ -159,7 +159,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
   describe "get_zero_copy/2 expiry" do
     test "returns nil for expired key" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       # Expire in the past
@@ -171,7 +171,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "returns value for non-expired key" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       future_ms = System.os_time(:millisecond) + 60_000
@@ -188,7 +188,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
   describe "get_zero_copy/2 concurrency" do
     test "concurrent gets return correct values" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -219,7 +219,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
   describe "get_zero_copy/2 resource cleanup" do
     test "multiple gets do not leak memory (GC cleans up resources)" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "k", :crypto.strong_rand_bytes(8192), 0)
@@ -244,7 +244,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "returned binary survives garbage collection of intermediaries" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "k", "survive_gc", 0)
@@ -266,7 +266,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
   describe "get_zero_copy/2 after delete" do
     test "returns nil after key is deleted" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "del_me", "value", 0)
@@ -284,7 +284,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
   describe "get_zero_copy/2 after overwrite" do
     test "returns latest value after overwrite" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "k", "v1", 0)
@@ -296,7 +296,7 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
 
     test "old binary remains valid after key overwrite" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
       :ok = NIF.put(store, "k", "original", 0)

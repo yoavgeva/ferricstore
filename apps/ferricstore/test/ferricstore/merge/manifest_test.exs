@@ -8,7 +8,7 @@ defmodule Ferricstore.Merge.ManifestTest do
     File.mkdir_p!(dir)
 
     on_exit(fn ->
-      File.rm_rf!(dir)
+      File.rm_rf(dir)
     end)
 
     %{dir: dir}
@@ -155,7 +155,7 @@ defmodule Ferricstore.Merge.ManifestTest do
     test "manifest writes to correct shard data directory under data/" do
       root = Path.join(System.tmp_dir!(), "manifest_layout_#{:erlang.unique_integer([:positive])}")
 
-      on_exit(fn -> File.rm_rf!(root) end)
+      on_exit(fn -> File.rm_rf(root) end)
 
       :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
 
@@ -177,7 +177,7 @@ defmodule Ferricstore.Merge.ManifestTest do
     test "manifest does not leak to other shard directories" do
       root = Path.join(System.tmp_dir!(), "manifest_isolation_#{:erlang.unique_integer([:positive])}")
 
-      on_exit(fn -> File.rm_rf!(root) end)
+      on_exit(fn -> File.rm_rf(root) end)
 
       :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
 
@@ -195,7 +195,7 @@ defmodule Ferricstore.Merge.ManifestTest do
     test "manifest cleanup works with canonical paths" do
       root = Path.join(System.tmp_dir!(), "manifest_cleanup_#{:erlang.unique_integer([:positive])}")
 
-      on_exit(fn -> File.rm_rf!(root) end)
+      on_exit(fn -> File.rm_rf(root) end)
 
       :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
 
@@ -212,7 +212,7 @@ defmodule Ferricstore.Merge.ManifestTest do
     test "interrupted merge recovery finds manifest in canonical path" do
       root = Path.join(System.tmp_dir!(), "manifest_recovery_#{:erlang.unique_integer([:positive])}")
 
-      on_exit(fn -> File.rm_rf!(root) end)
+      on_exit(fn -> File.rm_rf(root) end)
 
       :ok = Ferricstore.DataDir.ensure_layout!(root, 4)
 
@@ -240,7 +240,7 @@ defmodule Ferricstore.Merge.ManifestTest do
     test "manifest write and read with legacy shard path" do
       root = Path.join(System.tmp_dir!(), "manifest_legacy_#{:erlang.unique_integer([:positive])}")
 
-      on_exit(fn -> File.rm_rf!(root) end)
+      on_exit(fn -> File.rm_rf(root) end)
 
       # Create a legacy directory before layout.
       legacy = Path.join(root, "shard_0")

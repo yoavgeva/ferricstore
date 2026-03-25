@@ -47,7 +47,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "returns :ok or {:pending, op_id}" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       result = NIF.put_batch_async(store, [{"k", "v", 0}])
 
@@ -58,7 +58,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "empty batch returns :ok or {:pending, op_id}" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       result = NIF.put_batch_async(store, [])
       assert result == :ok or match?({:pending, _}, result)
@@ -67,7 +67,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "op_id is a non-negative integer when pending" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       case NIF.put_batch_async(store, [{"k", "v", 0}]) do
         {:pending, op_id} -> assert is_integer(op_id) and op_id >= 0
@@ -78,7 +78,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "successive calls return distinct op_ids when pending" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       results =
         for i <- 1..5 do
@@ -109,7 +109,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "io_complete message arrives with :ok for a normal batch" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = [{"ack_k", "ack_v", 0}]
       result = NIF.put_batch_async(store, batch)
@@ -119,7 +119,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "io_complete arrives for each independent batch" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for i <- 1..3 do
         batch = [{"seq_k#{i}", "seq_v#{i}", 0}]
@@ -131,7 +131,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "io_complete op_id matches the returned op_id" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       case NIF.put_batch_async(store, [{"match_k", "match_v", 0}]) do
         {:pending, op_id} ->
@@ -146,7 +146,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "no stray io_complete messages after await" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       result = NIF.put_batch_async(store, [{"stray_k", "v", 0}])
       :ok = await_result(result)
@@ -164,7 +164,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "value is readable after async completion" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = [{"read_k", "read_v", 0}]
       :ok = await_result(NIF.put_batch_async(store, batch))
@@ -175,7 +175,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "all values in a multi-entry batch are readable after completion" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = Enum.map(1..10, fn i -> {"multi_k#{i}", "multi_v#{i}", 0} end)
       :ok = await_result(NIF.put_batch_async(store, batch))
@@ -188,7 +188,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "value survives store reopen after async completion" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = await_result(NIF.put_batch_async(store, [{"dur_k", "dur_v", 0}]))
 
@@ -202,7 +202,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "expired entries are not visible after async completion" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 1_000
       future = System.os_time(:millisecond) + 60_000
@@ -221,7 +221,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "overwrite via put_batch_async reflects last value" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = await_result(NIF.put_batch_async(store, [{"ov_k", "v1", 0}]))
       :ok = await_result(NIF.put_batch_async(store, [{"ov_k", "v2", 0}]))
@@ -232,7 +232,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "large batch (100 entries) all readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = Enum.map(1..100, fn i -> {"lb_k#{i}", "lb_v#{i}", 0} end)
       :ok = await_result(NIF.put_batch_async(store, batch))
@@ -251,7 +251,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "sync put after async completion is readable" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = await_result(NIF.put_batch_async(store, [{"mix_async", "a", 0}]))
       :ok = NIF.put(store, "mix_sync", "s", 0)
@@ -263,7 +263,7 @@ defmodule Ferricstore.Bitcask.PutBatchAsyncTest do
     test "put_batch_async after sync put sees both" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "first_sync", "s", 0)
       :ok = await_result(NIF.put_batch_async(store, [{"then_async", "a", 0}]))

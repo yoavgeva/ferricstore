@@ -125,7 +125,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "1000 sequential async single-entry submissions — BEAM stays responsive" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {counter_pid, sample} = start_liveness_counter()
       on_exit(fn -> send(counter_pid, :stop) end)
@@ -146,7 +146,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "200 concurrent async submissions — BEAM stays responsive throughout" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {counter_pid, sample} = start_liveness_counter()
       on_exit(fn -> send(counter_pid, :stop) end)
@@ -170,7 +170,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "async writes interleaved with CPU-heavy Elixir work — neither starves" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Spawn a CPU-intensive process that keeps hashing
       cpu_pid =
@@ -211,7 +211,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "dirty-IO run queue stays low during 500 concurrent async submissions" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Sample dirty-IO queue before
       before_q = dirty_io_run_queue_len()
@@ -246,7 +246,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "concurrent async + concurrent get (Normal) — no deadlock, pool survives" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Pre-populate some keys so gets have something to read
       for i <- 1..50 do
@@ -281,7 +281,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "async writes + deletes (Normal) interleaved — no mutex deadlock" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Pre-write keys to delete
       for i <- 1..50 do
@@ -321,7 +321,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "10 concurrent 1MB-value batches complete without OOM or timeout" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       tasks =
         for i <- 1..10 do
@@ -343,7 +343,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "5 concurrent 5MB-value batches — scheduler threads not blocked" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {counter_pid, sample} = start_liveness_counter()
       on_exit(fn -> send(counter_pid, :stop) end)
@@ -369,7 +369,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "single 10MB value async write completes correctly" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       val = :crypto.strong_rand_bytes(10 * 1_024 * 1_024)
       assert :ok == await_async(store, [{"ten_mb", val, 0}], 30_000)
@@ -379,7 +379,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "batch of 10 × 100KB values — Normal NIF does not overflow reduction budget" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # 10 × 100KB = 1MB total. The encoding loop must yield or complete
       # within the 2000-reduction budget. If it doesn't, BEAM will emit a
@@ -412,7 +412,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "500 rapid single-entry submissions — all completions arrive, no loss" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Submit all 500 before draining any completions.
       # This maximally stresses the completion thread's CQE drain loop.
@@ -444,7 +444,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "20 tasks × 50 submissions each in parallel — 1000 total, no loss" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       tasks =
         for t <- 1..20 do
@@ -485,7 +485,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
       # The ring must handle chunking without dropping operations.
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       op_ids =
         for i <- 1..63 do
@@ -511,7 +511,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "batch of 300 entries (> 4× RING_SIZE) completes without partial write" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..300, do: {"r300_#{i}", "val_#{i}", 0}
       assert :ok == await_async(store, batch, 30_000)
@@ -530,7 +530,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "simultaneous put_batch_async + put_batch (both Normal) — no deadlock" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       async_tasks =
         for i <- 1..50 do
@@ -561,7 +561,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
     test "put_batch_async under keys/delete/get storm — no starvation" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Pre-populate
       for i <- 1..100, do: NIF.put(store, "storm_pre_#{i}", "v#{i}", 0)
@@ -614,7 +614,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
 
     test "shard handles 200 rapid puts followed by :flush without losing data" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       for i <- 1..200 do
         :ok = GenServer.call(pid, {:put, "rapid_shard_#{i}", "v#{i}", 0})
@@ -631,7 +631,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
       # Fire 50 puts without any sleep — they should land in the same or
       # adjacent 1ms timer windows, exercising the batch accumulation logic.
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       tasks =
         for i <- 1..50 do
@@ -662,7 +662,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
       on_exit(fn ->
         for {pid, dir} <- shards do
           if Process.alive?(pid), do: GenServer.stop(pid)
-          File.rm_rf!(dir)
+          File.rm_rf(dir)
         end
       end)
 
@@ -699,7 +699,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
       # not milliseconds (which would indicate it's waiting on I/O).
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Warmup
       _ = await_async(store, [{"warmup", "v", 0}])
@@ -745,7 +745,7 @@ defmodule Ferricstore.Bitcask.SchedulerStressTest do
       # (e.g. dirty thread pool growing, GC pressure, mutex starvation).
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       window_times =
         for window <- 1..10 do

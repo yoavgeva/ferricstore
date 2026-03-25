@@ -55,7 +55,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
         ArgumentError -> :ok
       end
 
-      File.rm_rf!(dir)
+      File.rm_rf(dir)
     end)
 
     %{

@@ -149,7 +149,7 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
       # Write a value via v2_append_record, then read it back via v2_pread_at
       dir = Path.join(System.tmp_dir!(), "zc_v2_test_#{:rand.uniform(9_999_999)}")
       File.mkdir_p!(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       path = Path.join(dir, "test.log")
       value = :crypto.strong_rand_bytes(4_096)

@@ -34,7 +34,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   describe "get_async correctness" do
     test "returns same value as synchronous get" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       :ok = NIF.put(store, "key1", "value1", 0)
@@ -48,7 +48,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "missing key returns {:ok, nil}" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert {:ok, nil} = Async.get(store, "nonexistent")
@@ -56,7 +56,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "large value (1MB) works correctly" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       large_value = :binary.copy("x", 1_000_000)
@@ -67,7 +67,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "binary key and value work correctly" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       key = <<0, 1, 2, 3, 255>>
@@ -85,7 +85,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   describe "put_batch_tokio_async + get_async round-trip" do
     test "basic round-trip works" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       batch = [{"k1", "v1", 0}, {"k2", "v2", 0}, {"k3", "v3", 0}]
@@ -98,7 +98,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "empty batch succeeds" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert :ok = Async.put_batch(store, [])
@@ -112,7 +112,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   describe "delete_async correctness" do
     test "delete + get returns nil" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       :ok = NIF.put(store, "del_key", "del_value", 0)
@@ -124,7 +124,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "deleting non-existent key returns {:ok, false}" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert {:ok, false} = Async.delete(store, "no_such_key")
@@ -138,7 +138,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   describe "write_hint_async" do
     test "succeeds on a store with data" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       :ok = NIF.put(store, "hint_key", "hint_val", 0)
@@ -147,7 +147,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "succeeds on an empty store" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert :ok = Async.write_hint(store)
@@ -161,7 +161,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   describe "purge_expired_async" do
     test "purges expired keys and returns count" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # expire_at_ms = 1 means already expired (1ms since epoch)
@@ -184,7 +184,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   describe "scheduler freedom" do
     test "during concurrent async reads, GenServer responds quickly" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Write 100 keys
@@ -232,7 +232,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   describe "concurrent safety" do
     test "50 concurrent get_async calls all complete successfully" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       for i <- 1..50 do
@@ -255,7 +255,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "mixed sync + async operations don't deadlock" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       :ok = NIF.put(store, "mix_key", "mix_val", 0)
@@ -277,7 +277,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "concurrent writes and reads don't crash" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Start write tasks
@@ -315,7 +315,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   describe "Tokio runtime" do
     test "runtime starts successfully (first get_async proves it)" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # If Tokio runtime failed to start, this would crash
@@ -324,7 +324,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "multiple concurrent spawns work" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Spawn 100 concurrent tasks
@@ -348,7 +348,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
   describe "NIF return values" do
     test "get_async returns {:pending, :ok}" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert {:pending, :ok} = NIF.get_async(store, "any_key")
@@ -363,7 +363,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "delete_async returns {:pending, :ok}" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert {:pending, :ok} = NIF.delete_async(store, "any_key")
@@ -377,7 +377,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "put_batch_tokio_async returns {:pending, :ok}" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert {:pending, :ok} = NIF.put_batch_tokio_async(store, [{"k", "v", 0}])
@@ -391,7 +391,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "write_hint_async returns {:pending, :ok}" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert {:pending, :ok} = NIF.write_hint_async(store)
@@ -405,7 +405,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
 
     test "purge_expired_async returns {:pending, :ok}" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       assert {:pending, :ok} = NIF.purge_expired_async(store)
@@ -426,7 +426,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
     @tag :perf
     test "100 concurrent cold reads complete faster than sequential" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Write keys
@@ -464,7 +464,7 @@ defmodule Ferricstore.Bitcask.AsyncIOTest do
     @tag :perf
     test "throughput: 1000 async gets complete within 10 seconds" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Write keys

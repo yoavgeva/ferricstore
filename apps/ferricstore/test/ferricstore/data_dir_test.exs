@@ -14,7 +14,7 @@ defmodule Ferricstore.DataDirTest do
 
   defp tmp_dir do
     dir = Path.join(System.tmp_dir!(), "datadir_test_#{:rand.uniform(9_999_999)}")
-    on_exit(fn -> File.rm_rf!(dir) end)
+    on_exit(fn -> File.rm_rf(dir) end)
     dir
   end
 

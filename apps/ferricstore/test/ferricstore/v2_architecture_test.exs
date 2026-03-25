@@ -23,7 +23,7 @@ defmodule Ferricstore.V2ArchitectureTest do
   setup do
     dir = Path.join(System.tmp_dir!(), "v2_test_#{:erlang.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    on_exit(fn -> File.rm_rf!(dir) end)
+    on_exit(fn -> File.rm_rf(dir) end)
     %{dir: dir}
   end
 

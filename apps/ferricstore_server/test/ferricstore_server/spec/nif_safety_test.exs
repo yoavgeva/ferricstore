@@ -52,7 +52,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
     @tag timeout: 30_000
     test "put/get/delete do not consume dirty IO scheduler threads" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Record dirty IO scheduler utilization before and after a burst of
@@ -119,7 +119,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
   describe "NF-010: empty key handling at NIF layer" do
     test "put with empty key does not crash the BEAM" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # The NIF layer accepts empty keys (returns :ok). The Router layer is
@@ -133,7 +133,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
 
     test "get after put with empty key returns the stored value or nil" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # If put accepted the empty key, get should return the value.
@@ -154,7 +154,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
 
     test "delete with empty key does not crash the BEAM" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       result = NIF.delete(store, "")
@@ -165,7 +165,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
 
     test "store remains usable after operations with empty key" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Exercise all ops with empty key
@@ -182,7 +182,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
   describe "NF-012: max key size (65,535 bytes) accepted" do
     test "key of exactly 65,535 bytes is accepted and round-trips" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       max_key = :crypto.strong_rand_bytes(65_535)
@@ -192,7 +192,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
 
     test "key of exactly 65,536 bytes (one over max) is rejected" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       oversized_key = :crypto.strong_rand_bytes(65_536)
@@ -247,7 +247,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
   describe "NF-020: 100 concurrent puts to different keys -> all readable" do
     test "all 100 keys are durable after concurrent puts at NIF layer" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       tasks =
@@ -271,7 +271,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
   describe "NF-021: 100 concurrent puts to same key -> last write wins" do
     test "final value is one of the written values (no garbage)" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       expected_values = MapSet.new(1..100, fn i -> "val_#{i}" end)
@@ -297,7 +297,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
   describe "NF-022: read during write returns old or new value, never garbage" do
     test "concurrent reads see only valid values during writes" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Seed with initial value
@@ -343,7 +343,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
   describe "NF-030: kill process holding NIF reference -> no BEAM crash" do
     test "killing a process during NIF put does not crash the BEAM" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Pre-populate to make the store non-trivial
@@ -376,7 +376,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
 
     test "killing a process during NIF get does not crash the BEAM" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Write a large value to make get take longer
@@ -402,7 +402,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
 
     test "killing a process during keys enumeration does not crash the BEAM" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       # Populate with enough keys to make keys() take measurable time
@@ -429,7 +429,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
 
     test "store reference from killed process is usable by surviving process" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       store = open_store(dir)
 
       :ok = NIF.put(store, "survive", "value", 0)
@@ -465,7 +465,7 @@ defmodule FerricstoreServer.Spec.NIFSafetyTest do
   describe "NF-031: open/close store 100 times on same dir -> no memory leak" do
     test "RSS does not grow beyond 20MB after 100 open/close cycles on same dir" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Seed the store with some data to make it non-trivial
       store = open_store(dir)

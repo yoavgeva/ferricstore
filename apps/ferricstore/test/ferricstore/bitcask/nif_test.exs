@@ -28,7 +28,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     test "opens a new store in an empty directory" do
       dir = tmp_dir()
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert {:ok, store} = NIF.new(dir)
       assert is_reference(store)
@@ -37,7 +37,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     test "reopens an existing store and recovers data" do
       dir = tmp_dir()
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store1 = open_store(dir)
       :ok = NIF.put(store1, "persist", "value", 0)
@@ -59,8 +59,8 @@ defmodule Ferricstore.Bitcask.NIFTest do
       dir_b = tmp_dir()
 
       on_exit(fn ->
-        File.rm_rf!(dir_a)
-        File.rm_rf!(dir_b)
+        File.rm_rf(dir_a)
+        File.rm_rf(dir_b)
       end)
 
       store_a = open_store(dir_a)
@@ -82,7 +82,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -125,7 +125,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
       # storage layer, so get returns nil.
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "empty_val", "", 0)
       assert {:ok, nil} == NIF.get(store, "empty_val")
@@ -164,7 +164,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -204,7 +204,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -245,7 +245,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -294,7 +294,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -359,7 +359,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store, dir: dir}
     end
 
@@ -385,7 +385,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     setup do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
       %{store: store}
     end
 
@@ -434,7 +434,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     test "data persists across store open/close" do
       dir = tmp_dir()
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store1 = open_store(dir)
       :ok = NIF.put(store1, "persist_key", "persist_val", 0)
@@ -450,7 +450,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     test "tombstone persists across reopen" do
       dir = tmp_dir()
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store1 = open_store(dir)
       :ok = NIF.put(store1, "tomb_key", "val", 0)
@@ -466,7 +466,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     test "multiple put/delete cycles persist correctly" do
       dir = tmp_dir()
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for round <- 1..10 do
         store = open_store(dir)
@@ -517,7 +517,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     test "concurrent puts from multiple processes do not corrupt data" do
       dir = tmp_dir()
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 
@@ -541,7 +541,7 @@ defmodule Ferricstore.Bitcask.NIFTest do
     test "concurrent gets do not corrupt data" do
       dir = tmp_dir()
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
 

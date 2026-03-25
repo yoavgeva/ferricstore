@@ -29,7 +29,7 @@ defmodule Ferricstore.Bitcask.NIFExtendedTest do
   defp setup_store(_context \\ %{}) do
     dir = tmp_dir()
     store = open_store(dir)
-    on_exit(fn -> File.rm_rf!(dir) end)
+    on_exit(fn -> File.rm_rf(dir) end)
     %{store: store, dir: dir}
   end
 

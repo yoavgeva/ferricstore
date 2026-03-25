@@ -47,7 +47,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
 
   defp setup_store do
     {store, dir} = open_store()
-    on_exit(fn -> File.rm_rf!(dir) end)
+    on_exit(fn -> File.rm_rf(dir) end)
     store
   end
 

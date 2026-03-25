@@ -249,7 +249,7 @@ defmodule FerricstoreServer.TlsRotationTest do
     {v1_der, v1_cert, v1_key} = generate_self_signed(tmp_dir, "v1")
     {v2_der, v2_cert, v2_key} = generate_self_signed(tmp_dir, "v2")
 
-    on_exit(fn -> File.rm_rf!(tmp_dir) end)
+    on_exit(fn -> File.rm_rf(tmp_dir) end)
 
     %{
       tmp_dir: tmp_dir,

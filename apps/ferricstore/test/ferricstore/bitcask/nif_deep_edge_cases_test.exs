@@ -62,12 +62,12 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
       # Creator Task process is now dead, but the ResourceArc lives
       assert {:ok, "value"} = NIF.get(store, "survive")
 
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
     end
 
     test "kill process during NIF execution — BEAM does not crash" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for i <- 1..1000 do
         :ok = NIF.put(store, "kill_test_#{i}", "value_#{i}", 0)
@@ -88,7 +88,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "NIF resource garbage collected after all references dropped" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for _ <- 1..20 do
         {:ok, s} = NIF.new(Path.join(dir, "gc_#{:rand.uniform(9_999_999)}"))
@@ -110,7 +110,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
   describe "binary safety" do
     test "NIF handles binary key with embedded nulls" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       key = <<0, 1, 0, 2, 0>>
       value = <<0, 0, 0, 0, 0>>
@@ -120,7 +120,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "NIF handles 0-byte key with non-empty value" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       result = NIF.put(store, "", "value", 0)
       assert result == :ok or match?({:error, _}, result)
@@ -132,7 +132,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "NIF handles very large binary key (65535 bytes)" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       key = :binary.copy("x", 65535)
       :ok = NIF.put(store, key, "v", 0)
@@ -141,7 +141,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "NIF rejects key larger than 65535 bytes" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       key = :binary.copy("x", 65536)
       result = NIF.put(store, key, "v", 0)
@@ -150,7 +150,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "NIF handles value with all null bytes" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       value = :binary.copy(<<0>>, 1024)
       :ok = NIF.put(store, "nullval", value, 0)
@@ -159,7 +159,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "NIF handles all 256 byte values in key" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for b <- 0..255 do
         key = <<b>>
@@ -176,7 +176,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "NIF handles non-UTF-8 binary data" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       key = <<0xFF, 0xFE, 0xFD, 0xFC>>
       value = <<0x80, 0x81, 0x82, 0x83>>
@@ -192,7 +192,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
   describe "concurrent stress" do
     test "100 processes doing different NIF operations simultaneously" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for i <- 1..50 do
         :ok = NIF.put(store, "k#{i}", "v#{i}", 0)
@@ -224,7 +224,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "store usable after process killed during write" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       pid =
         spawn(fn ->
@@ -243,7 +243,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "concurrent put_batch does not corrupt store" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       tasks =
         for t <- 1..10 do
@@ -270,14 +270,14 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
   describe "read_modify_write edge cases" do
     test "INCRBY on nonexistent key starts from zero" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert {:ok, "5"} = NIF.read_modify_write(store, "counter", {:incr_by, 5})
     end
 
     test "INCRBY overflow at i64::MAX returns error" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       max = 9_223_372_036_854_775_807
       :ok = NIF.put(store, "big", Integer.to_string(max), 0)
@@ -288,7 +288,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "INCRBY underflow at i64::MIN returns error" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       min = -9_223_372_036_854_775_808
       :ok = NIF.put(store, "small", Integer.to_string(min), 0)
@@ -298,7 +298,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "INCRBYFLOAT with non-numeric string returns error" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "nan_test", "not_a_number", 0)
       result = NIF.read_modify_write(store, "nan_test", {:incr_by_float, 1.0})
@@ -307,7 +307,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "SETRANGE beyond 512MB returns error" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       offset = 512 * 1024 * 1024
       result = NIF.read_modify_write(store, "huge", {:set_range, offset, "x"})
@@ -316,7 +316,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "APPEND to nonexistent key creates value" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert {:ok, "hello"} = NIF.read_modify_write(store, "appkey", {:append, "hello"})
       assert {:ok, "helloworld"} = NIF.read_modify_write(store, "appkey", {:append, "world"})
@@ -324,7 +324,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "SETBIT on nonexistent key" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert {:ok, _} = NIF.read_modify_write(store, "bitkey", {:set_bit, 7, 1})
     end
@@ -593,7 +593,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
     test "create, add, exists lifecycle" do
       dir = tmp_dir()
       path = Path.join(dir, "test.bloom")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {:ok, bloom} = NIF.bloom_create(path, 10_000, 7)
       # bloom_exists returns raw 0/1
@@ -607,7 +607,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
     test "empty key in bloom filter" do
       dir = tmp_dir()
       path = Path.join(dir, "empty_key.bloom")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {:ok, bloom} = NIF.bloom_create(path, 10_000, 7)
       _result = NIF.bloom_add(bloom, "")
@@ -618,7 +618,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
     test "mexists with mixed results" do
       dir = tmp_dir()
       path = Path.join(dir, "mexists.bloom")
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {:ok, bloom} = NIF.bloom_create(path, 100_000, 7)
       NIF.bloom_add(bloom, "present")
@@ -635,7 +635,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
   describe "yielding NIF safety" do
     test "keys() with 10K entries yields properly" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch =
         for i <- 1..10_000 do
@@ -649,7 +649,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "get_all() with 5K entries yields properly" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch =
         for i <- 1..5_000 do
@@ -663,7 +663,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "get_batch() with 5K keys yields properly" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch =
         for i <- 1..5_000 do
@@ -679,7 +679,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "get_range() with large range yields properly" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch =
         for i <- 1..5_000 do
@@ -699,7 +699,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
   describe "zero-copy binary safety" do
     test "get_zero_copy returns valid binary" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "zc_key", "zc_value_data", 0)
       {:ok, value} = NIF.get_zero_copy(store, "zc_key")
@@ -708,14 +708,14 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "get_zero_copy returns nil for missing key" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert {:ok, nil} = NIF.get_zero_copy(store, "missing")
     end
 
     test "get_all_zero_copy returns valid pairs" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for i <- 1..100 do
         :ok = NIF.put(store, "zc_all_#{i}", "val_#{i}", 0)
@@ -732,7 +732,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "get_batch_zero_copy handles mixed hits and misses" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "hit1", "val1", 0)
       :ok = NIF.put(store, "hit2", "val2", 0)
@@ -746,7 +746,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "zero-copy binaries remain valid after GC" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "gc_test", String.duplicate("x", 10_000), 0)
       {:ok, value} = NIF.get_zero_copy(store, "gc_test")
@@ -766,7 +766,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
   describe "store operation edge cases" do
     test "put_batch with empty list is no-op" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "existing", "value", 0)
       :ok = NIF.put_batch(store, [])
@@ -775,7 +775,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "put_batch with single item" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put_batch(store, [{"single", "item", 0}])
       assert {:ok, "item"} = NIF.get(store, "single")
@@ -783,7 +783,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "shard_stats on empty store" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {:ok, stats} = NIF.shard_stats(store)
       assert is_tuple(stats)
@@ -791,7 +791,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "file_sizes on empty store" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {:ok, sizes} = NIF.file_sizes(store)
       assert is_list(sizes)
@@ -799,7 +799,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "available_disk_space returns a positive number" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {:ok, space} = NIF.available_disk_space(store)
       assert is_integer(space) and space > 0
@@ -807,14 +807,14 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "write_hint on empty store" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       assert :ok = NIF.write_hint(store)
     end
 
     test "purge_expired with no expired keys" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "live", "data", 0)
       {:ok, 0} = NIF.purge_expired(store)
@@ -822,7 +822,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "run_compaction with empty file_ids list" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       {:ok, result} = NIF.run_compaction(store, [])
       assert is_tuple(result)
@@ -830,7 +830,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "store persists data across close and reopen" do
       dir = tmp_dir()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       store1 = open_store(dir)
       :ok = NIF.put(store1, "persist_key", "persist_value", 0)
@@ -844,7 +844,7 @@ defmodule Ferricstore.Bitcask.NIFDeepEdgeCasesTest do
 
     test "delete returns expected tuple format" do
       {store, dir} = open_store()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "del_me", "val", 0)
       assert {:ok, true} = NIF.delete(store, "del_me")

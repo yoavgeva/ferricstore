@@ -98,7 +98,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "4094-entry batch (RING_SIZE-2 writes) completes correctly" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       n = 4094
       batch = for i <- 1..n, do: {"r4094_#{i}", "v#{i}", 0}
@@ -114,7 +114,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "4095-entry batch (RING_SIZE-1 writes, fills ring exactly) completes correctly" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       n = 4095
       batch = for i <- 1..n, do: {"r4095_#{i}", "v#{i}", 0}
@@ -131,7 +131,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
       # The NIF should return {:error, _} without touching the keydir.
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Write one key before the oversized batch so we can verify it survives
       :ok = NIF.put(store, "pre_4096", "safe", 0)
@@ -177,7 +177,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
       # fresh ring state and correct file offsets.
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch1 = for i <- 1..4095, do: {"chain1_#{i}", "v1_#{i}", 0}
       assert :ok == submit_and_await!(store, batch1, 60_000)
@@ -323,7 +323,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
   describe "ETS-miss cold-read after async write" do
     test "key written async then ETS evicted — cold read warms from Bitcask" do
       {pid, idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "cold_k", "cold_v", 0})
       :ok = GenServer.call(pid, :flush)
@@ -342,7 +342,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
 
     test "Router.get takes cold path when ETS is empty for that shard" do
       {pid, idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       k = "cold_rtr_k"
       :ok = GenServer.call(pid, {:put, k, "cold_rtr_v", 0})
@@ -358,7 +358,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
 
     test "get_meta cold path returns value and expiry 0 for no-expiry key" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "meta_cold_k", "meta_v", 0})
       :ok = GenServer.call(pid, :flush)
@@ -380,7 +380,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
   describe "pending accumulation while flush is in-flight" do
     test "writes received while in-flight accumulate in pending, drain on next tick" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       # Write first key — triggers async flush, sets flush_in_flight
       :ok = GenServer.call(pid, {:put, "inf_k1", "v1", 0})
@@ -403,7 +403,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
 
     test "state.pending is [] and state.flush_in_flight is nil after all drains" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       for i <- 1..50 do
         :ok = GenServer.call(pid, {:put, "drain_#{i}", "v#{i}", 0})
@@ -420,7 +420,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
 
     test "100 rapid puts: all durable after explicit flush" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       for i <- 1..100 do
         :ok = GenServer.call(pid, {:put, "rp_#{i}", "rv#{i}", 0})
@@ -443,7 +443,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "purge_expired removes async-written expired keys and returns correct count" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 1_000
 
@@ -465,7 +465,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "purge_expired on store with no expired keys returns 0" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..10, do: {"nope_#{i}", "v#{i}", 0}
       assert :ok == submit_and_await!(store, batch)
@@ -477,7 +477,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "purge_expired after reopen only counts entries on disk" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 1_000
       batch = for i <- 1..3, do: {"rpo_exp_#{i}", "v#{i}", past}
@@ -500,7 +500,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "write_hint after async batch completes without error" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..20, do: {"hint_#{i}", "v#{i}", 0}
       assert :ok == submit_and_await!(store, batch)
@@ -511,7 +511,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "store reopened from hint file loads correct keydir" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..50, do: {"hf_#{i}", "hv#{i}", 0}
       assert :ok == submit_and_await!(store1, batch, 15_000)
@@ -536,7 +536,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
   describe "multiple independent stores" do
     test "3 stores write concurrently, no cross-contamination" do
       dirs = for _ <- 1..3, do: tmp_dir()
-      on_exit(fn -> Enum.each(dirs, &File.rm_rf!/1) end)
+      on_exit(fn -> Enum.each(dirs, &File.rm_rf/1) end)
 
       stores = Enum.map(dirs, &open_store/1)
 
@@ -566,7 +566,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
 
     test "5 stores, each gets a 100-entry batch, all survive" do
       dirs = for _ <- 1..5, do: tmp_dir()
-      on_exit(fn -> Enum.each(dirs, &File.rm_rf!/1) end)
+      on_exit(fn -> Enum.each(dirs, &File.rm_rf/1) end)
 
       stores = Enum.map(dirs, &open_store/1)
 
@@ -598,7 +598,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "200 concurrent tasks write the same key — one value survives, no crash" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # All tasks write the same key with a unique value
       tasks =
@@ -646,7 +646,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "2000-entry async batch: all values survive reopen" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       n = 2_000
       batch = for i <- 1..n, do: {"lbd_#{i}", "lv#{i}", 0}
@@ -667,7 +667,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "2000-entry batch + sync writes: all survive reopen" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Async batch
       batch = for i <- 1..2_000, do: {"mixed_a_#{i}", "av#{i}", 0}
@@ -701,7 +701,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "50 keys: each written with expiry, then overwritten without — all live" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 1_000
 
@@ -726,7 +726,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "batch with alternating expired/live entries: exact read semantics" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 1_000
       future = System.os_time(:millisecond) + 60_000
@@ -759,7 +759,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "keys: async writes appear, deleted keys disappear, expired excluded" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 1_000
 
@@ -793,7 +793,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "keys count is correct after batch overwrite (no duplicates)" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Write 10 unique keys
       batch1 = for i <- 1..10, do: {"dedup_#{i}", "v1", 0}
@@ -845,7 +845,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
   describe "shard restart fidelity: multiple crash-restart cycles" do
     test "3 crash-restart cycles: each round's data survives, new writes succeed" do
       {pid0, idx, dir} = start_shard()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       final_pid =
         Enum.reduce(1..3, pid0, fn round, pid ->
@@ -878,7 +878,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
 
     test "async writes in-flight during crash: pre-flush data survives" do
       {pid, idx, dir} = start_shard()
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Write + explicit flush (ensures data is on disk before crash)
       :ok = GenServer.call(pid, {:put, "pre_crash_ifl", "safe_val", 0})
@@ -910,7 +910,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "10 sequential batches to distinct keys: no value swap" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       # Submit all, collect op_ids, then verify in order
       op_ids =
@@ -935,7 +935,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "overwrite sequence: 20 async overwrites of same key — last value on disk" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       for i <- 1..20 do
         assert :ok == submit_and_await!(store, [{"ov_seq", "val_#{i}", 0}])
@@ -958,7 +958,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
   describe "shard resilience after async error completions" do
     test "shard receives error completion, clears in-flight, accepts further writes" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       :sys.replace_state(pid, fn s -> %{s | flush_in_flight: 9876} end)
       send(pid, {:io_complete, 9876, {:error, "simulated disk error"}})
@@ -974,7 +974,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
 
     test "3 consecutive error completions: shard stays alive and writable" do
       {pid, _idx, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf!(dir) end)
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
 
       for op_id <- [1111, 2222, 3333] do
         :sys.replace_state(pid, fn s -> %{s | flush_in_flight: op_id} end)
@@ -998,7 +998,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "batch of 100 entries with same key: last entry wins" do
       dir = tmp_dir()
       store = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..100, do: {"one_key", "v#{i}", 0}
       assert :ok == submit_and_await!(store, batch)
@@ -1010,7 +1010,7 @@ defmodule Ferricstore.Bitcask.IoUringIntegrationTest do
     test "100-same-key batch survives reopen with correct final value" do
       dir = tmp_dir()
       store1 = open_store(dir)
-      on_exit(fn -> File.rm_rf!(dir) end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       batch = for i <- 1..100, do: {"dup_reopen", "v#{i}", 0}
       assert :ok == submit_and_await!(store1, batch)
