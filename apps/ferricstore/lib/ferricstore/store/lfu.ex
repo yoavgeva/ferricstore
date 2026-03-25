@@ -87,19 +87,10 @@ defmodule Ferricstore.Store.LFU do
     {bsr(packed, 8) &&& 0xFFFF, packed &&& 0xFF}
   end
 
-  @doc """
-  Returns the current time in minutes, masked to 16 bits.
-
-  In tests, set `:persistent_term.put(:ferricstore_time_override, minutes)` to
-  control time without waiting. Production has zero overhead (~5ns persistent_term
-  read returns nil, falls through to real time).
-  """
+  @doc "Returns the current time in minutes, masked to 16 bits."
   @spec now_minutes() :: non_neg_integer()
   def now_minutes do
-    case :persistent_term.get(:ferricstore_time_override, nil) do
-      nil -> div(System.os_time(:second), 60) &&& 0xFFFF
-      minutes -> minutes &&& 0xFFFF
-    end
+    div(System.os_time(:second), 60) &&& 0xFFFF
   end
 
   @doc """
