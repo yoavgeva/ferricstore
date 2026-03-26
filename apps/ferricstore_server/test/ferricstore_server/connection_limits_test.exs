@@ -74,7 +74,8 @@ defmodule FerricstoreServer.ConnectionLimitsTest do
       send_command(sock, ["SET", "bigkey", large_value])
 
       # The connection should receive an error and be closed.
-      data = recv_all(sock)
+      # Use longer timeout for slow CI (1MB+ takes time to send/parse on macOS runners)
+      data = recv_all(sock, 10_000)
       assert data =~ "value too large"
 
       # Connection should be closed after the error
