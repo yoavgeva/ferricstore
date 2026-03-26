@@ -1633,6 +1633,10 @@ defmodule FerricStore do
       compound_type != nil ->
         {:ok, compound_type}
 
+      # Check for list metadata key (lists use compound keys, no type marker)
+      store.compound_get.(resolved_key, Ferricstore.Store.CompoundKey.list_meta_key(resolved_key)) != nil ->
+        {:ok, "list"}
+
       true ->
         case Router.get(resolved_key) do
           nil ->
