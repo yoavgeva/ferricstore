@@ -1,52 +1,98 @@
 defmodule FerricStore.Sandbox do
   @moduledoc """
-  True process-isolated sandbox for tests.
+  True process-isolated sandbox for tests — same model as `Ecto.Adapters.SQL.Sandbox`.
 
-  Each `checkout/1` creates a fully isolated FerricStore instance:
+  ## Why
 
-    * 2 private Shard GenServers (no global name registration)
-    * 2 private ETS keydir tables (anonymous, not named)
-    * 2 private ETS prefix_keys tables (anonymous, not named)
-    * Its own ra system (independent WAL + Raft groups)
-    * Its own tmpdir (cleaned up on checkin)
+  FerricStore is a shared-state system: all tests share the same ETS tables,
+  Bitcask files, and Raft WAL. Without isolation, tests pollute each other —
+  `DBSIZE` returns wrong counts, `KEYS *` shows other tests' keys, and
+  `FLUSHDB` destroys everyone's data.
 
-  Full production stack: ETS hot cache + Raft WAL + Bitcask on-disk files.
-  Complete isolation. Supports `async: true` tests.
+  Elixir/Phoenix developers expect Ecto-level isolation: each test sees an
+  empty database, writes are invisible to other tests, cleanup is instant.
+  This module provides exactly that.
 
-  Production code has ZERO overhead -- all sandbox resolution is behind
-  `@sandbox_enabled Application.compile_env(:ferricstore, :sandbox_enabled, false)`
-  which compiles away in production builds.
+  ## What each checkout creates
 
-  ## How it works
+  Each `checkout/1` spins up a fully isolated FerricStore instance:
 
-  `checkout/1` returns a `%FerricStore.Sandbox{}` struct and stores it in both
-  the calling process's Process dictionary and a shared ETS registry. The Router
-  checks `Process.get(:ferricstore_sandbox)` on every operation (~5ns). When a
-  struct sandbox is active, it routes to the private shards instead of the
-  application-supervised ones.
+    * **2 private Shard GenServers** — anonymous (no global name), private ETS
+    * **2 private ETS keydir tables** — anonymous, not the shared `:keydir_0` etc.
+    * **2 private ETS prefix_keys tables** — for SCAN index isolation
+    * **Its own ra system** — independent Raft WAL + consensus groups
+    * **Its own tmpdir** — Bitcask data files, WAL segments, cleaned on checkin
 
-  `allow/2` copies the sandbox from an owner process to a child process via the
-  ETS registry, enabling Tasks and spawned workers to share the same sandbox.
+  This is the **full production stack**: ETS hot cache → Raft WAL → Bitcask
+  on-disk files. Tests exercise the same code path as production — including
+  Raft leader election, WAL replay, and disk persistence. No mocks, no bypasses.
 
-  ## Backward compatibility
+  ## Why Raft is included (not bypassed)
 
-  The old prefix-based sandbox (`checkout/0` returning a string namespace) is
-  still supported. When `Process.get(:ferricstore_sandbox)` is a binary string,
-  the old key-prefixing behavior is used. When it is a `%FerricStore.Sandbox{}`
-  struct, the new shard-isolation behavior is used.
+  The sandbox could skip Raft for speed (`raft? = false`). We chose not to
+  because the sandbox is a **user-facing feature** — Phoenix developers use it
+  to test their application code against FerricStore. If their tests skip Raft,
+  they won't catch Raft-specific bugs (write ordering, WAL replay, consensus
+  failures). The sandbox must test what production runs.
+
+  Each sandbox starts its own ra system (~50ms) with its own WAL directory.
+  Shard writes go through `:ra.process_command` (direct, no Batcher batching)
+  for simplicity. The Raft apply path is identical to production.
+
+  ## Zero production overhead
+
+  All sandbox resolution code is behind a compile-time gate:
+
+      @sandbox_enabled Application.compile_env(:ferricstore, :sandbox_enabled, false)
+
+  In production builds (`sandbox_enabled: false`), the Elixir compiler
+  eliminates all sandbox code paths. `resolve_shard/1` compiles to
+  `shard_name/1`. `resolve_keydir/1` compiles to `:"keydir_\#{idx}"`.
+  No `Process.get` checks, no branching, no ETS registry lookups.
+  Zero nanoseconds added to production requests.
+
+  ## How routing works
+
+  The Router checks `Process.get(:ferricstore_sandbox)` on every operation
+  (~5ns in test builds). When a `%FerricStore.Sandbox{}` struct is active:
+
+    * `shard_for(key)` uses `rem(phash2(key), 2)` instead of the 1024-slot map
+    * `resolve_shard(idx)` returns the private shard PID instead of the global name
+    * `resolve_keydir(idx)` returns the private ETS tid instead of `:keydir_N`
+    * `raft_write` routes through the shard GenServer (which submits to private ra)
+
+  ## Async test support
+
+  `allow/2` copies the sandbox reference from a test process to a child process
+  via a shared ETS registry. This enables `Task.async` and `GenServer` workers
+  spawned by a test to read/write the same isolated sandbox:
+
+      sandbox = FerricStore.Sandbox.checkout()
+      task = Task.async(fn ->
+        FerricStore.Sandbox.allow(self())
+        FerricStore.set("from_task", "value")
+      end)
+      Task.await(task)
+      {:ok, "value"} = FerricStore.get("from_task")
 
   ## Usage
+
+  In your test:
 
       setup do
         sandbox = FerricStore.Sandbox.checkout()
         on_exit(fn -> FerricStore.Sandbox.checkin(sandbox) end)
-        %{sandbox: sandbox}
       end
 
   Or use the Case template:
 
       use FerricStore.Sandbox.Case
 
+  ## Cleanup
+
+  `checkin/1` stops the private shard GenServers, stops the ra system,
+  deletes the ETS tables, and removes the tmpdir. Instant cleanup —
+  no key-by-key iteration, no prefix scanning.
   """
 
   alias Ferricstore.Store.Router
