@@ -664,4 +664,197 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       {:ok, [], _} -> recv_response(sock, buf2)
     end
   end
+
+  defp kill_shard_and_wait(key) do
+    name = Router.shard_name(Router.shard_for(key))
+    pid = Process.whereis(name)
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 2_000
+    ShardHelpers.wait_shards_alive(10_000)
+  end
+
+  # ==========================================================================
+  # Strengthened fault tolerance assertions
+  # ==========================================================================
+
+  describe "fault tolerance: dbsize and key count accuracy" do
+    @tag :durability
+    test "dbsize is exact after crash recovery — no phantom keys" do
+      keys = for i <- 1..10, do: ukey("dbsize_#{i}")
+
+      for {k, i} <- Enum.with_index(keys, 1) do
+        batcher_put(k, "val_#{i}")
+      end
+
+      flush_all_batchers()
+      ShardHelpers.flush_all_shards()
+
+      # Verify before crash
+      for {k, i} <- Enum.with_index(keys, 1) do
+        assert Router.get(k) == "val_#{i}"
+      end
+
+      # Kill shard owning first key
+      kill_shard_and_wait(hd(keys))
+
+      # All keys must still be readable
+      for {k, i} <- Enum.with_index(keys, 1) do
+        assert Router.get(k) == "val_#{i}", "key #{k} lost after crash"
+      end
+
+      # dbsize must be at least 10 (could be more from other shards' residual keys)
+      size = Router.dbsize()
+      assert size >= 10, "dbsize #{size} is less than expected 10"
+    end
+  end
+
+  describe "fault tolerance: TTL survival" do
+    @tag :durability
+    test "TTL survives shard crash — key expires at the right time" do
+      k = ukey("ttl_crash")
+      # Set with 60s TTL (won't expire during test)
+      batcher_put(k, "ttl_val", System.os_time(:millisecond) + 60_000)
+      flush_all_batchers()
+      ShardHelpers.flush_all_shards()
+
+      assert Router.get(k) == "ttl_val"
+      {:ok, ttl_before} = FerricStore.pttl(k)
+      assert is_integer(ttl_before) and ttl_before > 0, "TTL should be positive before crash"
+
+      kill_shard_and_wait(k)
+
+      assert Router.get(k) == "ttl_val", "value lost after crash"
+      {:ok, ttl_after} = FerricStore.pttl(k)
+      assert is_integer(ttl_after) and ttl_after > 0, "TTL should survive crash"
+      # TTL should be close to before (within 5s tolerance for restart time)
+      assert abs(ttl_before - ttl_after) < 5_000, "TTL drifted too much after crash"
+    end
+
+    @tag :durability
+    test "already-expired key stays expired after crash" do
+      k = ukey("expired_crash")
+      # Set with TTL in the past
+      batcher_put(k, "gone", System.os_time(:millisecond) - 1_000)
+      flush_all_batchers()
+      ShardHelpers.flush_all_shards()
+
+      assert Router.get(k) == nil, "expired key should not be readable"
+
+      kill_shard_and_wait(k)
+
+      assert Router.get(k) == nil, "expired key must stay expired after crash"
+    end
+  end
+
+  describe "fault tolerance: compound key survival" do
+    @tag :durability
+    test "hash fields survive shard crash" do
+      k = ukey("hash_crash")
+      FerricStore.hset(k, %{"f1" => "v1", "f2" => "v2", "f3" => "v3"})
+      ShardHelpers.flush_all_shards()
+
+      assert {:ok, "v1"} = FerricStore.hget(k, "f1")
+      assert {:ok, "v2"} = FerricStore.hget(k, "f2")
+
+      kill_shard_and_wait(k)
+
+      assert {:ok, "v1"} = FerricStore.hget(k, "f1")
+      assert {:ok, "v2"} = FerricStore.hget(k, "f2")
+      assert {:ok, "v3"} = FerricStore.hget(k, "f3")
+
+      # Write new field after crash
+      FerricStore.hset(k, %{"f4" => "v4"})
+      assert {:ok, "v4"} = FerricStore.hget(k, "f4")
+    end
+
+    @tag :durability
+    test "set members survive shard crash" do
+      k = ukey("set_crash")
+      FerricStore.sadd(k, ["a", "b", "c"])
+      ShardHelpers.flush_all_shards()
+
+      {:ok, members_before} = FerricStore.smembers(k)
+      assert Enum.sort(members_before) == ["a", "b", "c"]
+
+      kill_shard_and_wait(k)
+
+      {:ok, members_after} = FerricStore.smembers(k)
+      assert Enum.sort(members_after) == ["a", "b", "c"], "set members lost after crash"
+    end
+  end
+
+  describe "fault tolerance: delete and INCR survival" do
+    @tag :durability
+    test "deleted key stays deleted after crash — tombstone replay" do
+      k = ukey("tombstone")
+      batcher_put(k, "temporary")
+      flush_all_batchers()
+      ShardHelpers.flush_all_shards()
+
+      assert Router.get(k) == "temporary"
+
+      Router.delete(k)
+      ShardHelpers.flush_all_shards()
+
+      assert Router.get(k) == nil, "key should be deleted"
+
+      kill_shard_and_wait(k)
+
+      assert Router.get(k) == nil, "tombstone must survive crash"
+    end
+
+    @tag :durability
+    test "INCR counter value survives crash" do
+      k = ukey("counter")
+      FerricStore.set(k, "0")
+      for _ <- 1..10, do: FerricStore.incr(k)
+      ShardHelpers.flush_all_shards()
+
+      assert {:ok, "10"} = FerricStore.get(k)
+
+      kill_shard_and_wait(k)
+
+      assert {:ok, "10"} = FerricStore.get(k)
+
+      # Continue incrementing after crash
+      FerricStore.incr(k)
+      assert {:ok, "11"} = FerricStore.get(k)
+    end
+  end
+
+  describe "fault tolerance: double crash recovery" do
+    @tag :durability
+    test "write → crash → write more → crash again → all data intact" do
+      k1 = ukey("double_crash_1")
+      batcher_put(k1, "round1")
+      flush_all_batchers()
+      ShardHelpers.flush_all_shards()
+
+      # First crash
+      kill_shard_and_wait(k1)
+      assert Router.get(k1) == "round1", "round 1 data lost"
+
+      # Write more after first recovery
+      k2 = ukey("double_crash_2")
+      batcher_put(k2, "round2")
+      flush_all_batchers()
+      ShardHelpers.flush_all_shards()
+
+      assert Router.get(k2) == "round2"
+
+      # Second crash
+      kill_shard_and_wait(k1)
+
+      assert Router.get(k1) == "round1", "round 1 data lost after second crash"
+      assert Router.get(k2) == "round2", "round 2 data lost after second crash"
+
+      # Write after second recovery
+      k3 = ukey("double_crash_3")
+      batcher_put(k3, "round3")
+      flush_all_batchers()
+      ShardHelpers.flush_all_shards()
+      assert Router.get(k3) == "round3", "write after double crash failed"
+    end
+  end
 end
