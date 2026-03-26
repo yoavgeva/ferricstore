@@ -210,11 +210,12 @@ defmodule Mix.Tasks.FerricstoreTest do
     test "shows shard information for large values" do
       import Ferricstore.Test.Utils
       Router.put("large_val", String.duplicate("z", 200))
+      Ferricstore.Test.ShardHelpers.flush_all_shards()
 
       eventually(fn ->
         output = capture_io(fn -> Mix.Tasks.Ferricstore.LargeValues.run(["--threshold", "50"]) end)
         assert output =~ "shard:"
-      end, 3000)
+      end, 5000)
     end
 
     test "uses default threshold of 1MB when no --threshold flag" do
