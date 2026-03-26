@@ -269,12 +269,9 @@ config :ferricstore, :memory_guard_interval_ms, 100
 
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
-| `:raft_enabled` | `boolean` | `true` | Both | Whether writes go through Raft consensus. See below. |
 | `:default_durability` | `:quorum \| :async` | `:quorum` | Both | Default durability level for all namespaces that don't have an explicit per-namespace override. Set to `:async` for Redis-like fire-and-forget speed at the cost of crash safety. Per-namespace overrides via `FERRICSTORE.CONFIG SET` or `:namespace_config` still take precedence. |
 
 ```elixir
-config :ferricstore, :raft_enabled, true
-
 # Default durability for all namespaces (overridden per-namespace)
 # :quorum = crash-safe (default), :async = fire-and-forget (faster)
 config :ferricstore, :default_durability, :quorum
@@ -286,7 +283,7 @@ come from ETS which is updated immediately regardless of Raft).
 
 ### What Raft does
 
-When `:raft_enabled` is `true` (default), every write follows this path:
+Every write follows this path:
 
 ```
   Client writes SET key value
@@ -309,10 +306,6 @@ When `:raft_enabled` is `true` (default), every write follows this path:
 
 If the node crashes **after** ETS update but **before** Raft commit, the write
 is lost. This window is typically <1ms (the group-commit batch interval).
-
-When `:raft_enabled` is `false`, writes skip Raft entirely — ETS is updated
-and the write is appended to disk in the background without fsync. Faster,
-but a crash can lose recent writes.
 
 ### Two durability modes (per-namespace)
 
@@ -392,26 +385,6 @@ config :ferricstore, :namespace_config, %{
   "analytics" => %{window_ms: 5, durability: :async}
 }
 ```
-
-### When to disable Raft entirely
-
-Set `:raft_enabled` to `false` only for:
-- **Benchmarking** — measure raw ETS + Bitcask throughput without Raft overhead
-- **Development** — faster startup, simpler debugging
-
-When disabled, writes go directly to the shard without fsync. Data is still
-written to disk (via OS page cache) and survives normal app restarts, but a
-sudden crash or power loss can lose the last ~1-30 seconds of writes.
-
-> **Multi-node warning:** `raft_enabled: false` **breaks multi-node clusters**.
-> With Raft disabled there is no replication — each node is independent. Writes
-> go to whichever node the client connects to and never propagate to other
-> nodes. No leader election, no failover, no data consistency across nodes.
-> Only use this in single-node setups.
-
-In production, leave Raft enabled. Use per-namespace `:async` durability
-for specific prefixes that don't need crash safety — this gives you the
-speed benefit without breaking replication.
 
 ## Connection Limits
 
@@ -725,7 +698,6 @@ config :ferricstore, :eviction_policy, :volatile_lru
 config :ferricstore, :memory_guard_interval_ms, 5_000
 config :ferricstore, :merge, check_interval_ms: 600_000, fragmentation_threshold: 0.99
 config :ferricstore, :expiry_sweep_interval_ms, 600_000
-config :ferricstore, :raft_enabled, true
 config :ferricstore, :sandbox_enabled, true
 
 # Generous supervisor budget for shard-kill tests

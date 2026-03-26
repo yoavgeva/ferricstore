@@ -1,0 +1,13 @@
+#{id => {ferricstore_shard_2,nonode@nohost},
+  machine =>
+      {module,'Elixir.Ferricstore.Raft.StateMachine',
+              #{ets => keydir_2,shard_index => 2,
+                shard_data_path => <<"data/data/shard_2">>,
+                active_file_id => 0,
+                active_file_path => <<"data/data/shard_2/00000.log">>}},
+  system => ferricstore_raft,uid => <<"ferricstore_shard_2">>,
+  cluster_name => ferricstore_shard_cluster_2,
+  initial_members => [{ferricstore_shard_2,nonode@nohost}],
+  log_init_args => #{uid => <<"ferricstore_shard_2">>},
+  broadcast_time => 100,tick_timeout => 1000,
+  install_snap_rpc_timeout => 120000,await_condition_timeout => 30000}.

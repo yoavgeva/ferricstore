@@ -677,7 +677,7 @@ FerricStore emits telemetry events for observability:
 
 | Event | Measurements | Metadata |
 |-------|-------------|----------|
-| `[:ferricstore, :node, :startup_complete]` | `duration_ms` | `shard_count`, `port`, `raft_enabled`, `mode` |
+| `[:ferricstore, :node, :startup_complete]` | `duration_ms` | `shard_count`, `port`, `mode` |
 | `[:ferricstore, :node, :shutdown_started]` | `uptime_ms` | -- |
 | `[:ferricstore, :memory, :check]` | `total_bytes` | `pressure_level`, `ratio`, `max_bytes` |
 | `[:ferricstore, :memory, :pressure]` | `total_bytes`, `max_bytes`, `ratio` | `level` (:ok, :warn, :pressure, :full) |
