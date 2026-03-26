@@ -443,12 +443,14 @@ defmodule Ferricstore.Commands.RedisCompatTest do
       assert result == 1 or match?({:error, _}, result)
     end
 
-    test "EXPIRE with negative value returns error" do
+    test "EXPIRE with negative value deletes the key (Redis compat)" do
       store = MockStore.make()
       Strings.handle("SET", ["mykey", "hello"], store)
 
       result = Expiry.handle("EXPIRE", ["mykey", "-1"], store)
-      assert {:error, _} = result
+      assert 1 == result
+      # Key should be deleted
+      assert nil == store.get.("mykey")
     end
 
     test "TTL on missing key returns -2" do

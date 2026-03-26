@@ -64,7 +64,11 @@ defmodule Ferricstore.Commands.SortedSet do
               {add_acc + 1, ch_acc}
 
             true ->
-              {existing_score, ""} = Float.parse(existing)
+              existing_score =
+                case Float.parse(existing) do
+                  {score, ""} -> score
+                  _ -> 0.0
+                end
 
               should_update =
                 cond do
@@ -270,8 +274,10 @@ defmodule Ferricstore.Commands.SortedSet do
                 0.0
 
               score_str ->
-                {score, ""} = Float.parse(score_str)
-                score
+                case Float.parse(score_str) do
+                  {score, ""} -> score
+                  _ -> 0.0
+                end
             end
 
           new_score = current_score + increment
@@ -291,8 +297,10 @@ defmodule Ferricstore.Commands.SortedSet do
                     0.0
 
                   score_str ->
-                    {score, ""} = Float.parse(score_str)
-                    score
+                    case Float.parse(score_str) do
+                      {score, ""} -> score
+                      _ -> 0.0
+                    end
                 end
 
               new_score = current_score + increment * 1.0
@@ -537,20 +545,25 @@ defmodule Ferricstore.Commands.SortedSet do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       case {parse_score_bound(min_str), parse_score_bound(max_str)} do
         {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
-          {with_scores, offset, count} = parse_range_by_score_opts(opts)
-          sorted = load_sorted_members(key, store)
+          case parse_range_by_score_opts(opts) do
+            {:error, _} = err ->
+              err
 
-          filtered =
-            Enum.filter(sorted, fn {_member, score} ->
-              score_gte?(score, min_val, min_excl) and score_lte?(score, max_val, max_excl)
-            end)
+            {with_scores, offset, count} ->
+              sorted = load_sorted_members(key, store)
 
-          paginated = apply_limit(filtered, offset, count)
+              filtered =
+                Enum.filter(sorted, fn {_member, score} ->
+                  score_gte?(score, min_val, min_excl) and score_lte?(score, max_val, max_excl)
+                end)
 
-          if with_scores do
-            Enum.flat_map(paginated, fn {member, score} -> [member, format_score(score)] end)
-          else
-            Enum.map(paginated, fn {member, _score} -> member end)
+              paginated = apply_limit(filtered, offset, count)
+
+              if with_scores do
+                Enum.flat_map(paginated, fn {member, score} -> [member, format_score(score)] end)
+              else
+                Enum.map(paginated, fn {member, _score} -> member end)
+              end
           end
 
         _ ->
@@ -571,20 +584,25 @@ defmodule Ferricstore.Commands.SortedSet do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       case {parse_score_bound(min_str), parse_score_bound(max_str)} do
         {{:ok, min_val, min_excl}, {:ok, max_val, max_excl}} ->
-          {with_scores, offset, count} = parse_range_by_score_opts(opts)
-          sorted = load_sorted_members(key, store) |> Enum.reverse()
+          case parse_range_by_score_opts(opts) do
+            {:error, _} = err ->
+              err
 
-          filtered =
-            Enum.filter(sorted, fn {_member, score} ->
-              score_gte?(score, min_val, min_excl) and score_lte?(score, max_val, max_excl)
-            end)
+            {with_scores, offset, count} ->
+              sorted = load_sorted_members(key, store) |> Enum.reverse()
 
-          paginated = apply_limit(filtered, offset, count)
+              filtered =
+                Enum.filter(sorted, fn {_member, score} ->
+                  score_gte?(score, min_val, min_excl) and score_lte?(score, max_val, max_excl)
+                end)
 
-          if with_scores do
-            Enum.flat_map(paginated, fn {member, score} -> [member, format_score(score)] end)
-          else
-            Enum.map(paginated, fn {member, _score} -> member end)
+              paginated = apply_limit(filtered, offset, count)
+
+              if with_scores do
+                Enum.flat_map(paginated, fn {member, score} -> [member, format_score(score)] end)
+              else
+                Enum.map(paginated, fn {member, _score} -> member end)
+              end
           end
 
         _ ->
@@ -627,7 +645,12 @@ defmodule Ferricstore.Commands.SortedSet do
 
     pairs
     |> Enum.map(fn {member, score_str} ->
-      {score, ""} = Float.parse(score_str)
+      score =
+        case Float.parse(score_str) do
+          {score, ""} -> score
+          _ -> 0.0
+        end
+
       {member, score}
     end)
     |> Enum.sort_by(fn {member, score} -> {score, member} end)
@@ -735,11 +758,18 @@ defmodule Ferricstore.Commands.SortedSet do
       "LIMIT" ->
         case rest do
           [offset_str, count_str | remaining] ->
-            {off, ""} = Integer.parse(offset_str)
-            {cnt, ""} = Integer.parse(count_str)
-            # Redis: negative count means all remaining from offset
-            real_count = if cnt < 0, do: :all, else: cnt
-            do_parse_range_by_score_opts(remaining, ws, off, real_count)
+            with {off, ""} <- Integer.parse(offset_str),
+                 {cnt, ""} <- Integer.parse(count_str) do
+              if off < 0 do
+                {:error, "ERR syntax error"}
+              else
+                # Redis: negative count means all remaining from offset
+                real_count = if cnt < 0, do: :all, else: cnt
+                do_parse_range_by_score_opts(remaining, ws, off, real_count)
+              end
+            else
+              _ -> {:error, "ERR value is not an integer or out of range"}
+            end
 
           _ ->
             {ws, offset, count}

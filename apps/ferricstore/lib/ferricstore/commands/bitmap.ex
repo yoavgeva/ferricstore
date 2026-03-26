@@ -25,6 +25,9 @@ defmodule Ferricstore.Commands.Bitmap do
 
   import Bitwise
 
+  # Redis limits bit offset to 2^32 - 1 (512MB value max)
+  @max_bit_offset 4_294_967_295
+
   @doc """
   Handles a bitmap command.
 
@@ -47,6 +50,7 @@ defmodule Ferricstore.Commands.Bitmap do
 
   def handle("SETBIT", [key, offset_str, bit_str], store) do
     with {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
+         :ok <- check_bit_offset(offset),
          {:ok, bit_val} <- parse_bit_value(bit_str) do
       current = store.get.(key) || <<>>
       byte_index = div(offset, 8)
@@ -83,7 +87,8 @@ defmodule Ferricstore.Commands.Bitmap do
   # ---------------------------------------------------------------------------
 
   def handle("GETBIT", [key, offset_str], store) do
-    with {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset") do
+    with {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
+         :ok <- check_bit_offset(offset) do
       current = store.get.(key) || <<>>
       byte_index = div(offset, 8)
 
@@ -209,6 +214,12 @@ defmodule Ferricstore.Commands.Bitmap do
   # ===========================================================================
 
   # --- Parsing helpers -------------------------------------------------------
+
+  defp check_bit_offset(offset) when offset > @max_bit_offset do
+    {:error, "ERR bit offset is not an integer or out of range"}
+  end
+
+  defp check_bit_offset(_offset), do: :ok
 
   @spec parse_non_negative_integer(binary(), binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
   defp parse_non_negative_integer(str, label) do

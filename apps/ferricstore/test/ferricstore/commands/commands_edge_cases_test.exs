@@ -1035,10 +1035,10 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
       assert -2 == Expiry.handle("TTL", ["k"], store)
     end
 
-    test "EXPIRE with negative value returns error" do
+    test "EXPIRE with negative value deletes the key (Redis compat)" do
       store = MockStore.make(%{"k" => {"v", 0}})
       result = Expiry.handle("EXPIRE", ["k", "-1"], store)
-      assert {:error, _} = result
+      assert 1 == result
     end
 
     test "PEXPIRE with millisecond precision" do

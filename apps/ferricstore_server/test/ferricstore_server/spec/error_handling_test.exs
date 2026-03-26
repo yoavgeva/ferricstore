@@ -481,22 +481,24 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
   # ERR-017: EXPIRE negative — SET foo bar; EXPIRE foo -1 → ERR invalid expire
   # ===========================================================================
 
-  describe "ERR-017: EXPIRE with negative value" do
-    test "EXPIRE with -1 returns ERR invalid expire time (unit)" do
+  describe "ERR-017: EXPIRE with negative value deletes key (Redis compat)" do
+    test "EXPIRE with -1 deletes the key (unit)" do
       store = MockStore.make(%{"foo" => {"bar", 0}})
 
       result = Expiry.handle("EXPIRE", ["foo", "-1"], store)
-      assert {:error, "ERR invalid expire time in 'expire' command"} = result
+      assert 1 == result
+      assert nil == store.get.("foo")
     end
 
-    test "PEXPIRE with -1 returns ERR invalid expire time (unit)" do
+    test "PEXPIRE with -1 deletes the key (unit)" do
       store = MockStore.make(%{"foo" => {"bar", 0}})
 
       result = Expiry.handle("PEXPIRE", ["foo", "-1"], store)
-      assert {:error, "ERR invalid expire time in 'pexpire' command"} = result
+      assert 1 == result
+      assert nil == store.get.("foo")
     end
 
-    test "EXPIRE with -1 returns ERR over TCP", %{port: port} do
+    test "EXPIRE with -1 deletes key over TCP", %{port: port} do
       sock = connect_and_hello(port)
       k = ukey("err017_tcp")
 
@@ -506,12 +508,13 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
       send_cmd(sock, ["EXPIRE", k, "-1"])
       response = recv_response(sock)
 
-      assert {:error, msg} = response
-      assert msg =~ "invalid expire time"
+      # Redis-compatible: returns integer 1 (key deleted)
+      assert 1 == response
 
-      # Cleanup
-      send_cmd(sock, ["DEL", k])
-      recv_response(sock)
+      # Key should be gone
+      send_cmd(sock, ["GET", k])
+      assert nil == recv_response(sock)
+
       :gen_tcp.close(sock)
     end
 

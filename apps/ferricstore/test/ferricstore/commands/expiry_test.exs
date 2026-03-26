@@ -19,9 +19,11 @@ defmodule Ferricstore.Commands.ExpiryTest do
       assert 0 == Expiry.handle("EXPIRE", ["missing", "10"], MockStore.make())
     end
 
-    test "EXPIRE with negative seconds returns error" do
+    test "EXPIRE with negative seconds deletes the key (Redis compat)" do
       store = MockStore.make(%{"k" => {"v", 0}})
-      assert {:error, _} = Expiry.handle("EXPIRE", ["k", "-1"], store)
+      assert 1 == Expiry.handle("EXPIRE", ["k", "-1"], store)
+      # Key should be gone
+      assert nil == store.get.("k")
     end
 
     test "EXPIRE with non-integer returns error" do
@@ -44,9 +46,10 @@ defmodule Ferricstore.Commands.ExpiryTest do
       assert 1 == Expiry.handle("PEXPIRE", ["k", "5000"], store)
     end
 
-    test "PEXPIRE with negative returns error" do
+    test "PEXPIRE with negative deletes the key (Redis compat)" do
       store = MockStore.make(%{"k" => {"v", 0}})
-      assert {:error, _} = Expiry.handle("PEXPIRE", ["k", "-1"], store)
+      assert 1 == Expiry.handle("PEXPIRE", ["k", "-1"], store)
+      assert nil == store.get.("k")
     end
 
     test "PEXPIRE missing key returns 0" do

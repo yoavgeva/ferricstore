@@ -80,22 +80,28 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp set_expiry_seconds(key, secs_str, store) do
-    with {secs, ""} <- Integer.parse(secs_str),
-         true <- secs >= 0 do
-      apply_expiry(key, Ferricstore.HLC.now_ms() + secs * 1_000, store)
-    else
-      false -> {:error, "ERR invalid expire time in 'expire' command"}
-      _ -> {:error, "ERR value is not an integer or out of range"}
+    case Integer.parse(secs_str) do
+      {secs, ""} when secs <= 0 ->
+        delete_if_exists(key, store)
+
+      {secs, ""} ->
+        apply_expiry(key, Ferricstore.HLC.now_ms() + secs * 1_000, store)
+
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 
   defp set_expiry_ms(key, ms_str, store) do
-    with {ms, ""} <- Integer.parse(ms_str),
-         true <- ms >= 0 do
-      apply_expiry(key, Ferricstore.HLC.now_ms() + ms, store)
-    else
-      false -> {:error, "ERR invalid expire time in 'pexpire' command"}
-      _ -> {:error, "ERR value is not an integer or out of range"}
+    case Integer.parse(ms_str) do
+      {ms, ""} when ms <= 0 ->
+        delete_if_exists(key, store)
+
+      {ms, ""} ->
+        apply_expiry(key, Ferricstore.HLC.now_ms() + ms, store)
+
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -120,6 +126,15 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
   # Private — apply expiry to existing key
   # ---------------------------------------------------------------------------
+
+  defp delete_if_exists(key, store) do
+    case store.get_meta.(key) do
+      nil -> 0
+      _ ->
+        store.delete.(key)
+        1
+    end
+  end
 
   defp apply_expiry(key, expire_at_ms, store) do
     case store.get_meta.(key) do

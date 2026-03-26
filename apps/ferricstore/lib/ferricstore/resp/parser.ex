@@ -251,6 +251,8 @@ defmodule Ferricstore.Resp.Parser do
 
   # -- Array: *<count>\r\n<elements...> or *-1\r\n ----------------------------
 
+  @max_array_count 1_048_576
+
   defp parse_array(data, max) do
     case read_line(data) do
       {:ok, "-1", rest} ->
@@ -258,8 +260,14 @@ defmodule Ferricstore.Resp.Parser do
 
       {:ok, count_str, rest} ->
         case Integer.parse(count_str) do
-          {count, ""} when count >= 0 -> parse_elements(rest, count, [], max)
-          _ -> {:error, {:invalid_array_count, count_str}}
+          {count, ""} when count > @max_array_count ->
+            {:error, "ERR protocol error: array too large"}
+
+          {count, ""} when count >= 0 ->
+            parse_elements(rest, count, [], max)
+
+          _ ->
+            {:error, {:invalid_array_count, count_str}}
         end
 
       :incomplete ->
@@ -434,8 +442,12 @@ defmodule Ferricstore.Resp.Parser do
   defp parse_inline(data) do
     case read_line(data) do
       {:ok, line, rest} ->
-        tokens = :binary.split(line, [<<" ">>, <<"\t">>], [:global, :trim_all])
-        {:ok, {:inline, tokens}, rest}
+        if byte_size(line) > 1_048_576 do
+          {:error, "ERR protocol error: inline command too long"}
+        else
+          tokens = :binary.split(line, [<<" ">>, <<"\t">>], [:global, :trim_all])
+          {:ok, {:inline, tokens}, rest}
+        end
 
       :incomplete ->
         :incomplete
