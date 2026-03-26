@@ -75,10 +75,12 @@ jobs:
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
           mkdir -p apps/ferricstore/priv/native
           if [ -f apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib ]; then
-            cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib apps/ferricstore/priv/native/libferricstore_bitcask.dylib
+            SRC=apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib
           else
-            cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/libferricstore_bitcask.so
+            SRC=apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so
           fi
+          cp "$SRC" apps/ferricstore/priv/native/libferricstore_bitcask.so
+          cp "$SRC" apps/ferricstore/priv/native/ferricstore_bitcask.so
 
       - name: Compile
         run: mix compile

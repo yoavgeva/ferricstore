@@ -22,6 +22,8 @@
 #![allow(clippy::cast_possible_wrap)]
 // NIF functions must return NifResult<Term> per the Rustler API, even when they never fail:
 #![allow(clippy::unnecessary_wraps)]
+// io_other_error: io_uring code uses Error::new(ErrorKind::Other, ..) for clarity; lint is Rust 1.83+.
+#![allow(clippy::io_other_error)]
 // Yielding NIF continuations use raw pointers and similar variable names:
 #![allow(clippy::ptr_as_ptr)]
 #![allow(clippy::similar_names)]
