@@ -10,6 +10,10 @@ config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.ge
 # Production defaults to System.schedulers_online().
 config :ferricstore, :shard_count, 4
 
+# High supervisor restart limits for test — shard-kill tests need many restarts.
+# Production default: {20, 10} (20 restarts in 10 seconds).
+config :ferricstore, :supervisor_max_restarts, {1000, 60}
+
 # Use a shorter sync-flush timeout in tests so that await_in_flight fails fast
 # (1 second) rather than blocking for 5 seconds. The Router call timeout is
 # set to 10 seconds, so there is plenty of headroom even on slow CI runners.

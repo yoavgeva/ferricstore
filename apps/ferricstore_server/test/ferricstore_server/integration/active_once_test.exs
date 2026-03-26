@@ -102,6 +102,57 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
 
   defp ukey(name), do: "ao_#{name}_#{:rand.uniform(999_999)}"
 
+  # Polls PUBSUB NUMSUB until the channel has at least 1 subscriber.
+  # Prevents race between SUBSCRIBE returning and PUBLISH finding the subscriber.
+  defp wait_for_subscription(port, channel, timeout \\ 3_000) do
+    sock = connect_and_hello(port)
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    result =
+      Enum.reduce_while(Stream.repeatedly(fn -> :poll end), :waiting, fn _, _ ->
+        send_cmd(sock, ["PUBSUB", "NUMSUB", channel])
+
+        case recv_response(sock) do
+          [^channel, count] when is_integer(count) and count > 0 -> {:halt, :ok}
+          _ ->
+            if System.monotonic_time(:millisecond) > deadline do
+              {:halt, :timeout}
+            else
+              Process.sleep(20)
+              {:cont, :waiting}
+            end
+        end
+      end)
+
+    :gen_tcp.close(sock)
+    if result == :timeout, do: raise("subscription not registered within #{timeout}ms")
+  end
+
+  # Polls PUBSUB NUMPAT until at least 1 pattern subscription exists.
+  defp wait_for_psubscription(port, _pattern, timeout \\ 3_000) do
+    sock = connect_and_hello(port)
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    result =
+      Enum.reduce_while(Stream.repeatedly(fn -> :poll end), :waiting, fn _, _ ->
+        send_cmd(sock, ["PUBSUB", "NUMPAT"])
+
+        case recv_response(sock) do
+          count when is_integer(count) and count > 0 -> {:halt, :ok}
+          _ ->
+            if System.monotonic_time(:millisecond) > deadline do
+              {:halt, :timeout}
+            else
+              Process.sleep(20)
+              {:cont, :waiting}
+            end
+        end
+      end)
+
+    :gen_tcp.close(sock)
+    if result == :timeout, do: raise("psubscription not registered within #{timeout}ms")
+  end
+
   # ---------------------------------------------------------------------------
   # Setup
   # ---------------------------------------------------------------------------
@@ -278,6 +329,9 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
       sub_resp = recv_response(sock_a)
       assert sub_resp == {:push, ["subscribe", channel, 1]}
 
+      # Wait for subscription to be registered in PubSub before publishing
+      wait_for_subscription(port, channel)
+
       # Client B: publish a message
       sock_b = connect_and_hello(port)
       send_cmd(sock_b, ["PUBLISH", channel, "hello_from_b"])
@@ -308,6 +362,9 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
       sock_a = connect_and_hello(port)
       send_cmd(sock_a, ["SUBSCRIBE", channel])
       _sub_resp = recv_response(sock_a)
+
+      # Wait for subscription to be registered before publishing
+      wait_for_subscription(port, channel)
 
       # Client B: publish 5 messages
       sock_b = connect_and_hello(port)
@@ -340,6 +397,9 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
       send_cmd(sock_a, ["PSUBSCRIBE", pattern])
       sub_resp = recv_response(sock_a)
       assert sub_resp == {:push, ["psubscribe", pattern, 1]}
+
+      # Wait for pattern subscription to be registered before publishing
+      wait_for_psubscription(port, pattern)
 
       # Client B: publish to matching channel
       sock_b = connect_and_hello(port)

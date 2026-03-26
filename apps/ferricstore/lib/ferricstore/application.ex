@@ -92,10 +92,16 @@ defmodule Ferricstore.Application do
     # a uniform 1024-slot -> shard mapping and stores it in persistent_term.
     # Also sets :ferricstore_shard_count.
     Ferricstore.Store.SlotMap.init(shard_count)
+    Ferricstore.Store.Router.init_shard_names(shard_count)
     :persistent_term.put(:ferricstore_promotion_threshold,
       Application.get_env(:ferricstore, :promotion_threshold, 100))
     :persistent_term.put(:ferricstore_read_sample_rate,
       Application.get_env(:ferricstore, :read_sample_rate, 100))
+
+    # Initialize sandbox registry (only in test -- sandbox_enabled is set in config/test.exs)
+    if Application.get_env(:ferricstore, :sandbox_enabled, false) do
+      FerricStore.Sandbox.init_registry()
+    end
 
     # Initialize waiter registry ETS for blocking commands
     Ferricstore.Waiters.init()
@@ -174,7 +180,8 @@ defmodule Ferricstore.Application do
           {Ferricstore.MemoryGuard, memory_guard_opts()}
         ]
 
-    opts = [strategy: :one_for_one, name: Ferricstore.Supervisor, max_restarts: 20, max_seconds: 10]
+    {max_r, max_s} = Application.get_env(:ferricstore, :supervisor_max_restarts, {20, 10})
+    opts = [strategy: :one_for_one, name: Ferricstore.Supervisor, max_restarts: max_r, max_seconds: max_s]
     result = Supervisor.start_link(children, opts)
 
     case result do
