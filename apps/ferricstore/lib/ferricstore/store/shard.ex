@@ -93,7 +93,11 @@ defmodule Ferricstore.Store.Shard do
     # shards with ad-hoc indices use the direct write path instead.
     raft?: true,
     # Whether this shard is a sandbox shard (private ETS, no global name).
-    sandbox?: false
+    sandbox?: false,
+    # For sandbox shards with Raft: the private ra system and server ID.
+    # When set, the shard submits directly to ra (no Batcher).
+    sandbox_ra_system: nil,
+    sandbox_ra_server_id: nil
   ]
 
   # -------------------------------------------------------------------
@@ -189,14 +193,21 @@ defmodule Ferricstore.Store.Shard do
     end
 
     # Start the Raft server for this shard.
-    # Sandbox shards skip Raft entirely -- they use the direct write path
-    # (ETS + Bitcask pending batch). No Batcher, no ra. Full isolation comes
-    # from having separate ETS tables and data directories.
-    raft? =
+    # Application-supervised shards use the global ra system + Batcher.
+    # Sandbox shards with a private ra system start their own ra server
+    # and submit directly (no Batcher). Sandbox shards without an ra system
+    # use the direct write path (ETS + Bitcask pending batch).
+    sandbox_ra_system = Keyword.get(opts, :sandbox_ra_system)
+
+    {raft?, sandbox_ra_server_id} =
       if sandbox? do
-        false
+        if sandbox_ra_system do
+          start_sandbox_raft(sandbox_ra_system, index, path, active_file_id, active_file_path, ets, prefix_keys, opts)
+        else
+          {false, nil}
+        end
       else
-        start_raft_if_available(index, path, active_file_id, active_file_path, ets)
+        {start_raft_if_available(index, path, active_file_id, active_file_path, ets), nil}
       end
 
     # v2: recover ETS keydir from hint files or by scanning log files.
@@ -256,7 +267,9 @@ defmodule Ferricstore.Store.Shard do
                        pending: [], flush_in_flight: nil,
                        promoted_instances: promoted,
                        raft?: raft?,
-                       sandbox?: sandbox?},
+                       sandbox?: sandbox?,
+                       sandbox_ra_system: sandbox_ra_system,
+                       sandbox_ra_server_id: sandbox_ra_server_id},
      {:continue, {:flush_interval, flush_ms}}}
   end
 
@@ -494,8 +507,8 @@ defmodule Ferricstore.Store.Shard do
     keys_to_delete = prefix_collect_keys(state.keydir, prefix)
 
     if state.raft? do
-      alias Ferricstore.Raft.Batcher
-      Enum.each(keys_to_delete, fn key -> Batcher.write(state.index, {:delete, key}) end)
+  
+      Enum.each(keys_to_delete, fn key -> raft_write(state, {:delete, key}) end)
       new_version = state.write_version + 1
       {:reply, :ok, %{state | write_version: new_version}}
     else
@@ -581,12 +594,12 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for compound_put: routes put through Raft for non-promoted,
   # or directly to dedicated Bitcask for promoted keys.
   defp handle_compound_put_raft(redis_key, compound_key, value, expire_at_ms, state) do
-    alias Ferricstore.Raft.Batcher
+
 
     case promoted_store(state, redis_key) do
       nil ->
         # Not promoted -- route through Raft
-        result = Batcher.write(state.index, {:put, compound_key, value, expire_at_ms})
+        result = raft_write(state, {:put, compound_key, value, expire_at_ms})
         new_version = state.write_version + 1
 
         case result do
@@ -657,11 +670,11 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for compound_delete: routes delete through Raft for non-promoted,
   # or directly to dedicated Bitcask for promoted keys.
   defp handle_compound_delete_raft(redis_key, compound_key, state) do
-    alias Ferricstore.Raft.Batcher
+
 
     case promoted_store(state, redis_key) do
       nil ->
-        result = Batcher.write(state.index, {:delete, compound_key})
+        result = raft_write(state, {:delete, compound_key})
         new_version = state.write_version + 1
 
         case result do
@@ -761,7 +774,7 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for compound_delete_prefix: routes deletes through Raft for non-promoted,
   # or directly cleans up dedicated Bitcask for promoted keys.
   defp handle_compound_delete_prefix_raft(redis_key, prefix, state) do
-    alias Ferricstore.Raft.Batcher
+
 
     case promoted_store(state, redis_key) do
       nil ->
@@ -769,7 +782,7 @@ defmodule Ferricstore.Store.Shard do
         keys_to_delete = prefix_collect_keys(state.keydir, prefix)
 
         Enum.each(keys_to_delete, fn key ->
-          Batcher.write(state.index, {:delete, key})
+          raft_write(state, {:delete, key})
         end)
 
         new_version = state.write_version + 1
@@ -852,8 +865,8 @@ defmodule Ferricstore.Store.Shard do
         # will reply directly to the original caller (from) when the ra
         # command commits. This frees the Shard GenServer to process the
         # next request immediately without waiting for Raft consensus.
-        alias Ferricstore.Raft.Batcher
-        Batcher.write_async(state.index, {:put, key, value, expire_at_ms}, from)
+    
+        raft_write_async(state, {:put, key, value, expire_at_ms}, from)
         new_version = state.write_version + 1
         {:noreply, %{state | write_version: new_version}}
       else
@@ -905,7 +918,7 @@ defmodule Ferricstore.Store.Shard do
   # computes the new value, then routes the resulting put through the Raft
   # Batcher so the write is replicated and committed before replying.
   defp handle_incr_raft(key, delta, state) do
-    alias Ferricstore.Raft.Batcher
+
 
     {current_value, expire_at_ms} =
       case ets_lookup_warm(state, key) do
@@ -916,7 +929,7 @@ defmodule Ferricstore.Store.Shard do
 
     case current_value do
       nil ->
-        result = Batcher.write(state.index, {:put, key, delta, 0})
+        result = raft_write(state, {:put, key, delta, 0})
         new_version = state.write_version + 1
 
         case result do
@@ -928,7 +941,7 @@ defmodule Ferricstore.Store.Shard do
         case coerce_integer(value) do
           {:ok, int_val} ->
             new_val = int_val + delta
-            result = Batcher.write(state.index, {:put, key, new_val, expire_at_ms})
+            result = raft_write(state, {:put, key, new_val, expire_at_ms})
             new_version = state.write_version + 1
 
             case result do
@@ -1042,9 +1055,9 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for INCRBYFLOAT: routes compound command through Raft.
   # The state machine performs the full read-modify-write atomically.
   defp handle_incr_float_raft(key, delta, state) do
-    alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:incr_float, key, delta})
+
+    result = raft_write(state, {:incr_float, key, delta})
     new_version = state.write_version + 1
 
     case result do
@@ -1147,9 +1160,9 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for APPEND: routes compound command through Raft.
   # The state machine performs the full read-modify-write atomically.
   defp handle_append_raft(key, suffix, state) do
-    alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:append, key, suffix})
+
+    result = raft_write(state, {:append, key, suffix})
     new_version = state.write_version + 1
 
     case result do
@@ -1222,9 +1235,9 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for GETSET: routes compound command through Raft.
   # The state machine performs the atomic get-and-set.
   defp handle_getset_raft(key, new_value, state) do
-    alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:getset, key, new_value})
+
+    result = raft_write(state, {:getset, key, new_value})
     new_version = state.write_version + 1
 
     case result do
@@ -1269,9 +1282,9 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for GETDEL: routes compound command through Raft.
   # The state machine performs the atomic get-and-delete.
   defp handle_getdel_raft(key, state) do
-    alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:getdel, key})
+
+    result = raft_write(state, {:getdel, key})
     new_version = state.write_version + 1
 
     case result do
@@ -1330,9 +1343,9 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for GETEX: routes compound command through Raft.
   # The state machine performs the atomic get-and-update-expiry.
   defp handle_getex_raft(key, expire_at_ms, state) do
-    alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:getex, key, expire_at_ms})
+
+    result = raft_write(state, {:getex, key, expire_at_ms})
     new_version = state.write_version + 1
 
     case result do
@@ -1396,9 +1409,9 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for SETRANGE: routes compound command through Raft.
   # The state machine performs the full read-modify-write atomically.
   defp handle_setrange_raft(key, offset, value, state) do
-    alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:setrange, key, offset, value})
+
+    result = raft_write(state, {:setrange, key, offset, value})
     new_version = state.write_version + 1
 
     case result do
@@ -1440,8 +1453,8 @@ defmodule Ferricstore.Store.Shard do
     if state.raft? do
       # Raft path: forward to Batcher via non-blocking cast. The Batcher
       # will reply directly to the original caller when ra commits.
-      alias Ferricstore.Raft.Batcher
-      Batcher.write_async(state.index, {:delete, key}, from)
+  
+      raft_write_async(state, {:delete, key}, from)
       new_version = state.write_version + 1
       {:noreply, %{state | write_version: new_version}}
     else
@@ -2021,12 +2034,12 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for CAS: sends compound command through Raft so the entire
   # read-compare-write is atomic within the replicated state machine.
   defp handle_cas_raft(key, expected, new_value, ttl_ms, state) do
-    alias Ferricstore.Raft.Batcher
+
 
     # Pre-compute absolute expiry before entering Raft so the state machine
     # apply/3 remains deterministic (no System.os_time calls).
     expire_at_ms = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: nil
-    result = Batcher.write(state.index, {:cas, key, expected, new_value, expire_at_ms})
+    result = raft_write(state, {:cas, key, expected, new_value, expire_at_ms})
 
     case result do
       r when r in [1, 0, nil] ->
@@ -2066,12 +2079,12 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for LOCK: sends compound command through Raft so the entire
   # check-and-acquire is atomic within the replicated state machine.
   defp handle_lock_raft(key, owner, ttl_ms, state) do
-    alias Ferricstore.Raft.Batcher
+
 
     # Pre-compute absolute expiry before entering Raft so the state machine
     # apply/3 remains deterministic.
     expire_at_ms = System.os_time(:millisecond) + ttl_ms
-    result = Batcher.write(state.index, {:lock, key, owner, expire_at_ms})
+    result = raft_write(state, {:lock, key, owner, expire_at_ms})
 
     case result do
       :ok ->
@@ -2117,9 +2130,9 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for UNLOCK: sends compound command through Raft so the entire
   # check-and-delete is atomic within the replicated state machine.
   defp handle_unlock_raft(key, owner, state) do
-    alias Ferricstore.Raft.Batcher
 
-    result = Batcher.write(state.index, {:unlock, key, owner})
+
+    result = raft_write(state, {:unlock, key, owner})
 
     case result do
       1 ->
@@ -2165,12 +2178,12 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for EXTEND: sends compound command through Raft so the entire
   # check-and-update is atomic within the replicated state machine.
   defp handle_extend_raft(key, owner, ttl_ms, state) do
-    alias Ferricstore.Raft.Batcher
+
 
     # Pre-compute absolute expiry before entering Raft so the state machine
     # apply/3 remains deterministic.
     expire_at_ms = System.os_time(:millisecond) + ttl_ms
-    result = Batcher.write(state.index, {:extend, key, owner, expire_at_ms})
+    result = raft_write(state, {:extend, key, owner, expire_at_ms})
 
     case result do
       1 ->
@@ -2218,12 +2231,12 @@ defmodule Ferricstore.Store.Shard do
   # Raft path for RATELIMIT.ADD: sends compound command through Raft so the
   # entire read-compute-write is atomic within the replicated state machine.
   defp handle_ratelimit_add_raft(key, window_ms, max, count, state) do
-    alias Ferricstore.Raft.Batcher
+
 
     # Pre-compute `now` before entering Raft so the state machine
     # apply/3 remains deterministic.
     now_ms = System.os_time(:millisecond)
-    result = Batcher.write(state.index, {:ratelimit_add, key, window_ms, max, count, now_ms})
+    result = raft_write(state, {:ratelimit_add, key, window_ms, max, count, now_ms})
 
     case result do
       [_status, _count, _remaining, _ttl] = reply ->
@@ -2314,17 +2327,17 @@ defmodule Ferricstore.Store.Shard do
   end
 
   defp build_list_compound_store_raft(_key, state) do
-    alias Ferricstore.Raft.Batcher
+
 
     %{
       compound_get: fn _redis_key, compound_key ->
         do_compound_get(state, compound_key)
       end,
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-        Batcher.write(state.index, {:put, compound_key, value, expire_at_ms})
+        raft_write(state, {:put, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn _redis_key, compound_key ->
-        Batcher.write(state.index, {:delete, compound_key})
+        raft_write(state, {:delete, compound_key})
       end,
       compound_scan: fn _redis_key, prefix ->
         results = prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
@@ -2557,8 +2570,8 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_info({:tx_pending_delete, key}, state) do
     if state.raft? do
-      alias Ferricstore.Raft.Batcher
-      Batcher.write(state.index, {:delete, key})
+  
+      raft_write(state, {:delete, key})
       new_version = state.write_version + 1
       {:noreply, %{state | write_version: new_version}}
     else
@@ -3617,6 +3630,39 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
+  # Submits a write command through Raft. For production shards, routes
+  # through the Batcher (group commit). For sandbox shards, submits
+  # directly to the private ra system via process_command (blocking).
+  defp raft_write(%__MODULE__{sandbox_ra_server_id: sid} = _state, command) when sid != nil do
+    case :ra.process_command(sid, command) do
+      {:ok, result, _leader} -> result
+      {:error, reason} -> {:error, inspect(reason)}
+      {:timeout, _} -> {:error, "ERR raft timeout"}
+    end
+  end
+
+  defp raft_write(%__MODULE__{index: index}, command) do
+    Ferricstore.Raft.Batcher.write(index, command)
+  end
+
+  # Async variant for handle_call paths that use {:noreply, state}.
+  # For production shards, the Batcher replies directly to the caller.
+  # For sandbox shards, submits synchronously and replies immediately.
+  defp raft_write_async(%__MODULE__{sandbox_ra_server_id: sid} = _state, command, from) when sid != nil do
+    result =
+      case :ra.process_command(sid, command) do
+        {:ok, result, _leader} -> result
+        {:error, reason} -> {:error, inspect(reason)}
+        {:timeout, _} -> {:error, "ERR raft timeout"}
+      end
+
+    GenServer.reply(from, result)
+  end
+
+  defp raft_write_async(%__MODULE__{index: index}, command, from) do
+    Ferricstore.Raft.Batcher.write_async(index, command, from)
+  end
+
   # Returns true if this shard has a pre-existing Batcher process (started by
   # Application.start for shards 0..N-1). If so, also starts the ra server
   # for this shard. Isolated test shards with ad-hoc indices won't have a
@@ -3633,6 +3679,68 @@ defmodule Ferricstore.Store.Shard do
       end
     else
       false
+    end
+  end
+
+  # Starts a ra server for a sandbox shard using a private ra system.
+  # Uses a unique server name derived from the sandbox_uid to avoid
+  # collisions with production ra servers and other sandbox instances.
+  # Returns {raft?, sandbox_ra_server_id}.
+  defp start_sandbox_raft(ra_system, index, shard_data_path, active_file_id, active_file_path, ets, prefix_keys, opts) do
+    sandbox_uid = Keyword.fetch!(opts, :sandbox_uid)
+    server_name = :"ferricstore_sandbox_shard_#{sandbox_uid}_#{index}"
+    server_id = {server_name, node()}
+    uid = "sbx_#{sandbox_uid}_#{index}"
+
+    machine_config = %{
+      shard_index: index,
+      shard_data_path: shard_data_path,
+      active_file_id: active_file_id,
+      active_file_path: active_file_path,
+      ets: ets,
+      prefix_keys: prefix_keys
+    }
+
+    server_config = %{
+      id: server_id,
+      uid: uid,
+      cluster_name: :"ferricstore_sandbox_cluster_#{sandbox_uid}_#{index}",
+      initial_members: [server_id],
+      machine: {:module, Ferricstore.Raft.StateMachine, machine_config},
+      log_init_args: %{uid: uid},
+      system: ra_system
+    }
+
+    try do
+      case :ra.start_server(ra_system, server_config) do
+        :ok ->
+          :ra.trigger_election(server_id)
+          wait_for_sandbox_leader(server_id)
+          {true, server_id}
+
+        {:error, {:already_started, _pid}} ->
+          {true, server_id}
+
+        {:error, reason} ->
+          Logger.warning("Sandbox ra server start failed: #{inspect(reason)}")
+          {false, nil}
+      end
+    catch
+      kind, reason ->
+        Logger.warning("Sandbox ra server start crashed: #{inspect(kind)} #{inspect(reason)}")
+        {false, nil}
+    end
+  end
+
+  defp wait_for_sandbox_leader(server_id, attempts \\ 50)
+  defp wait_for_sandbox_leader(_server_id, 0), do: :ok
+
+  defp wait_for_sandbox_leader(server_id, attempts) do
+    case :ra.members(server_id) do
+      {:ok, _members, _leader} -> :ok
+      _ ->
+        Process.sleep(10)
+        wait_for_sandbox_leader(server_id, attempts - 1)
     end
   end
 

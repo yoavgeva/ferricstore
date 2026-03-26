@@ -111,6 +111,15 @@ defmodule Ferricstore.Commands.Dispatcher do
       "v"
   """
   @spec dispatch(binary(), [binary()], map()) :: term()
+
+  # Fast path for the most common read commands: skip monotonic_time + SlowLog
+  # overhead (~100-200ns). These commands are always sub-microsecond for hot
+  # keys and would never appear in the slow log. The fast path avoids two
+  # System.monotonic_time calls + the SlowLog.maybe_log threshold check.
+  def dispatch("GET", args, store), do: Strings.handle("GET", args, store)
+  def dispatch("MGET", args, store), do: Strings.handle("MGET", args, store)
+  def dispatch("EXISTS", args, store), do: Strings.handle("EXISTS", args, store)
+
   def dispatch(name, args, store) do
     # The command name is expected to be already uppercase from normalise_cmd
     # in the connection layer. For defensive compatibility with embedded/test

@@ -115,7 +115,7 @@ defmodule Ferricstore.Raft.StateMachine do
       active_file_id: config.active_file_id,
       active_file_path: config.active_file_path,
       ets: config.ets,
-      prefix_keys: PrefixIndex.table_name(config.shard_index),
+      prefix_keys: Map.get(config, :prefix_keys, PrefixIndex.table_name(config.shard_index)),
       applied_count: 0,
       release_cursor_interval: interval
     }

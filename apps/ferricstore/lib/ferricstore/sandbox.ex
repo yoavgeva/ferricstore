@@ -102,10 +102,27 @@ defmodule FerricStore.Sandbox do
     tmpdir = Path.join(System.tmp_dir!(), "ferricstore_sandbox_#{unique}")
     File.mkdir_p!(tmpdir)
 
-    # Start shard GenServers (no global name, with private ETS)
-    # Sandbox shards skip Raft entirely -- they use the direct write path
-    # (ETS + Bitcask pending batch). Full isolation comes from separate
-    # ETS tables and data directories.
+    # Start a private ra system for this sandbox. Each sandbox gets its
+    # own WAL directory and ra system so Raft groups are fully isolated.
+    ra_system_name = :"ferricstore_sandbox_ra_#{unique}"
+    ra_data_dir = Path.join(tmpdir, "ra")
+    File.mkdir_p!(ra_data_dir)
+    ra_names = :ra_system.derive_names(ra_system_name)
+
+    ra_config = %{
+      name: ra_system_name,
+      names: ra_names,
+      data_dir: to_charlist(ra_data_dir),
+      wal_data_dir: to_charlist(ra_data_dir),
+      segment_max_entries: 32_768
+    }
+
+    {:ok, _} = :ra_system.start(ra_config)
+
+    # Start shard GenServers with private ETS and private ra system.
+    # Each shard starts its own ra server in the sandbox ra system and
+    # submits writes directly (no Batcher). This exercises the full
+    # production Raft stack while maintaining complete isolation.
     shards_info =
       for i <- 0..(shard_count - 1) do
         shard_dir = Path.join(tmpdir, "shard_#{i}")
@@ -136,7 +153,9 @@ defmodule FerricStore.Sandbox do
             data_dir: shard_dir,
             sandbox: true,
             sandbox_keydir: keydir,
-            sandbox_prefix_keys: prefix_keys
+            sandbox_prefix_keys: prefix_keys,
+            sandbox_ra_system: ra_system_name,
+            sandbox_uid: unique
           ])
 
         {i, %{pid: pid, keydir: keydir, prefix_keys: prefix_keys}}
@@ -164,7 +183,7 @@ defmodule FerricStore.Sandbox do
       shards: shards_tuple,
       keydirs: keydirs_tuple,
       prefix_tables: prefix_tables_tuple,
-      ra_system: nil,
+      ra_system: ra_system_name,
       shard_count: shard_count
     }
 
@@ -189,7 +208,7 @@ defmodule FerricStore.Sandbox do
   """
   @spec checkin(t() | namespace()) :: :ok
   def checkin(%__MODULE__{} = sandbox) do
-    # Stop shard GenServers
+    # Stop shard GenServers (this also stops the shard's handle to ra)
     for i <- 0..(sandbox.shard_count - 1) do
       pid = elem(sandbox.shards, i)
 
@@ -199,6 +218,17 @@ defmodule FerricStore.Sandbox do
         catch
           :exit, _ -> :ok
         end
+      end
+    end
+
+    # Stop the private ra system (stops all ra servers in this system).
+    # Must happen after shard GenServers are stopped to avoid writes
+    # to a stopped ra system.
+    if sandbox.ra_system do
+      try do
+        :ra_system.stop(sandbox.ra_system)
+      catch
+        _, _ -> :ok
       end
     end
 
