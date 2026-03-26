@@ -6,6 +6,10 @@ config :ferricstore, :port, 0
 config :ferricstore, :health_port, 0
 config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.getpid()}"
 
+# Use a fixed shard count in tests for deterministic behavior.
+# Production defaults to System.schedulers_online().
+config :ferricstore, :shard_count, 4
+
 # Use a shorter sync-flush timeout in tests so that await_in_flight fails fast
 # (1 second) rather than blocking for 5 seconds. The Router call timeout is
 # set to 10 seconds, so there is plenty of headroom even on slow CI runners.
