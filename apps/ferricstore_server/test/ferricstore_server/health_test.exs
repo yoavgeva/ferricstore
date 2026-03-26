@@ -18,6 +18,7 @@ defmodule FerricstoreServer.HealthTest do
 
   setup do
     ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.Health.set_ready(true) end)
     :ok
   end
 

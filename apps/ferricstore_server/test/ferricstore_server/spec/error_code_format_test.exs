@@ -66,6 +66,7 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
   end
 
   setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
     on_exit(fn -> Config.set("requirepass", "") end)
     :ok
   end

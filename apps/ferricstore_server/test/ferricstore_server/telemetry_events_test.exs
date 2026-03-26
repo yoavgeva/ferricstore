@@ -22,6 +22,12 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
   setup do
     ShardHelpers.flush_all_keys()
+
+    on_exit(fn ->
+      :persistent_term.put(:ferricstore_reject_writes, false)
+      :persistent_term.put(:ferricstore_keydir_full, false)
+    end)
+
     :ok
   end
 

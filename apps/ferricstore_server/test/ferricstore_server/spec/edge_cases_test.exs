@@ -110,6 +110,8 @@ defmodule FerricstoreServer.Spec.EdgeCasesTest do
   end
 
   setup do
+    ShardHelpers.flush_all_keys()
+
     # Clean PubSub ETS tables between tests
     if :ets.whereis(:ferricstore_pubsub) != :undefined do
       :ets.delete_all_objects(:ferricstore_pubsub)

@@ -79,6 +79,11 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
     %{port: Listener.port()}
   end
 
+  setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # Section 5.1: Single-shard transactions are atomic
   # ---------------------------------------------------------------------------

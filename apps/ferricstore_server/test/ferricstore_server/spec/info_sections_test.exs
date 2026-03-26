@@ -24,6 +24,11 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
     :ok
   end
 
+  setup do
+    ShardHelpers.flush_all_keys()
+    :ok
+  end
+
   # Builds a real store map backed by the application-supervised shards.
   defp build_real_store do
     %{

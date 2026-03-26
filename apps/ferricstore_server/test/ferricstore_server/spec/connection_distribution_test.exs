@@ -22,6 +22,11 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
 
   defp ukey(base), do: "conn_dist_#{base}_#{:rand.uniform(999_999)}"
 
+  setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # Section 2H: CLUSTER.HEALTH
   # ---------------------------------------------------------------------------

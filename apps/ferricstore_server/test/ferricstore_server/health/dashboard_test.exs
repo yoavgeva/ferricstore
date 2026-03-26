@@ -20,6 +20,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
 
   setup do
     ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.NamespaceConfig.reset_all() end)
     :ok
   end
 

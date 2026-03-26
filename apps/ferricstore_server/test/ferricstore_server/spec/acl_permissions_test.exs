@@ -83,6 +83,7 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
   end
 
   setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
     Acl.reset!()
     :ok
   end

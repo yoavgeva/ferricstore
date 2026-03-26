@@ -22,6 +22,11 @@ defmodule FerricstoreServer.Spec.HttpEndpointsTest do
 
   alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
 
+  setup do
+    on_exit(fn -> Ferricstore.Health.set_ready(true) end)
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # HTTP helpers
   # ---------------------------------------------------------------------------
