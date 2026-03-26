@@ -33,3 +33,5 @@ ferricstore-*.tar
 /priv/native/*.dll
 /priv/native/*.dylib
 
+.claude/worktrees/
+apps/ferricstore/data/
