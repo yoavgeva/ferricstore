@@ -310,6 +310,10 @@ defmodule Ferricstore.NamespaceConfig do
         :ets.delete_all_objects(@table)
     end
 
+    # Initialize the fast-path flag for Router.durability_for_key/1.
+    # No async namespaces exist at startup.
+    :persistent_term.put(:ferricstore_has_async_ns, false)
+
     {:ok, %{}}
   end
 
@@ -449,6 +453,24 @@ defmodule Ferricstore.NamespaceConfig do
   # when raft is disabled).
   @spec broadcast_ns_config_changed() :: :ok
   defp broadcast_ns_config_changed do
+    # Update the fast-path flag for Router.durability_for_key/1.
+    # Scan all config entries to check if any namespace uses :async durability.
+    # This runs only on config changes (rare), not on every write.
+    has_async =
+      try do
+        :ets.foldl(
+          fn {_prefix, _window, :async, _at, _by}, _acc -> true
+             _, acc -> acc
+          end,
+          false,
+          @table
+        )
+      rescue
+        ArgumentError -> false
+      end
+
+    :persistent_term.put(:ferricstore_has_async_ns, has_async)
+
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
     for i <- 0..(shard_count - 1) do

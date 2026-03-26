@@ -392,6 +392,9 @@ defmodule Ferricstore.Stats do
     run_id = :crypto.strong_rand_bytes(20) |> Base.encode16(case: :lower)
     start_time = System.monotonic_time(:millisecond)
 
+    # Store counter ref under both the legacy tuple key (for any code that
+    # reads it directly) and a fast atom key used by counter_ref/0.
+    :persistent_term.put(:ferricstore_stats_counter_ref, ref)
     :persistent_term.put({__MODULE__, :counter_ref}, ref)
     :persistent_term.put({__MODULE__, :run_id}, run_id)
     :persistent_term.put({__MODULE__, :start_time}, start_time)
@@ -415,7 +418,7 @@ defmodule Ferricstore.Stats do
   # ---------------------------------------------------------------------------
 
   defp counter_ref do
-    :persistent_term.get({__MODULE__, :counter_ref})
+    :persistent_term.get(:ferricstore_stats_counter_ref)
   end
 
   # Resolves the prefix to track: if the hotness table already has this prefix
