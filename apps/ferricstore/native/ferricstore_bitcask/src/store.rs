@@ -110,6 +110,11 @@ impl Store {
         let mut file_ids = collect_file_ids(data_dir)?;
         file_ids.sort_unstable();
 
+        // Track the valid end offset of the active (last) file so we can
+        // truncate any torn/garbage tail before opening the writer.
+        let active_file_id = file_ids.last().copied().unwrap_or(1);
+        let mut active_valid_end: Option<u64> = None;
+
         for &fid in &file_ids {
             let fid_hint_path = hint_path(data_dir, fid);
             let fid_log_path = log_path(data_dir, fid);
@@ -157,24 +162,51 @@ impl Store {
                     // Replay log tail past the hint's last known offset to pick
                     // up any writes that happened after the hint was generated.
                     if fid_log_path.exists() {
-                        replay_log_from(&fid_log_path, fid, hint_end_offset, &mut keydir)?;
+                        let end =
+                            replay_log_from(&fid_log_path, fid, hint_end_offset, &mut keydir)?;
+                        if fid == active_file_id {
+                            active_valid_end = Some(end);
+                        }
                     }
                 } else {
                     // Hint file corrupt — fall back to full log replay.
                     if fid_log_path.exists() {
-                        replay_log(&fid_log_path, fid, &mut keydir)?;
+                        let end = replay_log(&fid_log_path, fid, &mut keydir)?;
+                        if fid == active_file_id {
+                            active_valid_end = Some(end);
+                        }
                     }
                 }
             } else {
                 // No hint file — replay the raw log.
                 if fid_log_path.exists() {
-                    replay_log(&fid_log_path, fid, &mut keydir)?;
+                    let end = replay_log(&fid_log_path, fid, &mut keydir)?;
+                    if fid == active_file_id {
+                        active_valid_end = Some(end);
+                    }
                 }
             }
         }
 
-        let active_file_id = file_ids.last().copied().unwrap_or(1);
         let active_path = log_path(data_dir, active_file_id);
+
+        // Truncate the active log to the last valid record offset. This
+        // removes any torn writes or garbage bytes appended by a crash,
+        // ensuring new writes don't end up after unreadable data.
+        if let Some(valid_end) = active_valid_end {
+            if active_path.exists() {
+                let file_len = fs::metadata(&active_path).map(|m| m.len()).unwrap_or(0);
+                if valid_end < file_len {
+                    let f = fs::OpenOptions::new()
+                        .write(true)
+                        .open(&active_path)
+                        .map_err(|e| StoreError(e.to_string()))?;
+                    f.set_len(valid_end)
+                        .map_err(|e| StoreError(e.to_string()))?;
+                }
+            }
+        }
+
         let writer = LogWriter::open(&active_path, active_file_id)?;
 
         Ok(Self {
@@ -1005,12 +1037,14 @@ fn collect_file_ids(data_dir: &Path) -> Result<Vec<u64>> {
 
 /// Replay a raw log file from a given offset into the keydir.
 /// Used after loading a hint file to pick up any writes appended after the hint was generated.
+/// Replay a log file from a given offset. Returns the byte offset just past
+/// the last valid record.
 fn replay_log_from(
     log_path: &Path,
     file_id: u64,
     start_offset: u64,
     keydir: &mut KeyDir,
-) -> Result<()> {
+) -> Result<u64> {
     let mut reader = LogReader::open(log_path).map_err(|e| StoreError(e.to_string()))?;
     reader
         .seek_to(start_offset)
@@ -1041,11 +1075,14 @@ fn replay_log_from(
         offset += record_len;
     }
 
-    Ok(())
+    Ok(offset)
 }
 
 /// Replay a raw log file into the keydir (used when no hint file exists).
-fn replay_log(log_path: &Path, file_id: u64, keydir: &mut KeyDir) -> Result<()> {
+/// Replay a log file into the keydir. Returns the byte offset just past
+/// the last valid record (i.e. the point where a new writer should start
+/// appending). Any garbage or torn bytes beyond this offset are ignored.
+fn replay_log(log_path: &Path, file_id: u64, keydir: &mut KeyDir) -> Result<u64> {
     let mut reader = LogReader::open(log_path).map_err(|e| StoreError(e.to_string()))?;
     let mut offset: u64 = 0;
 
@@ -1075,7 +1112,7 @@ fn replay_log(log_path: &Path, file_id: u64, keydir: &mut KeyDir) -> Result<()> 
         offset += record_len;
     }
 
-    Ok(())
+    Ok(offset)
 }
 
 fn now_ms() -> u64 {
@@ -3113,6 +3150,18 @@ mod tests {
         assert_eq!(store.get(b"k1").unwrap(), Some(b"v1".to_vec()));
         assert_eq!(store.get(b"k2").unwrap(), Some(b"v2".to_vec()));
         assert_eq!(store.get(b"k3").unwrap(), Some(b"v3".to_vec()));
+        assert_eq!(store.len(), 3, "keydir must have exactly 3 entries");
+
+        // Store must be writable after torn-write recovery.
+        store.put(b"k4", b"v4", 0).unwrap();
+        assert_eq!(store.get(b"k4").unwrap(), Some(b"v4".to_vec()));
+        assert_eq!(store.len(), 4);
+
+        // Double recovery: close and reopen again.
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(b"k4").unwrap(), Some(b"v4".to_vec()));
+        assert_eq!(store.len(), 4);
     }
 
     #[test]
@@ -3142,6 +3191,12 @@ mod tests {
         let mut store = Store::open(dir.path()).unwrap();
         assert_eq!(store.get(b"a").unwrap(), Some(b"alpha".to_vec()));
         assert_eq!(store.get(b"b").unwrap(), Some(b"beta".to_vec()));
+        assert_eq!(store.len(), 2, "keydir must have exactly 2 entries");
+
+        // Store must be writable after garbage recovery.
+        store.put(b"c", b"gamma", 0).unwrap();
+        assert_eq!(store.get(b"c").unwrap(), Some(b"gamma".to_vec()));
+        assert_eq!(store.len(), 3);
     }
 
     #[test]
@@ -3219,6 +3274,11 @@ mod tests {
             store.get(b"ephemeral").unwrap().is_none(),
             "tombstone must survive reopen"
         );
+        assert_eq!(store.len(), 0, "deleted key must not appear in keydir");
+        assert!(
+            store.keys().is_empty(),
+            "keys() must be empty after tombstone replay"
+        );
 
         // Also verify that writing a new value after reopen works.
         store.put(b"ephemeral", b"resurrected", 0).unwrap();
@@ -3226,6 +3286,7 @@ mod tests {
             store.get(b"ephemeral").unwrap(),
             Some(b"resurrected".to_vec())
         );
+        assert_eq!(store.len(), 1);
     }
 
     #[test]
@@ -3284,6 +3345,12 @@ mod tests {
             store.get(b"third").unwrap().is_none(),
             "record after corruption must be skipped"
         );
+        assert_eq!(store.len(), 1, "only the first record should survive");
+
+        // Store must be writable after corruption recovery.
+        store.put(b"new", b"data", 0).unwrap();
+        assert_eq!(store.get(b"new").unwrap(), Some(b"data".to_vec()));
+        assert_eq!(store.len(), 2);
     }
 
     #[test]
@@ -3348,5 +3415,15 @@ mod tests {
             Some(b"file2_v2".to_vec()),
             "records from uncorrupted file must survive"
         );
+        assert_eq!(
+            store.len(),
+            2,
+            "only records from uncorrupted file should exist"
+        );
+
+        // Store must be writable after partial corruption.
+        store.put(b"recovery_key", b"works", 0).unwrap();
+        assert_eq!(store.get(b"recovery_key").unwrap(), Some(b"works".to_vec()));
+        assert_eq!(store.len(), 3);
     }
 }
