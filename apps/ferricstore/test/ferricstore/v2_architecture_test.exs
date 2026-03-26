@@ -600,8 +600,8 @@ defmodule Ferricstore.V2ArchitectureTest do
   # Performance sanity checks (tagged :perf)
   # =========================================================================
 
-  @describetag :perf
   describe "performance" do
+    @describetag :perf
     test "29. Hot read latency < 1us (single ETS lookup)", %{dir: _dir} do
       keydir = :ets.new(:v2_perf_hot, [:set, :public, {:read_concurrency, true}])
 
