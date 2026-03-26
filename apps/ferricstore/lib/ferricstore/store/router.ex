@@ -954,6 +954,9 @@ defmodule Ferricstore.Store.Router do
   end
 
   def list_op(key, operation) do
-    raft_write(shard_for(key), key, {:list_op, key, operation})
+    # Route through the shard GenServer which builds compound key stores.
+    # Individual element puts/deletes go through Raft via the compound store callbacks.
+    # This replaces the old path that sent {:list_op} as a single Raft entry (blob).
+    GenServer.call(shard_name(shard_for(key)), {:list_op, key, operation})
   end
 end
