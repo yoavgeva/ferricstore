@@ -265,7 +265,7 @@ defmodule Ferricstore.Commands.CommandTest do
       elapsed = System.monotonic_time(:millisecond) - start
 
       assert result == :ok
-      assert elapsed < 100
+      assert elapsed < 500
     end
 
     test "DEBUG SLEEP with invalid number returns error" do

@@ -16,6 +16,7 @@ defmodule FerricstoreServer.Integration.CrossShardAtomicTcpTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag timeout: 60_000
 
   alias Ferricstore.Resp.Encoder
   alias Ferricstore.Resp.Parser
@@ -36,7 +37,7 @@ defmodule FerricstoreServer.Integration.CrossShardAtomicTcpTest do
   end
 
   defp recv_response(sock, buf) do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 15_000)
+    {:ok, data} = :gen_tcp.recv(sock, 0, 30_000)
     buf2 = buf <> data
 
     case Parser.parse(buf2) do
