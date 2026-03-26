@@ -26,7 +26,8 @@ FerricStore is built around three core design principles: (1) all mutable state 
 │                                                                            │
 │  ┌────────────────────────────────────────────────┐                       │
 │  │                    Router                       │                       │
-│  │  key → :erlang.phash2(key, shard_count) → idx  │                       │
+│  │  key → phash2(key) band 0x3FF → slot            │                       │
+│  │  slot → slot_map[slot] → idx                   │                       │
 │  │  idx → :"Ferricstore.Store.Shard.N"            │                       │
 │  └────────────────┬────────────────┬──────────────┘                       │
 │                   │                │                                        │
@@ -101,8 +102,8 @@ Ferricstore.Supervisor (:one_for_one)
 ├── Ferricstore.Store.ShardSupervisor     # Supervises N Shard GenServers
 │   ├── Ferricstore.Store.Shard.0
 │   ├── Ferricstore.Store.Shard.1
-│   ├── Ferricstore.Store.Shard.2
-│   └── Ferricstore.Store.Shard.3
+│   ├── ...
+│   └── Ferricstore.Store.Shard.N-1   # N = System.schedulers_online()
 ├── Ferricstore.Raft.AsyncApplyWorker.0   # Async durability worker (shard 0)
 ├── Ferricstore.Raft.AsyncApplyWorker.1   # Async durability worker (shard 1)
 ├── ...                                   # (one AsyncApplyWorker per shard)
@@ -137,7 +138,7 @@ Stats starts first so counters are available before any connection. The ShardSup
 
 ## Shard Routing
 
-Every key is mapped to a shard using `:erlang.phash2(key, shard_count)`. This is a pure, deterministic function -- no lookup table, no coordinator. The shard count defaults to 4 and is set at compile time (determines maximum write parallelism).
+Every key is mapped to a shard via a 1,024-slot indirection layer: `phash2(key) band 0x3FF` maps the key to one of 1,024 slots, then a `persistent_term` slot-map tuple (`slot_map[slot]`) maps the slot to a shard index. This is a pure, deterministic function -- no coordinator. The shard count defaults to `System.schedulers_online()` and is set at startup (determines maximum write parallelism).
 
 Each shard has:
 - An ETS table (`keydir_N`) for hot data
@@ -148,17 +149,22 @@ Each shard has:
 - A merge scheduler for background compaction
 - An async apply worker for fire-and-forget writes
 
-The Router module (`Ferricstore.Store.Router`) pre-computes shard name atoms at compile time for O(1) dispatch (~5ns via `elem/2` on a tuple vs ~300ns for string interpolation).
+The Router module (`Ferricstore.Store.Router`) pre-computes shard name atoms at startup via `Router.init_shard_names(shard_count)` for O(1) dispatch (~5ns via `elem/2` on a tuple vs ~300ns for string interpolation).
 
 ```elixir
 # Router dispatches to the correct shard
 def get(key) do
-  idx = shard_for(key)        # :erlang.phash2(key, 4) -> 0..3
-  keydir = :"keydir_#{idx}"   # ETS table name
+  idx = shard_for(key)              # phash2(key) band 0x3FF -> slot -> slot_map[slot] -> idx
+  keydir = resolve_keydir(idx)      # pre-computed atom from persistent_term
 
   case ets_get(keydir, key, now) do
-    {:hit, value, _exp} -> value        # Hot path: no GenServer
-    :miss -> GenServer.call(shard, {:get, key})  # Cold path: pread from disk
+    {:hit, value, _exp} ->
+      sampled_read_bookkeeping(keydir, key)  # LFU touch + hot stats, sampled
+      value                                   # Hot path: no GenServer
+
+    :miss ->
+      Stats.record_cold_read(key)
+      GenServer.call(resolve_shard(idx), {:get, key})  # Cold path: pread from disk
   end
 end
 ```
@@ -240,7 +246,9 @@ Client                Router              Shard GenServer         Raft Batcher
    - **Quorum path**: The batch is submitted via `:ra.process_command/2` (for single commands) or as `{:batch, commands}` (for multi-command batches). The call blocks until Raft quorum acknowledges. `StateMachine.apply/3` runs on every node: it calls `NIF.v2_append_batch(active_file_path, records)` to write to Bitcask with fsync, then `:ets.insert(keydir, 7-tuple)` to update the keydir. Each caller receives their individual result.
    - **Async path**: The batch is sent to `AsyncApplyWorker` via `GenServer.cast` (fire-and-forget). All callers receive `:ok` immediately. The worker writes to Bitcask via `NIF.v2_append_batch` and updates ETS in the background.
 
-**Without Raft (`raft_enabled: false`)**:
+**Direct write path (sandbox test shards)**:
+
+Sandbox test shards bypass Raft and write through the Shard GenServer directly. This is not a user-facing option -- it is used internally by the test sandbox infrastructure to provide isolated, single-process shards.
 
 1. The Shard writes to ETS immediately via `:ets.insert` so reads see the value at once.
 2. The entry is prepended to an in-memory `pending` list in the GenServer state.
@@ -269,8 +277,8 @@ Client                Router              ETS keydir          Shard GenServer
   |                     |  ┌──────────────────┘                     |
   |                     |  |                                        |
   |                     |  |  value != nil (HOT)                    |
-  |                     |  |  LFU.touch(keydir, key, lfu)           |
-  |                     |  |  Stats.record_hot_read(key)            |
+  |                     |  |  sampled_read_bookkeeping(keydir, key) |
+  |                     |  |  (1 persistent_term + 1 rand, sampled) |
   |<-- value ----------|<─┘  ~1-5us, no GenServer                 |
   |                     |                                           |
   |                     |  |  value == nil (COLD)                   |
@@ -293,8 +301,8 @@ Client                Router              ETS keydir          Shard GenServer
 
 1. Calls `:ets.lookup(keydir, key)` -- lock-free with `read_concurrency: true`.
 2. Pattern-matches the 7-tuple:
-   - **Hot, no TTL**: `{key, value, 0, lfu, _, _, _}` when `value != nil` -- calls `LFU.touch/3` and returns `{:hit, value, 0}`.
-   - **Hot, valid TTL**: `{key, value, exp, lfu, _, _, _}` when `exp > now` and `value != nil` -- calls `LFU.touch/3` and returns `{:hit, value, exp}`.
+   - **Hot, no TTL**: `{key, value, 0, lfu, _, _, _}` when `value != nil` -- returns `{:hit, value, 0}`. The caller then invokes `sampled_read_bookkeeping/2` which performs a single `persistent_term` read + `rand` call, and only on the sampled fraction (default 1-in-100) does it call `LFU.touch/3` and `Stats.record_hot_read/1`.
+   - **Hot, valid TTL**: `{key, value, exp, lfu, _, _, _}` when `exp > now` and `value != nil` -- returns `{:hit, value, exp}` (same sampled bookkeeping as above).
    - **Cold**: `{key, nil, ...}` -- returns `:miss`. The Router then calls `GenServer.call(shard, {:get, key})`, which performs `NIF.v2_pread_at(file_path, offset)` using the location from the ETS tuple. After reading, the value is warmed back into ETS (subject to `hot_cache_max_value_size`).
    - **Expired**: `{key, _, exp, _, _, _, _}` when `exp <= now` -- deletes the entry from ETS and returns `:expired`. This is lazy eviction: expired keys are cleaned up on access.
    - **Missing**: `[]` -- returns `:miss`.
@@ -364,7 +372,7 @@ The LFU field in each keydir 7-tuple is a single integer packing two values into
 
 ### Access Algorithm
 
-On every key access (`LFU.touch/3`, called from `Router.ets_get/3`):
+On sampled key accesses (`LFU.touch/3`, called from `Router.sampled_read_bookkeeping/2` -- not every access, sampled at 1-in-N where N defaults to 100):
 
 1. **Decay**: `elapsed = now_minutes - ldt`. Reduce counter by `elapsed / lfu_decay_time` (default: 1 minute per step, 0 disables decay).
 2. **Probabilistic increment**: With probability `1 / (decayed_counter * lfu_log_factor + 1)` (default log_factor: 10), increment the counter by 1, capped at 255.
