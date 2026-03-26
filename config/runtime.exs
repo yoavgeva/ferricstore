@@ -11,6 +11,7 @@ if config_env() == :prod do
       if count == 0, do: System.schedulers_online(), else: count
     ),
     default_durability: String.to_existing_atom(System.get_env("FERRICSTORE_DURABILITY", "quorum")),
+    protected_mode: System.get_env("FERRICSTORE_PROTECTED_MODE", "true") == "true",
     sandbox_enabled: false
 
   # Clustering

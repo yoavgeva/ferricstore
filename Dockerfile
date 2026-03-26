@@ -1,11 +1,15 @@
 # ============================================================
 # Stage 1: Build
 # ============================================================
-FROM hexpm/elixir:1.19.5-erlang-28.3.1-ubuntu-noble-20250127 AS builder
+FROM hexpm/elixir:1.19.5-erlang-28.4.1-ubuntu-noble-20260217 AS builder
 
-# Install Rust
+# Install system deps + Rust
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates build-essential git \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV PATH="/root/.cargo/bin:$PATH"
 
 WORKDIR /app
 
@@ -47,7 +51,7 @@ RUN mix release ferricstore
 # ============================================================
 # Stage 2: Runtime
 # ============================================================
-FROM ubuntu:noble-20250127
+FROM ubuntu:noble-20260217
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3t64 libncurses6 libstdc++6 \
