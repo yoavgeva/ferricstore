@@ -72,11 +72,11 @@ defmodule FerricstoreServer.Spec.SandboxTest do
       Enum.each(tasks, &Task.await(&1, 5_000))
     end
 
-    test "each test has a unique prefixed namespace" do
+    test "each test has a unique sandbox" do
       ns = FerricStore.Sandbox.current_namespace()
-      assert is_binary(ns)
-      assert String.starts_with?(ns, "test_")
-      assert String.ends_with?(ns, "_")
+      assert ns != nil
+      # Struct sandbox: ref is unique
+      assert is_reference(ns.ref) or is_binary(ns)
     end
   end
 
@@ -87,7 +87,7 @@ defmodule FerricstoreServer.Spec.SandboxTest do
   describe "SB-002: cleanup after test" do
     test "100 keys written in a sandbox are cleaned up on checkin" do
       # Create a separate sandbox to control lifecycle explicitly
-      ns = FerricStore.Sandbox.checkout()
+      sandbox = FerricStore.Sandbox.checkout()
 
       try do
         # Write 100 keys
@@ -99,15 +99,13 @@ defmodule FerricstoreServer.Spec.SandboxTest do
         {:ok, size} = FerricStore.dbsize()
         assert size == 100
       after
-        FerricStore.Sandbox.checkin(ns)
+        FerricStore.Sandbox.checkin(sandbox)
       end
 
-      # After checkin, verify all keys with the namespace prefix are gone
-      for i <- 1..100 do
-        raw_key = ns <> "cleanup_key_#{i}"
-        assert Router.get(raw_key) == nil,
-               "Key #{raw_key} should have been cleaned up"
-      end
+      # After checkin, the sandbox shards are stopped and tmpdir deleted.
+      # The keys are gone because the entire private shard is gone.
+      assert sandbox.tmpdir != nil
+      refute File.dir?(sandbox.tmpdir)
     end
 
     test "no cross-test pollution from large key sets" do
@@ -122,20 +120,20 @@ defmodule FerricstoreServer.Spec.SandboxTest do
   # ---------------------------------------------------------------------------
 
   describe "SB-003: transparent key rewriting" do
-    test "FerricStore.set/get transparently rewrites keys with sandbox prefix" do
-      namespace = FerricStore.Sandbox.current_namespace()
-      assert namespace != nil
+    test "FerricStore.set/get works transparently in sandbox" do
+      sandbox = FerricStore.Sandbox.current_namespace()
+      assert sandbox != nil
 
       FerricStore.set("user:42", "data")
 
-      # The embedded API reads back through the same sandbox prefix
+      # The embedded API reads back through the sandbox's private shards
       assert {:ok, "data"} = FerricStore.get("user:42")
 
-      # The raw key in the store has the namespace prefix
-      assert Router.get(namespace <> "user:42") == "data"
-
-      # Without the prefix, the key does not exist
-      assert Router.get("user:42") == nil
+      # The key is stored in the private shard, not the application shard.
+      # Verify isolation: a fresh sandbox shouldn't see this key.
+      other = FerricStore.Sandbox.checkout()
+      assert {:ok, nil} = FerricStore.get("user:42")
+      FerricStore.Sandbox.checkin(other)
     end
 
     test "key rewriting is transparent for hash operations" do
@@ -145,8 +143,10 @@ defmodule FerricstoreServer.Spec.SandboxTest do
 
       assert {:ok, "alice"} = FerricStore.hget("user:42", "name")
 
-      # Direct Router access without namespace should not find the key
-      assert Router.get("user:42") == nil
+      # Verify isolation: another sandbox shouldn't see this hash
+      other = FerricStore.Sandbox.checkout()
+      assert {:ok, nil} = FerricStore.hget("user:42", "name")
+      FerricStore.Sandbox.checkin(other)
     end
 
     test "key rewriting is transparent for list operations" do
@@ -247,17 +247,11 @@ defmodule FerricstoreServer.Spec.SandboxTest do
   # ---------------------------------------------------------------------------
 
   describe "SB-005: FLUSHDB scoped to sandbox" do
-    test "FLUSHDB inside sandbox only removes sandbox-namespaced keys" do
-      _namespace = FerricStore.Sandbox.current_namespace()
-
+    test "FLUSHDB inside sandbox removes all sandbox keys" do
       # Write keys inside the sandbox
       FerricStore.set("flush_a", "1")
       FerricStore.set("flush_b", "2")
       FerricStore.set("flush_c", "3")
-
-      # Also write a key outside any sandbox directly via Router
-      global_key = "global_outside_sb_#{:erlang.unique_integer([:positive])}"
-      Router.put(global_key, "global_value", 0)
 
       # Verify sandbox keys exist
       {:ok, size_before} = FerricStore.dbsize()
@@ -273,28 +267,18 @@ defmodule FerricstoreServer.Spec.SandboxTest do
       assert {:ok, nil} = FerricStore.get("flush_a")
       assert {:ok, nil} = FerricStore.get("flush_b")
       assert {:ok, nil} = FerricStore.get("flush_c")
-
-      # The global key outside the sandbox should still exist
-      assert Router.get(global_key) == "global_value"
-
-      # Clean up the global key
-      Router.delete(global_key)
     end
 
     test "FLUSHDB in one sandbox does not affect another sandbox" do
       # Current sandbox: write keys
       FerricStore.set("shared_name", "from_sb1")
 
-      # Grab current namespace to verify later
-      ns1 = FerricStore.Sandbox.current_namespace()
-      raw_key_ns1 = ns1 <> "shared_name"
-
       # Create a second sandbox in a separate process
       test_pid = self()
 
       task =
         Task.async(fn ->
-          ns2 = FerricStore.Sandbox.checkout()
+          sb2 = FerricStore.Sandbox.checkout()
 
           try do
             FerricStore.set("shared_name", "from_sb2")
@@ -303,18 +287,17 @@ defmodule FerricstoreServer.Spec.SandboxTest do
             FerricStore.flushdb()
 
             {:ok, val_after_flush} = FerricStore.get("shared_name")
-            send(test_pid, {:sb2_result, val_after_flush, ns2})
+            send(test_pid, {:sb2_result, val_after_flush})
           after
-            FerricStore.Sandbox.checkin(ns2)
+            FerricStore.Sandbox.checkin(sb2)
           end
         end)
 
-      assert_receive {:sb2_result, nil, _ns2}, 5_000
+      assert_receive {:sb2_result, nil}, 5_000
       Task.await(task, 5_000)
 
-      # The first sandbox's key should still be intact
+      # The first sandbox's key should still be intact — private shards are isolated
       assert {:ok, "from_sb1"} = FerricStore.get("shared_name")
-      assert Router.get(raw_key_ns1) == "from_sb1"
     end
 
     test "FLUSHDB clears hash keys within sandbox scope" do

@@ -620,7 +620,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           ArgumentError -> :ok
         end
 
-        File.rm_rf!(dir)
+        File.rm_rf(dir)
       end)
 
       %{
