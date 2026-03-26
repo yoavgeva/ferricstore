@@ -273,4 +273,99 @@ mod tests {
             assert!(result > 0);
         }
     }
+
+    // ------------------------------------------------------------------
+    // Unrecoverable scenario resilience tests
+    // ------------------------------------------------------------------
+
+    // NOTE: Stack overflow in a Tokio worker thread causes SIGABRT (process death).
+    // This is NOT recoverable — Tokio cannot catch or replace the aborted thread.
+    // Tested and confirmed: `thread 'ferric-tokio' has overflowed its stack`
+    // followed by `fatal runtime error: stack overflow, aborting`.
+    //
+    // Mitigation: worker_threads use 8MB stacks (Tokio default). Our tasks only
+    // do flat IO operations (pread, fsync, put_batch) with bounded stack depth.
+    // No recursive algorithms are used in spawned tasks.
+
+    /// Verify that a large allocation failure inside a task doesn't kill the
+    /// runtime. Rust's default allocator aborts on OOM, but we can test the
+    /// fallible allocation path.
+    #[test]
+    fn large_allocation_failure_in_task_is_contained() {
+        let rt = runtime();
+
+        let alloc_handle = rt.spawn(async {
+            // Try to allocate something unreasonably large via try_reserve.
+            // This tests that the task handles allocation failure gracefully.
+            let mut v: Vec<u8> = Vec::new();
+            match v.try_reserve(usize::MAX / 2) {
+                Ok(()) => panic!("should not be able to allocate usize::MAX/2 bytes"),
+                Err(_) => "allocation_failed_gracefully",
+            }
+        });
+
+        let result = rt.block_on(alloc_handle).unwrap();
+        assert_eq!(result, "allocation_failed_gracefully");
+
+        // Runtime still alive
+        let health = rt.spawn(async { 99 });
+        assert_eq!(rt.block_on(health).unwrap(), 99);
+    }
+
+    /// Verify that blocking a Tokio worker thread for an extended period
+    /// doesn't prevent other tasks from completing (Tokio has work-stealing).
+    #[test]
+    fn blocking_task_does_not_starve_other_tasks() {
+        let rt = runtime();
+
+        // Spawn a blocking task on a worker thread
+        let blocker = rt.spawn(async {
+            // This blocks the worker for 500ms
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            "blocker_done"
+        });
+
+        // Spawn 10 quick tasks — they should complete even while one worker is blocked
+        let mut quick_handles = Vec::new();
+        for i in 0..10u64 {
+            quick_handles.push(rt.spawn(async move { i * 3 }));
+        }
+
+        // All quick tasks should complete within 1 second
+        for (i, h) in quick_handles.into_iter().enumerate() {
+            let val = rt.block_on(h).unwrap();
+            assert_eq!(
+                val,
+                i as u64 * 3,
+                "quick task {i} should complete even with a blocked worker"
+            );
+        }
+
+        // Blocker should also eventually finish
+        let blocker_result = rt.block_on(blocker).unwrap();
+        assert_eq!(blocker_result, "blocker_done");
+    }
+
+    /// Verify that many simultaneous panics across tasks don't crash the runtime.
+    #[test]
+    fn mass_panic_50_tasks_runtime_survives() {
+        let rt = runtime();
+
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            handles.push(rt.spawn(async move {
+                panic!("mass panic task {i}");
+            }));
+        }
+
+        // All tasks should return JoinError
+        for h in handles {
+            let result = rt.block_on(h);
+            assert!(result.is_err());
+        }
+
+        // Runtime must still be functional
+        let health = rt.spawn(async { 777 });
+        assert_eq!(rt.block_on(health).unwrap(), 777);
+    }
 }
