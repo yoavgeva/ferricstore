@@ -697,8 +697,7 @@ defmodule Ferricstore.Store.Router do
 
     case ets_get(keydir, key, now) do
       {:hit, value, _exp} ->
-        maybe_record_hot_read(key)
-        Stats.incr_keyspace_hits()
+        sampled_read_bookkeeping(keydir, key)
         value
 
       :expired ->
@@ -734,7 +733,7 @@ defmodule Ferricstore.Store.Router do
 
     case ets_get(keydir, key, now) do
       {:hit, value, exp} ->
-        maybe_record_hot_read(key)
+        sampled_read_bookkeeping(keydir, key)
         {value, exp}
 
       :expired ->
@@ -769,15 +768,13 @@ defmodule Ferricstore.Store.Router do
   defp ets_get(keydir, key, now) do
     try do
       case :ets.lookup(keydir, key) do
-        [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
-          maybe_lfu_touch(keydir, key, lfu)
+        [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
           {:hit, value, 0}
 
         [{^key, nil, 0, _lfu, _fid, _off, _vsize}] ->
           :miss
 
-        [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-          maybe_lfu_touch(keydir, key, lfu)
+        [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
           {:hit, value, exp}
 
         [{^key, nil, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
@@ -795,24 +792,23 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp maybe_lfu_touch(keydir, key, lfu) do
+  # Consolidated read bookkeeping: ONE persistent_term read + ONE rand call
+  # instead of two separate sample checks. Saves ~100ns per read.
+  # Called after a successful read (hit). Handles LFU touch, hot read
+  # recording, and stats increment in one sampled decision.
+  defp sampled_read_bookkeeping(keydir, key) do
+    Stats.incr_keyspace_hits()
     rate = :persistent_term.get(:ferricstore_read_sample_rate, @default_read_sample_rate)
-    if rate <= 1 or :rand.uniform(rate) == 1 do
-      lfu_touch(keydir, key, lfu)
-    end
-  end
 
-  defp maybe_record_hot_read(key) do
-    rate = :persistent_term.get(:ferricstore_read_sample_rate, @default_read_sample_rate)
     if rate <= 1 or :rand.uniform(rate) == 1 do
+      # Sampled: do the expensive bookkeeping
+      case :ets.lookup(keydir, key) do
+        [{^key, _v, _e, lfu, _f, _o, _vs}] -> LFU.touch(keydir, key, lfu)
+        _ -> :ok
+      end
+
       Stats.record_hot_read(key)
     end
-  end
-
-  # LFU touch with time-based decay (Redis-compatible).
-  # Decays counter based on elapsed minutes, then probabilistically increments.
-  defp lfu_touch(keydir, key, packed_lfu) do
-    LFU.touch(keydir, key, packed_lfu)
   end
 
   @doc """
