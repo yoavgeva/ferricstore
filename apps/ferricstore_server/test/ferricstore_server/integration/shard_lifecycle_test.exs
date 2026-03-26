@@ -13,6 +13,7 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
   # Shard lifecycle tests kill and restart shards, destroying ETS tables.
   # Must be excluded from umbrella runs to avoid polluting other apps.
   @moduletag :cluster

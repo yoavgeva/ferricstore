@@ -20,6 +20,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Batcher

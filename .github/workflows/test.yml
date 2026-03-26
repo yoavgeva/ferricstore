@@ -85,8 +85,11 @@ jobs:
       - name: Compile
         run: mix compile
 
-      - name: Run tests
+      - name: Run tests (excluding shard-kill)
         run: mix test --trace --timeout 30000
+
+      - name: Run shard-kill durability tests (isolated)
+        run: mix test --only shard_kill --timeout 60000
 
       - name: Run cluster tests (multi-node via :peer)
         if: always()

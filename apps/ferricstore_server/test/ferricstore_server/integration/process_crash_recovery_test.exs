@@ -8,6 +8,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

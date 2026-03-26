@@ -15,6 +15,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias Ferricstore.DataDir
   alias Ferricstore.Store.{Router, ShardSupervisor}

@@ -6,6 +6,7 @@ defmodule Ferricstore.Store.PrefixInterningTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias Ferricstore.Store.{PrefixIndex, Router}
   alias Ferricstore.Commands.{Generic, Server}
