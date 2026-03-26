@@ -240,6 +240,10 @@ defmodule Ferricstore.Raft.StateMachine do
     maybe_release_cursor(meta, old_count, new_state, shard_results)
   end
 
+  # Legacy: list operations used to be sent as a single {:list_op} Raft entry
+  # containing the entire operation. Now lists use compound keys (L:key\0pos)
+  # and individual {:put}/{:delete} entries. This handler remains for WAL
+  # replay of entries written before the compound-key migration.
   def apply(meta, {:list_op, key, operation}, state) do
     result = do_list_op(state, key, operation)
     old_count = state.applied_count

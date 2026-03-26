@@ -2243,55 +2243,74 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for list operations: reads locally, routes put/delete through Raft.
+  # Compound-key path for list operations (both Raft and direct).
+  # Each list element is a separate Bitcask entry: L:key\0<position> -> value
+  # Metadata: LM:key -> term_to_binary({length, next_left_pos, next_right_pos})
+  # This replaces the legacy blob path where the entire list was one serialized value.
   defp handle_list_op_raft(key, operation, state) do
-    alias Ferricstore.Store.ListOps
-    alias Ferricstore.Raft.Batcher
-
-    get_fn = fn -> do_get(state, key) end
-    put_fn = fn encoded_binary ->
-      Batcher.write(state.index, {:put, key, encoded_binary, 0})
-    end
-    delete_fn = fn ->
-      Batcher.write(state.index, {:delete, key})
-    end
-
-    result = ListOps.execute(get_fn, put_fn, delete_fn, operation)
+    store = build_list_compound_store_raft(key, state)
+    result = Ferricstore.Store.ListOps.execute(key, store, operation)
     new_version = state.write_version + 1
     {:reply, result, %{state | write_version: new_version}}
   end
 
-  # Direct path for list operations (no Raft).
   defp handle_list_op_direct(key, operation, state) do
     state = await_in_flight(state)
     state = flush_pending_sync(state)
-
-    alias Ferricstore.Store.ListOps
-
-    get_fn = fn -> do_get(state, key) end
-    put_fn = fn encoded_binary ->
-      case NIF.v2_append_batch(state.active_file_path, [{key, encoded_binary, 0}]) do
-        {:ok, [{offset, _value_size}]} ->
-          ets_insert_with_location(state, key, encoded_binary, 0, state.active_file_id, offset, byte_size(encoded_binary))
-        _ ->
-          ets_insert(state, key, encoded_binary, 0)
-      end
-      :ok
-    end
-    delete_fn = fn ->
-      case NIF.v2_append_tombstone(state.active_file_path, key) do
-        {:ok, _} ->
-          ets_delete_key(state, key)
-          :ok
-
-        {:error, reason} ->
-          Logger.error("Shard #{state.index}: tombstone write failed for list delete: #{inspect(reason)}")
-          {:error, reason}
-      end
-    end
-
-    result = ListOps.execute(get_fn, put_fn, delete_fn, operation)
+    store = build_list_compound_store_direct(key, state)
+    result = Ferricstore.Store.ListOps.execute(key, store, operation)
     {:reply, result, state}
+  end
+
+  defp build_list_compound_store_raft(_key, state) do
+    alias Ferricstore.Raft.Batcher
+
+    %{
+      compound_get: fn _redis_key, compound_key ->
+        do_compound_get(state, compound_key)
+      end,
+      compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
+        Batcher.write(state.index, {:put, compound_key, value, expire_at_ms})
+      end,
+      compound_delete: fn _redis_key, compound_key ->
+        Batcher.write(state.index, {:delete, compound_key})
+      end,
+      compound_scan: fn _redis_key, prefix ->
+        results = prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
+        Enum.sort_by(results, fn {field, _} -> field end)
+      end
+    }
+  end
+
+  defp build_list_compound_store_direct(_key, state) do
+    %{
+      compound_get: fn _redis_key, compound_key ->
+        do_compound_get(state, compound_key)
+      end,
+      compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
+        case NIF.v2_append_batch(state.active_file_path, [{compound_key, value, expire_at_ms}]) do
+          {:ok, [{offset, _value_size}]} ->
+            ets_insert_with_location(state, compound_key, value, expire_at_ms, state.active_file_id, offset, byte_size(value))
+          _ ->
+            ets_insert(state, compound_key, value, expire_at_ms)
+        end
+        :ok
+      end,
+      compound_delete: fn _redis_key, compound_key ->
+        case NIF.v2_append_tombstone(state.active_file_path, compound_key) do
+          {:ok, _} ->
+            ets_delete_key(state, compound_key)
+            :ok
+          {:error, reason} ->
+            Logger.error("Shard #{state.index}: tombstone write failed for list compound_delete: #{inspect(reason)}")
+            {:error, reason}
+        end
+      end,
+      compound_scan: fn _redis_key, prefix ->
+        results = prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
+        Enum.sort_by(results, fn {field, _} -> field end)
+      end
+    }
   end
 
   def handle_call({:list_op_lmove, src_key, dst_key, from_dir, to_dir}, _from, state) do
@@ -2302,68 +2321,20 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Raft path for LMOVE: reads locally, routes put/delete through Raft.
+  # Raft path for LMOVE using compound keys.
   defp handle_list_op_lmove_raft(src_key, dst_key, from_dir, to_dir, state) do
-    alias Ferricstore.Store.ListOps
-    alias Ferricstore.Raft.Batcher
-
-    src_get_fn = fn -> do_get(state, src_key) end
-    dst_get_fn = fn -> do_get(state, dst_key) end
-    src_put_fn = fn encoded ->
-      Batcher.write(state.index, {:put, src_key, encoded, 0})
-    end
-    dst_put_fn = fn encoded ->
-      Batcher.write(state.index, {:put, dst_key, encoded, 0})
-    end
-    src_delete_fn = fn ->
-      Batcher.write(state.index, {:delete, src_key})
-    end
-
-    result = ListOps.execute_lmove(src_get_fn, src_put_fn, src_delete_fn, dst_get_fn, dst_put_fn, from_dir, to_dir)
+    store = build_list_compound_store_raft(src_key, state)
+    result = Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
     new_version = state.write_version + 1
     {:reply, result, %{state | write_version: new_version}}
   end
 
-  # Direct path for LMOVE (no Raft).
+  # Direct path for LMOVE using compound keys.
   defp handle_list_op_lmove_direct(src_key, dst_key, from_dir, to_dir, state) do
     state = await_in_flight(state)
     state = flush_pending_sync(state)
-
-    alias Ferricstore.Store.ListOps
-
-    src_get_fn = fn -> do_get(state, src_key) end
-    dst_get_fn = fn -> do_get(state, dst_key) end
-    src_put_fn = fn encoded ->
-      case NIF.v2_append_batch(state.active_file_path, [{src_key, encoded, 0}]) do
-        {:ok, [{offset, _value_size}]} ->
-          ets_insert_with_location(state, src_key, encoded, 0, state.active_file_id, offset, byte_size(encoded))
-        _ ->
-          ets_insert(state, src_key, encoded, 0)
-      end
-      :ok
-    end
-    dst_put_fn = fn encoded ->
-      case NIF.v2_append_batch(state.active_file_path, [{dst_key, encoded, 0}]) do
-        {:ok, [{offset, _value_size}]} ->
-          ets_insert_with_location(state, dst_key, encoded, 0, state.active_file_id, offset, byte_size(encoded))
-        _ ->
-          ets_insert(state, dst_key, encoded, 0)
-      end
-      :ok
-    end
-    src_delete_fn = fn ->
-      case NIF.v2_append_tombstone(state.active_file_path, src_key) do
-        {:ok, _} ->
-          ets_delete_key(state, src_key)
-          :ok
-
-        {:error, reason} ->
-          Logger.error("Shard #{state.index}: tombstone write failed for LMOVE src delete: #{inspect(reason)}")
-          {:error, reason}
-      end
-    end
-
-    result = ListOps.execute_lmove(src_get_fn, src_put_fn, src_delete_fn, dst_get_fn, dst_put_fn, from_dir, to_dir)
+    store = build_list_compound_store_direct(src_key, state)
+    result = Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
     {:reply, result, state}
   end
 
@@ -2932,6 +2903,10 @@ defmodule Ferricstore.Store.Shard do
         {:ok, nil}
     end
   end
+
+  # Alias for compound key reads — same logic as do_get since compound keys
+  # are stored as regular ETS/Bitcask entries.
+  defp do_compound_get(state, compound_key), do: do_get(state, compound_key)
 
   defp do_get(state, key) do
     case ets_lookup(state, key) do
