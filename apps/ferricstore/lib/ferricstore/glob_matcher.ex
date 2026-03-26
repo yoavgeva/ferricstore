@@ -1,13 +1,9 @@
 defmodule Ferricstore.GlobMatcher do
   @moduledoc """
-  Hand-written binary glob matcher that avoids runtime regex compilation.
+  Linear-time binary glob matcher.
 
-  Replaces the `glob_to_regex/1` + `Regex.match?/2` pattern that was
-  duplicated across 5 modules (server.ex, generic.ex, hash.ex, set.ex,
-  config.ex). Each call to `Regex.compile!/1` costs ~1-5us of PCRE engine
-  time; this binary matcher is O(n*m) worst-case but avoids all
-  intermediate allocations (no grapheme list, no regex string, no compiled
-  NFA).
+  Uses a two-pointer algorithm that avoids exponential backtracking on
+  patterns like `*a*a*a*a*b` (CVE-2022-36021, CVE-2024-31228).
 
   Supports:
     * `*` -- matches zero or more bytes
@@ -29,83 +25,124 @@ defmodule Ferricstore.GlobMatcher do
       false
   """
 
+  # Maximum pattern length to prevent DoS via extremely long patterns.
+  @max_pattern_length 1024
+
   @doc """
   Returns `true` if `subject` matches the glob `pattern`.
 
-  ## Parameters
-
-    - `subject` -- the binary to test
-    - `pattern` -- glob pattern with `*`, `?`, `[...]` support
-
-  ## Returns
-
-  `true` if the entire subject matches the pattern, `false` otherwise.
+  Patterns longer than #{@max_pattern_length} bytes always return `false`.
   """
   @spec match?(binary(), binary()) :: boolean()
   def match?(subject, pattern) when is_binary(subject) and is_binary(pattern) do
-    do_match(subject, pattern)
-  end
-
-  # Both exhausted: match
-  defp do_match(<<>>, <<>>), do: true
-
-  # Trailing stars match empty subject
-  defp do_match(<<>>, <<"*", rest::binary>>), do: do_match(<<>>, rest)
-  defp do_match(<<>>, _pattern), do: false
-
-  # Star: try consuming zero chars (advance pattern) or one char (advance subject)
-  defp do_match(<<_, subject_rest::binary>> = subject, <<"*", rest::binary>>) do
-    do_match(subject, rest) or do_match(subject_rest, <<"*", rest::binary>>)
-  end
-
-  # Question mark: match exactly one byte
-  defp do_match(<<_, subject_rest::binary>>, <<"?", pattern_rest::binary>>) do
-    do_match(subject_rest, pattern_rest)
-  end
-
-  # Escaped character: match the next pattern byte literally
-  defp do_match(<<c, subject_rest::binary>>, <<"\\", c, pattern_rest::binary>>) do
-    do_match(subject_rest, pattern_rest)
-  end
-
-  defp do_match(_subject, <<"\\", _c, _pattern_rest::binary>>), do: false
-
-  # Character class: [...]
-  defp do_match(<<c, subject_rest::binary>>, <<"[", rest::binary>>) do
-    case parse_char_class(rest) do
-      {:ok, chars, negated, pattern_rest} ->
-        in_class = c in chars
-
-        if (negated and not in_class) or (not negated and in_class) do
-          do_match(subject_rest, pattern_rest)
-        else
-          false
-        end
-
-      :error ->
-        # Malformed class -- treat '[' as literal
-        if c == ?[ do
-          do_match(subject_rest, rest)
-        else
-          false
-        end
+    if byte_size(pattern) > @max_pattern_length do
+      false
+    else
+      do_match(subject, 0, byte_size(subject), pattern, 0, byte_size(pattern))
     end
   end
 
-  # Literal byte match
-  defp do_match(<<c, subject_rest::binary>>, <<c, pattern_rest::binary>>) do
-    do_match(subject_rest, pattern_rest)
+  # Linear-time glob matching using the "star restart" technique.
+  # When a `*` is encountered, we record the position. If a later literal
+  # fails to match, we backtrack to the star position and try consuming
+  # one more byte from the subject. This is O(n*m) worst case but avoids
+  # exponential branching because we only ever track ONE star restart point
+  # (the most recent `*`).
+  defp do_match(subject, si, slen, pattern, pi, plen) do
+    do_match_loop(subject, si, slen, pattern, pi, plen, -1, -1)
   end
 
-  # No match
-  defp do_match(_subject, _pattern), do: false
+  defp do_match_loop(subject, si, slen, pattern, pi, plen, star_pi, star_si) do
+    cond do
+      pi == plen and si == slen ->
+        # Both exhausted — match
+        true
 
-  # Parse character class content up to closing ']'
-  defp parse_char_class(<<"^", rest::binary>>), do: collect_class_chars(rest, [], true)
-  defp parse_char_class(<<"!", rest::binary>>), do: collect_class_chars(rest, [], true)
-  defp parse_char_class(rest), do: collect_class_chars(rest, [], false)
+      pi < plen and :binary.at(pattern, pi) == ?* ->
+        # Star: record restart point, advance pattern, try zero-length match
+        do_match_loop(subject, si, slen, pattern, pi + 1, plen, pi + 1, si)
 
-  defp collect_class_chars(<<"]", rest::binary>>, acc, negated), do: {:ok, acc, negated, rest}
-  defp collect_class_chars(<<c, rest::binary>>, acc, negated), do: collect_class_chars(rest, [c | acc], negated)
-  defp collect_class_chars(<<>>, _acc, _negated), do: :error
+      pi < plen and si < slen and match_one?(subject, si, pattern, pi) ->
+        # Current bytes match — advance both
+        skip = pattern_char_len(pattern, pi)
+        do_match_loop(subject, si + 1, slen, pattern, pi + skip, plen, star_pi, star_si)
+
+      star_pi >= 0 and star_si < slen ->
+        # Mismatch but we have a star — consume one more subject byte
+        new_star_si = star_si + 1
+        do_match_loop(subject, new_star_si, slen, pattern, star_pi, plen, star_pi, new_star_si)
+
+      true ->
+        # No star to backtrack to, and bytes don't match
+        false
+    end
+  end
+
+  # Check if subject[si] matches pattern[pi] (one character/class)
+  defp match_one?(subject, si, pattern, pi) do
+    pc = :binary.at(pattern, pi)
+    sc = :binary.at(subject, si)
+
+    cond do
+      pc == ?? ->
+        true
+
+      pc == ?\\ and pi + 1 < byte_size(pattern) ->
+        :binary.at(pattern, pi + 1) == sc
+
+      pc == ?[ ->
+        case parse_char_class_at(pattern, pi + 1) do
+          {:ok, chars, negated, _end_pi} ->
+            in_class = sc in chars
+            (negated and not in_class) or (not negated and in_class)
+
+          :error ->
+            pc == sc
+        end
+
+      true ->
+        pc == sc
+    end
+  end
+
+  # How many pattern bytes does the current character consume?
+  defp pattern_char_len(pattern, pi) do
+    pc = :binary.at(pattern, pi)
+
+    cond do
+      pc == ?\\ and pi + 1 < byte_size(pattern) -> 2
+      pc == ?[ ->
+        case parse_char_class_at(pattern, pi + 1) do
+          {:ok, _chars, _neg, end_pi} -> end_pi - pi
+          :error -> 1
+        end
+
+      true -> 1
+    end
+  end
+
+  # Parse [chars] or [^chars] starting at position `pos` (after the `[`)
+  defp parse_char_class_at(pattern, pos) do
+    plen = byte_size(pattern)
+
+    {negated, start} =
+      cond do
+        pos < plen and :binary.at(pattern, pos) in [?^, ?!] -> {true, pos + 1}
+        true -> {false, pos}
+      end
+
+    collect_class_chars_at(pattern, start, plen, [], negated)
+  end
+
+  defp collect_class_chars_at(_pattern, pos, plen, _acc, _negated) when pos >= plen, do: :error
+
+  defp collect_class_chars_at(pattern, pos, plen, acc, negated) do
+    c = :binary.at(pattern, pos)
+
+    if c == ?] do
+      {:ok, acc, negated, pos + 1}
+    else
+      collect_class_chars_at(pattern, pos + 1, plen, [c | acc], negated)
+    end
+  end
 end

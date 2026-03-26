@@ -972,7 +972,7 @@ defmodule FerricstoreServer.Connection do
 
       # Backwards compat: requirepass is set, default user has no ACL password.
       has_requirepass and username == "default" ->
-        if password == requirepass do
+        if :crypto.hash_equals(password, requirepass) do
           AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
           new_cache = build_acl_cache(username)
           {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: username, acl_cache: new_cache}}
