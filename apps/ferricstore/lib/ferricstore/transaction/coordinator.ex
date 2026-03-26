@@ -36,10 +36,10 @@ defmodule Ferricstore.Transaction.Coordinator do
   # ---------------------------------------------------------------------------
 
   defp execute_single_shard(queue, shard_idx, sandbox_namespace) do
-    shard_name = Router.shard_name(shard_idx)
+    shard = Router.resolve_shard(shard_idx)
 
     try do
-      GenServer.call(shard_name, {:tx_execute, queue, sandbox_namespace}, 10_000)
+      GenServer.call(shard, {:tx_execute, queue, sandbox_namespace}, 10_000)
     catch
       :exit, {:noproc, _} -> {:error, "ERR server not ready"}
       :exit, {reason, _} -> {:error, "ERR internal error: #{inspect(reason)}"}
@@ -51,43 +51,48 @@ defmodule Ferricstore.Transaction.Coordinator do
   # ---------------------------------------------------------------------------
 
   defp execute_cross_shard(shard_groups, index_map, total, sandbox_namespace) do
-    anchor_idx = shard_groups |> Map.keys() |> Enum.min()
+    # In sandbox mode (or when raft is unavailable), go directly to the
+    # sequential GenServer fallback. No raft in sandbox.
+    if Router.in_sandbox?() do
+      execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
+    else
+      anchor_idx = shard_groups |> Map.keys() |> Enum.min()
 
-    shard_batches =
-      Enum.map(shard_groups, fn {shard_idx, cmds_with_indices} ->
-        cmds = Enum.map(cmds_with_indices, fn {_orig_idx, cmd, args} -> {cmd, args} end)
-        {shard_idx, cmds, sandbox_namespace}
-      end)
+      shard_batches =
+        Enum.map(shard_groups, fn {shard_idx, cmds_with_indices} ->
+          cmds = Enum.map(cmds_with_indices, fn {_orig_idx, cmd, args} -> {cmd, args} end)
+          {shard_idx, cmds, sandbox_namespace}
+        end)
 
-    command = {:cross_shard_tx, shard_batches}
-    shard_id = Ferricstore.Raft.Cluster.shard_server_id(anchor_idx)
-    corr = make_ref()
+      command = {:cross_shard_tx, shard_batches}
+      shard_id = Ferricstore.Raft.Cluster.shard_server_id(anchor_idx)
+      corr = make_ref()
 
-    try do
-      case :ra.pipeline_command(shard_id, command, corr, :normal) do
-        :ok ->
-          case wait_for_ra_result(corr, shard_id, anchor_idx, command) do
-            {:ok, shard_results} ->
-              # Increment write versions for all involved shards
-              Enum.each(Map.keys(shard_groups), fn idx ->
-                Ferricstore.Store.WriteVersion.increment(idx)
-              end)
+      try do
+        case :ra.pipeline_command(shard_id, command, corr, :normal) do
+          :ok ->
+            case wait_for_ra_result(corr, shard_id, anchor_idx, command) do
+              {:ok, shard_results} ->
+                Enum.each(Map.keys(shard_groups), fn idx ->
+                  Ferricstore.Store.WriteVersion.increment(idx)
+                end)
 
-              reassemble_results(shard_results, index_map, total)
+                reassemble_results(shard_results, index_map, total)
 
-            {:error, _} = err ->
-              err
-          end
+              {:error, _} = err ->
+                err
+            end
 
-        {:error, :noproc} ->
-          execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
+          {:error, :noproc} ->
+            execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
 
-        {:error, _reason} ->
+          {:error, _reason} ->
+            execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
+        end
+      catch
+        :exit, {:noproc, _} ->
           execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
       end
-    catch
-      :exit, {:noproc, _} ->
-        execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
     end
   end
 
@@ -97,11 +102,11 @@ defmodule Ferricstore.Transaction.Coordinator do
     shard_results =
       Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds_with_indices}, acc ->
         queue = Enum.map(cmds_with_indices, fn {_orig_idx, cmd, args} -> {cmd, args} end)
-        shard_name = Router.shard_name(shard_idx)
+        shard = Router.resolve_shard(shard_idx)
 
         results =
           try do
-            GenServer.call(shard_name, {:tx_execute, queue, sandbox_namespace}, 10_000)
+            GenServer.call(shard, {:tx_execute, queue, sandbox_namespace}, 10_000)
           catch
             :exit, {:noproc, _} ->
               Enum.map(queue, fn _ -> {:error, "ERR server not ready"} end)

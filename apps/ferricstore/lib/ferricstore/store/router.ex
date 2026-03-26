@@ -39,7 +39,7 @@ defmodule Ferricstore.Store.Router do
     @doc false
     def resolve_keydir(idx) do
       case FerricStore.Sandbox.resolve() do
-        nil -> :"keydir_#{idx}"
+        nil -> keydir_name(idx)
         %FerricStore.Sandbox{keydirs: keydirs, shard_count: sc} -> elem(keydirs, rem(idx, sc))
       end
     end
@@ -81,7 +81,7 @@ defmodule Ferricstore.Store.Router do
     @doc false
     def resolve_shard(idx), do: shard_name(idx)
     @doc false
-    def resolve_keydir(idx), do: :"keydir_#{idx}"
+    def resolve_keydir(idx), do: keydir_name(idx)
     @doc false
     def resolve_prefix_table(idx), do: PrefixIndex.table_name(idx)
     @doc false
@@ -259,7 +259,7 @@ defmodule Ferricstore.Store.Router do
   # users choosing async accept eventual consistency.
 
   defp async_write(idx, {:put, key, value, expire_at_ms}) do
-    keydir = :"keydir_#{idx}"
+    keydir = keydir_name(idx)
     value_for_ets = case value do
       v when is_integer(v) -> Integer.to_string(v)
       v when is_float(v) -> Float.to_string(v)
@@ -296,7 +296,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write(idx, {:delete, key}) do
-    keydir = :"keydir_#{idx}"
+    keydir = keydir_name(idx)
     :ets.delete(keydir, key)
     PrefixIndex.untrack(PrefixIndex.table_name(idx), key, idx)
 
@@ -309,7 +309,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write(idx, {:incr, key, delta}) do
-    keydir = :"keydir_#{idx}"
+    keydir = keydir_name(idx)
     now = System.os_time(:millisecond)
 
     current =
@@ -345,7 +345,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write(idx, {:incr_float, key, delta}) do
-    keydir = :"keydir_#{idx}"
+    keydir = keydir_name(idx)
     now = System.os_time(:millisecond)
 
     current =
@@ -392,7 +392,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write(idx, {:append, key, suffix}) do
-    keydir = :"keydir_#{idx}"
+    keydir = keydir_name(idx)
     now = System.os_time(:millisecond)
 
     current =
@@ -414,7 +414,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write(idx, {:getset, key, new_value}) do
-    keydir = :"keydir_#{idx}"
+    keydir = keydir_name(idx)
     now = System.os_time(:millisecond)
 
     old =
@@ -428,7 +428,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write(idx, {:getdel, key}) do
-    keydir = :"keydir_#{idx}"
+    keydir = keydir_name(idx)
     now = System.os_time(:millisecond)
 
     old =
@@ -442,7 +442,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write(idx, {:getex, key, expire_at_ms}) do
-    keydir = :"keydir_#{idx}"
+    keydir = keydir_name(idx)
     now = System.os_time(:millisecond)
 
     case :ets.lookup(keydir, key) do
@@ -456,7 +456,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write(idx, {:setrange, key, offset, value}) do
-    keydir = :"keydir_#{idx}"
+    keydir = keydir_name(idx)
     now = System.os_time(:millisecond)
 
     current =
@@ -587,6 +587,12 @@ defmodule Ferricstore.Store.Router do
   def init_shard_names(shard_count) do
     names = List.to_tuple(for i <- 0..(shard_count - 1), do: :"Ferricstore.Store.Shard.#{i}")
     :persistent_term.put(:ferricstore_shard_names, names)
+
+    # Also cache keydir atom names to avoid string interpolation + atom
+    # creation (~120ns) on every read. Same pattern as shard_names.
+    keydirs = List.to_tuple(for i <- 0..(shard_count - 1), do: :"keydir_#{i}")
+    :persistent_term.put(:ferricstore_keydir_names, keydirs)
+
     :ok
   end
 
@@ -609,6 +615,27 @@ defmodule Ferricstore.Store.Router do
       _names ->
         # Index beyond the pre-computed range (e.g. test shards with ad-hoc indices).
         :"Ferricstore.Store.Shard.#{index}"
+    end
+  end
+
+  @doc """
+  Returns the keydir ETS table name for the shard at `index`.
+
+  Uses a pre-computed tuple from persistent_term for O(1) lookup (~5ns)
+  instead of string interpolation + atom creation (~120ns per call).
+  Falls back to string interpolation if the cache is not initialized.
+  """
+  @spec keydir_name(non_neg_integer()) :: atom()
+  def keydir_name(index) do
+    case :persistent_term.get(:ferricstore_keydir_names, nil) do
+      nil ->
+        :"keydir_#{index}"
+
+      names when index < tuple_size(names) ->
+        elem(names, index)
+
+      _names ->
+        :"keydir_#{index}"
     end
   end
 
@@ -847,10 +874,16 @@ defmodule Ferricstore.Store.Router do
     raft_write(idx, key, {:delete, key})
   end
 
-  @doc "Returns `true` if `key` exists and is not expired."
+  @doc """
+  Returns `true` if `key` exists and is not expired.
+
+  Uses direct ETS lookup (no GenServer roundtrip) for hot and cold keys.
+  A key is considered existing if it is in the keydir and not expired,
+  regardless of whether its value is hot (in ETS) or cold (on disk only).
+  """
   @spec exists?(binary()) :: boolean()
   def exists?(key) do
-    GenServer.call(resolve_shard(shard_for(key)), {:exists, key})
+    exists_fast?(key)
   end
 
   @doc """

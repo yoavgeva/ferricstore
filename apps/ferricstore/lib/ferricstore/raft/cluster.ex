@@ -85,9 +85,10 @@ defmodule Ferricstore.Raft.Cluster do
     * `:ok` on success
     * `{:error, reason}` on failure
   """
-  @spec start_shard_server(non_neg_integer(), binary(), non_neg_integer(), binary(), atom()) ::
+  @spec start_shard_server(non_neg_integer(), binary(), non_neg_integer(), binary(), atom(), keyword()) ::
           :ok | {:error, term()}
-  def start_shard_server(shard_index, shard_data_path, active_file_id, active_file_path, ets) do
+  def start_shard_server(shard_index, shard_data_path, active_file_id, active_file_path, ets, opts \\ []) do
+    ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     server_id = shard_server_id(shard_index)
 
     machine_config = %{
@@ -105,10 +106,10 @@ defmodule Ferricstore.Raft.Cluster do
       initial_members: [server_id],
       machine: {:module, Ferricstore.Raft.StateMachine, machine_config},
       log_init_args: %{uid: shard_uid(shard_index)},
-      system: @ra_system
+      system: ra_sys
     }
 
-    case :ra.start_server(@ra_system, server_config) do
+    case :ra.start_server(ra_sys, server_config) do
       :ok ->
         # Trigger election so single-node becomes leader immediately
         :ra.trigger_election(server_id)
@@ -124,12 +125,12 @@ defmodule Ferricstore.Raft.Cluster do
         # the SAME UID so it replays the WAL and recovers all committed state.
         # We must NOT force_delete -- that would destroy the WAL/snapshot data.
         Logger.info("ra server for shard #{shard_index} already running, stopping and restarting with same UID")
-        _ = :ra.stop_server(@ra_system, server_id)
+        _ = :ra.stop_server(ra_sys, server_id)
 
         # Wait for the ra process to fully terminate before restarting.
         Process.sleep(100)
 
-        case :ra.start_server(@ra_system, server_config) do
+        case :ra.start_server(ra_sys, server_config) do
           :ok ->
             :ra.trigger_election(server_id)
             wait_for_leader(server_id)
@@ -137,7 +138,7 @@ defmodule Ferricstore.Raft.Cluster do
           {:error, :not_new} ->
             # The server data directory already exists (expected after stop).
             # Use restart_server which re-opens existing state.
-            case :ra.restart_server(@ra_system, server_id) do
+            case :ra.restart_server(ra_sys, server_id) do
               :ok ->
                 :ra.trigger_election(server_id)
                 wait_for_leader(server_id)
@@ -167,8 +168,8 @@ defmodule Ferricstore.Raft.Cluster do
             "attempting fresh start with unique UID"
         )
 
-        _ = :ra.stop_server(@ra_system, server_id)
-        _ = :ra.force_delete_server(@ra_system, server_id)
+        _ = :ra.stop_server(ra_sys, server_id)
+        _ = :ra.force_delete_server(ra_sys, server_id)
 
         restart_uid = shard_uid(shard_index) <> "_#{System.unique_integer([:positive])}"
 
@@ -178,7 +179,7 @@ defmodule Ferricstore.Raft.Cluster do
             log_init_args: %{uid: restart_uid}
         }
 
-        case :ra.start_server(@ra_system, restart_config) do
+        case :ra.start_server(ra_sys, restart_config) do
           :ok ->
             :ra.trigger_election(server_id)
             wait_for_leader(server_id)

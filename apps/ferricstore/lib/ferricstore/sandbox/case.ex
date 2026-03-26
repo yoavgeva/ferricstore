@@ -1,14 +1,14 @@
 defmodule FerricStore.Sandbox.Case do
   @moduledoc """
   ExUnit case template that automatically checks out and checks in a
-  FerricStore sandbox namespace for each test.
+  FerricStore sandbox for each test.
 
   Using this module in a test module is equivalent to writing:
 
       setup do
-        namespace = FerricStore.Sandbox.checkout()
-        on_exit(fn -> FerricStore.Sandbox.checkin(namespace) end)
-        %{namespace: namespace}
+        sandbox = FerricStore.Sandbox.checkout()
+        on_exit(fn -> FerricStore.Sandbox.checkin(sandbox) end)
+        %{sandbox: sandbox}
       end
 
   ## Usage
@@ -36,9 +36,9 @@ defmodule FerricStore.Sandbox.Case do
   defmacro __using__(opts) do
     quote do
       setup do
-        namespace = FerricStore.Sandbox.checkout(unquote(opts))
-        on_exit(fn -> FerricStore.Sandbox.checkin(namespace) end)
-        %{namespace: namespace}
+        sandbox = FerricStore.Sandbox.checkout(unquote(opts))
+        on_exit(fn -> FerricStore.Sandbox.checkin(sandbox) end)
+        %{sandbox: sandbox}
       end
     end
   end

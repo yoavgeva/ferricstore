@@ -1349,28 +1349,38 @@ defmodule FerricStore do
     visible = CompoundKey.user_visible_keys(all_keys)
 
     results =
-      if namespace do
-        prefix_len = byte_size(namespace)
+      case namespace do
+        %FerricStore.Sandbox{} ->
+          # Struct sandbox: keys are already isolated (private shards), no prefix stripping
+          if match_all? do
+            visible
+          else
+            Enum.filter(visible, &Ferricstore.GlobMatcher.match?(&1, pattern))
+          end
 
-        Enum.reduce(visible, [], fn key, acc ->
-          if String.starts_with?(key, namespace) do
-            stripped = binary_part(key, prefix_len, byte_size(key) - prefix_len)
+        ns when is_binary(ns) ->
+          prefix_len = byte_size(ns)
 
-            if match_all? or Ferricstore.GlobMatcher.match?(stripped, pattern) do
-              [stripped | acc]
+          Enum.reduce(visible, [], fn key, acc ->
+            if String.starts_with?(key, ns) do
+              stripped = binary_part(key, prefix_len, byte_size(key) - prefix_len)
+
+              if match_all? or Ferricstore.GlobMatcher.match?(stripped, pattern) do
+                [stripped | acc]
+              else
+                acc
+              end
             else
               acc
             end
+          end)
+
+        nil ->
+          if match_all? do
+            visible
           else
-            acc
+            Enum.filter(visible, &Ferricstore.GlobMatcher.match?(&1, pattern))
           end
-        end)
-      else
-        if match_all? do
-          visible
-        else
-          Enum.filter(visible, &Ferricstore.GlobMatcher.match?(&1, pattern))
-        end
       end
 
     {:ok, results}
@@ -1410,44 +1420,73 @@ defmodule FerricStore do
   """
   @spec flushdb() :: :ok
   def flushdb do
-    namespace = Process.get(:ferricstore_sandbox)
+    sandbox = Process.get(:ferricstore_sandbox)
 
-    if namespace do
-      # Only flush keys in this sandbox namespace
-      FerricStore.Sandbox.checkin(namespace)
-      # Re-set the namespace since checkin clears it
-      Process.put(:ferricstore_sandbox, namespace)
-    else
-      # Delete ALL keys including compound sub-keys through the Shard
-      # GenServer which handles ETS + Bitcask tombstones properly.
-      shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+    case sandbox do
+      %FerricStore.Sandbox{} ->
+        # Struct sandbox: delete all keys via the private shards
+        sc = Router.effective_shard_count()
 
-      for i <- 0..(shard_count - 1) do
-        shard = Router.shard_name(i)
+        for i <- 0..(sc - 1) do
+          shard = Router.resolve_shard(i)
+          keydir = Router.resolve_keydir(i)
 
-        # Get ALL raw keys from ETS (including H:, S:, Z:, T: compound keys)
-        raw_keys =
-          try do
-            :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], :"keydir_#{i}")
-          rescue
-            ArgumentError -> []
-          end
+          raw_keys =
+            try do
+              :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], keydir)
+            rescue
+              ArgumentError -> []
+            end
 
-        # Delete each through the shard to write Bitcask tombstones
-        Enum.each(raw_keys, fn key ->
-          try do
-            GenServer.call(shard, {:delete, key}, 10_000)
-          catch
-            :exit, _ -> :ok
-          end
-        end)
+          Enum.each(raw_keys, fn key ->
+            try do
+              GenServer.call(shard, {:delete, key}, 10_000)
+            catch
+              :exit, _ -> :ok
+            end
+          end)
 
-        # Clear prefix index
-        try do :ets.delete_all_objects(:"prefix_keys_#{i}") catch :error, :badarg -> :ok end
-      end
+          # Clear prefix index
+          prefix_table = Router.resolve_prefix_table(i)
+          try do :ets.delete_all_objects(prefix_table) catch :error, :badarg -> :ok end
+        end
+
+        :ok
+
+      namespace when is_binary(namespace) ->
+        # Old string namespace sandbox: flush namespace keys
+        FerricStore.Sandbox.checkin(namespace)
+        # Re-set the namespace since checkin clears it
+        Process.put(:ferricstore_sandbox, namespace)
+        :ok
+
+      nil ->
+        # No sandbox: delete ALL keys
+        shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+
+        for i <- 0..(shard_count - 1) do
+          shard = Router.shard_name(i)
+
+          raw_keys =
+            try do
+              :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], :"keydir_#{i}")
+            rescue
+              ArgumentError -> []
+            end
+
+          Enum.each(raw_keys, fn key ->
+            try do
+              GenServer.call(shard, {:delete, key}, 10_000)
+            catch
+              :exit, _ -> :ok
+            end
+          end)
+
+          try do :ets.delete_all_objects(:"prefix_keys_#{i}") catch :error, :badarg -> :ok end
+        end
+
+        :ok
     end
-
-    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -2673,7 +2712,7 @@ defmodule FerricStore do
 
   # Gathers all set members for a resolved key, routing to the correct shard.
   defp gather_set_members(resolved_key) do
-    shard = Router.shard_name(Router.shard_for(resolved_key))
+    shard = Router.resolve_shard(Router.shard_for(resolved_key))
     prefix = Ferricstore.Store.CompoundKey.set_prefix(resolved_key)
     pairs = GenServer.call(shard, {:scan_prefix, prefix})
     MapSet.new(pairs, fn {member, _} -> member end)
@@ -3847,7 +3886,10 @@ defmodule FerricStore do
     def sandbox_key(key) do
       case Process.get(:ferricstore_sandbox) do
         nil -> key
-        namespace -> namespace <> key
+        # New struct sandbox: no key prefixing needed -- Router routes to private shards
+        %FerricStore.Sandbox{} -> key
+        # Old string namespace sandbox: prefix the key
+        namespace when is_binary(namespace) -> namespace <> key
       end
     end
   else
@@ -3894,27 +3936,27 @@ defmodule FerricStore do
       getex: &Router.getex/2,
       setrange: &Router.setrange/3,
       compound_get: fn _redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:get, compound_key})
       end,
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:put, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn _redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:delete, compound_key})
       end,
       compound_scan: fn _redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:scan_prefix, prefix})
       end,
       compound_count: fn _redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:count_prefix, prefix})
       end,
       compound_delete_prefix: fn _redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:delete_prefix, prefix})
       end
     }
@@ -4063,27 +4105,27 @@ defmodule FerricStore do
       exists?: fn k -> Router.exists?(k) end,
       keys: &Router.keys/0,
       compound_get: fn _redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:get, compound_key})
       end,
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:put, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn _redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:delete, compound_key})
       end,
       compound_scan: fn _redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:scan_prefix, prefix})
       end,
       compound_count: fn _redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:count_prefix, prefix})
       end,
       compound_delete_prefix: fn _redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(resolved_key))
+        shard = Router.resolve_shard(Router.shard_for(resolved_key))
         GenServer.call(shard, {:delete_prefix, prefix})
       end
     }
@@ -4229,10 +4271,14 @@ defmodule FerricStore.Pipe do
 
     queue = Enum.map(ordered, &to_resp_command/1)
 
+    # For the old string sandbox, pass the namespace so keys are prefixed.
+    # For the new struct sandbox, pass nil -- keys are not prefixed,
+    # and shard_for will route to the private sandbox shards.
     sandbox_namespace =
       case Process.get(:ferricstore_sandbox) do
         nil -> nil
-        ns -> ns
+        %FerricStore.Sandbox{} -> nil
+        ns when is_binary(ns) -> ns
       end
 
     raw_results = Ferricstore.Transaction.Coordinator.execute(queue, %{}, sandbox_namespace)
@@ -4465,7 +4511,8 @@ defmodule FerricStore.Tx do
     sandbox_namespace =
       case Process.get(:ferricstore_sandbox) do
         nil -> nil
-        ns -> ns
+        %FerricStore.Sandbox{} -> nil
+        ns when is_binary(ns) -> ns
       end
 
     Ferricstore.Transaction.Coordinator.execute(queue, %{}, sandbox_namespace)

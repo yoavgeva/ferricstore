@@ -415,11 +415,12 @@ defmodule Ferricstore.EmbeddedTest do
       if saved, do: Process.put(:ferricstore_sandbox, saved)
     end
 
-    test "prepends namespace when sandbox is active" do
+    test "returns key unchanged when struct sandbox is active" do
       # The sandbox is active because we use FerricStore.Sandbox.Case
-      namespace = Process.get(:ferricstore_sandbox)
-      assert is_binary(namespace)
-      assert FerricStore.sandbox_key("mykey") == namespace <> "mykey"
+      sandbox = Process.get(:ferricstore_sandbox)
+      assert %FerricStore.Sandbox{} = sandbox
+      # Struct sandbox: key is returned unchanged (isolation via private shards)
+      assert FerricStore.sandbox_key("mykey") == "mykey"
     end
   end
 

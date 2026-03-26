@@ -91,7 +91,9 @@ defmodule Ferricstore.Store.Shard do
     # Whether this shard has Raft infrastructure (Batcher + ra server).
     # Application-supervised shards (0-3) always have Raft. Isolated test
     # shards with ad-hoc indices use the direct write path instead.
-    raft?: true
+    raft?: true,
+    # Whether this shard is a sandbox shard (private ETS, no global name).
+    sandbox?: false
   ]
 
   # -------------------------------------------------------------------
@@ -110,8 +112,13 @@ defmodule Ferricstore.Store.Shard do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     index = Keyword.fetch!(opts, :index)
-    name = Router.shard_name(index)
-    GenServer.start_link(__MODULE__, opts, name: name)
+
+    if opts[:sandbox] do
+      GenServer.start_link(__MODULE__, opts)
+    else
+      name = Router.shard_name(index)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
   end
 
   # -------------------------------------------------------------------
@@ -124,7 +131,17 @@ defmodule Ferricstore.Store.Shard do
     index = Keyword.fetch!(opts, :index)
     data_dir = Keyword.fetch!(opts, :data_dir)
     flush_ms = Keyword.get(opts, :flush_interval_ms, @flush_interval_ms)
-    path = Ferricstore.DataDir.shard_data_path(data_dir, index)
+    sandbox? = Keyword.get(opts, :sandbox, false)
+
+    path =
+      if sandbox? do
+        # Sandbox shards: data_dir IS the shard dir (already created by Sandbox.checkout)
+        File.mkdir_p!(data_dir)
+        data_dir
+      else
+        Ferricstore.DataDir.shard_data_path(data_dir, index)
+      end
+
     File.mkdir_p!(path)
 
     # v2: scan data_dir for existing .log files, find highest file_id
@@ -136,75 +153,97 @@ defmodule Ferricstore.Store.Shard do
       File.touch!(active_file_path)
     end
 
-    keydir =
-      case :ets.whereis(:"keydir_#{index}") do
-        :undefined ->
-          :ets.new(:"keydir_#{index}", [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
+    {keydir, prefix_keys} =
+      if sandbox? do
+        # Sandbox: use pre-created anonymous ETS tables
+        kd = Keyword.fetch!(opts, :sandbox_keydir)
+        pk = Keyword.fetch!(opts, :sandbox_prefix_keys)
+        {kd, pk}
+      else
+        # Production: create/clear named ETS tables
+        kd =
+          case :ets.whereis(:"keydir_#{index}") do
+            :undefined ->
+              :ets.new(:"keydir_#{index}", [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
 
-        _ref ->
-          :ets.delete_all_objects(:"keydir_#{index}")
-          :"keydir_#{index}"
+            _ref ->
+              :ets.delete_all_objects(:"keydir_#{index}")
+              :"keydir_#{index}"
+          end
+
+        # Remove any leftover hot_cache table from a previous run.
+        case :ets.whereis(:"hot_cache_#{index}") do
+          :undefined -> :ok
+          _ref -> :ets.delete(:"hot_cache_#{index}")
+        end
+
+        pk = PrefixIndex.create_table(index)
+        {kd, pk}
       end
-
-    # Remove any leftover hot_cache table from a previous run.
-    case :ets.whereis(:"hot_cache_#{index}") do
-      :undefined -> :ok
-      _ref -> :ets.delete(:"hot_cache_#{index}")
-    end
 
     ets = keydir
 
-    # Create (or clear) the prefix index ETS bag table for fast SCAN MATCH
-    # lookups on 'prefix:*' patterns.
-    prefix_keys = PrefixIndex.create_table(index)
+    # Create bloom registry only for non-sandbox shards
+    unless sandbox? do
+      BloomRegistry.create_table(index)
+    end
 
-    # Create (or clear) the bloom registry ETS table for mmap-backed bloom
-    # filter NIF resources.
-    BloomRegistry.create_table(index)
-
-    # Start the Raft server for this shard if the ra system is running and
-    # a Batcher already exists (application-supervised shards 0..N-1).
-    # Isolated test shards with ad-hoc indices have no Batcher and fall back
-    # to the direct write path.
-    raft? = start_raft_if_available(index, path, active_file_id, active_file_path, ets)
+    # Start the Raft server for this shard.
+    # Sandbox shards skip Raft entirely -- they use the direct write path
+    # (ETS + Bitcask pending batch). No Batcher, no ra. Full isolation comes
+    # from having separate ETS tables and data directories.
+    raft? =
+      if sandbox? do
+        false
+      else
+        start_raft_if_available(index, path, active_file_id, active_file_path, ets)
+      end
 
     # v2: recover ETS keydir from hint files or by scanning log files.
     # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
     # Must run BEFORE recover_promoted so PM: markers are in ETS.
     recover_keydir(path, keydir, prefix_keys, index)
 
-    # Recover promoted collection instances. ETS is fully populated by
-    # recover_keydir above, so the Bitcask NIF fallback is skipped.
+    # Recover promoted collection instances (skip for sandbox -- no promoted data)
     promoted =
-      Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index)
+      if sandbox? do
+        %{}
+      else
+        Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index)
+      end
 
-    # Rebuild HNSW vector indices from persisted vectors.
-    hnsw_get_fn = fn key ->
-      case :ets.lookup(keydir, key) do
-        [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil -> value
-        [{^key, nil, _exp, _lfu, fid, off, _vsize}] ->
-          p = file_path(path, fid)
-          case NIF.v2_pread_at(p, off) do
-            {:ok, v} -> v
-            _ -> nil
-          end
-        _ -> nil
+    # Rebuild HNSW vector indices (skip for sandbox)
+    unless sandbox? do
+      hnsw_get_fn = fn key ->
+        case :ets.lookup(keydir, key) do
+          [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil -> value
+          [{^key, nil, _exp, _lfu, fid, off, _vsize}] ->
+            p = file_path(path, fid)
+            case NIF.v2_pread_at(p, off) do
+              {:ok, v} -> v
+              _ -> nil
+            end
+          _ -> nil
+        end
+      end
+
+      Ferricstore.Store.HnswRegistry.rebuild_for_shard(path, index, hnsw_get_fn)
+    end
+
+    # Re-open all mmap-backed bloom filter files from disk (skip for sandbox)
+    unless sandbox? do
+      bloom_count = BloomRegistry.recover(data_dir, index)
+
+      if bloom_count > 0 do
+        Logger.debug("Shard #{index}: recovered #{bloom_count} bloom filter(s)")
       end
     end
 
-    Ferricstore.Store.HnswRegistry.rebuild_for_shard(path, index, hnsw_get_fn)
-
-    # Re-open all mmap-backed bloom filter files from disk.
-    bloom_count = BloomRegistry.recover(data_dir, index)
-
-    if bloom_count > 0 do
-      Logger.debug("Shard #{index}: recovered #{bloom_count} bloom filter(s)")
+    # Publish active file metadata to persistent_term (skip for sandbox --
+    # sandbox shards don't use the async write path through Router)
+    unless sandbox? do
+      publish_active_file(index, active_file_id, active_file_path, path)
     end
-
-    # Publish active file metadata to persistent_term so the Router's
-    # fast async write path can access it without a GenServer.call.
-    # Updated on every file rotation (see maybe_rotate_file/1).
-    publish_active_file(index, active_file_id, active_file_path, path)
 
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
@@ -216,7 +255,8 @@ defmodule Ferricstore.Store.Shard do
                        active_file_size: active_file_size,
                        pending: [], flush_in_flight: nil,
                        promoted_instances: promoted,
-                       raft?: raft?},
+                       raft?: raft?,
+                       sandbox?: sandbox?},
      {:continue, {:flush_interval, flush_ms}}}
   end
 
@@ -1514,6 +1554,7 @@ defmodule Ferricstore.Store.Shard do
   # uses a direct write path, falling through to normal Router for other shards.
   defp build_local_store(state) do
     my_idx = state.index
+    is_sandbox = state.sandbox?
     # Build a minimal context with only the fields closures need, to avoid
     # capturing the entire state struct (which includes pending list,
     # promoted_instances, etc. that hold stale references).
@@ -1527,17 +1568,21 @@ defmodule Ferricstore.Store.Shard do
 
     # Direct put: write to ETS immediately, queue for async Bitcask flush.
     # This mirrors the non-raft {:put, ...} handler logic.
+    # In sandbox mode, all keys are treated as local (the Coordinator already
+    # routed them to this shard). Router.shard_for inside the shard GenServer
+    # cannot resolve sandbox shards because Process.get(:ferricstore_sandbox)
+    # is nil in the GenServer's process.
     local_put = fn key, value, expire_at_ms ->
-      if Router.shard_for(key) == my_idx do
+      is_local = is_sandbox or Router.shard_for(key) == my_idx
+
+      if is_local do
         ets_insert(ctx, key, value, expire_at_ms)
-        # If key was previously deleted in this tx, un-delete it
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
         if MapSet.member?(deleted, key) do
           Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
         end
 
-        # Send ourselves a message to persist (will be processed after handle_call returns)
         send(self(), {:tx_pending_write, key, value, expire_at_ms})
         :ok
       else
@@ -1546,7 +1591,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_delete = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         ets_delete_key(state, key)
         # Track deletion so subsequent reads within this tx see the key as gone
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
@@ -1559,7 +1604,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_get = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         # Check if key was deleted within this transaction
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
@@ -1586,7 +1631,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_get_meta = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
         if MapSet.member?(deleted, key) do
@@ -1611,7 +1656,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_exists = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
         if MapSet.member?(deleted, key) do
@@ -1634,7 +1679,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_incr = fn key, delta ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         current =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> value
@@ -1671,7 +1716,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_incr_float = fn key, delta ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         current =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> value
@@ -1709,7 +1754,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_append = fn key, suffix ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         current =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> to_disk_binary(value)
@@ -1732,7 +1777,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_getset = fn key, new_value ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         old =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> value
@@ -1754,7 +1799,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_getdel = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         old =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> value
@@ -1779,7 +1824,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_getex = fn key, expire_at_ms ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         value =
           case ets_lookup_warm(ctx, key) do
             {:hit, v, _exp} -> v
@@ -1804,7 +1849,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     local_setrange = fn key, offset, value ->
-      if Router.shard_for(key) == my_idx do
+      if is_sandbox or Router.shard_for(key) == my_idx do
         old =
           case ets_lookup_warm(ctx, key) do
             {:hit, v, _exp} -> to_disk_binary(v)
@@ -1852,7 +1897,7 @@ defmodule Ferricstore.Store.Shard do
       ratelimit_add: &Router.ratelimit_add/4,
       list_op: &Router.list_op/2,
       compound_get: fn redis_key, compound_key ->
-        if Router.shard_for(redis_key) == my_idx do
+        if is_sandbox or Router.shard_for(redis_key) == my_idx do
           # Local: read compound key directly from ETS
           case ets_lookup_warm(ctx, compound_key) do
             {:hit, value, _exp} -> value
@@ -1867,12 +1912,12 @@ defmodule Ferricstore.Store.Shard do
               end
           end
         else
-          shard = Router.shard_name(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(Router.shard_for(redis_key))
           GenServer.call(shard, {:compound_get, redis_key, compound_key})
         end
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        if Router.shard_for(redis_key) == my_idx do
+        if is_sandbox or Router.shard_for(redis_key) == my_idx do
           case ets_lookup_warm(ctx, compound_key) do
             {:hit, value, exp} -> {value, exp}
             :expired -> nil
@@ -1886,52 +1931,52 @@ defmodule Ferricstore.Store.Shard do
               end
           end
         else
-          shard = Router.shard_name(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(Router.shard_for(redis_key))
           GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
         end
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        if Router.shard_for(redis_key) == my_idx do
+        if is_sandbox or Router.shard_for(redis_key) == my_idx do
           ets_insert(ctx, compound_key, value, expire_at_ms)
           send(self(), {:tx_pending_write, compound_key, value, expire_at_ms})
           :ok
         else
-          shard = Router.shard_name(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(Router.shard_for(redis_key))
           GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
         end
       end,
       compound_delete: fn redis_key, compound_key ->
-        if Router.shard_for(redis_key) == my_idx do
+        if is_sandbox or Router.shard_for(redis_key) == my_idx do
           ets_delete_key(ctx, compound_key)
           send(self(), {:tx_pending_delete, compound_key})
           :ok
         else
-          shard = Router.shard_name(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(Router.shard_for(redis_key))
           GenServer.call(shard, {:compound_delete, redis_key, compound_key})
         end
       end,
       compound_scan: fn redis_key, prefix ->
-        if Router.shard_for(redis_key) == my_idx do
+        if is_sandbox or Router.shard_for(redis_key) == my_idx do
           # Uses :ets.select match spec instead of :ets.foldl full-table scan
           # Pass shard_data_path to enable cold-read for recovered keys
           results = prefix_scan_entries(ctx.keydir, prefix, ctx.shard_data_path)
           Enum.sort_by(results, fn {field, _} -> field end)
         else
-          shard = Router.shard_name(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(Router.shard_for(redis_key))
           GenServer.call(shard, {:compound_scan, redis_key, prefix})
         end
       end,
       compound_count: fn redis_key, prefix ->
-        if Router.shard_for(redis_key) == my_idx do
+        if is_sandbox or Router.shard_for(redis_key) == my_idx do
           # Uses :ets.select match spec instead of :ets.foldl full-table scan
           prefix_count_entries(ctx.keydir, prefix)
         else
-          shard = Router.shard_name(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(Router.shard_for(redis_key))
           GenServer.call(shard, {:compound_count, redis_key, prefix})
         end
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        if Router.shard_for(redis_key) == my_idx do
+        if is_sandbox or Router.shard_for(redis_key) == my_idx do
           # Uses :ets.select match spec instead of :ets.foldl full-table scan
           keys_to_delete = prefix_collect_keys(ctx.keydir, prefix)
 
@@ -1942,7 +1987,7 @@ defmodule Ferricstore.Store.Shard do
 
           :ok
         else
-          shard = Router.shard_name(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(Router.shard_for(redis_key))
           GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
         end
       end,
@@ -2162,6 +2207,12 @@ defmodule Ferricstore.Store.Shard do
     else
       handle_ratelimit_add_direct(key, window_ms, max, count, state)
     end
+  end
+
+  # 6-tuple variant: includes pre-computed now_ms from Router.raft_write.
+  # Used when sandbox mode sends the raft command directly to the shard.
+  def handle_call({:ratelimit_add, key, window_ms, max, count, _now_ms}, _from, state) do
+    handle_ratelimit_add_direct(key, window_ms, max, count, state)
   end
 
   # Raft path for RATELIMIT.ADD: sends compound command through Raft so the
@@ -3584,4 +3635,5 @@ defmodule Ferricstore.Store.Shard do
       false
     end
   end
+
 end
