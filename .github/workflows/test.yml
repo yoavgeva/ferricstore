@@ -89,6 +89,7 @@ jobs:
         run: mix test --trace --timeout 30000
 
       - name: Run shard-kill durability tests (isolated)
+        if: always()
         run: mix test --only shard_kill --timeout 60000
 
       - name: Run cluster tests (multi-node via :peer)

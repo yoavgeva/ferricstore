@@ -2,9 +2,8 @@ defmodule Mix.Tasks.FerricstoreTest do
   @moduledoc """
   Tests for FerricStore Mix operational tasks.
 
-  These tests verify that the five CLI tasks -- info, keys, config,
-  large_values, and merge -- produce correct output and handle edge
-  cases gracefully.
+  These tests verify that the CLI tasks -- info, keys, config,
+  and merge -- produce correct output and handle edge cases gracefully.
 
   The application is started via the normal test_helper.exs before any
   test runs. Each test captures stdout via `ExUnit.CaptureIO` to assert
@@ -176,60 +175,6 @@ defmodule Mix.Tasks.FerricstoreTest do
   end
 
   # -------------------------------------------------------------------
-  # mix ferricstore.large_values
-  # -------------------------------------------------------------------
-
-  describe "mix ferricstore.large_values" do
-    test "reports no large values when store is empty" do
-      output = capture_io(fn -> Mix.Tasks.Ferricstore.LargeValues.run([]) end)
-
-      assert output =~ "No values exceed"
-    end
-
-    test "reports no large values when all values are small" do
-      Router.put("small1", "hello")
-      Router.put("small2", "world")
-
-      output = capture_io(fn -> Mix.Tasks.Ferricstore.LargeValues.run([]) end)
-
-      assert output =~ "No values exceed"
-    end
-
-    test "detects a value above a custom threshold" do
-      # Use a very small threshold (10 bytes) so we don't need to allocate MBs
-      Router.put("big_key", String.duplicate("x", 100))
-      Router.put("tiny", "y")
-
-      output = capture_io(fn -> Mix.Tasks.Ferricstore.LargeValues.run(["--threshold", "10"]) end)
-
-      assert output =~ "big_key"
-      assert output =~ "100"
-      refute output =~ "tiny"
-    end
-
-    test "shows shard information for large values" do
-      import Ferricstore.Test.Utils
-      Router.put("large_val", String.duplicate("z", 200))
-      Ferricstore.Test.ShardHelpers.flush_all_shards()
-
-      eventually(fn ->
-        output = capture_io(fn -> Mix.Tasks.Ferricstore.LargeValues.run(["--threshold", "50"]) end)
-        assert output =~ "shard:"
-      end, 5000)
-    end
-
-    test "uses default threshold of 1MB when no --threshold flag" do
-      # With no large values, the default 1MB threshold should find nothing
-      Router.put("normal", "small_value")
-
-      output = capture_io(fn -> Mix.Tasks.Ferricstore.LargeValues.run([]) end)
-
-      assert output =~ "No values exceed"
-      assert output =~ "1048576"
-    end
-  end
-
-  # -------------------------------------------------------------------
   # mix ferricstore.merge
   # -------------------------------------------------------------------
 
@@ -280,9 +225,6 @@ defmodule Mix.Tasks.FerricstoreTest do
 
       output = capture_io(fn -> Mix.Tasks.Ferricstore.Config.run(["get", "default"]) end)
       assert output =~ "prefix:"
-
-      output = capture_io(fn -> Mix.Tasks.Ferricstore.LargeValues.run([]) end)
-      assert output =~ "No values exceed"
 
       output = capture_io(fn -> Mix.Tasks.Ferricstore.Merge.run(["0"]) end)
       assert output =~ "shard 0"
