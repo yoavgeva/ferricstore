@@ -972,7 +972,7 @@ defmodule FerricstoreServer.Connection do
 
       # Backwards compat: requirepass is set, default user has no ACL password.
       has_requirepass and username == "default" ->
-        if :crypto.hash_equals(password, requirepass) do
+        if constant_time_equal?(password, requirepass) do
           AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
           new_cache = build_acl_cache(username)
           {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: username, acl_cache: new_cache}}
@@ -990,6 +990,14 @@ defmodule FerricstoreServer.Connection do
       true ->
         {:continue, Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}), state}
     end
+  end
+
+  # Constant-time string comparison to prevent timing attacks on passwords.
+  # Hashes both inputs to ensure equal length before comparing.
+  defp constant_time_equal?(a, b) when is_binary(a) and is_binary(b) do
+    hash_a = :crypto.hash(:sha256, a)
+    hash_b = :crypto.hash(:sha256, b)
+    :crypto.hash_equals(hash_a, hash_b)
   end
 
   defp do_acl_auth(username, password, client_ip, state) do

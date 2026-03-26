@@ -267,10 +267,9 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
 
   describe "Group 3: edge cases" do
     @tag :durability
-    test "8. Empty value — Bitcask treats as tombstone" do
-      # Bitcask treats empty binary values as tombstones, so an empty string
-      # SET will not survive a crash (it will read back as nil). This test
-      # documents that known behavior.
+    test "8. Empty value survives crash (not a tombstone)" do
+      # Empty string values are valid and survive crash recovery.
+      # Tombstones use value_size=u32::MAX sentinel in the log format.
       k = ukey("empty_val")
 
       :ok = FerricStore.set(k, "")
@@ -278,15 +277,13 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
       flush_to_disk()
 
       {:ok, before} = FerricStore.get(k)
-      # Before crash, empty string is readable from ETS
       assert before == ""
 
       kill_shard_and_wait(k)
 
       {:ok, val} = FerricStore.get(k)
-      # After crash recovery from Bitcask, empty value is treated as tombstone
-      assert val == nil,
-             "expected empty value to be nil after crash (Bitcask tombstone), got: #{inspect(val)}"
+      assert val == "",
+             "empty value must survive crash, got: #{inspect(val)}"
 
       # Writes still work after recovery
       :ok = FerricStore.set(k, "no_longer_empty")
