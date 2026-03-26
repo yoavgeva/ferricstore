@@ -118,3 +118,11 @@ jobs:
       - name: Run io_uring + scheduler stress tests (Linux, io_uring available)
         if: runner.os == 'Linux' && steps.uring.outputs.available == 'true'
         run: mix test --only linux_io_uring
+
+      - name: Upload test audit logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-audit-${{ matrix.os }}-elixir${{ matrix.elixir }}
+          path: /tmp/ferricstore_test_audit/
+          retention-days: 7
