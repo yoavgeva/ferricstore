@@ -219,7 +219,7 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
       {:ok, peer_pid, node_name} =
         :peer.start(%{
           name: name,
-          args: code_paths ++ [~c"-connect_all", ~c"false"]
+          args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", Atom.to_charlist(Node.get_cookie())]
         })
 
       # Start ra on the peer

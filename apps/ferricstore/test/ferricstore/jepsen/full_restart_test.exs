@@ -117,7 +117,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
           {:ok, new_peer, new_node_name} =
             :peer.start(%{
               name: peer_name,
-              args: code_paths ++ [~c"-connect_all", ~c"false"]
+              args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", Atom.to_charlist(Node.get_cookie())]
             })
 
           # Configure the remote node with the SAME data directory
@@ -250,7 +250,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
           {:ok, new_peer, new_node_name} =
             :peer.start(%{
               name: peer_name,
-              args: code_paths ++ [~c"-connect_all", ~c"false"]
+              args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", Atom.to_charlist(Node.get_cookie())]
             })
 
           configure_remote_node(new_node_name, info.data_dir, 4)

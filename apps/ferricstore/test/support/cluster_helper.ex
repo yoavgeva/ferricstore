@@ -93,10 +93,12 @@ defmodule Ferricstore.Test.ClusterHelper do
         # Start the peer with the same code paths as the test runner.
         code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
 
+        cookie = Atom.to_charlist(Node.get_cookie())
+
         {:ok, peer_pid, node_name} =
           :peer.start(%{
             name: name,
-            args: code_paths ++ [~c"-connect_all", ~c"false"]
+            args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie]
           })
 
         # Set application env on the remote node before starting the app

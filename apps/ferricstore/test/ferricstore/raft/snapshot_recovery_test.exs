@@ -361,10 +361,12 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
       Enum.map(1..n, fn i ->
         name = :"snap_peer_#{:erlang.unique_integer([:positive])}_#{i}"
 
+        cookie = Atom.to_charlist(Node.get_cookie())
+
         {:ok, peer_pid, node_name} =
           :peer.start(%{
             name: name,
-            args: code_paths ++ [~c"-connect_all", ~c"false"]
+            args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie]
           })
 
         # Start ra on the peer
