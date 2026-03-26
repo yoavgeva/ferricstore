@@ -267,10 +267,8 @@ impl Store {
             return Ok(None);
         }
 
-        if entry.value_size == 0 {
-            // Tombstone — treat as not found.
-            return Ok(None);
-        }
+        // value_size == 0 is a valid empty value (not a tombstone).
+        // Tombstones use TOMBSTONE sentinel and are already removed from the keydir.
 
         let file = self.log_path_for(entry.file_id);
         let value_offset = entry.offset + HEADER_SIZE as u64 + key.len() as u64;

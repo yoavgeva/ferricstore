@@ -119,16 +119,15 @@ defmodule Ferricstore.Bitcask.NIFTest do
       assert result == :ok or match?({:error, _}, result)
     end
 
-    test "put with empty value is treated as tombstone" do
-      # The Bitcask log format uses value_size=0 as the tombstone sentinel.
-      # Storing an empty binary is indistinguishable from a delete at the
-      # storage layer, so get returns nil.
+    test "put with empty value stores empty string" do
+      # Tombstones now use value_size=u32::MAX; value_size=0 is a valid
+      # empty binary, so get returns "".
       dir = tmp_dir()
       store = open_store(dir)
       on_exit(fn -> File.rm_rf(dir) end)
 
       :ok = NIF.put(store, "empty_val", "", 0)
-      assert {:ok, nil} == NIF.get(store, "empty_val")
+      assert {:ok, ""} == NIF.get(store, "empty_val")
     end
 
     test "put with large value (100KB)", %{store: store} do

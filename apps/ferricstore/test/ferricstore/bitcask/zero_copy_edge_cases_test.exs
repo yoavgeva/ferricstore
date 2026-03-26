@@ -63,14 +63,14 @@ defmodule Ferricstore.Bitcask.ZeroCopyEdgeCasesTest do
       assert byte_size(val) == 1
     end
 
-    test "empty value is treated as tombstone (returns nil)" do
+    test "empty value stores empty string" do
       %{store: store} = setup_store()
-      # In Bitcask, value_size == 0 is a tombstone sentinel.
+      # Tombstones now use value_size=u32::MAX; value_size=0 is valid empty binary.
       :ok = NIF.put(store, "empty_val", "", 0)
 
-      assert {:ok, nil} = NIF.get_zero_copy(store, "empty_val")
+      assert {:ok, ""} = NIF.get_zero_copy(store, "empty_val")
       # Confirm regular get agrees
-      assert {:ok, nil} = NIF.get(store, "empty_val")
+      assert {:ok, ""} = NIF.get(store, "empty_val")
     end
 
     test "binary value with all null bytes" do

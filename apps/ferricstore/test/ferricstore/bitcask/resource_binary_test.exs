@@ -47,17 +47,17 @@ defmodule Ferricstore.Bitcask.ResourceBinaryTest do
       assert {:ok, nil} = NIF.get_zero_copy(store, "nonexistent")
     end
 
-    test "empty value is treated as tombstone (nil)" do
+    test "empty value stores empty string" do
       dir = tmp_dir()
       on_exit(fn -> File.rm_rf(dir) end)
 
       store = open_store(dir)
-      # In Bitcask, value_size == 0 is a tombstone — both get and
-      # get_zero_copy return nil for empty values.
+      # Tombstones now use value_size=u32::MAX; value_size=0 is a valid
+      # empty binary.
       :ok = NIF.put(store, "empty", "", 0)
 
-      assert {:ok, nil} = NIF.get(store, "empty")
-      assert {:ok, nil} = NIF.get_zero_copy(store, "empty")
+      assert {:ok, ""} = NIF.get(store, "empty")
+      assert {:ok, ""} = NIF.get_zero_copy(store, "empty")
     end
 
     test "works with large value (1 MB)" do
