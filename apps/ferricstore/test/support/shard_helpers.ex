@@ -306,4 +306,87 @@ defmodule Ferricstore.Test.ShardHelpers do
       end)
     end)
   end
+
+  # ---------------------------------------------------------------------------
+  # Safe shard kill with supervisor budget awareness
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Kills a shard process safely, respecting the supervisor's max_restarts budget.
+
+  Tracks kills in a persistent_term counter. If too many kills have happened
+  in the current window, sleeps to let the supervisor budget reset before
+  killing. After the kill, waits for the shard to fully restart (including
+  Raft leader election).
+
+  Use this instead of raw `Process.exit(pid, :kill)` in all shard-kill tests.
+
+  ## Parameters
+
+    * `shard_index` -- zero-based shard index to kill
+    * `opts` -- keyword options:
+      * `:timeout` -- max ms to wait for restart (default: 10_000)
+
+  ## Returns
+
+    * `:ok` on successful kill + restart
+
+  ## Example
+
+      ShardHelpers.kill_shard_safely(0)
+      assert Router.get(key) == "still_here"
+  """
+  @spec kill_shard_safely(non_neg_integer(), keyword()) :: :ok
+  def kill_shard_safely(shard_index, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 10_000)
+
+    # Rate-limit kills: the main Ferricstore.Supervisor has max_restarts: 20
+    # per 10 seconds. Space kills at least 600ms apart to stay well under budget.
+    last_kill_key = :ferricstore_test_last_kill_ms
+
+    last_kill =
+      try do
+        :persistent_term.get(last_kill_key)
+      rescue
+        ArgumentError -> 0
+      end
+
+    now = System.monotonic_time(:millisecond)
+    elapsed = now - last_kill
+
+    if elapsed < 600 do
+      Process.sleep(600 - elapsed)
+    end
+
+    name = :"Ferricstore.Store.Shard.#{shard_index}"
+    pid = Process.whereis(name)
+
+    if is_nil(pid) or not Process.alive?(pid) do
+      # Already dead — just wait for restart
+      wait_shards_alive(timeout)
+      :ok
+    else
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+      after
+        2_000 -> raise "Shard #{shard_index} did not die within 2000ms"
+      end
+
+      :persistent_term.put(last_kill_key, System.monotonic_time(:millisecond))
+      wait_shards_alive(timeout)
+      :ok
+    end
+  end
+
+  @doc """
+  Kills the shard that owns the given key. Convenience wrapper around
+  `kill_shard_safely/2`.
+  """
+  @spec kill_shard_for_key(binary(), keyword()) :: :ok
+  def kill_shard_for_key(key, opts \\ []) do
+    kill_shard_safely(Router.shard_for(key), opts)
+  end
 end

@@ -61,8 +61,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     Router.put(k, "before_crash")
     ShardHelpers.flush_all_shards()
 
-    kill_and_wait(:"Ferricstore.Store.Shard.#{idx}")
-    ShardHelpers.wait_shards_alive(10_000)
+    ShardHelpers.kill_shard_safely(idx)
 
     assert Router.get(k) == "before_crash"
 
@@ -81,8 +80,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
     ShardHelpers.flush_all_shards()
 
-    kill_and_wait(:"Ferricstore.Store.Shard.0")
-    ShardHelpers.wait_shards_alive(10_000)
+    ShardHelpers.kill_shard_safely(0)
 
     for {k, i} <- Enum.with_index(keys) do
       assert Router.get(k) == "shard_#{i}"
