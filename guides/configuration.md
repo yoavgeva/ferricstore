@@ -758,16 +758,99 @@ config :libcluster,
 
 These environment variables are read from `config/runtime.exs` in production (`MIX_ENV=prod`). They configure FerricStore when running as a release or Docker container.
 
+### Core
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRICSTORE_PORT` | `6379` | TCP port for RESP3 listener |
 | `FERRICSTORE_HEALTH_PORT` | `6380` | HTTP health/metrics port |
 | `FERRICSTORE_DATA_DIR` | `/data` | Root data directory (Bitcask, Raft WAL, mmap) |
-| `FERRICSTORE_SHARD_COUNT` | `0` (auto = `System.schedulers_online()`) | Number of shards. `0` auto-detects from available CPU cores. |
-| `FERRICSTORE_DURABILITY` | `quorum` | Default durability level (`quorum` or `async`) |
-| `FERRICSTORE_NODE_NAME` | unset | Erlang node name. Setting this enables clustering. |
-| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie for cluster authentication |
-| `FERRICSTORE_CLUSTER_NODES` | unset | Comma-separated list of peer node names to join |
+| `FERRICSTORE_SHARD_COUNT` | `0` (auto) | Number of shards. `0` = `System.schedulers_online()` |
+
+### Durability
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_DURABILITY` | `quorum` | Default durability (`quorum` or `async`) |
+
+### Memory & Eviction
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_MAX_MEMORY` | `0` (unlimited) | Max memory bytes. 0 = no limit |
+| `FERRICSTORE_EVICTION_POLICY` | `volatile_lru` | Eviction policy when memory limit reached |
+| `FERRICSTORE_MAX_VALUE_SIZE` | `1048576` (1MB) | Max value size in bytes |
+| `FERRICSTORE_HOT_CACHE_MAX_VALUE_SIZE` | `65536` (64KB) | Values larger than this are stored cold (disk only) |
+| `FERRICSTORE_MEMORY_GUARD_INTERVAL_MS` | `5000` | Memory pressure check interval |
+
+### LFU Scoring
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_LFU_DECAY_TIME` | `1` | Minutes between LFU counter decay |
+| `FERRICSTORE_LFU_LOG_FACTOR` | `10` | Logarithmic factor for LFU increment probability |
+| `FERRICSTORE_READ_SAMPLE_RATE` | `100` | 1-in-N reads trigger LFU/stats update (1 = every read) |
+
+### Expiry
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_EXPIRY_SWEEP_INTERVAL_MS` | `100` | Active expiry sweep interval |
+| `FERRICSTORE_EXPIRY_MAX_KEYS_PER_SWEEP` | `20` | Max keys to expire per sweep cycle |
+
+### Slow Log
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_SLOWLOG_SLOWER_THAN_US` | `10000` (10ms) | Log commands slower than this |
+| `FERRICSTORE_SLOWLOG_MAX_LEN` | `128` | Max slow log entries (ring buffer) |
+
+### Security
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_PROTECTED_MODE` | `true` | Reject non-localhost connections without auth |
+| `FERRICSTORE_MAXCLIENTS` | `10000` | Max concurrent TCP connections |
+| `FERRICSTORE_AUDIT_LOG` | `false` | Enable audit logging |
+| `FERRICSTORE_ACL_AUTO_SAVE` | `false` | Auto-save ACL changes to disk |
+
+### TLS
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_TLS_PORT` | `6380` | TLS listener port (only if cert configured) |
+| `FERRICSTORE_TLS_CERT_FILE` | unset | Path to TLS certificate. Setting this enables TLS |
+| `FERRICSTORE_TLS_KEY_FILE` | unset | Path to TLS private key |
+| `FERRICSTORE_TLS_CA_CERT_FILE` | unset | Path to CA certificate for client verification |
+| `FERRICSTORE_REQUIRE_TLS` | `false` | Reject non-TLS connections when TLS is configured |
+
+### Connection
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_SOCKET_ACTIVE_MODE` | `true` | TCP active mode: `true`, `once`, or integer N |
+
+### Raft Internals
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_RELEASE_CURSOR_INTERVAL` | `10000` | Raft snapshot interval (applies between snapshots) |
+| `FERRICSTORE_PROMOTION_THRESHOLD` | `100` | Field count to promote collection to dedicated Bitcask |
+
+### Clustering
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_NODE_NAME` | unset | Erlang node name. Setting this enables clustering |
+| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie |
+| `FERRICSTORE_CLUSTER_NODES` | unset | Comma-separated peer node names |
+
+### Supervisor (advanced)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_MAX_RESTARTS` | `20` | Max child restarts before supervisor gives up |
+| `FERRICSTORE_MAX_RESTARTS_SECONDS` | `10` | Time window for max restarts |
 
 ## Runtime Configuration (CONFIG SET)
 
