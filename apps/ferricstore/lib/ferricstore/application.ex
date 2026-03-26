@@ -55,7 +55,7 @@ defmodule Ferricstore.Application do
     mode = Ferricstore.Mode.current()
     port = Application.get_env(:ferricstore, :port, 6379)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    shard_count = Application.get_env(:ferricstore, :shard_count, System.schedulers_online())
     Logger.info("FerricStore starting in #{mode} mode")
 
     # Create the on-disk directory layout (spec 2B.4) before any process

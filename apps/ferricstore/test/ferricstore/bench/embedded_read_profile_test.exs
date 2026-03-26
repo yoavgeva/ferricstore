@@ -5,6 +5,13 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
 
   @iterations 100_000
 
+  setup_all do
+    # Use production sample rate for benchmarks (default is 1 in test config)
+    :persistent_term.put(:ferricstore_read_sample_rate, 100)
+    on_exit(fn -> :persistent_term.put(:ferricstore_read_sample_rate, 1) end)
+    :ok
+  end
+
   test "profile embedded GET - every layer timed" do
     alias Ferricstore.Store.{Router, LFU}
 

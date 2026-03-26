@@ -4,11 +4,16 @@ defmodule Ferricstore.Test.ShardHelpers do
 
   Use this module in any test that kills or restarts shards to ensure the
   supervisor tree is fully healthy before and after the test.
+
+  Also provides dynamic key discovery helpers for tests that need keys on
+  specific or different shards, without hardcoding key-to-shard mappings.
   """
 
+  alias Ferricstore.Store.Router
+
   @doc """
-  Synchronously flushes all pending async writes on all 4 application-supervised
-  shards (0–3) to disk.
+  Synchronously flushes all pending async writes on all application-supervised
+  shards to disk.
 
   Call this before killing a shard in tests that verify crash durability, to
   ensure rapid consecutive puts (which may still be in state.pending due to
@@ -17,7 +22,9 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
   @spec flush_all_shards() :: :ok
   def flush_all_shards do
-    Enum.each(0..3, fn i ->
+    shard_count = shard_count()
+
+    Enum.each(0..(shard_count - 1), fn i ->
       name = :"Ferricstore.Store.Shard.#{i}"
 
       case Process.whereis(name) do
@@ -132,7 +139,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   @doc """
-  Waits until all 4 application-supervised shards (0–3) are alive and have
+  Waits until all application-supervised shards are alive and have
   completed their `init/1` (ETS warmed from Bitcask, Raft server started).
 
   Polls every 20ms up to `timeout_ms`. Raises if any shard hasn't restarted
@@ -148,8 +155,9 @@ defmodule Ferricstore.Test.ShardHelpers do
   @spec wait_shards_alive(non_neg_integer()) :: :ok
   def wait_shards_alive(timeout_ms \\ 5_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
+    shard_count = shard_count()
 
-    Enum.each(0..3, fn i ->
+    Enum.each(0..(shard_count - 1), fn i ->
       name = :"Ferricstore.Store.Shard.#{i}"
 
       result =
@@ -181,7 +189,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # harmless (flushes the empty pending list on a fresh shard).
     remaining_ms = max(deadline - System.monotonic_time(:millisecond), 1_000)
 
-    Enum.each(0..3, fn i ->
+    Enum.each(0..(shard_count - 1), fn i ->
       name = :"Ferricstore.Store.Shard.#{i}"
 
       try do
@@ -199,11 +207,89 @@ defmodule Ferricstore.Test.ShardHelpers do
     wait_raft_leaders(deadline)
   end
 
-  # Polls ra.members/1 for each shard until all 4 ra servers report a leader.
+  # ---------------------------------------------------------------------------
+  # Dynamic key discovery helpers
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Finds a key string that routes to the given shard index.
+
+  Iterates candidate keys `"dynkey_0"`, `"dynkey_1"`, ... until one hashes
+  to `shard_idx`. Returns the matching key string.
+  """
+  @spec key_for_shard(non_neg_integer()) :: binary()
+  def key_for_shard(shard_idx) do
+    i =
+      Enum.find(0..100_000, fn i ->
+        Router.shard_for("dynkey_#{i}") == shard_idx
+      end)
+
+    "dynkey_#{i}"
+  end
+
+  @doc """
+  Finds `n` keys that each route to DIFFERENT shards.
+
+  Returns a list of `n` key strings, each on a distinct shard.
+  Raises if fewer than `n` shards exist.
+  """
+  @spec keys_on_different_shards(pos_integer()) :: [binary()]
+  def keys_on_different_shards(n) do
+    shard_count = shard_count()
+    target_shards = Enum.take(0..(shard_count - 1), n)
+    Enum.map(target_shards, &key_for_shard/1)
+  end
+
+  @doc """
+  Finds 2 keys that route to the SAME shard.
+
+  Returns `{key_a, key_b}` where both hash to the same shard index.
+  """
+  @spec keys_on_same_shard() :: {binary(), binary()}
+  def keys_on_same_shard do
+    shard = Router.shard_for("same_a")
+
+    other =
+      Enum.find(0..100_000, fn i ->
+        Router.shard_for("same_#{i}") == shard and "same_#{i}" != "same_a"
+      end)
+
+    {"same_a", "same_#{other}"}
+  end
+
+  @doc """
+  Finds 2 keys that route to different shards under the given namespace prefix.
+
+  Returns `{key_a, key_b}` (without the namespace prefix) where
+  `Router.shard_for(ns <> key_a) != Router.shard_for(ns <> key_b)`.
+  """
+  @spec cross_shard_keys_for_namespace(binary()) :: {binary(), binary()}
+  def cross_shard_keys_for_namespace(ns) do
+    key_a = "nskey_0"
+    shard_a = Router.shard_for(ns <> key_a)
+
+    i =
+      Enum.find(1..100_000, fn i ->
+        Router.shard_for(ns <> "nskey_#{i}") != shard_a
+      end)
+
+    {key_a, "nskey_#{i}"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Internal
+  # ---------------------------------------------------------------------------
+
+  defp shard_count do
+    :persistent_term.get(:ferricstore_shard_count, Application.get_env(:ferricstore, :shard_count, 4))
+  end
+
+  # Polls ra.members/1 for each shard until all ra servers report a leader.
   defp wait_raft_leaders(deadline) do
     alias Ferricstore.Raft.Cluster
+    shard_count = shard_count()
 
-    Enum.each(0..3, fn i ->
+    Enum.each(0..(shard_count - 1), fn i ->
       server_id = Cluster.shard_server_id(i)
 
       Enum.reduce_while(Stream.repeatedly(fn -> Process.sleep(20) end), :waiting, fn _, _ ->
