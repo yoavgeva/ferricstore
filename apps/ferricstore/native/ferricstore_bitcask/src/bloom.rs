@@ -80,7 +80,7 @@ impl BloomFilter {
             fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
 
-        let byte_count = ((num_bits + 7) / 8) as usize;
+        let byte_count = num_bits.div_ceil(8) as usize;
         let file_size = HEADER_SIZE + byte_count;
 
         // Write the file with header + zeroed bit array.
@@ -163,7 +163,7 @@ impl BloomFilter {
             buf
         });
 
-        let expected_size = HEADER_SIZE + ((num_bits + 7) / 8) as usize;
+        let expected_size = HEADER_SIZE + num_bits.div_ceil(8) as usize;
         if file_size < expected_size {
             unsafe {
                 libc::munmap(mmap, file_size);
@@ -217,9 +217,7 @@ impl BloomFilter {
         let h2 = xxhash_rust::xxh3::xxh3_64_with_seed(element, 0x9E37_79B9_7F4A_7C15);
         let num_bits = self.num_bits;
 
-        (0..self.num_hashes as u64).map(move |i| {
-            h1.wrapping_add(i.wrapping_mul(h2)) % num_bits
-        })
+        (0..self.num_hashes as u64).map(move |i| h1.wrapping_add(i.wrapping_mul(h2)) % num_bits)
     }
 
     /// Get a bit from the mmap'd bit array.
@@ -291,8 +289,13 @@ impl BloomFilter {
     /// - `Drop` impl calls `msync()` (MS_SYNC) before `munmap`
     /// - Explicit `msync()` calls from Elixir
     pub fn msync_async(&self) -> Result<(), String> {
-        let ret =
-            unsafe { libc::msync(self.mmap as *mut libc::c_void, self.mmap_len, libc::MS_ASYNC) };
+        let ret = unsafe {
+            libc::msync(
+                self.mmap as *mut libc::c_void,
+                self.mmap_len,
+                libc::MS_ASYNC,
+            )
+        };
         if ret != 0 {
             Err(format!(
                 "msync_async failed: {}",
@@ -419,7 +422,7 @@ pub fn bloom_add<'a>(
     // MS_SYNC which blocks until pages are flushed to disk (~100-500 us per call).
     // Durability is guaranteed by msync(MS_SYNC) in bloom_madd, Drop, and explicit flush.
     let _ = filter.msync_async();
-    Ok(if is_new { 1u32 } else { 0u32 }.encode(env))
+    Ok(u32::from(is_new).encode(env))
 }
 
 /// Add multiple elements to a bloom filter.
@@ -434,7 +437,7 @@ pub fn bloom_madd<'a>(
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let results: Vec<u32> = elements
         .iter()
-        .map(|e| if filter.add(e.as_slice()) { 1 } else { 0 })
+        .map(|e| u32::from(filter.add(e.as_slice())))
         .collect();
     let _ = filter.msync();
     Ok(results.encode(env))
@@ -451,7 +454,7 @@ pub fn bloom_exists<'a>(
 ) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let found = filter.exists(element.as_slice());
-    Ok(if found { 1u32 } else { 0u32 }.encode(env))
+    Ok(u32::from(found).encode(env))
 }
 
 /// Check if multiple elements may exist.
@@ -466,7 +469,7 @@ pub fn bloom_mexists<'a>(
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let results: Vec<u32> = elements
         .iter()
-        .map(|e| if filter.exists(e.as_slice()) { 1 } else { 0 })
+        .map(|e| u32::from(filter.exists(e.as_slice())))
         .collect();
     Ok(results.encode(env))
 }
@@ -724,7 +727,7 @@ mod tests {
         }
 
         // Concurrent reads via multiple threads
-        let filter_ptr = &filter as *const BloomFilter;
+        let filter_ptr = std::ptr::addr_of!(filter);
         let handles: Vec<_> = (0..4)
             .map(|t| {
                 let p = filter_ptr as usize;
@@ -902,7 +905,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("badmagic.bloom");
         // Write a file with wrong magic bytes
-        std::fs::write(&path, &[0xFF; 64]).unwrap();
+        std::fs::write(&path, [0xFF; 64]).unwrap();
         let result = BloomFilter::open_existing(&path);
         assert!(result.is_err(), "bad magic must return error");
     }
@@ -911,7 +914,7 @@ mod tests {
     fn bloom_open_zero_length_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.bloom");
-        std::fs::write(&path, &[]).unwrap();
+        std::fs::write(&path, []).unwrap();
         let result = BloomFilter::open_existing(&path);
         assert!(result.is_err(), "zero-length file must return error");
     }

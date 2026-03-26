@@ -41,9 +41,9 @@ static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 pub fn runtime() -> &'static Runtime {
     TOKIO_RT.get_or_init(|| {
         let num_cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(std::num::NonZero::get)
             .unwrap_or(4);
-        let workers = num_cpus.min(4).max(1);
+        let workers = num_cpus.clamp(1, 4);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .thread_name("ferric-tokio")
@@ -68,8 +68,8 @@ mod tests {
 
     #[test]
     fn runtime_is_singleton() {
-        let rt1 = runtime() as *const Runtime;
-        let rt2 = runtime() as *const Runtime;
+        let rt1 = std::ptr::from_ref::<Runtime>(runtime());
+        let rt2 = std::ptr::from_ref::<Runtime>(runtime());
         assert_eq!(rt1, rt2, "runtime() must return the same instance");
     }
 
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn multiple_concurrent_spawns_no_deadlock() {
-        let rt = runtime();
+        let _rt = runtime();
         // Spawn tasks from multiple threads concurrently
         let handles: Vec<_> = (0..4)
             .map(|t| {
@@ -170,9 +170,7 @@ mod tests {
         let mut panic_handles = Vec::new();
         for i in 0..10 {
             panic_handles.push(rt.spawn(async move {
-                if i % 2 == 0 {
-                    panic!("deliberate panic in task {i}");
-                }
+                assert!(i % 2 != 0, "deliberate panic in task {i}");
                 i
             }));
         }

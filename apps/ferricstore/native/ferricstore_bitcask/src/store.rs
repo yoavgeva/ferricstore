@@ -581,14 +581,13 @@ impl Store {
                 results.push(None);
                 continue;
             }
-            let reader = match reader_cache.get_mut(&entry.file_id) {
-                Some(r) => r,
-                None => {
-                    let log_file = self.log_path_for(entry.file_id);
-                    let r = LogReader::open(&log_file)?;
-                    reader_cache.insert(entry.file_id, r);
-                    reader_cache.get_mut(&entry.file_id).unwrap()
-                }
+            let reader = if let Some(r) = reader_cache.get_mut(&entry.file_id) {
+                r
+            } else {
+                let log_file = self.log_path_for(entry.file_id);
+                let r = LogReader::open(&log_file)?;
+                reader_cache.insert(entry.file_id, r);
+                reader_cache.get_mut(&entry.file_id).unwrap()
             };
             let val = reader.read_at(entry.offset)?.and_then(|r| r.value);
             results.push(val);
@@ -626,14 +625,13 @@ impl Store {
         let mut reader_cache: HashMap<u64, LogReader> = HashMap::new();
         let mut result = Vec::with_capacity(matching.len());
         for (key, entry) in matching {
-            let reader = match reader_cache.get_mut(&entry.file_id) {
-                Some(r) => r,
-                None => {
-                    let log_file = self.log_path_for(entry.file_id);
-                    let r = LogReader::open(&log_file)?;
-                    reader_cache.insert(entry.file_id, r);
-                    reader_cache.get_mut(&entry.file_id).unwrap()
-                }
+            let reader = if let Some(r) = reader_cache.get_mut(&entry.file_id) {
+                r
+            } else {
+                let log_file = self.log_path_for(entry.file_id);
+                let r = LogReader::open(&log_file)?;
+                reader_cache.insert(entry.file_id, r);
+                reader_cache.get_mut(&entry.file_id).unwrap()
             };
             if let Some(record) = reader.read_at(entry.offset)? {
                 if let Some(value) = record.value {
@@ -2871,7 +2869,7 @@ mod tests {
         let dir = tmp();
         let mut store = Store::open(dir.path()).unwrap();
         let results = store.get_batch(&[b"a", b"b", b"c"]).unwrap();
-        assert!(results.iter().all(|r| r.is_none()));
+        assert!(results.iter().all(Option::is_none));
     }
 
     #[test]
@@ -2980,11 +2978,11 @@ mod tests {
         assert_eq!(results.len(), 60);
 
         // First 50 should have values, last 10 should be None
-        for i in 0..50 {
-            assert!(results[i].is_some(), "key batch_{i:02} should exist");
+        for (i, result) in results.iter().enumerate().take(50) {
+            assert!(result.is_some(), "key batch_{i:02} should exist");
         }
-        for i in 50..60 {
-            assert!(results[i].is_none(), "key batch_{i:02} should not exist");
+        for (i, result) in results.iter().enumerate().take(60).skip(50) {
+            assert!(result.is_none(), "key batch_{i:02} should not exist");
         }
     }
 
@@ -2999,9 +2997,7 @@ mod tests {
             store.put(key.as_bytes(), val.as_bytes(), 0).unwrap();
         }
 
-        let result = store
-            .get_range(b"range_010", b"range_020", 100)
-            .unwrap();
+        let result = store.get_range(b"range_010", b"range_020", 100).unwrap();
 
         // Should get keys 010..=020 = 11 keys
         assert_eq!(result.len(), 11);

@@ -244,7 +244,7 @@ impl LogWriter {
 
         // H-2 fix: combine all encoded records into a single buffer and write
         // once, instead of calling append() N times through BufWriter.
-        let total_len: usize = encoded.iter().map(|b| b.len()).sum();
+        let total_len: usize = encoded.iter().map(Vec::len).sum();
         let mut combined = Vec::with_capacity(total_len);
         let mut offsets = Vec::with_capacity(encoded.len());
         let mut running = self.backend.offset();
@@ -454,7 +454,7 @@ fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     // Step 1: pread the header
     let mut header = [0u8; HEADER_SIZE];
     match file.read_at(&mut header, offset) {
-        Ok(0) => return Ok(None), // EOF
+        Ok(0) => return Ok(None),                    // EOF
         Ok(n) if n < HEADER_SIZE => return Ok(None), // truncated header = EOF
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -468,11 +468,12 @@ fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     let value_size = u32::from_le_bytes(header[22..26].try_into().unwrap()) as usize;
 
     // Step 2: pread key + value in a single call
-    let body_len = key_size + if value_size == TOMBSTONE as usize && key_size > 0 {
-        0
-    } else {
-        value_size
-    };
+    let body_len = key_size
+        + if value_size == TOMBSTONE as usize && key_size > 0 {
+            0
+        } else {
+            value_size
+        };
     let mut body = vec![0u8; body_len];
     if body_len > 0 {
         let body_offset = offset + HEADER_SIZE as u64;
@@ -1275,10 +1276,7 @@ mod tests {
         let dir = temp_dir();
         let path = dir.path().join("data.log");
         let mut w = LogWriter::open(&path, 1).unwrap();
-        let entries: Vec<(&[u8], &[u8], u64)> = vec![
-            (b"nk1", b"nv1", 0),
-            (b"nk2", b"nv22", 0),
-        ];
+        let entries: Vec<(&[u8], &[u8], u64)> = vec![(b"nk1", b"nv1", 0), (b"nk2", b"nv22", 0)];
         let results = w.write_batch_nosync(&entries).unwrap();
         assert_eq!(results.len(), 2);
 
@@ -1312,10 +1310,7 @@ mod tests {
         let dir = temp_dir();
         let path = dir.path().join("data.log");
         let mut w = LogWriter::open(&path, 1).unwrap();
-        let entries: Vec<(&[u8], &[u8], u64)> = vec![
-            (b"dk1", b"dv1", 0),
-            (b"dk2", b"dv2", 0),
-        ];
+        let entries: Vec<(&[u8], &[u8], u64)> = vec![(b"dk1", b"dv1", 0), (b"dk2", b"dv2", 0)];
         let results = w.write_batch_nosync(&entries).unwrap();
         // Now fsync
         w.sync().unwrap();
@@ -1735,11 +1730,9 @@ mod tests {
 
         let file = File::open(&path).unwrap();
         assert!(pread_record_from_file(&file, file_size).unwrap().is_none());
-        assert!(
-            pread_record_from_file(&file, file_size + 1000)
-                .unwrap()
-                .is_none()
-        );
+        assert!(pread_record_from_file(&file, file_size + 1000)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

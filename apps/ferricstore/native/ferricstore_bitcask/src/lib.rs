@@ -7,12 +7,21 @@
 // - cast_sign_loss / cast_lossless: io_uring result codes require these casts.
 // - items_after_statements: common in test helpers and is clear.
 // - doc_markdown: minor style preference, not a correctness issue.
+// - missing_errors_doc / missing_panics_doc: NIF wrapper docs don't benefit from # Errors sections.
+// - must_use_candidate: most public methods are called via NIF wrappers where must_use is irrelevant.
+// - cast_possible_wrap: u64→i64 casts are intentional in tdigest/store code.
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_lossless)]
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::items_after_statements)]
 #![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::cast_possible_wrap)]
+// NIF functions must return NifResult<Term> per the Rustler API, even when they never fail:
+#![allow(clippy::unnecessary_wraps)]
 // Yielding NIF continuations use raw pointers and similar variable names:
 #![allow(clippy::ptr_as_ptr)]
 #![allow(clippy::similar_names)]
@@ -655,7 +664,10 @@ unsafe extern "C" fn keys_continue(
     };
 
     // H-NEW-1 fix: recover from poisoned mutex instead of panicking.
-    let mut idx = state.index.lock().unwrap_or_else(|e| e.into_inner());
+    let mut idx = state
+        .index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let total = state.keys.len();
 
     // BEAM-guided adaptive yielding: process items one at a time, checking
@@ -675,20 +687,19 @@ unsafe extern "C" fn keys_continue(
         items_this_slice += 1;
 
         // Ask the BEAM every 64 items if our timeslice is exhausted
-        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total {
-            if consume_timeslice(env, 1) {
-                // BEAM says yield — timeslice exhausted
-                drop(idx);
-                let new_state_term = state_term.as_c_arg();
-                let new_list = acc.as_c_arg();
-                return rustler::codegen_runtime::NifReturned::Reschedule {
-                    fun_name: CSTR_KEYS.clone(),
-                    flags: rustler::SchedulerFlags::Normal,
-                    fun: keys_continue,
-                    args: vec![new_state_term, new_list],
-                }
-                .apply(env);
+        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total && consume_timeslice(env, 1)
+        {
+            // BEAM says yield — timeslice exhausted
+            drop(idx);
+            let new_state_term = state_term.as_c_arg();
+            let new_list = acc.as_c_arg();
+            return rustler::codegen_runtime::NifReturned::Reschedule {
+                fun_name: CSTR_KEYS.clone(),
+                flags: rustler::SchedulerFlags::Normal,
+                fun: keys_continue,
+                args: vec![new_state_term, new_list],
             }
+            .apply(env);
         }
     }
 
@@ -701,7 +712,7 @@ unsafe extern "C" fn keys_continue(
 
 rustler::codegen_runtime::inventory::submit! {
     rustler::Nif {
-        name: "keys\0".as_ptr() as *const rustler::codegen_runtime::c_char,
+        name: c"keys".as_ptr() as *const rustler::codegen_runtime::c_char,
         arity: 1,
         flags: rustler::SchedulerFlags::Normal as rustler::codegen_runtime::c_uint,
         raw_func: {
@@ -790,7 +801,10 @@ unsafe extern "C" fn get_all_continue(
     };
 
     // H-NEW-1 fix: recover from poisoned mutex instead of panicking.
-    let mut idx = state.index.lock().unwrap_or_else(|e| e.into_inner());
+    let mut idx = state
+        .index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let total = state.pairs.len();
 
     let mut acc = partial_list;
@@ -806,19 +820,18 @@ unsafe extern "C" fn get_all_continue(
         *idx += 1;
         items_this_slice += 1;
 
-        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total {
-            if consume_timeslice(env, 1) {
-                drop(idx);
-                let new_state = state_term.as_c_arg();
-                let new_list = acc.as_c_arg();
-                return rustler::codegen_runtime::NifReturned::Reschedule {
-                    fun_name: CSTR_GET_ALL.clone(),
-                    flags: rustler::SchedulerFlags::Normal,
-                    fun: get_all_continue,
-                    args: vec![new_state, new_list],
-                }
-                .apply(env);
+        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total && consume_timeslice(env, 1)
+        {
+            drop(idx);
+            let new_state = state_term.as_c_arg();
+            let new_list = acc.as_c_arg();
+            return rustler::codegen_runtime::NifReturned::Reschedule {
+                fun_name: CSTR_GET_ALL.clone(),
+                flags: rustler::SchedulerFlags::Normal,
+                fun: get_all_continue,
+                args: vec![new_state, new_list],
             }
+            .apply(env);
         }
     }
 
@@ -831,7 +844,7 @@ unsafe extern "C" fn get_all_continue(
 
 rustler::codegen_runtime::inventory::submit! {
     rustler::Nif {
-        name: "get_all\0".as_ptr() as *const rustler::codegen_runtime::c_char,
+        name: c"get_all".as_ptr() as *const rustler::codegen_runtime::c_char,
         arity: 1,
         flags: rustler::SchedulerFlags::Normal as rustler::codegen_runtime::c_uint,
         raw_func: {
@@ -929,7 +942,10 @@ unsafe extern "C" fn get_batch_continue(
     };
 
     // H-NEW-1 fix: recover from poisoned mutex instead of panicking.
-    let mut idx = state.index.lock().unwrap_or_else(|e| e.into_inner());
+    let mut idx = state
+        .index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let total = state.results.len();
 
     let mut acc = partial_list;
@@ -941,19 +957,18 @@ unsafe extern "C" fn get_batch_continue(
         *idx += 1;
         items_this_slice += 1;
 
-        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total {
-            if consume_timeslice(env, 1) {
-                drop(idx);
-                let new_state = state_term.as_c_arg();
-                let new_list = acc.as_c_arg();
-                return rustler::codegen_runtime::NifReturned::Reschedule {
-                    fun_name: CSTR_GET_BATCH.clone(),
-                    flags: rustler::SchedulerFlags::Normal,
-                    fun: get_batch_continue,
-                    args: vec![new_state, new_list],
-                }
-                .apply(env);
+        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total && consume_timeslice(env, 1)
+        {
+            drop(idx);
+            let new_state = state_term.as_c_arg();
+            let new_list = acc.as_c_arg();
+            return rustler::codegen_runtime::NifReturned::Reschedule {
+                fun_name: CSTR_GET_BATCH.clone(),
+                flags: rustler::SchedulerFlags::Normal,
+                fun: get_batch_continue,
+                args: vec![new_state, new_list],
             }
+            .apply(env);
         }
     }
 
@@ -966,7 +981,7 @@ unsafe extern "C" fn get_batch_continue(
 
 rustler::codegen_runtime::inventory::submit! {
     rustler::Nif {
-        name: "get_batch\0".as_ptr() as *const rustler::codegen_runtime::c_char,
+        name: c"get_batch".as_ptr() as *const rustler::codegen_runtime::c_char,
         arity: 2,
         flags: rustler::SchedulerFlags::Normal as rustler::codegen_runtime::c_uint,
         raw_func: {
@@ -1071,7 +1086,10 @@ unsafe extern "C" fn get_range_continue(
     };
 
     // H-NEW-1 fix: recover from poisoned mutex instead of panicking.
-    let mut idx = state.index.lock().unwrap_or_else(|e| e.into_inner());
+    let mut idx = state
+        .index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let total = state.pairs.len();
 
     let mut acc = partial_list;
@@ -1087,19 +1105,18 @@ unsafe extern "C" fn get_range_continue(
         *idx += 1;
         items_this_slice += 1;
 
-        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total {
-            if consume_timeslice(env, 1) {
-                drop(idx);
-                let new_state = state_term.as_c_arg();
-                let new_list = acc.as_c_arg();
-                return rustler::codegen_runtime::NifReturned::Reschedule {
-                    fun_name: CSTR_GET_RANGE.clone(),
-                    flags: rustler::SchedulerFlags::Normal,
-                    fun: get_range_continue,
-                    args: vec![new_state, new_list],
-                }
-                .apply(env);
+        if items_this_slice % YIELD_CHECK_INTERVAL == 0 && *idx < total && consume_timeslice(env, 1)
+        {
+            drop(idx);
+            let new_state = state_term.as_c_arg();
+            let new_list = acc.as_c_arg();
+            return rustler::codegen_runtime::NifReturned::Reschedule {
+                fun_name: CSTR_GET_RANGE.clone(),
+                flags: rustler::SchedulerFlags::Normal,
+                fun: get_range_continue,
+                args: vec![new_state, new_list],
             }
+            .apply(env);
         }
     }
 
@@ -1112,7 +1129,7 @@ unsafe extern "C" fn get_range_continue(
 
 rustler::codegen_runtime::inventory::submit! {
     rustler::Nif {
-        name: "get_range\0".as_ptr() as *const rustler::codegen_runtime::c_char,
+        name: c"get_range".as_ptr() as *const rustler::codegen_runtime::c_char,
         arity: 4,
         flags: rustler::SchedulerFlags::Normal as rustler::codegen_runtime::c_uint,
         raw_func: {
@@ -1644,7 +1661,10 @@ fn get_async<'a>(
             // If a previous NIF panicked while holding the lock, the mutex is
             // poisoned. We recover the inner data — the Elixir GenServer will
             // restart the shard if the state is inconsistent.
-            let mut store = store_clone.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = store_clone
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             store.get(&key_bytes)
         };
         // Wrap the value in a ResourceArc<ValueBuffer> before entering the send
@@ -1686,7 +1706,10 @@ fn delete_async<'a>(
             // If a previous NIF panicked while holding the lock, the mutex is
             // poisoned. We recover the inner data — the Elixir GenServer will
             // restart the shard if the state is inconsistent.
-            let mut store = store_clone.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = store_clone
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             store.delete(&key_bytes)
         };
         let mut msg_env = rustler::OwnedEnv::new();
@@ -1737,7 +1760,10 @@ fn put_batch_tokio_async<'a>(
             // If a previous NIF panicked while holding the lock, the mutex is
             // poisoned. We recover the inner data — the Elixir GenServer will
             // restart the shard if the state is inconsistent.
-            let mut store = store_clone.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = store_clone
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             store.put_batch_preencoded(&encoded, &metadata)
         };
         let mut msg_env = rustler::OwnedEnv::new();
@@ -1751,7 +1777,7 @@ fn put_batch_tokio_async<'a>(
 
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn write_hint_async<'a>(env: Env<'a>, resource: ResourceArc<StoreResource>) -> NifResult<Term<'a>> {
+fn write_hint_async(env: Env<'_>, resource: ResourceArc<StoreResource>) -> NifResult<Term<'_>> {
     let pid: LocalPid = env.pid();
     let store_clone = resource.clone();
     async_io::runtime().spawn(async move {
@@ -1760,7 +1786,10 @@ fn write_hint_async<'a>(env: Env<'a>, resource: ResourceArc<StoreResource>) -> N
             // If a previous NIF panicked while holding the lock, the mutex is
             // poisoned. We recover the inner data — the Elixir GenServer will
             // restart the shard if the state is inconsistent.
-            let mut store = store_clone.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = store_clone
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             store.write_hint_file()
         };
         let mut msg_env = rustler::OwnedEnv::new();
@@ -1774,10 +1803,7 @@ fn write_hint_async<'a>(env: Env<'a>, resource: ResourceArc<StoreResource>) -> N
 
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn purge_expired_async<'a>(
-    env: Env<'a>,
-    resource: ResourceArc<StoreResource>,
-) -> NifResult<Term<'a>> {
+fn purge_expired_async(env: Env<'_>, resource: ResourceArc<StoreResource>) -> NifResult<Term<'_>> {
     let pid: LocalPid = env.pid();
     let store_clone = resource.clone();
     async_io::runtime().spawn(async move {
@@ -1786,7 +1812,10 @@ fn purge_expired_async<'a>(
             // If a previous NIF panicked while holding the lock, the mutex is
             // poisoned. We recover the inner data — the Elixir GenServer will
             // restart the shard if the state is inconsistent.
-            let mut store = store_clone.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = store_clone
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             store.purge_expired()
         };
         let mut msg_env = rustler::OwnedEnv::new();
@@ -1800,11 +1829,11 @@ fn purge_expired_async<'a>(
 
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-fn run_compaction_async<'a>(
-    env: Env<'a>,
+fn run_compaction_async(
+    env: Env<'_>,
     resource: ResourceArc<StoreResource>,
     file_ids: Vec<u64>,
-) -> NifResult<Term<'a>> {
+) -> NifResult<Term<'_>> {
     let pid: LocalPid = env.pid();
     let store_clone = resource.clone();
     async_io::runtime().spawn(async move {
@@ -1813,7 +1842,10 @@ fn run_compaction_async<'a>(
             // If a previous NIF panicked while holding the lock, the mutex is
             // poisoned. We recover the inner data — the Elixir GenServer will
             // restart the shard if the state is inconsistent.
-            let mut store = store_clone.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = store_clone
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             store.run_compaction(&file_ids)
         };
         let mut msg_env = rustler::OwnedEnv::new();
@@ -1842,18 +1874,15 @@ fn run_compaction_async<'a>(
 /// This function handles the all-zeros case explicitly, matching the pattern
 /// used in `store.rs::collect_file_ids`.
 fn parse_file_id(path: &std::path::Path) -> u64 {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .map(|stem| {
-            let trimmed = stem.trim_start_matches('0');
-            if trimmed.is_empty() {
-                // All zeros (e.g. "00000000000000000000.log") → file_id 0
-                0
-            } else {
-                trimmed.parse::<u64>().unwrap_or(0)
-            }
-        })
-        .unwrap_or(0)
+    path.file_stem().and_then(|s| s.to_str()).map_or(0, |stem| {
+        let trimmed = stem.trim_start_matches('0');
+        if trimmed.is_empty() {
+            // All zeros (e.g. "00000000000000000000.log") → file_id 0
+            0
+        } else {
+            trimmed.parse::<u64>().unwrap_or(0)
+        }
+    })
 }
 
 /// Append a record to a data file. Returns `{:ok, {offset, record_size}}`.
@@ -1960,7 +1989,7 @@ fn v2_append_batch<'a>(
 /// No Mutex needed — pread is stateless and thread-safe.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
-fn v2_pread_at<'a>(env: Env<'a>, path: String, offset: u64) -> NifResult<Term<'a>> {
+fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
     let p = std::path::Path::new(&path);
 
     // C-2/C-6 fix: use File::open + pread_record directly instead of
@@ -2014,7 +2043,9 @@ fn v2_scan_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
                         ob.release(env)
                     }
                     None => {
-                        return Ok((atoms::error(), "out of memory allocating key binary").encode(env));
+                        return Ok(
+                            (atoms::error(), "out of memory allocating key binary").encode(env)
+                        );
                     }
                 };
 
@@ -2052,11 +2083,7 @@ fn v2_scan_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
 /// original `locations` order before returning.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
-fn v2_pread_batch<'a>(
-    env: Env<'a>,
-    path: String,
-    locations: Vec<u64>,
-) -> NifResult<Term<'a>> {
+fn v2_pread_batch<'a>(env: Env<'a>, path: String, locations: Vec<u64>) -> NifResult<Term<'a>> {
     let p = std::path::Path::new(&path);
 
     // C-2/C-6 fix: open file once, use pread for each offset
@@ -2088,7 +2115,8 @@ fn v2_pread_batch<'a>(
             }
 
             // Unwrap results back to original order.
-            let results: Vec<Term<'a>> = slot_results.into_iter().map(|t| t.unwrap_or(nil)).collect();
+            let results: Vec<Term<'a>> =
+                slot_results.into_iter().map(|t| t.unwrap_or(nil)).collect();
 
             Ok((atoms::ok(), results).encode(env))
         }
@@ -2103,7 +2131,7 @@ fn v2_pread_batch<'a>(
 /// read-only, and `fdatasync()` on a read-only fd is a no-op per POSIX.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
-fn v2_fsync<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+fn v2_fsync(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     let p = std::path::Path::new(&path);
     match std::fs::OpenOptions::new().write(true).open(p) {
         // C-7 fix: use sync_data (fdatasync) instead of sync_all (fsync)
@@ -2169,7 +2197,9 @@ fn v2_read_hint_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
                             ob.release(env)
                         }
                         None => {
-                            return Ok((atoms::error(), "out of memory allocating key binary").encode(env));
+                            return Ok(
+                                (atoms::error(), "out of memory allocating key binary").encode(env)
+                            );
                         }
                     };
                     let tuple = (
@@ -2196,12 +2226,12 @@ fn v2_read_hint_file<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
 /// Used by compaction to copy only live records to a new file.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
-fn v2_copy_records<'a>(
-    env: Env<'a>,
+fn v2_copy_records(
+    env: Env<'_>,
     source_path: String,
     dest_path: String,
     offsets: Vec<u64>,
-) -> NifResult<Term<'a>> {
+) -> NifResult<Term<'_>> {
     let src = std::path::Path::new(&source_path);
     let dst = std::path::Path::new(&dest_path);
 
@@ -2218,13 +2248,9 @@ fn v2_copy_records<'a>(
                             if let Some(ref value) = record.value {
                                 let new_offset = writer
                                     .write(&record.key, value, record.expire_at_ms)
-                                    .map_err(|e| {
-                                        rustler::Error::Term(Box::new(e.to_string()))
-                                    })?;
-                                let new_size = (log::HEADER_SIZE
-                                    + record.key.len()
-                                    + value.len())
-                                    as u64;
+                                    .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+                                let new_size =
+                                    (log::HEADER_SIZE + record.key.len() + value.len()) as u64;
                                 results.push((new_offset, new_size));
                             }
                             // Skip tombstones silently
@@ -2270,13 +2296,13 @@ fn v2_copy_records<'a>(
 /// pread + CRC validation.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
-fn v2_pread_at_async<'a>(
-    env: Env<'a>,
+fn v2_pread_at_async(
+    env: Env<'_>,
     caller_pid: LocalPid,
     correlation_id: u64,
     path: String,
     offset: u64,
-) -> NifResult<Term<'a>> {
+) -> NifResult<Term<'_>> {
     async_io::runtime().spawn(async move {
         let p = std::path::Path::new(&path);
         // C-2/C-6 fix: use File::open + pread instead of LogReader::open
@@ -2294,18 +2320,22 @@ fn v2_pread_at_async<'a>(
                 }
                 None => {
                     // Tombstone at this offset
-                    (atoms::tokio_complete(), correlation_id, atoms::ok(), atoms::nil()).encode(env)
+                    (
+                        atoms::tokio_complete(),
+                        correlation_id,
+                        atoms::ok(),
+                        atoms::nil(),
+                    )
+                        .encode(env)
                 }
             },
-            Ok(None) => {
-                (
-                    atoms::tokio_complete(),
-                    correlation_id,
-                    atoms::error(),
-                    "offset past EOF",
-                )
-                    .encode(env)
-            }
+            Ok(None) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                "offset past EOF",
+            )
+                .encode(env),
             Err(e) => (
                 atoms::tokio_complete(),
                 correlation_id,
@@ -2330,12 +2360,12 @@ fn v2_pread_at_async<'a>(
 /// MGET / GET_BATCH cold path.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
-fn v2_pread_batch_async<'a>(
-    env: Env<'a>,
+fn v2_pread_batch_async(
+    env: Env<'_>,
     caller_pid: LocalPid,
     correlation_id: u64,
     locations: Vec<(String, u64)>,
-) -> NifResult<Term<'a>> {
+) -> NifResult<Term<'_>> {
     async_io::runtime().spawn(async move {
         // Spawn each pread as a separate Tokio task for concurrency.
         let mut handles = Vec::with_capacity(locations.len());
@@ -2374,7 +2404,13 @@ fn v2_pread_batch_async<'a>(
                     None => atoms::nil().encode(env),
                 })
                 .collect();
-            (atoms::tokio_complete(), correlation_id, atoms::ok(), results).encode(env)
+            (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::ok(),
+                results,
+            )
+                .encode(env)
         });
     });
     Ok(atoms::ok().encode(env))
@@ -2389,17 +2425,20 @@ fn v2_pread_batch_async<'a>(
 /// the BEAM scheduler stays free.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value)]
-fn v2_fsync_async<'a>(
-    env: Env<'a>,
+fn v2_fsync_async(
+    env: Env<'_>,
     caller_pid: LocalPid,
     correlation_id: u64,
     path: String,
-) -> NifResult<Term<'a>> {
+) -> NifResult<Term<'_>> {
     async_io::runtime().spawn(async move {
         let p = std::path::Path::new(&path);
         // C-7 fix: use sync_data (fdatasync) instead of sync_all (fsync)
         // L-REMAIN-1 fix: open with write permission so sync_data actually flushes
-        let result = std::fs::OpenOptions::new().write(true).open(p).and_then(|f| f.sync_data());
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .and_then(|f| f.sync_data());
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -2589,7 +2628,11 @@ mod audit_fix_tests {
     #[test]
     fn parse_file_id_all_zeros() {
         let path = std::path::Path::new("/data/00000000000000000000.log");
-        assert_eq!(parse_file_id(path), 0, "all-zeros filename must produce file_id 0");
+        assert_eq!(
+            parse_file_id(path),
+            0,
+            "all-zeros filename must produce file_id 0"
+        );
     }
 
     #[test]
@@ -2614,7 +2657,11 @@ mod audit_fix_tests {
     #[test]
     fn parse_file_id_non_numeric_returns_zero() {
         let path = std::path::Path::new("/data/notanumber.log");
-        assert_eq!(parse_file_id(path), 0, "non-numeric filename must produce file_id 0");
+        assert_eq!(
+            parse_file_id(path),
+            0,
+            "non-numeric filename must produce file_id 0"
+        );
     }
 
     #[test]
@@ -2635,15 +2682,16 @@ mod audit_fix_tests {
         // Write some data using LogWriter
         {
             let mut writer = log::LogWriter::open(&path, 0).unwrap();
-            writer
-                .write(b"key", b"value", 0)
-                .unwrap();
+            writer.write(b"key", b"value", 0).unwrap();
             writer.sync().unwrap();
         }
 
         // Open with write permission and sync — should succeed
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        assert!(f.sync_data().is_ok(), "sync_data on write-opened file must succeed");
+        assert!(
+            f.sync_data().is_ok(),
+            "sync_data on write-opened file must succeed"
+        );
     }
 
     #[test]
@@ -2699,7 +2747,9 @@ mod audit_fix_tests {
         // Verify all records are readable
         let file = std::fs::File::open(&path).unwrap();
         for (offset, key, value) in &expected_offsets {
-            let record = log::pread_record_from_file(&file, *offset).unwrap().unwrap();
+            let record = log::pread_record_from_file(&file, *offset)
+                .unwrap()
+                .unwrap();
             assert_eq!(&record.key, key);
             assert_eq!(record.value.as_ref().unwrap(), value);
         }
@@ -2758,7 +2808,7 @@ mod audit_fix_tests {
         assert!(m.lock().is_err(), "mutex should be poisoned after panic");
 
         // Verify unwrap_or_else recovers the inner value
-        let guard = m.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(*guard, 42, "recovered value must be intact");
     }
 }

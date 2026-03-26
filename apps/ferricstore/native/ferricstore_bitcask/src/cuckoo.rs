@@ -61,8 +61,8 @@ enum Storage {
         len: usize,
         /// File descriptor (kept open for the lifetime of the mapping).
         fd: i32,
-        /// Path to the backing file.
-        path: PathBuf,
+        /// Path to the backing file (retained for diagnostics).
+        _path: PathBuf,
     },
 }
 
@@ -113,6 +113,7 @@ impl Storage {
     }
 
     /// Call msync(MS_SYNC) if mmap-backed.
+    #[cfg(test)]
     fn msync_sync(&self) {
         if let Storage::Mmap { ptr, len, .. } = self {
             unsafe {
@@ -327,7 +328,10 @@ impl CuckooFilter {
             unsafe {
                 libc::munmap(mmap, file_size);
             }
-            return Err(format!("dup fd failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "dup fd failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         // Drop the File — we keep owned_fd.
         drop(file);
@@ -337,7 +341,7 @@ impl CuckooFilter {
                 ptr,
                 len: file_size,
                 fd: owned_fd,
-                path: path.to_path_buf(),
+                _path: path.to_path_buf(),
             },
             num_buckets,
             bucket_size,
@@ -464,15 +468,11 @@ impl CuckooFilter {
 
     /// Find the first empty slot in a bucket. Returns `Some(slot_idx)` or `None`.
     fn find_empty_slot(&self, bucket_idx: usize) -> Option<usize> {
-        for slot in 0..self.bucket_size {
-            if self.is_slot_empty(bucket_idx, slot) {
-                return Some(slot);
-            }
-        }
-        None
+        (0..self.bucket_size).find(|&slot| self.is_slot_empty(bucket_idx, slot))
     }
 
     /// Add an element to the filter. Returns `Ok(())` on success, `Err(())` if full.
+    #[allow(clippy::result_unit_err)]
     pub fn add(&mut self, element: &[u8]) -> Result<(), ()> {
         let (fp, b1) = self.fingerprint_and_bucket(element);
         let b2 = self.alternate_bucket(b1, &fp);
@@ -529,6 +529,7 @@ impl CuckooFilter {
 
     /// Add an element only if it does not already exist.
     /// Returns 1 if added, 0 if already present, or `Err(())` if full.
+    #[allow(clippy::result_unit_err)]
     pub fn addnx(&mut self, element: &[u8]) -> Result<u64, ()> {
         if self.exists(element) {
             return Ok(0);
@@ -557,10 +558,7 @@ impl CuckooFilter {
 
     /// Check multiple elements at once. Returns a vector of 0/1 values.
     pub fn mexists(&self, elements: &[&[u8]]) -> Vec<u64> {
-        elements
-            .iter()
-            .map(|e| if self.exists(e) { 1 } else { 0 })
-            .collect()
+        elements.iter().map(|e| u64::from(self.exists(e))).collect()
     }
 
     /// Delete one occurrence of an element. Returns 1 if deleted, 0 if not found.
@@ -730,8 +728,9 @@ pub fn cuckoo_create(
     capacity: u64,
     bucket_size: u64,
     max_kicks: u64,
-    _expansion: u64,
+    expansion: u64,
 ) -> NifResult<Term> {
+    let _ = expansion; // Reserved for future use; NIF API requires the parameter.
     if capacity == 0 {
         return Ok((atoms::error(), "capacity must be > 0").encode(env));
     }
@@ -762,7 +761,12 @@ pub fn cuckoo_create(
 /// Returns `{:ok, resource}` or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_create_file(env: Env, path: String, capacity: u64, bucket_size: u64) -> NifResult<Term> {
+pub fn cuckoo_create_file(
+    env: Env,
+    path: String,
+    capacity: u64,
+    bucket_size: u64,
+) -> NifResult<Term> {
     let bs = if bucket_size == 0 {
         DEFAULT_BUCKET_SIZE
     } else {
@@ -866,7 +870,7 @@ pub fn cuckoo_exists<'a>(
     item: Binary<'a>,
 ) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
-    let result: u64 = if filter.exists(item.as_slice()) { 1 } else { 0 };
+    let result: u64 = u64::from(filter.exists(item.as_slice()));
     Ok(result.encode(env))
 }
 
@@ -880,7 +884,7 @@ pub fn cuckoo_mexists<'a>(
     items: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
-    let slices: Vec<&[u8]> = items.iter().map(|b| b.as_slice()).collect();
+    let slices: Vec<&[u8]> = items.iter().map(Binary::as_slice).collect();
     let results = filter.mexists(&slices);
     Ok(results.encode(env))
 }
@@ -903,7 +907,7 @@ pub fn cuckoo_count<'a>(
 /// Returns `{:ok, map}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_info<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>) -> NifResult<Term<'a>> {
+pub fn cuckoo_info(env: Env<'_>, resource: ResourceArc<CuckooResource>) -> NifResult<Term<'_>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let total_slots = (filter.num_buckets * filter.bucket_size) as u64;
     let info = (
@@ -925,10 +929,10 @@ pub fn cuckoo_info<'a>(env: Env<'a>, resource: ResourceArc<CuckooResource>) -> N
 /// Returns `{:ok, binary}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_serialize<'a>(
-    env: Env<'a>,
+pub fn cuckoo_serialize(
+    env: Env<'_>,
     resource: ResourceArc<CuckooResource>,
-) -> NifResult<Term<'a>> {
+) -> NifResult<Term<'_>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
     let bytes = filter.serialize();
     let mut bin = OwnedBinary::new(bytes.len()).ok_or(rustler::Error::BadArg)?;

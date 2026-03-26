@@ -63,7 +63,6 @@ impl CountMinSketch {
         }
         min_count
     }
-
 }
 
 /// FNV-1a hash with a configurable offset basis for double hashing.
@@ -448,7 +447,7 @@ pub fn topk_query(
 
     let results: Vec<i32> = items
         .iter()
-        .map(|item| if topk.query(item) { 1 } else { 0 })
+        .map(|item| i32::from(topk.query(item)))
         .collect();
 
     Ok(results.encode(env))
@@ -492,7 +491,7 @@ pub fn topk_info(env: Env, resource: ResourceArc<TopKResource>) -> NifResult<Ter
 /// Returns `{:ok, binary}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn topk_to_bytes<'a>(env: Env<'a>, resource: ResourceArc<TopKResource>) -> NifResult<Term<'a>> {
+pub fn topk_to_bytes(env: Env<'_>, resource: ResourceArc<TopKResource>) -> NifResult<Term<'_>> {
     let topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
     let bytes = topk.to_bytes();
     let mut bin = OwnedBinary::new(bytes.len()).ok_or(rustler::Error::BadArg)?;
@@ -661,7 +660,9 @@ impl MmapTopK {
             buf
         });
         if magic != TOPK_MAGIC {
-            unsafe { libc::munmap(mmap, file_size); }
+            unsafe {
+                libc::munmap(mmap, file_size);
+            }
             return Err("invalid topk file magic".into());
         }
 
@@ -688,7 +689,9 @@ impl MmapTopK {
 
         let expected = Self::file_size(k, width, depth);
         if file_size < expected {
-            unsafe { libc::munmap(mmap, file_size); }
+            unsafe {
+                libc::munmap(mmap, file_size);
+            }
             return Err(format!(
                 "file too small: expected {expected}, got {file_size}"
             ));
@@ -711,9 +714,7 @@ impl MmapTopK {
                 buf
             }) as usize;
             if elem_len <= MAX_ELEMENT_LEN {
-                let elem_bytes = unsafe {
-                    std::slice::from_raw_parts(entry_ptr.add(12), elem_len)
-                };
+                let elem_bytes = unsafe { std::slice::from_raw_parts(entry_ptr.add(12), elem_len) };
                 if let Ok(s) = std::str::from_utf8(elem_bytes) {
                     fingerprints.insert(s.to_string());
                 }
@@ -807,11 +808,7 @@ impl MmapTopK {
     fn cms_set(&self, row: usize, col: usize, val: i64) {
         let offset = Self::cms_offset() + (row * self.width + col) * 8;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                val.to_le_bytes().as_ptr(),
-                self.mmap.add(offset),
-                8,
-            );
+            std::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), self.mmap.add(offset), 8);
         }
     }
 
@@ -860,9 +857,7 @@ impl MmapTopK {
             buf
         }) as usize;
         let clamped = elem_len.min(MAX_ELEMENT_LEN);
-        let bytes = unsafe {
-            std::slice::from_raw_parts(self.mmap.add(base + 12), clamped)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(self.mmap.add(base + 12), clamped) };
         String::from_utf8_lossy(bytes).to_string()
     }
 
@@ -870,11 +865,7 @@ impl MmapTopK {
         let base = Self::heap_offset(self.width, self.depth) + idx * HEAP_ENTRY_SIZE;
         unsafe {
             // Write count
-            std::ptr::copy_nonoverlapping(
-                count.to_le_bytes().as_ptr(),
-                self.mmap.add(base),
-                8,
-            );
+            std::ptr::copy_nonoverlapping(count.to_le_bytes().as_ptr(), self.mmap.add(base), 8);
             // Write element length
             let elem_bytes = element.as_bytes();
             let len = elem_bytes.len().min(MAX_ELEMENT_LEN);
@@ -885,11 +876,7 @@ impl MmapTopK {
             );
             // Write element bytes (zero-padded)
             std::ptr::write_bytes(self.mmap.add(base + 12), 0, MAX_ELEMENT_LEN);
-            std::ptr::copy_nonoverlapping(
-                elem_bytes.as_ptr(),
-                self.mmap.add(base + 12),
-                len,
-            );
+            std::ptr::copy_nonoverlapping(elem_bytes.as_ptr(), self.mmap.add(base + 12), len);
         }
     }
 
@@ -975,7 +962,11 @@ impl MmapTopK {
 
     pub fn msync(&self) -> Result<(), String> {
         let ret = unsafe {
-            libc::msync(self.mmap as *mut libc::c_void, self.mmap_len, libc::MS_ASYNC)
+            libc::msync(
+                self.mmap as *mut libc::c_void,
+                self.mmap_len,
+                libc::MS_ASYNC,
+            )
         };
         if ret != 0 {
             Err(format!("msync failed: {}", std::io::Error::last_os_error()))
@@ -993,7 +984,11 @@ impl Drop for MmapTopK {
     fn drop(&mut self) {
         if !self.mmap.is_null() {
             unsafe {
-                libc::msync(self.mmap as *mut libc::c_void, self.mmap_len, libc::MS_ASYNC);
+                libc::msync(
+                    self.mmap as *mut libc::c_void,
+                    self.mmap_len,
+                    libc::MS_ASYNC,
+                );
                 libc::munmap(self.mmap as *mut libc::c_void, self.mmap_len);
             }
         }
@@ -1093,7 +1088,7 @@ pub fn topk_file_query(
     let topk = resource.topk.lock().map_err(|_| rustler::Error::BadArg)?;
     let results: Vec<i32> = items
         .iter()
-        .map(|item| if topk.query(item) { 1 } else { 0 })
+        .map(|item| i32::from(topk.query(item)))
         .collect();
     Ok(results.encode(env))
 }
@@ -1316,8 +1311,7 @@ mod tests {
         for i in 1..counts.len() {
             assert!(
                 counts[i - 1] >= counts[i],
-                "list not sorted desc: {:?}",
-                counts
+                "list not sorted desc: {counts:?}"
             );
         }
     }
@@ -1611,7 +1605,10 @@ mod tests {
         let items = topk.list();
         let counts: Vec<i64> = items.iter().map(|(_, c)| *c).collect();
         for i in 1..counts.len() {
-            assert!(counts[i - 1] >= counts[i], "list not sorted desc: {counts:?}");
+            assert!(
+                counts[i - 1] >= counts[i],
+                "list not sorted desc: {counts:?}"
+            );
         }
     }
 
@@ -1643,7 +1640,7 @@ mod tests {
     fn mmap_topk_open_bad_magic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.topk");
-        std::fs::write(&path, &[0xFF; 128]).unwrap();
+        std::fs::write(&path, [0xFF; 128]).unwrap();
         let result = MmapTopK::open_existing(&path);
         assert!(result.is_err());
     }

@@ -440,7 +440,10 @@ mod tests {
 
         // Data should be readable from disk (flushed to page cache).
         let contents = std::fs::read(&path).unwrap();
-        assert_eq!(contents, b"hello", "data must be readable after flush_no_sync");
+        assert_eq!(
+            contents, b"hello",
+            "data must be readable after flush_no_sync"
+        );
     }
 
     /// `flush_no_sync` followed by `sync` should still work correctly.
@@ -545,7 +548,11 @@ mod tests {
         }
 
         let backend = SyncBackend::open_small_buffer(&path).unwrap();
-        assert_eq!(backend.offset(), 4, "offset must resume at file size after reopen");
+        assert_eq!(
+            backend.offset(),
+            4,
+            "offset must resume at file size after reopen"
+        );
     }
 
     #[test]

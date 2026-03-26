@@ -203,11 +203,7 @@ mod tests {
         }
         let after = allocated_bytes();
         // Counter should not have drifted significantly
-        let drift = if after > before {
-            after - before
-        } else {
-            before - after
-        };
+        let drift = after.abs_diff(before);
         // Generous margin: other test threads allocate concurrently, and the
         // system allocator may keep thread-local caches that are not immediately
         // returned to the OS.
@@ -236,11 +232,7 @@ mod tests {
             h.join().unwrap();
         }
         let after = allocated_bytes();
-        let drift = if after > before {
-            after - before
-        } else {
-            before - after
-        };
+        let drift = after.abs_diff(before);
         // Generous margin: when cargo test runs hundreds of tests in parallel,
         // other threads allocate concurrently causing apparent drift.
         assert!(

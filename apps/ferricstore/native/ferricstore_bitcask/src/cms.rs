@@ -58,8 +58,8 @@ enum Storage {
         len: usize,
         /// File descriptor (kept open for the lifetime of the mapping).
         fd: i32,
-        /// Path to the backing file.
-        path: PathBuf,
+        /// Path to the backing file (retained for diagnostics).
+        _path: PathBuf,
     },
 }
 
@@ -70,18 +70,23 @@ unsafe impl Sync for Storage {}
 
 impl Storage {
     /// Get a pointer to the start of the counter data (past the header).
+    ///
+    /// The mmap header is 32 bytes (4 * u64), so `ptr + 32` is 8-byte aligned
+    /// when `ptr` comes from mmap (page-aligned).
+    #[allow(clippy::cast_ptr_alignment)]
     fn counter_ptr(&self) -> *const i64 {
         match self {
             Storage::InMemory(v) => v.as_ptr(),
-            Storage::Mmap { ptr, .. } => unsafe { ptr.add(MMAP_HEADER_SIZE) as *const i64 },
+            Storage::Mmap { ptr, .. } => unsafe { ptr.add(MMAP_HEADER_SIZE).cast::<i64>() },
         }
     }
 
     /// Get a mutable pointer to the start of the counter data.
+    #[allow(clippy::cast_ptr_alignment)]
     fn counter_ptr_mut(&mut self) -> *mut i64 {
         match self {
             Storage::InMemory(v) => v.as_mut_ptr(),
-            Storage::Mmap { ptr, .. } => unsafe { ptr.add(MMAP_HEADER_SIZE) as *mut i64 },
+            Storage::Mmap { ptr, .. } => unsafe { ptr.add(MMAP_HEADER_SIZE).cast::<i64>() },
         }
     }
 
@@ -110,6 +115,7 @@ impl Storage {
     }
 
     /// Call msync(MS_SYNC) if mmap-backed.
+    #[cfg(test)]
     fn msync_sync(&self) {
         if let Storage::Mmap { ptr, len, .. } = self {
             unsafe {
@@ -291,7 +297,10 @@ impl CountMinSketch {
             unsafe {
                 libc::munmap(mmap, file_size);
             }
-            return Err(format!("dup fd failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "dup fd failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         drop(file);
 
@@ -300,7 +309,7 @@ impl CountMinSketch {
                 ptr,
                 len: file_size,
                 fd: owned_fd,
-                path: path.to_path_buf(),
+                _path: path.to_path_buf(),
             },
             width,
             depth,
@@ -328,11 +337,7 @@ impl CountMinSketch {
     fn write_header_count(&self) {
         if let Storage::Mmap { ptr, .. } = &self.storage {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.count.to_le_bytes().as_ptr(),
-                    ptr.add(24),
-                    8,
-                );
+                std::ptr::copy_nonoverlapping(self.count.to_le_bytes().as_ptr(), ptr.add(24), 8);
             }
         }
     }
@@ -633,11 +638,11 @@ pub fn cms_query<'a>(
 /// Returns `:ok` or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cms_merge<'a>(
-    env: Env<'a>,
+pub fn cms_merge(
+    env: Env<'_>,
     dest: ResourceArc<CmsResource>,
     sources: Vec<(ResourceArc<CmsResource>, i64)>,
-) -> NifResult<Term<'a>> {
+) -> NifResult<Term<'_>> {
     // Lock dest first, then sources. To avoid deadlock we need to be careful.
     // We collect source data before locking dest.
     let source_data: Vec<(Vec<i64>, usize, usize, u64, i64)> = {
@@ -646,13 +651,7 @@ pub fn cms_merge<'a>(
             let src = src_res.sketch.lock().map_err(|_| rustler::Error::BadArg)?;
             let size = src.counter_count();
             let counters = src.storage.counter_slice(size);
-            data.push((
-                counters.to_vec(),
-                src.width,
-                src.depth,
-                src.count,
-                *weight,
-            ));
+            data.push((counters.to_vec(), src.width, src.depth, src.count, *weight));
         }
         data
     };
@@ -708,7 +707,7 @@ pub fn cms_info(env: Env, resource: ResourceArc<CmsResource>) -> NifResult<Term>
 /// Returns `{:ok, binary}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cms_to_bytes<'a>(env: Env<'a>, resource: ResourceArc<CmsResource>) -> NifResult<Term<'a>> {
+pub fn cms_to_bytes(env: Env<'_>, resource: ResourceArc<CmsResource>) -> NifResult<Term<'_>> {
     let sketch = resource.sketch.lock().map_err(|_| rustler::Error::BadArg)?;
     let bytes = sketch.to_bytes();
     let mut bin = rustler::OwnedBinary::new(bytes.len()).ok_or(rustler::Error::BadArg)?;
@@ -1029,7 +1028,7 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_zero_width() {
-        let mut data = vec![0u8; 24 + 0]; // width=0, depth=1, count=0
+        let mut data = vec![0u8; 24]; // width=0, depth=1, count=0
         data[0..8].copy_from_slice(&0u64.to_le_bytes()); // width = 0
         data[8..16].copy_from_slice(&1u64.to_le_bytes());
         assert!(CountMinSketch::from_bytes(&data).is_none());

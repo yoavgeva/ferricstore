@@ -179,9 +179,11 @@ impl TDigest {
             return f64::NAN;
         }
 
+        #[allow(clippy::float_cmp)]
         if q == 0.0 {
             return self.min;
         }
+        #[allow(clippy::float_cmp)]
         if q == 1.0 {
             return self.max;
         }
@@ -241,6 +243,7 @@ impl TDigest {
         }
 
         if self.centroids.is_empty() {
+            #[allow(clippy::float_cmp)]
             if self.max == self.min {
                 return 0.5;
             }
@@ -878,6 +881,7 @@ fn tdigest_deserialize<'a>(env: Env<'a>, data: rustler::Binary<'a>) -> NifResult
 // Resource registration (called from lib.rs load)
 // ---------------------------------------------------------------------------
 
+#[allow(non_local_definitions)]
 pub fn register_resource(env: Env) {
     let _ = rustler::resource!(TDigestResource, env);
 }
@@ -892,6 +896,7 @@ pub fn register_mmap_resource(_env: Env) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
