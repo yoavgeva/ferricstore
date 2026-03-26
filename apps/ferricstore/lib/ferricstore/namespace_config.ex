@@ -50,7 +50,10 @@ defmodule Ferricstore.NamespaceConfig do
 
   @table :ferricstore_ns_config
   @default_window_ms 1
-  @default_durability :quorum
+
+  defp get_default_durability do
+    Application.get_env(:ferricstore, :default_durability, :quorum)
+  end
 
   # ---------------------------------------------------------------------------
   # Types
@@ -273,7 +276,7 @@ defmodule Ferricstore.NamespaceConfig do
   @spec durability_for(binary()) :: :quorum | :async
   def durability_for(prefix) when is_binary(prefix) do
     case lookup(prefix) do
-      nil -> @default_durability
+      nil -> get_default_durability()
       %{durability: d} -> d
     end
   end
@@ -287,8 +290,8 @@ defmodule Ferricstore.NamespaceConfig do
   @doc """
   Returns the default durability mode.
   """
-  @spec default_durability() :: :quorum | :async
-  def default_durability, do: @default_durability
+  @spec get_default_durability() :: :quorum | :async
+  def default_durability, do: get_default_durability()
 
   # ---------------------------------------------------------------------------
   # GenServer callbacks
@@ -311,9 +314,10 @@ defmodule Ferricstore.NamespaceConfig do
     end
 
     # Initialize the fast-path flags for Router.durability_for_key/1.
-    # No async namespaces exist at startup.
-    :persistent_term.put(:ferricstore_durability_mode, :all_quorum)
-    :persistent_term.put(:ferricstore_has_async_ns, false)
+    # No namespaces configured at startup — use the global default.
+    default = get_default_durability()
+    :persistent_term.put(:ferricstore_durability_mode, if(default == :async, do: :all_async, else: :all_quorum))
+    :persistent_term.put(:ferricstore_has_async_ns, default == :async)
 
     {:ok, %{}}
   end
@@ -341,11 +345,11 @@ defmodule Ferricstore.NamespaceConfig do
           [] ->
             new_entry =
               case field do
-                :window_ms -> {prefix, value, @default_durability, now, changed_by}
+                :window_ms -> {prefix, value, get_default_durability(), now, changed_by}
                 :durability -> {prefix, @default_window_ms, value, now, changed_by}
               end
 
-            {@default_durability, new_entry}
+            {get_default_durability(), new_entry}
         end
 
       :ets.insert(@table, entry)
@@ -408,7 +412,7 @@ defmodule Ferricstore.NamespaceConfig do
     %{
       prefix: prefix,
       window_ms: @default_window_ms,
-      durability: @default_durability,
+      durability: get_default_durability(),
       changed_at: 0,
       changed_by: ""
     }
@@ -475,7 +479,11 @@ defmodule Ferricstore.NamespaceConfig do
 
     durability_mode =
       case {has_async, has_quorum} do
-        {false, _} -> :all_quorum
+        {false, false} ->
+          # No namespaces configured — use the global default
+          if get_default_durability() == :async, do: :all_async, else: :all_quorum
+
+        {false, true} -> :all_quorum
         {true, false} -> :all_async
         {true, true} -> :mixed
       end
