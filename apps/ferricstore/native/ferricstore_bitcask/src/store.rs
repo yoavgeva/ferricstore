@@ -224,13 +224,8 @@ impl Store {
     ///
     /// Returns a `StoreError` if the record cannot be written or synced to disk.
     pub fn put(&mut self, key: &[u8], value: &[u8], expire_at_ms: u64) -> Result<()> {
-        if value.is_empty() {
-            // Empty value is equivalent to a tombstone — treat as delete.
-            self.writer.write_tombstone(key)?;
-            self.writer.sync()?;
-            self.keydir.delete(key);
-            return Ok(());
-        }
+        // Empty values are valid (e.g. `SET key ""`). Tombstones use a
+        // sentinel value_size (u32::MAX) in the log format, not empty bytes.
         let offset = self.writer.write(key, value, expire_at_ms)?;
         self.writer.sync()?;
         #[allow(clippy::cast_possible_truncation)]
@@ -2584,16 +2579,21 @@ mod tests {
     }
 
     #[test]
-    fn put_empty_value_treated_as_tombstone() {
+    fn put_empty_value_is_valid() {
         let dir = tmp();
         let mut store = Store::open(dir.path()).unwrap();
         store.put(b"k", b"v", 0).unwrap();
-        // Empty value is treated as delete per store.rs line 173-178
+        // Empty value is a valid value (Redis SET key "" is valid)
         store.put(b"k", b"", 0).unwrap();
-        assert!(
-            store.get(b"k").unwrap().is_none(),
-            "empty value must act as tombstone"
+        assert_eq!(
+            store.get(b"k").unwrap(),
+            Some(vec![]),
+            "empty value must be stored, not treated as tombstone"
         );
+        // Survives reopen
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(b"k").unwrap(), Some(vec![]));
     }
 
     #[test]

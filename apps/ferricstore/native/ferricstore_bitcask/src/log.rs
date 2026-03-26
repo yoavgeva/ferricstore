@@ -25,7 +25,8 @@ use crate::io_backend::{self, IoBackend};
 pub const HEADER_SIZE: usize = 26;
 
 /// Sentinel `value_size` marking a tombstone (deleted key).
-pub const TOMBSTONE: u32 = 0;
+/// Uses `u32::MAX` so that `value_size = 0` can represent a genuine empty value.
+pub const TOMBSTONE: u32 = u32::MAX;
 
 #[derive(Debug)]
 pub struct LogError(pub String);
@@ -435,7 +436,21 @@ pub(crate) fn encode_record(key: &[u8], value: &[u8], expire_at_ms: u64) -> Vec<
 }
 
 fn encode_tombstone(key: &[u8]) -> Vec<u8> {
-    encode_record(key, &[], 0)
+    // Tombstone: value_size = TOMBSTONE (u32::MAX), no value bytes.
+    let now_ms = now_ms();
+    #[allow(clippy::cast_possible_truncation)]
+    let key_size = key.len() as u16;
+    let total = HEADER_SIZE + key.len();
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&[0u8; 4]); // CRC placeholder
+    buf.extend_from_slice(&now_ms.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes()); // expire_at_ms = 0
+    buf.extend_from_slice(&key_size.to_le_bytes());
+    buf.extend_from_slice(&TOMBSTONE.to_le_bytes()); // sentinel
+    buf.extend_from_slice(key);
+    let crc = crc32(&buf[4..]);
+    buf[0..4].copy_from_slice(&crc.to_le_bytes());
+    buf
 }
 
 /// Read a record at `offset` using `pread` (1 syscall instead of seek+read = 2).
@@ -465,15 +480,17 @@ fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     let timestamp_ms = u64::from_le_bytes(header[4..12].try_into().unwrap());
     let expire_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
     let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
-    let value_size = u32::from_le_bytes(header[22..26].try_into().unwrap()) as usize;
+    let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+    let is_tombstone = value_size_raw == TOMBSTONE;
+    let value_size = if is_tombstone {
+        0
+    } else {
+        value_size_raw as usize
+    };
 
     // Step 2: pread key + value in a single call
-    let body_len = key_size
-        + if value_size == TOMBSTONE as usize && key_size > 0 {
-            0
-        } else {
-            value_size
-        };
+    let actual_value_size = value_size;
+    let body_len = key_size + actual_value_size;
     let mut body = vec![0u8; body_len];
     if body_len > 0 {
         let body_offset = offset + HEADER_SIZE as u64;
@@ -486,17 +503,16 @@ fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
     }
 
     let key = body[..key_size].to_vec();
-    let value = if value_size == TOMBSTONE as usize && key_size > 0 {
-        vec![]
-    } else {
-        body[key_size..].to_vec()
-    };
+    let value = body[key_size..].to_vec();
 
-    // C-5 fix: verify CRC incrementally (no throwaway Vec)
+    // C-5 fix: verify CRC incrementally (no throwaway Vec).
+    // For tombstones, the CRC covers only the header + key (no value bytes).
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&header[4..]);
     hasher.update(&key);
-    hasher.update(&value);
+    if !is_tombstone {
+        hasher.update(&value);
+    }
     let computed_crc = hasher.finalize();
 
     if computed_crc != stored_crc {
@@ -509,11 +525,7 @@ fn pread_record(file: &File, offset: u64) -> Result<Option<Record>> {
         timestamp_ms,
         expire_at_ms,
         key,
-        value: if value_size == 0 {
-            None // tombstone
-        } else {
-            Some(value)
-        },
+        value: if is_tombstone { None } else { Some(value) },
     };
 
     Ok(Some(record))
@@ -531,26 +543,26 @@ fn read_next_record(reader: &mut impl Read) -> Result<Option<Record>> {
     let timestamp_ms = u64::from_le_bytes(header[4..12].try_into().unwrap());
     let expire_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
     let key_size = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
-    let value_size = u32::from_le_bytes(header[22..26].try_into().unwrap()) as usize;
+    let value_size_raw = u32::from_le_bytes(header[22..26].try_into().unwrap());
+    let is_tombstone = value_size_raw == TOMBSTONE;
 
     let mut key = vec![0u8; key_size];
     reader.read_exact(&mut key)?;
 
-    let value = if value_size == TOMBSTONE as usize && key_size > 0 {
-        // tombstone check: value_size == 0
+    let value = if is_tombstone {
         vec![]
     } else {
-        let mut v = vec![0u8; value_size];
+        let mut v = vec![0u8; value_size_raw as usize];
         reader.read_exact(&mut v)?;
         v
     };
 
-    // C-5 fix: verify CRC incrementally without allocating a throwaway Vec.
-    // Uses crc32fast::Hasher to stream the header tail, key, and value.
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&header[4..]);
     hasher.update(&key);
-    hasher.update(&value);
+    if !is_tombstone {
+        hasher.update(&value);
+    }
     let computed_crc = hasher.finalize();
 
     if computed_crc != stored_crc {
@@ -563,11 +575,7 @@ fn read_next_record(reader: &mut impl Read) -> Result<Option<Record>> {
         timestamp_ms,
         expire_at_ms,
         key,
-        value: if value_size == 0 {
-            None // tombstone
-        } else {
-            Some(value)
-        },
+        value: if is_tombstone { None } else { Some(value) },
     };
 
     Ok(Some(record))
@@ -780,15 +788,16 @@ mod tests {
     }
 
     #[test]
-    fn zero_length_value_is_not_tombstone_when_key_present() {
-        // value_size=0 is the tombstone sentinel — but encode_record with empty
-        // value produces value_size=0, which IS decoded as a tombstone.
-        // This is by design: callers must use write_tombstone for deletes.
+    fn zero_length_value_is_valid_not_tombstone() {
+        // value_size=0 is a genuine empty value. Tombstones use TOMBSTONE (u32::MAX).
         let encoded = encode_record(b"k", b"", 0);
         let mut cursor = io::Cursor::new(&encoded);
         let r = read_next_record(&mut cursor).unwrap().unwrap();
-        // Empty value decodes as tombstone (value_size==0 is the sentinel)
-        assert!(r.value.is_none());
+        assert_eq!(
+            r.value,
+            Some(vec![]),
+            "empty value must roundtrip as Some(vec![])"
+        );
     }
 
     #[test]
@@ -1069,13 +1078,17 @@ mod tests {
     }
 
     #[test]
-    fn encode_tombstone_value_size_is_zero() {
-        // encode_tombstone calls encode_record with empty value — value_size on disk is 0.
+    fn encode_tombstone_value_size_is_sentinel() {
+        // encode_tombstone writes value_size = TOMBSTONE (u32::MAX) as sentinel.
         let key = b"tomb_key";
         let encoded = encode_tombstone(key);
-        // The value_size field lives at bytes 22..26 in the encoded record.
         let value_size = u32::from_le_bytes(encoded[22..26].try_into().unwrap());
-        assert_eq!(value_size, 0, "tombstone must encode value_size=0");
+        assert_eq!(
+            value_size, TOMBSTONE,
+            "tombstone must encode value_size=TOMBSTONE"
+        );
+        // No value bytes after the key
+        assert_eq!(encoded.len(), HEADER_SIZE + key.len());
     }
 
     #[test]
@@ -1550,7 +1563,8 @@ mod tests {
         let mut cursor = io::Cursor::new(&encoded);
         let r = read_next_record(&mut cursor).unwrap().unwrap();
         assert!(r.key.is_empty());
-        assert!(r.value.is_none()); // empty value = tombstone
+        // Empty value is valid (value_size=0), not a tombstone (value_size=TOMBSTONE)
+        assert_eq!(r.value, Some(vec![]));
     }
 
     #[test]
