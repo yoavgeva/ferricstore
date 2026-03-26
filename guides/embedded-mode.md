@@ -791,15 +791,17 @@ If you routinely store values larger than 64 KB, consider:
 
 ## Testing with Sandbox
 
-FerricStore provides async-safe test isolation identical in concept to `Ecto.Adapters.SQL.Sandbox`:
+FerricStore provides true Ecto-level test isolation. Each test gets private shards, private ETS tables, a private Raft WAL, and a private tmpdir. The full production stack runs with complete isolation, supporting `async: true`.
+
+Requires `config :ferricstore, :sandbox_enabled, true` in test config (set by default).
 
 ```elixir
 defmodule MyApp.CacheTest do
   use ExUnit.Case, async: true
 
   setup do
-    namespace = FerricStore.Sandbox.checkout()
-    on_exit(fn -> FerricStore.Sandbox.checkin(namespace) end)
+    sandbox = FerricStore.Sandbox.checkout()
+    on_exit(fn -> FerricStore.Sandbox.checkin(sandbox) end)
     :ok
   end
 
@@ -809,7 +811,7 @@ defmodule MyApp.CacheTest do
   end
 
   test "isolated from other tests" do
-    # "key" here is a different key from the test above
+    # "key" here lives in a completely separate shard/ETS/WAL
     assert {:ok, nil} = FerricStore.get("key")
   end
 end
@@ -823,18 +825,27 @@ use FerricStore.Sandbox.Case
 
 ### How Sandbox Works
 
-1. `checkout/0` generates a unique prefix (e.g., `"test_a1b2c3d4e5f6g7h8_"`)
-2. The prefix is stored in the process dictionary under `:ferricstore_sandbox`
-3. Every FerricStore API call checks this key and prepends the prefix to the real key
-4. `checkin/1` deletes all keys with the prefix and clears the process dictionary
+1. `checkout/0` creates a private set of shards, ETS tables, Raft WAL directories, and a tmpdir for the test
+2. The sandbox reference is stored in the process dictionary under `:ferricstore_sandbox`
+3. Every FerricStore API call routes to the test's private shards instead of the application-level ones
+4. `checkin/1` tears down the private shards, deletes all ETS tables, and cleans up the tmpdir
 5. Production code runs with `Process.get(:ferricstore_sandbox) == nil` -- zero overhead
+
+### Sharing Sandbox with Spawned Processes
+
+When your test spawns tasks or processes that need to access the same sandbox:
+
+```elixir
+# Allow another process to use this test's private shards
+FerricStore.Sandbox.allow(self(), worker_pid)
+```
 
 ### TTL Freeze
 
 Prevent flaky tests due to timing:
 
 ```elixir
-namespace = FerricStore.Sandbox.checkout(freeze_ttl: true)
+sandbox = FerricStore.Sandbox.checkout(freeze_ttl: true)
 
 # Set a key with short TTL
 :ok = FerricStore.set("key", "value", ttl: 100)
@@ -845,12 +856,6 @@ assert {:ok, "value"} = FerricStore.get("key")
 # Force expiry manually
 FerricStore.Sandbox.expire_now("key")
 assert {:ok, nil} = FerricStore.get("key")
-```
-
-### Sharing Namespace with Spawned Processes
-
-```elixir
-FerricStore.Sandbox.allow(worker_pid)
 ```
 
 ## Integration with Phoenix

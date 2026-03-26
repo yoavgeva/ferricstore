@@ -76,15 +76,20 @@ config :ferricstore, :data_dir, "data"
 
 ### Test Configuration
 
-FerricStore provides test sandbox isolation. Configure test mode with ephemeral ports and temporary data:
+FerricStore provides Ecto-level test sandbox isolation. Configure test mode with ephemeral ports, temporary data, and sandbox enabled:
 
 ```elixir
 # config/test.exs
 config :ferricstore, :port, 0
 config :ferricstore, :health_port, 0
 config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.getpid()}"
+config :ferricstore, :shard_count, 4
 config :ferricstore, :max_memory_bytes, 1_073_741_824
 config :ferricstore, :eviction_policy, :volatile_lru
+config :ferricstore, :sandbox_enabled, true
+
+# Generous supervisor budget for tests that kill shards
+config :ferricstore, :supervisor_max_restarts, {1000, 60}
 
 # Disable node discovery during tests
 config :libcluster, topologies: :disabled
@@ -264,9 +269,19 @@ PONG
 
 ## Testing with Sandbox
 
-FerricStore provides async-safe test isolation, inspired by `Ecto.Adapters.SQL.Sandbox`. Each test gets a unique namespace prefix -- tests can run concurrently without key collisions.
+FerricStore provides true Ecto-level test isolation. Each test gets private shards, private ETS tables, a private Raft WAL, and a private tmpdir -- the full production stack runs in complete isolation. Tests support `async: true` out of the box.
+
+Requires `config :ferricstore, :sandbox_enabled, true` in test config (set by default).
 
 ### Setup
+
+The simplest approach is the built-in case template:
+
+```elixir
+use FerricStore.Sandbox.Case
+```
+
+Or set up manually for more control:
 
 ```elixir
 # test/support/case.ex or in each test file
@@ -274,17 +289,11 @@ defmodule MyApp.FerricStoreCase do
   use ExUnit.CaseTemplate
 
   setup do
-    namespace = FerricStore.Sandbox.checkout()
-    on_exit(fn -> FerricStore.Sandbox.checkin(namespace) end)
-    %{namespace: namespace}
+    sandbox = FerricStore.Sandbox.checkout()
+    on_exit(fn -> FerricStore.Sandbox.checkin(sandbox) end)
+    %{sandbox: sandbox}
   end
 end
-```
-
-Or use the built-in case template:
-
-```elixir
-use FerricStore.Sandbox.Case
 ```
 
 ### Writing Tests
@@ -299,10 +308,28 @@ defmodule MyApp.CacheTest do
   end
 
   test "keys are isolated between tests" do
-    # This test runs in parallel -- "key" here is a different key
-    # than "key" in the test above, thanks to sandbox namespacing.
+    # This test runs in parallel -- "key" here lives in a completely
+    # separate shard/ETS/WAL from the test above.
     assert {:ok, nil} = FerricStore.get("key")
   end
+end
+```
+
+### Sharing Sandbox with Async Tasks
+
+When your test spawns processes that need to access the same sandbox:
+
+```elixir
+test "async task can write to sandbox" do
+  task = Task.async(fn ->
+    FerricStore.set("from_task", "hello")
+  end)
+
+  # Allow the task process to use this test's sandbox
+  FerricStore.Sandbox.allow(self(), task.pid)
+  Task.await(task)
+
+  assert {:ok, "hello"} = FerricStore.get("from_task")
 end
 ```
 
@@ -310,9 +337,9 @@ end
 
 ```elixir
 setup do
-  namespace = FerricStore.Sandbox.checkout(freeze_ttl: true)
-  on_exit(fn -> FerricStore.Sandbox.checkin(namespace) end)
-  %{namespace: namespace}
+  sandbox = FerricStore.Sandbox.checkout(freeze_ttl: true)
+  on_exit(fn -> FerricStore.Sandbox.checkin(sandbox) end)
+  %{sandbox: sandbox}
 end
 
 test "expiry works" do
@@ -324,6 +351,19 @@ test "expiry works" do
   assert {:ok, nil} = FerricStore.get("key")
 end
 ```
+
+### Test Module Tags
+
+FerricStore's test suite uses module tags to categorize slow or disruptive tests. These are excluded from the default `mix test` run:
+
+| Tag | Purpose | Run with |
+|-----|---------|----------|
+| `@moduletag :shard_kill` | Tests that kill shard processes | `mix test --include shard_kill` |
+| `@moduletag :compaction` | Bitcask merge/compaction tests | `mix test --include compaction` |
+| `@moduletag :concurrency` | Race condition and stress tests | `mix test --include concurrency` |
+| `@moduletag :conn_lifecycle` | Connection lifecycle tests | `mix test --include conn_lifecycle` |
+
+Use `ShardHelpers.kill_shard_safely/2` (with built-in rate limiting) instead of raw `Process.exit(pid, :kill)` in shard-kill tests.
 
 ## Next Steps
 

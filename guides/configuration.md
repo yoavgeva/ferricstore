@@ -49,6 +49,20 @@ config :ferricstore, :shard_count, 4
 config :ferricstore, :hot_cache_max_value_size, 65_536
 ```
 
+## Supervisor
+
+| Option | Type | Default | Applies to | Description |
+|--------|------|---------|------------|-------------|
+| `:supervisor_max_restarts` | `{integer, integer}` | `{20, 10}` | Both | `{max_restarts, max_seconds}` for the shard supervisor. Controls how many shard restarts are allowed within the time window before the supervisor itself shuts down. Increase for test suites that deliberately kill shards. |
+
+```elixir
+# Production default: 20 restarts in 10 seconds
+config :ferricstore, :supervisor_max_restarts, {20, 10}
+
+# Test config: generous budget for shard-kill tests
+config :ferricstore, :supervisor_max_restarts, {1000, 60}
+```
+
 ## Memory Management
 
 | Option | Type | Default | Applies to | Description |
@@ -247,9 +261,14 @@ config :ferricstore, :memory_guard_interval_ms, 100
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
 | `:raft_enabled` | `boolean` | `true` | Both | Whether writes go through Raft consensus. See below. |
+| `:default_durability` | `:quorum \| :async` | `:quorum` | Both | Default durability level for all namespaces that don't have an explicit per-namespace override. Set to `:async` for Redis-like fire-and-forget speed at the cost of crash safety. Per-namespace overrides via `FERRICSTORE.CONFIG SET` or `:namespace_config` still take precedence. |
 
 ```elixir
 config :ferricstore, :raft_enabled, true
+
+# Default durability for all namespaces (overridden per-namespace)
+# :quorum = crash-safe (default), :async = fire-and-forget (faster)
+config :ferricstore, :default_durability, :quorum
 ```
 
 Raft controls **write durability** — whether a write is crash-safe before the
@@ -296,7 +315,11 @@ be configured with a different durability level:
 | `:quorum` | Write goes through Raft. Blocks until a **majority of nodes** have committed and fsynced the write to disk. Client gets OK only after quorum confirms. | **Crash-safe.** If you got OK, the data is on disk on a majority of nodes. Single node: fsynced locally. 3 nodes: fsynced on at least 2 — the third catches up later via Raft log replication. | ~1-5ms (group commit window + fsync) |
 | `:async` | Write bypasses Raft entirely. Sent directly to `AsyncApplyWorker` which writes to disk without fsync. Client gets OK immediately. | **NOT crash-safe.** A crash loses unfsynced writes (last ~1-100ms of data). | ~10-50us (ETS write only) |
 
-**Default:** All namespaces use `:quorum` with a 1ms group-commit window.
+**Default:** All namespaces use `:quorum` with a 1ms group-commit window. This
+can be changed globally via `config :ferricstore, :default_durability, :async`
+to make all namespaces default to async (Redis-like speed). Per-namespace
+overrides via `FERRICSTORE.CONFIG SET` or `:namespace_config` still take
+precedence over the global default.
 
 **When to use `:async`:** For data you can afford to lose on crash — ephemeral
 counters, rate limit windows, analytics events, cache warming. The 10-100x
@@ -684,6 +707,7 @@ config :libcluster,
 config :ferricstore, :port, 0
 config :ferricstore, :health_port, 0
 config :ferricstore, :data_dir, System.tmp_dir!() <> "/ferricstore_test_#{:os.getpid()}"
+config :ferricstore, :shard_count, 4
 config :ferricstore, :sync_flush_timeout_ms, 1_000
 config :ferricstore, :max_memory_bytes, 1_073_741_824
 config :ferricstore, :eviction_policy, :volatile_lru
@@ -691,6 +715,11 @@ config :ferricstore, :memory_guard_interval_ms, 5_000
 config :ferricstore, :merge, check_interval_ms: 600_000, fragmentation_threshold: 0.99
 config :ferricstore, :expiry_sweep_interval_ms, 600_000
 config :ferricstore, :raft_enabled, true
+config :ferricstore, :sandbox_enabled, true
+
+# Generous supervisor budget for shard-kill tests
+config :ferricstore, :supervisor_max_restarts, {1000, 60}
+
 config :libcluster, topologies: :disabled
 ```
 

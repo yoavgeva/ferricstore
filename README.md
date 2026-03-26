@@ -14,7 +14,7 @@ A Redis-compatible key-value store built in Elixir and Rust. FerricStore runs as
 - **FerricStore-native commands** -- CAS, distributed LOCK/UNLOCK, RATELIMIT, FETCH_OR_COMPUTE
 - **ACL security** -- user accounts, PBKDF2 passwords, command categories, key patterns
 - **TLS support** -- optional encrypted connections with certificate auth
-- **Sandbox testing** -- async-safe per-test isolation (like Ecto.Sandbox)
+- **Sandbox testing** -- Ecto-level per-test isolation: private shards, private ETS, private Raft WAL, full `async: true` support
 - **Prometheus metrics** -- built-in scrape endpoint, no external dependencies
 - **LFU eviction** -- Redis-compatible probabilistic eviction with configurable policies
 
@@ -200,12 +200,86 @@ OK
 | **Consensus** | Redis Sentinel / Cluster | Raft (ra library) |
 | **Probabilistic structures** | Redis Stack (separate module) | Built-in (mmap-backed) |
 | **Vector search** | Redis Stack | Built-in |
-| **Test isolation** | Manual flush | Sandbox (like Ecto.Sandbox) |
+| **Test isolation** | Manual flush | Ecto-level Sandbox (private shards per test) |
 | **Observability** | External tools | Observer, remote shell, `:ets.info` |
 | **Hot-upgradable** | Restart required | OTP hot code reload |
 | **CAS primitive** | Lua scripting | Native CAS command |
 | **Rate limiting** | Lua scripting | Native RATELIMIT.ADD command |
 | **Cache stampede** | Manual implementation | Native FETCH_OR_COMPUTE |
+
+## Recent Changes
+
+### Ecto-Level Test Sandbox
+
+FerricStore now provides true per-test isolation comparable to `Ecto.Adapters.SQL.Sandbox`. Each test gets private shards, private ETS tables, a private Raft WAL, and a private tmpdir. The full production stack runs in each test with complete isolation, supporting `async: true`.
+
+```elixir
+# Option 1: built-in case template
+use FerricStore.Sandbox.Case
+
+# Option 2: manual checkout/checkin
+setup do
+  sandbox = FerricStore.Sandbox.checkout()
+  on_exit(fn -> FerricStore.Sandbox.checkin(sandbox) end)
+  %{sandbox: sandbox}
+end
+
+# Share sandbox with spawned processes
+FerricStore.Sandbox.allow(test_pid, task_pid)
+```
+
+Requires `config :ferricstore, :sandbox_enabled, true` in test config (set by default).
+
+### Configurable Default Durability
+
+A new global config option controls the default durability level for all writes:
+
+```elixir
+# Redis-like speed (fire-and-forget to Raft):
+config :ferricstore, :default_durability, :async
+
+# Strong consistency (default):
+config :ferricstore, :default_durability, :quorum
+```
+
+Per-namespace overrides via `CONFIG SET` still take precedence.
+
+### Lists Use Compound Keys
+
+Lists migrated from serialized blobs (`term_to_binary({:list, elements})`) to compound keys (`L:key\0<position>`). Each element is a separate Bitcask entry. LPUSH/RPUSH is now O(1) per element instead of O(N).
+
+**Breaking:** If you read raw Bitcask files directly, list data is now stored as compound keys instead of a single serialized entry per list.
+
+### Empty String Values Are Valid
+
+`SET key ""` now stores an actual empty string instead of being treated as a delete. The Bitcask tombstone sentinel changed from `value_size=0` to `value_size=u32::MAX`.
+
+**Breaking:** Bitcask on-disk format changed. Existing data files from versions before this change must be migrated.
+
+### Bug Fixes
+
+- **Shard restart preserves data** -- Supervisor restarts now use `stop + restart` with the same UID instead of `force_delete_server`, preserving all committed Raft WAL data.
+- **Torn write recovery** -- The active Bitcask log file is truncated to the last valid CRC-checked record on open, so writes after crash recovery no longer silently get lost.
+
+### Input Validation Hardening
+
+Protocol-level limits now prevent resource exhaustion:
+
+| Input | Limit |
+|-------|-------|
+| RESP array elements | 1,000,000 |
+| Inline command size | 1 MB |
+| INCR/DECRBY values | i64 range |
+| SETRANGE offset | 512 MB |
+| SUBSCRIBE/PSUBSCRIBE per connection | 100,000 |
+| SETBIT offset | 2^32 - 1 |
+| Glob patterns (KEYS, SCAN) | 1,024 bytes (CVE-2022-36021 mitigation) |
+
+### Performance Optimizations
+
+- `Router.shard_name/1`: pre-computed atom tuple via `elem/2` (5.6-8x faster than string interpolation)
+- `durability_for_key/1`: three-state fast-path (8.4x faster for homogeneous namespace configs)
+- `Stats.counter_ref/1`: atom persistent_term key (+21% throughput)
 
 ## Guides
 

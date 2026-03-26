@@ -422,6 +422,7 @@ Small collections store each field as a compound key in the shared shard:
 - Hash fields: `H:redis_key\0field`
 - Set members: `S:redis_key\0member`
 - Sorted set members: `Z:redis_key\0member`
+- List elements: `L:redis_key\0<position>`
 
 ### Promotion Process
 
@@ -436,9 +437,14 @@ Small collections store each field as a compound key in the shared shard:
 
 On shard startup, `Promotion.recover_promoted/4` scans ETS for `PM:` marker keys (populated by `recover_keydir`), re-opens dedicated Bitcask directories, and scans their log files to recover entries into ETS.
 
-### Lists Are Not Promoted
+### List Compound Keys
 
-Lists store all elements as a single serialized Erlang term in one Bitcask entry (via `ListOps`). Since there is no compound key fan-out, lists do not benefit from promotion and are intentionally skipped.
+Lists use compound keys like other collection types:
+- List elements: `L:redis_key\0<position>`
+
+Each element is a separate Bitcask entry, making LPUSH/RPUSH O(1) per element instead of O(N). Position values encode the element's location in the list.
+
+Lists are not promoted to dedicated Bitcask instances because the position-based compound key scheme already provides efficient per-element access.
 
 ## Merge / Compaction
 
@@ -473,16 +479,17 @@ Each log file can have a corresponding `.hint` file (e.g., `00000.hint`). Hint f
 On shard startup, `Shard.init/1` rebuilds the in-memory keydir:
 
 1. **Discover active file**: Scans the shard data directory for `.log` files, finds the highest file ID and its size.
-2. **Create ETS table**: `keydir_N` with `:set`, `:public`, `:named_table`, `read_concurrency`, `write_concurrency`.
-3. **Recover keydir** (`recover_keydir/4`):
+2. **Torn write recovery**: The active log file is truncated to the last valid CRC-checked record. Any partially-written bytes after a crash are discarded, ensuring that subsequent appends start from a clean boundary and no data is silently lost.
+3. **Create ETS table**: `keydir_N` with `:set`, `:public`, `:named_table`, `read_concurrency`, `write_concurrency`.
+4. **Recover keydir** (`recover_keydir/4`):
    - If `.hint` files exist: read them via `NIF.v2_read_hint_file/2` and populate ETS with cold entries (value=nil, disk location known). Then scan only unhinted log files.
    - If no hint files: full scan of all log files via `NIF.v2_scan_file/2`. For each record, insert or delete from ETS. Last-writer-wins (higher file_id + higher offset wins).
    - Entries recovered from hints/logs are inserted as cold: `{key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size}`.
-4. **Recover promoted collections**: Scans ETS for `PM:` marker keys, re-opens dedicated Bitcask directories, scans their logs to recover entries.
-5. **Rebuild HNSW indices**: Reads persisted vectors from disk and rebuilds in-memory HNSW graphs.
-6. **Recover bloom filters**: Re-opens mmap-backed bloom filter files.
-7. **Start Raft server**: `Raft.Cluster.start_shard_server/5` starts the ra server for this shard (or recovers if already running with stale state).
-8. **Schedule flush timer and expiry sweep**.
+5. **Recover promoted collections**: Scans ETS for `PM:` marker keys, re-opens dedicated Bitcask directories, scans their logs to recover entries.
+6. **Rebuild HNSW indices**: Reads persisted vectors from disk and rebuilds in-memory HNSW graphs.
+7. **Recover bloom filters**: Re-opens mmap-backed bloom filter files.
+8. **Start Raft server**: `Raft.Cluster.start_shard_server/5` starts the ra server for this shard. On supervisor restart after a shard crash, the existing Raft server is stopped and restarted with the same UID, preserving all committed WAL data (previous versions used `force_delete_server` which destroyed the WAL).
+9. **Schedule flush timer and expiry sweep**.
 
 ## Rust NIF Design
 
@@ -528,7 +535,7 @@ Correlation IDs (monotonically increasing integers from `System.unique_integer/1
   4 bytes      8 bytes             8 bytes              2 bytes         4 bytes           variable    variable
 ```
 
-Header size: 26 bytes. CRC32 covers everything after the checksum field. Tombstone records have `value_size = 0` and no value bytes. All integers are little-endian. The I/O backend is selected at startup: `io_uring` on Linux kernel >= 5.1, `BufWriter<File>` otherwise.
+Header size: 26 bytes. CRC32 covers everything after the checksum field. Tombstone records have `value_size = u32::MAX` (0xFFFFFFFF) and no value bytes. A `value_size` of 0 indicates a valid empty string value (`SET key ""`). All integers are little-endian. The I/O backend is selected at startup: `io_uring` on Linux kernel >= 5.1, `BufWriter<File>` otherwise.
 
 ### mmap-Backed Structures (NIF Resources)
 
@@ -602,6 +609,22 @@ Each connection maintains:
 ### Transaction Support (MULTI/EXEC/DISCARD/WATCH)
 
 When `MULTI` is issued, the connection enters `:queuing` mode. Subsequent commands (except EXEC, DISCARD, MULTI, WATCH, UNWATCH) are queued with `+QUEUED` responses. `EXEC` executes all queued commands sequentially. If `WATCH` was used and any watched key's shard write-version changed, `EXEC` returns nil (transaction aborted). `DISCARD` clears the queue.
+
+### Input Validation
+
+Protocol-level limits prevent resource exhaustion from malicious or malformed input:
+
+| Input | Limit | Enforced At |
+|-------|-------|-------------|
+| RESP array elements | 1,000,000 | RESP3 parser |
+| Inline command size | 1 MB | RESP3 parser |
+| INCR/DECRBY values | i64 range (-2^63 to 2^63-1) | Command handler |
+| SETRANGE offset | 512 MB | Command handler |
+| SUBSCRIBE/PSUBSCRIBE per connection | 100,000 | Connection state |
+| SETBIT offset | 2^32 - 1 | Command handler |
+| Glob patterns (KEYS, SCAN) | 1,024 bytes | Command handler (CVE-2022-36021 mitigation) |
+
+These limits apply in both standalone and embedded mode. The RESP parser limits are checked before command dispatch, so oversized payloads are rejected without allocating memory for the full payload.
 
 ## Three-Tier Storage
 
