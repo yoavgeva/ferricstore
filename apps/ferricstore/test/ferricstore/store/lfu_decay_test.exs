@@ -43,6 +43,9 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
   setup do
     flush_all_keys()
+    on_exit(fn ->
+      Ferricstore.Test.ShardHelpers.wait_shards_alive()
+    end)
     :ok
   end
 

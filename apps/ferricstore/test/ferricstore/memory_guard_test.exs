@@ -10,6 +10,15 @@ defmodule Ferricstore.MemoryGuardTest do
 
   alias Ferricstore.MemoryGuard
 
+  setup do
+    on_exit(fn ->
+      :persistent_term.put(:ferricstore_reject_writes, false)
+      :persistent_term.put(:ferricstore_keydir_full, false)
+    end)
+
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # MemoryGuard starts and runs periodic checks
   # ---------------------------------------------------------------------------

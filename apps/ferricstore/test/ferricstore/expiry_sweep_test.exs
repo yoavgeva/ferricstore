@@ -10,9 +10,15 @@ defmodule Ferricstore.ExpirySweepTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
+  import Ferricstore.Test.ShardHelpers, only: [flush_all_keys: 0]
 
   # Use a unique prefix per test to avoid cross-test key collisions.
   defp ukey(base), do: "expiry_sweep_test:#{base}:#{System.unique_integer([:positive])}"
+
+  setup do
+    flush_all_keys()
+    :ok
+  end
 
   # ---------------------------------------------------------------------------
   # Helpers

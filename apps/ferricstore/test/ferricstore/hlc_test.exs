@@ -421,49 +421,38 @@ defmodule Ferricstore.HLCTest do
 
   describe "graceful fallback" do
     test "now() returns wall clock when persistent_term is not set" do
-      # Temporarily remove the persistent_term to simulate pre-init state.
       ref = :persistent_term.get(:ferricstore_hlc_ref)
+      on_exit(fn -> :persistent_term.put(:ferricstore_hlc_ref, ref) end)
       :persistent_term.erase(:ferricstore_hlc_ref)
 
-      try do
-        wall_before = System.os_time(:millisecond)
-        {phys, logical} = HLC.now()
-        wall_after = System.os_time(:millisecond)
+      wall_before = System.os_time(:millisecond)
+      {phys, logical} = HLC.now()
+      wall_after = System.os_time(:millisecond)
 
-        assert phys >= wall_before
-        assert phys <= wall_after + 1
-        assert logical == 0
-      after
-        # Restore the ref so other tests keep working.
-        :persistent_term.put(:ferricstore_hlc_ref, ref)
-      end
+      assert phys >= wall_before
+      assert phys <= wall_after + 1
+      assert logical == 0
     end
 
     test "now_ms() returns wall clock when persistent_term is not set" do
       ref = :persistent_term.get(:ferricstore_hlc_ref)
+      on_exit(fn -> :persistent_term.put(:ferricstore_hlc_ref, ref) end)
       :persistent_term.erase(:ferricstore_hlc_ref)
 
-      try do
-        wall_before = System.os_time(:millisecond)
-        ms = HLC.now_ms()
-        wall_after = System.os_time(:millisecond)
+      wall_before = System.os_time(:millisecond)
+      ms = HLC.now_ms()
+      wall_after = System.os_time(:millisecond)
 
-        assert ms >= wall_before
-        assert ms <= wall_after + 1
-      after
-        :persistent_term.put(:ferricstore_hlc_ref, ref)
-      end
+      assert ms >= wall_before
+      assert ms <= wall_after + 1
     end
 
     test "drift_ms() returns 0 when persistent_term is not set" do
       ref = :persistent_term.get(:ferricstore_hlc_ref)
+      on_exit(fn -> :persistent_term.put(:ferricstore_hlc_ref, ref) end)
       :persistent_term.erase(:ferricstore_hlc_ref)
 
-      try do
-        assert HLC.drift_ms() == 0
-      after
-        :persistent_term.put(:ferricstore_hlc_ref, ref)
-      end
+      assert HLC.drift_ms() == 0
     end
   end
 end
