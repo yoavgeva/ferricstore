@@ -123,6 +123,12 @@ from RAM (Tier 1 → Tier 2) but it stays on disk. The ETS entry keeps the key
 and disk location (`file_id`, `offset`) so the next read can fetch it. The key
 goes from "hot" (~1-5 us) to "cold" (~50-200 us) — slower but still accessible.
 
+**Expiration DOES delete data.** When a key's TTL expires, the key is
+permanently removed from both ETS and Bitcask (a tombstone is written to disk).
+The key is gone — `GET` returns nil, `EXISTS` returns 0. This happens two ways:
+lazy deletion on the next read, and active sweep every 100ms (configurable).
+This is the same behavior as Redis `EXPIRE`.
+
 When RAM usage reaches `max_memory_bytes`, MemoryGuard must choose which hot
 keys to make cold. This involves two things:
 
