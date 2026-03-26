@@ -56,6 +56,54 @@ mix deps.get
 mix run --no-halt
 ```
 
+### Docker
+
+```bash
+docker build -t ferricstore .
+docker run -p 6379:6379 -v ferricstore_data:/data ferricstore
+```
+
+Environment variables (set via `docker run -e` or in `docker-compose.yml`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_PORT` | `6379` | TCP port for RESP3 listener |
+| `FERRICSTORE_HEALTH_PORT` | `6380` | HTTP health/metrics port |
+| `FERRICSTORE_DATA_DIR` | `/data` | Data directory inside the container |
+| `FERRICSTORE_SHARD_COUNT` | `0` (auto = scheduler count) | Number of shards |
+| `FERRICSTORE_DURABILITY` | `quorum` | Default durability (`quorum` or `async`) |
+| `FERRICSTORE_NODE_NAME` | unset | Erlang node name (enables clustering) |
+| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie |
+| `FERRICSTORE_CLUSTER_NODES` | unset | Comma-separated list of peer node names |
+
+For a 3-node cluster with HAProxy: `docker compose up -d`
+
+### Release Build
+
+```bash
+MIX_ENV=prod mix release ferricstore
+```
+
+Output at `_build/prod/rel/ferricstore/`. Start with:
+
+```bash
+_build/prod/rel/ferricstore/bin/ferricstore start
+```
+
+### Benchmarking
+
+Requires [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark):
+
+```bash
+# macOS
+brew install memtier_benchmark
+
+# Run the full suite
+./bench/run.sh
+```
+
+Tests: write-only (SET), read-only (GET), mixed 1:10, pipelined GET (pipeline=10), large values (4KB).
+
 ## Configuration
 
 ### Minimal Configuration (Embedded)
@@ -362,6 +410,12 @@ FerricStore's test suite uses module tags to categorize slow or disruptive tests
 | `@moduletag :compaction` | Bitcask merge/compaction tests | `mix test --include compaction` |
 | `@moduletag :concurrency` | Race condition and stress tests | `mix test --include concurrency` |
 | `@moduletag :conn_lifecycle` | Connection lifecycle tests | `mix test --include conn_lifecycle` |
+| `@moduletag :bench` | Long-running throughput benchmarks (30s+) | `mix test --include bench` |
+| `@moduletag :cluster` | Multi-node `:peer` cluster tests (slow, ~10-30s each) | `mix test --include cluster` |
+| `@moduletag :jepsen` | Jepsen-style durability/consistency fault injection | `mix test --include jepsen` |
+| `@moduletag :perf` | Performance regression tests | `mix test --include perf` |
+| `@moduletag :linux_io_uring` | Linux io_uring backend tests (requires kernel >= 5.1) | `mix test --include linux_io_uring` |
+| `@moduletag :large_alloc` | Large allocation tests (>= 512 MiB, may OOM on small runners) | `mix test --include large_alloc` |
 
 Use `ShardHelpers.kill_shard_safely/2` (with built-in rate limiting) instead of raw `Process.exit(pid, :kill)` in shard-kill tests.
 

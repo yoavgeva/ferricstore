@@ -96,6 +96,20 @@ OK
 (integer) 2
 ```
 
+## Docker
+
+```bash
+# Single node
+docker build -t ferricstore .
+docker run -p 6379:6379 -v ferricstore_data:/data ferricstore
+
+# 3-node cluster with HAProxy
+docker compose up -d
+
+# Benchmark (requires memtier_benchmark)
+./bench/run.sh
+```
+
 ## Architecture
 
 ```

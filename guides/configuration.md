@@ -26,6 +26,7 @@ config :ferricstore, :mode, :embedded
 |--------|------|---------|------------|-------------|
 | `:port` | `integer` | `6379` | Standalone only | TCP port for the RESP3 listener. Use `0` for an OS-assigned ephemeral port (useful in tests). |
 | `:health_port` | `integer` | `4000` | Standalone only | HTTP port for health checks and Prometheus metrics. Use `0` for ephemeral. |
+| `:socket_active_mode` | `:once \| true \| integer` | `true` | Standalone only | TCP socket active mode. `:once` reads one message at a time (back-pressure friendly). `true` pushes all data without flow control (highest throughput). An integer N reads N messages then switches to passive. |
 
 ```elixir
 config :ferricstore, :port, 6379
@@ -75,6 +76,8 @@ config :ferricstore, :supervisor_max_restarts, {1000, 60}
 | `:hot_cache_min_ram` | `integer` | `67_108_864` | Both | Minimum RAM for hot cache values in bytes (default: 64 MB). |
 | `:maxclients` | `integer` | `10_000` | Standalone only | Maximum simultaneous client connections. Ignored in embedded mode (no TCP connections). |
 | `:promotion_threshold` | `integer` | `100` | Both | Field/member count threshold for promoting collections (hash/set/zset) to dedicated Bitcask instances. |
+| `:acl_auto_save` | `boolean` | `false` | Both | Auto-save ACL changes to disk when modified via `ACL SETUSER` or `ACL DELUSER`. |
+| `:read_sample_rate` | `integer` | `100` | Both | LFU/stats sampling rate. `1` = update counters on every read, `100` = sample 1% of reads. Higher values reduce per-read overhead at the cost of LFU accuracy. |
 
 ### Eviction: How It Works
 
@@ -328,6 +331,8 @@ latency reduction is significant for high-throughput fire-and-forget workloads.
 **When to use `:quorum`:** For anything that must survive a crash — user data,
 sessions, financial transactions, queue state. This is the default and the
 right choice for most data.
+
+> **Note:** Async durability mode with values >64KB may exhibit read-back issues. Use quorum mode for large values.
 
 ### How Raft log replication works (multi-node)
 
@@ -748,6 +753,21 @@ config :libcluster,
     ]
   ]
 ```
+
+## Runtime Environment Variables
+
+These environment variables are read from `config/runtime.exs` in production (`MIX_ENV=prod`). They configure FerricStore when running as a release or Docker container.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRICSTORE_PORT` | `6379` | TCP port for RESP3 listener |
+| `FERRICSTORE_HEALTH_PORT` | `6380` | HTTP health/metrics port |
+| `FERRICSTORE_DATA_DIR` | `/data` | Root data directory (Bitcask, Raft WAL, mmap) |
+| `FERRICSTORE_SHARD_COUNT` | `0` (auto = `System.schedulers_online()`) | Number of shards. `0` auto-detects from available CPU cores. |
+| `FERRICSTORE_DURABILITY` | `quorum` | Default durability level (`quorum` or `async`) |
+| `FERRICSTORE_NODE_NAME` | unset | Erlang node name. Setting this enables clustering. |
+| `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie for cluster authentication |
+| `FERRICSTORE_CLUSTER_NODES` | unset | Comma-separated list of peer node names to join |
 
 ## Runtime Configuration (CONFIG SET)
 

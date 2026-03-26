@@ -60,7 +60,7 @@ The embedded API (`FerricStore` module) and the RESP3/TCP mode execute the same 
 |--------|---------------|---------------|
 | **Return values** | Raw RESP3 types (bulk strings, integers, arrays) | Elixir-idiomatic types (`{:ok, value}`, `:ok`, etc.) |
 | **Blocking commands** | `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` supported | Not available -- return immediately |
-| **Sandbox** | Not applicable | Process-based key prefixing for test isolation |
+| **Sandbox** | Not applicable (test feature) | Test-only: provides Ecto-level per-test isolation with private shards. Not a production embedded feature. |
 | **Set algebra** | `SINTER`/`SUNION`/`SDIFF` scan the single shard owning the key | Same behavior -- set members are co-located per key |
 | **Transactions** | `MULTI`/`EXEC`/`WATCH` at connection level | `FerricStore.multi/1` with function-based API |
 | **ACL** | Per-connection ACL enforcement | No ACL checks |
