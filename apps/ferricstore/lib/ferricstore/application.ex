@@ -174,7 +174,7 @@ defmodule Ferricstore.Application do
           {Ferricstore.MemoryGuard, memory_guard_opts()}
         ]
 
-    opts = [strategy: :one_for_one, name: Ferricstore.Supervisor]
+    opts = [strategy: :one_for_one, name: Ferricstore.Supervisor, max_restarts: 20, max_seconds: 10]
     result = Supervisor.start_link(children, opts)
 
     case result do

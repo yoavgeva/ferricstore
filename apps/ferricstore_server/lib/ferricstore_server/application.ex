@@ -48,7 +48,7 @@ defmodule FerricstoreServer.Application do
           tls_listener_children() ++
           [FerricstoreServer.Health.Endpoint.child_spec(health_port)]
 
-      opts = [strategy: :one_for_one, name: FerricstoreServer.Supervisor]
+      opts = [strategy: :one_for_one, name: FerricstoreServer.Supervisor, max_restarts: 20, max_seconds: 10]
       Supervisor.start_link(children, opts)
     end
   end
