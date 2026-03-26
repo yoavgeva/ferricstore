@@ -467,6 +467,87 @@ defmodule Ferricstore.SandboxTest do
   end
 
   # ===========================================================================
+  # ===========================================================================
+  # Full stack isolation proof — every component is private
+  # ===========================================================================
+
+  describe "full stack isolation" do
+    test "every component is private between two sandboxes" do
+      # Create two sandboxes
+      s1 = FerricStore.Sandbox.checkout()
+      s1_shards = s1.shards
+      s1_keydirs = s1.keydirs
+      s1_tmpdir = s1.tmpdir
+      s1_ra = s1.ra_system
+      FerricStore.Sandbox.checkin(s1)
+
+      s2 = FerricStore.Sandbox.checkout()
+      s2_shards = s2.shards
+      s2_keydirs = s2.keydirs
+      s2_tmpdir = s2.tmpdir
+      s2_ra = s2.ra_system
+      FerricStore.Sandbox.checkin(s2)
+
+      # 1. Shard PIDs are different
+      assert s1_shards != s2_shards, "shard PIDs must be different"
+
+      # 2. ETS tables are different
+      assert s1_keydirs != s2_keydirs, "ETS keydir tables must be different"
+
+      # 3. Tmpdirs are different
+      assert s1_tmpdir != s2_tmpdir, "tmpdirs must be different"
+
+      # 4. Ra systems are different
+      assert s1_ra != s2_ra, "ra systems must be different"
+
+      # 5. Neither uses the application shards
+      app_shard_0 = Process.whereis(:"Ferricstore.Store.Shard.0")
+      assert elem(s1_shards, 0) != app_shard_0, "sandbox must not use app shards"
+
+      # 6. Neither uses the application ETS
+      app_keydir = :"keydir_0"
+      assert elem(s1_keydirs, 0) != app_keydir, "sandbox must not use app ETS"
+
+      # Now prove data isolation with writes
+      s1 = FerricStore.Sandbox.checkout()
+
+      FerricStore.set("proof", "from_s1")
+      FerricStore.hset("myhash", %{"f" => "v"})
+      {:ok, size} = FerricStore.dbsize()
+      assert size >= 2, "dbsize must count the keys we wrote"
+
+      # Bitcask files exist in sandbox tmpdir
+      shard_dir = Path.join(s1.tmpdir, "shard_0")
+      assert File.dir?(shard_dir), "sandbox shard dir must exist"
+
+      # WAL directory exists
+      ra_dir = Path.join(s1.tmpdir, "ra")
+      assert File.dir?(ra_dir), "sandbox ra dir must exist"
+      wal_files = Path.wildcard(Path.join(ra_dir, "**/*.wal"))
+      assert length(wal_files) > 0, "WAL files must exist in sandbox ra dir"
+
+      FerricStore.Sandbox.checkin(s1)
+
+      # Second sandbox sees nothing
+      s2 = FerricStore.Sandbox.checkout()
+
+      assert {:ok, nil} = FerricStore.get("proof")
+      assert {:ok, nil} = FerricStore.hget("myhash", "f")
+      assert {:ok, 0} = FerricStore.dbsize()
+
+      # FLUSHDB only affects this sandbox
+      FerricStore.set("s2key", "s2val")
+      FerricStore.flushdb()
+      assert {:ok, 0} = FerricStore.dbsize()
+
+      FerricStore.Sandbox.checkin(s2)
+
+      # Tmpdir cleaned up after checkin
+      refute File.dir?(s1.tmpdir), "s1 tmpdir must be deleted after checkin"
+      refute File.dir?(s2.tmpdir), "s2 tmpdir must be deleted after checkin"
+    end
+  end
+
   # Backward compatibility -- old string namespace sandbox
   # ===========================================================================
 
