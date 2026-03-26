@@ -1290,23 +1290,31 @@ defmodule FerricstoreServer.Connection do
     {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'subscribe' command"}), state}
   end
 
+  # Max channels + patterns per connection to prevent per-connection heap exhaustion.
+  @max_subscriptions 100_000
+
   defp dispatch("SUBSCRIBE", channels, state) do
     # Lazily initialize MapSets on first subscribe (memory audit L3).
     state = ensure_pubsub_sets(state)
 
-    {responses, new_state} =
-      Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
-        PS.subscribe(ch, self())
-        new_channels = MapSet.put(st.pubsub_channels, ch)
-        new_st = %{st | pubsub_channels: new_channels}
-        count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
-        push = {:push, ["subscribe", ch, count]}
-        {[Encoder.encode(push) | acc], new_st}
-      end)
+    current_count = MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
 
-    # No need to switch socket mode — already in active: :once from the main loop.
-    # The pubsub_loop will re-arm after handling each message.
-    {:continue, Enum.reverse(responses), new_state}
+    if current_count + length(channels) > @max_subscriptions do
+      {:error_reply,
+       {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}, state}
+    else
+      {responses, new_state} =
+        Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
+          PS.subscribe(ch, self())
+          new_channels = MapSet.put(st.pubsub_channels, ch)
+          new_st = %{st | pubsub_channels: new_channels}
+          count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
+          push = {:push, ["subscribe", ch, count]}
+          {[Encoder.encode(push) | acc], new_st}
+        end)
+
+      {:continue, Enum.reverse(responses), new_state}
+    end
   end
 
   defp dispatch("UNSUBSCRIBE", [], state) do
@@ -1341,18 +1349,24 @@ defmodule FerricstoreServer.Connection do
   defp dispatch("PSUBSCRIBE", patterns, state) do
     state = ensure_pubsub_sets(state)
 
-    {responses, new_state} =
-      Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
-        PS.psubscribe(pat, self())
-        new_patterns = MapSet.put(st.pubsub_patterns, pat)
-        new_st = %{st | pubsub_patterns: new_patterns}
-        count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
-        push = {:push, ["psubscribe", pat, count]}
-        {[Encoder.encode(push) | acc], new_st}
-      end)
+    current_count = MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
 
-    # No socket mode switch needed — already in active: :once.
-    {:continue, Enum.reverse(responses), new_state}
+    if current_count + length(patterns) > @max_subscriptions do
+      {:error_reply,
+       {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}, state}
+    else
+      {responses, new_state} =
+        Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
+          PS.psubscribe(pat, self())
+          new_patterns = MapSet.put(st.pubsub_patterns, pat)
+          new_st = %{st | pubsub_patterns: new_patterns}
+          count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
+          push = {:push, ["psubscribe", pat, count]}
+          {[Encoder.encode(push) | acc], new_st}
+        end)
+
+      {:continue, Enum.reverse(responses), new_state}
+    end
   end
 
   defp dispatch("PUNSUBSCRIBE", [], state) do

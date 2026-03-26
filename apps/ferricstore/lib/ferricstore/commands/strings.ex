@@ -215,10 +215,20 @@ defmodule Ferricstore.Commands.Strings do
   def handle("DECR", [key], store), do: store.incr.(key, -1)
   def handle("DECR", _args, _store), do: {:error, "ERR wrong number of arguments for 'decr' command"}
 
+  # Redis range: [-2^63, 2^63-1] for integer operations.
+  @max_int64 9_223_372_036_854_775_807
+  @min_int64 -9_223_372_036_854_775_808
+
   def handle("INCRBY", [key, delta_str], store) do
     case Integer.parse(delta_str) do
-      {delta, ""} -> store.incr.(key, delta)
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      {delta, ""} when delta >= @min_int64 and delta <= @max_int64 ->
+        store.incr.(key, delta)
+
+      {_delta, ""} ->
+        {:error, "ERR value is not an integer or out of range"}
+
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -227,8 +237,14 @@ defmodule Ferricstore.Commands.Strings do
 
   def handle("DECRBY", [key, delta_str], store) do
     case Integer.parse(delta_str) do
-      {delta, ""} -> store.incr.(key, -delta)
-      _ -> {:error, "ERR value is not an integer or out of range"}
+      {delta, ""} when delta >= @min_int64 and delta <= @max_int64 ->
+        store.incr.(key, -delta)
+
+      {_delta, ""} ->
+        {:error, "ERR value is not an integer or out of range"}
+
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
     end
   end
 
@@ -392,11 +408,17 @@ defmodule Ferricstore.Commands.Strings do
   # SETRANGE
   # ---------------------------------------------------------------------------
 
+  # Redis caps SETRANGE offset at 512MB (536_870_911 = 2^29 - 1).
+  @max_setrange_offset 536_870_911
+
   def handle("SETRANGE", [key, offset_str, value], store) do
     case Integer.parse(offset_str) do
-      {offset, ""} when offset >= 0 ->
+      {offset, ""} when offset >= 0 and offset <= @max_setrange_offset ->
         {:ok, new_len} = store.setrange.(key, offset, value)
         new_len
+
+      {offset, ""} when offset > @max_setrange_offset ->
+        {:error, "ERR string exceeds maximum allowed size (512MB)"}
 
       {_offset, ""} ->
         {:error, "ERR offset is out of range"}
