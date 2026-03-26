@@ -310,8 +310,9 @@ defmodule Ferricstore.NamespaceConfig do
         :ets.delete_all_objects(@table)
     end
 
-    # Initialize the fast-path flag for Router.durability_for_key/1.
+    # Initialize the fast-path flags for Router.durability_for_key/1.
     # No async namespaces exist at startup.
+    :persistent_term.put(:ferricstore_durability_mode, :all_quorum)
     :persistent_term.put(:ferricstore_has_async_ns, false)
 
     {:ok, %{}}
@@ -456,19 +457,31 @@ defmodule Ferricstore.NamespaceConfig do
     # Update the fast-path flag for Router.durability_for_key/1.
     # Scan all config entries to check if any namespace uses :async durability.
     # This runs only on config changes (rare), not on every write.
-    has_async =
+    # Compute three-state durability mode for Router fast-path.
+    # Scans all config entries (rare operation — only on config changes).
+    {has_async, has_quorum} =
       try do
         :ets.foldl(
-          fn {_prefix, _window, :async, _at, _by}, _acc -> true
+          fn {_prefix, _window, :async, _at, _by}, {_a, q} -> {true, q}
+             {_prefix, _window, :quorum, _at, _by}, {a, _q} -> {a, true}
              _, acc -> acc
           end,
-          false,
+          {false, false},
           @table
         )
       rescue
-        ArgumentError -> false
+        ArgumentError -> {false, false}
       end
 
+    durability_mode =
+      case {has_async, has_quorum} do
+        {false, _} -> :all_quorum
+        {true, false} -> :all_async
+        {true, true} -> :mixed
+      end
+
+    :persistent_term.put(:ferricstore_durability_mode, durability_mode)
+    # Keep backward compat flag for any code checking the old boolean
     :persistent_term.put(:ferricstore_has_async_ns, has_async)
 
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)

@@ -21,6 +21,76 @@ defmodule Ferricstore.Store.Router do
   import Bitwise, only: [band: 2]
 
   @slot_mask 1023
+  @sandbox_enabled Application.compile_env(:ferricstore, :sandbox_enabled, false)
+
+  # ---------------------------------------------------------------------------
+  # Sandbox resolution (compile-time gated -- zero overhead in production)
+  # ---------------------------------------------------------------------------
+
+  if @sandbox_enabled do
+    @doc false
+    def resolve_shard(idx) do
+      case FerricStore.Sandbox.resolve() do
+        nil -> shard_name(idx)
+        %FerricStore.Sandbox{shards: shards, shard_count: sc} -> elem(shards, rem(idx, sc))
+      end
+    end
+
+    @doc false
+    def resolve_keydir(idx) do
+      case FerricStore.Sandbox.resolve() do
+        nil -> :"keydir_#{idx}"
+        %FerricStore.Sandbox{keydirs: keydirs, shard_count: sc} -> elem(keydirs, rem(idx, sc))
+      end
+    end
+
+    @doc false
+    def resolve_prefix_table(idx) do
+      case FerricStore.Sandbox.resolve() do
+        nil -> PrefixIndex.table_name(idx)
+        %FerricStore.Sandbox{prefix_tables: pt, shard_count: sc} -> elem(pt, rem(idx, sc))
+      end
+    end
+
+    @doc false
+    def effective_shard_count do
+      case FerricStore.Sandbox.resolve() do
+        nil -> :persistent_term.get(:ferricstore_shard_count)
+        %FerricStore.Sandbox{shard_count: sc} -> sc
+      end
+    end
+
+    @doc false
+    def sandbox_shard_for(key) do
+      case FerricStore.Sandbox.resolve() do
+        nil ->
+          slot = slot_for(key)
+          slot_map = :persistent_term.get(:ferricstore_slot_map)
+          elem(slot_map, slot)
+
+        %FerricStore.Sandbox{shard_count: sc} ->
+          rem(:erlang.phash2(key), sc)
+      end
+    end
+
+    @doc false
+    def in_sandbox? do
+      FerricStore.Sandbox.resolve() != nil
+    end
+  else
+    @doc false
+    def resolve_shard(idx), do: shard_name(idx)
+    @doc false
+    def resolve_keydir(idx), do: :"keydir_#{idx}"
+    @doc false
+    def resolve_prefix_table(idx), do: PrefixIndex.table_name(idx)
+    @doc false
+    def effective_shard_count, do: :persistent_term.get(:ferricstore_shard_count)
+    @doc false
+    def sandbox_shard_for(key), do: shard_for(key)
+    @doc false
+    def in_sandbox?, do: false
+  end
 
   # ---------------------------------------------------------------------------
   # Write-path dispatch: quorum writes bypass Shard, async writes use Shard
@@ -123,15 +193,27 @@ defmodule Ferricstore.Store.Router do
 
   # Determines the durability mode for a key by extracting its namespace
   # prefix and looking up the namespace config. Returns `:quorum` or `:async`.
+  #
+  # Three-state fast path via persistent_term (~5ns):
+  #   :all_quorum — no async namespaces configured, return :quorum immediately
+  #   :all_async  — all namespaces are async, return :async immediately
+  #   :mixed      — some quorum, some async, must split key and lookup
+  #
+  # The flag is set by NamespaceConfig whenever durability settings change.
   @spec durability_for_key(binary()) :: :quorum | :async
   defp durability_for_key(key) do
-    prefix =
-      case :binary.split(key, ":") do
-        [^key] -> "_root"
-        [p | _] -> p
-      end
+    case :persistent_term.get(:ferricstore_durability_mode, :all_quorum) do
+      :all_quorum -> :quorum
+      :all_async -> :async
+      :mixed ->
+        prefix =
+          case :binary.split(key, ":") do
+            [^key] -> "_root"
+            [p | _] -> p
+          end
 
-    Ferricstore.NamespaceConfig.durability_for(prefix)
+        Ferricstore.NamespaceConfig.durability_for(prefix)
+    end
   end
 
   # Dispatches writes based on namespace durability mode.
@@ -141,10 +223,26 @@ defmodule Ferricstore.Store.Router do
   #         Like Redis Cluster — client sees the write before replication completes.
   #         Leader crash before replication = data loss (documented trade-off).
   @spec raft_write(non_neg_integer(), binary(), tuple()) :: term()
-  defp raft_write(idx, key, command) do
-    case durability_for_key(key) do
-      :quorum -> quorum_write(idx, command)
-      :async -> async_write(idx, command)
+  if @sandbox_enabled do
+    defp raft_write(idx, key, command) do
+      if in_sandbox?() do
+        # Sandbox: route through the sandbox shard GenServer directly.
+        # The sandbox shard has its own ra system and handles writes via
+        # its raft? path (or direct path). No Batcher, no async writes.
+        GenServer.call(resolve_shard(idx), command)
+      else
+        case durability_for_key(key) do
+          :quorum -> quorum_write(idx, command)
+          :async -> async_write(idx, command)
+        end
+      end
+    end
+  else
+    defp raft_write(idx, key, command) do
+      case durability_for_key(key) do
+        :quorum -> quorum_write(idx, command)
+        :async -> async_write(idx, command)
+      end
     end
   end
 
@@ -418,10 +516,24 @@ defmodule Ferricstore.Store.Router do
   instead of the full key.
   """
   @spec shard_for(binary()) :: non_neg_integer()
-  def shard_for(key) do
-    slot = slot_for(key)
-    slot_map = :persistent_term.get(:ferricstore_slot_map)
-    elem(slot_map, slot)
+  if @sandbox_enabled do
+    def shard_for(key) do
+      case FerricStore.Sandbox.resolve() do
+        nil ->
+          slot = slot_for(key)
+          slot_map = :persistent_term.get(:ferricstore_slot_map)
+          elem(slot_map, slot)
+
+        %FerricStore.Sandbox{shard_count: sc} ->
+          rem(:erlang.phash2(key), sc)
+      end
+    end
+  else
+    def shard_for(key) do
+      slot = slot_for(key)
+      slot_map = :persistent_term.get(:ferricstore_slot_map)
+      elem(slot_map, slot)
+    end
   end
 
   @doc """
@@ -465,10 +577,40 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc """
+  Initializes the pre-computed shard name cache in persistent_term.
+
+  Must be called once during application startup (after SlotMap.init).
+  Stores a tuple of atoms so that `shard_name/1` is a single `elem/2`
+  call (~3ns) instead of string interpolation + atom creation (~120ns).
+  """
+  @spec init_shard_names(pos_integer()) :: :ok
+  def init_shard_names(shard_count) do
+    names = List.to_tuple(for i <- 0..(shard_count - 1), do: :"Ferricstore.Store.Shard.#{i}")
+    :persistent_term.put(:ferricstore_shard_names, names)
+    :ok
+  end
+
+  @doc """
   Returns the registered process name for the shard at `index`.
+
+  Uses a pre-computed tuple from persistent_term for O(1) lookup.
+  Falls back to string interpolation if the cache is not initialized
+  (e.g. during early startup or tests).
   """
   @spec shard_name(non_neg_integer()) :: atom()
-  def shard_name(index), do: :"Ferricstore.Store.Shard.#{index}"
+  def shard_name(index) do
+    case :persistent_term.get(:ferricstore_shard_names, nil) do
+      nil ->
+        :"Ferricstore.Store.Shard.#{index}"
+
+      names when index < tuple_size(names) ->
+        elem(names, index)
+
+      _names ->
+        # Index beyond the pre-computed range (e.g. test shards with ad-hoc indices).
+        :"Ferricstore.Store.Shard.#{index}"
+    end
+  end
 
   # -------------------------------------------------------------------
   # Convenience accessors (dispatch to correct shard)
@@ -488,7 +630,7 @@ defmodule Ferricstore.Store.Router do
   @spec get_file_ref(binary()) :: {binary(), non_neg_integer(), non_neg_integer()} | nil
   def get_file_ref(key) do
     idx = shard_for(key)
-    keydir = :"keydir_#{idx}"
+    keydir = resolve_keydir(idx)
     now = System.os_time(:millisecond)
 
     case ets_get(keydir, key, now) do
@@ -501,7 +643,7 @@ defmodule Ferricstore.Store.Router do
         nil
 
       :miss ->
-        GenServer.call(shard_name(idx), {:get_file_ref, key})
+        GenServer.call(resolve_shard(idx), {:get_file_ref, key})
 
       :no_table ->
         nil
@@ -523,7 +665,7 @@ defmodule Ferricstore.Store.Router do
   @spec get(binary()) :: binary() | nil
   def get(key) do
     idx = shard_for(key)
-    keydir = :"keydir_#{idx}"
+    keydir = resolve_keydir(idx)
     now = System.os_time(:millisecond)
 
     case ets_get(keydir, key, now) do
@@ -538,13 +680,13 @@ defmodule Ferricstore.Store.Router do
 
       :miss ->
         Stats.record_cold_read(key)
-        result = GenServer.call(shard_name(idx), {:get, key})
+        result = GenServer.call(resolve_shard(idx), {:get, key})
         if result != nil, do: Stats.incr_keyspace_hits(), else: Stats.incr_keyspace_misses()
         result
 
       :no_table ->
         Stats.record_cold_read(key)
-        result = GenServer.call(shard_name(idx), {:get, key})
+        result = GenServer.call(resolve_shard(idx), {:get, key})
         if result != nil, do: Stats.incr_keyspace_hits(), else: Stats.incr_keyspace_misses()
         result
     end
@@ -560,7 +702,7 @@ defmodule Ferricstore.Store.Router do
   @spec get_meta(binary()) :: {binary(), non_neg_integer()} | nil
   def get_meta(key) do
     idx = shard_for(key)
-    keydir = :"keydir_#{idx}"
+    keydir = resolve_keydir(idx)
     now = System.os_time(:millisecond)
 
     case ets_get(keydir, key, now) do
@@ -574,11 +716,11 @@ defmodule Ferricstore.Store.Router do
 
       :miss ->
         Stats.record_cold_read(key)
-        GenServer.call(shard_name(idx), {:get_meta, key})
+        GenServer.call(resolve_shard(idx), {:get_meta, key})
 
       :no_table ->
         Stats.record_cold_read(key)
-        GenServer.call(shard_name(idx), {:get_meta, key})
+        GenServer.call(resolve_shard(idx), {:get_meta, key})
     end
   end
 
@@ -669,7 +811,6 @@ defmodule Ferricstore.Store.Router do
         case check_keydir_full(key) do
           :ok ->
             idx = shard_for(key)
-
             raft_write(idx, key, {:put, key, value, expire_at_ms})
 
           {:error, _} = err ->
@@ -709,7 +850,7 @@ defmodule Ferricstore.Store.Router do
   @doc "Returns `true` if `key` exists and is not expired."
   @spec exists?(binary()) :: boolean()
   def exists?(key) do
-    GenServer.call(shard_name(shard_for(key)), {:exists, key})
+    GenServer.call(resolve_shard(shard_for(key)), {:exists, key})
   end
 
   @doc """
@@ -724,7 +865,7 @@ defmodule Ferricstore.Store.Router do
   @spec exists_fast?(binary()) :: boolean()
   def exists_fast?(key) do
     idx = shard_for(key)
-    keydir = :"keydir_#{idx}"
+    keydir = resolve_keydir(idx)
     now = System.os_time(:millisecond)
 
     try do
@@ -817,9 +958,9 @@ defmodule Ferricstore.Store.Router do
   @doc "Returns all live (non-expired, non-deleted) keys across every shard."
   @spec keys() :: [binary()]
   def keys do
-    shard_count = :persistent_term.get(:ferricstore_shard_count)
-    Enum.flat_map(0..(shard_count - 1), fn i ->
-      GenServer.call(shard_name(i), :keys)
+    sc = effective_shard_count()
+    Enum.flat_map(0..(sc - 1), fn i ->
+      GenServer.call(resolve_shard(i), :keys)
     end)
   end
 
@@ -832,19 +973,19 @@ defmodule Ferricstore.Store.Router do
   """
   @spec keys_with_prefix(binary()) :: [binary()]
   def keys_with_prefix(prefix) when is_binary(prefix) do
-    shard_count = :persistent_term.get(:ferricstore_shard_count)
-    Enum.flat_map(0..(shard_count - 1), fn i ->
-      GenServer.call(shard_name(i), {:keys_with_prefix, prefix})
+    sc = effective_shard_count()
+    Enum.flat_map(0..(sc - 1), fn i ->
+      GenServer.call(resolve_shard(i), {:keys_with_prefix, prefix})
     end)
   end
 
   @doc "Returns the count of all live keys across every shard."
   @spec dbsize() :: non_neg_integer()
   def dbsize do
-    shard_count = :persistent_term.get(:ferricstore_shard_count)
-    Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
+    sc = effective_shard_count()
+    Enum.reduce(0..(sc - 1), 0, fn i, acc ->
       try do
-        acc + :ets.info(:"keydir_#{i}", :size)
+        acc + :ets.info(resolve_keydir(i), :size)
       rescue
         ArgumentError -> acc
       end
@@ -858,7 +999,7 @@ defmodule Ferricstore.Store.Router do
   """
   @spec get_version(binary()) :: non_neg_integer()
   def get_version(key) do
-    GenServer.call(shard_name(shard_for(key)), {:get_version, key})
+    GenServer.call(resolve_shard(shard_for(key)), {:get_version, key})
   end
 
   @doc """
@@ -873,7 +1014,7 @@ defmodule Ferricstore.Store.Router do
   @spec get_keydir_file_ref(binary()) :: {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | :miss
   def get_keydir_file_ref(key) do
     idx = shard_for(key)
-    keydir = :"keydir_#{idx}"
+    keydir = resolve_keydir(idx)
     now = System.os_time(:millisecond)
 
     try do
@@ -938,14 +1079,14 @@ defmodule Ferricstore.Store.Router do
     dst_idx = shard_for(destination)
 
     if src_idx == dst_idx do
-      GenServer.call(shard_name(src_idx), {:list_op_lmove, key, destination, from_dir, to_dir})
+      GenServer.call(resolve_shard(src_idx), {:list_op_lmove, key, destination, from_dir, to_dir})
     else
-      case GenServer.call(shard_name(src_idx), {:list_op, key, {:pop_for_move, from_dir}}) do
+      case GenServer.call(resolve_shard(src_idx), {:list_op, key, {:pop_for_move, from_dir}}) do
         nil -> nil
         {:error, _} = err -> err
         element ->
           push_op = if to_dir == :left, do: {:lpush, [element]}, else: {:rpush, [element]}
-          case GenServer.call(shard_name(dst_idx), {:list_op, destination, push_op}) do
+          case GenServer.call(resolve_shard(dst_idx), {:list_op, destination, push_op}) do
             {:error, _} = err -> err
             _length -> element
           end
@@ -954,9 +1095,6 @@ defmodule Ferricstore.Store.Router do
   end
 
   def list_op(key, operation) do
-    # Route through the shard GenServer which builds compound key stores.
-    # Individual element puts/deletes go through Raft via the compound store callbacks.
-    # This replaces the old path that sent {:list_op} as a single Raft entry (blob).
-    GenServer.call(shard_name(shard_for(key)), {:list_op, key, operation})
+    GenServer.call(resolve_shard(shard_for(key)), {:list_op, key, operation})
   end
 end
