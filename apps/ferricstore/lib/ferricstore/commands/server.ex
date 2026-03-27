@@ -470,7 +470,7 @@ defmodule Ferricstore.Commands.Server do
       {"keyspace_hit_ratio", format_float_field(hit_ratio)},
       {"hot_reads", Integer.to_string(hot_est)},
       {"cold_reads", Integer.to_string(cold_est)},
-      {"hot_read_pct", format_float_field(hot_pct)},
+      {"hot_cache_hit_ratio", format_float_field(hot_pct)},
       {"read_sample_rate", "1:#{rate}"},
       {"expired_keys", Integer.to_string(Stats.expired_keys())},
       {"evicted_keys", Integer.to_string(Stats.evicted_keys())}
