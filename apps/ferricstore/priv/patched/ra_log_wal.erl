@@ -922,7 +922,19 @@ open_at_first_record(File) ->
             %% the only version currently supported
             Fd;
         {ok, <<Magic:4/binary, UnknownVersion:8/unsigned>>} ->
-            exit({unknown_wal_file_format, Magic, UnknownVersion})
+            exit({unknown_wal_file_format, Magic, UnknownVersion});
+        eof ->
+            %% Empty WAL file (created but no data written before crash).
+            %% Return the fd positioned at byte 0 — the recovery loop will
+            %% see eof immediately and treat it as an empty WAL.
+            Fd;
+        {ok, PartialHeader} ->
+            %% Truncated header (fewer than 5 bytes written before crash).
+            %% Treat as empty — the WAL is unrecoverable.
+            ?WARN("wal: truncated header in ~ts (~b bytes), treating as empty",
+                  [File, byte_size(PartialHeader)]),
+            {ok, 0} = file:position(Fd, 0),
+            Fd
     end.
 
 close_existing(Fd) ->
