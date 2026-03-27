@@ -1758,11 +1758,8 @@ defmodule FerricstoreServer.Connection do
         {:continue, Encoder.encode(result), new_state}
 
       :miss ->
-        result = nil
-        new_state = maybe_track_read("GET", [lookup_key], result, state)
-        maybe_notify_keyspace("GET", [lookup_key], result)
-        maybe_notify_tracking("GET", [lookup_key], result, state)
-        {:continue, Encoder.encode(result), new_state}
+        # Fall back to normal dispatch for type checking (WRONGTYPE on non-string keys)
+        dispatch_normal("GET", [key], state)
     end
   end
 
