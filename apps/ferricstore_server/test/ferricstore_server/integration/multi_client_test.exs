@@ -516,13 +516,6 @@ defmodule FerricstoreServer.Integration.MultiClientTest do
       sock_a = connect_and_hello(port)
       sock_b = connect_and_hello(port)
 
-      # Disable L1 cache on both connections so cross-client visibility
-      # is not blocked by per-connection caching.
-      send_cmd(sock_a, ["CLIENT", "L1CACHE", "OFF"])
-      assert {:simple, "OK"} == recv_one(sock_a)
-      send_cmd(sock_b, ["CLIENT", "L1CACHE", "OFF"])
-      assert {:simple, "OK"} == recv_one(sock_b)
-
       # A sets the key
       send_cmd(sock_a, ["SET", key, "exists"])
       assert {:simple, "OK"} == recv_one(sock_a)

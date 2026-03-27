@@ -55,7 +55,11 @@ defmodule Ferricstore.Application do
     mode = Ferricstore.Mode.current()
     port = Application.get_env(:ferricstore, :port, 6379)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    shard_count = Application.get_env(:ferricstore, :shard_count, System.schedulers_online())
+    shard_count =
+      case Application.get_env(:ferricstore, :shard_count, 0) do
+        0 -> System.schedulers_online()
+        n when is_integer(n) and n > 0 -> n
+      end
     Logger.info("FerricStore starting in #{mode} mode")
 
     # Create the on-disk directory layout (spec 2B.4) before any process
@@ -391,18 +395,31 @@ defmodule Ferricstore.Application do
   # loaded before the WAL process starts.
   @spec install_patched_wal() :: :ok | :error
   defp install_patched_wal do
-    wal_source =
-      :ferricstore
-      |> :code.priv_dir()
-      |> Path.join("patched/ra_log_wal.erl")
+    priv_dir = :code.priv_dir(:ferricstore)
 
-    # Resolve the ra source directory for include paths. In a Mix dev/test
-    # environment, :code.lib_dir(:ra, :src) may return {:error, :bad_name}
-    # because Mix manages deps differently. Fall back to the deps/ directory.
+    # First try pre-compiled .beam (release mode or after mix compile)
+    beam_path = Path.join(priv_dir, "patched/ra_log_wal.beam")
+
+    cond do
+      File.exists?(beam_path) ->
+        binary = File.read!(beam_path)
+        :code.purge(:ra_log_wal)
+        {:module, :ra_log_wal} = :code.load_binary(:ra_log_wal, ~c"ra_log_wal.erl", binary)
+        Logger.info("Loaded patched ra_log_wal with async fdatasync (pre-compiled)")
+        :ok
+
+      true ->
+        # Fall back to runtime compilation (dev mode with sources available)
+        compile_patched_wal(priv_dir)
+    end
+  end
+
+  defp compile_patched_wal(priv_dir) do
+    wal_source = Path.join(priv_dir, "patched/ra_log_wal.erl")
+
     ra_src_dir =
       case :code.lib_dir(:ra, :src) do
         {:error, _} ->
-          # Mix dev mode: sources are in deps/ra/src
           wal_source
           |> Path.dirname()
           |> Path.join("../../../../deps/ra/src")
@@ -419,6 +436,10 @@ defmodule Ferricstore.Application do
 
     case :compile.file(to_charlist(wal_source), compile_opts) do
       {:ok, :ra_log_wal, binary, _warnings} ->
+        # Save .beam for future use (release builds)
+        beam_path = Path.join(priv_dir, "patched/ra_log_wal.beam")
+        File.write!(beam_path, binary)
+
         :code.purge(:ra_log_wal)
         {:module, :ra_log_wal} = :code.load_binary(:ra_log_wal, ~c"ra_log_wal.erl", binary)
         Logger.info("Loaded patched ra_log_wal with async fdatasync")

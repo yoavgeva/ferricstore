@@ -97,7 +97,14 @@ defmodule FerricstoreServer.Application do
   # child spec suitable for embedding in any supervisor.  The listener will
   # bind to `port` (0 = ephemeral, useful in tests).
   defp ranch_listener_spec(port) do
-    transport_opts = %{socket_opts: [port: port]}
+    transport_opts = %{socket_opts: [
+      port: port,
+      nodelay: true,
+      recbuf: 65_536,
+      sndbuf: 65_536,
+      backlog: 1024,
+      keepalive: true
+    ]}
     protocol_opts = %{}
 
     :ranch.child_spec(

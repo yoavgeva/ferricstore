@@ -299,10 +299,10 @@ defmodule FerricstoreServer.Health.DashboardTest do
       assert String.contains?(body, "Cache Performance")
       assert String.contains?(body, "Shards")
       assert String.contains?(body, "Connections")
-      # Nav links to sub-pages
+      # Sidebar navigation links
       assert String.contains?(body, "Slow Log")
       assert String.contains?(body, "Merge Status")
-      assert String.contains?(body, "Namespace Config")
+      assert String.contains?(body, "Config")
     end
 
     test "Content-Type header is text/html" do
@@ -535,34 +535,34 @@ defmodule FerricstoreServer.Health.DashboardTest do
       NamespaceConfig.reset_all()
     end
 
-    test "namespace config nav link appears after merge status nav link on main page" do
+    test "config sidebar link appears after merge status in sidebar" do
       data = Dashboard.collect()
       html = Dashboard.render(data)
 
       merge_pos = :binary.match(html, "Merge Status") |> elem(0)
-      ns_pos = :binary.match(html, "Namespace Config") |> elem(0)
+      config_pos = :binary.match(html, "Config") |> elem(0)
 
-      assert ns_pos > merge_pos
+      assert config_pos > merge_pos
     end
   end
 
-  describe "GET /dashboard namespace config nav link" do
-    test "HTTP response body contains Namespace Config nav link" do
+  describe "GET /dashboard namespace config sidebar link" do
+    test "HTTP response body contains Config sidebar link" do
       port = HealthEndpoint.port()
       response = http_get(port, "/dashboard")
       body = extract_body(response)
 
-      assert String.contains?(body, "Namespace Config")
+      assert String.contains?(body, "Config")
       assert String.contains?(body, "/dashboard/config")
     end
 
-    test "HTTP response shows defaults label in nav card when no overrides exist" do
+    test "HTTP response sidebar contains config link regardless of overrides" do
       NamespaceConfig.reset_all()
       port = HealthEndpoint.port()
       response = http_get(port, "/dashboard")
       body = extract_body(response)
 
-      assert String.contains?(body, "defaults")
+      assert String.contains?(body, "/dashboard/config")
     end
   end
 

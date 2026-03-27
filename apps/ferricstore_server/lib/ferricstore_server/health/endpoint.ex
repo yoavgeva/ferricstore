@@ -226,6 +226,18 @@ defmodule FerricstoreServer.Health.Endpoint do
     send_html_response(socket, transport, 200, "OK", body)
   end
 
+  defp handle_request(socket, transport, "GET", "/dashboard/storage") do
+    data = FerricstoreServer.Health.Dashboard.collect_storage_page()
+    body = FerricstoreServer.Health.Dashboard.render_storage_page(data)
+    send_html_response(socket, transport, 200, "OK", body)
+  end
+
+  defp handle_request(socket, transport, "GET", "/dashboard/prefixes") do
+    data = FerricstoreServer.Health.Dashboard.collect_prefixes_page()
+    body = FerricstoreServer.Health.Dashboard.render_prefixes_page(data)
+    send_html_response(socket, transport, 200, "OK", body)
+  end
+
   defp handle_request(socket, transport, "GET", "/metrics") do
     body = Ferricstore.Metrics.scrape()
     send_text_response(socket, transport, 200, "OK", body)

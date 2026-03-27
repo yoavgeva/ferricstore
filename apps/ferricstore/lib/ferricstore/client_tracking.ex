@@ -478,9 +478,7 @@ defmodule Ferricstore.ClientTracking do
   end
 
   # Sends the invalidation message (iodata) alongside the pre-extracted key
-  # list to the target connection process. Passing keys directly avoids the
-  # need to re-parse RESP iodata for L1 cache invalidation (~500-1000ns saved
-  # per invalidation push).
+  # list to the target connection process.
   defp safe_send(target_pid, message, keys, socket_sender) do
     if Process.alive?(target_pid) do
       try do

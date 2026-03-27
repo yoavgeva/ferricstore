@@ -29,7 +29,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   additional ports or dependencies are required.
   """
 
-  alias Ferricstore.{Health, MemoryGuard, NamespaceConfig, SlowLog, Stats}
+  alias Ferricstore.{DataDir, Health, MemoryGuard, NamespaceConfig, SlowLog, Stats}
   alias Ferricstore.Merge.Scheduler, as: MergeScheduler
   alias Ferricstore.Raft.Cluster, as: RaftCluster
 
@@ -162,7 +162,9 @@ defmodule FerricstoreServer.Health.Dashboard do
       slowlog: collect_slowlog(),
       merge: collect_merge(),
       namespace_config: NamespaceConfig.get_all(),
-      cluster: collect_cluster()
+      cluster: collect_cluster(),
+      lifecycle: collect_lifecycle(),
+      storage_summary: collect_storage_summary()
     }
   end
 
@@ -174,13 +176,15 @@ defmodule FerricstoreServer.Health.Dashboard do
     page_head("FerricStore Dashboard", 2) <>
       ~s(<body>\n) <>
       render_top_bar(data) <>
-      ~s(<div class="content">) <>
+      ~s(<div class="layout">\n) <>
+      render_sidebar(data, "overview") <>
+      ~s(<div class="main-content">\n<div class="content">) <>
       render_cache_performance(data.hotcold) <>
+      render_lifecycle(data.lifecycle) <>
       render_shards(data.shards) <>
       render_memory_alert(data.memory) <>
       render_connections(data.connections) <>
-      render_nav_links(data) <>
-      ~s(</div>) <>
+      ~s(</div>\n</div>\n</div>\n) <>
       render_footer(data) <>
       ~s(</body>\n</html>\n)
   end
@@ -204,10 +208,13 @@ defmodule FerricstoreServer.Health.Dashboard do
   def render_slowlog_page(data) do
     page_head("Slow Log - FerricStore", 5) <>
       ~s(<body>\n) <>
+      ~s(<div class="layout">\n) <>
+      render_sidebar_static("slowlog") <>
+      ~s(<div class="main-content">\n) <>
       render_subpage_header("Slow Log") <>
       ~s(<div class="content">) <>
       render_slowlog_table(data.slowlog) <>
-      ~s(</div>\n</body>\n</html>\n)
+      ~s(</div>\n</div>\n</div>\n</body>\n</html>\n)
   end
 
   # ---------------------------------------------------------------------------
@@ -229,10 +236,13 @@ defmodule FerricstoreServer.Health.Dashboard do
   def render_merge_page(data) do
     page_head("Merge Status - FerricStore", 10) <>
       ~s(<body>\n) <>
+      ~s(<div class="layout">\n) <>
+      render_sidebar_static("merge") <>
+      ~s(<div class="main-content">\n) <>
       render_subpage_header("Merge Status") <>
       ~s(<div class="content">) <>
       render_merge_table(data.merge) <>
-      ~s(</div>\n</body>\n</html>\n)
+      ~s(</div>\n</div>\n</div>\n</body>\n</html>\n)
   end
 
   # ---------------------------------------------------------------------------
@@ -254,10 +264,13 @@ defmodule FerricstoreServer.Health.Dashboard do
   def render_config_page(data) do
     page_head("Namespace Config - FerricStore", nil) <>
       ~s(<body>\n) <>
+      ~s(<div class="layout">\n) <>
+      render_sidebar_static("config") <>
+      ~s(<div class="main-content">\n) <>
       render_subpage_header("Namespace Config") <>
       ~s(<div class="content">) <>
       render_config_table(data.namespace_config) <>
-      ~s(</div>\n</body>\n</html>\n)
+      ~s(</div>\n</div>\n</div>\n</body>\n</html>\n)
   end
 
   # ---------------------------------------------------------------------------
@@ -282,11 +295,14 @@ defmodule FerricstoreServer.Health.Dashboard do
   def render_raft_page(data) do
     page_head("Raft Consensus - FerricStore", 5) <>
       ~s(<body>\n) <>
+      ~s(<div class="layout">\n) <>
+      render_sidebar_static("raft") <>
+      ~s(<div class="main-content">\n) <>
       render_subpage_header("Raft Consensus") <>
       ~s(<div class="content">) <>
       render_cluster_info(data.cluster) <>
       render_raft_table(data.raft_shards) <>
-      ~s(</div>\n</body>\n</html>\n)
+      ~s(</div>\n</div>\n</div>\n</body>\n</html>\n)
   end
 
   # ---------------------------------------------------------------------------
@@ -311,11 +327,115 @@ defmodule FerricstoreServer.Health.Dashboard do
   def render_clients_page(data) do
     page_head("Client List - FerricStore", 5) <>
       ~s(<body>\n) <>
+      ~s(<div class="layout">\n) <>
+      render_sidebar_static("clients") <>
+      ~s(<div class="main-content">\n) <>
       render_subpage_header("Client List") <>
       ~s(<div class="content">) <>
       render_clients_summary(data.connections) <>
       render_clients_table(data.clients) <>
-      ~s(</div>\n</body>\n</html>\n)
+      ~s(</div>\n</div>\n</div>\n</body>\n</html>\n)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Public API -- Storage Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects data for the storage sub-page.
+  """
+  @spec collect_storage_page() :: %{shards: [map()], total_disk_bytes: non_neg_integer(), total_files: non_neg_integer()}
+  def collect_storage_page do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore")
+
+    shard_storage =
+      Enum.map(0..(shard_count() - 1), fn index ->
+        shard_dir = DataDir.shard_data_path(data_dir, index)
+        {disk_bytes, data_files, hint_files} = scan_shard_dir(shard_dir)
+
+        %{
+          index: index,
+          disk_bytes: disk_bytes,
+          data_file_count: data_files,
+          hint_file_count: hint_files
+        }
+      end)
+
+    total_disk = Enum.reduce(shard_storage, 0, fn s, acc -> acc + s.disk_bytes end)
+    total_files = Enum.reduce(shard_storage, 0, fn s, acc -> acc + s.data_file_count + s.hint_file_count end)
+
+    %{shards: shard_storage, total_disk_bytes: total_disk, total_files: total_files}
+  end
+
+  @doc """
+  Renders the storage sub-page.
+  """
+  @spec render_storage_page(map()) :: binary()
+  def render_storage_page(data) do
+    page_head("Storage - FerricStore", 10) <>
+      ~s(<body>\n) <>
+      ~s(<div class="layout">\n) <>
+      render_sidebar_static("storage") <>
+      ~s(<div class="main-content">\n) <>
+      render_subpage_header("Storage") <>
+      ~s(<div class="content">) <>
+      render_storage_summary(data) <>
+      render_storage_table(data.shards) <>
+      ~s(</div>\n</div>\n</div>\n</body>\n</html>\n)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Public API -- Prefixes Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects data for the key prefixes sub-page.
+  """
+  @spec collect_prefixes_page() :: %{prefixes: [map()], total_sampled: non_neg_integer()}
+  def collect_prefixes_page do
+    # Get hotness data for read counts
+    hotness = Stats.hotness_top(20)
+    hotness_map = Map.new(hotness, fn {prefix, hot, cold, _pct} -> {prefix, {hot, cold}} end)
+
+    # Sample keys from keydir ETS tables to count per-prefix key distribution
+    {prefix_counts, total_sampled} = sample_prefix_counts()
+
+    total_keys = Enum.reduce(prefix_counts, 0, fn {_prefix, count}, acc -> acc + count end)
+
+    prefixes =
+      prefix_counts
+      |> Enum.map(fn {prefix, count} ->
+        pct = if total_keys > 0, do: Float.round(count / total_keys * 100, 1), else: 0.0
+        {hot, cold} = Map.get(hotness_map, prefix, {0, 0})
+
+        %{
+          prefix: prefix,
+          keys: count,
+          pct: pct,
+          hot_reads: hot,
+          cold_reads: cold
+        }
+      end)
+      |> Enum.sort_by(fn p -> p.keys end, :desc)
+      |> Enum.take(50)
+
+    %{prefixes: prefixes, total_sampled: total_sampled}
+  end
+
+  @doc """
+  Renders the key prefixes sub-page.
+  """
+  @spec render_prefixes_page(map()) :: binary()
+  def render_prefixes_page(data) do
+    page_head("Key Prefixes - FerricStore", 10) <>
+      ~s(<body>\n) <>
+      ~s(<div class="layout">\n) <>
+      render_sidebar_static("prefixes") <>
+      ~s(<div class="main-content">\n) <>
+      render_subpage_header("Key Prefixes") <>
+      ~s(<div class="content">) <>
+      render_prefixes_table(data) <>
+      ~s(</div>\n</div>\n</div>\n</body>\n</html>\n)
   end
 
   # ---------------------------------------------------------------------------
@@ -344,6 +464,8 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @spec collect_shards() :: [shard_data()]
   defp collect_shards do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore")
+
     Enum.map(0..(shard_count() - 1), fn index ->
       keydir = :"keydir_#{index}"
 
@@ -374,7 +496,10 @@ defmodule FerricstoreServer.Health.Dashboard do
           ArgumentError -> {"down", 0, 0}
         end
 
-      %{index: index, status: status, keys: keys, ets_memory_bytes: ets_mem}
+      shard_dir = DataDir.shard_data_path(data_dir, index)
+      {disk_bytes, _, _} = scan_shard_dir(shard_dir)
+
+      %{index: index, status: status, keys: keys, ets_memory_bytes: ets_mem, disk_bytes: disk_bytes}
     end)
   end
 
@@ -507,6 +632,124 @@ defmodule FerricstoreServer.Health.Dashboard do
       cluster_size: size,
       nodes: nodes
     }
+  end
+
+  @spec collect_lifecycle() :: map()
+  defp collect_lifecycle do
+    mg_stats =
+      try do
+        MemoryGuard.stats()
+      catch
+        :exit, _ ->
+          %{keydir_bytes: 0, keydir_max_ram: 0, keydir_ratio: 0.0}
+      end
+
+    keydir_full =
+      try do
+        MemoryGuard.keydir_full?()
+      catch
+        :exit, _ -> false
+      end
+
+    uptime = max(Stats.uptime_seconds(), 1)
+    expired = Stats.expired_keys()
+    evicted = Stats.evicted_keys()
+
+    %{
+      expired_total: expired,
+      evicted_total: evicted,
+      expired_per_sec: Float.round(expired / uptime, 1),
+      evicted_per_sec: Float.round(evicted / uptime, 1),
+      keydir_bytes: mg_stats.keydir_bytes,
+      keydir_max_ram: mg_stats.keydir_max_ram,
+      keydir_ratio: mg_stats.keydir_ratio,
+      keydir_full: keydir_full
+    }
+  end
+
+  @spec collect_storage_summary() :: %{total_disk_bytes: non_neg_integer()}
+  defp collect_storage_summary do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore")
+
+    total =
+      Enum.reduce(0..(shard_count() - 1), 0, fn index, acc ->
+        shard_dir = DataDir.shard_data_path(data_dir, index)
+        {disk_bytes, _, _} = scan_shard_dir(shard_dir)
+        acc + disk_bytes
+      end)
+
+    %{total_disk_bytes: total}
+  end
+
+  # Scans a shard directory for disk usage and file counts.
+  # Returns {total_bytes, data_file_count, hint_file_count}.
+  @spec scan_shard_dir(binary()) :: {non_neg_integer(), non_neg_integer(), non_neg_integer()}
+  defp scan_shard_dir(shard_dir) do
+    try do
+      files = File.ls!(shard_dir)
+
+      Enum.reduce(files, {0, 0, 0}, fn file, {bytes, data, hints} ->
+        full_path = Path.join(shard_dir, file)
+
+        file_size =
+          case File.stat(full_path) do
+            {:ok, %{size: size}} -> size
+            _ -> 0
+          end
+
+        is_data = String.ends_with?(file, ".log")
+        is_hint = String.ends_with?(file, ".hint")
+
+        {
+          bytes + file_size,
+          if(is_data, do: data + 1, else: data),
+          if(is_hint, do: hints + 1, else: hints)
+        }
+      end)
+    rescue
+      _ -> {0, 0, 0}
+    end
+  end
+
+  # Samples keys from keydir ETS tables to count per-prefix distribution.
+  # Limited to 10,000 keys total to avoid expensive full scans.
+  @spec sample_prefix_counts() :: {[{binary(), non_neg_integer()}], non_neg_integer()}
+  defp sample_prefix_counts do
+    max_sample = 10_000
+    sc = shard_count()
+    per_shard = div(max_sample, max(sc, 1))
+
+    {counts_map, total} =
+      Enum.reduce(0..(sc - 1), {%{}, 0}, fn i, {acc_map, acc_total} ->
+        keydir = :"keydir_#{i}"
+
+        try do
+          {shard_map, shard_count_val} =
+            :ets.foldl(
+              fn {key, _val, _exp, _lfu, _fid, _off, _vsize}, {m, c} ->
+                if c >= per_shard do
+                  {m, c}
+                else
+                  prefix = Stats.extract_prefix(key)
+                  {Map.update(m, prefix, 1, &(&1 + 1)), c + 1}
+                end
+              end,
+              {%{}, 0},
+              keydir
+            )
+
+          merged =
+            Map.merge(acc_map, shard_map, fn _k, v1, v2 -> v1 + v2 end)
+
+          {merged, acc_total + shard_count_val}
+        rescue
+          _ -> {acc_map, acc_total}
+        catch
+          :exit, _ -> {acc_map, acc_total}
+        end
+      end)
+
+    {Enum.to_list(counts_map), total}
   end
 
   @spec collect_raft_shards() :: [raft_shard_data()]
@@ -666,7 +909,7 @@ defmodule FerricstoreServer.Health.Dashboard do
       </div>
       <div class="sep"></div>
       <div class="metric">
-        <span class="label">Hit Rate</span>
+        <span class="label">Hit Rate #{sampled_tag(hotcold.sample_rate)}</span>
         <span class="val" style="color:#{hit_color};">#{hotcold.hit_ratio}%</span>
       </div>
       <div class="sep"></div>
@@ -703,9 +946,9 @@ defmodule FerricstoreServer.Health.Dashboard do
     <div class="cache-hero">
       <div class="hit-rate-card">
         <div class="hit-rate-num" style="color:#{hit_color};">#{data.hit_ratio}%</div>
-        <div class="hit-rate-label">Hit Rate</div>
+        <div class="hit-rate-label">Hit Rate #{sampled_tag(data.sample_rate)}</div>
         <div class="hit-rate-sub">
-          <span>#{format_rate(data.hits_per_sec)}</span> hits/sec &middot;
+          <span>#{format_rate(data.hits_per_sec)}</span> hits/sec #{sampled_tag(data.sample_rate)} &middot;
           <span>#{format_rate(data.misses_per_sec)}</span> misses/sec
         </div>
       </div>
@@ -713,7 +956,7 @@ defmodule FerricstoreServer.Health.Dashboard do
         <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Where hits come from</div>
         <div class="source-row">
           <div>
-            <div class="source-name">RAM <span class="info-icon" title="Served from ETS in-memory cache. Latency: ~1-5us.">i</span></div>
+            <div class="source-name">RAM #{sampled_tag(data.sample_rate)} <span class="info-icon" title="Served from ETS in-memory cache. Estimated from 1:#{data.sample_rate} sampling. Latency: ~1-5us.">i</span></div>
             <div class="source-detail">fast path (~1-5us)</div>
           </div>
           <div class="source-pct c-green">#{data.ram_ratio}%</div>
@@ -721,12 +964,98 @@ defmodule FerricstoreServer.Health.Dashboard do
         <div class="source-bar-wrap"><div class="source-bar-fill" style="width:#{ram_bar_width}%;background:#3fb950;"></div></div>
         <div class="source-row">
           <div>
-            <div class="source-name">Disk <span class="info-icon" title="Required Bitcask disk read. Latency: ~50-200us. High disk ratio means memory pressure is evicting hot keys.">i</span></div>
-            <div class="source-detail">slow path (~50-200us)</div>
+            <div class="source-name">Disk <span class="info-icon" title="Required Bitcask disk read. This is an exact count (not sampled). Latency: ~50-200us. High disk ratio means memory pressure is evicting hot keys.">i</span></div>
+            <div class="source-detail">slow path (~50-200us) &middot; exact</div>
           </div>
           <div class="source-pct c-yellow">#{data.disk_ratio}%</div>
         </div>
         <div class="source-bar-wrap"><div class="source-bar-fill" style="width:#{disk_bar_width}%;background:#d29922;"></div></div>
+      </div>
+    </div>
+    """
+  end
+
+  @spec render_lifecycle(map()) :: binary()
+  defp render_lifecycle(data) do
+    # Evicted card color
+    evicted_color =
+      cond do
+        data.evicted_per_sec > 100 -> "c-red"
+        data.evicted_total > 0 -> "c-yellow"
+        true -> ""
+      end
+
+    # Keydir capacity bar color and percentage
+    keydir_pct = if data.keydir_max_ram > 0, do: Float.round(data.keydir_ratio * 100, 1), else: 0.0
+    keydir_bar_width = min(keydir_pct, 100)
+
+    keydir_bar_color =
+      cond do
+        keydir_pct > 90 -> "#f85149"
+        keydir_pct > 70 -> "#d29922"
+        true -> "#3fb950"
+      end
+
+    keydir_pct_class =
+      cond do
+        keydir_pct > 90 -> "c-red"
+        keydir_pct > 70 -> "c-yellow"
+        true -> "c-green"
+      end
+
+    keydir_full_alert =
+      if data.keydir_full do
+        """
+        <div style="background:#8b1a1a; border:2px solid #f85149; border-radius:8px; padding:12px 16px; margin-bottom:16px; color:#f85149; font-weight:700; font-size:0.85rem;">
+          KEYDIR FULL &mdash; new writes are being rejected. Increase max_memory or evict keys.
+        </div>
+        """
+      else
+        ""
+      end
+
+    """
+    <div class="section-title">Key Lifecycle</div>
+    #{keydir_full_alert}<div class="cache-hero">
+      <div class="source-card">
+        <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Expired</div>
+        <div class="source-row">
+          <div>
+            <div class="source-name">Total</div>
+          </div>
+          <div class="source-pct">#{format_number(data.expired_total)}</div>
+        </div>
+        <div class="source-row">
+          <div>
+            <div class="source-name">Rate</div>
+          </div>
+          <div class="source-pct">#{format_rate(data.expired_per_sec)}/sec</div>
+        </div>
+      </div>
+      <div class="source-card">
+        <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Evicted</div>
+        <div class="source-row">
+          <div>
+            <div class="source-name">Total</div>
+          </div>
+          <div class="source-pct #{evicted_color}">#{format_number(data.evicted_total)}</div>
+        </div>
+        <div class="source-row">
+          <div>
+            <div class="source-name">Rate</div>
+          </div>
+          <div class="source-pct #{evicted_color}">#{format_rate(data.evicted_per_sec)}/sec</div>
+        </div>
+      </div>
+      <div class="source-card">
+        <div style="font-size:0.75rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">Keydir Capacity</div>
+        <div class="source-row">
+          <div>
+            <div class="source-name">#{format_bytes(data.keydir_bytes)} / #{format_bytes(data.keydir_max_ram)}</div>
+          </div>
+          <div class="source-pct #{keydir_pct_class}">#{keydir_pct}%</div>
+        </div>
+        <div class="source-bar-wrap"><div class="source-bar-fill" style="width:#{keydir_bar_width}%;background:#{keydir_bar_color};"></div></div>
       </div>
     </div>
     """
@@ -744,12 +1073,15 @@ defmodule FerricstoreServer.Health.Dashboard do
             _ -> ~s(<span class="c-red">#{escape(shard.status)}</span>)
           end
 
+        disk_bytes = Map.get(shard, :disk_bytes, 0)
+
         """
         <tr>
           <td>#{shard.index}</td>
           <td>#{status_html}</td>
           <td>#{format_number(shard.keys)}</td>
           <td>#{format_bytes(shard.ets_memory_bytes)}</td>
+          <td>#{format_bytes(disk_bytes)}</td>
         </tr>
         """
       end)
@@ -766,7 +1098,7 @@ defmodule FerricstoreServer.Health.Dashboard do
     <div class="section-title">Shards #{summary_badge}</div>
     <table>
       <thead>
-        <tr><th>Shard</th><th>Status</th><th>Keys</th><th>Memory</th></tr>
+        <tr><th>Shard</th><th>Status</th><th>Keys</th><th>Memory</th><th>Disk</th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -878,52 +1210,7 @@ defmodule FerricstoreServer.Health.Dashboard do
     """
   end
 
-  @spec render_nav_links(dashboard_data()) :: binary()
-  defp render_nav_links(data) do
-    slowlog_count = length(data.slowlog)
-    slowlog_label = if slowlog_count == 0, do: "none", else: "#{slowlog_count} entries"
-
-    active_merges = Enum.count(data.merge, & &1.merging)
-    merge_label = if active_merges > 0, do: "#{active_merges} active", else: "idle"
-
-    config_count = length(data.namespace_config)
-    config_label = if config_count == 0, do: "defaults", else: "#{config_count} overrides"
-
-    cluster = data.cluster
-    raft_label =
-      case cluster.cluster_mode do
-        :standalone -> "standalone"
-        :cluster -> "#{cluster.cluster_size} nodes"
-      end
-
-    conns = data.connections
-
-    """
-    <div class="section-title">More</div>
-    <div class="nav-links">
-      <a class="nav-card" href="/dashboard/slowlog">
-        <span class="nav-card-title">Slow Log</span>
-        <span class="nav-card-count">#{escape(slowlog_label)}</span>
-      </a>
-      <a class="nav-card" href="/dashboard/merge">
-        <span class="nav-card-title">Merge Status</span>
-        <span class="nav-card-count">#{escape(merge_label)}</span>
-      </a>
-      <a class="nav-card" href="/dashboard/config">
-        <span class="nav-card-title">Namespace Config</span>
-        <span class="nav-card-count">#{escape(config_label)}</span>
-      </a>
-      <a class="nav-card" href="/dashboard/raft">
-        <span class="nav-card-title">Raft Consensus</span>
-        <span class="nav-card-count">#{escape(raft_label)}</span>
-      </a>
-      <a class="nav-card" href="/dashboard/clients">
-        <span class="nav-card-title">Client List</span>
-        <span class="nav-card-count">#{format_number(conns.active)} active</span>
-      </a>
-    </div>
-    """
-  end
+  # render_nav_links removed — replaced by sidebar navigation
 
   @spec render_footer(dashboard_data()) :: binary()
   defp render_footer(data) do
@@ -1262,6 +1549,102 @@ defmodule FerricstoreServer.Health.Dashboard do
   end
 
   # ---------------------------------------------------------------------------
+  # HTML rendering -- Storage Sub-page
+  # ---------------------------------------------------------------------------
+
+  @spec render_storage_summary(map()) :: binary()
+  defp render_storage_summary(data) do
+    """
+    <div class="conn-row" style="margin-bottom:16px;">
+      <div class="conn-item">
+        <span class="conn-label">Total Disk </span>
+        <span class="conn-val">#{format_bytes(data.total_disk_bytes)}</span>
+      </div>
+      <div class="conn-item">
+        <span class="conn-label">Total Files </span>
+        <span class="conn-val">#{format_number(data.total_files)}</span>
+      </div>
+    </div>
+    """
+  end
+
+  @spec render_storage_table([map()]) :: binary()
+  defp render_storage_table(shards) do
+    rows =
+      Enum.map_join(shards, "\n", fn shard ->
+        """
+        <tr>
+          <td>#{shard.index}</td>
+          <td>#{format_bytes(shard.disk_bytes)}</td>
+          <td>#{shard.data_file_count}</td>
+          <td>#{shard.hint_file_count}</td>
+        </tr>
+        """
+      end)
+
+    """
+    <div class="section-title">Per-Shard Storage</div>
+    <table>
+      <thead>
+        <tr><th>Shard</th><th>Disk Size</th><th>Data Files</th><th>Hint Files</th></tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
+    """
+  end
+
+  # ---------------------------------------------------------------------------
+  # HTML rendering -- Prefixes Sub-page
+  # ---------------------------------------------------------------------------
+
+  @spec render_prefixes_table(map()) :: binary()
+  defp render_prefixes_table(data) do
+    prefix_count = length(data.prefixes)
+    count_label = if prefix_count == 0, do: "none", else: "#{prefix_count} prefixes"
+
+    rows =
+      case data.prefixes do
+        [] ->
+          ~s(<tr><td colspan="5" class="c-muted">No keys found</td></tr>)
+
+        _ ->
+          Enum.map_join(data.prefixes, "\n", fn p ->
+            """
+            <tr>
+              <td class="mono">#{escape(p.prefix)}</td>
+              <td>#{format_number(p.keys)}</td>
+              <td>#{p.pct}%</td>
+              <td>#{format_number(p.hot_reads)}</td>
+              <td>#{format_number(p.cold_reads)}</td>
+            </tr>
+            """
+          end)
+      end
+
+    sampled_note =
+      if data.total_sampled > 0 do
+        ~s(<div style="margin-top:8px; font-size:0.72rem; color:#484f58;">Sampled #{format_number(data.total_sampled)} keys from keydir ETS tables</div>)
+      else
+        ""
+      end
+
+    """
+    <div class="section-title">Key Prefixes <span class="badge badge-idle">#{escape(count_label)}</span></div>
+    <table>
+      <thead>
+        <tr><th>Prefix</th><th>Keys</th><th>% of Total</th><th>Hot Reads #{sampled_tag(:persistent_term.get(:ferricstore_read_sample_rate, 100))}</th><th>Cold Reads</th></tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
+    #{sampled_note}
+    """
+  end
+
+  # ---------------------------------------------------------------------------
   # Shared HTML scaffolding
   # ---------------------------------------------------------------------------
 
@@ -1365,17 +1748,19 @@ defmodule FerricstoreServer.Health.Dashboard do
         .conn-item .conn-label { font-size: 0.7rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.3px; }
         .conn-item .conn-val { font-weight: 700; color: #f0f6fc; }
 
-        /* Navigation cards */
-        .nav-links { display: flex; gap: 12px; flex-wrap: wrap; }
-        .nav-card { display: flex; flex-direction: column; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 20px; min-width: 160px; text-decoration: none; color: inherit; transition: border-color 0.15s, background 0.15s; flex: 1; }
-        .nav-card:hover { border-color: #58a6ff; background: #1c2128; }
-        .nav-card-title { font-size: 0.85rem; font-weight: 600; color: #58a6ff; }
-        .nav-card-count { font-size: 0.75rem; color: #8b949e; margin-top: 4px; }
+        /* Sidebar */
+        .layout { display: flex; min-height: calc(100vh - 54px); }
+        .sidebar { width: 200px; flex-shrink: 0; background: #161b22; border-right: 1px solid #30363d; padding: 12px 0; position: sticky; top: 0; height: calc(100vh - 54px); overflow-y: auto; }
+        .sidebar a { display: flex; align-items: center; gap: 8px; padding: 8px 16px; text-decoration: none; color: #c9d1d9; font-size: 0.82rem; transition: background 0.1s; border-left: 3px solid transparent; }
+        .sidebar a:hover { background: #1c2128; }
+        .sidebar a.active { background: #1c2128; border-left-color: #58a6ff; color: #58a6ff; font-weight: 600; }
+        .sidebar .nav-label { flex: 1; }
+        .sidebar .nav-badge { font-size: 0.65rem; color: #8b949e; background: #21262d; padding: 1px 6px; border-radius: 8px; white-space: nowrap; }
+        .sidebar .nav-section { font-size: 0.65rem; color: #484f58; text-transform: uppercase; letter-spacing: 0.5px; padding: 16px 16px 4px; }
+        .main-content { flex: 1; min-width: 0; }
 
-        /* Sub-page header */
-        .subpage-header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; }
-        .back-link { color: #58a6ff; text-decoration: none; font-size: 0.85rem; font-weight: 500; white-space: nowrap; }
-        .back-link:hover { text-decoration: underline; }
+        /* Sub-page header (still used inside main-content on sub-pages) */
+        .subpage-header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: #0d1117; border-bottom: 1px solid #30363d; }
         .subpage-title { font-size: 1.1rem; font-weight: 700; color: #f0f6fc; }
 
         /* Footer */
@@ -1386,8 +1771,16 @@ defmodule FerricstoreServer.Health.Dashboard do
 
         .mono { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem; }
 
+        /* Sampling indicator */
+        .sampled-tag { display: inline-block; font-size: 0.55rem; color: #8b949e; background: #21262d; padding: 0px 4px; border-radius: 3px; vertical-align: middle; font-weight: 400; letter-spacing: 0; text-transform: none; cursor: help; }
+
         /* Responsive */
-        @media (max-width: 600px) {
+        @media (max-width: 768px) {
+          .layout { flex-direction: column; }
+          .sidebar { width: 100%; height: auto; position: static; border-right: none; border-bottom: 1px solid #30363d; padding: 8px 0; display: flex; flex-wrap: wrap; overflow-x: auto; }
+          .sidebar a { padding: 6px 12px; border-left: none; border-bottom: 2px solid transparent; font-size: 0.75rem; }
+          .sidebar a.active { border-left: none; border-bottom-color: #58a6ff; }
+          .sidebar .nav-section { display: none; }
           .top-bar { gap: 12px; padding: 10px 12px; }
           .top-bar .metric .val { font-size: 0.9rem; }
           .top-bar .sep { display: none; }
@@ -1395,8 +1788,6 @@ defmodule FerricstoreServer.Health.Dashboard do
           .hit-rate-num { font-size: 2.2rem; }
           .cache-hero { flex-direction: column; }
           .hit-rate-card { min-width: unset; }
-          .nav-links { flex-direction: column; }
-          .nav-card { min-width: unset; }
         }
       </style>
     </head>
@@ -1407,15 +1798,88 @@ defmodule FerricstoreServer.Health.Dashboard do
   defp render_subpage_header(title) do
     """
     <div class="subpage-header">
-      <a class="back-link" href="/dashboard">&larr; Dashboard</a>
       <span class="subpage-title">#{escape(title)}</span>
     </div>
+    """
+  end
+
+  # Sidebar with live badge data (used on main dashboard)
+  @spec render_sidebar(dashboard_data(), String.t()) :: binary()
+  defp render_sidebar(data, active) do
+    slowlog_count = length(data.slowlog)
+    slowlog_badge = if slowlog_count == 0, do: "", else: "#{slowlog_count}"
+
+    active_merges = Enum.count(data.merge, & &1.merging)
+    merge_badge = if active_merges > 0, do: "#{active_merges}", else: ""
+
+    config_count = length(data.namespace_config)
+    config_badge = if config_count == 0, do: "", else: "#{config_count}"
+
+    conns = data.connections
+    conns_badge = if conns.active > 0, do: "#{conns.active}", else: ""
+
+    storage_badge = format_bytes(data.storage_summary.total_disk_bytes)
+
+    sidebar_html(active, %{
+      "slowlog" => slowlog_badge,
+      "merge" => merge_badge,
+      "config" => config_badge,
+      "clients" => conns_badge,
+      "storage" => storage_badge
+    })
+  end
+
+  # Sidebar without live data (used on sub-pages to avoid expensive data collection)
+  @spec render_sidebar_static(String.t()) :: binary()
+  defp render_sidebar_static(active) do
+    sidebar_html(active, %{"slowlog" => "", "merge" => "", "config" => "", "clients" => "", "storage" => ""})
+  end
+
+  defp sidebar_html(active, badges) do
+    items = [
+      {"overview", "/dashboard", "Overview"},
+      {"slowlog", "/dashboard/slowlog", "Slow Log"},
+      {"merge", "/dashboard/merge", "Merge Status"},
+      {"storage", "/dashboard/storage", "Storage"},
+      {"raft", "/dashboard/raft", "Raft Consensus"},
+      {"config", "/dashboard/config", "Config"},
+      {"clients", "/dashboard/clients", "Clients"},
+      {"prefixes", "/dashboard/prefixes", "Key Prefixes"}
+    ]
+
+    links =
+      Enum.map_join(items, "\n", fn {key, href, label} ->
+        active_class = if key == active, do: " active", else: ""
+        badge_val = Map.get(badges, key, "")
+
+        badge_html =
+          if badge_val != "" and badge_val != nil do
+            ~s(<span class="nav-badge">#{escape(to_string(badge_val))}</span>)
+          else
+            ""
+          end
+
+        ~s(<a class="#{active_class}" href="#{href}"><span class="nav-label">#{escape(label)}</span>#{badge_html}</a>)
+      end)
+
+    """
+    <nav class="sidebar">
+      #{links}
+    </nav>
     """
   end
 
   # ---------------------------------------------------------------------------
   # Formatting helpers (private)
   # ---------------------------------------------------------------------------
+
+  # Renders a small "~1:N" tag indicating a value is estimated from sampling.
+  # Shows the actual configured sample rate so the user knows the precision.
+  @spec sampled_tag(pos_integer()) :: binary()
+  defp sampled_tag(1), do: ""  # 1:1 = every request, no sampling
+  defp sampled_tag(rate) do
+    ~s(<span class="sampled-tag" title="Estimated from 1:#{rate} sampling">~1:#{rate}</span>)
+  end
 
   @spec hit_rate_color(float()) :: binary()
   defp hit_rate_color(ratio) do

@@ -667,9 +667,6 @@ defmodule FerricstoreServer.ConnectionMemoryBenchTest do
   # Summary: recommendations
   # -------------------------------------------------------------------------
 
-  @l1_max_entries Application.compile_env(:ferricstore, :l1_cache_max_entries, 64)
-  @l1_max_bytes Application.compile_env(:ferricstore, :l1_cache_max_bytes, 1_048_576)
-
   describe "summary" do
     @tag timeout: 10_000
     test "prints recommendations based on connection.ex analysis" do
@@ -682,7 +679,6 @@ defmodule FerricstoreServer.ConnectionMemoryBenchTest do
         - multi_queue:   NO LIMIT -- list grows unbounded during MULTI
         - pipeline size: NO LIMIT -- parsed command list is unbounded
         - value size:    NO LIMIT -- values pass through as-is
-        - L1 cache:      BOUNDED  -- #{inspect(@l1_max_entries)} entries, #{inspect(@l1_max_bytes)} bytes max
 
         Recommended limits to add to connection.ex:
         --------------------------------------------------

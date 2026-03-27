@@ -1,0 +1,37 @@
+## FerricStore BEAM VM configuration
+## Applied at release boot via `mix release`
+
+## Node name
+-sname ferricstore
+
+## Max processes (default 262144, need headroom for many connections)
++P 1048576
+
+## Max ports/file descriptors (default 65536, each connection = 1 port)
++Q 1048576
+
+## Scheduler bind type: bind to CPU cores to reduce cache thrashing
++stbt db
+
+## Scheduler busy-wait: spin-wait instead of sleeping
+## Catches incoming TCP messages faster (~10-30us less latency)
+## Tradeoff: uses more CPU when idle
++sbwt very_short
+
+## Scheduler wakeup threshold: wake schedulers faster on new work
++swt very_low
+
+## Scheduler utilization balancing: distribute work more evenly
++sub true
+
+## Async thread pool: used for file I/O (Bitcask disk reads, WAL writes)
+## Default is 1; 128 allows many concurrent disk operations
++A 128
+
+## Binary allocator strategy: address-order best-fit
+## Better for workloads with many short-lived binaries (RESP parsing)
++MBas aobf
++MHas aobf
+
+## Disable carrier utilization limit for better allocator throughput
++Muacul 0

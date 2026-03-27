@@ -16,6 +16,7 @@ defmodule Ferricstore.Umbrella.MixProject do
             # NO ferricstore_ecto — it's a library for Phoenix apps
           ],
           include_executables_for: [:unix],
+          rel_templates_path: "rel",
           steps: [:assemble, :tar]
         ]
       ]
