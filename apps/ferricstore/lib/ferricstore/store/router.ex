@@ -113,33 +113,20 @@ defmodule Ferricstore.Store.Router do
   # so that WATCH/EXEC can detect the mutation. False positives (incrementing
   # when no state actually changed) are safe -- they only cause a spurious
   # WATCH failure, which the client retries.
-  # Per-shard leader cache in persistent_term. Updated on :not_leader rejection.
-  # On a single node, the local server IS the leader — cache hit every time.
-  # On multi-node, this avoids the follower→leader forwarding hop after the
-  # first write discovers the leader.
-  defp cached_leader(idx) do
-    case :persistent_term.get({:ferricstore_shard_leader, idx}, nil) do
-      nil -> Ferricstore.Raft.Cluster.shard_server_id(idx)
-      leader -> leader
-    end
-  end
-
-  defp cache_leader(idx, leader) do
-    :persistent_term.put({:ferricstore_shard_leader, idx}, leader)
-  end
-
   @spec quorum_write(non_neg_integer(), tuple()) :: term()
   defp quorum_write(idx, command) do
-    leader = cached_leader(idx)
+    shard_id = Ferricstore.Raft.Cluster.shard_server_id(idx)
     corr = make_ref()
 
     result =
       try do
-        case :ra.pipeline_command(leader, command, corr, :normal) do
+        case :ra.pipeline_command(shard_id, command, corr, :normal) do
           :ok ->
-            wait_for_ra_applied(corr, leader, idx, command)
+            wait_for_ra_applied(corr, shard_id, idx, command)
 
           {:error, :noproc} ->
+            # Ra server not alive (shard restarting). Fall back to Shard
+            # GenServer which re-initialises ra during its init.
             GenServer.call(shard_name(idx), command)
 
           {:error, _reason} ->
@@ -167,10 +154,9 @@ defmodule Ferricstore.Store.Router do
   @spec wait_for_ra_applied(reference(), :ra.server_id(), non_neg_integer(), tuple()) :: term()
   defp wait_for_ra_applied(corr, shard_id, idx, command) do
     receive do
-      {:ra_event, leader_hint, {:applied, applied_list}} ->
+      {:ra_event, _leader, {:applied, applied_list}} ->
         case List.keyfind(applied_list, corr, 0) do
           {^corr, result} ->
-            if leader_hint not in [nil, :undefined], do: cache_leader(idx, leader_hint)
             result
 
           nil ->
@@ -179,18 +165,18 @@ defmodule Ferricstore.Store.Router do
         end
 
       {:ra_event, _from, {:rejected, {:not_leader, maybe_leader, ^corr}}} ->
-        # Leader changed. Cache the new leader and retry directly.
-        new_leader =
+        # Leader changed. Retry once with the suggested leader, or fall
+        # back to the Shard GenServer if no leader hint is available.
+        leader =
           if maybe_leader not in [nil, :undefined],
             do: maybe_leader,
             else: shard_id
 
-        cache_leader(idx, new_leader)
         retry_corr = make_ref()
 
-        case :ra.pipeline_command(new_leader, command, retry_corr, :normal) do
+        case :ra.pipeline_command(leader, command, retry_corr, :normal) do
           :ok ->
-            wait_for_ra_applied(retry_corr, new_leader, idx, command)
+            wait_for_ra_applied(retry_corr, leader, idx, command)
 
           _err ->
             GenServer.call(shard_name(idx), command)
