@@ -396,58 +396,21 @@ defmodule Ferricstore.Application do
   @spec install_patched_wal() :: :ok | :error
   defp install_patched_wal do
     priv_dir = :code.priv_dir(:ferricstore)
-
-    # First try pre-compiled .beam (release mode or after mix compile)
     beam_path = Path.join(priv_dir, "patched/ra_log_wal.beam")
 
-    cond do
-      File.exists?(beam_path) ->
-        binary = File.read!(beam_path)
-        :code.purge(:ra_log_wal)
-        {:module, :ra_log_wal} = :code.load_binary(:ra_log_wal, ~c"ra_log_wal.erl", binary)
-        Logger.info("Loaded patched ra_log_wal with async fdatasync (pre-compiled)")
-        :ok
+    if File.exists?(beam_path) do
+      binary = File.read!(beam_path)
+      :code.purge(:ra_log_wal)
+      {:module, :ra_log_wal} = :code.load_binary(:ra_log_wal, ~c"ra_log_wal.erl", binary)
+      Logger.info("Loaded patched ra_log_wal with async fdatasync")
+      :ok
+    else
+      Logger.error(
+        "Patched ra_log_wal.beam not found at #{beam_path}. " <>
+          "Run `mix compile` to generate it from priv/patched/ra_log_wal.erl"
+      )
 
-      true ->
-        # Fall back to runtime compilation (dev mode with sources available)
-        compile_patched_wal(priv_dir)
-    end
-  end
-
-  defp compile_patched_wal(priv_dir) do
-    wal_source = Path.join(priv_dir, "patched/ra_log_wal.erl")
-
-    ra_src_dir =
-      case :code.lib_dir(:ra, :src) do
-        {:error, _} ->
-          wal_source
-          |> Path.dirname()
-          |> Path.join("../../../../deps/ra/src")
-          |> Path.expand()
-          |> to_charlist()
-
-        dir ->
-          to_charlist(dir)
-      end
-
-    compile_opts =
-      [:binary, :return_errors, :return_warnings,
-       {:i, ra_src_dir}]
-
-    case :compile.file(to_charlist(wal_source), compile_opts) do
-      {:ok, :ra_log_wal, binary, _warnings} ->
-        # Save .beam for future use (release builds)
-        beam_path = Path.join(priv_dir, "patched/ra_log_wal.beam")
-        File.write!(beam_path, binary)
-
-        :code.purge(:ra_log_wal)
-        {:module, :ra_log_wal} = :code.load_binary(:ra_log_wal, ~c"ra_log_wal.erl", binary)
-        Logger.info("Loaded patched ra_log_wal with async fdatasync")
-        :ok
-
-      {:error, errors, _warnings} ->
-        Logger.error("Failed to compile patched ra_log_wal: #{inspect(errors)}")
-        :error
+      :error
     end
   end
 end

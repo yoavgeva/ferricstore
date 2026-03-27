@@ -14,7 +14,7 @@ defmodule Ferricstore.MixProject do
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      compilers: Mix.compilers(),
+      compilers: Mix.compilers() ++ [:patched_wal],
       deps: deps(),
       package: package()
     ]
