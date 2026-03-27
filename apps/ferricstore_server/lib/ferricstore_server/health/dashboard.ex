@@ -452,10 +452,10 @@ defmodule FerricstoreServer.Health.Dashboard do
       end)
 
     """
-    <h2>Per-Shard Status</h2>
+    <h2>Per-Shard Status <span class="info-icon" title="Number of parallel key partitions. Each shard has its own ETS table and Raft group. Default: one per CPU core.">i</span></h2>
     <table>
       <thead>
-        <tr><th>Shard</th><th>Status</th><th>Keys</th><th>ETS Memory</th></tr>
+        <tr><th>Shard</th><th>Status <span class="info-icon" title="Whether this shard's Raft group has an elected leader. No leader = writes fail.">i</span></th><th>Keys <span class="info-icon" title="Number of keys owned by this shard.">i</span></th><th>ETS Memory <span class="info-icon" title="ETS memory used by this shard's keydir table.">i</span></th></tr>
       </thead>
       <tbody>
         #{rows}
@@ -488,19 +488,19 @@ defmodule FerricstoreServer.Health.Dashboard do
     <h2>Hot/Cold Metrics</h2>
     <div class="grid">
       <div class="card">
-        <div class="label">Hot Read %</div>
+        <div class="label">Hot Read % <span class="info-icon" title="Percentage of hits served from ETS (RAM) vs Bitcask (disk). Low ratio means values are being evicted — consider increasing max_memory.">i</span></div>
         <div class="value">#{Float.round(data.hot_read_pct, 2)}%</div>
       </div>
       <div class="card">
-        <div class="label">Cold Reads/sec</div>
+        <div class="label">Cold Reads/sec <span class="info-icon" title="Keys with values on disk only. Reads take ~50-200μs (NVMe) via Bitcask pread.">i</span></div>
         <div class="value">#{Float.round(data.cold_reads_per_sec, 2)}</div>
       </div>
       <div class="card">
-        <div class="label">Total Hot Reads</div>
+        <div class="label">Total Hot Reads <span class="info-icon" title="Keys with values cached in ETS (RAM). Reads take ~1-5μs.">i</span></div>
         <div class="value">#{format_number(data.total_hot)}</div>
       </div>
       <div class="card">
-        <div class="label">Total Cold Reads</div>
+        <div class="label">Total Cold Reads <span class="info-icon" title="Keys with values on disk only. Reads take ~50-200μs (NVMe) via Bitcask pread.">i</span></div>
         <div class="value">#{format_number(data.total_cold)}</div>
       </div>
     </div>
@@ -557,7 +557,7 @@ defmodule FerricstoreServer.Health.Dashboard do
     <h2>Memory Pressure</h2>
     <div class="grid">
       <div class="card">
-        <div class="label">Pressure Level</div>
+        <div class="label">Pressure Level <span class="info-icon" title="ok = normal, warning = 70-85%, pressure = 85-95% (evicting), reject = 95%+ (writes rejected).">i</span></div>
         <div class="value"><span class="badge #{badge_class}">#{escape(level_str)}</span></div>
       </div>
       <div class="card">
@@ -565,7 +565,7 @@ defmodule FerricstoreServer.Health.Dashboard do
         <div class="value">#{pct}%</div>
       </div>
       <div class="card">
-        <div class="label">Used / Max</div>
+        <div class="label">Used / Max <span class="info-icon" title="Configured maximum ETS memory budget. Set via FERRICSTORE_MAX_MEMORY.">i</span></div>
         <div class="value">#{format_bytes(data.total_bytes)} / #{format_bytes(data.max_bytes)}</div>
       </div>
       <div class="card">
@@ -590,7 +590,7 @@ defmodule FerricstoreServer.Health.Dashboard do
     <h2>Connections</h2>
     <div class="grid">
       <div class="card">
-        <div class="label">Active Connections</div>
+        <div class="label">Active Connections <span class="info-icon" title="Active TCP client connections. Each connection is an independent Erlang process.">i</span></div>
         <div class="value">#{format_number(data.active)}</div>
       </div>
       <div class="card">
