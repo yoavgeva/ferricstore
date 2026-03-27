@@ -425,7 +425,7 @@ defmodule FerricstoreServer.Health.Dashboard do
       </div>
       <div class="card">
         <div class="label">Connections <span class="info-icon" title="Active TCP client connections right now. Each connection is an independent Erlang process.">i</span></div>
-        <div class="value">#{format_number(data.connections.active)}</div>
+        <div class="value">#{format_number(Ferricstore.Stats.active_connections())}</div>
       </div>
     </div>
     """
