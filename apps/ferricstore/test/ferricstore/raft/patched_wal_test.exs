@@ -501,6 +501,100 @@ defmodule Ferricstore.Raft.PatchedWalTest do
       end
     end
 
+    test "rollover under write pressure doesn't lose entries (drain_pending_sync)" do
+      # This is the critical race: if writes are in pending_sync (written to
+      # kernel buffer but not yet fdatasync'd / notified), and rollover happens,
+      # drain_pending_sync MUST flush and update Wal#wal.ranges before the old
+      # WAL file's ranges are sent to the segment writer. If ranges are stale,
+      # the segment writer won't know about those entries and they'll be lost
+      # when the old .wal file is deleted.
+      #
+      # Strategy: flood writes from many concurrent tasks, force rollover
+      # mid-flood, then verify EVERY write is readable after.
+      prefix = ukey("drain_race")
+      total_writers = 30
+      writes_per = 50
+      barrier = :counters.new(1, [:atomics])
+
+      # Start writers that write as fast as possible
+      tasks =
+        for w <- 1..total_writers do
+          Task.async(fn ->
+            # Wait for all tasks to be spawned before starting
+            :counters.add(barrier, 1, 1)
+
+            for i <- 1..writes_per do
+              key = "#{prefix}:#{w}:#{i}"
+              :ok = FerricStore.set(key, "w#{w}_i#{i}")
+
+              # Trigger rollover mid-flight from one writer
+              if w == 1 and i == 25 do
+                :ra_log_wal.force_roll_over(wal_name())
+              end
+            end
+          end)
+        end
+
+      Task.await_many(tasks, 60_000)
+
+      # The critical assertion: EVERY write must be readable.
+      # If drain_pending_sync failed to update ranges before rollover,
+      # some entries written just before rollover would be lost.
+      missing = []
+
+      missing =
+        for w <- 1..total_writers, i <- 1..writes_per, reduce: missing do
+          acc ->
+            key = "#{prefix}:#{w}:#{i}"
+            {:ok, val} = FerricStore.get(key)
+
+            if val != "w#{w}_i#{i}" do
+              [{key, val} | acc]
+            else
+              acc
+            end
+        end
+
+      assert missing == [],
+             "Lost #{length(missing)} entries during rollover: #{inspect(Enum.take(missing, 5))}"
+    end
+
+    test "rollover + immediate second rollover doesn't lose entries" do
+      # Double rollover stress: two rollovers in quick succession with writes
+      # between them. Tests that drain_pending_sync handles the sync_in_flight
+      # → wait → re-sync path correctly.
+      prefix = ukey("double_roll")
+
+      for i <- 1..100 do
+        :ok = FerricStore.set("#{prefix}:#{i}", "batch1")
+      end
+
+      :ra_log_wal.force_roll_over(wal_name())
+
+      for i <- 101..200 do
+        :ok = FerricStore.set("#{prefix}:#{i}", "batch2")
+      end
+
+      :ra_log_wal.force_roll_over(wal_name())
+
+      for i <- 201..300 do
+        :ok = FerricStore.set("#{prefix}:#{i}", "batch3")
+      end
+
+      # Verify all 3 batches across 2 rollovers
+      for i <- 1..100 do
+        {:ok, "batch1"} = FerricStore.get("#{prefix}:#{i}")
+      end
+
+      for i <- 101..200 do
+        {:ok, "batch2"} = FerricStore.get("#{prefix}:#{i}")
+      end
+
+      for i <- 201..300 do
+        {:ok, "batch3"} = FerricStore.get("#{prefix}:#{i}")
+      end
+    end
+
     test "WAL counter resets after rollover" do
       # fill_ratio should drop after rollover (new empty file)
       prefix = ukey("counter_reset")
