@@ -25,10 +25,10 @@ open_at_first_record(File) ->
 
 ```elixir
 # 1. Add ra to a fresh mix project:
-#    {:ra, "~> 2.15"}
+#    {:ra, "~> 3.1"}
 
 # 2. Run this script:
-Mix.install([{:ra, "~> 2.15"}])
+Mix.install([{:ra, "~> 3.1"}])
 
 dir = Path.join(System.tmp_dir!(), "ra_eof_bug_#{System.unique_integer([:positive])}")
 File.mkdir_p!(dir)
