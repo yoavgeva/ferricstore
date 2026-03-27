@@ -216,6 +216,7 @@ defmodule FerricstoreServer.Health.Dashboard do
         .badge-idle { background: #30363d; color: #8b949e; }
         .mono { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem; }
         .footer { margin-top: 24px; color: #484f58; font-size: 0.75rem; text-align: center; }
+        .info-icon { display: inline-block; width: 14px; height: 14px; border-radius: 50%; background: #30363d; color: #8b949e; font-size: 10px; text-align: center; line-height: 14px; cursor: help; margin-left: 4px; vertical-align: middle; }
       </style>
     </head>
     <body>
@@ -407,24 +408,24 @@ defmodule FerricstoreServer.Health.Dashboard do
         <div class="value #{status_class}">#{escape(Atom.to_string(data.status))}</div>
       </div>
       <div class="card">
-        <div class="label">Uptime</div>
+        <div class="label">Uptime <span class="info-icon" title="Time since FerricStore started. Restarts reset this counter.">i</span></div>
         <div class="value">#{format_uptime(data.uptime_seconds)}</div>
       </div>
       <div class="card">
-        <div class="label">Total Keys</div>
+        <div class="label">Total Keys <span class="info-icon" title="Total keys across all shards. Includes both hot (in RAM) and cold (on disk) keys.">i</span></div>
         <div class="value">#{format_number(data.total_keys)}</div>
       </div>
       <div class="card">
-        <div class="label">Memory</div>
+        <div class="label">Memory <span class="info-icon" title="Total ETS memory across all shard keydirs. Includes key metadata, hot values, and LFU counters.">i</span></div>
         <div class="value">#{format_bytes(data.memory_bytes)}</div>
       </div>
       <div class="card">
-        <div class="label">Commands</div>
+        <div class="label">Commands <span class="info-icon" title="Commands processed per second across all connections. Includes both reads and writes.">i</span></div>
         <div class="value">#{format_number(data.total_commands)}</div>
       </div>
       <div class="card">
-        <div class="label">Connections (lifetime)</div>
-        <div class="value">#{format_number(data.total_connections)}</div>
+        <div class="label">Connections <span class="info-icon" title="Active TCP client connections right now. Each connection is an independent Erlang process.">i</span></div>
+        <div class="value">#{format_number(data.connections.active)}</div>
       </div>
     </div>
     """
