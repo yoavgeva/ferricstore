@@ -2,44 +2,36 @@ defmodule FerricstoreServer.Health.Dashboard do
   @moduledoc """
   Self-contained HTML dashboard for FerricStore observability (spec 7.3).
 
-  Renders a single-page HTML dashboard with no external dependencies -- no
-  Phoenix, no JavaScript frameworks, no CSS libraries. The page auto-refreshes
-  every 2 seconds via an HTML `<meta http-equiv="refresh">` tag.
+  Renders a multi-page HTML dashboard with no external dependencies -- no
+  Phoenix, no JavaScript frameworks, no CSS libraries. Pages auto-refresh
+  via HTML `<meta http-equiv="refresh">` tags at page-appropriate intervals.
 
-  ## Design
+  ## Pages
 
-  The dashboard follows a progressive-disclosure layout optimized for
-  glanceability:
-
-  1. **Top bar** -- status badge, ops/sec, hit rate, memory bar, connections
-  2. **Cache Performance** -- hit rate gauge + RAM vs disk breakdown
-  3. **Shards** -- compact status table
-  4. **Memory** -- only shown when pressure level != :ok
-  5. **Footer** -- uptime, version, sample rate note, refresh indicator
-
-  Slow log, merge status, and namespace config are available as collapsed
-  sections for on-demand inspection.
+  1. **Main dashboard** (`/dashboard`) -- top bar, cache perf, shards, memory,
+     connections, and navigation links to sub-pages. Refreshes every 2s.
+  2. **Slow Log** (`/dashboard/slowlog`) -- full slow log table. Refreshes 5s.
+  3. **Merge Status** (`/dashboard/merge`) -- per-shard merge/compaction. Refreshes 10s.
+  4. **Namespace Config** (`/dashboard/config`) -- namespace overrides. No refresh.
+  5. **Raft Consensus** (`/dashboard/raft`) -- per-shard Raft health, leader,
+     term, applied/commit index. The multi-node view. Refreshes 5s.
+  6. **Client List** (`/dashboard/clients`) -- active client connections with
+     IP, age, idle time. Refreshes 5s.
 
   ## Architecture
 
-  This module is a pure function module with no process state. `collect/0`
-  gathers data from existing modules (`Stats`, `Health`, `MemoryGuard`,
-  `SlowLog`, `Merge.Scheduler`, `Metrics`) and `render/1` turns that data
-  into an HTML binary string.
+  This module is a pure function module with no process state. Each page has
+  a `collect_*` function that gathers data and a `render_*` function that
+  produces HTML. The endpoint routes to the appropriate pair.
 
-  The dashboard is served by `FerricstoreServer.Health.Endpoint` at `GET /dashboard`.
+  The dashboard is served by `FerricstoreServer.Health.Endpoint` at `GET /dashboard*`.
   Since it reuses the existing Ranch health listener (default port 9090), no
   additional ports or dependencies are required.
-
-  ## Usage
-
-      # Programmatic access to dashboard data
-      data = FerricstoreServer.Health.Dashboard.collect()
-      html = FerricstoreServer.Health.Dashboard.render(data)
   """
 
   alias Ferricstore.{Health, MemoryGuard, NamespaceConfig, SlowLog, Stats}
   alias Ferricstore.Merge.Scheduler, as: MergeScheduler
+  alias Ferricstore.Raft.Cluster, as: RaftCluster
 
   @doc false
   defp shard_count, do: :persistent_term.get(:ferricstore_shard_count, 4)
@@ -57,7 +49,8 @@ defmodule FerricstoreServer.Health.Dashboard do
           connections: connections_data(),
           slowlog: [slowlog_entry()],
           merge: [merge_status()],
-          namespace_config: [NamespaceConfig.ns_entry()]
+          namespace_config: [NamespaceConfig.ns_entry()],
+          cluster: cluster_data()
         }
 
   @typedoc "Overview section data."
@@ -123,26 +116,40 @@ defmodule FerricstoreServer.Health.Dashboard do
           total_bytes_reclaimed: non_neg_integer()
         }
 
+  @typedoc "Cluster topology data."
+  @type cluster_data :: %{
+          node_name: atom(),
+          cluster_mode: :standalone | :cluster,
+          cluster_size: non_neg_integer(),
+          nodes: [atom()]
+        }
+
+  @typedoc "Per-shard Raft consensus data."
+  @type raft_shard_data :: %{
+          shard: non_neg_integer(),
+          status: :ok | :unavailable,
+          leader: :ra.server_id() | nil,
+          current_term: non_neg_integer(),
+          commit_index: non_neg_integer(),
+          last_applied: non_neg_integer(),
+          log_size: non_neg_integer(),
+          members: [:ra.server_id()]
+        }
+
+  @typedoc "Active client connection data."
+  @type client_data :: %{
+          pid: pid(),
+          peer: String.t(),
+          age_seconds: non_neg_integer(),
+          flags: String.t()
+        }
+
   # ---------------------------------------------------------------------------
-  # Public API
+  # Public API -- Main Dashboard
   # ---------------------------------------------------------------------------
 
   @doc """
   Collects all dashboard data from running subsystems.
-
-  Gathers information from `Health`, `Stats`, `MemoryGuard`, `SlowLog`, and
-  `Merge.Scheduler`. Each data source is queried with error handling so that
-  the dashboard degrades gracefully if a subsystem is temporarily unavailable.
-
-  ## Returns
-
-  A `dashboard_data()` map with all sections populated.
-
-  ## Examples
-
-      iex> data = Ferricstore.Health.Dashboard.collect()
-      iex> is_integer(data.overview.uptime_seconds)
-      true
   """
   @spec collect() :: dashboard_data()
   def collect do
@@ -154,172 +161,161 @@ defmodule FerricstoreServer.Health.Dashboard do
       connections: collect_connections(),
       slowlog: collect_slowlog(),
       merge: collect_merge(),
-      namespace_config: NamespaceConfig.get_all()
+      namespace_config: NamespaceConfig.get_all(),
+      cluster: collect_cluster()
     }
   end
 
   @doc """
-  Renders dashboard data as a complete HTML page.
-
-  The returned binary is a self-contained HTML document with inline CSS. No
-  external resources are loaded. The page includes a `<meta http-equiv="refresh"
-  content="2">` tag for automatic 2-second polling.
-
-  ## Parameters
-
-    * `data` -- a `dashboard_data()` map as returned by `collect/0`
-
-  ## Returns
-
-  A UTF-8 binary containing the full HTML document.
-
-  ## Examples
-
-      iex> data = Ferricstore.Health.Dashboard.collect()
-      iex> html = Ferricstore.Health.Dashboard.render(data)
-      iex> String.contains?(html, "<title>")
-      true
+  Renders the main dashboard page as a complete HTML document.
   """
   @spec render(dashboard_data()) :: binary()
   def render(data) do
-    """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <meta http-equiv="refresh" content="2">
-      <title>FerricStore Dashboard</title>
-      <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #0d1117; color: #c9d1d9; padding: 0; min-height: 100vh; }
-
-        /* Top bar */
-        .top-bar { display: flex; align-items: center; gap: 24px; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; flex-wrap: wrap; }
-        .top-bar .logo { font-size: 1.1rem; font-weight: 700; color: #58a6ff; white-space: nowrap; }
-        .top-bar .metric { display: flex; flex-direction: column; align-items: center; min-width: 80px; }
-        .top-bar .metric .label { font-size: 0.65rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
-        .top-bar .metric .val { font-size: 1.1rem; font-weight: 700; color: #f0f6fc; }
-        .top-bar .sep { width: 1px; height: 32px; background: #30363d; flex-shrink: 0; }
-
-        /* Status badge */
-        .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-        .dot-green { background: #3fb950; box-shadow: 0 0 6px #3fb95066; }
-        .dot-yellow { background: #d29922; box-shadow: 0 0 6px #d2992266; }
-        .dot-red { background: #f85149; box-shadow: 0 0 6px #f8514966; }
-
-        /* Memory bar in top bar */
-        .mem-bar-wrap { width: 80px; height: 6px; background: #21262d; border-radius: 3px; margin-top: 2px; overflow: hidden; }
-        .mem-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
-
-        /* Main content */
-        .content { padding: 16px 20px 80px; max-width: 1200px; margin: 0 auto; }
-
-        /* Section headers */
-        .section-title { font-size: 0.9rem; font-weight: 600; color: #79c0ff; margin: 24px 0 12px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .section-title:first-child { margin-top: 8px; }
-
-        /* Hero hit rate */
-        .cache-hero { display: flex; gap: 24px; margin-bottom: 16px; flex-wrap: wrap; }
-        .hit-rate-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px 28px; text-align: center; min-width: 180px; flex: 0 0 auto; }
-        .hit-rate-num { font-size: 3rem; font-weight: 800; line-height: 1.1; }
-        .hit-rate-label { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
-        .hit-rate-sub { font-size: 0.8rem; color: #8b949e; margin-top: 8px; }
-        .hit-rate-sub span { color: #c9d1d9; font-weight: 600; }
-
-        /* Source breakdown */
-        .source-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px 24px; flex: 1; min-width: 200px; }
-        .source-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; }
-        .source-row + .source-row { border-top: 1px solid #21262d; }
-        .source-name { font-size: 0.85rem; color: #c9d1d9; }
-        .source-detail { font-size: 0.7rem; color: #484f58; }
-        .source-pct { font-size: 1.1rem; font-weight: 700; }
-        .source-bar-wrap { width: 100%; height: 4px; background: #21262d; border-radius: 2px; margin-top: 4px; }
-        .source-bar-fill { height: 100%; border-radius: 2px; }
-
-        /* Compact table */
-        table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; font-size: 0.82rem; }
-        th { background: #21262d; color: #8b949e; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px; padding: 6px 12px; text-align: left; }
-        td { padding: 6px 12px; border-top: 1px solid #21262d; }
-        tr:hover td { background: #1c2128; }
-
-        /* Status colors */
-        .c-green { color: #3fb950; }
-        .c-yellow { color: #d29922; }
-        .c-red { color: #f85149; }
-        .c-muted { color: #484f58; }
-
-        /* Badges */
-        .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.7rem; font-weight: 600; }
-        .badge-ok { background: #238636; color: #fff; }
-        .badge-warning { background: #9e6a03; color: #fff; }
-        .badge-pressure { background: #da3633; color: #fff; }
-        .badge-reject { background: #8b1a1a; color: #fff; }
-        .badge-merging { background: #1f6feb; color: #fff; }
-        .badge-idle { background: #30363d; color: #8b949e; }
-
-        /* Memory pressure alert */
-        .pressure-alert { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
-        .pressure-alert.level-warning { border-color: #9e6a03; }
-        .pressure-alert.level-pressure { border-color: #da3633; }
-        .pressure-alert.level-reject { border-color: #f85149; border-width: 2px; }
-        .pressure-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-        .pressure-bar-wrap { width: 100%; height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin: 8px 0; }
-        .pressure-bar-fill { height: 100%; border-radius: 4px; }
-        .pressure-details { font-size: 0.8rem; color: #8b949e; }
-        .pressure-details span { color: #c9d1d9; font-weight: 600; }
-        .pressure-action { font-size: 0.75rem; color: #d29922; margin-top: 6px; font-style: italic; }
-
-        /* Connections inline */
-        .conn-row { display: flex; gap: 24px; align-items: center; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 16px; font-size: 0.85rem; flex-wrap: wrap; }
-        .conn-item .conn-label { font-size: 0.7rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.3px; }
-        .conn-item .conn-val { font-weight: 700; color: #f0f6fc; }
-
-        /* Collapsible sections */
-        details { margin-bottom: 12px; }
-        details summary { cursor: pointer; font-size: 0.85rem; color: #8b949e; padding: 8px 0; user-select: none; list-style: none; }
-        details summary::-webkit-details-marker { display: none; }
-        details summary::before { content: "\\25B6\\00A0"; font-size: 0.7rem; }
-        details[open] summary::before { content: "\\25BC\\00A0"; }
-        details summary:hover { color: #c9d1d9; }
-
-        /* Footer */
-        .footer { position: fixed; bottom: 0; left: 0; right: 0; background: #0d1117; border-top: 1px solid #21262d; padding: 6px 20px; font-size: 0.7rem; color: #484f58; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
-
-        /* Tooltip */
-        .info-icon { display: inline-block; width: 14px; height: 14px; border-radius: 50%; background: #30363d; color: #8b949e; font-size: 10px; text-align: center; line-height: 14px; cursor: help; margin-left: 4px; vertical-align: middle; }
-
-        .mono { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem; }
-
-        /* Responsive */
-        @media (max-width: 600px) {
-          .top-bar { gap: 12px; padding: 10px 12px; }
-          .top-bar .metric .val { font-size: 0.9rem; }
-          .top-bar .sep { display: none; }
-          .content { padding: 12px 12px 70px; }
-          .hit-rate-num { font-size: 2.2rem; }
-          .cache-hero { flex-direction: column; }
-          .hit-rate-card { min-width: unset; }
-        }
-      </style>
-    </head>
-    <body>
-    """ <>
+    page_head("FerricStore Dashboard", 2) <>
+      ~s(<body>\n) <>
       render_top_bar(data) <>
       ~s(<div class="content">) <>
       render_cache_performance(data.hotcold) <>
       render_shards(data.shards) <>
       render_memory_alert(data.memory) <>
       render_connections(data.connections) <>
-      render_collapsed_slowlog(data.slowlog) <>
-      render_collapsed_merge(data.merge) <>
-      render_collapsed_namespace_config(data.namespace_config) <>
+      render_nav_links(data) <>
       ~s(</div>) <>
       render_footer(data) <>
-      """
-      </body>
-      </html>
-      """
+      ~s(</body>\n</html>\n)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Public API -- Slow Log Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects data for the slow log sub-page.
+  """
+  @spec collect_slowlog_page() :: %{slowlog: [slowlog_entry()]}
+  def collect_slowlog_page do
+    %{slowlog: collect_slowlog()}
+  end
+
+  @doc """
+  Renders the slow log sub-page.
+  """
+  @spec render_slowlog_page(%{slowlog: [slowlog_entry()]}) :: binary()
+  def render_slowlog_page(data) do
+    page_head("Slow Log - FerricStore", 5) <>
+      ~s(<body>\n) <>
+      render_subpage_header("Slow Log") <>
+      ~s(<div class="content">) <>
+      render_slowlog_table(data.slowlog) <>
+      ~s(</div>\n</body>\n</html>\n)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Public API -- Merge Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects data for the merge status sub-page.
+  """
+  @spec collect_merge_page() :: %{merge: [merge_status()]}
+  def collect_merge_page do
+    %{merge: collect_merge()}
+  end
+
+  @doc """
+  Renders the merge status sub-page.
+  """
+  @spec render_merge_page(%{merge: [merge_status()]}) :: binary()
+  def render_merge_page(data) do
+    page_head("Merge Status - FerricStore", 10) <>
+      ~s(<body>\n) <>
+      render_subpage_header("Merge Status") <>
+      ~s(<div class="content">) <>
+      render_merge_table(data.merge) <>
+      ~s(</div>\n</body>\n</html>\n)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Public API -- Namespace Config Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects data for the namespace config sub-page.
+  """
+  @spec collect_config_page() :: %{namespace_config: [NamespaceConfig.ns_entry()]}
+  def collect_config_page do
+    %{namespace_config: NamespaceConfig.get_all()}
+  end
+
+  @doc """
+  Renders the namespace config sub-page (no auto-refresh).
+  """
+  @spec render_config_page(%{namespace_config: [NamespaceConfig.ns_entry()]}) :: binary()
+  def render_config_page(data) do
+    page_head("Namespace Config - FerricStore", nil) <>
+      ~s(<body>\n) <>
+      render_subpage_header("Namespace Config") <>
+      ~s(<div class="content">) <>
+      render_config_table(data.namespace_config) <>
+      ~s(</div>\n</body>\n</html>\n)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Public API -- Raft Consensus Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects data for the Raft consensus sub-page.
+  """
+  @spec collect_raft_page() :: %{raft_shards: [raft_shard_data()], cluster: cluster_data()}
+  def collect_raft_page do
+    %{
+      raft_shards: collect_raft_shards(),
+      cluster: collect_cluster()
+    }
+  end
+
+  @doc """
+  Renders the Raft consensus sub-page.
+  """
+  @spec render_raft_page(%{raft_shards: [raft_shard_data()], cluster: cluster_data()}) :: binary()
+  def render_raft_page(data) do
+    page_head("Raft Consensus - FerricStore", 5) <>
+      ~s(<body>\n) <>
+      render_subpage_header("Raft Consensus") <>
+      ~s(<div class="content">) <>
+      render_cluster_info(data.cluster) <>
+      render_raft_table(data.raft_shards) <>
+      ~s(</div>\n</body>\n</html>\n)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Public API -- Client List Sub-page
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Collects data for the client list sub-page.
+  """
+  @spec collect_clients_page() :: %{clients: [client_data()], connections: connections_data()}
+  def collect_clients_page do
+    %{
+      clients: collect_client_list(),
+      connections: collect_connections()
+    }
+  end
+
+  @doc """
+  Renders the client list sub-page.
+  """
+  @spec render_clients_page(%{clients: [client_data()], connections: connections_data()}) :: binary()
+  def render_clients_page(data) do
+    page_head("Client List - FerricStore", 5) <>
+      ~s(<body>\n) <>
+      render_subpage_header("Client List") <>
+      ~s(<div class="content">) <>
+      render_clients_summary(data.connections) <>
+      render_clients_table(data.clients) <>
+      ~s(</div>\n</body>\n</html>\n)
   end
 
   # ---------------------------------------------------------------------------
@@ -392,7 +388,7 @@ defmodule FerricstoreServer.Health.Dashboard do
 
     # hot_reads and keyspace_hits are sampled; cold_reads and misses are exact
     hot_est = hot_sampled * rate
-    cold_exact = cold_sampled  # NOT sampled — called on every cold read
+    cold_exact = cold_sampled  # NOT sampled -- called on every cold read
     total_hits = hot_est + cold_exact
     total_lookups = total_hits + misses
 
@@ -455,7 +451,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @spec collect_slowlog() :: [slowlog_entry()]
   defp collect_slowlog do
     try do
-      SlowLog.get(20)
+      SlowLog.get(128)
       |> Enum.map(fn {id, timestamp_us, duration_us, command} ->
         %{
           id: id,
@@ -499,8 +495,112 @@ defmodule FerricstoreServer.Health.Dashboard do
     end)
   end
 
+  @spec collect_cluster() :: cluster_data()
+  defp collect_cluster do
+    this_node = node()
+    nodes = [Node.self() | Node.list()]
+    size = length(nodes)
+
+    %{
+      node_name: this_node,
+      cluster_mode: if(size > 1, do: :cluster, else: :standalone),
+      cluster_size: size,
+      nodes: nodes
+    }
+  end
+
+  @spec collect_raft_shards() :: [raft_shard_data()]
+  defp collect_raft_shards do
+    Enum.map(0..(shard_count() - 1), fn i ->
+      server_id = RaftCluster.shard_server_id(i)
+
+      try do
+        case :ra.member_overview(server_id) do
+          {:ok, overview, leader} ->
+            # overview is a map with per-member data keyed by server_id
+            local = Map.get(overview, server_id, %{})
+            members = Map.keys(overview)
+
+            %{
+              shard: i,
+              status: :ok,
+              leader: leader,
+              current_term: Map.get(local, :current_term, 0),
+              commit_index: Map.get(local, :commit_index, 0),
+              last_applied: Map.get(local, :last_applied, 0),
+              log_size: Map.get(local, :log_size, 0),
+              members: members
+            }
+
+          {:error, _} ->
+            %{shard: i, status: :unavailable, leader: nil, current_term: 0,
+              commit_index: 0, last_applied: 0, log_size: 0, members: []}
+
+          {:timeout, _} ->
+            %{shard: i, status: :unavailable, leader: nil, current_term: 0,
+              commit_index: 0, last_applied: 0, log_size: 0, members: []}
+        end
+      catch
+        :exit, _ ->
+          %{shard: i, status: :unavailable, leader: nil, current_term: 0,
+            commit_index: 0, last_applied: 0, log_size: 0, members: []}
+      end
+    end)
+  end
+
+  @spec collect_client_list() :: [client_data()]
+  defp collect_client_list do
+    try do
+      pids = :ranch.procs(FerricstoreServer.Listener, :connections)
+      now = System.monotonic_time(:millisecond)
+
+      Enum.map(pids, fn pid ->
+        info = Process.info(pid, [:dictionary, :current_function])
+
+        {peer, age, flags} =
+          case info do
+            nil ->
+              {"unknown:0", 0, ""}
+
+            kw ->
+              dict = Keyword.get(kw, :dictionary, [])
+              state = Keyword.get(dict, :"$conn_state", nil)
+
+              peer_str =
+                case state do
+                  %{peer: {ip, port}} ->
+                    ip_str = :inet.ntoa(ip) |> to_string()
+                    "#{ip_str}:#{port}"
+                  _ ->
+                    "unknown:0"
+                end
+
+              created =
+                case state do
+                  %{created_at: ts} when is_integer(ts) -> ts
+                  _ -> now
+                end
+
+              age_s = max(0, div(now - created, 1000))
+
+              flag_list =
+                []
+                |> then(fn f -> if state && Map.get(state, :multi_state) == :queuing, do: ["M" | f], else: f end)
+                |> then(fn f -> if state && Map.get(state, :pubsub_channels), do: ["S" | f], else: f end)
+                |> then(fn f -> if state && Map.get(state, :tracking) && Map.get(state.tracking, :enabled), do: ["T" | f], else: f end)
+
+              {peer_str, age_s, Enum.join(flag_list)}
+          end
+
+        %{pid: pid, peer: peer, age_seconds: age, flags: flags}
+      end)
+    catch
+      _, _ -> []
+    end
+  end
+
   # ---------------------------------------------------------------------------
-  # HTML rendering (private)
+  # HTML rendering -- Main Dashboard
   # ---------------------------------------------------------------------------
 
   @spec render_top_bar(dashboard_data()) :: binary()
@@ -509,6 +609,7 @@ defmodule FerricstoreServer.Health.Dashboard do
     hotcold = data.hotcold
     memory = data.memory
     conns = data.connections
+    cluster = data.cluster
 
     # Status dot color
     {dot_class, status_text} =
@@ -528,9 +629,28 @@ defmodule FerricstoreServer.Health.Dashboard do
     mem_bar_color = mem_bar_color(mem_pct)
     mem_bar_width = min(mem_pct, 100)
 
+    # Cluster info
+    cluster_label =
+      case cluster.cluster_mode do
+        :standalone -> "standalone"
+        :cluster -> "#{cluster.cluster_size}-node cluster"
+      end
+
+    node_short = cluster.node_name |> Atom.to_string()
+
     """
     <div class="top-bar">
       <div class="logo"><span class="status-dot #{dot_class}"></span>FerricStore</div>
+      <div class="sep"></div>
+      <div class="metric">
+        <span class="label">Node</span>
+        <span class="val" style="font-size:0.75rem;">#{escape(node_short)}</span>
+      </div>
+      <div class="sep"></div>
+      <div class="metric">
+        <span class="label">Cluster</span>
+        <span class="val" style="font-size:0.85rem;">#{escape(cluster_label)}</span>
+      </div>
       <div class="sep"></div>
       <div class="metric">
         <span class="label">Status</span>
@@ -755,8 +875,71 @@ defmodule FerricstoreServer.Health.Dashboard do
     """
   end
 
-  @spec render_collapsed_slowlog([slowlog_entry()]) :: binary()
-  defp render_collapsed_slowlog(entries) do
+  @spec render_nav_links(dashboard_data()) :: binary()
+  defp render_nav_links(data) do
+    slowlog_count = length(data.slowlog)
+    slowlog_label = if slowlog_count == 0, do: "none", else: "#{slowlog_count} entries"
+
+    active_merges = Enum.count(data.merge, & &1.merging)
+    merge_label = if active_merges > 0, do: "#{active_merges} active", else: "idle"
+
+    config_count = length(data.namespace_config)
+    config_label = if config_count == 0, do: "defaults", else: "#{config_count} overrides"
+
+    cluster = data.cluster
+    raft_label =
+      case cluster.cluster_mode do
+        :standalone -> "standalone"
+        :cluster -> "#{cluster.cluster_size} nodes"
+      end
+
+    conns = data.connections
+
+    """
+    <div class="section-title">More</div>
+    <div class="nav-links">
+      <a class="nav-card" href="/dashboard/slowlog">
+        <span class="nav-card-title">Slow Log</span>
+        <span class="nav-card-count">#{escape(slowlog_label)}</span>
+      </a>
+      <a class="nav-card" href="/dashboard/merge">
+        <span class="nav-card-title">Merge Status</span>
+        <span class="nav-card-count">#{escape(merge_label)}</span>
+      </a>
+      <a class="nav-card" href="/dashboard/config">
+        <span class="nav-card-title">Namespace Config</span>
+        <span class="nav-card-count">#{escape(config_label)}</span>
+      </a>
+      <a class="nav-card" href="/dashboard/raft">
+        <span class="nav-card-title">Raft Consensus</span>
+        <span class="nav-card-count">#{escape(raft_label)}</span>
+      </a>
+      <a class="nav-card" href="/dashboard/clients">
+        <span class="nav-card-title">Client List</span>
+        <span class="nav-card-count">#{format_number(conns.active)} active</span>
+      </a>
+    </div>
+    """
+  end
+
+  @spec render_footer(dashboard_data()) :: binary()
+  defp render_footer(data) do
+    sample_rate = data.hotcold.sample_rate
+
+    """
+    <div class="footer">
+      <span>Uptime: #{format_uptime(data.overview.uptime_seconds)} &middot; v0.1.0 &middot; Run #{escape(String.slice(data.overview.run_id, 0, 8))}</span>
+      <span>Hit/miss stats estimated from 1:#{sample_rate} sampling &middot; Auto-refresh 2s</span>
+    </div>
+    """
+  end
+
+  # ---------------------------------------------------------------------------
+  # HTML rendering -- Sub-page content sections
+  # ---------------------------------------------------------------------------
+
+  @spec render_slowlog_table([slowlog_entry()]) :: binary()
+  defp render_slowlog_table(entries) do
     count = length(entries)
     count_label = if count == 0, do: "none", else: "#{count} entries"
 
@@ -783,22 +966,20 @@ defmodule FerricstoreServer.Health.Dashboard do
       end
 
     """
-    <details>
-      <summary>Slow Log (#{count_label})</summary>
-      <table>
-        <thead>
-          <tr><th>ID</th><th>Time</th><th>Duration</th><th>Command</th></tr>
-        </thead>
-        <tbody>
-          #{rows}
-        </tbody>
-      </table>
-    </details>
+    <div class="section-title">Slow Log <span class="badge badge-idle">#{escape(count_label)}</span></div>
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Time</th><th>Duration</th><th>Command</th></tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
     """
   end
 
-  @spec render_collapsed_merge([merge_status()]) :: binary()
-  defp render_collapsed_merge(merges) do
+  @spec render_merge_table([merge_status()]) :: binary()
+  defp render_merge_table(merges) do
     active_count = Enum.count(merges, & &1.merging)
     summary_label = if active_count > 0, do: "#{active_count} active", else: "idle"
 
@@ -830,22 +1011,20 @@ defmodule FerricstoreServer.Health.Dashboard do
       end)
 
     """
-    <details>
-      <summary>Merge Status (#{summary_label})</summary>
-      <table>
-        <thead>
-          <tr><th>Shard</th><th>Mode</th><th>Status</th><th>Last Merge</th><th>Merges</th><th>Reclaimed</th></tr>
-        </thead>
-        <tbody>
-          #{rows}
-        </tbody>
-      </table>
-    </details>
+    <div class="section-title">Merge Status <span class="badge badge-idle">#{escape(summary_label)}</span></div>
+    <table>
+      <thead>
+        <tr><th>Shard</th><th>Mode</th><th>Status</th><th>Last Merge</th><th>Merges</th><th>Reclaimed</th></tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
     """
   end
 
-  @spec render_collapsed_namespace_config([NamespaceConfig.ns_entry()]) :: binary()
-  defp render_collapsed_namespace_config(entries) do
+  @spec render_config_table([NamespaceConfig.ns_entry()]) :: binary()
+  defp render_config_table(entries) do
     count_label =
       case entries do
         [] -> "defaults"
@@ -898,21 +1077,335 @@ defmodule FerricstoreServer.Health.Dashboard do
       end
 
     """
-    <details>
-      <summary>Namespace Config (#{count_label})</summary>
-      #{body}
-    </details>
+    <div class="section-title">Namespace Config <span class="badge badge-idle">#{escape(count_label)}</span></div>
+    #{body}
     """
   end
 
-  @spec render_footer(dashboard_data()) :: binary()
-  defp render_footer(data) do
-    sample_rate = data.hotcold.sample_rate
+  @spec render_cluster_info(cluster_data()) :: binary()
+  defp render_cluster_info(cluster) do
+    node_str = Atom.to_string(cluster.node_name)
+
+    cluster_badge =
+      case cluster.cluster_mode do
+        :standalone ->
+          ~s(<span class="badge badge-idle">standalone</span>)
+        :cluster ->
+          ~s(<span class="badge badge-ok">#{cluster.cluster_size}-node cluster</span>)
+      end
+
+    nodes_html =
+      if cluster.cluster_size > 1 do
+        node_items =
+          Enum.map_join(cluster.nodes, "", fn n ->
+            is_self = n == cluster.node_name
+            class = if is_self, do: "c-green", else: ""
+            label = if is_self, do: " (this node)", else: ""
+            ~s(<span class="#{class}" style="margin-right:16px;">#{escape(Atom.to_string(n))}#{label}</span>)
+          end)
+
+        """
+        <div style="margin-top:8px; font-size:0.82rem; color:#8b949e;">
+          Nodes: #{node_items}
+        </div>
+        """
+      else
+        ""
+      end
 
     """
-    <div class="footer">
-      <span>Uptime: #{format_uptime(data.overview.uptime_seconds)} &middot; v0.1.0 &middot; Run #{escape(String.slice(data.overview.run_id, 0, 8))}</span>
-      <span>Hit/miss stats estimated from 1:#{sample_rate} sampling &middot; Auto-refresh 2s</span>
+    <div class="section-title">Cluster #{cluster_badge}</div>
+    <div class="conn-row" style="flex-direction:column; align-items:flex-start;">
+      <div style="font-size:0.85rem;">
+        <span class="conn-label">Node: </span>
+        <span class="conn-val mono">#{escape(node_str)}</span>
+      </div>
+      #{nodes_html}
+    </div>
+    """
+  end
+
+  @spec render_raft_table([raft_shard_data()]) :: binary()
+  defp render_raft_table(raft_shards) do
+    ok_count = Enum.count(raft_shards, &(&1.status == :ok))
+    total = length(raft_shards)
+
+    summary_badge =
+      if ok_count == total do
+        ~s(<span class="badge badge-ok">all ok</span>)
+      else
+        ~s(<span class="badge badge-pressure">#{total - ok_count} unavailable</span>)
+      end
+
+    rows =
+      Enum.map_join(raft_shards, "\n", fn rs ->
+        status_html =
+          case rs.status do
+            :ok -> ~s(<span class="c-green">ok</span>)
+            _ -> ~s(<span class="c-red">unavailable</span>)
+          end
+
+        leader_html =
+          case rs.leader do
+            nil -> ~s(<span class="c-muted">none</span>)
+            {name, leader_node} ->
+              is_local = leader_node == node()
+              class = if is_local, do: "c-green", else: ""
+              leader_str = "#{name}@#{leader_node}"
+              ~s(<span class="#{class} mono">#{escape(leader_str)}</span>)
+          end
+
+        members_str =
+          case rs.members do
+            [] -> "-"
+            members ->
+              members
+              |> Enum.map(fn {name, n} -> "#{name}@#{n}" end)
+              |> Enum.join(", ")
+          end
+
+        lag = rs.commit_index - rs.last_applied
+        lag_class = cond do
+          lag > 1000 -> "c-red"
+          lag > 100 -> "c-yellow"
+          true -> ""
+        end
+
+        """
+        <tr>
+          <td>#{rs.shard}</td>
+          <td>#{status_html}</td>
+          <td>#{leader_html}</td>
+          <td>#{rs.current_term}</td>
+          <td>#{format_number(rs.commit_index)}</td>
+          <td class="#{lag_class}">#{format_number(rs.last_applied)}</td>
+          <td>#{format_number(rs.log_size)}</td>
+          <td class="mono" style="font-size:0.75rem;">#{escape(members_str)}</td>
+        </tr>
+        """
+      end)
+
+    """
+    <div class="section-title">Per-Shard Raft State #{summary_badge}</div>
+    <table>
+      <thead>
+        <tr><th>Shard</th><th>Status</th><th>Leader</th><th>Term</th><th>Commit Idx</th><th>Applied Idx</th><th>Log Size</th><th>Members</th></tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
+    """
+  end
+
+  @spec render_clients_summary(connections_data()) :: binary()
+  defp render_clients_summary(conns) do
+    blocked_class = if conns.blocked > 0, do: "c-yellow", else: ""
+
+    """
+    <div class="conn-row" style="margin-bottom:16px;">
+      <div class="conn-item">
+        <span class="conn-label">Active </span>
+        <span class="conn-val">#{format_number(conns.active)}</span>
+      </div>
+      <div class="conn-item">
+        <span class="conn-label">Blocked </span>
+        <span class="conn-val #{blocked_class}">#{format_number(conns.blocked)}</span>
+      </div>
+      <div class="conn-item">
+        <span class="conn-label">Tracking </span>
+        <span class="conn-val">#{format_number(conns.tracking)}</span>
+      </div>
+    </div>
+    """
+  end
+
+  @spec render_clients_table([client_data()]) :: binary()
+  defp render_clients_table(clients) do
+    rows =
+      case clients do
+        [] ->
+          ~s(<tr><td colspan="4" class="c-muted">No active connections</td></tr>)
+
+        _ ->
+          Enum.map_join(clients, "\n", fn c ->
+            pid_str = inspect(c.pid)
+
+            """
+            <tr>
+              <td class="mono">#{escape(pid_str)}</td>
+              <td class="mono">#{escape(c.peer)}</td>
+              <td>#{format_uptime(c.age_seconds)}</td>
+              <td>#{escape(c.flags)}</td>
+            </tr>
+            """
+          end)
+      end
+
+    """
+    <div class="section-title">Active Connections <span class="badge badge-idle">#{length(clients)}</span></div>
+    <table>
+      <thead>
+        <tr><th>PID</th><th>Client Address</th><th>Age</th><th>Flags</th></tr>
+      </thead>
+      <tbody>
+        #{rows}
+      </tbody>
+    </table>
+    <div style="margin-top:8px; font-size:0.72rem; color:#484f58;">
+      Flags: M=in MULTI transaction, S=subscribed (pub/sub), T=tracking enabled
+    </div>
+    """
+  end
+
+  # ---------------------------------------------------------------------------
+  # Shared HTML scaffolding
+  # ---------------------------------------------------------------------------
+
+  @spec page_head(String.t(), non_neg_integer() | nil) :: binary()
+  defp page_head(title, refresh_seconds) do
+    refresh_meta =
+      case refresh_seconds do
+        nil -> ""
+        n -> ~s(  <meta http-equiv="refresh" content="#{n}">\n)
+      end
+
+    """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+    #{refresh_meta}  <title>#{escape(title)}</title>
+      <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #0d1117; color: #c9d1d9; padding: 0; min-height: 100vh; }
+
+        /* Top bar */
+        .top-bar { display: flex; align-items: center; gap: 24px; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; flex-wrap: wrap; }
+        .top-bar .logo { font-size: 1.1rem; font-weight: 700; color: #58a6ff; white-space: nowrap; }
+        .top-bar .metric { display: flex; flex-direction: column; align-items: center; min-width: 80px; }
+        .top-bar .metric .label { font-size: 0.65rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+        .top-bar .metric .val { font-size: 1.1rem; font-weight: 700; color: #f0f6fc; }
+        .top-bar .sep { width: 1px; height: 32px; background: #30363d; flex-shrink: 0; }
+
+        /* Status badge */
+        .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+        .dot-green { background: #3fb950; box-shadow: 0 0 6px #3fb95066; }
+        .dot-yellow { background: #d29922; box-shadow: 0 0 6px #d2992266; }
+        .dot-red { background: #f85149; box-shadow: 0 0 6px #f8514966; }
+
+        /* Memory bar in top bar */
+        .mem-bar-wrap { width: 80px; height: 6px; background: #21262d; border-radius: 3px; margin-top: 2px; overflow: hidden; }
+        .mem-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+
+        /* Main content */
+        .content { padding: 16px 20px 80px; max-width: 1200px; margin: 0 auto; }
+
+        /* Section headers */
+        .section-title { font-size: 0.9rem; font-weight: 600; color: #79c0ff; margin: 24px 0 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .section-title:first-child { margin-top: 8px; }
+
+        /* Hero hit rate */
+        .cache-hero { display: flex; gap: 24px; margin-bottom: 16px; flex-wrap: wrap; }
+        .hit-rate-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px 28px; text-align: center; min-width: 180px; flex: 0 0 auto; }
+        .hit-rate-num { font-size: 3rem; font-weight: 800; line-height: 1.1; }
+        .hit-rate-label { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+        .hit-rate-sub { font-size: 0.8rem; color: #8b949e; margin-top: 8px; }
+        .hit-rate-sub span { color: #c9d1d9; font-weight: 600; }
+
+        /* Source breakdown */
+        .source-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px 24px; flex: 1; min-width: 200px; }
+        .source-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; }
+        .source-row + .source-row { border-top: 1px solid #21262d; }
+        .source-name { font-size: 0.85rem; color: #c9d1d9; }
+        .source-detail { font-size: 0.7rem; color: #484f58; }
+        .source-pct { font-size: 1.1rem; font-weight: 700; }
+        .source-bar-wrap { width: 100%; height: 4px; background: #21262d; border-radius: 2px; margin-top: 4px; }
+        .source-bar-fill { height: 100%; border-radius: 2px; }
+
+        /* Compact table */
+        table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; font-size: 0.82rem; }
+        th { background: #21262d; color: #8b949e; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px; padding: 6px 12px; text-align: left; }
+        td { padding: 6px 12px; border-top: 1px solid #21262d; }
+        tr:hover td { background: #1c2128; }
+
+        /* Status colors */
+        .c-green { color: #3fb950; }
+        .c-yellow { color: #d29922; }
+        .c-red { color: #f85149; }
+        .c-muted { color: #484f58; }
+
+        /* Badges */
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.7rem; font-weight: 600; }
+        .badge-ok { background: #238636; color: #fff; }
+        .badge-warning { background: #9e6a03; color: #fff; }
+        .badge-pressure { background: #da3633; color: #fff; }
+        .badge-reject { background: #8b1a1a; color: #fff; }
+        .badge-merging { background: #1f6feb; color: #fff; }
+        .badge-idle { background: #30363d; color: #8b949e; }
+
+        /* Memory pressure alert */
+        .pressure-alert { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+        .pressure-alert.level-warning { border-color: #9e6a03; }
+        .pressure-alert.level-pressure { border-color: #da3633; }
+        .pressure-alert.level-reject { border-color: #f85149; border-width: 2px; }
+        .pressure-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+        .pressure-bar-wrap { width: 100%; height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin: 8px 0; }
+        .pressure-bar-fill { height: 100%; border-radius: 4px; }
+        .pressure-details { font-size: 0.8rem; color: #8b949e; }
+        .pressure-details span { color: #c9d1d9; font-weight: 600; }
+        .pressure-action { font-size: 0.75rem; color: #d29922; margin-top: 6px; font-style: italic; }
+
+        /* Connections inline */
+        .conn-row { display: flex; gap: 24px; align-items: center; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px 16px; font-size: 0.85rem; flex-wrap: wrap; }
+        .conn-item .conn-label { font-size: 0.7rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.3px; }
+        .conn-item .conn-val { font-weight: 700; color: #f0f6fc; }
+
+        /* Navigation cards */
+        .nav-links { display: flex; gap: 12px; flex-wrap: wrap; }
+        .nav-card { display: flex; flex-direction: column; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 20px; min-width: 160px; text-decoration: none; color: inherit; transition: border-color 0.15s, background 0.15s; flex: 1; }
+        .nav-card:hover { border-color: #58a6ff; background: #1c2128; }
+        .nav-card-title { font-size: 0.85rem; font-weight: 600; color: #58a6ff; }
+        .nav-card-count { font-size: 0.75rem; color: #8b949e; margin-top: 4px; }
+
+        /* Sub-page header */
+        .subpage-header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: #161b22; border-bottom: 1px solid #30363d; }
+        .back-link { color: #58a6ff; text-decoration: none; font-size: 0.85rem; font-weight: 500; white-space: nowrap; }
+        .back-link:hover { text-decoration: underline; }
+        .subpage-title { font-size: 1.1rem; font-weight: 700; color: #f0f6fc; }
+
+        /* Footer */
+        .footer { position: fixed; bottom: 0; left: 0; right: 0; background: #0d1117; border-top: 1px solid #21262d; padding: 6px 20px; font-size: 0.7rem; color: #484f58; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+
+        /* Tooltip */
+        .info-icon { display: inline-block; width: 14px; height: 14px; border-radius: 50%; background: #30363d; color: #8b949e; font-size: 10px; text-align: center; line-height: 14px; cursor: help; margin-left: 4px; vertical-align: middle; }
+
+        .mono { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.82rem; }
+
+        /* Responsive */
+        @media (max-width: 600px) {
+          .top-bar { gap: 12px; padding: 10px 12px; }
+          .top-bar .metric .val { font-size: 0.9rem; }
+          .top-bar .sep { display: none; }
+          .content { padding: 12px 12px 70px; }
+          .hit-rate-num { font-size: 2.2rem; }
+          .cache-hero { flex-direction: column; }
+          .hit-rate-card { min-width: unset; }
+          .nav-links { flex-direction: column; }
+          .nav-card { min-width: unset; }
+        }
+      </style>
+    </head>
+    """
+  end
+
+  @spec render_subpage_header(String.t()) :: binary()
+  defp render_subpage_header(title) do
+    """
+    <div class="subpage-header">
+      <a class="back-link" href="/dashboard">&larr; Dashboard</a>
+      <span class="subpage-title">#{escape(title)}</span>
     </div>
     """
   end

@@ -190,6 +190,36 @@ defmodule FerricstoreServer.Health.Endpoint do
     send_html_response(socket, transport, 200, "OK", body)
   end
 
+  defp handle_request(socket, transport, "GET", "/dashboard/slowlog") do
+    data = FerricstoreServer.Health.Dashboard.collect_slowlog_page()
+    body = FerricstoreServer.Health.Dashboard.render_slowlog_page(data)
+    send_html_response(socket, transport, 200, "OK", body)
+  end
+
+  defp handle_request(socket, transport, "GET", "/dashboard/merge") do
+    data = FerricstoreServer.Health.Dashboard.collect_merge_page()
+    body = FerricstoreServer.Health.Dashboard.render_merge_page(data)
+    send_html_response(socket, transport, 200, "OK", body)
+  end
+
+  defp handle_request(socket, transport, "GET", "/dashboard/config") do
+    data = FerricstoreServer.Health.Dashboard.collect_config_page()
+    body = FerricstoreServer.Health.Dashboard.render_config_page(data)
+    send_html_response(socket, transport, 200, "OK", body)
+  end
+
+  defp handle_request(socket, transport, "GET", "/dashboard/raft") do
+    data = FerricstoreServer.Health.Dashboard.collect_raft_page()
+    body = FerricstoreServer.Health.Dashboard.render_raft_page(data)
+    send_html_response(socket, transport, 200, "OK", body)
+  end
+
+  defp handle_request(socket, transport, "GET", "/dashboard/clients") do
+    data = FerricstoreServer.Health.Dashboard.collect_clients_page()
+    body = FerricstoreServer.Health.Dashboard.render_clients_page(data)
+    send_html_response(socket, transport, 200, "OK", body)
+  end
+
   defp handle_request(socket, transport, "GET", "/metrics") do
     body = Ferricstore.Metrics.scrape()
     send_text_response(socket, transport, 200, "OK", body)
