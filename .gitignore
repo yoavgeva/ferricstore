@@ -37,3 +37,4 @@ ferricstore-*.tar
 apps/ferricstore/data/
 apps/ferricstore/priv/native/*.so
 apps/ferricstore/priv/patched/*.beam
+.claude/
