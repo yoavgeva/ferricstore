@@ -209,9 +209,15 @@ defmodule FerricstoreServer.Health.Endpoint do
   end
 
   defp handle_request(socket, transport, "GET", "/dashboard/raft") do
-    data = FerricstoreServer.Health.Dashboard.collect_raft_page()
-    body = FerricstoreServer.Health.Dashboard.render_raft_page(data)
-    send_html_response(socket, transport, 200, "OK", body)
+    try do
+      data = FerricstoreServer.Health.Dashboard.collect_raft_page()
+      body = FerricstoreServer.Health.Dashboard.render_raft_page(data)
+      send_html_response(socket, transport, 200, "OK", body)
+    catch
+      kind, reason ->
+        body = "<html><body style='background:#0d1117;color:#f85149;padding:20px;font-family:monospace;'><h2>Raft Page Error</h2><pre>#{inspect(kind)}: #{inspect(reason, pretty: true, limit: 10)}</pre><a href='/dashboard' style='color:#58a6ff;'>← Dashboard</a></body></html>"
+        send_html_response(socket, transport, 200, "OK", body)
+    end
   end
 
   defp handle_request(socket, transport, "GET", "/dashboard/clients") do

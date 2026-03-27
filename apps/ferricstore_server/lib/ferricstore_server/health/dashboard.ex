@@ -516,21 +516,11 @@ defmodule FerricstoreServer.Health.Dashboard do
 
       try do
         case :ra.member_overview(server_id) do
-          {:ok, overview, leader} ->
-            # overview is a map with per-member data keyed by server_id
-            local = Map.get(overview, server_id, %{})
-            members = Map.keys(overview)
+          {:ok, overview} when is_map(overview) ->
+            extract_raft_overview(i, server_id, overview)
 
-            %{
-              shard: i,
-              status: :ok,
-              leader: leader,
-              current_term: Map.get(local, :current_term, 0),
-              commit_index: Map.get(local, :commit_index, 0),
-              last_applied: Map.get(local, :last_applied, 0),
-              log_size: Map.get(local, :log_size, 0),
-              members: members
-            }
+          {:ok, overview, _leader} when is_map(overview) ->
+            extract_raft_overview(i, server_id, overview)
 
           {:error, _} ->
             %{shard: i, status: :unavailable, leader: nil, current_term: 0,
@@ -546,6 +536,19 @@ defmodule FerricstoreServer.Health.Dashboard do
             commit_index: 0, last_applied: 0, log_size: 0, members: []}
       end
     end)
+  end
+
+  defp extract_raft_overview(i, server_id, overview) do
+    %{
+      shard: i,
+      status: :ok,
+      leader: Map.get(overview, :leader, Map.get(overview, :id, server_id)),
+      current_term: Map.get(overview, :current_term, 0),
+      commit_index: Map.get(overview, :commit_index, 0),
+      last_applied: Map.get(overview, :last_applied, 0),
+      log_size: Map.get(overview, :log_size, 0),
+      members: Map.get(overview, :members, [server_id])
+    }
   end
 
   @spec collect_client_list() :: [client_data()]
