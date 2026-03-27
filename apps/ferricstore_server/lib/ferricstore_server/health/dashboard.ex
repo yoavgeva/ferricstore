@@ -301,11 +301,29 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @spec collect_hotcold() :: hotcold_data()
   defp collect_hotcold do
+    rate = :persistent_term.get(:ferricstore_read_sample_rate, 100)
+    hits_sampled = Stats.keyspace_hits()
+    misses = Stats.keyspace_misses()
+    hot_sampled = Stats.total_hot_reads()
+    cold_sampled = Stats.total_cold_reads()
+
+    hits_est = hits_sampled * rate
+    hot_est = hot_sampled * rate
+    cold_est = cold_sampled * rate
+    total_lookups = hits_est + misses
+
     %{
       hot_read_pct: Stats.hot_read_pct(),
       cold_reads_per_sec: Stats.cold_reads_per_second(),
-      total_hot: Stats.total_hot_reads(),
-      total_cold: Stats.total_cold_reads(),
+      total_hot: hot_est,
+      total_cold: cold_est,
+      total_hits: hits_est,
+      total_misses: misses,
+      total_lookups: total_lookups,
+      hit_ratio: if(total_lookups > 0, do: Float.round(hits_est / total_lookups * 100, 1), else: 0.0),
+      ram_ratio: if(hits_est > 0, do: Float.round(hot_est / hits_est * 100, 1), else: 0.0),
+      disk_ratio: if(hits_est > 0, do: Float.round(cold_est / hits_est * 100, 1), else: 0.0),
+      sample_rate: rate,
       top_prefixes: Stats.hotness_top(10)
     }
   end
@@ -485,28 +503,31 @@ defmodule FerricstoreServer.Health.Dashboard do
       end
 
     """
-    <h2>Hot/Cold Metrics</h2>
+    <h2>Cache Performance</h2>
     <div class="grid">
       <div class="card">
-        <div class="label">Hot Read % <span class="info-icon" title="Percentage of hits served from ETS (RAM) vs Bitcask (disk). Low ratio means values are being evicted — consider increasing max_memory.">i</span></div>
-        <div class="value">#{Float.round(data.hot_read_pct, 2)}%</div>
+        <div class="label">Hit Rate <span class="info-icon" title="Percentage of GET requests that found the key. Low = clients reading keys that don't exist or expired.">i</span></div>
+        <div class="value" style="color:#{if data.hit_ratio >= 90, do: "#3fb950", else: if data.hit_ratio >= 70, do: "#d29922", else: "#f85149"}">#{data.hit_ratio}%</div>
       </div>
       <div class="card">
-        <div class="label">Cold Reads/sec <span class="info-icon" title="Keys with values on disk only. Reads take ~50-200μs (NVMe) via Bitcask pread.">i</span></div>
-        <div class="value">#{Float.round(data.cold_reads_per_sec, 2)}</div>
+        <div class="label">Found in RAM <span class="info-icon" title="Of the keys found, how many were served from ETS (~1-5μs). Higher = faster responses.">i</span></div>
+        <div class="value">#{data.ram_ratio}%</div>
       </div>
       <div class="card">
-        <div class="label">Total Hot Reads <span class="info-icon" title="Keys with values cached in ETS (RAM). Reads take ~1-5μs.">i</span></div>
-        <div class="value">#{format_number(data.total_hot)}</div>
+        <div class="label">Found on Disk <span class="info-icon" title="Of the keys found, how many needed Bitcask disk read (~50-200μs). High = consider increasing max_memory.">i</span></div>
+        <div class="value">#{data.disk_ratio}%</div>
       </div>
       <div class="card">
-        <div class="label">Total Cold Reads <span class="info-icon" title="Keys with values on disk only. Reads take ~50-200μs (NVMe) via Bitcask pread.">i</span></div>
-        <div class="value">#{format_number(data.total_cold)}</div>
+        <div class="label">Misses <span class="info-icon" title="GET requests where the key didn't exist. These are fast (ETS lookup returns empty).">i</span></div>
+        <div class="value">#{format_number(data.total_misses)}</div>
       </div>
+    </div>
+    <div style="font-size:0.75rem; color:#484f58; margin: -8px 0 12px 0;">
+      Estimated from 1:#{data.sample_rate} sampling. Totals: #{format_number(data.total_lookups)} lookups, #{format_number(data.total_hits)} hits, #{format_number(data.total_misses)} misses
     </div>
     <table>
       <thead>
-        <tr><th>Prefix</th><th>Hot Reads</th><th>Cold Reads</th><th>Cold %</th></tr>
+        <tr><th>Prefix</th><th>RAM Reads</th><th>Disk Reads</th><th>Disk %</th></tr>
       </thead>
       <tbody>
         #{prefix_rows}
