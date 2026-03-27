@@ -35,3 +35,4 @@ ferricstore-*.tar
 
 .claude/worktrees/
 apps/ferricstore/data/
+apps/ferricstore/priv/native/*.so
