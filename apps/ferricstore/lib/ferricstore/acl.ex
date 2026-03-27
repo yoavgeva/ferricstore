@@ -933,24 +933,37 @@ defmodule Ferricstore.Acl do
   # Private -- password hashing (Fix 1)
   # ---------------------------------------------------------------------------
 
-  # Hashes a password using a random 16-byte salt and SHA-256.
-  # Returns a base64-encoded binary of `salt <> hash` (48 bytes raw).
   @spec hash_password(binary()) :: binary()
+  # PBKDF2-SHA256 with 100K iterations. Makes brute-force of leaked acl.conf
+  # impractical: ~100ms per guess vs nanoseconds with plain SHA-256.
+  # Salt is 16 random bytes, unique per password.
+  @pbkdf2_iterations 100_000
+  @pbkdf2_key_length 32
+
   defp hash_password(password) do
     salt = :crypto.strong_rand_bytes(16)
-    hash = :crypto.hash(:sha256, salt <> password)
+    hash = :crypto.pbkdf2_hmac(:sha256, password, salt, @pbkdf2_iterations, @pbkdf2_key_length)
     Base.encode64(salt <> hash)
   end
 
-  # Verifies a plaintext password against a stored hash.
-  # Extracts the 16-byte salt from the stored hash and recomputes.
+  # Verifies a plaintext password against a stored PBKDF2 hash.
+  # Extracts the 16-byte salt, recomputes PBKDF2, constant-time compares.
+  # Also accepts legacy SHA-256 hashes (32 bytes after salt) for backward
+  # compatibility with acl.conf files created before the PBKDF2 upgrade.
   @spec verify_password(binary(), binary()) :: boolean()
   defp verify_password(password, stored_hash) do
     case Base.decode64(stored_hash) do
       {:ok, <<salt::binary-16, hash::binary-32>>} ->
-        computed = :crypto.hash(:sha256, salt <> password)
-        # Constant-time comparison to prevent timing attacks
-        :crypto.hash_equals(computed, hash)
+        # Try PBKDF2 first (new format)
+        pbkdf2 = :crypto.pbkdf2_hmac(:sha256, password, salt, @pbkdf2_iterations, @pbkdf2_key_length)
+
+        if :crypto.hash_equals(pbkdf2, hash) do
+          true
+        else
+          # Fallback: legacy SHA-256 (for old acl.conf files)
+          legacy = :crypto.hash(:sha256, salt <> password)
+          :crypto.hash_equals(legacy, hash)
+        end
 
       _ ->
         false
