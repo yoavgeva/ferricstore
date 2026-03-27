@@ -417,14 +417,9 @@ defmodule Ferricstore.Stats.HotnessTest do
       assert result =~ "cold_reads:"
     end
 
-    test "INFO stats includes hot_read_pct field" do
+    test "INFO stats includes hot_cache_hit_ratio field" do
       result = Server.handle("INFO", ["stats"], MockStore.make())
-      assert result =~ "hot_read_pct:"
-    end
-
-    test "INFO stats includes cold_reads_per_second field" do
-      result = Server.handle("INFO", ["stats"], MockStore.make())
-      assert result =~ "cold_reads_per_second:"
+      assert result =~ "hot_cache_hit_ratio:"
     end
 
     test "hot_reads value is a non-negative integer" do
@@ -449,32 +444,21 @@ defmodule Ferricstore.Stats.HotnessTest do
       assert val >= 0
     end
 
-    test "hot_read_pct is a valid float" do
+    test "hot_cache_hit_ratio is a valid float" do
       result = Server.handle("INFO", ["stats"], MockStore.make())
       [_header | fields] = String.split(result, "\r\n", trim: true)
 
-      line = Enum.find(fields, &String.starts_with?(&1, "hot_read_pct:"))
-      val_str = String.trim_leading(line, "hot_read_pct:")
+      line = Enum.find(fields, &String.starts_with?(&1, "hot_cache_hit_ratio:"))
+      val_str = String.trim_leading(line, "hot_cache_hit_ratio:")
       {val, ""} = Float.parse(val_str)
       assert val >= 0.0 and val <= 100.0
-    end
-
-    test "cold_reads_per_second is a valid float" do
-      result = Server.handle("INFO", ["stats"], MockStore.make())
-      [_header | fields] = String.split(result, "\r\n", trim: true)
-
-      line = Enum.find(fields, &String.starts_with?(&1, "cold_reads_per_second:"))
-      val_str = String.trim_leading(line, "cold_reads_per_second:")
-      {val, ""} = Float.parse(val_str)
-      assert val >= 0.0
     end
 
     test "INFO all includes hot/cold fields" do
       result = Server.handle("INFO", ["all"], MockStore.make())
       assert result =~ "hot_reads:"
       assert result =~ "cold_reads:"
-      assert result =~ "hot_read_pct:"
-      assert result =~ "cold_reads_per_second:"
+      assert result =~ "hot_cache_hit_ratio:"
     end
   end
 end

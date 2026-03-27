@@ -190,52 +190,57 @@ defmodule FerricstoreServer.Health.DashboardTest do
       assert String.contains?(html, "<title>FerricStore Dashboard</title>")
     end
 
-    test "contains overview section", %{html: html} do
-      assert String.contains?(html, "Overview")
-      assert String.contains?(html, "Uptime")
-      assert String.contains?(html, "Total Keys")
+    test "contains top bar with key metrics", %{html: html} do
+      assert String.contains?(html, "top-bar")
+      assert String.contains?(html, "FerricStore")
+      assert String.contains?(html, "Node")
+      assert String.contains?(html, "Status")
       assert String.contains?(html, "Memory")
-      assert String.contains?(html, "Commands")
+      assert String.contains?(html, "Keys")
     end
 
-    test "contains per-shard status section", %{html: html} do
-      assert String.contains?(html, "Per-Shard Status")
-      assert String.contains?(html, "ETS Memory")
+    test "contains shards section", %{html: html} do
+      assert String.contains?(html, "Shards")
+      assert String.contains?(html, "<th>Shard</th>")
+      assert String.contains?(html, "<th>Status</th>")
+      assert String.contains?(html, "<th>Memory</th>")
     end
 
-    test "contains hot/cold metrics section", %{html: html} do
-      assert String.contains?(html, "Hot/Cold Metrics")
-      assert String.contains?(html, "Hot Read %")
-      assert String.contains?(html, "Cold Reads/sec")
+    test "contains cache performance section", %{html: html} do
+      assert String.contains?(html, "Cache Performance")
+      assert String.contains?(html, "Hit Rate")
+      assert String.contains?(html, "RAM")
+      assert String.contains?(html, "Disk")
     end
 
-    test "contains memory pressure section", %{html: html} do
-      assert String.contains?(html, "Memory Pressure")
-      assert String.contains?(html, "Pressure Level")
-      assert String.contains?(html, "Eviction Policy")
+    test "contains memory info in top bar", %{html: html} do
+      # Memory is shown in the top bar; the full pressure section only appears
+      # when pressure != :ok. Verify the top bar memory metric is present.
+      assert String.contains?(html, "Memory")
+      assert String.contains?(html, "mem-bar-wrap")
     end
 
     test "contains connections section", %{html: html} do
       assert String.contains?(html, "Connections")
-      assert String.contains?(html, "Active Connections")
-      assert String.contains?(html, "Blocked Clients")
-      assert String.contains?(html, "Tracking Clients")
+      assert String.contains?(html, "Active")
+      assert String.contains?(html, "Blocked")
+      assert String.contains?(html, "Tracking")
     end
 
-    test "contains slowlog section", %{html: html} do
-      assert String.contains?(html, "Slowlog")
-      assert String.contains?(html, "Duration")
-      assert String.contains?(html, "Command")
+    test "contains slow log nav link to sub-page", %{html: html} do
+      assert String.contains?(html, ~s(href="/dashboard/slowlog"))
+      assert String.contains?(html, "Slow Log")
     end
 
-    test "contains merge status section", %{html: html} do
+    test "contains merge status nav link to sub-page", %{html: html} do
+      assert String.contains?(html, ~s(href="/dashboard/merge"))
       assert String.contains?(html, "Merge Status")
-      assert String.contains?(html, "Last Merge")
-      assert String.contains?(html, "Bytes Reclaimed")
     end
 
     test "contains run ID in footer", %{data: data, html: html} do
-      assert String.contains?(html, data.overview.run_id)
+      # Footer shows first 8 characters of the run_id
+      short_id = String.slice(data.overview.run_id, 0, 8)
+      assert String.contains?(html, short_id)
     end
 
     test "escapes HTML entities in rendered output" do
@@ -287,13 +292,17 @@ defmodule FerricstoreServer.Health.DashboardTest do
       response = http_get(port, "/dashboard")
       body = extract_body(response)
 
-      assert String.contains?(body, "Overview")
-      assert String.contains?(body, "Per-Shard Status")
-      assert String.contains?(body, "Hot/Cold Metrics")
-      assert String.contains?(body, "Memory Pressure")
+      # Top bar with key metrics
+      assert String.contains?(body, "top-bar")
+      assert String.contains?(body, "FerricStore")
+      # Main content sections
+      assert String.contains?(body, "Cache Performance")
+      assert String.contains?(body, "Shards")
       assert String.contains?(body, "Connections")
-      assert String.contains?(body, "Slowlog")
+      # Nav links to sub-pages
+      assert String.contains?(body, "Slow Log")
       assert String.contains?(body, "Merge Status")
+      assert String.contains?(body, "Namespace Config")
     end
 
     test "Content-Type header is text/html" do
@@ -430,18 +439,18 @@ defmodule FerricstoreServer.Health.DashboardTest do
     end
   end
 
-  describe "render/1 namespace config section" do
-    test "HTML contains Namespace Config heading" do
-      data = Dashboard.collect()
-      html = Dashboard.render(data)
+  describe "render_config_page/1 namespace config sub-page" do
+    test "config sub-page contains Namespace Config heading" do
+      data = Dashboard.collect_config_page()
+      html = Dashboard.render_config_page(data)
 
       assert String.contains?(html, "Namespace Config")
     end
 
     test "shows built-in defaults message when no namespaces configured" do
       NamespaceConfig.reset_all()
-      data = Dashboard.collect()
-      html = Dashboard.render(data)
+      data = Dashboard.collect_config_page()
+      html = Dashboard.render_config_page(data)
 
       assert String.contains?(html, "All namespaces using built-in defaults (1ms, quorum)")
     end
@@ -451,8 +460,8 @@ defmodule FerricstoreServer.Health.DashboardTest do
       :ok = NamespaceConfig.set("session", "window_ms", "5")
       :ok = NamespaceConfig.set("session", "durability", "quorum")
 
-      data = Dashboard.collect()
-      html = Dashboard.render(data)
+      data = Dashboard.collect_config_page()
+      html = Dashboard.render_config_page(data)
 
       assert String.contains?(html, "session")
       assert String.contains?(html, "5")
@@ -467,14 +476,14 @@ defmodule FerricstoreServer.Health.DashboardTest do
       NamespaceConfig.reset_all()
     end
 
-    test "highlights async durability with warning color" do
+    test "highlights async durability with yellow color" do
       NamespaceConfig.reset_all()
       :ok = NamespaceConfig.set("ephemeral", "durability", "async")
 
-      data = Dashboard.collect()
-      html = Dashboard.render(data)
+      data = Dashboard.collect_config_page()
+      html = Dashboard.render_config_page(data)
 
-      assert String.contains?(html, "status-warning")
+      assert String.contains?(html, "c-yellow")
       assert String.contains?(html, "async")
 
       NamespaceConfig.reset_all()
@@ -484,68 +493,49 @@ defmodule FerricstoreServer.Health.DashboardTest do
       NamespaceConfig.reset_all()
       :ok = NamespaceConfig.set("safe", "window_ms", "2")
 
-      data = Dashboard.collect()
-      html = Dashboard.render(data)
+      data = Dashboard.collect_config_page()
+      html = Dashboard.render_config_page(data)
 
       # The durability cell for "safe" should not have warning class
-      # Extract the table rows area to check
       assert String.contains?(html, "quorum")
-      # quorum cells should not have status-warning on them
-      # We verify by checking there is no status-warning in the namespace config
-      # section at all (since the only namespace is quorum)
+      # Extract the config table area to check
       [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
       # Take until the next section or end of body
       ns_html =
-        case String.split(ns_section, "<h2>", parts: 2) do
+        case String.split(ns_section, "section-title", parts: 2) do
           [section, _rest] -> section
           [section] -> section
         end
 
-      refute String.contains?(ns_html, "status-warning")
+      refute String.contains?(ns_html, "c-yellow")
 
       NamespaceConfig.reset_all()
     end
 
-    test "shows config status badge as green when namespaces are configured" do
+    test "shows overrides count badge when namespaces are configured" do
       NamespaceConfig.reset_all()
       :ok = NamespaceConfig.set("metrics", "window_ms", "100")
 
-      data = Dashboard.collect()
-      html = Dashboard.render(data)
+      data = Dashboard.collect_config_page()
+      html = Dashboard.render_config_page(data)
 
-      [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
-
-      ns_html =
-        case String.split(ns_section, "<h2>", parts: 2) do
-          [section, _rest] -> section
-          [section] -> section
-        end
-
-      assert String.contains?(ns_html, "badge-ok")
+      assert String.contains?(html, "1 overrides")
 
       NamespaceConfig.reset_all()
     end
 
-    test "shows config status badge as amber when all defaults" do
+    test "shows defaults badge when all defaults" do
       NamespaceConfig.reset_all()
 
-      data = Dashboard.collect()
-      html = Dashboard.render(data)
+      data = Dashboard.collect_config_page()
+      html = Dashboard.render_config_page(data)
 
-      [_before, ns_section] = String.split(html, "Namespace Config", parts: 2)
-
-      ns_html =
-        case String.split(ns_section, "<h2>", parts: 2) do
-          [section, _rest] -> section
-          [section] -> section
-        end
-
-      assert String.contains?(ns_html, "badge-warning")
+      assert String.contains?(html, "defaults")
 
       NamespaceConfig.reset_all()
     end
 
-    test "namespace config section appears after merge status section" do
+    test "namespace config nav link appears after merge status nav link on main page" do
       data = Dashboard.collect()
       html = Dashboard.render(data)
 
@@ -556,19 +546,46 @@ defmodule FerricstoreServer.Health.DashboardTest do
     end
   end
 
-  describe "GET /dashboard includes namespace config" do
-    test "HTTP response body contains Namespace Config section" do
+  describe "GET /dashboard namespace config nav link" do
+    test "HTTP response body contains Namespace Config nav link" do
       port = HealthEndpoint.port()
       response = http_get(port, "/dashboard")
       body = extract_body(response)
 
       assert String.contains?(body, "Namespace Config")
+      assert String.contains?(body, "/dashboard/config")
     end
 
-    test "HTTP response shows built-in defaults when no overrides exist" do
+    test "HTTP response shows defaults label in nav card when no overrides exist" do
       NamespaceConfig.reset_all()
       port = HealthEndpoint.port()
       response = http_get(port, "/dashboard")
+      body = extract_body(response)
+
+      assert String.contains?(body, "defaults")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Sub-page HTTP endpoints
+  # ---------------------------------------------------------------------------
+
+  describe "GET /dashboard/config sub-page" do
+    test "returns 200 with config page HTML" do
+      port = HealthEndpoint.port()
+      response = http_get(port, "/dashboard/config")
+
+      assert response =~ "HTTP/1.1 200 OK"
+      assert response =~ "text/html"
+
+      body = extract_body(response)
+      assert String.contains?(body, "Namespace Config")
+    end
+
+    test "shows built-in defaults when no overrides exist" do
+      NamespaceConfig.reset_all()
+      port = HealthEndpoint.port()
+      response = http_get(port, "/dashboard/config")
       body = extract_body(response)
 
       assert String.contains?(body, "built-in defaults")

@@ -575,7 +575,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       assert is_binary(info)
       assert info =~ "hot_reads:"
       assert info =~ "cold_reads:"
-      assert info =~ "hot_read_pct:"
+      assert info =~ "hot_cache_hit_ratio:"
     end
   end
 

@@ -51,7 +51,7 @@ defmodule Ferricstore.MixProject do
     [
       {:rustler_precompiled, "~> 0.8"},
       {:rustler, "~> 0.37", optional: true},
-      {:ra, "~> 2.14"},
+      {:ra, "~> 3.1"},
       {:libcluster, "~> 3.3"},
       {:telemetry, "~> 1.4"},
       {:jason, "~> 1.4"},
