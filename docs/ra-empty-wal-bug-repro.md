@@ -109,9 +109,30 @@ open_at_first_record(File) ->
     end.
 ```
 
+## Verified Affected Versions
+
+Tested and confirmed on both:
+
+- **ra 2.17.2** — `{:case_clause, :eof}` at `ra_log_wal.erl` line 920
+- **ra 3.1.2** (latest) — `{:case_clause, :eof}` at `ra_log_wal.erl` line 825
+
+The bug has existed since `open_at_first_record/1` was introduced. Both v2.x and v3.x have the identical code pattern with no `eof` clause.
+
+```
+13:09:45.113 [error] WAL in repro_bug failed to initialise with {:case_clause, :eof}, stack [
+  {:ra_log_wal, :open_at_first_record, 1, [file: ..., line: 825]},
+  {:ra_log_wal, :"-recover_wal/2-anonymous-5-", 7, [file: ..., line: 419]},
+  ...
+]
+```
+
 ## Environment
 
-- ra version: 2.15.x (also present in earlier versions)
+- ra version: **2.17.2 and 3.1.2** (both confirmed)
 - Erlang/OTP: 28
 - OS: Linux / macOS
 - Discovered in FerricStore (distributed cache using ra for Raft consensus)
+
+## Impact
+
+This affects any system using ra (including RabbitMQ quorum queues). If a node is kill -9'd or OOM-killed during WAL file rotation, the ra system will not start on the next boot.
