@@ -8,12 +8,13 @@ FerricStore implements 250+ commands covering standard Redis data types, probabi
 
 These commands match Redis 7.4 behavior exactly -- same arguments, same return values, same error messages:
 
-GET, SET (EX/PX/NX/XX), DEL, EXISTS, MGET, MSET, MSETNX, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT,
+GET, SET (EX/PX/EXAT/PXAT/NX/XX/GET/KEEPTTL), DEL, EXISTS, MGET, MSET, MSETNX, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT,
 APPEND, STRLEN, GETSET, GETDEL, GETEX, SETNX, SETEX, PSETEX, GETRANGE, SETRANGE,
 HSET, HGET, HDEL, HMGET, HGETALL, HEXISTS, HKEYS, HVALS, HLEN, HINCRBY, HINCRBYFLOAT,
-HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HEXPIRETIME,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, LPUSHX, RPUSHX,
-SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SRANDMEMBER, SPOP, SDIFF, SINTER, SUNION, SMOVE, SSCAN,
+HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HEXPIRETIME, HGETDEL, HGETEX, HSETEX,
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, RPOPLPUSH, LPUSHX, RPUSHX,
+SADD, SREM, SMEMBERS, SISMEMBER, SMISMEMBER, SCARD, SRANDMEMBER, SPOP, SDIFF, SINTER, SUNION,
+SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD, SMOVE, SSCAN,
 ZADD (NX/XX/GT/LT/CH), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, ZREM, ZINCRBY,
 ZCOUNT, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZMSCORE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZSCAN,
 XADD, XLEN, XRANGE, XREVRANGE, XREAD (including BLOCK), XTRIM, XDEL, XINFO STREAM,
@@ -23,7 +24,7 @@ SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP,
 PFADD, PFCOUNT, PFMERGE,
 GEOADD, GEOPOS, GEODIST, GEOHASH, GEOSEARCH, GEOSEARCHSTORE,
 PING, ECHO, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
-OBJECT ENCODING/HELP/FREQ/IDLETIME/REFCOUNT, SCAN, CONFIG GET/SET/RESETSTAT/REWRITE,
+OBJECT HELP/REFCOUNT, SCAN, CONFIG GET/SET/RESETSTAT/REWRITE,
 SLOWLOG GET/LEN/RESET, COMMAND/COMMAND COUNT/COMMAND LIST/COMMAND INFO/COMMAND DOCS/COMMAND GETKEYS,
 MULTI, EXEC, DISCARD, WATCH, UNWATCH, SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH,
 CLIENT ID/SETNAME/GETNAME/INFO/LIST/TRACKING/CACHING/TRACKINGINFO/GETREDIR, HELLO, AUTH, QUIT, RESET
@@ -32,15 +33,14 @@ CLIENT ID/SETNAME/GETNAME/INFO/LIST/TRACKING/CACHING/TRACKINGINFO/GETREDIR, HELL
 
 | Command | Difference |
 |---------|-----------|
-| `SET` | `EXAT` / `PXAT` / `GET` / `KEEPTTL` options not yet supported |
 | `ZRANGE` | Redis 6.2+ unified syntax (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`) not yet supported -- use `ZRANGEBYSCORE`/`ZREVRANGEBYSCORE` instead |
 | `SCAN` | Cursor is key-based (alphabetic position), not an opaque integer. Functionally equivalent but cursor values differ from Redis |
 | `HSCAN`/`SSCAN`/`ZSCAN` | Cursor is an integer offset into the scanned list. Redis uses a hash-table-based cursor; results are equivalent |
 | `FLUSHDB`/`FLUSHALL` | `ASYNC`/`SYNC` accepted but both execute synchronously; true async reclaim happens during Bitcask merge |
 | `UNLINK` | Semantically identical to `DEL` -- async reclaim is deferred to Bitcask merge |
-| `OBJECT ENCODING` | Always returns `"raw"` (FerricStore uses a single internal encoding) |
+| `OBJECT ENCODING` | Returns type-specific encoding (`"embstr"`, `"raw"`, `"hashtable"`, `"quicklist"`, `"skiplist"`, `"stream"`) instead of Redis's internal encodings like `ziplist`/`listpack`/`intset` |
 | `OBJECT FREQ` | Returns the LFU counter from keydir, not Redis's logarithmic frequency |
-| `OBJECT IDLETIME` | Always returns `0` (no idle tracking) |
+| `OBJECT IDLETIME` | Returns idle seconds derived from LFU last-decrement-time, not Redis's LRU clock |
 | `SELECT` | Returns error -- FerricStore is single-database |
 | `INFO` | Returns FerricStore-specific sections (`raft`, `bitcask`, `ferricstore`, `keydir_analysis`, `namespace_config`) in addition to Redis standard sections |
 | `WAIT` | Always returns `0` immediately (no replica acknowledgement) |
@@ -54,18 +54,16 @@ These have no Redis equivalent:
 `CAS`, `LOCK`, `UNLOCK`, `EXTEND`, `RATELIMIT.ADD`, `FETCH_OR_COMPUTE`, `FETCH_OR_COMPUTE_RESULT`, `FETCH_OR_COMPUTE_ERROR`, `KEY_INFO`,
 `VCREATE`, `VADD`, `VGET`, `VDEL`, `VSEARCH`, `VINFO`, `VLIST`, `VEVICT`,
 `FERRICSTORE.CONFIG`, `FERRICSTORE.METRICS`, `FERRICSTORE.HOTNESS`, `FERRICSTORE.KEY_INFO`,
-`CLUSTER.HEALTH`, `CLUSTER.STATS`
+`CLUSTER.HEALTH`, `CLUSTER.STATS`, `CLUSTER.KEYSLOT`, `CLUSTER.SLOTS`
 
 ### Redis Commands NOT Yet Supported
 
 `EVAL`, `EVALSHA`, `EVALSHA_RO`, `EVAL_RO` (Lua scripting),
-`SINTERCARD`, `SDIFFSTORE`, `SINTERSTORE`, `SUNIONSTORE` (set store operations),
-`SMISMEMBER` (dispatched but implementation status TBD),
 `LMPOP`, `ZMPOP`, `BZMPOP` (multi-key pop),
 `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE` (sorted set store operations),
 `ZRANGESTORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZLEXCOUNT`,
 `SORT`, `SORT_RO`,
-`OBJECT HELP` with extended subcommands,
+`OBJECT` extended subcommands (`OBJECT PERSIST`, `OBJECT COPY`),
 `CLUSTER` (full Redis Cluster protocol),
 `DUMP`, `RESTORE`, `MIGRATE`, `MOVE`,
 `CLIENT KILL`, `CLIENT NO-EVICT`, `CLIENT PAUSE`, `CLIENT UNPAUSE`,
@@ -95,18 +93,22 @@ Sets a string value with optional expiry and conditional flags.
 
 | | |
 |---|---|
-| **RESP3 syntax** | `SET key value [EX seconds] [PX milliseconds] [NX\|XX]` |
+| **RESP3 syntax** | `SET key value [EX seconds \| PX milliseconds \| EXAT unix-sec \| PXAT unix-ms] [NX\|XX] [GET] [KEEPTTL]` |
 | **Embedded API** | `FerricStore.set(key, value, ttl: ms)` |
-| **RESP3 return** | `+OK` on success, `_` (null) when NX/XX condition fails |
+| **RESP3 return** | `+OK` on success, `_` (null) when NX/XX condition fails. With `GET`: returns old value or null. |
 | **Elixir return** | `:ok` on success, `{:ok, nil}` when condition fails |
 
 **Options:**
 - `EX seconds` -- set expiry in seconds (must be > 0)
 - `PX milliseconds` -- set expiry in milliseconds (must be > 0)
+- `EXAT unix-sec` -- set absolute expiry as Unix timestamp in seconds
+- `PXAT unix-ms` -- set absolute expiry as Unix timestamp in milliseconds
 - `NX` -- only set if key does not exist
 - `XX` -- only set if key already exists
+- `GET` -- return the old value stored at key (or null if key didn't exist)
+- `KEEPTTL` -- retain the existing TTL on the key (cannot combine with EX/PX/EXAT/PXAT)
 
-**Redis compat:** `EXAT`, `PXAT`, `GET`, and `KEEPTTL` options not yet implemented.
+**Redis compat:** Fully compatible -- all SET options supported.
 
 **FerricStore behavior:** Expiry is stored as an absolute HLC timestamp (`expire_at_ms`). Writes go through Raft group-commit -- the ETS keydir is updated immediately (sub-microsecond read visibility) while Bitcask persistence is batched.
 
@@ -573,7 +575,35 @@ Set algebra operations across multiple keys.
 | **RESP3 return** | Array of members |
 | **Redis compat** | Fully compatible. All keys are loaded into `MapSet` for computation. |
 
-**Note:** `SDIFFSTORE`, `SINTERSTORE`, `SUNIONSTORE`, `SINTERCARD` are dispatched but implementation may be partial.
+### SDIFFSTORE / SINTERSTORE / SUNIONSTORE
+
+Store operations that compute set algebra and write the result to a destination key.
+
+| | |
+|---|---|
+| **RESP3 syntax** | `SDIFFSTORE dest key [key ...]`, `SINTERSTORE dest key [key ...]`, `SUNIONSTORE dest key [key ...]` |
+| **RESP3 return** | Integer -- cardinality of the resulting set |
+| **Redis compat** | Fully compatible. Destination is cleared and re-created. |
+
+### SINTERCARD
+
+Returns the cardinality of the intersection without creating a new set.
+
+| | |
+|---|---|
+| **RESP3 syntax** | `SINTERCARD numkeys key [key ...] [LIMIT limit]` |
+| **RESP3 return** | Integer -- intersection cardinality (capped by LIMIT if provided) |
+| **Redis compat** | Fully compatible |
+
+### SMISMEMBER
+
+Returns whether each member is a member of the set.
+
+| | |
+|---|---|
+| **RESP3 syntax** | `SMISMEMBER key member [member ...]` |
+| **RESP3 return** | Array of `1` / `0` |
+| **Redis compat** | Fully compatible |
 
 ### SMOVE
 
@@ -829,10 +859,10 @@ All Redis-compatible. Expiry uses HLC timestamps internally.
 
 | Subcommand | Return | Notes |
 |------------|--------|-------|
-| `OBJECT ENCODING key` | `"raw"` | FerricStore uses a single encoding |
+| `OBJECT ENCODING key` | Type-specific encoding | Returns `"embstr"` (strings <= 44 bytes), `"raw"` (longer strings), `"hashtable"` (hashes), `"quicklist"` (lists), `"skiplist"` (sorted sets), `"stream"` (streams) |
 | `OBJECT HELP` | Array of help strings | Redis-compatible format |
 | `OBJECT FREQ key` | Integer (LFU counter) | Uses keydir LFU, not Redis logarithmic frequency |
-| `OBJECT IDLETIME key` | `0` | No idle tracking |
+| `OBJECT IDLETIME key` | Integer (idle seconds) | Derived from LFU last-decrement-time. Returns elapsed seconds since last access. |
 | `OBJECT REFCOUNT key` | `1` | Always 1 |
 
 ### WAIT
@@ -1241,7 +1271,7 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 
 ## Differences from Redis -- Summary
 
-1. **Single database** -- `SELECT` is accepted but only database 0 exists.
+1. **Single database** -- `SELECT` returns an error. FerricStore is single-database.
 2. **RESP3 only** -- `HELLO 3` is required. RESP2 is not supported.
 3. **No Lua scripting** -- `EVAL`/`EVALSHA` are not implemented. Use CAS, LOCK, and FETCH_OR_COMPUTE for atomic operations.
 4. **No blocking commands in embedded mode** -- `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` require a TCP connection.
@@ -1253,5 +1283,5 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 10. **HLC timestamps** -- expiry uses Hybrid Logical Clock timestamps instead of wall-clock time. Monotonic even during clock skew.
 11. **Compound key storage** -- hash fields, set members, zset members, and vector data are stored as individual Bitcask entries with structured key prefixes, enabling O(1) field-level access without deserializing the entire data structure.
 12. **SCAN cursor** -- uses alphabetic key position, not Redis's opaque hash-table cursor. Functionally equivalent but cursor values differ.
-13. **OBJECT ENCODING** -- always returns `"raw"`. FerricStore does not use ziplist, listpack, intset, or other Redis internal encodings.
+13. **OBJECT ENCODING** -- returns type-specific encodings (`"embstr"`, `"raw"`, `"hashtable"`, `"quicklist"`, `"skiplist"`, `"stream"`) but does not use Redis's memory-optimized internal encodings like `ziplist`, `listpack`, `intset`, or `skiplist` (Redis's native C implementation).
 14. **INFO sections** -- includes FerricStore-specific sections: `raft`, `bitcask`, `ferricstore`, `keydir_analysis`, `namespace_config`.

@@ -1,58 +1,33 @@
 # Extensions
 
-FerricStore ships with two extension packages that integrate with the broader Elixir ecosystem. Both use the same underlying FerricStore engine -- you can use them independently or together.
+FerricStore ships with extension packages that integrate with the Elixir ecosystem.
 
 ## Overview
 
-| Package | What It Does | When to Use |
-|---------|-------------|-------------|
-| `ferricstore_nebulex` | Nebulex 3.x adapter | You want a standard Nebulex cache API backed by persistent storage |
-| `ferricstore_ecto` | Transparent Ecto L2 cache | You want automatic caching for `Repo.get` / `Repo.all` with zero boilerplate |
+| Package | What It Does |
+|---------|-------------|
+| `ferricstore_session` | Plug.Session.Store adapter — durable sessions that survive restarts |
+| `ferricstore_ecto` | Transparent Ecto L2 cache |
 
-## Nebulex Adapter
+## Session Store
 
-**Package:** `ferricstore_nebulex`
-**Drop-in replacement for:** `Nebulex.Adapters.Local`
-**Key benefit:** Your Nebulex cache survives BEAM restarts
-
-### Quick Start
+**Package:** `ferricstore_session`
+**Drop-in replacement for:** Cookie store or ETS session store
+**Key benefit:** Sessions survive deploys, restarts, and node failures
 
 ```elixir
-# 1. Define your cache
-defmodule MyApp.Cache do
-  use Nebulex.Cache,
-    otp_app: :my_app,
-    adapter: FerricstoreNebulex.Adapter
-end
+# mix.exs
+{:ferricstore_session, "~> 0.1.0"}
 
-# 2. Configure (config/config.exs)
-config :my_app, MyApp.Cache,
-  prefix: "cache",
-  serializer: :erlang_term
-
-# 3. Add to supervision tree
-children = [MyApp.Cache]
-
-# 4. Use it
-MyApp.Cache.put("key", "value", ttl: :timer.hours(1))
-MyApp.Cache.get("key")
+# In your Phoenix endpoint:
+plug Plug.Session,
+  store: FerricStore.Session.Store,
+  key: "_my_app_key",
+  ttl: 3600,
+  prefix: "sess"
 ```
 
-### When to Use
-
-- You already use Nebulex and want persistent storage
-- You want the standard Nebulex API (portable across adapters)
-- You need counters, TTL management, bulk operations, streaming
-- You're migrating from Cachex or ConCache to a persistent cache
-
-### Configuration
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `prefix` | `"nbx"` | Key prefix. Use different prefixes to namespace multiple caches. |
-| `serializer` | `:erlang_term` | `:erlang_term` (any Elixir term) or `:jason` (JSON-compatible types only). |
-
-See the [full README](apps/ferricstore_nebulex/README.md) for migration guides, all supported operations, and testing setup.
+Unlike cookie sessions (4KB limit, client-side), FerricStore sessions are server-side with no size limit. Unlike ETS sessions, they persist on disk — deploying your app doesn't log out your users.
 
 ## Ecto L2 Cache
 
@@ -122,53 +97,14 @@ Repo.get(User, 42, cache: [ttl: ms])   # custom TTL for this read
 
 See the [full README](apps/ferricstore_ecto/README.md) for the complete invalidation flow, field serialization details, before/after comparisons, and testing setup.
 
-## Using Both Together
-
-Both packages share the same FerricStore backend. You can use the Nebulex adapter for general-purpose caching and the Ecto cache for automatic Repo caching, in the same application:
-
-```elixir
-# mix.exs
-def deps do
-  [
-    {:ferricstore, "~> 0.1.0"},
-    {:ferricstore_nebulex, "~> 0.1.0"},
-    {:ferricstore_ecto, "~> 0.1.0"}
-  ]
-end
-```
-
-```elixir
-# General-purpose cache (sessions, rate limits, feature flags)
-defmodule MyApp.Cache do
-  use Nebulex.Cache,
-    otp_app: :my_app,
-    adapter: FerricstoreNebulex.Adapter
-end
-
-# Ecto L2 cache (automatic Repo caching)
-defmodule MyApp.Repo do
-  use FerricStore.Ecto.CachedRepo,
-    otp_app: :my_app,
-    adapter: Ecto.Adapters.Postgres
-end
-```
-
-The two packages use different key prefixes by default (`"nbx:"` for Nebulex, `"ecto:"` for Ecto), so they coexist without conflicts.
-
-### Architecture Diagram
+### Architecture
 
 ```
 Your Application
-├── MyApp.Cache (Nebulex API)
-│   └── FerricstoreNebulex.Adapter
-│       └── FerricStore  ─────────────┐
-│           Keys: nbx:session:abc     │
-│           Keys: nbx:rate:ip:1.2.3   │
-│                                      │  Same FerricStore
-├── MyApp.Repo (Ecto API)             │  engine & storage
-│   └── FerricStore.Ecto.CachedRepo   │
-│       └── FerricstoreEcto.Cache     │
-│           └── FerricStore ──────────┘
+├── MyApp.Repo (Ecto API)
+│   └── FerricStore.Ecto.CachedRepo
+│       └── FerricstoreEcto.Cache
+│           └── FerricStore
 │               Keys: ecto:users:42
 │               Keys: ecto:gen:users
 │               Keys: ecto:q:123:g0:pks
@@ -181,11 +117,10 @@ Your Application
 
 ## Dependencies
 
-Both extension packages depend on `ferricstore` (the core engine). You must have FerricStore configured and running in your application's supervision tree before using either extension. See the [Getting Started](getting-started.md) guide for FerricStore setup.
+The extension packages depend on `ferricstore` (the core engine). You must have FerricStore configured and running in your application's supervision tree before using any extension. See the [Getting Started](getting-started.md) guide for FerricStore setup.
 
 ### Version Compatibility
 
-| Package | FerricStore | Nebulex | Ecto | Elixir |
-|---------|-------------|---------|------|--------|
-| `ferricstore_nebulex 0.1.x` | `~> 0.1.0` | `~> 3.0` | -- | `~> 1.19` |
-| `ferricstore_ecto 0.1.x` | `~> 0.1.0` | -- | `~> 3.11` | `~> 1.19` |
+| Package | FerricStore | Ecto | Elixir |
+|---------|-------------|------|--------|
+| `ferricstore_ecto 0.1.x` | `~> 0.1.0` | `~> 3.11` | `~> 1.19` |

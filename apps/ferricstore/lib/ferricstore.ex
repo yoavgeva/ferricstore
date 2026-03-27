@@ -77,22 +77,36 @@ defmodule FerricStore do
       clearing it. Mutually exclusive with `:ttl`, `:exat`, `:pxat`.
     * `:cache` - Named cache instance (default: the default cache).
 
-  ## Returns
-
-    * `:ok` on success (default).
-    * `{:ok, old_value}` when `:get` is `true`.
-    * `nil` when `:nx` or `:xx` condition prevented the write (and `:get` is
-      not set).
-
   ## Examples
 
-      :ok = FerricStore.set("user:42:name", "alice", ttl: :timer.hours(1))
-      :ok = FerricStore.set("counter", "0")
-      :ok = FerricStore.set("event:ts", "data", exat: 1711234567)
-      :ok = FerricStore.set("event:ts", "data", pxat: 1711234567000)
-      {:ok, "old"} = FerricStore.set("key", "new", get: true)
-      :ok = FerricStore.set("key", "new_val", keepttl: true)
+      iex> FerricStore.set("user:42:name", "alice")
+      :ok
 
+      iex> FerricStore.set("session:abc", "token_data", ttl: :timer.hours(1))
+      :ok
+
+      iex> FerricStore.set("cache:page:home", "html", exat: 1711234567)
+      :ok
+
+      iex> FerricStore.set("lock:order:99", "owner_1", nx: true)
+      :ok
+
+      iex> FerricStore.set("lock:order:99", "owner_2", nx: true)
+      nil
+
+      iex> FerricStore.set("counter", "0")
+      :ok
+      iex> FerricStore.set("counter", "100", get: true)
+      {:ok, "0"}
+
+      iex> FerricStore.set("missing", "val", get: true)
+      {:ok, nil}
+
+      iex> FerricStore.set("session:abc", "refreshed", keepttl: true)
+      :ok
+
+  Returns `{:error, reason}` if the value exceeds the configured
+  `max_value_size`.
   """
   @spec set(key(), value(), set_opts()) :: :ok | {:ok, value() | nil} | nil | {:error, binary()}
   def set(key, value, opts \\ []) do
@@ -158,9 +172,9 @@ defmodule FerricStore do
   end
 
   @doc """
-  Gets the value for `key`.
+  Gets the value stored at `key`.
 
-  Returns `{:ok, value}` if the key exists and is not expired, or `{:ok, nil}`
+  Returns `{:ok, value}` if the key exists and has not expired, or `{:ok, nil}`
   if the key does not exist or has expired.
 
   ## Options
@@ -169,8 +183,13 @@ defmodule FerricStore do
 
   ## Examples
 
-      {:ok, "alice"} = FerricStore.get("user:42:name")
-      {:ok, nil} = FerricStore.get("nonexistent")
+      iex> FerricStore.set("user:42:name", "alice")
+      :ok
+      iex> FerricStore.get("user:42:name")
+      {:ok, "alice"}
+
+      iex> FerricStore.get("nonexistent:key")
+      {:ok, nil}
 
   """
   @spec get(key(), get_opts()) :: {:ok, value() | nil}
@@ -186,13 +205,19 @@ defmodule FerricStore do
   end
 
   @doc """
-  Deletes `key`.
+  Deletes `key` from the store.
 
-  Returns `:ok` whether or not the key existed.
+  Returns `:ok` regardless of whether the key existed.
 
   ## Examples
 
-      :ok = FerricStore.del("user:42:name")
+      iex> FerricStore.set("session:temp", "data")
+      :ok
+      iex> FerricStore.del("session:temp")
+      :ok
+
+      iex> FerricStore.del("nonexistent:key")
+      :ok
 
   """
   @spec del(key()) :: :ok
@@ -207,18 +232,21 @@ defmodule FerricStore do
   Increments the integer value stored at `key` by 1.
 
   If the key does not exist, it is initialized to `0` before incrementing,
-  resulting in a value of `1`. If the key holds a value that cannot be parsed
-  as an integer, returns `{:error, reason}`.
-
-  ## Returns
-
-    * `{:ok, new_value}` where `new_value` is the integer value after increment.
-    * `{:error, reason}` if the stored value is not a valid integer.
+  resulting in a value of `1`. Returns `{:error, reason}` if the stored value
+  cannot be parsed as an integer.
 
   ## Examples
 
-      {:ok, 1} = FerricStore.incr("counter")
-      {:ok, 2} = FerricStore.incr("counter")
+      iex> FerricStore.incr("page:views:home")
+      {:ok, 1}
+
+      iex> FerricStore.incr("page:views:home")
+      {:ok, 2}
+
+      iex> FerricStore.set("name", "alice")
+      :ok
+      iex> FerricStore.incr("name")
+      {:error, "ERR value is not an integer or out of range"}
 
   """
   @spec incr(key()) :: {:ok, integer()} | {:error, binary()}
@@ -230,17 +258,18 @@ defmodule FerricStore do
   Decrements the integer value stored at `key` by 1.
 
   If the key does not exist, it is initialized to `0` before decrementing,
-  resulting in a value of `-1`. If the key holds a value that cannot be parsed
-  as an integer, returns `{:error, reason}`.
-
-  ## Returns
-
-    * `{:ok, new_value}` where `new_value` is the integer value after decrement.
-    * `{:error, reason}` if the stored value is not a valid integer.
+  resulting in a value of `-1`. Returns `{:error, reason}` if the stored value
+  cannot be parsed as an integer.
 
   ## Examples
 
-      {:ok, -1} = FerricStore.decr("counter")
+      iex> FerricStore.decr("rate_limit:user:42")
+      {:ok, -1}
+
+      iex> FerricStore.set("stock:item:99", "10")
+      :ok
+      iex> FerricStore.decr("stock:item:99")
+      {:ok, 9}
 
   """
   @spec decr(key()) :: {:ok, integer()} | {:error, binary()}
@@ -252,15 +281,17 @@ defmodule FerricStore do
   Decrements the integer value stored at `key` by `amount`.
 
   If the key does not exist, it is initialized to `0` before decrementing.
-
-  ## Returns
-
-    * `{:ok, new_value}` where `new_value` is the integer value after decrement.
-    * `{:error, reason}` if the stored value is not a valid integer.
+  Returns `{:error, reason}` if the stored value is not a valid integer.
 
   ## Examples
 
-      {:ok, 90} = FerricStore.decr_by("counter", 10)
+      iex> FerricStore.set("stock:item:99", "100")
+      :ok
+      iex> FerricStore.decr_by("stock:item:99", 10)
+      {:ok, 90}
+
+      iex> FerricStore.decr_by("new_counter", 5)
+      {:ok, -5}
 
   """
   @spec decr_by(key(), integer()) :: {:ok, integer()} | {:error, binary()}
@@ -272,18 +303,20 @@ defmodule FerricStore do
   Increments the integer value stored at `key` by `amount`.
 
   If the key does not exist, it is initialized to `0` before incrementing.
-  If the key holds a value that cannot be parsed as an integer, returns
-  `{:error, reason}`.
-
-  ## Returns
-
-    * `{:ok, new_value}` where `new_value` is the integer value after increment.
-    * `{:error, reason}` if the stored value is not a valid integer.
+  Returns `{:error, reason}` if the stored value is not a valid integer.
 
   ## Examples
 
-      {:ok, 10} = FerricStore.incr_by("counter", 10)
-      {:ok, 15} = FerricStore.incr_by("counter", 5)
+      iex> FerricStore.incr_by("page:views:home", 10)
+      {:ok, 10}
+
+      iex> FerricStore.incr_by("page:views:home", 5)
+      {:ok, 15}
+
+      iex> FerricStore.set("name", "alice")
+      :ok
+      iex> FerricStore.incr_by("name", 1)
+      {:error, "ERR value is not an integer or out of range"}
 
   """
   @spec incr_by(key(), integer()) :: {:ok, integer()} | {:error, binary()}
@@ -304,19 +337,21 @@ defmodule FerricStore do
   end
 
   @doc """
-  Increments the float value stored at `key` by `amount`.
+  Increments the numeric value stored at `key` by a floating-point `amount`.
 
-  If the key does not exist, it is initialized to `0` before incrementing.
-  Returns the new value as a string.
-
-  ## Returns
-
-    * `{:ok, new_value_string}` on success.
-    * `{:error, reason}` if the stored value is not a valid number.
+  If the key does not exist, it is initialized to `0.0` before incrementing.
+  The new value is returned as a string representation. Returns
+  `{:error, reason}` if the stored value is not a valid number.
 
   ## Examples
 
-      {:ok, "3.14"} = FerricStore.incr_by_float("counter", 3.14)
+      iex> FerricStore.incr_by_float("price:item:99", 3.14)
+      {:ok, "3.14"}
+
+      iex> FerricStore.set("balance:user:42", "100.50")
+      :ok
+      iex> FerricStore.incr_by_float("balance:user:42", -20.25)
+      {:ok, "80.25"}
 
   """
   @spec incr_by_float(key(), float()) :: {:ok, binary()} | {:error, binary()}
@@ -332,11 +367,17 @@ defmodule FerricStore do
   @doc """
   Gets values for multiple keys in a single call.
 
-  Returns `{:ok, [value | nil, ...]}` with values in the same order as the keys.
+  Returns `{:ok, values}` where `values` is a list in the same order as the
+  input keys. Missing or expired keys appear as `nil` in the result list.
 
   ## Examples
 
-      {:ok, ["val1", nil, "val3"]} = FerricStore.mget(["key1", "key2", "key3"])
+      iex> FerricStore.set("user:1:name", "alice")
+      :ok
+      iex> FerricStore.set("user:2:name", "bob")
+      :ok
+      iex> FerricStore.mget(["user:1:name", "user:2:name", "user:3:name"])
+      {:ok, ["alice", "bob", nil]}
 
   """
   @spec mget([key()]) :: {:ok, [value() | nil]}
@@ -348,15 +389,18 @@ defmodule FerricStore do
   end
 
   @doc """
-  Sets multiple key-value pairs atomically.
+  Sets multiple key-value pairs in a single call.
 
-  ## Returns
-
-    * `:ok`
+  All pairs are written without expiry. Use `set/3` with `:ttl` if individual
+  keys need time-to-live.
 
   ## Examples
 
-      :ok = FerricStore.mset(%{"key1" => "val1", "key2" => "val2"})
+      iex> FerricStore.mset(%{"user:1:name" => "alice", "user:2:name" => "bob"})
+      :ok
+
+      iex> FerricStore.get("user:1:name")
+      {:ok, "alice"}
 
   """
   @spec mset(%{key() => value()}) :: :ok
@@ -368,15 +412,20 @@ defmodule FerricStore do
   end
 
   @doc """
-  Appends `suffix` to the value of `key`. Creates the key if it does not exist.
+  Appends `suffix` to the string value stored at `key`.
 
-  ## Returns
-
-    * `{:ok, new_byte_length}` on success.
+  If the key does not exist, it is created with `suffix` as its value.
+  Returns the byte length of the string after the append.
 
   ## Examples
 
-      {:ok, 11} = FerricStore.append("key", " World")
+      iex> FerricStore.set("log:request:42", "GET /api")
+      :ok
+      iex> FerricStore.append("log:request:42", " 200 OK")
+      {:ok, 15}
+
+      iex> FerricStore.append("new:key", "hello")
+      {:ok, 5}
 
   """
   @spec append(key(), binary()) :: {:ok, non_neg_integer()}
@@ -395,7 +444,13 @@ defmodule FerricStore do
 
   ## Examples
 
-      {:ok, 5} = FerricStore.strlen("key")
+      iex> FerricStore.set("user:42:name", "alice")
+      :ok
+      iex> FerricStore.strlen("user:42:name")
+      {:ok, 5}
+
+      iex> FerricStore.strlen("nonexistent:key")
+      {:ok, 0}
 
   """
   @spec strlen(key()) :: {:ok, non_neg_integer()}
@@ -408,13 +463,20 @@ defmodule FerricStore do
   end
 
   @doc """
-  Atomically sets `key` to `value` and returns the old value.
+  Atomically sets `key` to `value` and returns the previous value.
 
-  Returns `{:ok, old_value}` or `{:ok, nil}` if the key did not exist.
+  Returns `{:ok, old_value}` or `{:ok, nil}` if the key did not previously
+  exist. Useful for atomic swap patterns like rotating session tokens.
 
   ## Examples
 
-      {:ok, "old"} = FerricStore.getset("key", "new")
+      iex> FerricStore.set("session:token", "tok_abc")
+      :ok
+      iex> FerricStore.getset("session:token", "tok_xyz")
+      {:ok, "tok_abc"}
+
+      iex> FerricStore.getset("fresh:key", "first_value")
+      {:ok, nil}
 
   """
   @spec getset(key(), value()) :: {:ok, value() | nil}
@@ -425,13 +487,19 @@ defmodule FerricStore do
   end
 
   @doc """
-  Atomically gets and deletes `key`.
+  Atomically gets the value of `key` and deletes it.
 
-  Returns `{:ok, value}` or `{:ok, nil}` if the key did not exist.
+  Returns `{:ok, value}` or `{:ok, nil}` if the key did not exist. Useful
+  for consuming one-time tokens or dequeuing single values.
 
   ## Examples
 
-      {:ok, "value"} = FerricStore.getdel("key")
+      iex> FerricStore.set("otp:user:42", "839201")
+      :ok
+      iex> FerricStore.getdel("otp:user:42")
+      {:ok, "839201"}
+      iex> FerricStore.getdel("otp:user:42")
+      {:ok, nil}
 
   """
   @spec getdel(key()) :: {:ok, value() | nil}
@@ -444,18 +512,26 @@ defmodule FerricStore do
   @doc """
   Gets the value of `key` and optionally updates its expiry.
 
+  When called without options, behaves identically to `get/2`. Pass `:ttl`
+  to refresh the expiry on access, or `:persist` to remove it.
+
   ## Options
 
-    * `:ttl` - New TTL in milliseconds.
-    * `:persist` - When `true`, removes the TTL.
-
-  ## Returns
-
-    * `{:ok, value}` or `{:ok, nil}` if the key does not exist.
+    * `:ttl` - New TTL in milliseconds to set on the key.
+    * `:persist` - When `true`, removes any existing TTL, making the key persistent.
 
   ## Examples
 
-      {:ok, "value"} = FerricStore.getex("key", ttl: 60_000)
+      iex> FerricStore.set("session:abc", "data", ttl: 10_000)
+      :ok
+      iex> FerricStore.getex("session:abc", ttl: 60_000)
+      {:ok, "data"}
+
+      iex> FerricStore.getex("session:abc", persist: true)
+      {:ok, "data"}
+
+      iex> FerricStore.getex("nonexistent:key")
+      {:ok, nil}
 
   """
   @spec getex(key(), keyword()) :: {:ok, value() | nil}
@@ -487,14 +563,16 @@ defmodule FerricStore do
   @doc """
   Sets `key` to `value` only if the key does not already exist.
 
-  ## Returns
-
-    * `{:ok, true}` if the key was set.
-    * `{:ok, false}` if the key already existed.
+  Returns `{:ok, true}` if the key was created, or `{:ok, false}` if the key
+  already existed and the write was skipped.
 
   ## Examples
 
-      {:ok, true} = FerricStore.setnx("new_key", "value")
+      iex> FerricStore.setnx("lock:job:import", "worker_1")
+      {:ok, true}
+
+      iex> FerricStore.setnx("lock:job:import", "worker_2")
+      {:ok, false}
 
   """
   @spec setnx(key(), value()) :: {:ok, boolean()}
@@ -511,13 +589,16 @@ defmodule FerricStore do
   @doc """
   Sets `key` to `value` with a TTL in seconds.
 
-  ## Returns
-
-    * `:ok`
+  This is a convenience wrapper equivalent to
+  `set(key, value, ttl: seconds * 1_000)`.
 
   ## Examples
 
-      :ok = FerricStore.setex("key", 60, "value")
+      iex> FerricStore.setex("session:abc", 3600, "token_data")
+      :ok
+
+      iex> FerricStore.setex("cache:query:recent", 60, "[\"row1\",\"row2\"]")
+      :ok
 
   """
   @spec setex(key(), pos_integer(), value()) :: :ok
@@ -530,13 +611,16 @@ defmodule FerricStore do
   @doc """
   Sets `key` to `value` with a TTL in milliseconds.
 
-  ## Returns
-
-    * `:ok`
+  This is a convenience wrapper equivalent to
+  `set(key, value, ttl: milliseconds)`.
 
   ## Examples
 
-      :ok = FerricStore.psetex("key", 60_000, "value")
+      iex> FerricStore.psetex("rate_limit:user:42", 500, "1")
+      :ok
+
+      iex> FerricStore.psetex("debounce:click", 200, "pending")
+      :ok
 
   """
   @spec psetex(key(), pos_integer(), value()) :: :ok
@@ -547,13 +631,23 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns a substring of the string stored at `key` between byte offsets `start` and `stop`.
+  Returns a substring of the string stored at `key` between byte offsets `start` and `stop` (inclusive).
 
-  Negative offsets count from the end. Returns `{:ok, ""}` for nonexistent keys.
+  Negative offsets count from the end of the string (`-1` is the last byte).
+  Returns `{:ok, ""}` if the key does not exist or the range is empty.
 
   ## Examples
 
-      {:ok, "World"} = FerricStore.getrange("key", 6, 10)
+      iex> FerricStore.set("greeting", "Hello, World!")
+      :ok
+      iex> FerricStore.getrange("greeting", 7, 11)
+      {:ok, "World"}
+
+      iex> FerricStore.getrange("greeting", -6, -1)
+      {:ok, "orld!"}
+
+      iex> FerricStore.getrange("nonexistent", 0, 10)
+      {:ok, ""}
 
   """
   @spec getrange(key(), integer(), integer()) :: {:ok, binary()}
@@ -577,14 +671,23 @@ defmodule FerricStore do
   end
 
   @doc """
-  Overwrites part of the string at `key` starting at `offset`.
+  Overwrites part of the string stored at `key` starting at byte `offset`.
 
-  Zero-pads if the key doesn't exist or the string is shorter than offset.
-  Returns `{:ok, new_byte_length}`.
+  If the key does not exist, or the existing string is shorter than `offset`,
+  the value is zero-padded to reach the offset before writing. Returns
+  `{:ok, new_byte_length}` with the total length after the write.
 
   ## Examples
 
-      {:ok, 11} = FerricStore.setrange("key", 6, "Redis")
+      iex> FerricStore.set("greeting", "Hello World")
+      :ok
+      iex> FerricStore.setrange("greeting", 6, "Redis")
+      {:ok, 11}
+      iex> FerricStore.get("greeting")
+      {:ok, "Hello Redis"}
+
+      iex> FerricStore.setrange("padded:key", 5, "!")
+      {:ok, 6}
 
   """
   @spec setrange(key(), non_neg_integer(), binary()) :: {:ok, non_neg_integer()}
@@ -597,16 +700,19 @@ defmodule FerricStore do
   end
 
   @doc """
-  Sets multiple key-value pairs only if none of the keys already exist.
+  Sets multiple key-value pairs only if none of the given keys already exist.
 
-  ## Returns
-
-    * `{:ok, true}` if all keys were set.
-    * `{:ok, false}` if any key already existed (no keys are set).
+  This is atomic: either all keys are set, or none are. If any key in the
+  map already exists, the entire operation is skipped and `{:ok, false}` is
+  returned.
 
   ## Examples
 
-      {:ok, true} = FerricStore.msetnx(%{"a" => "1", "b" => "2"})
+      iex> FerricStore.msetnx(%{"user:1:email" => "a@test.com", "user:2:email" => "b@test.com"})
+      {:ok, true}
+
+      iex> FerricStore.msetnx(%{"user:1:email" => "new@test.com", "user:3:email" => "c@test.com"})
+      {:ok, false}
 
   """
   @spec msetnx(%{key() => value()}) :: {:ok, boolean()}
@@ -632,13 +738,15 @@ defmodule FerricStore do
 
   `fields` is a map of `%{field_name => value}`. Field names and values are
   stored as binaries. If the hash does not exist, a new one is created.
-
-  Each field is stored as a separate compound key (`H:key\\0field`) matching
-  the RESP/Dispatcher storage format.
+  Existing fields are overwritten.
 
   ## Examples
 
-      :ok = FerricStore.hset("user:42", %{"name" => "alice", "age" => "30"})
+      iex> FerricStore.hset("user:42", %{"name" => "alice", "age" => "30"})
+      :ok
+
+      iex> FerricStore.hset("user:42", %{"name" => "bob"})
+      :ok
 
   """
   @spec hset(key(), %{binary() => binary()}) :: :ok
@@ -656,15 +764,22 @@ defmodule FerricStore do
   end
 
   @doc """
-  Gets the value of `field` from the hash stored at `key`.
+  Gets the value of a single field from the hash stored at `key`.
 
   Returns `{:ok, value}` if the field exists, or `{:ok, nil}` if the field
   or the hash does not exist.
 
   ## Examples
 
-      {:ok, "alice"} = FerricStore.hget("user:42", "name")
-      {:ok, nil} = FerricStore.hget("user:42", "nonexistent_field")
+      iex> FerricStore.hset("user:42", %{"name" => "alice", "age" => "30"})
+      iex> FerricStore.hget("user:42", "name")
+      {:ok, "alice"}
+
+      iex> FerricStore.hget("user:42", "nonexistent_field")
+      {:ok, nil}
+
+      iex> FerricStore.hget("no_such_hash", "field")
+      {:ok, nil}
 
   """
   @spec hget(key(), binary()) :: {:ok, binary() | nil}
@@ -686,7 +801,12 @@ defmodule FerricStore do
 
   ## Examples
 
-      {:ok, %{"name" => "alice", "age" => "30"}} = FerricStore.hgetall("user:42")
+      iex> FerricStore.hset("user:42", %{"name" => "alice", "age" => "30"})
+      iex> FerricStore.hgetall("user:42")
+      {:ok, %{"name" => "alice", "age" => "30"}}
+
+      iex> FerricStore.hgetall("no_such_hash")
+      {:ok, %{}}
 
   """
   @spec hgetall(key()) :: {:ok, %{binary() => binary()}}
@@ -717,18 +837,13 @@ defmodule FerricStore do
   left-to-right, so the last element in the list ends up as the leftmost
   element (matching Redis LPUSH semantics).
 
-  ## Parameters
-
-    * `key` - the list key
-    * `elements` - a list of binary elements to push
-
-  ## Returns
-
-    * `{:ok, length}` where `length` is the list length after the push.
-
   ## Examples
 
-      {:ok, 3} = FerricStore.lpush("mylist", ["a", "b", "c"])
+      iex> FerricStore.lpush("tasks:queue", ["send_email"])
+      {:ok, 1}
+
+      iex> FerricStore.lpush("tasks:queue", ["generate_report", "resize_image"])
+      {:ok, 3}
 
   """
   @spec lpush(key(), [binary()]) :: {:ok, non_neg_integer()}
@@ -746,18 +861,13 @@ defmodule FerricStore do
 
   If the key does not exist, a new list is created.
 
-  ## Parameters
-
-    * `key` - the list key
-    * `elements` - a list of binary elements to push
-
-  ## Returns
-
-    * `{:ok, length}` where `length` is the list length after the push.
-
   ## Examples
 
-      {:ok, 3} = FerricStore.rpush("mylist", ["a", "b", "c"])
+      iex> FerricStore.rpush("tasks:queue", ["send_email"])
+      {:ok, 1}
+
+      iex> FerricStore.rpush("tasks:queue", ["generate_report", "resize_image"])
+      {:ok, 3}
 
   """
   @spec rpush(key(), [binary()]) :: {:ok, non_neg_integer()}
@@ -777,21 +887,17 @@ defmodule FerricStore do
   greater than 1, returns a list of elements. Returns `{:ok, nil}` if the key
   does not exist or the list is empty.
 
-  ## Parameters
-
-    * `key` - the list key
-    * `count` - number of elements to pop (default: 1)
-
-  ## Returns
-
-    * `{:ok, element}` when count is 1
-    * `{:ok, [element, ...]}` when count > 1
-    * `{:ok, nil}` if the key does not exist
-
   ## Examples
 
-      {:ok, "a"} = FerricStore.lpop("mylist")
-      {:ok, ["a", "b"]} = FerricStore.lpop("mylist", 2)
+      iex> FerricStore.rpush("tasks:queue", ["task_a", "task_b", "task_c"])
+      iex> FerricStore.lpop("tasks:queue")
+      {:ok, "task_a"}
+
+      iex> FerricStore.lpop("tasks:queue", 2)
+      {:ok, ["task_b", "task_c"]}
+
+      iex> FerricStore.lpop("empty_queue")
+      {:ok, nil}
 
   """
   @spec lpop(key(), pos_integer()) :: {:ok, binary() | [binary()] | nil}
@@ -811,21 +917,17 @@ defmodule FerricStore do
   greater than 1, returns a list of elements. Returns `{:ok, nil}` if the key
   does not exist or the list is empty.
 
-  ## Parameters
-
-    * `key` - the list key
-    * `count` - number of elements to pop (default: 1)
-
-  ## Returns
-
-    * `{:ok, element}` when count is 1
-    * `{:ok, [element, ...]}` when count > 1
-    * `{:ok, nil}` if the key does not exist
-
   ## Examples
 
-      {:ok, "c"} = FerricStore.rpop("mylist")
-      {:ok, ["c", "b"]} = FerricStore.rpop("mylist", 2)
+      iex> FerricStore.rpush("tasks:queue", ["task_a", "task_b", "task_c"])
+      iex> FerricStore.rpop("tasks:queue")
+      {:ok, "task_c"}
+
+      iex> FerricStore.rpop("tasks:queue", 2)
+      {:ok, ["task_b", "task_a"]}
+
+      iex> FerricStore.rpop("empty_queue")
+      {:ok, nil}
 
   """
   @spec rpop(key(), pos_integer()) :: {:ok, binary() | [binary()] | nil}
@@ -844,20 +946,17 @@ defmodule FerricStore do
   Both `start` and `stop` are zero-based, inclusive indices. Negative indices
   count from the end of the list (-1 is the last element).
 
-  ## Parameters
-
-    * `key` - the list key
-    * `start` - start index (inclusive)
-    * `stop` - stop index (inclusive)
-
-  ## Returns
-
-    * `{:ok, [elements]}` - the elements in the range, or an empty list
-
   ## Examples
 
-      {:ok, ["a", "b", "c"]} = FerricStore.lrange("mylist", 0, -1)
-      {:ok, ["b"]} = FerricStore.lrange("mylist", 1, 1)
+      iex> FerricStore.rpush("tasks:queue", ["task_a", "task_b", "task_c"])
+      iex> FerricStore.lrange("tasks:queue", 0, -1)
+      {:ok, ["task_a", "task_b", "task_c"]}
+
+      iex> FerricStore.lrange("tasks:queue", 1, 1)
+      {:ok, ["task_b"]}
+
+      iex> FerricStore.lrange("nonexistent", 0, -1)
+      {:ok, []}
 
   """
   @spec lrange(key(), integer(), integer()) :: {:ok, [binary()]}
@@ -877,8 +976,12 @@ defmodule FerricStore do
 
   ## Examples
 
-      {:ok, 3} = FerricStore.llen("mylist")
-      {:ok, 0} = FerricStore.llen("nonexistent")
+      iex> FerricStore.rpush("tasks:queue", ["task_a", "task_b", "task_c"])
+      iex> FerricStore.llen("tasks:queue")
+      {:ok, 3}
+
+      iex> FerricStore.llen("nonexistent")
+      {:ok, 0}
 
   """
   @spec llen(key()) :: {:ok, non_neg_integer()}
@@ -899,22 +1002,15 @@ defmodule FerricStore do
   Adds one or more members to the set stored at `key`.
 
   If the key does not exist, a new set is created. Members that already exist
-  in the set are ignored.
-
-  ## Parameters
-
-    * `key` - the set key
-    * `members` - a list of binary members to add
-
-  ## Returns
-
-    * `{:ok, added_count}` - the number of members that were actually added
-      (not counting duplicates).
+  in the set are ignored. Returns the count of members actually added.
 
   ## Examples
 
-      {:ok, 3} = FerricStore.sadd("myset", ["a", "b", "c"])
-      {:ok, 1} = FerricStore.sadd("myset", ["c", "d"])
+      iex> FerricStore.sadd("article:42:tags", ["elixir", "rust", "database"])
+      {:ok, 3}
+
+      iex> FerricStore.sadd("article:42:tags", ["rust", "performance"])
+      {:ok, 1}
 
   """
   @spec sadd(key(), [binary()]) :: {:ok, non_neg_integer()}
@@ -928,20 +1024,17 @@ defmodule FerricStore do
   @doc """
   Removes one or more members from the set stored at `key`.
 
-  Members that do not exist in the set are ignored.
-
-  ## Parameters
-
-    * `key` - the set key
-    * `members` - a list of binary members to remove
-
-  ## Returns
-
-    * `{:ok, removed_count}` - the number of members that were actually removed.
+  Members that do not exist in the set are ignored. Returns the count of
+  members actually removed.
 
   ## Examples
 
-      {:ok, 1} = FerricStore.srem("myset", ["a"])
+      iex> FerricStore.sadd("article:42:tags", ["elixir", "rust", "database"])
+      iex> FerricStore.srem("article:42:tags", ["rust"])
+      {:ok, 1}
+
+      iex> FerricStore.srem("article:42:tags", ["nonexistent"])
+      {:ok, 0}
 
   """
   @spec srem(key(), [binary()]) :: {:ok, non_neg_integer()}
@@ -955,11 +1048,18 @@ defmodule FerricStore do
   @doc """
   Returns all members of the set stored at `key`.
 
-  Returns `{:ok, []}` if the key does not exist.
+  Returns `{:ok, []}` if the key does not exist. The order of returned
+  members is not guaranteed.
 
   ## Examples
 
-      {:ok, members} = FerricStore.smembers("myset")
+      iex> FerricStore.sadd("article:42:tags", ["elixir", "rust"])
+      iex> {:ok, members} = FerricStore.smembers("article:42:tags")
+      iex> Enum.sort(members)
+      ["elixir", "rust"]
+
+      iex> FerricStore.smembers("nonexistent")
+      {:ok, []}
 
   """
   @spec smembers(key()) :: {:ok, [binary()]}
@@ -973,15 +1073,20 @@ defmodule FerricStore do
   @doc """
   Checks whether `member` is a member of the set stored at `key`.
 
-  ## Returns
-
-    * `true` if the member exists in the set
-    * `false` otherwise
+  Returns `true` if the member exists in the set, `false` otherwise.
+  Returns `false` if the key does not exist.
 
   ## Examples
 
-      true = FerricStore.sismember("myset", "a")
-      false = FerricStore.sismember("myset", "z")
+      iex> FerricStore.sadd("article:42:tags", ["elixir", "rust"])
+      iex> FerricStore.sismember("article:42:tags", "elixir")
+      true
+
+      iex> FerricStore.sismember("article:42:tags", "python")
+      false
+
+      iex> FerricStore.sismember("nonexistent", "member")
+      false
 
   """
   @spec sismember(key(), binary()) :: boolean()
@@ -999,8 +1104,12 @@ defmodule FerricStore do
 
   ## Examples
 
-      {:ok, 3} = FerricStore.scard("myset")
-      {:ok, 0} = FerricStore.scard("nonexistent")
+      iex> FerricStore.sadd("article:42:tags", ["elixir", "rust", "database"])
+      iex> FerricStore.scard("article:42:tags")
+      {:ok, 3}
+
+      iex> FerricStore.scard("nonexistent")
+      {:ok, 0}
 
   """
   @spec scard(key()) :: {:ok, non_neg_integer()}
@@ -1020,21 +1129,16 @@ defmodule FerricStore do
 
   `score_member_pairs` is a list of `{score, member}` tuples where `score` is
   a number and `member` is a binary string. If a member already exists, its
-  score is updated.
-
-  ## Parameters
-
-    * `key` - the sorted set key
-    * `score_member_pairs` - list of `{score, member}` tuples
-
-  ## Returns
-
-    * `{:ok, added_count}` - the number of new members added (not counting
-      score updates on existing members).
+  score is updated. Returns the count of new members added (not counting
+  score updates).
 
   ## Examples
 
-      {:ok, 2} = FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}])
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}])
+      {:ok, 2}
+
+      iex> FerricStore.zadd("leaderboard", [{150.0, "alice"}, {300.0, "charlie"}])
+      {:ok, 1}
 
   """
   @spec zadd(key(), [{number(), binary()}]) :: {:ok, non_neg_integer()}
@@ -1053,23 +1157,27 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns members in the sorted set stored at `key` within the rank range
-  `start..stop` (zero-based, inclusive). Negative indices count from the end.
+  Returns members in the sorted set stored at `key` within the rank range `start..stop`.
+
+  Indices are zero-based and inclusive. Negative indices count from the end
+  (-1 is the last element). Members are ordered by score ascending.
 
   ## Options
 
     * `:withscores` - When `true`, returns `{member, score}` tuples instead
       of bare member strings. Defaults to `false`.
 
-  ## Returns
-
-    * `{:ok, members}` - list of member strings (or `{member, score}` tuples
-      when `:withscores` is `true`). Empty list if key does not exist.
-
   ## Examples
 
-      {:ok, ["alice", "bob"]} = FerricStore.zrange("leaderboard", 0, -1)
-      {:ok, [{"alice", 100.0}, {"bob", 200.0}]} = FerricStore.zrange("leaderboard", 0, -1, withscores: true)
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}, {300.0, "charlie"}])
+      iex> FerricStore.zrange("leaderboard", 0, -1)
+      {:ok, ["alice", "bob", "charlie"]}
+
+      iex> FerricStore.zrange("leaderboard", 0, 1, withscores: true)
+      {:ok, [{"alice", 100.0}, {"bob", 200.0}]}
+
+      iex> FerricStore.zrange("nonexistent", 0, -1)
+      {:ok, []}
 
   """
   @spec zrange(key(), integer(), integer(), zrange_opts()) :: {:ok, [binary() | {binary(), float()}]}
@@ -1103,12 +1211,16 @@ defmodule FerricStore do
   Returns the score of `member` in the sorted set stored at `key`.
 
   Returns `{:ok, score}` if the member exists, or `{:ok, nil}` if the member
-  or key does not exist.
+  or the key does not exist.
 
   ## Examples
 
-      {:ok, 100.0} = FerricStore.zscore("leaderboard", "alice")
-      {:ok, nil} = FerricStore.zscore("leaderboard", "unknown")
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}])
+      iex> FerricStore.zscore("leaderboard", "alice")
+      {:ok, 100.0}
+
+      iex> FerricStore.zscore("leaderboard", "unknown")
+      {:ok, nil}
 
   """
   @spec zscore(key(), binary()) :: {:ok, float() | nil}
@@ -1133,8 +1245,12 @@ defmodule FerricStore do
 
   ## Examples
 
-      {:ok, 2} = FerricStore.zcard("leaderboard")
-      {:ok, 0} = FerricStore.zcard("nonexistent")
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}])
+      iex> FerricStore.zcard("leaderboard")
+      {:ok, 2}
+
+      iex> FerricStore.zcard("nonexistent")
+      {:ok, 0}
 
   """
   @spec zcard(key()) :: {:ok, non_neg_integer()}
@@ -1148,20 +1264,17 @@ defmodule FerricStore do
   @doc """
   Removes one or more members from the sorted set stored at `key`.
 
-  Members that do not exist are ignored.
-
-  ## Parameters
-
-    * `key` - the sorted set key
-    * `members` - a list of binary members to remove
-
-  ## Returns
-
-    * `{:ok, removed_count}` - the number of members actually removed.
+  Members that do not exist are ignored. Returns the count of members
+  actually removed.
 
   ## Examples
 
-      {:ok, 1} = FerricStore.zrem("leaderboard", ["alice"])
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}])
+      iex> FerricStore.zrem("leaderboard", ["alice"])
+      {:ok, 1}
+
+      iex> FerricStore.zrem("leaderboard", ["nonexistent"])
+      {:ok, 0}
 
   """
   @spec zrem(key(), [binary()]) :: {:ok, non_neg_integer()}
@@ -1177,10 +1290,12 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Performs an atomic compare-and-swap on `key`.
+  Performs an atomic compare-and-swap (optimistic locking) on `key`.
 
-  If the current value of `key` equals `expected`, it is replaced with
-  `new_value`. Optionally sets a TTL on the key.
+  If the current value of `key` equals `expected`, it is atomically replaced
+  with `new_value`. This is the building block for lock-free concurrent updates --
+  read the current value, compute the new value, then CAS. If another writer
+  changed the value in between, CAS returns `false` and you retry.
 
   ## Options
 
@@ -1189,15 +1304,18 @@ defmodule FerricStore do
 
   ## Returns
 
-    * `{:ok, true}` if the swap was performed
-    * `{:ok, false}` if the current value did not match `expected`
-    * `{:ok, nil}` if the key does not exist
+    * `{:ok, true}` if the swap was performed.
+    * `{:ok, false}` if the current value did not match `expected` (retry needed).
+    * `{:ok, nil}` if the key does not exist.
 
   ## Examples
 
-      FerricStore.set("counter", "1")
-      {:ok, true} = FerricStore.cas("counter", "1", "2")
-      {:ok, false} = FerricStore.cas("counter", "1", "3")
+      iex> FerricStore.set("inventory:item:99", "10")
+      :ok
+      iex> FerricStore.cas("inventory:item:99", "10", "9")
+      {:ok, true}
+      iex> FerricStore.cas("inventory:item:99", "10", "8")
+      {:ok, false}
 
   """
   @spec cas(key(), binary(), binary(), cas_opts()) :: {:ok, true | false | nil}
@@ -1213,7 +1331,7 @@ defmodule FerricStore do
   end
 
   @doc """
-  Cache-aside with stampede protection.
+  Cache-aside pattern with stampede (thundering herd) protection.
 
   Checks whether `key` has a cached value. If it does, returns
   `{:ok, {:hit, value}}`. If not, returns `{:ok, {:compute, hint}}` to
@@ -1221,29 +1339,33 @@ defmodule FerricStore do
   `fetch_or_compute_result/3`.
 
   Only one caller at a time receives `{:compute, hint}` for a given key --
-  other concurrent callers block until the value is available (stampede
-  protection).
+  all other concurrent callers block until the winner stores the computed
+  value. This prevents N concurrent cache misses from triggering N
+  identical expensive computations (the "stampede" problem).
 
   ## Options
 
-    * `:ttl` (required) - TTL in milliseconds for the cached value
+    * `:ttl` (required) - TTL in milliseconds for the cached value.
     * `:hint` - An opaque string passed back in `{:compute, hint}`. Defaults
       to `""`.
 
   ## Returns
 
-    * `{:ok, {:hit, value}}` if the value is cached
-    * `{:ok, {:compute, hint}}` if the caller should compute the value
-    * `{:error, reason}` on failure
+    * `{:ok, {:hit, value}}` if the value is cached.
+    * `{:ok, {:compute, hint}}` if the caller should compute the value.
+    * `{:error, reason}` on failure.
 
   ## Examples
 
-      case FerricStore.fetch_or_compute("expensive:key", ttl: 60_000) do
-        {:ok, {:hit, value}} -> value
+      case FerricStore.fetch_or_compute("dashboard:stats:today", ttl: 30_000) do
+        {:ok, {:hit, cached}} ->
+          Jason.decode!(cached)
+
         {:ok, {:compute, _hint}} ->
-          value = expensive_computation()
-          FerricStore.fetch_or_compute_result("expensive:key", value, ttl: 60_000)
-          value
+          stats = DashboardService.compute_stats()
+          encoded = Jason.encode!(stats)
+          FerricStore.fetch_or_compute_result("dashboard:stats:today", encoded, ttl: 30_000)
+          stats
       end
 
   """
@@ -1263,10 +1385,11 @@ defmodule FerricStore do
   end
 
   @doc """
-  Stores the computed value for a `fetch_or_compute/2` cache miss.
+  Stores the computed value for a `fetch_or_compute/2` cache miss and unblocks waiters.
 
-  This function should be called after receiving `{:ok, {:compute, hint}}`
-  from `fetch_or_compute/2`. It stores the value and unblocks any waiters.
+  Must be called after receiving `{:ok, {:compute, hint}}` from `fetch_or_compute/2`.
+  Stores the value in the cache and wakes all concurrent callers that were blocked
+  waiting for the computation to complete.
 
   ## Options
 
@@ -1278,7 +1401,8 @@ defmodule FerricStore do
 
   ## Examples
 
-      FerricStore.fetch_or_compute_result("expensive:key", computed_value, ttl: 60_000)
+      iex> FerricStore.fetch_or_compute_result("dashboard:stats:today", encoded_json, ttl: 30_000)
+      :ok
 
   """
   @spec fetch_or_compute_result(key(), binary(), keyword()) :: :ok | {:error, binary()}
@@ -1293,18 +1417,17 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Checks whether `key` exists and is not expired.
-
-  ## Returns
-
-    * `true` if the key exists
-    * `false` otherwise
+  Checks whether `key` exists in the store and has not expired.
 
   ## Examples
 
-      FerricStore.set("mykey", "value")
-      true = FerricStore.exists("mykey")
-      false = FerricStore.exists("nonexistent")
+      iex> FerricStore.set("user:42:name", "alice")
+      :ok
+      iex> FerricStore.exists("user:42:name")
+      true
+
+      iex> FerricStore.exists("nonexistent:key")
+      false
 
   """
   @spec exists(key()) :: boolean()
@@ -1315,22 +1438,31 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns all keys matching `pattern`.
+  Returns all keys matching `pattern` (glob-style).
 
   The pattern supports glob-style wildcards:
 
-    * `*` matches any sequence of characters
-    * `?` matches any single character
+    * `*` - matches any sequence of characters
+    * `?` - matches any single character
 
-  ## Returns
-
-    * `{:ok, [keys]}` - list of matching keys. Note that in sandbox mode,
-      the sandbox prefix is stripped from returned keys.
+  In sandbox mode, the sandbox prefix is transparently stripped from returned
+  keys, so patterns and results always use the logical key names.
 
   ## Examples
 
-      {:ok, keys} = FerricStore.keys("user:*")
-      {:ok, all_keys} = FerricStore.keys()
+      iex> FerricStore.set("user:1:name", "alice")
+      :ok
+      iex> FerricStore.set("user:2:name", "bob")
+      :ok
+      iex> FerricStore.set("order:1", "pending")
+      :ok
+      iex> {:ok, user_keys} = FerricStore.keys("user:*")
+      iex> Enum.sort(user_keys)
+      ["user:1:name", "user:2:name"]
+
+      iex> {:ok, all} = FerricStore.keys()
+      iex> length(all) >= 3
+      true
 
   """
   @spec keys(binary()) :: {:ok, [binary()]}
@@ -1387,14 +1519,21 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns the total number of keys in the store.
+  Returns the total number of user-visible keys in the store.
 
   In sandbox mode, only keys belonging to the current sandbox namespace
-  are counted, and internal compound keys are excluded.
+  are counted. Internal compound keys (used by hashes, lists, sets, and
+  sorted sets) are excluded from the count.
 
   ## Examples
 
-      {:ok, count} = FerricStore.dbsize()
+      iex> FerricStore.set("key:a", "1")
+      :ok
+      iex> FerricStore.set("key:b", "2")
+      :ok
+      iex> {:ok, count} = FerricStore.dbsize()
+      iex> count >= 2
+      true
 
   """
   @spec dbsize() :: {:ok, non_neg_integer()}
@@ -1496,12 +1635,18 @@ defmodule FerricStore do
   @doc """
   Sets a TTL (in milliseconds) on an existing key.
 
-  Returns `{:ok, true}` if the timeout was set, `{:ok, false}` if the key
-  does not exist.
+  The key will be automatically deleted after `ttl_ms` milliseconds have
+  elapsed. Returns `{:ok, false}` if the key does not exist.
 
   ## Examples
 
-      {:ok, true} = FerricStore.expire("user:42", :timer.minutes(30))
+      iex> FerricStore.set("session:abc", "data")
+      :ok
+      iex> FerricStore.expire("session:abc", :timer.minutes(30))
+      {:ok, true}
+
+      iex> FerricStore.expire("nonexistent:key", 5_000)
+      {:ok, false}
 
   """
   @spec expire(key(), non_neg_integer()) :: {:ok, boolean()}
@@ -1520,14 +1665,26 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns the remaining TTL in milliseconds for `key`.
+  Returns the remaining time-to-live in milliseconds for `key`.
 
-  Returns `{:ok, milliseconds_remaining}` if a TTL is set, `{:ok, nil}` if the
-  key has no expiry, or `{:ok, nil}` if the key does not exist.
+  Returns `{:ok, ms}` if the key has a TTL set, or `{:ok, nil}` if the key
+  has no expiry or does not exist.
 
   ## Examples
 
-      {:ok, ms} = FerricStore.ttl("user:42")
+      iex> FerricStore.set("session:abc", "data", ttl: 60_000)
+      :ok
+      iex> {:ok, ms} = FerricStore.ttl("session:abc")
+      iex> ms > 0 and ms <= 60_000
+      true
+
+      iex> FerricStore.set("permanent:key", "data")
+      :ok
+      iex> FerricStore.ttl("permanent:key")
+      {:ok, nil}
+
+      iex> FerricStore.ttl("nonexistent:key")
+      {:ok, nil}
 
   """
   @spec ttl(key()) :: {:ok, non_neg_integer() | nil}
@@ -1546,20 +1703,30 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Copies the value from `source` to `destination`.
+  Copies the value (and its TTL) from `source` to `destination`.
+
+  By default, returns an error if the destination already exists. Pass
+  `:replace` to overwrite.
 
   ## Options
 
-    * `:replace` - When `true`, overwrites `destination` if it exists.
-
-  ## Returns
-
-    * `{:ok, true}` on success.
-    * `{:error, reason}` if the source does not exist or destination exists without replace.
+    * `:replace` - When `true`, overwrites `destination` if it already exists.
 
   ## Examples
 
-      {:ok, true} = FerricStore.copy("src", "dst")
+      iex> FerricStore.set("user:42:name", "alice")
+      :ok
+      iex> FerricStore.copy("user:42:name", "user:42:name:backup")
+      {:ok, true}
+
+      iex> FerricStore.copy("user:42:name", "user:42:name:backup")
+      {:error, "ERR target key already exists"}
+
+      iex> FerricStore.copy("user:42:name", "user:42:name:backup", replace: true)
+      {:ok, true}
+
+      iex> FerricStore.copy("nonexistent", "dst")
+      {:error, "ERR no such key"}
 
   """
   @spec copy(key(), key(), keyword()) :: {:ok, true} | {:error, binary()}
@@ -1583,16 +1750,24 @@ defmodule FerricStore do
   end
 
   @doc """
-  Renames `source` to `destination`. Deletes `destination` if it exists.
+  Renames `source` to `destination`, overwriting `destination` if it exists.
 
-  ## Returns
-
-    * `:ok` on success.
-    * `{:error, reason}` if the source does not exist.
+  The value and TTL are transferred to the new key name, and the source key
+  is deleted. Returns `{:error, reason}` if the source does not exist.
 
   ## Examples
 
-      :ok = FerricStore.rename("old", "new")
+      iex> FerricStore.set("temp:upload:abc", "file_data")
+      :ok
+      iex> FerricStore.rename("temp:upload:abc", "file:abc")
+      :ok
+      iex> FerricStore.get("file:abc")
+      {:ok, "file_data"}
+      iex> FerricStore.exists("temp:upload:abc")
+      false
+
+      iex> FerricStore.rename("nonexistent", "dst")
+      {:error, "ERR no such key"}
 
   """
   @spec rename(key(), key()) :: :ok | {:error, binary()}
@@ -1612,17 +1787,27 @@ defmodule FerricStore do
   end
 
   @doc """
-  Renames `source` to `destination` only if `destination` does not exist.
+  Renames `source` to `destination` only if `destination` does not already exist.
 
-  ## Returns
-
-    * `{:ok, true}` if renamed.
-    * `{:ok, false}` if destination already exists.
-    * `{:error, reason}` if source does not exist.
+  Unlike `rename/2`, this will not overwrite an existing destination key.
+  The value and TTL are transferred on success.
 
   ## Examples
 
-      {:ok, true} = FerricStore.renamenx("old", "new")
+      iex> FerricStore.set("temp:import:1", "data")
+      :ok
+      iex> FerricStore.renamenx("temp:import:1", "import:1")
+      {:ok, true}
+
+      iex> FerricStore.set("import:2", "existing")
+      :ok
+      iex> FerricStore.set("temp:import:2", "new_data")
+      :ok
+      iex> FerricStore.renamenx("temp:import:2", "import:2")
+      {:ok, false}
+
+      iex> FerricStore.renamenx("nonexistent", "dst")
+      {:error, "ERR no such key"}
 
   """
   @spec renamenx(key(), key()) :: {:ok, boolean()} | {:error, binary()}
@@ -1646,17 +1831,26 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns the type of the value stored at `key`.
+  Returns the data type of the value stored at `key`.
 
-  ## Returns
-
-    * `{:ok, type_string}` where type_string is one of: "string", "hash", "list",
-      "set", "zset", "stream", or "none".
+  The returned type string reflects the underlying data structure: `"string"`,
+  `"hash"`, `"list"`, `"set"`, `"zset"`, `"stream"`, or `"none"` if the key
+  does not exist.
 
   ## Examples
 
-      {:ok, "string"} = FerricStore.type("key")
-      {:ok, "none"} = FerricStore.type("missing")
+      iex> FerricStore.set("user:42:name", "alice")
+      :ok
+      iex> FerricStore.type("user:42:name")
+      {:ok, "string"}
+
+      iex> FerricStore.hset("user:42", %{"name" => "alice"})
+      :ok
+      iex> FerricStore.type("user:42")
+      {:ok, "hash"}
+
+      iex> FerricStore.type("nonexistent:key")
+      {:ok, "none"}
 
   """
   @spec type(key()) :: {:ok, binary()}
@@ -1706,9 +1900,19 @@ defmodule FerricStore do
   @doc """
   Returns a random key from the store, or `{:ok, nil}` if the store is empty.
 
+  In sandbox mode, only keys within the current sandbox are candidates.
+
   ## Examples
 
-      {:ok, "some_key"} = FerricStore.randomkey()
+      iex> FerricStore.set("key:a", "1")
+      :ok
+      iex> {:ok, key} = FerricStore.randomkey()
+      iex> is_binary(key)
+      true
+
+      iex> # When the store is empty:
+      iex> FerricStore.randomkey()
+      {:ok, nil}
 
   """
   @spec randomkey() :: {:ok, key() | nil}
@@ -1725,16 +1929,25 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Removes the TTL from `key`, making it persistent.
+  Removes the TTL from `key`, making it persist indefinitely.
 
-  ## Returns
-
-    * `{:ok, true}` if the TTL was removed.
-    * `{:ok, false}` if the key does not exist or has no TTL.
+  Returns `{:ok, true}` if an expiry was removed, or `{:ok, false}` if the
+  key does not exist or already has no TTL.
 
   ## Examples
 
-      {:ok, true} = FerricStore.persist("key")
+      iex> FerricStore.set("session:abc", "data", ttl: 60_000)
+      :ok
+      iex> FerricStore.persist("session:abc")
+      {:ok, true}
+      iex> FerricStore.ttl("session:abc")
+      {:ok, nil}
+
+      iex> FerricStore.persist("permanent:key")
+      {:ok, false}
+
+      iex> FerricStore.persist("nonexistent:key")
+      {:ok, false}
 
   """
   @spec persist(key()) :: {:ok, boolean()}
@@ -1755,32 +1968,39 @@ defmodule FerricStore do
   end
 
   @doc """
-  Sets a TTL in milliseconds on `key`. Alias for `expire/2`.
+  Sets a TTL in milliseconds on an existing key.
 
-  ## Returns
-
-    * `{:ok, true}` if the TTL was set.
-    * `{:ok, false}` if the key does not exist.
+  This is an alias for `expire/2` -- both accept milliseconds.
 
   ## Examples
 
-      {:ok, true} = FerricStore.pexpire("key", 30_000)
+      iex> FerricStore.set("rate_limit:user:42", "3")
+      :ok
+      iex> FerricStore.pexpire("rate_limit:user:42", 30_000)
+      {:ok, true}
+
+      iex> FerricStore.pexpire("nonexistent:key", 5_000)
+      {:ok, false}
 
   """
   @spec pexpire(key(), non_neg_integer()) :: {:ok, boolean()}
   def pexpire(key, ttl_ms), do: expire(key, ttl_ms)
 
   @doc """
-  Sets the key to expire at the given Unix timestamp in seconds.
+  Sets the key to expire at the given absolute Unix timestamp (in seconds).
 
-  ## Returns
-
-    * `{:ok, true}` if the expiry was set.
-    * `{:ok, false}` if the key does not exist.
+  The key will be automatically deleted when the system clock reaches the
+  specified timestamp. Returns `{:ok, false}` if the key does not exist.
 
   ## Examples
 
-      {:ok, true} = FerricStore.expireat("key", 1700000000)
+      iex> FerricStore.set("event:promo", "active")
+      :ok
+      iex> FerricStore.expireat("event:promo", 1_700_000_000)
+      {:ok, true}
+
+      iex> FerricStore.expireat("nonexistent:key", 1_700_000_000)
+      {:ok, false}
 
   """
   @spec expireat(key(), non_neg_integer()) :: {:ok, boolean()}
@@ -1799,16 +2019,20 @@ defmodule FerricStore do
   end
 
   @doc """
-  Sets the key to expire at the given Unix timestamp in milliseconds.
+  Sets the key to expire at the given absolute Unix timestamp (in milliseconds).
 
-  ## Returns
-
-    * `{:ok, true}` if the expiry was set.
-    * `{:ok, false}` if the key does not exist.
+  Like `expireat/2` but with millisecond precision. Returns `{:ok, false}`
+  if the key does not exist.
 
   ## Examples
 
-      {:ok, true} = FerricStore.pexpireat("key", 1700000000000)
+      iex> FerricStore.set("event:flash_sale", "active")
+      :ok
+      iex> FerricStore.pexpireat("event:flash_sale", 1_700_000_000_000)
+      {:ok, true}
+
+      iex> FerricStore.pexpireat("nonexistent:key", 1_700_000_000_000)
+      {:ok, false}
 
   """
   @spec pexpireat(key(), non_neg_integer()) :: {:ok, boolean()}
@@ -1828,15 +2052,24 @@ defmodule FerricStore do
   @doc """
   Returns the absolute Unix timestamp (in seconds) at which `key` will expire.
 
-  ## Returns
-
-    * `{:ok, timestamp}` if the key has an expiry.
-    * `{:ok, -1}` if the key exists but has no expiry.
-    * `{:ok, -2}` if the key does not exist.
+  Returns `{:ok, -1}` if the key exists but has no associated expiry, and
+  `{:ok, -2}` if the key does not exist.
 
   ## Examples
 
-      {:ok, 1700000000} = FerricStore.expiretime("key")
+      iex> FerricStore.set("session:abc", "data", ttl: 60_000)
+      :ok
+      iex> {:ok, ts} = FerricStore.expiretime("session:abc")
+      iex> ts > 0
+      true
+
+      iex> FerricStore.set("permanent:key", "data")
+      :ok
+      iex> FerricStore.expiretime("permanent:key")
+      {:ok, -1}
+
+      iex> FerricStore.expiretime("nonexistent:key")
+      {:ok, -2}
 
   """
   @spec expiretime(key()) :: {:ok, integer()}
@@ -1853,15 +2086,24 @@ defmodule FerricStore do
   @doc """
   Returns the absolute Unix timestamp (in milliseconds) at which `key` will expire.
 
-  ## Returns
-
-    * `{:ok, timestamp_ms}` if the key has an expiry.
-    * `{:ok, -1}` if the key exists but has no expiry.
-    * `{:ok, -2}` if the key does not exist.
+  Like `expiretime/1` but with millisecond precision. Returns `{:ok, -1}`
+  if the key has no expiry, and `{:ok, -2}` if it does not exist.
 
   ## Examples
 
-      {:ok, 1700000000000} = FerricStore.pexpiretime("key")
+      iex> FerricStore.set("session:abc", "data", ttl: 60_000)
+      :ok
+      iex> {:ok, ts_ms} = FerricStore.pexpiretime("session:abc")
+      iex> ts_ms > 0
+      true
+
+      iex> FerricStore.set("permanent:key", "data")
+      :ok
+      iex> FerricStore.pexpiretime("permanent:key")
+      {:ok, -1}
+
+      iex> FerricStore.pexpiretime("nonexistent:key")
+      {:ok, -2}
 
   """
   @spec pexpiretime(key()) :: {:ok, integer()}
@@ -1876,16 +2118,21 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns the remaining TTL in milliseconds. Alias for `ttl/1`.
+  Returns the remaining time-to-live in milliseconds for `key`.
 
-  ## Returns
-
-    * `{:ok, ms}` if a TTL is set.
-    * `{:ok, nil}` if the key has no expiry or does not exist.
+  This is an alias for `ttl/1` -- both return millisecond precision.
+  Returns `{:ok, nil}` if the key has no expiry or does not exist.
 
   ## Examples
 
-      {:ok, ms} = FerricStore.pttl("key")
+      iex> FerricStore.set("cache:result", "data", ttl: 30_000)
+      :ok
+      iex> {:ok, ms} = FerricStore.pttl("cache:result")
+      iex> ms > 0 and ms <= 30_000
+      true
+
+      iex> FerricStore.pttl("nonexistent:key")
+      {:ok, nil}
 
   """
   @spec pttl(key()) :: {:ok, non_neg_integer() | nil}
@@ -2038,13 +2285,17 @@ defmodule FerricStore do
   @doc """
   Deletes one or more fields from the hash stored at `key`.
 
-  ## Returns
-
-    * `{:ok, count}` - Number of fields that were removed.
+  Fields that do not exist are ignored. Returns the count of fields actually
+  removed.
 
   ## Examples
 
-      {:ok, 2} = FerricStore.hdel("hash", ["field1", "field2"])
+      iex> FerricStore.hset("user:42", %{"name" => "alice", "age" => "30", "email" => "a@b.c"})
+      iex> FerricStore.hdel("user:42", ["age", "email"])
+      {:ok, 2}
+
+      iex> FerricStore.hdel("user:42", ["nonexistent"])
+      {:ok, 0}
 
   """
   @spec hdel(key(), [binary()]) :: {:ok, non_neg_integer()}
@@ -2062,9 +2313,20 @@ defmodule FerricStore do
   @doc """
   Returns whether `field` exists in the hash stored at `key`.
 
+  Returns `true` if the field exists, `false` otherwise. Returns `false`
+  if the key itself does not exist.
+
   ## Examples
 
-      true = FerricStore.hexists("hash", "name")
+      iex> FerricStore.hset("user:42", %{"name" => "alice"})
+      iex> FerricStore.hexists("user:42", "name")
+      true
+
+      iex> FerricStore.hexists("user:42", "missing")
+      false
+
+      iex> FerricStore.hexists("no_such_hash", "field")
+      false
 
   """
   @spec hexists(key(), binary()) :: boolean()
@@ -2082,9 +2344,16 @@ defmodule FerricStore do
   @doc """
   Returns the number of fields in the hash stored at `key`.
 
+  Returns `{:ok, 0}` if the key does not exist.
+
   ## Examples
 
-      {:ok, 3} = FerricStore.hlen("hash")
+      iex> FerricStore.hset("user:42", %{"name" => "alice", "age" => "30", "email" => "a@b.c"})
+      iex> FerricStore.hlen("user:42")
+      {:ok, 3}
+
+      iex> FerricStore.hlen("no_such_hash")
+      {:ok, 0}
 
   """
   @spec hlen(key()) :: {:ok, non_neg_integer()}
@@ -2101,9 +2370,18 @@ defmodule FerricStore do
   @doc """
   Returns all field names from the hash stored at `key`.
 
+  Returns `{:ok, []}` if the key does not exist. The order of returned field
+  names is not guaranteed.
+
   ## Examples
 
-      {:ok, ["name", "age"]} = FerricStore.hkeys("hash")
+      iex> FerricStore.hset("user:42", %{"name" => "alice", "age" => "30"})
+      iex> {:ok, fields} = FerricStore.hkeys("user:42")
+      iex> Enum.sort(fields)
+      ["age", "name"]
+
+      iex> FerricStore.hkeys("no_such_hash")
+      {:ok, []}
 
   """
   @spec hkeys(key()) :: {:ok, [binary()]}
@@ -2120,9 +2398,18 @@ defmodule FerricStore do
   @doc """
   Returns all field values from the hash stored at `key`.
 
+  Returns `{:ok, []}` if the key does not exist. The order of returned values
+  corresponds to the order of fields (not guaranteed to be insertion order).
+
   ## Examples
 
-      {:ok, ["alice", "30"]} = FerricStore.hvals("hash")
+      iex> FerricStore.hset("user:42", %{"name" => "alice", "age" => "30"})
+      iex> {:ok, vals} = FerricStore.hvals("user:42")
+      iex> Enum.sort(vals)
+      ["30", "alice"]
+
+      iex> FerricStore.hvals("no_such_hash")
+      {:ok, []}
 
   """
   @spec hvals(key()) :: {:ok, [binary()]}
@@ -2139,11 +2426,17 @@ defmodule FerricStore do
   @doc """
   Returns values for the specified `fields` from the hash at `key`.
 
-  Returns `nil` for fields that do not exist.
+  Returns `nil` for fields that do not exist. The order of returned values
+  matches the order of the requested fields.
 
   ## Examples
 
-      {:ok, ["alice", nil]} = FerricStore.hmget("hash", ["name", "missing"])
+      iex> FerricStore.hset("user:42", %{"name" => "alice", "age" => "30"})
+      iex> FerricStore.hmget("user:42", ["name", "missing", "age"])
+      {:ok, ["alice", nil, "30"]}
+
+      iex> FerricStore.hmget("no_such_hash", ["a", "b"])
+      {:ok, [nil, nil]}
 
   """
   @spec hmget(key(), [binary()]) :: {:ok, [binary() | nil]}
@@ -2161,13 +2454,17 @@ defmodule FerricStore do
   @doc """
   Increments the integer value of `field` in the hash at `key` by `amount`.
 
-  ## Returns
-
-    * `{:ok, new_value}` on success.
+  If the field does not exist, it is created with `0` before incrementing.
+  Returns `{:error, reason}` if the field value is not a valid integer.
 
   ## Examples
 
-      {:ok, 15} = FerricStore.hincrby("hash", "count", 5)
+      iex> FerricStore.hset("user:42", %{"login_count" => "10"})
+      iex> FerricStore.hincrby("user:42", "login_count", 5)
+      {:ok, 15}
+
+      iex> FerricStore.hincrby("user:42", "new_counter", 1)
+      {:ok, 1}
 
   """
   @spec hincrby(key(), binary(), integer()) :: {:ok, integer()} | {:error, binary()}
@@ -2188,13 +2485,18 @@ defmodule FerricStore do
   @doc """
   Increments the float value of `field` in the hash at `key` by `amount`.
 
-  ## Returns
-
-    * `{:ok, new_value_string}` on success.
+  If the field does not exist, it is created with `0` before incrementing.
+  Returns the new value as a string. Returns `{:error, reason}` if the field
+  value is not a valid number.
 
   ## Examples
 
-      {:ok, "12.5"} = FerricStore.hincrbyfloat("hash", "val", 2.5)
+      iex> FerricStore.hset("product:99", %{"price" => "10.0"})
+      iex> FerricStore.hincrbyfloat("product:99", "price", 2.5)
+      {:ok, "12.5"}
+
+      iex> FerricStore.hincrbyfloat("product:99", "discount", 0.15)
+      {:ok, "0.15"}
 
   """
   @spec hincrbyfloat(key(), binary(), float()) :: {:ok, binary()} | {:error, binary()}
@@ -2216,14 +2518,16 @@ defmodule FerricStore do
   @doc """
   Sets `field` in the hash at `key` only if the field does not already exist.
 
-  ## Returns
-
-    * `{:ok, true}` if the field was set.
-    * `{:ok, false}` if the field already existed.
+  Returns `{:ok, true}` if the field was set, `{:ok, false}` if it already
+  existed.
 
   ## Examples
 
-      {:ok, true} = FerricStore.hsetnx("hash", "field", "value")
+      iex> FerricStore.hsetnx("user:42", "name", "alice")
+      {:ok, true}
+
+      iex> FerricStore.hsetnx("user:42", "name", "bob")
+      {:ok, false}
 
   """
   @spec hsetnx(key(), binary(), binary()) :: {:ok, boolean()}
@@ -2245,13 +2549,23 @@ defmodule FerricStore do
   @doc """
   Returns one or more random field names from the hash at `key`.
 
-  Without `count`, returns a single field name or `nil`.
-  With `count`, returns a list of field names.
+  Without `count`, returns a single field name or `nil` if the hash is empty.
+  With positive `count`, returns up to `count` unique fields. With negative
+  `count`, returns `abs(count)` fields with possible duplicates.
 
   ## Examples
 
-      {:ok, "name"} = FerricStore.hrandfield("hash")
-      {:ok, ["name", "age"]} = FerricStore.hrandfield("hash", 2)
+      iex> FerricStore.hset("user:42", %{"name" => "alice", "age" => "30", "email" => "a@b.c"})
+      iex> {:ok, field} = FerricStore.hrandfield("user:42")
+      iex> field in ["name", "age", "email"]
+      true
+
+      iex> {:ok, fields} = FerricStore.hrandfield("user:42", 2)
+      iex> length(fields)
+      2
+
+      iex> FerricStore.hrandfield("nonexistent")
+      {:ok, nil}
 
   """
   @spec hrandfield(key(), integer() | nil) :: {:ok, binary() | [binary()] | nil}
@@ -2281,9 +2595,16 @@ defmodule FerricStore do
   @doc """
   Returns the string length of the value for `field` in the hash at `key`.
 
+  Returns `{:ok, 0}` if the field or the key does not exist.
+
   ## Examples
 
-      {:ok, 5} = FerricStore.hstrlen("hash", "name")
+      iex> FerricStore.hset("user:42", %{"name" => "alice"})
+      iex> FerricStore.hstrlen("user:42", "name")
+      {:ok, 5}
+
+      iex> FerricStore.hstrlen("user:42", "missing")
+      {:ok, 0}
 
   """
   @spec hstrlen(key(), binary()) :: {:ok, non_neg_integer()}
@@ -2304,12 +2625,20 @@ defmodule FerricStore do
   @doc """
   Returns the element at `index` in the list stored at `key`.
 
-  Negative indices count from the end. Returns `{:ok, nil}` for out-of-range
-  indices or nonexistent keys.
+  Negative indices count from the end (-1 is the last element). Returns
+  `{:ok, nil}` for out-of-range indices or nonexistent keys.
 
   ## Examples
 
-      {:ok, "a"} = FerricStore.lindex("list", 0)
+      iex> FerricStore.rpush("tasks:queue", ["task_a", "task_b", "task_c"])
+      iex> FerricStore.lindex("tasks:queue", 0)
+      {:ok, "task_a"}
+
+      iex> FerricStore.lindex("tasks:queue", -1)
+      {:ok, "task_c"}
+
+      iex> FerricStore.lindex("tasks:queue", 99)
+      {:ok, nil}
 
   """
   @spec lindex(key(), integer()) :: {:ok, binary() | nil}
@@ -2325,14 +2654,17 @@ defmodule FerricStore do
   @doc """
   Sets the element at `index` in the list stored at `key`.
 
-  ## Returns
-
-    * `:ok` on success.
-    * `{:error, reason}` if the index is out of range.
+  Returns `:ok` on success, or `{:error, reason}` if the index is out of range
+  or the key does not exist.
 
   ## Examples
 
-      :ok = FerricStore.lset("list", 1, "X")
+      iex> FerricStore.rpush("tasks:queue", ["task_a", "task_b", "task_c"])
+      iex> FerricStore.lset("tasks:queue", 1, "task_b_updated")
+      :ok
+
+      iex> FerricStore.lset("tasks:queue", 99, "value")
+      {:error, "ERR index out of range"}
 
   """
   @spec lset(key(), integer(), binary()) :: :ok | {:error, binary()}
@@ -2351,17 +2683,21 @@ defmodule FerricStore do
   @doc """
   Removes occurrences of `element` from the list at `key`.
 
-  * `count > 0` - Remove `count` occurrences from head.
-  * `count < 0` - Remove `abs(count)` occurrences from tail.
-  * `count == 0` - Remove all occurrences.
+  The `count` argument controls the direction and number of removals:
 
-  ## Returns
-
-    * `{:ok, removed_count}` on success.
+    * `count > 0` - Remove up to `count` occurrences scanning from head to tail.
+    * `count < 0` - Remove up to `abs(count)` occurrences scanning from tail to head.
+    * `count == 0` - Remove all occurrences.
 
   ## Examples
 
-      {:ok, 3} = FerricStore.lrem("list", 0, "a")
+      iex> FerricStore.rpush("tasks:queue", ["retry", "send", "retry", "retry"])
+      iex> FerricStore.lrem("tasks:queue", 0, "retry")
+      {:ok, 3}
+
+      iex> FerricStore.rpush("tasks:queue", ["a", "b", "a"])
+      iex> FerricStore.lrem("tasks:queue", 1, "a")
+      {:ok, 1}
 
   """
   @spec lrem(key(), integer(), binary()) :: {:ok, non_neg_integer()}
@@ -2377,20 +2713,20 @@ defmodule FerricStore do
   @doc """
   Inserts `element` before or after `pivot` in the list at `key`.
 
-  ## Parameters
-
-    * `direction` - `:before` or `:after`
-    * `pivot` - The reference element.
-    * `element` - The element to insert.
-
-  ## Returns
-
-    * `{:ok, new_length}` if the pivot was found.
-    * `{:ok, -1}` if the pivot was not found.
+  Returns `{:ok, new_length}` if the pivot was found, or `{:ok, -1}` if the
+  pivot was not found. Returns `{:ok, 0}` if the key does not exist.
 
   ## Examples
 
-      {:ok, 4} = FerricStore.linsert("list", :before, "b", "X")
+      iex> FerricStore.rpush("tasks:queue", ["task_a", "task_b", "task_c"])
+      iex> FerricStore.linsert("tasks:queue", :before, "task_b", "task_new")
+      {:ok, 4}
+
+      iex> FerricStore.linsert("tasks:queue", :after, "task_c", "task_last")
+      {:ok, 5}
+
+      iex> FerricStore.linsert("tasks:queue", :before, "nonexistent", "x")
+      {:ok, -1}
 
   """
   @spec linsert(key(), :before | :after, binary(), binary()) :: {:ok, integer()}
@@ -2406,21 +2742,17 @@ defmodule FerricStore do
   @doc """
   Atomically moves an element from one list to another.
 
-  ## Parameters
-
-    * `source` - Source list key.
-    * `destination` - Destination list key.
-    * `from_dir` - `:left` or `:right`, which end to pop from.
-    * `to_dir` - `:left` or `:right`, which end to push to.
-
-  ## Returns
-
-    * `{:ok, element}` on success.
-    * `{:ok, nil}` if the source list is empty.
+  Pops from `from_dir` of `source` and pushes to `to_dir` of `destination`.
+  Returns `{:ok, nil}` if the source list is empty or does not exist.
 
   ## Examples
 
-      {:ok, "a"} = FerricStore.lmove("src", "dst", :left, :right)
+      iex> FerricStore.rpush("inbox", ["msg_a", "msg_b"])
+      iex> FerricStore.lmove("inbox", "processing", :left, :right)
+      {:ok, "msg_a"}
+
+      iex> FerricStore.lmove("empty_list", "dst", :left, :right)
+      {:ok, nil}
 
   """
   @spec lmove(key(), key(), :left | :right, :left | :right) :: {:ok, binary() | nil}
@@ -2435,22 +2767,28 @@ defmodule FerricStore do
   @doc """
   Finds the position of `element` in the list at `key`.
 
+  Returns the zero-based index of the first match, or `{:ok, nil}` if not
+  found. When `:count` is specified, returns a list of indices.
+
   ## Options
 
-    * `:rank` - Start searching from the Nth match (default: 1).
-    * `:count` - Return up to N positions. 0 means all. When given, returns a list.
-    * `:maxlen` - Limit scan to first N elements.
-
-  ## Returns
-
-    * `{:ok, index}` for single result.
-    * `{:ok, [indices]}` when `:count` is specified.
-    * `{:ok, nil}` when element not found.
+    * `:rank` - Skip the first N-1 matches and return starting from the Nth
+      (default: 1). Negative rank searches from tail.
+    * `:count` - Return up to N positions. 0 means all. When given, always
+      returns a list.
+    * `:maxlen` - Limit scan to the first N elements (default: 0, no limit).
 
   ## Examples
 
-      {:ok, 1} = FerricStore.lpos("list", "b")
-      {:ok, [0, 2, 4]} = FerricStore.lpos("list", "a", count: 0)
+      iex> FerricStore.rpush("tasks:queue", ["retry", "send", "retry", "process"])
+      iex> FerricStore.lpos("tasks:queue", "retry")
+      {:ok, 0}
+
+      iex> FerricStore.lpos("tasks:queue", "retry", count: 0)
+      {:ok, [0, 2]}
+
+      iex> FerricStore.lpos("tasks:queue", "missing")
+      {:ok, nil}
 
   """
   @spec lpos(key(), binary(), keyword()) :: {:ok, integer() | [integer()] | nil}
@@ -2472,11 +2810,17 @@ defmodule FerricStore do
   @doc """
   Returns the membership status of multiple members in the set at `key`.
 
-  Returns a list of 1s and 0s corresponding to each member.
+  Returns a list of 1s and 0s corresponding to each member, in the same order
+  as the input list.
 
   ## Examples
 
-      {:ok, [1, 0, 1]} = FerricStore.smismember("set", ["a", "z", "c"])
+      iex> FerricStore.sadd("article:42:tags", ["elixir", "rust", "database"])
+      iex> FerricStore.smismember("article:42:tags", ["elixir", "python", "database"])
+      {:ok, [1, 0, 1]}
+
+      iex> FerricStore.smismember("nonexistent", ["a", "b"])
+      {:ok, [0, 0]}
 
   """
   @spec smismember(key(), [binary()]) :: {:ok, [0 | 1]}
@@ -2493,15 +2837,25 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns one or more random members from the set at `key`.
+  Returns one or more random members from the set at `key` without removing them.
 
-  Without `count`, returns a single member or `nil`.
-  With `count`, returns a list of members.
+  Without `count`, returns a single member or `nil` for empty/nonexistent sets.
+  With positive `count`, returns up to `count` unique members. With negative
+  `count`, returns `abs(count)` members with possible duplicates.
 
   ## Examples
 
-      {:ok, "a"} = FerricStore.srandmember("set")
-      {:ok, ["a", "b"]} = FerricStore.srandmember("set", 2)
+      iex> FerricStore.sadd("article:42:tags", ["elixir", "rust", "database"])
+      iex> {:ok, member} = FerricStore.srandmember("article:42:tags")
+      iex> member in ["elixir", "rust", "database"]
+      true
+
+      iex> {:ok, members} = FerricStore.srandmember("article:42:tags", 2)
+      iex> length(members)
+      2
+
+      iex> FerricStore.srandmember("nonexistent")
+      {:ok, nil}
 
   """
   @spec srandmember(key(), integer() | nil) :: {:ok, binary() | [binary()] | nil}
@@ -2523,13 +2877,22 @@ defmodule FerricStore do
   @doc """
   Removes and returns one or more random members from the set at `key`.
 
-  Without `count`, returns a single member or `nil`.
-  With `count`, returns a list of members.
+  Without `count`, returns a single member or `nil` for empty/nonexistent sets.
+  With `count`, returns a list of up to `count` removed members.
 
   ## Examples
 
-      {:ok, "a"} = FerricStore.spop("set")
-      {:ok, ["a", "b"]} = FerricStore.spop("set", 2)
+      iex> FerricStore.sadd("article:42:tags", ["elixir", "rust", "database"])
+      iex> {:ok, tag} = FerricStore.spop("article:42:tags")
+      iex> tag in ["elixir", "rust", "database"]
+      true
+
+      iex> {:ok, tags} = FerricStore.spop("article:42:tags", 2)
+      iex> length(tags)
+      2
+
+      iex> FerricStore.spop("nonexistent")
+      {:ok, nil}
 
   """
   @spec spop(key(), non_neg_integer() | nil) :: {:ok, binary() | [binary()] | nil}
@@ -2549,13 +2912,18 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns the set difference: members in the first set that are not in the others.
+  Returns the set difference: members in the first set that are not in any of the other sets.
 
-  Handles cross-shard keys by gathering members from each key's shard.
+  Handles cross-shard keys transparently. Returns `{:ok, []}` if the first
+  key does not exist.
 
   ## Examples
 
-      {:ok, ["a"]} = FerricStore.sdiff(["set1", "set2"])
+      iex> FerricStore.sadd("frontend:tags", ["elixir", "react", "tailwind"])
+      iex> FerricStore.sadd("backend:tags", ["elixir", "postgres"])
+      iex> {:ok, diff} = FerricStore.sdiff(["frontend:tags", "backend:tags"])
+      iex> Enum.sort(diff)
+      ["react", "tailwind"]
 
   """
   @spec sdiff([key()]) :: {:ok, [binary()]}
@@ -2577,11 +2945,15 @@ defmodule FerricStore do
   @doc """
   Returns the set intersection: members common to all given sets.
 
-  Handles cross-shard keys by gathering members from each key's shard.
+  Handles cross-shard keys transparently. Returns `{:ok, []}` if any key
+  does not exist.
 
   ## Examples
 
-      {:ok, ["b", "c"]} = FerricStore.sinter(["set1", "set2"])
+      iex> FerricStore.sadd("frontend:tags", ["elixir", "react", "tailwind"])
+      iex> FerricStore.sadd("backend:tags", ["elixir", "postgres"])
+      iex> FerricStore.sinter(["frontend:tags", "backend:tags"])
+      {:ok, ["elixir"]}
 
   """
   @spec sinter([key()]) :: {:ok, [binary()]}
@@ -2603,11 +2975,15 @@ defmodule FerricStore do
   @doc """
   Returns the set union: all unique members across all given sets.
 
-  Handles cross-shard keys by gathering members from each key's shard.
+  Handles cross-shard keys transparently.
 
   ## Examples
 
-      {:ok, ["a", "b", "c"]} = FerricStore.sunion(["set1", "set2"])
+      iex> FerricStore.sadd("frontend:tags", ["elixir", "react"])
+      iex> FerricStore.sadd("backend:tags", ["elixir", "postgres"])
+      iex> {:ok, union} = FerricStore.sunion(["frontend:tags", "backend:tags"])
+      iex> Enum.sort(union)
+      ["elixir", "postgres", "react"]
 
   """
   @spec sunion([key()]) :: {:ok, [binary()]}
@@ -2621,11 +2997,15 @@ defmodule FerricStore do
   @doc """
   Computes the set difference of the given keys and stores the result in `destination`.
 
-  Returns the number of elements in the resulting set.
+  Any existing value at `destination` is overwritten. Returns the number of
+  elements in the resulting set.
 
   ## Examples
 
-      {:ok, 2} = FerricStore.sdiffstore("dst", ["set1", "set2"])
+      iex> FerricStore.sadd("frontend:tags", ["elixir", "react", "tailwind"])
+      iex> FerricStore.sadd("backend:tags", ["elixir", "postgres"])
+      iex> FerricStore.sdiffstore("frontend_only:tags", ["frontend:tags", "backend:tags"])
+      {:ok, 2}
 
   """
   @spec sdiffstore(key(), [key()]) :: {:ok, non_neg_integer()}
@@ -2640,11 +3020,15 @@ defmodule FerricStore do
   @doc """
   Computes the set intersection of the given keys and stores the result in `destination`.
 
-  Returns the number of elements in the resulting set.
+  Any existing value at `destination` is overwritten. Returns the number of
+  elements in the resulting set.
 
   ## Examples
 
-      {:ok, 2} = FerricStore.sinterstore("dst", ["set1", "set2"])
+      iex> FerricStore.sadd("frontend:tags", ["elixir", "react"])
+      iex> FerricStore.sadd("backend:tags", ["elixir", "postgres"])
+      iex> FerricStore.sinterstore("shared:tags", ["frontend:tags", "backend:tags"])
+      {:ok, 1}
 
   """
   @spec sinterstore(key(), [key()]) :: {:ok, non_neg_integer()}
@@ -2659,11 +3043,15 @@ defmodule FerricStore do
   @doc """
   Computes the set union of the given keys and stores the result in `destination`.
 
-  Returns the number of elements in the resulting set.
+  Any existing value at `destination` is overwritten. Returns the number of
+  elements in the resulting set.
 
   ## Examples
 
-      {:ok, 4} = FerricStore.sunionstore("dst", ["set1", "set2"])
+      iex> FerricStore.sadd("frontend:tags", ["elixir", "react"])
+      iex> FerricStore.sadd("backend:tags", ["elixir", "postgres"])
+      iex> FerricStore.sunionstore("all:tags", ["frontend:tags", "backend:tags"])
+      {:ok, 3}
 
   """
   @spec sunionstore(key(), [key()]) :: {:ok, non_neg_integer()}
@@ -2678,16 +3066,23 @@ defmodule FerricStore do
   @doc """
   Returns the cardinality of the intersection of all given sets.
 
-  When `limit` is provided and > 0, stops counting after reaching the limit.
+  More efficient than `sinter/1` when you only need the count, not the
+  actual members.
 
   ## Options
 
-    * `:limit` - Maximum count to return (0 means no limit, default 0).
+    * `:limit` - Stop counting after reaching this limit (0 means no limit,
+      default: 0). Useful for early termination on large sets.
 
   ## Examples
 
-      {:ok, 3} = FerricStore.sintercard(["set1", "set2"])
-      {:ok, 2} = FerricStore.sintercard(["set1", "set2"], limit: 2)
+      iex> FerricStore.sadd("frontend:tags", ["elixir", "react", "tailwind"])
+      iex> FerricStore.sadd("backend:tags", ["elixir", "postgres", "tailwind"])
+      iex> FerricStore.sintercard(["frontend:tags", "backend:tags"])
+      {:ok, 2}
+
+      iex> FerricStore.sintercard(["frontend:tags", "backend:tags"], limit: 1)
+      {:ok, 1}
 
   """
   @spec sintercard([key()], keyword()) :: {:ok, non_neg_integer()}
@@ -2723,16 +3118,22 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Returns the rank of `member` in the sorted set at `key` (ascending order).
+  Returns the rank of `member` in the sorted set at `key` (ascending score order).
 
-  ## Returns
-
-    * `{:ok, rank}` (0-based) if the member exists.
-    * `{:ok, nil}` if the member does not exist.
+  Rank is 0-based (the member with the lowest score has rank 0). Returns
+  `{:ok, nil}` if the member or key does not exist.
 
   ## Examples
 
-      {:ok, 0} = FerricStore.zrank("zset", "alice")
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}, {300.0, "charlie"}])
+      iex> FerricStore.zrank("leaderboard", "alice")
+      {:ok, 0}
+
+      iex> FerricStore.zrank("leaderboard", "charlie")
+      {:ok, 2}
+
+      iex> FerricStore.zrank("leaderboard", "unknown")
+      {:ok, nil}
 
   """
   @spec zrank(key(), binary()) :: {:ok, non_neg_integer() | nil}
@@ -2744,16 +3145,22 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns the reverse rank of `member` in the sorted set at `key` (descending order).
+  Returns the reverse rank of `member` in the sorted set at `key` (descending score order).
 
-  ## Returns
-
-    * `{:ok, rank}` (0-based) if the member exists.
-    * `{:ok, nil}` if the member does not exist.
+  Rank is 0-based (the member with the highest score has rank 0). Returns
+  `{:ok, nil}` if the member or key does not exist.
 
   ## Examples
 
-      {:ok, 2} = FerricStore.zrevrank("zset", "alice")
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}, {300.0, "charlie"}])
+      iex> FerricStore.zrevrank("leaderboard", "charlie")
+      {:ok, 0}
+
+      iex> FerricStore.zrevrank("leaderboard", "alice")
+      {:ok, 2}
+
+      iex> FerricStore.zrevrank("leaderboard", "unknown")
+      {:ok, nil}
 
   """
   @spec zrevrank(key(), binary()) :: {:ok, non_neg_integer() | nil}
@@ -2767,19 +3174,20 @@ defmodule FerricStore do
   @doc """
   Returns members with scores between `min` and `max` (inclusive by default).
 
-  Supports "-inf" and "+inf" as score bounds.
-
-  ## Options
-
-    * `:withscores` - When `true`, returns `{member, score}` tuples.
-
-  ## Returns
-
-    * `{:ok, members}` - list of member strings.
+  Use "-inf" and "+inf" for unbounded ranges. Prefix a bound with "(" for
+  exclusive (e.g., "(100" means score > 100).
 
   ## Examples
 
-      {:ok, ["b", "c"]} = FerricStore.zrangebyscore("zset", "2", "3")
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}, {300.0, "charlie"}])
+      iex> FerricStore.zrangebyscore("leaderboard", "100", "200")
+      {:ok, ["alice", "bob"]}
+
+      iex> FerricStore.zrangebyscore("leaderboard", "-inf", "+inf")
+      {:ok, ["alice", "bob", "charlie"]}
+
+      iex> FerricStore.zrangebyscore("leaderboard", "(200", "+inf")
+      {:ok, ["charlie"]}
 
   """
   @spec zrangebyscore(key(), binary(), binary(), keyword()) :: {:ok, [binary()]}
@@ -2793,15 +3201,17 @@ defmodule FerricStore do
   @doc """
   Counts members in the sorted set at `key` with scores between `min` and `max`.
 
-  Supports "-inf" and "+inf".
-
-  ## Returns
-
-    * `{:ok, count}` on success.
+  Use "-inf" and "+inf" for unbounded ranges. Prefix a bound with "(" for
+  exclusive.
 
   ## Examples
 
-      {:ok, 2} = FerricStore.zcount("zset", "2", "3")
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}, {300.0, "charlie"}])
+      iex> FerricStore.zcount("leaderboard", "100", "200")
+      {:ok, 2}
+
+      iex> FerricStore.zcount("leaderboard", "-inf", "+inf")
+      {:ok, 3}
 
   """
   @spec zcount(key(), binary(), binary()) :: {:ok, non_neg_integer()}
@@ -2815,15 +3225,17 @@ defmodule FerricStore do
   @doc """
   Increments the score of `member` in the sorted set at `key` by `increment`.
 
-  Creates the member with the given score if it does not exist.
-
-  ## Returns
-
-    * `{:ok, new_score_string}` on success.
+  Creates the member with the given increment as score if it does not exist.
+  Returns the new score as a string.
 
   ## Examples
 
-      {:ok, "15.0"} = FerricStore.zincrby("zset", 5.0, "alice")
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}])
+      iex> FerricStore.zincrby("leaderboard", 50.0, "alice")
+      {:ok, "150.0"}
+
+      iex> FerricStore.zincrby("leaderboard", 25.0, "newcomer")
+      {:ok, "25.0"}
 
   """
   @spec zincrby(key(), number(), binary()) :: {:ok, binary()}
@@ -2837,12 +3249,23 @@ defmodule FerricStore do
   @doc """
   Returns one or more random members from the sorted set at `key`.
 
-  Without `count`, returns a single member or `nil`.
-  With `count`, returns a list of members.
+  Without `count`, returns a single member or `nil` for empty/nonexistent keys.
+  With positive `count`, returns up to `count` unique members. With negative
+  `count`, returns `abs(count)` members with possible duplicates.
 
   ## Examples
 
-      {:ok, "alice"} = FerricStore.zrandmember("zset")
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}, {300.0, "charlie"}])
+      iex> {:ok, member} = FerricStore.zrandmember("leaderboard")
+      iex> member in ["alice", "bob", "charlie"]
+      true
+
+      iex> {:ok, members} = FerricStore.zrandmember("leaderboard", 2)
+      iex> length(members)
+      2
+
+      iex> FerricStore.zrandmember("nonexistent")
+      {:ok, nil}
 
   """
   @spec zrandmember(key(), integer() | nil) :: {:ok, binary() | [binary()] | nil}
@@ -2864,13 +3287,16 @@ defmodule FerricStore do
   @doc """
   Removes and returns up to `count` members with the lowest scores.
 
-  ## Returns
-
-    * `{:ok, [{member, score}, ...]}` on success.
+  Returns `{:ok, []}` if the key does not exist or the sorted set is empty.
 
   ## Examples
 
-      {:ok, [{"alice", 1.0}]} = FerricStore.zpopmin("zset", 1)
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}, {300.0, "charlie"}])
+      iex> FerricStore.zpopmin("leaderboard", 1)
+      {:ok, [{"alice", 100.0}]}
+
+      iex> FerricStore.zpopmin("leaderboard", 2)
+      {:ok, [{"bob", 200.0}, {"charlie", 300.0}]}
 
   """
   @spec zpopmin(key(), pos_integer()) :: {:ok, [{binary(), float()}]}
@@ -2896,13 +3322,16 @@ defmodule FerricStore do
   @doc """
   Removes and returns up to `count` members with the highest scores.
 
-  ## Returns
-
-    * `{:ok, [{member, score}, ...]}` on success.
+  Returns `{:ok, []}` if the key does not exist or the sorted set is empty.
 
   ## Examples
 
-      {:ok, [{"bob", 200.0}]} = FerricStore.zpopmax("zset", 1)
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}, {300.0, "charlie"}])
+      iex> FerricStore.zpopmax("leaderboard", 1)
+      {:ok, [{"charlie", 300.0}]}
+
+      iex> FerricStore.zpopmax("leaderboard", 2)
+      {:ok, [{"bob", 200.0}, {"alice", 100.0}]}
 
   """
   @spec zpopmax(key(), pos_integer()) :: {:ok, [{binary(), float()}]}
@@ -2928,15 +3357,14 @@ defmodule FerricStore do
   @doc """
   Returns scores for multiple members in the sorted set at `key`.
 
-  Returns `nil` for members that do not exist.
-
-  ## Returns
-
-    * `{:ok, [score | nil, ...]}` on success.
+  Returns `nil` for members that do not exist. The order of returned scores
+  matches the order of the input members.
 
   ## Examples
 
-      {:ok, [1.0, nil]} = FerricStore.zmscore("zset", ["alice", "unknown"])
+      iex> FerricStore.zadd("leaderboard", [{100.0, "alice"}, {200.0, "bob"}])
+      iex> FerricStore.zmscore("leaderboard", ["alice", "unknown", "bob"])
+      {:ok, [100.0, nil, 200.0]}
 
   """
   @spec zmscore(key(), [binary()]) :: {:ok, [float() | nil]}
@@ -2963,17 +3391,23 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Adds an entry to the stream at `key` with auto-generated ID.
+  Appends an entry to the stream at `key` with an auto-generated ID.
 
-  `fields` is a flat list of field-value pairs: `["key1", "val1", "key2", "val2"]`.
+  `fields` is a flat list of field-value pairs: `["field1", "val1", "field2", "val2"]`.
+  Streams are append-only logs ideal for event sourcing, activity feeds, and audit trails.
 
   ## Returns
 
-    * `{:ok, entry_id}` on success.
+    * `{:ok, entry_id}` where `entry_id` is a `"timestamp-seq"` string.
+    * `{:error, reason}` on failure.
 
   ## Examples
 
-      {:ok, "1234567-0"} = FerricStore.xadd("stream", ["name", "alice"])
+      iex> FerricStore.xadd("events:user:42", ["action", "login", "ip", "10.0.0.1"])
+      {:ok, "1711234567890-0"}
+
+      iex> FerricStore.xadd("activity:feed", ["type", "comment", "body", "looks great!"])
+      {:ok, "1711234567891-0"}
 
   """
   @spec xadd(key(), [binary()]) :: {:ok, binary()} | {:error, binary()}
@@ -2993,7 +3427,8 @@ defmodule FerricStore do
 
   ## Examples
 
-      {:ok, 5} = FerricStore.xlen("stream")
+      iex> FerricStore.xlen("events:user:42")
+      {:ok, 5}
 
   """
   @spec xlen(key()) :: {:ok, non_neg_integer()}
@@ -3005,9 +3440,9 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns entries from the stream at `key` in forward order between `start` and `stop`.
+  Returns entries from the stream at `key` in forward (oldest-first) order between `start` and `stop`.
 
-  Use "-" for the minimum and "+" for the maximum stream IDs.
+  Use `"-"` for the minimum and `"+"` for the maximum stream IDs.
 
   ## Options
 
@@ -3019,7 +3454,11 @@ defmodule FerricStore do
 
   ## Examples
 
-      {:ok, entries} = FerricStore.xrange("stream", "-", "+", count: 10)
+      iex> FerricStore.xrange("events:user:42", "-", "+", count: 10)
+      {:ok, [{"1711234567890-0", ["action", "login", "ip", "10.0.0.1"]}]}
+
+      iex> FerricStore.xrange("activity:feed", "-", "+")
+      {:ok, [{"1711234567891-0", ["type", "comment", "body", "looks great!"]}]}
 
   """
   @spec xrange(key(), binary(), binary(), keyword()) :: {:ok, [tuple()]}
@@ -3034,7 +3473,7 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns entries from the stream at `key` in reverse order between `stop` and `start`.
+  Returns entries from the stream at `key` in reverse (newest-first) order between `stop` and `start`.
 
   ## Options
 
@@ -3046,7 +3485,8 @@ defmodule FerricStore do
 
   ## Examples
 
-      {:ok, entries} = FerricStore.xrevrange("stream", "+", "-")
+      iex> FerricStore.xrevrange("events:user:42", "+", "-", count: 5)
+      {:ok, [{"1711234567890-0", ["action", "login", "ip", "10.0.0.1"]}]}
 
   """
   @spec xrevrange(key(), binary(), binary(), keyword()) :: {:ok, [tuple()]}
@@ -3061,19 +3501,22 @@ defmodule FerricStore do
   end
 
   @doc """
-  Trims the stream at `key` to a specified length.
+  Trims the stream at `key` to a maximum number of entries, evicting the oldest.
+
+  Useful for capping event logs and activity feeds to prevent unbounded growth.
 
   ## Options
 
-    * `:maxlen` - Maximum number of entries to keep.
+    * `:maxlen` (required) - Maximum number of entries to keep.
 
   ## Returns
 
-    * `{:ok, trimmed_count}` on success.
+    * `{:ok, trimmed_count}` - the number of entries removed.
 
   ## Examples
 
-      {:ok, 5} = FerricStore.xtrim("stream", maxlen: 10)
+      iex> FerricStore.xtrim("events:user:42", maxlen: 1000)
+      {:ok, 5}
 
   """
   @spec xtrim(key(), keyword()) :: {:ok, non_neg_integer()}
@@ -3175,11 +3618,16 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns the cardinality (number of elements added) to the Bloom filter.
+  Returns the approximate number of unique elements added to the Bloom filter at `key`.
 
   ## Returns
 
     * `{:ok, count}` on success.
+
+  ## Examples
+
+      iex> FerricStore.bf_card("emails:seen")
+      {:ok, 42}
 
   """
   @spec bf_card(key()) :: {:ok, non_neg_integer()}
@@ -3191,11 +3639,17 @@ defmodule FerricStore do
   end
 
   @doc """
-  Returns information about the Bloom filter at `key`.
+  Returns metadata about the Bloom filter at `key` (capacity, error rate, size, etc.).
 
   ## Returns
 
-    * `{:ok, info_list}` on success.
+    * `{:ok, info_list}` - flat key-value list of filter properties.
+    * `{:error, reason}` if the filter does not exist.
+
+  ## Examples
+
+      iex> FerricStore.bf_info("emails:seen")
+      {:ok, ["Capacity", 100000, "Size", 120048, "Number of filters", 1, "Number of items inserted", 42, "Expansion rate", 2]}
 
   """
   @spec bf_info(key()) :: {:ok, list()} | {:error, binary()}
@@ -3210,7 +3664,24 @@ defmodule FerricStore do
   # Cuckoo Filter operations
   # ---------------------------------------------------------------------------
 
-  @doc "Creates a Cuckoo filter with specified capacity."
+  @doc """
+  Creates a Cuckoo filter with the specified capacity.
+
+  A Cuckoo filter is similar to a Bloom filter but supports deletion and counting.
+  Use it when you need probabilistic membership checks with the ability to remove
+  items later (e.g., tracking active sessions that can be revoked).
+
+  ## Parameters
+
+    * `key` - the Cuckoo filter key
+    * `capacity` - expected number of elements
+
+  ## Examples
+
+      iex> FerricStore.cf_reserve("sessions:active", 50_000)
+      :ok
+
+  """
   @spec cf_reserve(key(), pos_integer()) :: :ok | {:error, binary()}
   def cf_reserve(key, capacity) do
     resolved_key = sandbox_key(key)
@@ -3218,7 +3689,22 @@ defmodule FerricStore do
     Ferricstore.Commands.Cuckoo.handle("CF.RESERVE", [resolved_key, to_string(capacity)], store)
   end
 
-  @doc "Adds an element to the Cuckoo filter, auto-creating if needed."
+  @doc """
+  Adds an element to the Cuckoo filter at `key`, auto-creating if needed.
+
+  Unlike Bloom filters, duplicate insertions increase the count for the element.
+
+  ## Returns
+
+    * `{:ok, 1}` on success.
+    * `{:error, reason}` if the filter is full and cannot accommodate the element.
+
+  ## Examples
+
+      iex> FerricStore.cf_add("sessions:active", "sess_abc123")
+      {:ok, 1}
+
+  """
   @spec cf_add(key(), binary()) :: {:ok, 0 | 1} | {:error, binary()}
   def cf_add(key, element) do
     resolved_key = sandbox_key(key)
@@ -3227,7 +3713,24 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Adds element only if not already present."
+  @doc """
+  Adds an element to the Cuckoo filter only if it is not already present.
+
+  ## Returns
+
+    * `{:ok, 1}` if the element was newly added.
+    * `{:ok, 0}` if the element already exists.
+    * `{:error, reason}` if the filter is full.
+
+  ## Examples
+
+      iex> FerricStore.cf_addnx("sessions:active", "sess_abc123")
+      {:ok, 1}
+
+      iex> FerricStore.cf_addnx("sessions:active", "sess_abc123")
+      {:ok, 0}
+
+  """
   @spec cf_addnx(key(), binary()) :: {:ok, 0 | 1} | {:error, binary()}
   def cf_addnx(key, element) do
     resolved_key = sandbox_key(key)
@@ -3236,7 +3739,23 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Deletes one occurrence of element from the Cuckoo filter."
+  @doc """
+  Deletes one occurrence of an element from the Cuckoo filter at `key`.
+
+  This is the key advantage of Cuckoo filters over Bloom filters -- elements
+  can be removed. Only deletes one occurrence if the element was added multiple times.
+
+  ## Returns
+
+    * `{:ok, 1}` if the element was deleted.
+    * `{:ok, 0}` if the element was not found.
+
+  ## Examples
+
+      iex> FerricStore.cf_del("sessions:active", "sess_abc123")
+      {:ok, 1}
+
+  """
   @spec cf_del(key(), binary()) :: {:ok, 0 | 1}
   def cf_del(key, element) do
     resolved_key = sandbox_key(key)
@@ -3245,7 +3764,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Checks if element may exist in the Cuckoo filter."
+  @doc """
+  Checks if an element may exist in the Cuckoo filter at `key`.
+
+  ## Returns
+
+    * `{:ok, 1}` if the element probably exists.
+    * `{:ok, 0}` if the element definitely does not exist.
+
+  ## Examples
+
+      iex> FerricStore.cf_exists("sessions:active", "sess_abc123")
+      {:ok, 1}
+
+  """
   @spec cf_exists(key(), binary()) :: {:ok, 0 | 1}
   def cf_exists(key, element) do
     resolved_key = sandbox_key(key)
@@ -3254,7 +3786,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Checks multiple elements against the Cuckoo filter."
+  @doc """
+  Checks multiple elements against the Cuckoo filter at `key` in a single call.
+
+  ## Returns
+
+    * `{:ok, [0 | 1, ...]}` - `1` for probably present, `0` for definitely absent,
+      one per element.
+
+  ## Examples
+
+      iex> FerricStore.cf_mexists("sessions:active", ["sess_abc123", "sess_unknown"])
+      {:ok, [1, 0]}
+
+  """
   @spec cf_mexists(key(), [binary()]) :: {:ok, [0 | 1]}
   def cf_mexists(key, elements) when is_list(elements) do
     resolved_key = sandbox_key(key)
@@ -3263,7 +3808,19 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns approximate count of element in the Cuckoo filter."
+  @doc """
+  Returns the approximate number of times an element was added to the Cuckoo filter.
+
+  ## Returns
+
+    * `{:ok, count}` - estimated insertion count for the element.
+
+  ## Examples
+
+      iex> FerricStore.cf_count("sessions:active", "sess_abc123")
+      {:ok, 1}
+
+  """
   @spec cf_count(key(), binary()) :: {:ok, non_neg_integer()}
   def cf_count(key, element) do
     resolved_key = sandbox_key(key)
@@ -3272,7 +3829,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns information about the Cuckoo filter."
+  @doc """
+  Returns metadata about the Cuckoo filter at `key` (size, bucket count, etc.).
+
+  ## Returns
+
+    * `{:ok, info_list}` - flat key-value list of filter properties.
+    * `{:error, reason}` if the filter does not exist.
+
+  ## Examples
+
+      iex> FerricStore.cf_info("sessions:active")
+      {:ok, ["Size", 1024, "Number of buckets", 512, "Number of filters", 1, "Number of items inserted", 3, "Number of items deleted", 0, "Bucket size", 2, "Expansion rate", 1, "Max iterations", 20]}
+
+  """
   @spec cf_info(key()) :: {:ok, list()} | {:error, binary()}
   def cf_info(key) do
     resolved_key = sandbox_key(key)
@@ -3285,7 +3855,26 @@ defmodule FerricStore do
   # Count-Min Sketch operations
   # ---------------------------------------------------------------------------
 
-  @doc "Creates a Count-Min Sketch with given width and depth."
+  @doc """
+  Creates a Count-Min Sketch with the given `width` and `depth` dimensions.
+
+  A Count-Min Sketch is a probabilistic structure for approximate frequency counting.
+  It uses sub-linear space and answers "how many times has X been seen?" with bounded
+  over-estimation. Ideal for view counts, click tracking, and frequency analysis
+  where exact counts are not required.
+
+  ## Parameters
+
+    * `key` - the CMS key
+    * `width` - number of counters per hash function (larger = more accurate)
+    * `depth` - number of hash functions (larger = lower error probability)
+
+  ## Examples
+
+      iex> FerricStore.cms_initbydim("page:views", 2000, 5)
+      :ok
+
+  """
   @spec cms_initbydim(key(), pos_integer(), pos_integer()) :: :ok | {:error, binary()}
   def cms_initbydim(key, width, depth) do
     resolved_key = sandbox_key(key)
@@ -3293,7 +3882,23 @@ defmodule FerricStore do
     Ferricstore.Commands.CMS.handle("CMS.INITBYDIM", [resolved_key, to_string(width), to_string(depth)], store)
   end
 
-  @doc "Creates a Count-Min Sketch with target error rate and probability."
+  @doc """
+  Creates a Count-Min Sketch with a target error rate and over-estimation probability.
+
+  The sketch dimensions (width/depth) are computed automatically from the error bounds.
+
+  ## Parameters
+
+    * `key` - the CMS key
+    * `error` - acceptable error rate as a fraction (e.g. `0.001` for 0.1%)
+    * `probability` - probability of exceeding the error rate (e.g. `0.01` for 1%)
+
+  ## Examples
+
+      iex> FerricStore.cms_initbyprob("click:tracking", 0.001, 0.01)
+      :ok
+
+  """
   @spec cms_initbyprob(key(), float(), float()) :: :ok | {:error, binary()}
   def cms_initbyprob(key, error, probability) do
     resolved_key = sandbox_key(key)
@@ -3301,7 +3906,25 @@ defmodule FerricStore do
     Ferricstore.Commands.CMS.handle("CMS.INITBYPROB", [resolved_key, to_string(error), to_string(probability)], store)
   end
 
-  @doc "Increments counts for element-count pairs in the CMS."
+  @doc """
+  Increments the count for one or more elements in the Count-Min Sketch.
+
+  ## Parameters
+
+    * `key` - the CMS key
+    * `pairs` - list of `{element, increment}` tuples
+
+  ## Returns
+
+    * `{:ok, [new_count, ...]}` - estimated count after increment, one per element.
+    * `{:error, reason}` if the sketch does not exist.
+
+  ## Examples
+
+      iex> FerricStore.cms_incrby("page:views", [{"homepage", 1}, {"about", 3}])
+      {:ok, [1, 3]}
+
+  """
   @spec cms_incrby(key(), [{binary(), pos_integer()}]) :: {:ok, [non_neg_integer()]} | {:error, binary()}
   def cms_incrby(key, pairs) when is_list(pairs) do
     resolved_key = sandbox_key(key)
@@ -3311,7 +3934,22 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Queries estimated counts for elements in the CMS."
+  @doc """
+  Queries the estimated frequency count for one or more elements in the Count-Min Sketch.
+
+  Counts may be over-estimated but never under-estimated.
+
+  ## Returns
+
+    * `{:ok, [count, ...]}` - estimated count per element.
+    * `{:error, reason}` if the sketch does not exist.
+
+  ## Examples
+
+      iex> FerricStore.cms_query("page:views", ["homepage", "about", "unknown"])
+      {:ok, [42, 7, 0]}
+
+  """
   @spec cms_query(key(), [binary()]) :: {:ok, [non_neg_integer()]} | {:error, binary()}
   def cms_query(key, elements) when is_list(elements) do
     resolved_key = sandbox_key(key)
@@ -3320,7 +3958,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns information about the CMS."
+  @doc """
+  Returns metadata about the Count-Min Sketch at `key` (width, depth, total count).
+
+  ## Returns
+
+    * `{:ok, info_list}` - flat key-value list of sketch properties.
+    * `{:error, reason}` if the sketch does not exist.
+
+  ## Examples
+
+      iex> FerricStore.cms_info("page:views")
+      {:ok, ["width", 2000, "depth", 5, "count", 49]}
+
+  """
   @spec cms_info(key()) :: {:ok, list()} | {:error, binary()}
   def cms_info(key) do
     resolved_key = sandbox_key(key)
@@ -3333,7 +3984,24 @@ defmodule FerricStore do
   # TopK operations
   # ---------------------------------------------------------------------------
 
-  @doc "Creates a Top-K tracker with specified k."
+  @doc """
+  Creates a Top-K tracker that maintains the `k` most frequent elements.
+
+  A Top-K structure uses the Heavy Keeper algorithm to efficiently track the
+  most popular items in a data stream with bounded memory. Ideal for trending
+  topics, popular search queries, and hot product tracking.
+
+  ## Parameters
+
+    * `key` - the Top-K tracker key
+    * `k` - number of top elements to track
+
+  ## Examples
+
+      iex> FerricStore.topk_reserve("trending:searches", 10)
+      :ok
+
+  """
   @spec topk_reserve(key(), pos_integer()) :: :ok | {:error, binary()}
   def topk_reserve(key, k) do
     resolved_key = sandbox_key(key)
@@ -3341,7 +4009,22 @@ defmodule FerricStore do
     Ferricstore.Commands.TopK.handle("TOPK.RESERVE", [resolved_key, to_string(k)], store)
   end
 
-  @doc "Adds elements to the Top-K tracker."
+  @doc """
+  Adds one or more elements to the Top-K tracker, updating frequency counts.
+
+  If an element displaces another from the top-k, the displaced element is returned.
+
+  ## Returns
+
+    * `{:ok, [displaced | nil, ...]}` - `nil` if no element was displaced,
+      or the name of the displaced element, one per input.
+
+  ## Examples
+
+      iex> FerricStore.topk_add("trending:searches", ["elixir", "rust", "golang"])
+      {:ok, [nil, nil, nil]}
+
+  """
   @spec topk_add(key(), [binary()]) :: {:ok, list()} | {:error, binary()}
   def topk_add(key, elements) when is_list(elements) do
     resolved_key = sandbox_key(key)
@@ -3350,7 +4033,19 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Queries whether elements are in the Top-K."
+  @doc """
+  Checks whether elements are currently in the Top-K set.
+
+  ## Returns
+
+    * `{:ok, [0 | 1, ...]}` - `1` if the element is in the top-k, `0` otherwise.
+
+  ## Examples
+
+      iex> FerricStore.topk_query("trending:searches", ["elixir", "obscure-lang"])
+      {:ok, [1, 0]}
+
+  """
   @spec topk_query(key(), [binary()]) :: {:ok, list()} | {:error, binary()}
   def topk_query(key, elements) when is_list(elements) do
     resolved_key = sandbox_key(key)
@@ -3359,7 +4054,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Lists the current Top-K elements."
+  @doc """
+  Returns the current Top-K elements, ordered by estimated frequency (descending).
+
+  ## Returns
+
+    * `{:ok, [element, ...]}` - the top-k element names.
+    * `{:error, reason}` if the tracker does not exist.
+
+  ## Examples
+
+      iex> FerricStore.topk_list("trending:searches")
+      {:ok, ["elixir", "rust", "golang"]}
+
+  """
   @spec topk_list(key()) :: {:ok, [binary()]} | {:error, binary()}
   def topk_list(key) do
     resolved_key = sandbox_key(key)
@@ -3368,7 +4076,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns information about the Top-K tracker."
+  @doc """
+  Returns metadata about the Top-K tracker at `key` (k, width, depth, decay).
+
+  ## Returns
+
+    * `{:ok, info_list}` - flat key-value list of tracker properties.
+    * `{:error, reason}` if the tracker does not exist.
+
+  ## Examples
+
+      iex> FerricStore.topk_info("trending:searches")
+      {:ok, ["k", 10, "width", 8, "depth", 7, "decay", "0.9"]}
+
+  """
   @spec topk_info(key()) :: {:ok, list()} | {:error, binary()}
   def topk_info(key) do
     resolved_key = sandbox_key(key)
@@ -3381,7 +4102,19 @@ defmodule FerricStore do
   # T-Digest operations
   # ---------------------------------------------------------------------------
 
-  @doc "Creates a T-Digest structure at `key`."
+  @doc """
+  Creates a T-Digest structure at `key` for estimating quantiles and percentiles.
+
+  A T-Digest compactly summarizes a distribution of numeric values, enabling
+  accurate estimation of percentiles (p50, p95, p99) with bounded memory.
+  Ideal for latency monitoring, response time analysis, and SLA tracking.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_create("api:latency:ms")
+      :ok
+
+  """
   @spec tdigest_create(key()) :: :ok | {:error, binary()}
   def tdigest_create(key) do
     resolved_key = sandbox_key(key)
@@ -3389,7 +4122,20 @@ defmodule FerricStore do
     Ferricstore.Commands.TDigest.handle("TDIGEST.CREATE", [resolved_key], store)
   end
 
-  @doc "Adds values to the T-Digest at `key`."
+  @doc """
+  Adds one or more numeric observations to the T-Digest at `key`.
+
+  ## Parameters
+
+    * `key` - the T-Digest key
+    * `values` - list of numeric values to add
+
+  ## Examples
+
+      iex> FerricStore.tdigest_add("api:latency:ms", [12.5, 45.0, 3.2, 89.1, 150.0])
+      :ok
+
+  """
   @spec tdigest_add(key(), [number()]) :: :ok | {:error, binary()}
   def tdigest_add(key, values) when is_list(values) do
     resolved_key = sandbox_key(key)
@@ -3398,7 +4144,22 @@ defmodule FerricStore do
     Ferricstore.Commands.TDigest.handle("TDIGEST.ADD", [resolved_key | value_strs], store)
   end
 
-  @doc "Estimates values at given quantiles."
+  @doc """
+  Estimates the values at the given quantile points (0.0 to 1.0).
+
+  For example, quantile `0.5` is the median, `0.95` is the 95th percentile.
+
+  ## Returns
+
+    * `{:ok, [value, ...]}` - estimated value at each quantile.
+    * `{:error, reason}` if the digest does not exist.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_quantile("api:latency:ms", [0.5, 0.95, 0.99])
+      {:ok, ["45.0", "150.0", "150.0"]}
+
+  """
   @spec tdigest_quantile(key(), [float()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_quantile(key, quantiles) when is_list(quantiles) do
     resolved_key = sandbox_key(key)
@@ -3408,7 +4169,23 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Estimates CDF at given values."
+  @doc """
+  Estimates the cumulative distribution function (CDF) at the given values.
+
+  Returns the fraction of observations less than or equal to each value.
+  For example, a CDF of `0.95` at value `100` means 95% of observations
+  were <= 100.
+
+  ## Returns
+
+    * `{:ok, [fraction, ...]}` - CDF value (0.0 to 1.0) at each input.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_cdf("api:latency:ms", [50.0, 100.0])
+      {:ok, ["0.6", "0.8"]}
+
+  """
   @spec tdigest_cdf(key(), [number()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_cdf(key, values) when is_list(values) do
     resolved_key = sandbox_key(key)
@@ -3418,7 +4195,15 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns the minimum observed value."
+  @doc """
+  Returns the minimum value observed in the T-Digest at `key`.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_min("api:latency:ms")
+      {:ok, "3.2"}
+
+  """
   @spec tdigest_min(key()) :: {:ok, binary()} | {:error, binary()}
   def tdigest_min(key) do
     resolved_key = sandbox_key(key)
@@ -3427,7 +4212,15 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns the maximum observed value."
+  @doc """
+  Returns the maximum value observed in the T-Digest at `key`.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_max("api:latency:ms")
+      {:ok, "150.0"}
+
+  """
   @spec tdigest_max(key()) :: {:ok, binary()} | {:error, binary()}
   def tdigest_max(key) do
     resolved_key = sandbox_key(key)
@@ -3436,7 +4229,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns metadata about the T-Digest."
+  @doc """
+  Returns metadata about the T-Digest at `key` (compression, total observations, etc.).
+
+  ## Returns
+
+    * `{:ok, info_list}` - flat key-value list of digest properties.
+    * `{:error, reason}` if the digest does not exist.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_info("api:latency:ms")
+      {:ok, ["Compression", 100, "Capacity", 610, "Merged nodes", 5, "Unmerged nodes", 0, "Merged weight", "5.0", "Unmerged weight", "0.0", "Total compressions", 1]}
+
+  """
   @spec tdigest_info(key()) :: {:ok, list()} | {:error, binary()}
   def tdigest_info(key) do
     resolved_key = sandbox_key(key)
@@ -3445,7 +4251,15 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Resets the T-Digest to empty."
+  @doc """
+  Resets the T-Digest at `key`, discarding all observations.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_reset("api:latency:ms")
+      :ok
+
+  """
   @spec tdigest_reset(key()) :: :ok | {:error, binary()}
   def tdigest_reset(key) do
     resolved_key = sandbox_key(key)
@@ -3453,7 +4267,25 @@ defmodule FerricStore do
     Ferricstore.Commands.TDigest.handle("TDIGEST.RESET", [resolved_key], store)
   end
 
-  @doc "Computes the trimmed mean between the given quantile bounds."
+  @doc """
+  Computes the trimmed mean of values between quantile bounds `lo` and `hi`.
+
+  A trimmed mean excludes outliers by only averaging values within the specified
+  quantile range. For example, `tdigest_trimmed_mean(key, 0.1, 0.9)` averages
+  the middle 80% of the distribution.
+
+  ## Parameters
+
+    * `key` - the T-Digest key
+    * `lo` - lower quantile bound (0.0 to 1.0)
+    * `hi` - upper quantile bound (0.0 to 1.0)
+
+  ## Examples
+
+      iex> FerricStore.tdigest_trimmed_mean("api:latency:ms", 0.1, 0.9)
+      {:ok, "45.5"}
+
+  """
   @spec tdigest_trimmed_mean(key(), float(), float()) :: {:ok, binary()} | {:error, binary()}
   def tdigest_trimmed_mean(key, lo, hi) do
     resolved_key = sandbox_key(key)
@@ -3462,7 +4294,19 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Estimates rank of values in the T-Digest."
+  @doc """
+  Estimates the rank (number of observations less than or equal to) for each value.
+
+  ## Returns
+
+    * `{:ok, [rank, ...]}` - estimated rank per value.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_rank("api:latency:ms", [50.0, 100.0])
+      {:ok, [3, 4]}
+
+  """
   @spec tdigest_rank(key(), [number()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_rank(key, values) when is_list(values) do
     resolved_key = sandbox_key(key)
@@ -3472,7 +4316,19 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Estimates reverse rank of values."
+  @doc """
+  Estimates the reverse rank (number of observations greater than) for each value.
+
+  ## Returns
+
+    * `{:ok, [reverse_rank, ...]}` - estimated reverse rank per value.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_revrank("api:latency:ms", [50.0, 100.0])
+      {:ok, [2, 1]}
+
+  """
   @spec tdigest_revrank(key(), [number()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_revrank(key, values) when is_list(values) do
     resolved_key = sandbox_key(key)
@@ -3482,7 +4338,19 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Estimates value at given rank."
+  @doc """
+  Estimates the value at each given rank (0-based position in sorted order).
+
+  ## Returns
+
+    * `{:ok, [value, ...]}` - estimated value at each rank.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_byrank("api:latency:ms", [0, 2, 4])
+      {:ok, ["3.2", "45.0", "150.0"]}
+
+  """
   @spec tdigest_byrank(key(), [integer()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_byrank(key, ranks) when is_list(ranks) do
     resolved_key = sandbox_key(key)
@@ -3492,7 +4360,19 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Estimates value at given reverse rank."
+  @doc """
+  Estimates the value at each given reverse rank (0 = largest, 1 = second largest, etc.).
+
+  ## Returns
+
+    * `{:ok, [value, ...]}` - estimated value at each reverse rank.
+
+  ## Examples
+
+      iex> FerricStore.tdigest_byrevrank("api:latency:ms", [0, 1])
+      {:ok, ["150.0", "89.1"]}
+
+  """
   @spec tdigest_byrevrank(key(), [integer()]) :: {:ok, list()} | {:error, binary()}
   def tdigest_byrevrank(key, ranks) when is_list(ranks) do
     resolved_key = sandbox_key(key)
@@ -3506,7 +4386,24 @@ defmodule FerricStore do
   # Vector operations
   # ---------------------------------------------------------------------------
 
-  @doc "Creates a vector collection."
+  @doc """
+  Creates a vector collection for storing and searching high-dimensional embeddings.
+
+  Vector collections enable similarity search (k-nearest neighbors) for
+  recommendation engines, semantic search, and content deduplication.
+
+  ## Parameters
+
+    * `collection` - name of the vector collection
+    * `dims` - number of dimensions per vector (must match all inserted vectors)
+    * `metric` - distance metric: `:cosine`, `:euclidean`, or `:ip` (inner product)
+
+  ## Examples
+
+      iex> FerricStore.vcreate("product:embeddings", 128, :cosine)
+      :ok
+
+  """
   @spec vcreate(binary(), pos_integer(), atom()) :: :ok | {:error, binary()}
   def vcreate(collection, dims, metric) do
     resolved = sandbox_key(collection)
@@ -3519,7 +4416,21 @@ defmodule FerricStore do
     end
   end
 
-  @doc "Adds a vector to the collection."
+  @doc """
+  Adds or updates a named vector in the collection.
+
+  ## Parameters
+
+    * `collection` - the vector collection name
+    * `key` - unique identifier for this vector
+    * `components` - list of float components (length must match collection dims)
+
+  ## Examples
+
+      iex> FerricStore.vadd("product:embeddings", "prod_42", [0.1, 0.8, -0.3, 0.5])
+      :ok
+
+  """
   @spec vadd(binary(), binary(), [float()]) :: :ok | {:error, binary()}
   def vadd(collection, key, components) when is_list(components) do
     resolved = sandbox_key(collection)
@@ -3532,7 +4443,21 @@ defmodule FerricStore do
     end
   end
 
-  @doc "Deletes a vector from the collection."
+  @doc """
+  Deletes a vector from the collection by its key.
+
+  ## Returns
+
+    * `{:ok, 1}` if the vector was deleted.
+    * `{:ok, 0}` if the vector did not exist.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.vdel("product:embeddings", "prod_42")
+      {:ok, 1}
+
+  """
   @spec vdel(binary(), binary()) :: {:ok, 0 | 1} | {:error, binary()}
   def vdel(collection, key) do
     resolved = sandbox_key(collection)
@@ -3541,7 +4466,29 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Searches for nearest neighbors in the collection."
+  @doc """
+  Finds the `k` nearest neighbors to `query_vector` in the collection.
+
+  Returns results ordered by similarity (closest first), using the distance
+  metric configured when the collection was created.
+
+  ## Parameters
+
+    * `collection` - the vector collection name
+    * `query_vector` - list of float components to search for
+    * `k` - number of nearest neighbors to return
+
+  ## Returns
+
+    * `{:ok, results}` - list of `[key, distance]` pairs, closest first.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.vsearch("product:embeddings", [0.1, 0.7, -0.2, 0.6], 3)
+      {:ok, [["prod_42", "0.05"], ["prod_99", "0.12"], ["prod_7", "0.34"]]}
+
+  """
   @spec vsearch(binary(), [float()], pos_integer()) :: {:ok, list()} | {:error, binary()}
   def vsearch(collection, query_vector, k) when is_list(query_vector) do
     resolved = sandbox_key(collection)
@@ -3553,7 +4500,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns metadata about the vector collection."
+  @doc """
+  Returns metadata about the vector collection (dimensions, metric, vector count).
+
+  ## Returns
+
+    * `{:ok, info_list}` - flat key-value list of collection properties.
+    * `{:error, reason}` if the collection does not exist.
+
+  ## Examples
+
+      iex> FerricStore.vinfo("product:embeddings")
+      {:ok, ["dimensions", 128, "metric", "cosine", "vector_count", 42]}
+
+  """
   @spec vinfo(binary()) :: {:ok, list()} | {:error, binary()}
   def vinfo(collection) do
     resolved = sandbox_key(collection)
@@ -3562,7 +4522,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns the number of vectors in the collection."
+  @doc """
+  Returns the number of vectors stored in the collection.
+
+  ## Returns
+
+    * `{:ok, count}` on success.
+    * `{:error, reason}` if the collection does not exist.
+
+  ## Examples
+
+      iex> FerricStore.vcard("product:embeddings")
+      {:ok, 42}
+
+  """
   @spec vcard(binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
   def vcard(collection) do
     resolved = sandbox_key(collection)
@@ -3580,7 +4553,31 @@ defmodule FerricStore do
   # Geo operations
   # ---------------------------------------------------------------------------
 
-  @doc "Adds geospatial members to the sorted set at `key`."
+  @doc """
+  Adds geospatial members (longitude, latitude, name) to the geo index at `key`.
+
+  Members are stored in a sorted set using geohash-encoded scores,
+  enabling radius queries and distance calculations for location-based features.
+
+  ## Parameters
+
+    * `key` - the geo index key
+    * `members` - list of `{longitude, latitude, name}` tuples
+
+  ## Returns
+
+    * `{:ok, added_count}` - number of new members added.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.geoadd("stores:nyc", [
+      ...>   {-73.935242, 40.730610, "brooklyn_store"},
+      ...>   {-74.0060, 40.7128, "manhattan_store"}
+      ...> ])
+      {:ok, 2}
+
+  """
   @spec geoadd(key(), [{number(), number(), binary()}]) :: {:ok, non_neg_integer()} | {:error, binary()}
   def geoadd(key, members) when is_list(members) do
     resolved_key = sandbox_key(key)
@@ -3592,7 +4589,28 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns the distance between two members."
+  @doc """
+  Returns the distance between two geo members.
+
+  ## Parameters
+
+    * `key` - the geo index key
+    * `member1` - first member name
+    * `member2` - second member name
+    * `unit` - distance unit: `"m"` (meters, default), `"km"`, `"mi"`, or `"ft"`
+
+  ## Returns
+
+    * `{:ok, distance_string}` on success.
+    * `{:ok, nil}` if either member does not exist.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.geodist("stores:nyc", "brooklyn_store", "manhattan_store", "km")
+      {:ok, "8.4567"}
+
+  """
   @spec geodist(key(), binary(), binary(), binary()) :: {:ok, binary()} | {:error, binary()}
   def geodist(key, member1, member2, unit \\ "m") do
     resolved_key = sandbox_key(key)
@@ -3601,7 +4619,22 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns geohash strings for members."
+  @doc """
+  Returns geohash strings for the specified members.
+
+  Geohashes are base-32 encoded strings representing a geographic area, useful
+  for proximity grouping and prefix-based spatial queries.
+
+  ## Returns
+
+    * `{:ok, [geohash | nil, ...]}` - a geohash per member, or `nil` for missing members.
+
+  ## Examples
+
+      iex> FerricStore.geohash("stores:nyc", ["brooklyn_store", "manhattan_store"])
+      {:ok, ["dr5regy3zc0", "dr5regw3pp0"]}
+
+  """
   @spec geohash(key(), [binary()]) :: {:ok, list()} | {:error, binary()}
   def geohash(key, members) when is_list(members) do
     resolved_key = sandbox_key(key)
@@ -3610,7 +4643,20 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns positions (longitude, latitude) for members."
+  @doc """
+  Returns the longitude/latitude positions for the specified members.
+
+  ## Returns
+
+    * `{:ok, [[longitude, latitude] | nil, ...]}` - coordinates per member,
+      or `nil` for missing members.
+
+  ## Examples
+
+      iex> FerricStore.geopos("stores:nyc", ["brooklyn_store"])
+      {:ok, [["-73.935242", "40.730610"]]}
+
+  """
   @spec geopos(key(), [binary()]) :: {:ok, list()} | {:error, binary()}
   def geopos(key, members) when is_list(members) do
     resolved_key = sandbox_key(key)
@@ -3623,7 +4669,33 @@ defmodule FerricStore do
   # JSON operations
   # ---------------------------------------------------------------------------
 
-  @doc "Sets a JSON value at path in the JSON document at `key`."
+  @doc """
+  Sets a JSON value at `path` in the document stored at `key`.
+
+  Creates the document if it does not exist (when path is `"$"`). Uses
+  JSONPath syntax for nested access. Ideal for storing user preferences,
+  feature flags, and nested configuration.
+
+  ## Parameters
+
+    * `key` - the document key
+    * `path` - JSONPath expression (e.g. `"$"`, `"$.settings.theme"`)
+    * `value` - JSON-encoded string to store
+
+  ## Returns
+
+    * `:ok` on success.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.json_set("user:42:prefs", "$", ~s({"theme":"dark","lang":"en"}))
+      :ok
+
+      iex> FerricStore.json_set("user:42:prefs", "$.theme", ~s("light"))
+      :ok
+
+  """
   @spec json_set(key(), binary(), binary()) :: :ok | {:error, binary()}
   def json_set(key, path, value) do
     resolved_key = sandbox_key(key)
@@ -3635,7 +4707,29 @@ defmodule FerricStore do
     end
   end
 
-  @doc "Gets the JSON value at path from the document at `key`."
+  @doc """
+  Gets the JSON value at `path` from the document stored at `key`.
+
+  ## Parameters
+
+    * `key` - the document key
+    * `path` - JSONPath expression (default: `"$"` for the root)
+
+  ## Returns
+
+    * `{:ok, json_string}` on success.
+    * `{:ok, nil}` if the key does not exist.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.json_get("user:42:prefs", "$.theme")
+      {:ok, "[\"dark\"]"}
+
+      iex> FerricStore.json_get("user:42:prefs")
+      {:ok, "[{\"theme\":\"dark\",\"lang\":\"en\"}]"}
+
+  """
   @spec json_get(key(), binary()) :: {:ok, binary()} | {:error, binary()}
   def json_get(key, path \\ "$") do
     resolved_key = sandbox_key(key)
@@ -3644,7 +4738,22 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Deletes a JSON path from the document at `key`."
+  @doc """
+  Deletes the value at `path` from the JSON document at `key`.
+
+  When path is `"$"`, the entire document is deleted.
+
+  ## Returns
+
+    * `{:ok, deleted_count}` - number of paths deleted.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.json_del("user:42:prefs", "$.theme")
+      {:ok, 1}
+
+  """
   @spec json_del(key(), binary()) :: {:ok, term()} | {:error, binary()}
   def json_del(key, path \\ "$") do
     resolved_key = sandbox_key(key)
@@ -3653,7 +4762,21 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns the JSON type at path."
+  @doc """
+  Returns the JSON type of the value at `path` in the document at `key`.
+
+  ## Returns
+
+    * `{:ok, type}` where type is one of `"object"`, `"array"`, `"string"`,
+      `"number"`, `"boolean"`, `"null"`.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.json_type("user:42:prefs", "$.theme")
+      {:ok, ["string"]}
+
+  """
   @spec json_type(key(), binary()) :: {:ok, binary()} | {:error, binary()}
   def json_type(key, path \\ "$") do
     resolved_key = sandbox_key(key)
@@ -3662,7 +4785,26 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Increments a number value at a JSON path."
+  @doc """
+  Atomically increments a numeric value at `path` in the JSON document at `key`.
+
+  ## Parameters
+
+    * `key` - the document key
+    * `path` - JSONPath to a numeric value
+    * `increment` - the increment amount as a string (e.g. `"1"`, `"0.5"`)
+
+  ## Returns
+
+    * `{:ok, new_value_string}` on success.
+    * `{:error, reason}` if the path is not a number.
+
+  ## Examples
+
+      iex> FerricStore.json_numincrby("config:app", "$.retry_count", "1")
+      {:ok, "[4]"}
+
+  """
   @spec json_numincrby(key(), binary(), binary()) :: {:ok, binary()} | {:error, binary()}
   def json_numincrby(key, path, increment) do
     resolved_key = sandbox_key(key)
@@ -3671,7 +4813,26 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Appends values to a JSON array at path."
+  @doc """
+  Appends one or more JSON values to the array at `path` in the document at `key`.
+
+  ## Parameters
+
+    * `key` - the document key
+    * `path` - JSONPath to an array
+    * `values` - list of JSON-encoded strings to append
+
+  ## Returns
+
+    * `{:ok, new_array_length}` on success.
+    * `{:error, reason}` if the path is not an array.
+
+  ## Examples
+
+      iex> FerricStore.json_arrappend("user:42:prefs", "$.tags", [~s("vip"), ~s("beta")])
+      {:ok, [4]}
+
+  """
   @spec json_arrappend(key(), binary(), [binary()]) :: {:ok, term()} | {:error, binary()}
   def json_arrappend(key, path, values) when is_list(values) do
     resolved_key = sandbox_key(key)
@@ -3680,7 +4841,15 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns the length of a JSON array at path."
+  @doc """
+  Returns the length of the JSON array at `path` in the document at `key`.
+
+  ## Examples
+
+      iex> FerricStore.json_arrlen("user:42:prefs", "$.tags")
+      {:ok, [4]}
+
+  """
   @spec json_arrlen(key(), binary()) :: {:ok, integer()} | {:error, binary()}
   def json_arrlen(key, path \\ "$") do
     resolved_key = sandbox_key(key)
@@ -3689,7 +4858,15 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns the length of a JSON string at path."
+  @doc """
+  Returns the length of the JSON string at `path` in the document at `key`.
+
+  ## Examples
+
+      iex> FerricStore.json_strlen("user:42:prefs", "$.theme")
+      {:ok, [4]}
+
+  """
   @spec json_strlen(key(), binary()) :: {:ok, integer()} | {:error, binary()}
   def json_strlen(key, path \\ "$") do
     resolved_key = sandbox_key(key)
@@ -3698,7 +4875,15 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns the keys of a JSON object at path."
+  @doc """
+  Returns the keys of the JSON object at `path` in the document at `key`.
+
+  ## Examples
+
+      iex> FerricStore.json_objkeys("user:42:prefs")
+      {:ok, [["theme", "lang"]]}
+
+  """
   @spec json_objkeys(key(), binary()) :: {:ok, list()} | {:error, binary()}
   def json_objkeys(key, path \\ "$") do
     resolved_key = sandbox_key(key)
@@ -3707,7 +4892,15 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Returns the number of keys in a JSON object at path."
+  @doc """
+  Returns the number of keys in the JSON object at `path` in the document at `key`.
+
+  ## Examples
+
+      iex> FerricStore.json_objlen("user:42:prefs")
+      {:ok, [2]}
+
+  """
   @spec json_objlen(key(), binary()) :: {:ok, integer()} | {:error, binary()}
   def json_objlen(key, path \\ "$") do
     resolved_key = sandbox_key(key)
@@ -3720,7 +4913,33 @@ defmodule FerricStore do
   # Native: lock, unlock, extend, ratelimit_add
   # ---------------------------------------------------------------------------
 
-  @doc "Acquires a distributed lock on `key` with the given owner and TTL."
+  @doc """
+  Acquires a distributed mutex lock on `key` with the given `owner` identity and TTL.
+
+  Only one owner can hold a lock at a time. If the lock is already held by a
+  different owner, returns an error. Use `unlock/2` to release and `extend/3`
+  to renew the TTL before expiry.
+
+  ## Parameters
+
+    * `key` - the lock key (e.g. `"lock:order:123"`)
+    * `owner` - unique owner identifier (e.g. a UUID or node name)
+    * `ttl_ms` - lock duration in milliseconds (auto-expires as a safety net)
+
+  ## Returns
+
+    * `:ok` if the lock was acquired.
+    * `{:error, reason}` if the lock is held by another owner.
+
+  ## Examples
+
+      iex> FerricStore.lock("lock:order:123", "worker_abc", 30_000)
+      :ok
+
+      iex> FerricStore.lock("lock:order:123", "worker_xyz", 30_000)
+      {:error, "ERR lock is held by another owner"}
+
+  """
   @spec lock(key(), binary(), pos_integer()) :: :ok | {:error, binary()}
   def lock(key, owner, ttl_ms) do
     resolved_key = sandbox_key(key)
@@ -3730,7 +4949,23 @@ defmodule FerricStore do
     end
   end
 
-  @doc "Releases a lock on `key` if held by `owner`."
+  @doc """
+  Releases the lock on `key`, but only if it is currently held by `owner`.
+
+  This ensures that a lock holder cannot accidentally release someone else's lock
+  (e.g. after a timeout and re-acquisition by another process).
+
+  ## Returns
+
+    * `{:ok, 1}` if the lock was released.
+    * `{:error, reason}` if the lock is not held by `owner`.
+
+  ## Examples
+
+      iex> FerricStore.unlock("lock:order:123", "worker_abc")
+      {:ok, 1}
+
+  """
   @spec unlock(key(), binary()) :: {:ok, 1} | {:error, binary()}
   def unlock(key, owner) do
     resolved_key = sandbox_key(key)
@@ -3740,7 +4975,23 @@ defmodule FerricStore do
     end
   end
 
-  @doc "Extends the TTL of a lock on `key` if held by `owner`."
+  @doc """
+  Extends the TTL of a lock on `key`, but only if it is currently held by `owner`.
+
+  Call this periodically to prevent lock expiry while a long-running operation
+  is still in progress.
+
+  ## Returns
+
+    * `{:ok, 1}` if the TTL was extended.
+    * `{:error, reason}` if the lock is not held by `owner`.
+
+  ## Examples
+
+      iex> FerricStore.extend("lock:order:123", "worker_abc", 30_000)
+      {:ok, 1}
+
+  """
   @spec extend(key(), binary(), pos_integer()) :: {:ok, 1} | {:error, binary()}
   def extend(key, owner, ttl_ms) do
     resolved_key = sandbox_key(key)
@@ -3750,7 +5001,34 @@ defmodule FerricStore do
     end
   end
 
-  @doc "Adds a count to the sliding window rate limiter at `key`."
+  @doc """
+  Records `count` events against the sliding-window rate limiter at `key`.
+
+  Uses a sliding window algorithm to track request counts within a time window.
+  Returns the current count and whether the limit has been exceeded. Ideal for
+  API rate limiting, abuse prevention, and throttling.
+
+  ## Parameters
+
+    * `key` - the rate limit key (e.g. `"ratelimit:api:user:42"`)
+    * `window_ms` - sliding window duration in milliseconds
+    * `max` - maximum allowed events within the window
+    * `count` - number of events to record (default: 1)
+
+  ## Returns
+
+    * `{:ok, [allowed, current_count]}` where `allowed` is `1` (allowed) or `0`
+      (rate limit exceeded), and `current_count` is the total events in the window.
+
+  ## Examples
+
+      iex> FerricStore.ratelimit_add("ratelimit:api:user:42", 60_000, 100)
+      {:ok, [1, 1]}
+
+      iex> FerricStore.ratelimit_add("ratelimit:api:user:42", 60_000, 100, 5)
+      {:ok, [1, 6]}
+
+  """
   @spec ratelimit_add(key(), pos_integer(), pos_integer(), pos_integer()) :: {:ok, list()}
   def ratelimit_add(key, window_ms, max, count \\ 1) do
     resolved_key = sandbox_key(key)
@@ -3762,7 +5040,25 @@ defmodule FerricStore do
   # HyperLogLog operations
   # ---------------------------------------------------------------------------
 
-  @doc "Adds elements to the HyperLogLog at `key`."
+  @doc """
+  Adds elements to the HyperLogLog at `key` for approximate cardinality counting.
+
+  A HyperLogLog uses ~12KB of memory to estimate the number of unique elements
+  in a set with a standard error of 0.81%. Ideal for counting unique visitors,
+  distinct IPs, or unique events without storing every value.
+
+  ## Returns
+
+    * `{:ok, true}` if the internal registers were modified (new unique element likely).
+    * `{:ok, false}` if the registers were not modified.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.pfadd("visitors:2024-03-28", ["user_1", "user_2", "user_3"])
+      {:ok, true}
+
+  """
   @spec pfadd(key(), [binary()]) :: {:ok, boolean()} | {:error, binary()}
   def pfadd(key, elements) when is_list(elements) do
     resolved_key = sandbox_key(key)
@@ -3775,7 +5071,26 @@ defmodule FerricStore do
     end
   end
 
-  @doc "Returns the approximate cardinality of the union of HyperLogLogs."
+  @doc """
+  Returns the approximate number of unique elements across one or more HyperLogLogs.
+
+  When given multiple keys, computes the cardinality of their union without
+  modifying the underlying structures.
+
+  ## Returns
+
+    * `{:ok, count}` - estimated unique element count.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.pfcount(["visitors:2024-03-28"])
+      {:ok, 3}
+
+      iex> FerricStore.pfcount(["visitors:2024-03-27", "visitors:2024-03-28"])
+      {:ok, 5}
+
+  """
   @spec pfcount([key()]) :: {:ok, non_neg_integer()} | {:error, binary()}
   def pfcount(keys) when is_list(keys) do
     resolved_keys = Enum.map(keys, &sandbox_key/1)
@@ -3784,7 +5099,23 @@ defmodule FerricStore do
     wrap_result(result)
   end
 
-  @doc "Merges multiple HyperLogLogs into `dest_key`."
+  @doc """
+  Merges multiple HyperLogLog keys into `dest_key`.
+
+  The resulting HyperLogLog approximates the cardinality of the union of all
+  source sets. Useful for computing weekly/monthly unique counts from daily ones.
+
+  ## Returns
+
+    * `:ok` on success.
+    * `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> FerricStore.pfmerge("visitors:2024-w13", ["visitors:2024-03-25", "visitors:2024-03-26", "visitors:2024-03-27"])
+      :ok
+
+  """
   @spec pfmerge(key(), [key()]) :: :ok | {:error, binary()}
   def pfmerge(dest_key, source_keys) when is_list(source_keys) do
     resolved_dest = sandbox_key(dest_key)
@@ -3830,15 +5161,41 @@ defmodule FerricStore do
   # Server: ping, echo, flushall
   # ---------------------------------------------------------------------------
 
-  @doc "Returns `{:ok, \"PONG\"}`."
+  @doc """
+  Health check that returns `{:ok, "PONG"}`.
+
+  ## Examples
+
+      iex> FerricStore.ping()
+      {:ok, "PONG"}
+
+  """
   @spec ping() :: {:ok, binary()}
   def ping, do: {:ok, "PONG"}
 
-  @doc "Echoes back the given message."
+  @doc """
+  Echoes back the given message, useful for connection testing.
+
+  ## Examples
+
+      iex> FerricStore.echo("hello")
+      {:ok, "hello"}
+
+  """
   @spec echo(binary()) :: {:ok, binary()}
   def echo(message) when is_binary(message), do: {:ok, message}
 
-  @doc "Deletes all keys. In sandbox mode, only sandbox keys are deleted."
+  @doc """
+  Deletes all keys from the store. In sandbox mode, only sandbox keys are deleted.
+
+  Alias for `flushdb/0`.
+
+  ## Examples
+
+      iex> FerricStore.flushall()
+      :ok
+
+  """
   @spec flushall() :: :ok
   def flushall, do: flushdb()
 

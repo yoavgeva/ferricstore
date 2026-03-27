@@ -28,6 +28,16 @@ config :ferricstore, :mode, :embedded
 | `:health_port` | `integer` | `4000` | Standalone only | HTTP port for health checks and Prometheus metrics. Use `0` for ephemeral. |
 | `:socket_active_mode` | `:once \| true \| integer` | `true` | Standalone only | TCP socket active mode. `:once` reads one message at a time (back-pressure friendly). `true` pushes all data without flow control (highest throughput). An integer N reads N messages then switches to passive. |
 
+The TCP listener also sets the following socket options (not configurable at runtime):
+
+| Socket Option | Value | Description |
+|---------------|-------|-------------|
+| `nodelay` | `true` | Disable Nagle's algorithm for low-latency responses |
+| `recbuf` | `65_536` | Receive buffer size (64 KB) |
+| `sndbuf` | `65_536` | Send buffer size (64 KB) |
+| `backlog` | `1024` | TCP listen backlog |
+| `keepalive` | `true` | Enable TCP keepalive to detect dead connections |
+
 ```elixir
 config :ferricstore, :port, 6379
 config :ferricstore, :health_port, 4000
@@ -41,12 +51,12 @@ config :ferricstore, :health_port, 4000
 | Option | Type | Default | Applies to | Description |
 |--------|------|---------|------------|-------------|
 | `:data_dir` | `string` | `"data"` | Both | Root directory for Bitcask data files, Raft WAL, mmap structures, and hint files. Each shard gets a subdirectory. |
-| `:shard_count` | `integer` | `4` | Both | Number of shards. Each shard is a separate ETS table, Bitcask directory, and Raft group. More shards = more write parallelism but more file descriptors. **Compile-time only.** |
+| `:shard_count` | `integer` | `0` (auto) | Both | Number of shards. `0` = auto-detect via `System.schedulers_online()`. Each shard is a separate ETS table, Bitcask directory, and Raft group. More shards = more write parallelism but more file descriptors. Set at startup. |
 | `:hot_cache_max_value_size` | `integer` | `65_536` | Both | Maximum value size (bytes) stored in ETS hot cache. Values larger than this are stored as `nil` in ETS and read from Bitcask on access. Prevents large binaries from being copied on every ETS lookup. |
 
 ```elixir
 config :ferricstore, :data_dir, "data"
-config :ferricstore, :shard_count, 4
+config :ferricstore, :shard_count, 0  # 0 = auto-detect from CPU cores
 config :ferricstore, :hot_cache_max_value_size, 65_536
 ```
 
@@ -425,27 +435,6 @@ legitimate workload while preventing pathological resource exhaustion:
 - **Pipeline overflow** — a pipeline batch with more than 100K commands is
   rejected with `-ERR pipeline batch too large`.
 
-## L1 Per-Connection Cache
-
-*Standalone only — embedded mode has no TCP connections so L1 cache does not apply. In embedded mode, reads go directly to ETS (~1-5 us) which is already faster than L1 would provide.*
-
-> See [Architecture Guide — Connection Handling](architecture.md#connection-handling)
-> for how L1 cache, CLIENT TRACKING, and per-connection state work.
-
-Each TCP connection maintains a small in-process cache for repeated reads of the same keys. Invalidation is handled by CLIENT TRACKING.
-
-| Option | Type | Default | Applies to | Description |
-|--------|------|---------|------------|-------------|
-| `:l1_cache_enabled` | `boolean` | `true` | Standalone only | Enable per-connection L1 cache. |
-| `:l1_cache_max_entries` | `integer` | `64` | Standalone only | Maximum number of keys cached per connection. |
-| `:l1_cache_max_bytes` | `integer` | `1_048_576` | Standalone only | Maximum total bytes cached per connection (1 MB). |
-
-```elixir
-config :ferricstore, :l1_cache_enabled, true
-config :ferricstore, :l1_cache_max_entries, 64
-config :ferricstore, :l1_cache_max_bytes, 1_048_576
-```
-
 ## Sendfile Zero-Copy
 
 *Standalone only — embedded mode returns values directly via ETS or `v2_pread_at`, with no socket involved.*
@@ -698,6 +687,7 @@ config :ferricstore, :eviction_policy, :volatile_lru
 config :ferricstore, :memory_guard_interval_ms, 5_000
 config :ferricstore, :merge, check_interval_ms: 600_000, fragmentation_threshold: 0.99
 config :ferricstore, :expiry_sweep_interval_ms, 600_000
+config :ferricstore, :read_sample_rate, 1
 config :ferricstore, :sandbox_enabled, true
 
 # Generous supervisor budget for shard-kill tests
@@ -889,7 +879,6 @@ These reflect the startup configuration and cannot be changed at runtime.
 | `maxclients` | Maximum simultaneous client connections | Standalone only |
 | `tcp-port` | TCP port | Standalone only |
 | `data-dir` | Bitcask data directory | Both |
-| `raft-enabled` | Whether Raft is active | Both |
 | `tls-port` | TLS port | Standalone only |
 | `tls-cert-file` | PEM certificate path | Standalone only |
 | `tls-key-file` | PEM key path | Standalone only |

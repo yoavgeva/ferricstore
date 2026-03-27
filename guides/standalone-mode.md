@@ -43,7 +43,7 @@ end
 # config/config.exs
 config :ferricstore, :port, 6379
 config :ferricstore, :data_dir, "/var/lib/ferricstore"
-config :ferricstore, :shard_count, 4
+config :ferricstore, :shard_count, 0  # 0 = auto-detect from CPU cores
 config :ferricstore, :max_memory_bytes, 8_589_934_592  # 8 GB
 config :ferricstore, :eviction_policy, :allkeys_lru
 ```
@@ -196,7 +196,7 @@ readinessProbe:
 
 livenessProbe:
   httpGet:
-    path: /health/ready
+    path: /health/live
     port: 4000
   initialDelaySeconds: 10
   periodSeconds: 10
@@ -207,8 +207,19 @@ livenessProbe:
 A human-friendly health dashboard is available at:
 
 ```
-GET /health/dashboard
+GET /dashboard
 ```
+
+The dashboard has sidebar navigation with the following pages:
+
+- **Overview** (`/dashboard`) -- top bar, cache perf, shards, memory, connections. Auto-refreshes every 2s.
+- **Slow Log** (`/dashboard/slowlog`) -- full slow log table. Refreshes 5s.
+- **Merge Status** (`/dashboard/merge`) -- per-shard merge/compaction. Refreshes 10s.
+- **Storage** (`/dashboard/storage`) -- per-shard on-disk storage details.
+- **Raft Consensus** (`/dashboard/raft`) -- per-shard Raft health, leader, term, applied/commit index. Refreshes 5s.
+- **Config** (`/dashboard/config`) -- namespace config overrides.
+- **Clients** (`/dashboard/clients`) -- active client connections with IP, age, idle time. Refreshes 5s.
+- **Key Prefixes** (`/dashboard/prefixes`) -- key prefix distribution.
 
 ## Prometheus Metrics
 
@@ -257,20 +268,9 @@ Each TCP connection is handled by a Ranch protocol handler with:
 - **RESP3 parser** -- full RESP3 protocol support (HELLO 3 only)
 - **ACL check** -- every command is checked against the authenticated user's permissions
 - **Command dispatch** -- O(1) lookup via compile-time dispatch map
-- **L1 cache** -- per-connection hot key cache (~5ns reads, invalidated by CLIENT TRACKING)
-- **Backpressure** -- `active: once` sockets prevent fast clients from overwhelming the server
+- **Configurable socket mode** -- `socket_active_mode` (default: `true`). Supports `true`, `:once`, or an integer N for `active: N` flow control.
 - **Sliding window pipeline** -- concurrent dispatch of pure commands within a pipeline batch; responses sent in-order as they complete
-
-### L1 Per-Connection Cache
-
-Each connection caches recent GET results in a process-local Map. This avoids repeated ETS lookups for frequently accessed keys. When another connection writes a tracked key, CLIENT TRACKING sends an invalidation message that clears the stale L1 entry.
-
-Configuration:
-```elixir
-config :ferricstore, :l1_cache_enabled, true
-config :ferricstore, :l1_cache_max_entries, 64
-config :ferricstore, :l1_cache_max_bytes, 1_048_576
-```
+- **Socket tuning** -- `nodelay: true`, `recbuf: 65536`, `sndbuf: 65536`, `backlog: 1024`, `keepalive: true`
 
 ### Sendfile Zero-Copy
 

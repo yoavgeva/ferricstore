@@ -5,6 +5,10 @@ defmodule FerricStore.Session.Store do
   Sessions are stored as serialized Erlang terms under keys with a configurable
   prefix (default `"session"`). Each session key has the form `"<prefix>:<sid>"`.
 
+  Unlike the default cookie store, sessions are stored server-side with automatic
+  TTL expiry. Unlike ETS-based stores, sessions survive application restarts
+  because FerricStore persists all data to disk via Bitcask and Raft WAL.
+
   ## Options
 
     * `:prefix` - Key prefix for session entries. Defaults to `"session"`.
@@ -18,6 +22,18 @@ defmodule FerricStore.Session.Store do
         key: "_my_app_key",
         ttl: 3600,
         prefix: "sess"
+
+  ## Why Use This?
+
+    * **Survives restarts** -- sessions persist on disk, so deploys don't log out users
+    * **Shared across nodes** -- in a cluster, any node can read any session (Raft-replicated)
+    * **Automatic expiry** -- TTL-based cleanup, no manual garbage collection
+    * **No cookie size limit** -- store arbitrarily large session data (cookies are capped at 4KB)
+
+  ## Installation
+
+      # mix.exs
+      {:ferricstore_session, "~> 0.1.0"}
 
   """
 

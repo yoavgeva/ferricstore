@@ -17,7 +17,7 @@ FerricStore is built around three core design principles: (1) all mutable state 
 │  Ranch TCP/TLS → Connection     │                  │
 │  → RESP3 Parser → ACL Check     │                  │
 │  → Command Dispatcher           │                  │
-│  → L1 Cache → CLIENT TRACKING   │                  │
+│  → CLIENT TRACKING              │                  │
 └──────────────────┬───────────────┘                  │
                    │                                  │
                    ▼                                  ▼
@@ -99,6 +99,9 @@ Ferricstore.Supervisor (:one_for_one)
 ├── Ferricstore.Raft.Batcher.0            # Group-commit batcher (shard 0)
 ├── Ferricstore.Raft.Batcher.1            # Group-commit batcher (shard 1)
 ├── ...                                   # (one Batcher per shard)
+├── Ferricstore.Store.BitcaskWriter.0     # Background Bitcask writer (shard 0)
+├── Ferricstore.Store.BitcaskWriter.1     # Background Bitcask writer (shard 1)
+├── ...                                   # (one BitcaskWriter per shard)
 ├── Ferricstore.Store.ShardSupervisor     # Supervises N Shard GenServers
 │   ├── Ferricstore.Store.Shard.0
 │   ├── Ferricstore.Store.Shard.1
@@ -131,8 +134,9 @@ Before the supervision tree starts, `Application.start/2` performs critical init
 2. `LFU.init_config_cache()` -- caches `lfu_decay_time` and `lfu_log_factor` in `persistent_term` (~5ns reads)
 3. `persistent_term` initialization -- `hot_cache_max_value_size`, `keydir_full`, `reject_writes`, `shard_count`, `promotion_threshold`
 4. `Waiters.init()`, `ClientTracking.init_tables()`, `Stream.init_tables()`, `HnswRegistry.create_table()` -- ETS tables for blocking commands, client tracking, streams, and vector indices
-5. `Raft.Cluster.start_system(data_dir)` -- starts the ra system (WAL directory under `data_dir/ra`)
-6. Supervision tree starts: Stats -> SlowLog -> AuditLog -> Config -> NamespaceConfig -> Acl -> HLC -> Batchers -> ShardSupervisor -> AsyncApplyWorkers -> Merge.Supervisor -> PubSub -> FetchOrCompute -> MemoryGuard
+5. `install_patched_wal()` -- loads the patched `ra_log_wal` module with async fdatasync (pre-compiled `.beam` in release mode, runtime-compiled in dev)
+6. `Raft.Cluster.start_system(data_dir)` -- starts the ra system (WAL directory under `data_dir/ra`)
+7. Supervision tree starts: Stats -> SlowLog -> AuditLog -> Config -> NamespaceConfig -> Acl -> HLC -> Batchers -> BitcaskWriters -> ShardSupervisor -> AsyncApplyWorkers -> Merge.Supervisor -> PubSub -> FetchOrCompute -> MemoryGuard
 
 Stats starts first so counters are available before any connection. The ShardSupervisor must start before the Ranch listener (in the server app) so the key-value store is ready before any client arrives. MemoryGuard starts last because it reads from shard ETS tables.
 
@@ -236,7 +240,7 @@ Client                Router              Shard GenServer         Raft Batcher
 
 ### Write Path Details
 
-**With Raft enabled (default)**:
+**Raft write path (always active)**:
 
 1. `Router.put/3` validates key/value size limits (max key: 64KB, max value: 512MB) and checks `keydir_full?()` via `persistent_term` (~5ns).
 2. `Shard.handle_call({:put, key, value, expire_at_ms})` calls `Batcher.write(shard_index, {:put, key, value, expire_at_ms})`.
@@ -595,7 +599,7 @@ Each TCP connection is a Ranch protocol handler (`FerricstoreServer.Connection`)
 1. Performs the Ranch handshake (`ranch.handshake/1`)
 2. Enforces `require_tls` -- rejects plaintext connections if configured
 3. Checks protected mode -- rejects non-localhost when no ACL passwords are set
-4. Enters an event-driven receive loop with `active: :once` sockets
+4. Enters an event-driven receive loop (configurable via `:socket_active_mode`, default `active: true`)
 
 ### Sliding Window Pipeline
 
@@ -608,7 +612,6 @@ Connections support pipelined commands with concurrent dispatch:
 ### Per-Connection State
 
 Each connection maintains:
-- **L1 cache**: Process-local Map of recent GET results (~5ns reads). Max 64 entries / 1MB. Invalidated by CLIENT TRACKING.
 - **Multi/transaction state**: `:none` or `:queuing` mode, queued commands, watched keys with shard write versions.
 - **ACL context**: Cached user permissions (commands, key patterns, enabled flag).
 - **Pub/Sub subscriptions**: Channel and pattern subscription sets.

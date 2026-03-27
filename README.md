@@ -161,6 +161,10 @@ Cache 16% of dataset                  Cache 100% of dataset on disk, hot 16% in 
 | **Cold** | Bitcask (on disk) | ~50-200us (NVMe) | Everything — evicted keys still readable |
 | **Probabilistic** | mmap files | ~1-10us | Bloom, Cuckoo, CMS, TopK, vectors |
 
+**Cache without fear.** With RAM-only caches, you limit what you cache because eviction means a database hit. You avoid caching large datasets, expensive queries, or anything where a miss causes a stampede. With disk-backed storage, eviction is a 100us penalty, not a 10ms database roundtrip. Cache everything — your product catalog, your user profiles, your search results. The worst case is a disk read, not a database storm.
+
+**Never cold-start again.** When Redis restarts, the cache is empty. Every request misses. Your database gets slammed with the full production load until the cache warms up — minutes to hours depending on dataset size. FerricStore restarts with all data on disk. The first request after a deploy reads from Bitcask in microseconds, not from Postgres in milliseconds. There is no cold start.
+
 ## Commands (250+)
 
 | Category | Examples | Count |

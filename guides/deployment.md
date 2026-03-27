@@ -23,6 +23,32 @@ Environment variables:
 | `FERRICSTORE_COOKIE` | `ferricstore` | Erlang distribution cookie |
 | `FERRICSTORE_CLUSTER_NODES` | none | Comma-separated peer node names |
 
+### BEAM VM Tuning
+
+The release ships with `rel/vm.args.eex` containing production BEAM flags:
+
+- `+P 1048576` -- max processes (headroom for many connections)
+- `+Q 1048576` -- max ports/file descriptors
+- `+stbt db` -- bind schedulers to CPU cores
+- `+sbwt very_short` -- scheduler busy-wait for lower latency
+- `+swt very_low` -- wake schedulers faster on new work
+- `+sub true` -- scheduler utilization balancing
+- `+A 128` -- async thread pool for file I/O
+- `+MBas aobf` / `+MHas aobf` -- binary allocator strategy (address-order best-fit)
+- `+Muacul 0` -- disable carrier utilization limit
+
+### Socket Options
+
+The TCP acceptor uses the following socket options (hardcoded in `ferricstore_server`):
+
+| Option | Value | Purpose |
+|--------|-------|---------|
+| `nodelay` | `true` | Disable Nagle's algorithm for lower latency |
+| `recbuf` | `65_536` | 64 KB receive buffer |
+| `sndbuf` | `65_536` | 64 KB send buffer |
+| `backlog` | `1024` | TCP listen backlog |
+| `keepalive` | `true` | Detect dead connections |
+
 ## Docker
 
 ### Basic

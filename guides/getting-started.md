@@ -50,7 +50,7 @@ end
 Or clone the repository and run directly:
 
 ```bash
-git clone https://github.com/YoavGivati/ferricstore.git
+git clone https://github.com/yoavgeva/ferricstore.git
 cd ferricstore
 mix deps.get
 mix run --no-halt

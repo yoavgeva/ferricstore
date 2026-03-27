@@ -31,7 +31,7 @@ end
 # config/config.exs
 config :ferricstore, :mode, :embedded
 config :ferricstore, :data_dir, "priv/ferricstore_data"
-config :ferricstore, :shard_count, 4
+config :ferricstore, :shard_count, 0  # 0 = auto-detect from CPU cores
 config :ferricstore, :max_memory_bytes, 1_073_741_824  # 1 GB
 config :ferricstore, :eviction_policy, :volatile_lru
 ```
@@ -40,7 +40,6 @@ In embedded mode, these options are **not used** and can be omitted:
 - `:port` (no TCP listener)
 - `:health_port` (no HTTP endpoint)
 - `:tls_port`, `:tls_cert_file`, `:tls_key_file` (no TLS)
-- `:l1_cache_enabled` (no connections)
 - `:sendfile_threshold` (no TCP sends)
 
 ### 3. Start Using It
