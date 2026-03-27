@@ -29,7 +29,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use rustler::schedule::consume_timeslice;
 use rustler::{Binary, Encoder, Env, NifResult, ResourceArc, Term};
+
+/// How often (in items) to call `consume_timeslice` and let the BEAM
+/// decide whether we should yield. 64 matches the interval used in lib.rs.
+const YIELD_CHECK_INTERVAL: usize = 64;
 
 const MAGIC: u64 = 0x424C_4F4F_4D46_5F31; // "BLOOMF_1"
 const HEADER_SIZE: usize = 32;
@@ -435,10 +440,13 @@ pub fn bloom_madd<'a>(
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
-    let results: Vec<u32> = elements
-        .iter()
-        .map(|e| u32::from(filter.add(e.as_slice())))
-        .collect();
+    let mut results: Vec<u32> = Vec::with_capacity(elements.len());
+    for (i, e) in elements.iter().enumerate() {
+        results.push(u32::from(filter.add(e.as_slice())));
+        if i % YIELD_CHECK_INTERVAL == 0 && i > 0 {
+            let _ = consume_timeslice(env, 1);
+        }
+    }
     let _ = filter.msync();
     Ok(results.encode(env))
 }
@@ -467,10 +475,13 @@ pub fn bloom_mexists<'a>(
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
-    let results: Vec<u32> = elements
-        .iter()
-        .map(|e| u32::from(filter.exists(e.as_slice())))
-        .collect();
+    let mut results: Vec<u32> = Vec::with_capacity(elements.len());
+    for (i, e) in elements.iter().enumerate() {
+        results.push(u32::from(filter.exists(e.as_slice())));
+        if i % YIELD_CHECK_INTERVAL == 0 && i > 0 {
+            let _ = consume_timeslice(env, 1);
+        }
+    }
     Ok(results.encode(env))
 }
 

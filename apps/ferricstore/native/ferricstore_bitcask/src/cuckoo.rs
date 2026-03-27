@@ -26,7 +26,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use rustler::schedule::consume_timeslice;
 use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
+
+/// How often (in items) to call `consume_timeslice` and let the BEAM
+/// decide whether we should yield. 64 matches the interval used in lib.rs.
+const YIELD_CHECK_INTERVAL: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -884,8 +889,13 @@ pub fn cuckoo_mexists<'a>(
     items: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
     let filter = resource.filter.lock().map_err(|_| rustler::Error::BadArg)?;
-    let slices: Vec<&[u8]> = items.iter().map(Binary::as_slice).collect();
-    let results = filter.mexists(&slices);
+    let mut results: Vec<u64> = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        results.push(u64::from(filter.exists(item.as_slice())));
+        if i % YIELD_CHECK_INTERVAL == 0 && i > 0 {
+            let _ = consume_timeslice(env, 1);
+        }
+    }
     Ok(results.encode(env))
 }
 

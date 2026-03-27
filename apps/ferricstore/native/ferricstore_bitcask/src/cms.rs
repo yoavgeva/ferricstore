@@ -29,7 +29,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use rustler::schedule::consume_timeslice;
 use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
+
+/// How often (in items) to call `consume_timeslice` and let the BEAM
+/// decide whether we should yield. 64 matches the interval used in lib.rs.
+const YIELD_CHECK_INTERVAL: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -604,9 +609,12 @@ pub fn cms_incrby<'a>(
 ) -> NifResult<Term<'a>> {
     let mut sketch = resource.sketch.lock().map_err(|_| rustler::Error::BadArg)?;
     let mut counts: Vec<i64> = Vec::with_capacity(items.len());
-    for (element, count) in &items {
+    for (i, (element, count)) in items.iter().enumerate() {
         let min = sketch.increment(element.as_slice(), *count);
         counts.push(min);
+        if i % YIELD_CHECK_INTERVAL == 0 && i > 0 {
+            let _ = consume_timeslice(env, 1);
+        }
     }
     Ok((atoms::ok(), counts).encode(env))
 }
@@ -624,10 +632,13 @@ pub fn cms_query<'a>(
     elements: Vec<rustler::Binary<'a>>,
 ) -> NifResult<Term<'a>> {
     let sketch = resource.sketch.lock().map_err(|_| rustler::Error::BadArg)?;
-    let counts: Vec<i64> = elements
-        .iter()
-        .map(|e| sketch.query(e.as_slice()))
-        .collect();
+    let mut counts: Vec<i64> = Vec::with_capacity(elements.len());
+    for (i, e) in elements.iter().enumerate() {
+        counts.push(sketch.query(e.as_slice()));
+        if i % YIELD_CHECK_INTERVAL == 0 && i > 0 {
+            let _ = consume_timeslice(env, 1);
+        }
+    }
     Ok((atoms::ok(), counts).encode(env))
 }
 
@@ -669,11 +680,16 @@ pub fn cms_merge(
 
     // Accumulate count changes separately to avoid double mutable borrow.
     let mut count_delta: i64 = 0;
+    let mut items_processed: usize = 0;
     {
         let dest_counters = dest_sketch.storage.counter_slice_mut(size);
         for (counters, _, _, count, weight) in &source_data {
             for i in 0..size {
                 dest_counters[i] += counters[i] * weight;
+                items_processed += 1;
+                if items_processed % YIELD_CHECK_INTERVAL == 0 {
+                    let _ = consume_timeslice(env, 1);
+                }
             }
             count_delta += *count as i64 * weight;
         }
