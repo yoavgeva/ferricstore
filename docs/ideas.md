@@ -42,3 +42,21 @@ Current SCAN does a full keyspace scan + sort on every call. With 10M keys, each
 **Why deferred:** SCAN is rarely used in hot paths. The `KEYS` command is already flagged as `@dangerous` in ACL. For typical key counts (<1M), the current approach is fast enough.
 
 **If revisited:** Maintain a per-shard sorted key snapshot with TTL. Return cursor as the last key's binary position. Subsequent SCAN calls binary-search into the snapshot instead of re-scanning.
+
+## ACL Replication via Raft
+
+Currently ACL is per-node — `acl.conf` must be manually deployed to all cluster nodes. Users must copy the file and run `ACL LOAD` on each node after any change.
+
+**Phase 1 (Raft replication):** `ACL SETUSER` becomes a Raft command replicated to all nodes automatically. No manual file distribution. Same consistency as data writes.
+
+**Phase 2 (Control Plane + Dashboard):** A management API and web dashboard for user/ACL administration. Part of the existing health dashboard at `/dashboard`:
+- Create/edit/delete users via web UI
+- View active sessions and permissions
+- Credential rotation with zero downtime
+- Audit log of ACL changes
+- OAuth/OIDC integration for enterprise SSO
+- API endpoint for infrastructure automation (Terraform, Pulumi)
+
+**Why deferred:** Phase 1 requires ACL operations in the Raft state machine. Phase 2 requires a web framework (Phoenix LiveView) and auth integration. Both are significant but would make FerricStore competitive with managed Redis services.
+
+**Current approach:** Deploy the same `acl.conf` to all nodes via config management (Ansible, k8s Secrets, Terraform). Same as self-hosted Redis Cluster.
