@@ -22,10 +22,9 @@
    git add apps/ferricstore/checksum-Elixir.Ferricstore.Bitcask.NIF.exs
    git commit -m "release: update NIF checksums for vX.Y.Z"
    ```
-8. Publish to Hex.pm:
-   ```bash
-   cd apps/ferricstore && mix hex.publish
-   ```
+8. Hex.pm publish happens automatically via the **Publish to Hex.pm** workflow
+   (requires `HEX_API_KEY` secret). Docker Hub push also triggers automatically
+   (requires `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` secrets).
 
 ## Development builds
 
