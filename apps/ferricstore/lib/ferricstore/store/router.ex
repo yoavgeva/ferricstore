@@ -705,15 +705,28 @@ defmodule Ferricstore.Store.Router do
         nil
 
       :miss ->
-        Stats.record_cold_read(key)
+        # Key not in Router's direct ETS path. Ask the shard GenServer
+        # which does its own ETS lookup + Bitcask cold read if needed.
         result = GenServer.call(resolve_shard(idx), {:get, key})
-        if result != nil, do: Stats.incr_keyspace_hits(), else: Stats.incr_keyspace_misses()
+
+        if result != nil do
+          # Shard found it — this was a cold read (value on disk)
+          Stats.record_cold_read(key)
+        else
+          Stats.incr_keyspace_misses()
+        end
+
         result
 
       :no_table ->
-        Stats.record_cold_read(key)
         result = GenServer.call(resolve_shard(idx), {:get, key})
-        if result != nil, do: Stats.incr_keyspace_hits(), else: Stats.incr_keyspace_misses()
+
+        if result != nil do
+          Stats.record_cold_read(key)
+        else
+          Stats.incr_keyspace_misses()
+        end
+
         result
     end
   end

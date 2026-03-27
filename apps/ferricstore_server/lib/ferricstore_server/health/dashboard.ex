@@ -307,22 +307,23 @@ defmodule FerricstoreServer.Health.Dashboard do
     hot_sampled = Stats.total_hot_reads()
     cold_sampled = Stats.total_cold_reads()
 
-    hits_est = hits_sampled * rate
+    # hot_reads and keyspace_hits are sampled; cold_reads and misses are exact
     hot_est = hot_sampled * rate
-    cold_est = cold_sampled * rate
-    total_lookups = hits_est + misses
+    cold_exact = cold_sampled  # NOT sampled — called on every cold read
+    total_hits = hot_est + cold_exact
+    total_lookups = total_hits + misses
 
     %{
       hot_read_pct: Stats.hot_read_pct(),
       cold_reads_per_sec: Stats.cold_reads_per_second(),
       total_hot: hot_est,
-      total_cold: cold_est,
-      total_hits: hits_est,
+      total_cold: cold_exact,
+      total_hits: total_hits,
       total_misses: misses,
       total_lookups: total_lookups,
-      hit_ratio: if(total_lookups > 0, do: Float.round(hits_est / total_lookups * 100, 1), else: 0.0),
-      ram_ratio: if(hits_est > 0, do: Float.round(hot_est / hits_est * 100, 1), else: 0.0),
-      disk_ratio: if(hits_est > 0, do: Float.round(cold_est / hits_est * 100, 1), else: 0.0),
+      hit_ratio: if(total_lookups > 0, do: Float.round(total_hits / total_lookups * 100, 1), else: 0.0),
+      ram_ratio: if(total_hits > 0, do: Float.round(hot_est / total_hits * 100, 1), else: 0.0),
+      disk_ratio: if(total_hits > 0, do: Float.round(cold_exact / total_hits * 100, 1), else: 0.0),
       sample_rate: rate,
       top_prefixes: Stats.hotness_top(10)
     }
