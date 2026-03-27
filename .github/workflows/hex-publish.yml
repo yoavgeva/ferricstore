@@ -1,0 +1,86 @@
+name: Publish to Hex.pm
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  MIX_ENV: prod
+
+jobs:
+  publish:
+    name: Publish packages to Hex.pm
+    runs-on: ubuntu-22.04
+
+    # Wait for NIF precompilation to finish (release.yml builds the NIFs)
+    needs: []
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: hex-publish-${{ hashFiles('mix.lock') }}
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Wait for precompiled NIFs
+        run: |
+          echo "Waiting for NIF artifacts from release workflow..."
+          # The release.yml workflow builds precompiled NIFs and attaches them
+          # to the GitHub Release. The rustler_precompiled hex package downloads
+          # them at install time. We need the release to exist before publishing.
+          for i in $(seq 1 60); do
+            if gh release view "v${{ steps.version.outputs.version }}" --json assets --jq '.assets | length' 2>/dev/null | grep -q '[1-9]'; then
+              echo "Release assets found."
+              break
+            fi
+            echo "Waiting... ($i/60)"
+            sleep 10
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Publish packages in dependency order
+      - name: Publish ferricstore (core)
+        run: |
+          cd apps/ferricstore
+          mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Publish ferricstore_server
+        run: |
+          cd apps/ferricstore_server
+          mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Publish ferricstore_ecto
+        run: |
+          cd apps/ferricstore_ecto
+          mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Publish ferricstore_session
+        run: |
+          cd apps/ferricstore_session
+          mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

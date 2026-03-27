@@ -24,6 +24,7 @@ COPY mix.exs mix.lock ./
 COPY apps/ferricstore/mix.exs apps/ferricstore/mix.exs
 COPY apps/ferricstore_server/mix.exs apps/ferricstore_server/mix.exs
 COPY apps/ferricstore_ecto/mix.exs apps/ferricstore_ecto/mix.exs
+COPY apps/ferricstore_session/mix.exs apps/ferricstore_session/mix.exs
 COPY config/config.exs config/prod.exs config/runtime.exs config/
 
 RUN mix deps.get --only prod
@@ -38,10 +39,13 @@ RUN mkdir -p apps/ferricstore/priv/native && \
     cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so \
        apps/ferricstore/priv/native/ferricstore_bitcask.so
 
-# Copy application source and compile
+# Copy application source, priv, and release config
 COPY apps/ferricstore/lib apps/ferricstore/lib
+COPY apps/ferricstore/priv apps/ferricstore/priv
+COPY rel rel
 COPY apps/ferricstore_server/lib apps/ferricstore_server/lib
 COPY apps/ferricstore_ecto/lib apps/ferricstore_ecto/lib
+COPY apps/ferricstore_session/lib apps/ferricstore_session/lib
 
 RUN mix compile
 
