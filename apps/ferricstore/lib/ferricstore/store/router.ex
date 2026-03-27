@@ -796,12 +796,15 @@ defmodule Ferricstore.Store.Router do
   # instead of two separate sample checks. Saves ~100ns per read.
   # Called after a successful read (hit). Handles LFU touch, hot read
   # recording, and stats increment in one sampled decision.
+  # All read bookkeeping is sampled at the same rate for consistency.
+  # Display code multiplies by the rate to estimate actuals.
+  # This saves ~5ns per non-sampled read (no counters.add).
   defp sampled_read_bookkeeping(keydir, key) do
-    Stats.incr_keyspace_hits()
     rate = :persistent_term.get(:ferricstore_read_sample_rate, @default_read_sample_rate)
 
     if rate <= 1 or :rand.uniform(rate) == 1 do
-      # Sampled: do the expensive bookkeeping
+      Stats.incr_keyspace_hits()
+
       case :ets.lookup(keydir, key) do
         [{^key, _v, _e, lfu, _f, _o, _vs}] -> LFU.touch(keydir, key, lfu)
         _ -> :ok

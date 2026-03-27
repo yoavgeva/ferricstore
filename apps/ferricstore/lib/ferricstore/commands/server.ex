@@ -448,20 +448,27 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("stats", _store) do
-    hot = Stats.total_hot_reads()
-    cold = Stats.total_cold_reads()
-    hot_pct = Stats.hot_read_pct()
-    cold_per_sec = Stats.cold_reads_per_second()
+    rate = :persistent_term.get(:ferricstore_read_sample_rate, 100)
+    hot_sampled = Stats.total_hot_reads()
+    cold_sampled = Stats.total_cold_reads()
+    hits_sampled = Stats.keyspace_hits()
+    misses = Stats.keyspace_misses()
+
+    # Estimated actuals: sampled counters × sample rate
+    hot_est = hot_sampled * rate
+    cold_est = cold_sampled * rate
+    hits_est = hits_sampled * rate
+    hot_pct = if hot_est + cold_est > 0, do: Float.round(hot_est / (hot_est + cold_est) * 100, 2), else: 0.0
 
     fields = [
       {"total_connections_received", Integer.to_string(Stats.total_connections())},
       {"total_commands_processed", Integer.to_string(Stats.total_commands())},
-      {"hot_reads", Integer.to_string(hot)},
-      {"cold_reads", Integer.to_string(cold)},
+      {"hot_reads", Integer.to_string(hot_est)},
+      {"cold_reads", Integer.to_string(cold_est)},
       {"hot_read_pct", format_float_field(hot_pct)},
-      {"cold_reads_per_second", format_float_field(cold_per_sec)},
-      {"keyspace_hits", Integer.to_string(Stats.keyspace_hits())},
-      {"keyspace_misses", Integer.to_string(Stats.keyspace_misses())},
+      {"keyspace_hits", Integer.to_string(hits_est)},
+      {"keyspace_misses", Integer.to_string(misses)},
+      {"read_sample_rate", "1:#{rate}"},
       {"expired_keys", Integer.to_string(Stats.expired_keys())},
       {"evicted_keys", Integer.to_string(Stats.evicted_keys())}
     ]
