@@ -154,13 +154,15 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
       # Track all committed values
       committed_values = Agent.start_link(fn -> MapSet.new(["initial", nil]) end) |> elem(1)
 
-      # Writer task: writes known values sequentially
+      # Writer task: writes known values sequentially.
+      # Register the value in the committed set BEFORE writing so that a
+      # concurrent reader never sees a value it doesn't recognize.
       writer =
         Task.async(fn ->
           for i <- 1..100 do
             v = "write:#{i}"
-            :ok = :rpc.call(n1.name, Ferricstore.Store.Router, :put, [key, v, 0])
             Agent.update(committed_values, &MapSet.put(&1, v))
+            :ok = :rpc.call(n1.name, Ferricstore.Store.Router, :put, [key, v, 0])
           end
         end)
 

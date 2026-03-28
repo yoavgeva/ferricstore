@@ -278,18 +278,11 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
              "#{length(missing_keys)} keys claimed successful but missing. " <>
                "First 10: #{inspect(Enum.take(missing_keys, 10))}"
 
-      # Verify on a non-leader member via local query
+      # Verify on a non-leader member via local query.
+      # The follower may still be applying the Raft log, so retry with backoff.
       non_leader = members |> List.delete(current_leader) |> hd()
-      non_leader_state = query_local(non_leader)
 
-      non_leader_missing =
-        Enum.count(all_keys, fn key ->
-          expected_value = "val:" <> String.replace_prefix(key, "heavy:", "")
-          Map.get(non_leader_state, key) != expected_value
-        end)
-
-      assert non_leader_missing == 0,
-             "#{non_leader_missing} keys missing on non-leader #{inspect(non_leader)}"
+      wait_until_local_consistent(non_leader, all_keys, 30_000)
 
       Logger.info(
         "[5-node] Data integrity: #{total_successes}/#{total_successes} keys verified"
@@ -455,18 +448,10 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
              "#{length(missing_keys)} keys claimed successful but missing. " <>
                "First 10: #{inspect(Enum.take(missing_keys, 10))}"
 
-      # Verify on all members
+      # Verify on all members. Followers may still be applying the Raft log,
+      # so retry with backoff.
       for member <- members do
-        member_state = query_local(member)
-
-        member_missing =
-          Enum.count(all_keys, fn key ->
-            expected_value = "val:" <> String.replace_prefix(key, "heavy:", "")
-            Map.get(member_state, key) != expected_value
-          end)
-
-        assert member_missing == 0,
-               "#{member_missing} keys missing on member #{inspect(member)}"
+        wait_until_local_consistent(member, all_keys, 30_000)
       end
 
       Logger.info(
@@ -587,17 +572,20 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
       assert Map.get(state, "recovered:1") == "yes",
              "Post-recovery write missing"
 
-      # Verify on all members via local query
+      # Verify on all members via local query. Followers may still be
+      # applying the Raft log after recovery, so retry with backoff.
+      dual_keys = Enum.map(1..1_000, &"dual:#{&1}")
+
       for member <- members do
-        member_state = query_local(member)
-
-        member_missing =
-          Enum.count(1..1_000, fn i ->
-            Map.get(member_state, "dual:#{i}") != "v#{i}"
-          end)
-
-        assert member_missing == 0,
-               "#{member_missing} baseline keys missing on #{inspect(member)}"
+        wait_until_local_consistent(
+          member,
+          dual_keys,
+          30_000,
+          fn key ->
+            i = key |> String.split(":") |> List.last() |> String.to_integer()
+            "v#{i}"
+          end
+        )
       end
 
       report = """
@@ -866,6 +854,39 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
       true ->
         Process.sleep(200)
         do_wait_alive(member, deadline)
+    end
+  end
+
+  # Waits until a local query on `member` contains all expected keys.
+  # `value_fn` defaults to deriving the expected value from the "heavy:W:C" key format.
+  defp wait_until_local_consistent(member, keys, timeout_ms, value_fn \\ nil) do
+    value_fn = value_fn || fn key ->
+      "val:" <> String.replace_prefix(key, "heavy:", "")
+    end
+
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_local_consistent(member, keys, value_fn, deadline)
+  end
+
+  defp do_wait_local_consistent(member, keys, value_fn, deadline) do
+    state = query_local(member)
+
+    missing =
+      Enum.count(keys, fn key ->
+        Map.get(state, key) != value_fn.(key)
+      end)
+
+    cond do
+      missing == 0 ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
+        assert missing == 0,
+               "#{missing} keys missing on #{inspect(member)} after timeout"
+
+      true ->
+        Process.sleep(500)
+        do_wait_local_consistent(member, keys, value_fn, deadline)
     end
   end
 end

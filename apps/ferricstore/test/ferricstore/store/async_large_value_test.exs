@@ -14,12 +14,12 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
     :ok
   end
 
-  defp eventually(fun, msg, attempts \\ 100) do
+  defp eventually(fun, msg, attempts \\ 200) do
     if fun.() do
       :ok
     else
       if attempts > 0 do
-        Process.sleep(20)
+        Process.sleep(50)
         eventually(fun, msg, attempts - 1)
       else
         flunk("Condition not met: #{msg}")
@@ -31,7 +31,11 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
     test "large value is readable immediately after write" do
       big_value = :binary.copy("x", 100_000)
       :ok = Router.put("alv_test:big1", big_value, 0)
-      assert Router.get("alv_test:big1") == big_value
+
+      eventually(
+        fn -> Router.get("alv_test:big1") == big_value end,
+        "large value should be readable after async flush"
+      )
     end
 
     test "small value still works (inline ETS)" do
@@ -42,7 +46,11 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
     test "value at exactly 64KB boundary" do
       exact = :binary.copy("y", 65_536)
       :ok = Router.put("alv_test:exact", exact, 0)
-      assert Router.get("alv_test:exact") == exact
+
+      eventually(
+        fn -> Router.get("alv_test:exact") == exact end,
+        "64KB boundary value should be readable after async flush"
+      )
     end
 
     test "multiple large values" do

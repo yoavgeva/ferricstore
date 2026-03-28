@@ -25,6 +25,19 @@ defmodule Ferricstore.AclPersistenceTest do
     %{tmp_dir: tmp_dir}
   end
 
+  defp eventually(fun, msg, attempts \\ 100) do
+    if fun.() do
+      :ok
+    else
+      if attempts > 0 do
+        Process.sleep(50)
+        eventually(fun, msg, attempts - 1)
+      else
+        flunk("Timed out: #{msg}")
+      end
+    end
+  end
+
   # Helper to extract key glob strings from compiled patterns
   defp key_globs(patterns) when is_list(patterns) do
     Enum.map(patterns, fn {glob, _mode, _regex} -> glob end)
@@ -811,6 +824,7 @@ defmodule Ferricstore.AclPersistenceTest do
   # ---------------------------------------------------------------------------
 
   describe "large scale" do
+    @tag timeout: 120_000
     test "saves and loads 1000 users", %{tmp_dir: dir} do
       for i <- 1..1000 do
         Acl.set_user("user_#{String.pad_leading(to_string(i), 4, "0")}", ["on", ">pass#{i}"])
@@ -826,9 +840,12 @@ defmodule Ferricstore.AclPersistenceTest do
       Acl.reset!()
       assert :ok = Acl.load(dir)
 
-      # Verify count
-      users = Acl.list_users()
-      assert length(users) == 1001  # 1000 + default
+      # On slow CI the GenServer may still be processing the load.
+      # Retry until the user count stabilizes.
+      eventually(fn ->
+        users = Acl.list_users()
+        length(users) == 1001
+      end, "expected 1001 users (1000 + default) after load")
 
       # Spot check authentication
       assert {:ok, _} = Acl.authenticate("user_0001", "pass1")

@@ -65,12 +65,17 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     ShardHelpers.flush_all_shards()
 
     ShardHelpers.kill_shard_safely(idx)
+    ShardHelpers.wait_shards_alive(30_000)
 
     ShardHelpers.eventually(fn -> Router.get(k) == "before_crash" end,
       "data should survive shard crash")
 
     k2 = ukey("after_shard")
-    Router.put(k2, "new_write")
+
+    ShardHelpers.eventually(fn ->
+      Router.put(k2, "new_write") == :ok
+    end, "write should succeed after shard crash")
+
     ShardHelpers.eventually(fn -> Router.get(k2) == "new_write" end,
       "new writes should work after shard crash")
   end
@@ -86,6 +91,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     ShardHelpers.flush_all_shards()
 
     ShardHelpers.kill_shard_safely(0)
+    ShardHelpers.wait_shards_alive(30_000)
 
     for {k, i} <- Enum.with_index(keys) do
       ShardHelpers.eventually(fn -> Router.get(k) == "shard_#{i}" end,
