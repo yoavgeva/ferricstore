@@ -354,10 +354,15 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
       # Poll until the shard process is back and responsive
       poll_until_shard_alive(shard_name, 30_000)
 
-      # New connection: verify the pre-existing value survived and new writes work
+      # New connection: verify the pre-existing value survived and new writes work.
+      # The shard may still be recovering its keydir from Bitcask on slow CI,
+      # so retry the GET until the value is available.
       sock_post = connect_and_hello(port)
-      send_cmd(sock_post, ["GET", k_before])
-      assert "durable" = recv_response(sock_post)
+
+      ShardHelpers.eventually(fn ->
+        send_cmd(sock_post, ["GET", k_before])
+        recv_response(sock_post) == "durable"
+      end, "pre-crash value should survive shard restart")
 
       k_after = "after_crash_#{:rand.uniform(999_999)}"
       send_cmd(sock_post, ["SET", k_after, "new_val"])

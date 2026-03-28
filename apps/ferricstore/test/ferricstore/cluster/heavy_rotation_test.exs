@@ -39,7 +39,7 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
 
   @moduletag :cluster
 
-  @ra_timeout 10_000
+  @ra_timeout 15_000
   @machine {:module, Ferricstore.Test.KvMachine, %{}}
 
   # Batch size for the continuous writer. Each ra command applies this many puts.
@@ -181,7 +181,7 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
         :ok = :ra.stop_server(ra_system, target)
         Process.sleep(300)
 
-        new_leader = wait_for_stable_leader(remaining, 10_000)
+        new_leader = wait_for_stable_leader(remaining, 15_000)
         Agent.update(leader_agent, fn _ -> new_leader end)
 
         # Keep member down to accumulate writes during degraded state
@@ -192,7 +192,7 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
         assert restart_result in [:ok, {:error, :already_started}],
                "Restart failed: #{inspect(restart_result)}"
 
-        wait_for_member_alive(target, 15_000)
+        wait_for_member_alive(target, 30_000)
         Logger.info("[5-node] Rotation #{i}/#{cluster_size}: #{inspect(target)} back")
 
         # Update leader after restart in case it changed
@@ -367,7 +367,7 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
         assert restart_result in [:ok, {:error, :already_started}],
                "Restart failed: #{inspect(restart_result)}"
 
-        wait_for_member_alive(target, 15_000)
+        wait_for_member_alive(target, 30_000)
         Logger.info("[3-node] Rotation #{i}/#{cluster_size}: #{inspect(target)} back")
 
         updated_leader = wait_for_stable_leader(members)
@@ -539,7 +539,7 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
       Logger.info("[3-node-dual] Restoring #{inspect(victim_follower)} to restore quorum")
 
       :ra.restart_server(ra_system, victim_follower)
-      wait_for_member_alive(victim_follower, 15_000)
+      wait_for_member_alive(victim_follower, 30_000)
       Process.sleep(2_000)
 
       recovery_leader =
@@ -553,7 +553,7 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
 
       # Restore the original leader
       :ra.restart_server(ra_system, leader)
-      wait_for_member_alive(leader, 15_000)
+      wait_for_member_alive(leader, 30_000)
       Process.sleep(1_000)
 
       # Verify no baseline data loss

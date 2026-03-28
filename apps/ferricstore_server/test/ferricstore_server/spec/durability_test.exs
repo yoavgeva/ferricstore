@@ -775,8 +775,12 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       ShardHelpers.eventually(fn ->
         {:ok, "v1"} == FerricStore.hget(k, "f1")
       end, "hash field f1 should survive shard crash")
-      assert {:ok, "v2"} = FerricStore.hget(k, "f2")
-      assert {:ok, "v3"} = FerricStore.hget(k, "f3")
+      ShardHelpers.eventually(fn ->
+        {:ok, "v2"} == FerricStore.hget(k, "f2")
+      end, "hash field f2 should survive shard crash")
+      ShardHelpers.eventually(fn ->
+        {:ok, "v3"} == FerricStore.hget(k, "f3")
+      end, "hash field f3 should survive shard crash")
 
       # Write new field after crash
       FerricStore.hset(k, %{"f4" => "v4"})

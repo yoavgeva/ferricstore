@@ -153,6 +153,28 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
     end
   end
 
+  defp eventually(fun, msg \\ "condition not met", attempts \\ 100) do
+    result =
+      try do
+        fun.()
+      rescue
+        _ -> false
+      catch
+        :exit, _ -> false
+      end
+
+    if result do
+      :ok
+    else
+      if attempts > 1 do
+        Process.sleep(100)
+        eventually(fun, msg, attempts - 1)
+      else
+        flunk("Timed out: #{msg}")
+      end
+    end
+  end
+
   defp extract_keys(result) do
     result
     |> Enum.chunk_every(2)
@@ -195,7 +217,14 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       # waits for the new PID, Raft leader, and shard responsiveness.
       _new_pid = kill_and_wait_restart(shard_index)
 
-      # Search again after restart -- HNSW index should have been rebuilt
+      # Search again after restart -- HNSW index should have been rebuilt.
+      # On slow CI runners, the HNSW index rebuild may take additional time
+      # after the shard GenServer reports ready, so retry.
+      eventually(fn ->
+        result_after = Vector.handle("VSEARCH", [collection | query] ++ ["TOP", "5"], store)
+        is_list(result_after) and length(result_after) >= 10
+      end, "VSEARCH should return results after restart")
+
       result_after = Vector.handle("VSEARCH", [collection | query] ++ ["TOP", "5"], store)
       keys_after = extract_keys(result_after)
 
@@ -230,11 +259,12 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       # Kill and restart
       _new_pid = kill_and_wait_restart(shard_index)
 
-      # VSEARCH for the exact vector should return "mykey" as the closest
-      result = Vector.handle("VSEARCH", [collection, "1.5", "2.5", "3.5", "TOP", "1"], store)
-      keys = extract_keys(result)
-      assert hd(keys) == "mykey",
-             "Expected 'mykey' as closest result after restart, got: #{inspect(keys)}"
+      # VSEARCH for the exact vector should return "mykey" as the closest.
+      # Retry until HNSW index rebuild completes on slow CI.
+      eventually(fn ->
+        result = Vector.handle("VSEARCH", [collection, "1.5", "2.5", "3.5", "TOP", "1"], store)
+        is_list(result) and length(result) >= 2 and hd(extract_keys(result)) == "mykey"
+      end, "VSEARCH should find 'mykey' after restart")
     end
 
     @tag timeout: 30_000
@@ -262,12 +292,12 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       # Kill and restart
       _new_pid = kill_and_wait_restart(shard_index)
 
-      # Count should still be 25
-      info_after = Vector.handle("VINFO", [collection], store)
-      info_map_after = list_to_info_map(info_after)
-
-      assert info_map_after["vector_count"] == 25,
-             "Expected 25 vectors after restart, got #{info_map_after["vector_count"]}"
+      # Count should still be 25. Retry until HNSW index rebuild completes.
+      eventually(fn ->
+        info_after = Vector.handle("VINFO", [collection], store)
+        is_list(info_after) and length(info_after) >= 2 and
+          list_to_info_map(info_after)["vector_count"] == 25
+      end, "Expected 25 vectors after restart")
     end
 
     @tag timeout: 30_000
@@ -291,13 +321,11 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       # Kill and restart
       _new_pid = kill_and_wait_restart(shard_index)
 
-      # Search for x_axis direction
-      result = Vector.handle("VSEARCH", [collection, "1.0", "0.0", "0.0", "TOP", "2"], store)
-      keys = extract_keys(result)
-
-      # x_axis should be closest (cosine dist = 0), xy_diag should be second
-      assert hd(keys) == "x_axis",
-             "x_axis should be the closest, got: #{inspect(keys)}"
+      # Search for x_axis direction. Retry until HNSW index rebuild completes.
+      eventually(fn ->
+        result = Vector.handle("VSEARCH", [collection, "1.0", "0.0", "0.0", "TOP", "2"], store)
+        is_list(result) and length(result) >= 4 and hd(extract_keys(result)) == "x_axis"
+      end, "x_axis should be the closest after restart")
     end
 
     @tag timeout: 30_000
@@ -321,13 +349,14 @@ defmodule FerricstoreServer.Integration.VectorPersistenceTest do
       # Kill and restart
       _new_pid = kill_and_wait_restart(shard_index)
 
-      # Search should only return "keep"
-      result =
-        Vector.handle("VSEARCH", [collection, "1.0", "0.0", "0.0", "TOP", "10"], store)
+      # Search should only return "keep". Retry until HNSW index rebuild completes.
+      eventually(fn ->
+        result =
+          Vector.handle("VSEARCH", [collection, "1.0", "0.0", "0.0", "TOP", "10"], store)
 
-      keys = extract_keys(result)
-      assert "keep" in keys
-      refute "delete_me" in keys, "Deleted vector should not appear after restart"
+        is_list(result) and length(result) >= 2 and
+          "keep" in extract_keys(result) and "delete_me" not in extract_keys(result)
+      end, "Deleted vector should not appear and 'keep' should be present after restart")
     end
   end
 

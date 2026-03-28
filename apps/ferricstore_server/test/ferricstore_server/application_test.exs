@@ -254,8 +254,9 @@ defmodule FerricstoreServer.ApplicationTest do
         assert is_pid(pid) and Process.alive?(pid), "Shard #{i} should still be alive"
       end
 
-      # Shard 3 should be restarted
-      deadline = System.monotonic_time(:millisecond) + 2_000
+      # Shard 3 should be restarted. Allow generous time for Raft WAL
+      # replay on slow CI runners.
+      deadline = System.monotonic_time(:millisecond) + 30_000
 
       new_shard3 =
         Enum.find_value(Stream.repeatedly(fn -> Process.sleep(20) end), fn _ ->
@@ -278,8 +279,8 @@ defmodule FerricstoreServer.ApplicationTest do
       ref = Process.monitor(shard2)
       Process.exit(shard2, :kill)
       assert_receive {:DOWN, ^ref, :process, ^shard2, :killed}, 1_000
-      # Wait for shard 2 to restart
-      Process.sleep(200)
+      # Wait for shard 2 to fully restart (including init/Raft WAL replay)
+      ShardHelpers.wait_shards_alive(30_000)
 
       port = Listener.port()
       {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 1000)

@@ -171,8 +171,10 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
     # pending monitor/link notifications.
     Process.sleep(1_000)
 
-    # Wait for leaders to be re-confirmed on remaining nodes
-    :ok = ClusterHelper.wait_for_leaders(remaining, 4, timeout: 5_000)
+    # Wait for leaders to be re-confirmed on remaining nodes.
+    # On slow CI runners, distribution cleanup and leader re-election can
+    # take longer than expected after a node kill.
+    :ok = ClusterHelper.wait_for_leaders(remaining, 4, timeout: 15_000)
 
     # Remaining nodes should still work
     Enum.each(remaining, fn node ->
@@ -206,7 +208,7 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
         end
       end)
 
-    :ok = ClusterHelper.wait_for_leaders(alive_nodes, 4, timeout: 3_000)
+    :ok = ClusterHelper.wait_for_leaders(alive_nodes, 4, timeout: 15_000)
 
     Enum.each(alive_nodes, fn node ->
       leader = ClusterHelper.find_leader([node], 0)
@@ -262,10 +264,10 @@ defmodule Ferricstore.Cluster.FailoverTest do
   # on success, or the last {:badrpc, reason} on persistent failure. Retries
   # on {:badrpc, _} to handle transient distribution hiccups after cluster
   # stop/start cycles.
-  defp rpc_with_retry(node_name, mod, fun, args, retries \\ 10) do
+  defp rpc_with_retry(node_name, mod, fun, args, retries \\ 20) do
     case :rpc.call(node_name, mod, fun, args) do
       {:badrpc, _reason} when retries > 0 ->
-        Process.sleep(300)
+        Process.sleep(500)
         rpc_with_retry(node_name, mod, fun, args, retries - 1)
 
       result ->

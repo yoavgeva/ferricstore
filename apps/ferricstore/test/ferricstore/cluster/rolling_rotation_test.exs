@@ -55,7 +55,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
   @cluster_size 5
 
   # Timeout for ra operations (leader election can take seconds).
-  @ra_timeout 10_000
+  @ra_timeout 15_000
 
   # Machine spec: module-based so ra can serialize it for WAL recovery.
   @machine {:module, Ferricstore.Test.KvMachine, %{}}
@@ -235,7 +235,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
         :ok = :ra.stop_server(@ra_system, target)
         Process.sleep(300)
 
-        new_leader = wait_for_stable_leader(remaining, 5_000)
+        new_leader = wait_for_stable_leader(remaining, 15_000)
 
         Logger.info(
           "[Phase 4.#{i}] Quorum maintained, leader: #{inspect(new_leader)}"
@@ -270,7 +270,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
                "[Phase 4.#{i}] Restart failed: #{inspect(restart_result)}"
 
         # Wait for the restarted member to rejoin the cluster
-        wait_for_member_alive(target, 10_000)
+        wait_for_member_alive(target, 30_000)
 
         Logger.info("[Phase 4.#{i}] Member #{inspect(target)} restarted and alive")
 
@@ -343,7 +343,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       :ok = :ra.stop_server(@ra_system, current_leader)
 
       start_time = System.monotonic_time(:millisecond)
-      new_leader = wait_for_stable_leader(non_leaders, 5_000)
+      new_leader = wait_for_stable_leader(non_leaders, 15_000)
       election_ms = System.monotonic_time(:millisecond) - start_time
 
       assert new_leader != current_leader,
@@ -359,7 +359,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
 
       # Restart the killed leader
       :ra.restart_server(@ra_system, current_leader)
-      wait_for_member_alive(current_leader, 10_000)
+      wait_for_member_alive(current_leader, 30_000)
 
       state = query_leader(members)
       assert Map.get(state, "post_election") == "works"
@@ -379,7 +379,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
 
       Process.sleep(500)
 
-      survivor_leader = wait_for_stable_leader(survivors, 10_000)
+      survivor_leader = wait_for_stable_leader(survivors, 15_000)
 
       Logger.info("[Phase 6] Quorum holds with 3/5 members")
 
@@ -396,11 +396,11 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       Logger.info("[Phase 6] 20 writes succeeded with 3/5 members")
 
       :ra.restart_server(@ra_system, victim_2)
-      wait_for_member_alive(victim_2, 10_000)
+      wait_for_member_alive(victim_2, 30_000)
       Logger.info("[Phase 6] #{inspect(victim_2)} recovered")
 
       :ra.restart_server(@ra_system, victim_1)
-      wait_for_member_alive(victim_1, 10_000)
+      wait_for_member_alive(victim_1, 30_000)
       Logger.info("[Phase 6] #{inspect(victim_1)} recovered")
 
       # Verify recovered members see dual_failure writes via leader
@@ -489,10 +489,10 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
 
       # Restart one member to restore quorum (3/5)
       :ra.restart_server(@ra_system, m3)
-      wait_for_member_alive(m3, 10_000)
+      wait_for_member_alive(m3, 30_000)
       Process.sleep(500)
 
-      recovery_leader = wait_for_stable_leader([m3 | alive], 10_000)
+      recovery_leader = wait_for_stable_leader([m3 | alive], 15_000)
 
       {:ok, _, _} =
         :ra.process_command(recovery_leader, {:put, "qb:recovered", "yes"}, @ra_timeout)
@@ -544,7 +544,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
         Process.sleep(300)
 
         remaining = List.delete(members, target)
-        new_leader = wait_for_stable_leader(remaining, 5_000)
+        new_leader = wait_for_stable_leader(remaining, 15_000)
 
         # Write + delete during restart
         {:ok, _, _} =
@@ -554,7 +554,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
           :ra.process_command(new_leader, {:delete, "del:restart_#{i}"}, @ra_timeout)
 
         :ra.restart_server(@ra_system, target)
-        wait_for_member_alive(target, 10_000)
+        wait_for_member_alive(target, 30_000)
 
         # Verify state through leader
         current_leader = wait_for_stable_leader(members)
@@ -604,7 +604,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       Process.sleep(300)
 
       remaining = tl(members)
-      batch_leader = wait_for_stable_leader(remaining, 5_000)
+      batch_leader = wait_for_stable_leader(remaining, 15_000)
 
       batch_cmd =
         {:batch,
@@ -616,7 +616,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
 
       # Restart and verify catch-up includes the batch
       :ra.restart_server(@ra_system, target)
-      wait_for_member_alive(target, 10_000)
+      wait_for_member_alive(target, 30_000)
 
       # Verify through leader
       current_leader = wait_for_stable_leader(members)

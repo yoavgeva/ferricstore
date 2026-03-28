@@ -15,14 +15,23 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
   end
 
   defp eventually(fun, msg, attempts \\ 200) do
-    if fun.() do
+    result =
+      try do
+        fun.()
+      rescue
+        _ -> false
+      catch
+        :exit, _ -> false
+      end
+
+    if result do
       :ok
     else
       if attempts > 0 do
         Process.sleep(50)
         eventually(fun, msg, attempts - 1)
       else
-        flunk("Condition not met: #{msg}")
+        flunk("Timed out: #{msg}")
       end
     end
   end

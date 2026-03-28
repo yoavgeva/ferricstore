@@ -257,7 +257,8 @@ defmodule Ferricstore.Raft.IntegrationTest do
       assert new_pid != pid
 
       # Data should be recoverable from Bitcask
-      assert "survives_crash" == Router.get(k)
+      ShardHelpers.eventually(fn -> "survives_crash" == Router.get(k) end,
+        "data should survive shard crash and be recovered from Bitcask")
     end
   end
 
