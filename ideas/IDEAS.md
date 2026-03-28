@@ -1,16 +1,21 @@
 # Ideas / Future Work
 
-## Cross-Node Cross-Shard ACID Transactions (Phase 2)
+## ACID Transactions — BEGIN / COMMIT / ROLLBACK
 
-Phase 1 (implemented) supports `BEGIN`/`COMMIT`/`ROLLBACK` for single-shard and same-node cross-shard transactions. Full ACID with automatic rollback.
+Single-shard ACID transactions with automatic rollback. All commands succeed or none apply. Uses buffer architecture for zero dirty reads — commands execute into a process-dictionary buffer, only flushed to ETS + Bitcask if all succeed. State machine on Raft leader ensures consistency across nodes.
 
-Phase 2 would extend this to cross-node cross-shard transactions using Two-Phase Commit (2PC) across Raft groups:
+See [acid-transactions.md](acid-transactions.md) for full design.
 
-1. **PREPARE**: Coordinator sends commands to each shard's Raft leader. Each shard dry-runs in a staging area, votes YES/NO.
-2. **COMMIT/ABORT**: If all vote YES, coordinator sends COMMIT to all. If any votes NO, sends ABORT to all.
+### Phase 2: Cross-Node Cross-Shard ACID
 
-Hard problems: coordinator crash between phases (needs transaction recovery log), network partitions (temporary inconsistency), double latency (2 Raft round-trips vs 1).
+Extends to cross-node transactions using Two-Phase Commit (2PC) across Raft groups. PREPARE → vote → COMMIT/ABORT. Hard problems: coordinator crash, network partitions, double latency.
 
-Most users can avoid this by using hash tags: `{user}:profile` and `{user}:settings` hash to the same shard. Phase 2 only needed when keys genuinely must live on different shards.
+Most users can avoid this with hash tags: `{user}:profile` and `{user}:settings` hash to the same shard.
 
-Reference: CockroachDB and Google Spanner are the only widely-used systems that solve this well. Redis Cluster rejects cross-shard transactions entirely (`CROSSSLOT` error).
+Reference: CockroachDB and Spanner are the only systems that solve this well. Redis Cluster rejects cross-shard transactions entirely.
+
+## Time Series: Columnar Chunk Encoding
+
+Close the compression gap with TimescaleDB by sealing closed time buckets into columnar binary blobs. Delta-delta timestamps + Gorilla/XOR values = 8-14x compression, 3600x fewer syscalls for range scans.
+
+See [ts-columnar-spec.md](ts-columnar-spec.md) for full design.
