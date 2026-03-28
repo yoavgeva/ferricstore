@@ -2,7 +2,7 @@
 
 **The Redis-compatible store where every write is durable by default.**
 
-FerricStore is a distributed, ACID-compliant key-value store with Redis wire protocol (RESP3). Every write goes through Raft consensus and is fsync'd to disk before the client gets OK. No "enable persistence" checkbox. No "hope the AOF rewrite finishes before the crash." Your data survives kill -9, node failures, and power loss — automatically.
+FerricStore is a distributed, crash-safe key-value store with Redis wire protocol (RESP3). Every write goes through Raft consensus and is fsync'd to disk before the client gets OK. No "enable persistence" checkbox. No "hope the AOF rewrite finishes before the crash." Your data survives kill -9, node failures, and power loss — automatically.
 
 ## Why FerricStore?
 
@@ -12,18 +12,20 @@ Redis, Dragonfly, and Memcached treat persistence as optional. By default, your 
 
 You shouldn't have to choose between speed and safety.
 
-### Distributed ACID
+### Durable by Design
 
-FerricStore provides full ACID guarantees on quorum-mode writes:
+Every write in FerricStore is:
 
 | Property | How |
 |---|---|
-| **Atomicity** | MULTI/EXEC, CAS, and every individual command execute as single Raft log entries |
-| **Consistency** | Raft linearizability — every read sees the latest committed write |
-| **Isolation** | Single-threaded state machine per shard — commands never interleave |
-| **Durability** | WAL + fdatasync + Raft quorum — majority of nodes must persist before ack |
+| **Atomic** | Each command is a single Raft log entry — applied or not, never partial |
+| **Consistent** | Raft linearizability — every read sees the latest committed write |
+| **Isolated** | Single-threaded state machine per shard — commands never interleave |
+| **Durable** | WAL + fdatasync + Raft quorum — majority of nodes must persist before ack |
 
-No other Redis-compatible store offers this. Not Redis (no distributed ACID). Not Dragonfly (no consensus). Not Garnet (single-node transactions only, manual failover). Not KeyDB (no WAL consensus).
+These guarantees apply per-command. MULTI/EXEC provides batch execution (Redis-compatible, no rollback). CAS provides atomic compare-and-swap. Full multi-command ACID transactions with rollback (BEGIN/COMMIT/ROLLBACK) are planned — see `ideas/acid-transactions.md`.
+
+No other Redis-compatible store offers this level of per-command durability and consistency. Redis has no consensus. Dragonfly has no replication. Garnet requires an external control plane for failover.
 
 ### What Happens When a Node Dies
 
@@ -84,7 +86,7 @@ Drop-in Redis replacement. 250+ commands. Use your existing Redis client librari
 |---|---|---|---|---|
 | RESP3 protocol | Yes | Yes | Yes | **Yes** |
 | Durable by default | No | No | Checkpoint | **Yes (WAL + Raft)** |
-| Distributed ACID | No | No | Single-node only | **Yes** |
+| Per-command durability + consistency | AOF (lossy) | No consensus | Single-node only | **Raft quorum + fsync** |
 | Automatic failover | Sentinel (separate) | No | No (needs control plane) | **Built-in (Raft)** |
 | Embeddable as library | No | No | .NET only | **Elixir/Erlang** |
 | Test sandbox | No | No | No | **Ecto-level isolation** |
