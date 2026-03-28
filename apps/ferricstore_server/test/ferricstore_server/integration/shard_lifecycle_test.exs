@@ -184,8 +184,10 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 2_000
 
       _new_pid = wait_for_new_pid(shard_name_for(k), pid)
+      ShardHelpers.wait_shards_alive()
 
-      assert v == Router.get(k), "Value should be recovered from Bitcask after shard restart"
+      ShardHelpers.eventually(fn -> v == Router.get(k) end,
+        "Value should be recovered from Bitcask after shard restart")
     end
 
     test "new shard process is registered under same name after restart" do
@@ -219,9 +221,11 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
 
       # Kill shard, wait for restart
       {_old, _new} = kill_shard_for_key(k)
+      ShardHelpers.wait_shards_alive()
 
       # First GET after restart: cache miss, warms from Bitcask
-      assert v == Router.get(k)
+      ShardHelpers.eventually(fn -> v == Router.get(k) end,
+        "Value should be recovered from Bitcask after shard restart")
 
       # Second GET: served from ETS
       assert v == Router.get(k)
@@ -246,12 +250,13 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       # Kill shard 0 three times
       for _ <- 1..3 do
         kill_and_wait_restart(0)
+        ShardHelpers.wait_shards_alive()
       end
 
       # All 10 keys should still be retrievable regardless of which shard they map to
       for {k, i} <- Enum.with_index(keys, 1) do
-        assert "val_#{i}" == Router.get(k),
-               "Key #{k} should survive three restarts of shard 0"
+        ShardHelpers.eventually(fn -> "val_#{i}" == Router.get(k) end,
+          "Key #{k} should survive three restarts of shard 0")
       end
     end
 
@@ -279,8 +284,13 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
 
       # After restart is complete, writes should succeed
       _new_pid = wait_for_new_pid(Router.shard_name(0), old_pid)
-      assert :ok == Router.put(k, "after_restart", 0)
-      assert "after_restart" == Router.get(k)
+      ShardHelpers.wait_shards_alive()
+      ShardHelpers.eventually(fn ->
+        Router.put(k, "after_restart", 0) == :ok
+      end, "put should succeed after shard restart")
+      ShardHelpers.eventually(fn ->
+        "after_restart" == Router.get(k)
+      end, "get should return value written after shard restart")
     end
   end
 

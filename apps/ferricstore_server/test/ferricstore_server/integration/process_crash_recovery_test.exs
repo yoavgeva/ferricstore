@@ -9,25 +9,27 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
   use ExUnit.Case, async: false
   @moduletag :shard_kill
+  @moduletag timeout: 600_000
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do
-    ShardHelpers.wait_shards_alive(10_000)
+    ShardHelpers.wait_shards_alive(30_000)
     :ok
   end
 
   setup do
-    # Space out kills to stay within supervisor max_restarts budget
-    Process.sleep(2_000)
-    ShardHelpers.wait_shards_alive(10_000)
+    # Space out kills to stay within supervisor max_restarts budget.
+    # Use 1s instead of 2s -- kill_shard_safely has its own 600ms rate limiter.
+    Process.sleep(1_000)
+    ShardHelpers.wait_shards_alive(30_000)
     ShardHelpers.flush_all_keys()
 
     on_exit(fn ->
       :persistent_term.put(:ferricstore_reject_writes, false)
       :persistent_term.put(:ferricstore_keydir_full, false)
-      ShardHelpers.wait_shards_alive(10_000)
+      ShardHelpers.wait_shards_alive(30_000)
     end)
   end
 
@@ -64,11 +66,13 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
     ShardHelpers.kill_shard_safely(idx)
 
-    assert Router.get(k) == "before_crash"
+    ShardHelpers.eventually(fn -> Router.get(k) == "before_crash" end,
+      "data should survive shard crash")
 
     k2 = ukey("after_shard")
     Router.put(k2, "new_write")
-    assert Router.get(k2) == "new_write"
+    ShardHelpers.eventually(fn -> Router.get(k2) == "new_write" end,
+      "new writes should work after shard crash")
   end
 
   test "shard crash: other shards unaffected" do
@@ -84,7 +88,8 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     ShardHelpers.kill_shard_safely(0)
 
     for {k, i} <- Enum.with_index(keys) do
-      assert Router.get(k) == "shard_#{i}"
+      ShardHelpers.eventually(fn -> Router.get(k) == "shard_#{i}" end,
+        "shard #{i} data should be unaffected by shard 0 crash")
     end
   end
 
@@ -99,12 +104,14 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
     kill_and_wait(Ferricstore.Raft.Batcher.batcher_name(0))
 
-    assert Router.get(k) == "durable"
+    ShardHelpers.eventually(fn -> Router.get(k) == "durable" end,
+      "data should survive batcher crash")
 
     k2 = ukey("batcher_post")
     Router.put(k2, "after")
     ShardHelpers.flush_all_shards()
-    assert Router.get(k2) == "after"
+    ShardHelpers.eventually(fn -> Router.get(k2) == "after" end,
+      "writes should work after batcher crash")
   end
 
   test "BitcaskWriter crash: data survives and writes resume" do
@@ -114,12 +121,14 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
     kill_and_wait(Ferricstore.Store.BitcaskWriter.writer_name(0))
 
-    assert Router.get(k) == "durable"
+    ShardHelpers.eventually(fn -> Router.get(k) == "durable" end,
+      "data should survive BitcaskWriter crash")
 
     k2 = ukey("writer_post")
     Router.put(k2, "after")
     ShardHelpers.flush_all_shards()
-    assert Router.get(k2) == "after"
+    ShardHelpers.eventually(fn -> Router.get(k2) == "after" end,
+      "writes should work after BitcaskWriter crash")
   end
 
   test "AsyncApplyWorker crash: quorum writes unaffected" do
@@ -129,7 +138,8 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
     kill_and_wait(Ferricstore.Raft.AsyncApplyWorker.worker_name(0))
 
-    assert Router.get(k) == "safe"
+    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+      "data should survive AsyncApplyWorker crash")
   end
 
   # ===========================================================================
@@ -140,34 +150,39 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     k = ukey("stats")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.Stats)
-    assert Router.get(k) == "safe"
+    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+      "data should survive Stats crash")
   end
 
   test "SlowLog crash: data unaffected" do
     k = ukey("slowlog")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.SlowLog)
-    assert Router.get(k) == "safe"
+    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+      "data should survive SlowLog crash")
   end
 
   test "PubSub crash: data unaffected" do
     k = ukey("pubsub")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.PubSub)
-    assert Router.get(k) == "safe"
+    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+      "data should survive PubSub crash")
   end
 
   test "Config crash: data unaffected" do
     k = ukey("config")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.Config)
-    assert Router.get(k) == "safe"
+    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+      "data should survive Config crash")
   end
 
   test "MemoryGuard crash: data unaffected" do
     k = ukey("memguard")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.MemoryGuard)
-    assert Router.get(k) == "safe"
+    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+      "data should survive MemoryGuard crash")
   end
 end

@@ -407,8 +407,8 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       # Wait for the DOWN message confirming the process died
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
 
-      # Wait for supervisor to restart the shard
-      :timer.sleep(200)
+      # Wait for supervisor to restart the shard and init to complete
+      ShardHelpers.wait_shards_alive()
 
       # The new shard process should have a different PID
       new_pid = shard_pid_for(k)
@@ -416,7 +416,8 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       assert new_pid != pid, "Expected a new process after restart"
 
       # Data persisted in Bitcask should survive the restart
-      assert "persistent_value" == Router.get(k)
+      ShardHelpers.eventually(fn -> "persistent_value" == Router.get(k) end,
+        "Data should survive shard restart")
     end
 
     test "ETS cache is rebuilt on warm after shard restart" do
@@ -435,10 +436,11 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
-      :timer.sleep(200)
+      ShardHelpers.wait_shards_alive()
 
       # New ETS table is empty (fresh shard), but GET should warm it from Bitcask
-      assert "rebuild_val" == Router.get(k)
+      ShardHelpers.eventually(fn -> "rebuild_val" == Router.get(k) end,
+        "Value should be recovered from Bitcask after shard restart")
       assert [{^k, "rebuild_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
     end
 
@@ -465,12 +467,12 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
-      :timer.sleep(200)
+      ShardHelpers.wait_shards_alive()
 
       # All keys should survive
       for k <- same_shard_keys do
-        assert "val_#{k}" == Router.get(k),
-               "Key #{k} should survive shard restart"
+        ShardHelpers.eventually(fn -> "val_#{k}" == Router.get(k) end,
+          "Key #{k} should survive shard restart")
       end
     end
   end

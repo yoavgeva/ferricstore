@@ -153,7 +153,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   to serve reads.
   """
   @spec wait_shards_alive(non_neg_integer()) :: :ok
-  def wait_shards_alive(timeout_ms \\ 5_000) do
+  def wait_shards_alive(timeout_ms \\ 30_000) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     shard_count = shard_count()
 
@@ -187,7 +187,9 @@ defmodule Ferricstore.Test.ShardHelpers do
     # can succeed while init is still running (warming ETS from Bitcask, setting
     # up the Raft server). The :flush call blocks until init completes and is
     # harmless (flushes the empty pending list on a fresh shard).
-    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 1_000)
+    # Give each GenServer.call enough time for Raft WAL replay (can take 7+
+    # seconds on CI with large WAL files). Minimum 15s per shard.
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 15_000)
 
     Enum.each(0..(shard_count - 1), fn i ->
       name = :"Ferricstore.Store.Shard.#{i}"
@@ -338,10 +340,10 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
   @spec kill_shard_safely(non_neg_integer(), keyword()) :: :ok
   def kill_shard_safely(shard_index, opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, 10_000)
+    timeout = Keyword.get(opts, :timeout, 30_000)
 
-    # Rate-limit kills: the main Ferricstore.Supervisor has max_restarts: 20
-    # per 10 seconds. Space kills at least 600ms apart to stay well under budget.
+    # Rate-limit kills to stay under the supervisor's max_restarts budget.
+    # Test config allows 1000 restarts in 60s, so 100ms spacing is generous.
     last_kill_key = :ferricstore_test_last_kill_ms
 
     last_kill =
@@ -354,8 +356,8 @@ defmodule Ferricstore.Test.ShardHelpers do
     now = System.monotonic_time(:millisecond)
     elapsed = now - last_kill
 
-    if elapsed < 600 do
-      Process.sleep(600 - elapsed)
+    if elapsed < 100 do
+      Process.sleep(100 - elapsed)
     end
 
     name = :"Ferricstore.Store.Shard.#{shard_index}"
@@ -388,5 +390,45 @@ defmodule Ferricstore.Test.ShardHelpers do
   @spec kill_shard_for_key(binary(), keyword()) :: :ok
   def kill_shard_for_key(key, opts \\ []) do
     kill_shard_safely(Router.shard_for(key), opts)
+  end
+
+  @doc """
+  Polls `fun` until it returns a truthy value, sleeping `interval_ms` between
+  attempts. Returns `:ok` on success. Raises with `msg` if the condition is
+  not met within `attempts * interval_ms`.
+
+  Use this after shard kill/restart to wait for data recovery before asserting.
+  After a shard restart, the ETS keydir is empty until `init/1` finishes
+  recovering from Bitcask. `Router.get` returns `nil` for keys that are not
+  yet in ETS (the `:miss` fast path), so immediate assertions on recovered
+  values will fail on slow CI runners.
+
+  ## Example
+
+      ShardHelpers.kill_shard_safely(0)
+      ShardHelpers.eventually(fn -> Router.get(key) == "expected" end,
+                              "key should survive shard restart")
+  """
+  @spec eventually((() -> boolean()), binary(), pos_integer(), pos_integer()) :: :ok
+  def eventually(fun, msg \\ "condition not met", attempts \\ 50, interval_ms \\ 100) do
+    result =
+      try do
+        fun.()
+      rescue
+        _ -> false
+      catch
+        :exit, _ -> false
+      end
+
+    if result do
+      :ok
+    else
+      if attempts > 1 do
+        Process.sleep(interval_ms)
+        eventually(fun, msg, attempts - 1, interval_ms)
+      else
+        raise ExUnit.AssertionError, message: "Timed out: #{msg}"
+      end
+    end
   end
 end

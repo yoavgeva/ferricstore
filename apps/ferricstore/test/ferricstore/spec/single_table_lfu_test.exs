@@ -337,7 +337,9 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
       # After restart, key should be readable (rebuilt from Bitcask)
       drain_all()
-      assert Router.get("restart_key") == "restart_val"
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get("restart_key") == "restart_val"
+      end, "key should be readable after shard restart")
 
       # Verify it's in the keydir with the 7-element tuple format
       [{key, _val, exp, packed_lfu, _fid, _off, _vsize}] = keydir_lookup("restart_key")

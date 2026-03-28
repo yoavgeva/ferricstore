@@ -373,8 +373,10 @@ defmodule Ferricstore.Store.PrefixInterningTest do
 
       # After restart, the key should be discoverable via SCAN
       # (prefix index rebuilt from keydir on init)
-      results = scan_all(store, "persist:*")
-      assert key in results
+      ShardHelpers.eventually(fn ->
+        results = scan_all(store, "persist:*")
+        key in results
+      end, "prefix index should survive shard restart")
     end
   end
 

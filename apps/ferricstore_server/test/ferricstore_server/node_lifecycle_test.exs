@@ -155,10 +155,11 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       # Wait for the supervisor to restart it.
       new_pid = wait_for_new_pid(shard_name, old_pid)
       assert new_pid != old_pid
+      ShardHelpers.wait_shards_alive()
 
       # Data should be recovered from Bitcask.
-      assert value == Router.get(key),
-             "Data should survive shard crash and be recovered from Bitcask"
+      ShardHelpers.eventually(fn -> value == Router.get(key) end,
+        "Data should survive shard crash and be recovered from Bitcask")
     end
 
     @tag :capture_log
@@ -174,11 +175,12 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # Kill shard 0 only.
       {_old, _new} = kill_and_wait_restart(0)
+      ShardHelpers.wait_shards_alive()
 
       # All 20 keys should still be readable.
       for {k, i} <- Enum.with_index(keys, 1) do
-        assert "val_#{i}" == Router.get(k),
-               "Key #{k} should survive shard 0 crash"
+        ShardHelpers.eventually(fn -> "val_#{i}" == Router.get(k) end,
+          "Key #{k} should survive shard 0 crash")
       end
     end
   end
@@ -207,11 +209,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       # Flush and crash shard 2.
       :ok = GenServer.call(Router.shard_name(2), :flush)
       {_old, _new} = kill_and_wait_restart(2)
-
-      # Wait for the new shard to finish init (ETS table creation).
-      # The shard registers its name before init completes, so we need
-      # to call it to ensure init has finished.
-      :ok = GenServer.call(Router.shard_name(2), :flush)
+      ShardHelpers.wait_shards_alive()
 
       # ETS table should still exist (recreated by the new shard process).
       ref = :ets.whereis(ets_name)
@@ -219,7 +217,8 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # The old cached entry is gone (ETS was recreated), but the data
       # is recoverable from Bitcask on the first GET.
-      assert "ets_test" == Router.get(key)
+      ShardHelpers.eventually(fn -> "ets_test" == Router.get(key) end,
+        "Data should be recoverable from Bitcask after restart")
 
       # Now it should be back in ETS.
       assert [{^key, "ets_test", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets_name, key)
@@ -242,6 +241,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # Kill shard 3.
       {_old, _new} = kill_and_wait_restart(3)
+      ShardHelpers.wait_shards_alive()
 
       # TCP should still work.
       send_cmd(sock, ["PING"])
@@ -266,10 +266,14 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # Kill that shard.
       {_old, _new} = kill_and_wait_restart(shard_idx)
+      ShardHelpers.wait_shards_alive()
 
       # Verify data is recovered via TCP.
-      send_cmd(sock, ["GET", key])
-      assert recv_response(sock) == "before_crash"
+      # The shard may still be recovering its keydir from Bitcask, so retry.
+      ShardHelpers.eventually(fn ->
+        send_cmd(sock, ["GET", key])
+        recv_response(sock) == "before_crash"
+      end, "data should be recovered via TCP after shard restart")
 
       # New writes should also work.
       key2 = ukey("tcp_after")

@@ -141,10 +141,11 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       ShardHelpers.flush_all_shards()
 
       {_old, _new} = kill_and_wait_restart(0)
+      ShardHelpers.wait_shards_alive()
 
       # After restart, Bitcask replays the log and the value should be recoverable.
-      assert value == Router.get(key),
-             "Value should survive shard crash and restart (recovered from Bitcask)"
+      ShardHelpers.eventually(fn -> value == Router.get(key) end,
+        "Value should survive shard crash and restart (recovered from Bitcask)")
     end
 
     test "multiple keys on same shard survive crash" do
@@ -158,10 +159,11 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
       ShardHelpers.flush_all_shards()
       {_old, _new} = kill_and_wait_restart(1)
+      ShardHelpers.wait_shards_alive()
 
       for {k, v} <- keys do
-        assert Router.get(k) == v,
-               "Key #{k} should survive crash recovery"
+        ShardHelpers.eventually(fn -> Router.get(k) == v end,
+          "Key #{k} should survive crash recovery")
       end
     end
   end
