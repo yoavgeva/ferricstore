@@ -660,17 +660,31 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(idx)
     now = System.os_time(:millisecond)
 
-    case ets_get(keydir, key, now) do
-      {:hit, _value, _exp} ->
+    case ets_get_full(keydir, key, now) do
+      {:hit, _value, _lfu} ->
         # Hot key — value is in ETS, sendfile not applicable.
         nil
+
+      {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
+        # Cold key — return file ref directly, no GenServer needed.
+        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+        # Adjust offset to skip header and key bytes (sendfile needs value offset).
+        value_offset = offset + 26 + byte_size(key)
+        {path, value_offset, value_size}
+
+      {:cold, _file_id, _offset, _value_size} ->
+        # Invalid file ref — fall back to GenServer.
+        GenServer.call(resolve_shard(idx), {:get_file_ref, key})
 
       :expired ->
         Stats.incr_keyspace_misses()
         nil
 
       :miss ->
-        GenServer.call(resolve_shard(idx), {:get_file_ref, key})
+        # Key doesn't exist. No GenServer needed.
+        nil
 
       :no_table ->
         nil
@@ -786,22 +800,36 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(idx)
     now = System.os_time(:millisecond)
 
-    case ets_get(keydir, key, now) do
-      {:hit, value, _exp} ->
-        sampled_read_bookkeeping(keydir, key)
+    case ets_get_full(keydir, key, now) do
+      {:hit, value, lfu} ->
+        sampled_read_bookkeeping_fast(keydir, key, lfu)
         value
 
-      :expired ->
-        Stats.incr_keyspace_misses()
-        nil
+      {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
+        # Cold key — value evicted from ETS but disk location known.
+        # Read directly from Bitcask via NIF, bypassing the Shard GenServer.
+        # The ETS entry has valid file_id/offset from when the write committed,
+        # so pread works without flushing pending async writes.
+        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
-      :miss ->
-        # Key not in Router's direct ETS path. Ask the shard GenServer
-        # which does its own ETS lookup + Bitcask cold read if needed.
+        case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
+          {:ok, value} ->
+            Stats.record_cold_read(key)
+            # Warm ETS: promote back to hot if value fits in cache
+            warm_ets_after_cold_read(keydir, key, value, file_id, offset)
+            value
+
+          _ ->
+            nil
+        end
+
+      {:cold, _file_id, _offset, _value_size} ->
+        # Cold entry but invalid file ref (file_id=0 or value_size=0) — ask GenServer.
         result = GenServer.call(resolve_shard(idx), {:get, key})
 
         if result != nil do
-          # Shard found it — this was a cold read (value on disk)
           Stats.record_cold_read(key)
         else
           Stats.incr_keyspace_misses()
@@ -809,7 +837,17 @@ defmodule Ferricstore.Store.Router do
 
         result
 
+      :expired ->
+        Stats.incr_keyspace_misses()
+        nil
+
+      :miss ->
+        # Key not in ETS at all — doesn't exist. No GenServer needed.
+        Stats.incr_keyspace_misses()
+        nil
+
       :no_table ->
+        # ETS table unavailable (shard restarting). Fall back to GenServer.
         result = GenServer.call(resolve_shard(idx), {:get, key})
 
         if result != nil do
@@ -835,18 +873,59 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(idx)
     now = System.os_time(:millisecond)
 
-    case ets_get(keydir, key, now) do
-      {:hit, value, exp} ->
-        sampled_read_bookkeeping(keydir, key)
-        {value, exp}
+    case ets_get_full(keydir, key, now) do
+      {:hit, value, lfu} ->
+        sampled_read_bookkeeping_fast(keydir, key, lfu)
+        # Recover expire_at_ms from ETS (ets_get_full returns lfu, not exp).
+        expire_at_ms =
+          try do
+            case :ets.lookup(keydir, key) do
+              [{^key, _val, exp, _lfu, _fid, _off, _vsize}] -> exp
+              _ -> 0
+            end
+          rescue
+            ArgumentError -> 0
+          end
+        {value, expire_at_ms}
+
+      {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
+        # Cold key — read value from disk directly, return with expire_at_ms.
+        expire_at_ms =
+          try do
+            case :ets.lookup(keydir, key) do
+              [{^key, _val, exp, _lfu, _fid, _off, _vsize}] -> exp
+              _ -> 0
+            end
+          rescue
+            ArgumentError -> 0
+          end
+
+        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+
+        case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
+          {:ok, value} ->
+            Stats.record_cold_read(key)
+            warm_ets_after_cold_read(keydir, key, value, file_id, offset)
+            {value, expire_at_ms}
+
+          _ ->
+            nil
+        end
+
+      {:cold, _file_id, _offset, _value_size} ->
+        # Invalid file ref — ask GenServer.
+        Stats.record_cold_read(key)
+        GenServer.call(resolve_shard(idx), {:get_meta, key})
 
       :expired ->
         Stats.incr_keyspace_misses()
         nil
 
       :miss ->
-        Stats.record_cold_read(key)
-        GenServer.call(resolve_shard(idx), {:get_meta, key})
+        Stats.incr_keyspace_misses()
+        nil
 
       :no_table ->
         Stats.record_cold_read(key)
@@ -854,13 +933,6 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  # ETS fast-path lookup using the single keydir table.
-  # 7-tuple format: {key, value | nil, expire_at_ms, lfu_counter, file_id, offset, value_size}
-  # Returns:
-  #   {:hit, value, expire_at_ms} -- key is live and hot (value != nil)
-  #   :expired                    -- key existed but has passed its TTL (also evicts it)
-  #   :miss                       -- key not in ETS or cold (value == nil, may be in Bitcask)
-  #   :no_table                   -- ETS table does not exist (shard restarting)
   # Sampling rate for read-side bookkeeping (LFU touch + hot/cold stats).
   # 1 in N reads performs the ETS writes. Reduces write contention at high
   # concurrency with negligible impact on LFU accuracy (logarithmic counter)
@@ -869,56 +941,7 @@ defmodule Ferricstore.Store.Router do
   # Default 100 = sample 1 in 100 reads. Set to 1 to disable sampling.
   @default_read_sample_rate 100
 
-  defp ets_get(keydir, key, now) do
-    try do
-      case :ets.lookup(keydir, key) do
-        [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
-          {:hit, value, 0}
-
-        [{^key, nil, 0, _lfu, _fid, _off, _vsize}] ->
-          :miss
-
-        [{^key, value, exp, _lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-          {:hit, value, exp}
-
-        [{^key, nil, exp, _lfu, _fid, _off, _vsize}] when exp > now ->
-          :miss
-
-        [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-          :ets.delete(keydir, key)
-          :expired
-
-        [] ->
-          :miss
-      end
-    rescue
-      ArgumentError -> :no_table
-    end
-  end
-
-  # Consolidated read bookkeeping: ONE persistent_term read + ONE rand call
-  # instead of two separate sample checks. Saves ~100ns per read.
-  # Called after a successful read (hit). Handles LFU touch, hot read
-  # recording, and stats increment in one sampled decision.
-  # All read bookkeeping is sampled at the same rate for consistency.
-  # Display code multiplies by the rate to estimate actuals.
-  # This saves ~5ns per non-sampled read (no counters.add).
-  defp sampled_read_bookkeeping(keydir, key) do
-    rate = :persistent_term.get(:ferricstore_read_sample_rate, @default_read_sample_rate)
-
-    if rate <= 1 or :rand.uniform(rate) == 1 do
-      Stats.incr_keyspace_hits()
-
-      case :ets.lookup(keydir, key) do
-        [{^key, _v, _e, lfu, _f, _o, _vs}] -> LFU.touch(keydir, key, lfu)
-        _ -> :ok
-      end
-
-      Stats.record_hot_read(key)
-    end
-  end
-
-  # Fast variant: LFU counter already available from the initial ETS lookup.
+  # LFU counter already available from the initial ets_get_full lookup.
   # Eliminates the second ETS lookup that sampled_read_bookkeeping does.
   defp sampled_read_bookkeeping_fast(keydir, key, lfu) do
     rate = :persistent_term.get(:ferricstore_read_sample_rate, @default_read_sample_rate)
@@ -927,6 +950,21 @@ defmodule Ferricstore.Store.Router do
       Stats.incr_keyspace_hits()
       LFU.touch(keydir, key, lfu)
       Stats.record_hot_read(key)
+    end
+  end
+
+  # After a cold read, promote the value back to ETS (hot) if it fits
+  # under the hot cache max value size threshold. ETS is :public with
+  # write_concurrency so this is safe from any process.
+  @hot_cache_max_value_size 65_536
+  defp warm_ets_after_cold_read(keydir, key, value, file_id, offset) do
+    if byte_size(value) <= :persistent_term.get(:ferricstore_hot_cache_max_value_size, @hot_cache_max_value_size) do
+      # Update only the value field (position 2), preserving expire/lfu/file metadata
+      try do
+        :ets.update_element(keydir, key, {2, value})
+      rescue
+        ArgumentError -> :ok
+      end
     end
   end
 
