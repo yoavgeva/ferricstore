@@ -722,16 +722,12 @@ defmodule Ferricstore.Store.Router do
         :miss
 
       :miss ->
-        result = GenServer.call(resolve_shard(idx), {:get, key})
-        if result != nil do
-          Stats.record_cold_read(key)
-          {:cold_value, result}
-        else
-          Stats.incr_keyspace_misses()
-          :miss
-        end
+        # Key not in ETS = doesn't exist. No GenServer needed.
+        Stats.incr_keyspace_misses()
+        :miss
 
       :no_table ->
+        # ETS table unavailable (shard restarting). Fall back to GenServer.
         result = GenServer.call(resolve_shard(idx), {:get, key})
         if result != nil do
           Stats.record_cold_read(key)
