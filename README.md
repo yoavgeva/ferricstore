@@ -271,7 +271,6 @@ FerricStore's standalone server includes a dashboard at `/dashboard` with no ext
 - [Embedded Mode](guides/embedded-mode.md)
 - [Standalone Mode](guides/standalone-mode.md)
 - [Commands Reference](guides/commands.md)
-- [ACID Transactions (BEGIN/COMMIT/ROLLBACK)](guides/acid-transactions.md)
 - [Security](guides/security.md)
 - [Deployment](guides/deployment.md)
 
