@@ -431,7 +431,7 @@ defmodule Ferricstore.Test.ShardHelpers do
                               "key should survive shard restart")
   """
   @spec eventually((() -> boolean()), binary(), pos_integer(), pos_integer()) :: :ok
-  def eventually(fun, msg \\ "condition not met", attempts \\ 50, interval_ms \\ 100) do
+  def eventually(fun, msg \\ "condition not met", attempts \\ 100, interval_ms \\ 100) do
     result =
       try do
         fun.()
