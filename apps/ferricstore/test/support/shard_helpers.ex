@@ -371,7 +371,7 @@ defmodule Ferricstore.Test.ShardHelpers do
       try do
         :persistent_term.get(last_kill_key)
       rescue
-        ArgumentError -> 0
+        ArgumentError -> System.monotonic_time(:millisecond)
       end
 
     now = System.monotonic_time(:millisecond)
