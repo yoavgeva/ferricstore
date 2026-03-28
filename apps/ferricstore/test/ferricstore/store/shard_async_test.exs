@@ -34,7 +34,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
   describe "put and get through async flush" do
     test "value written via put is readable immediately (ETS)" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "ak", "av", 0})
       # ETS write is synchronous — value readable before fsync
@@ -43,7 +43,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "value is durable after flush (sync call)" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "durable", "yes", 0})
       # :flush awaits in-flight and does sync flush
@@ -60,7 +60,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
   describe "flush_in_flight state" do
     test "flush_in_flight is nil on a fresh shard" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       state = :sys.get_state(pid)
       assert state.flush_in_flight == nil
@@ -68,7 +68,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "flush_in_flight is cleared after :flush call" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "fi_k", "fi_v", 0})
       :ok = GenServer.call(pid, :flush)
@@ -79,7 +79,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "pending is empty after successful flush" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "p_k", "p_v", 0})
       :ok = GenServer.call(pid, :flush)
@@ -96,7 +96,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
   describe "delete awaits in-flight flush" do
     test "delete after put returns nil on get" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "del_k", "del_v", 0})
       :ok = GenServer.call(pid, {:delete, "del_k"})
@@ -106,7 +106,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "delete flushes pending before writing tombstone" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "before_del", "v", 0})
       :ok = GenServer.call(pid, {:put, "del_target", "v", 0})
@@ -119,7 +119,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "flush_in_flight is nil after delete" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "dfi_k", "v", 0})
       :ok = GenServer.call(pid, {:delete, "dfi_k"})
@@ -136,7 +136,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
   describe "keys awaits in-flight flush" do
     test "keys returns written key after flush" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "keys_k", "v", 0})
       keys = GenServer.call(pid, :keys)
@@ -146,7 +146,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "keys does not return deleted key" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :ok = GenServer.call(pid, {:put, "kd_a", "v", 0})
       :ok = GenServer.call(pid, {:put, "kd_b", "v", 0})
@@ -165,7 +165,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
   describe "handle_info {:io_complete, ...}" do
     test "stale op_id is ignored (flush_in_flight stays nil)" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       # Start with no in-flight op; send a stale completion message
       send(pid, {:io_complete, 99_999, :ok})
@@ -178,7 +178,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "error completion clears flush_in_flight" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       # Inject a fake in-flight op_id directly into state
       :sys.replace_state(pid, fn state -> %{state | flush_in_flight: 42} end)
@@ -193,7 +193,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "matching op_id completion clears flush_in_flight" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       :sys.replace_state(pid, fn state -> %{state | flush_in_flight: 7} end)
       send(pid, {:io_complete, 7, :ok})
@@ -211,7 +211,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
   describe "concurrent puts" do
     test "10 concurrent puts are all readable" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       tasks =
         for i <- 1..10 do
@@ -230,7 +230,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "50 concurrent puts are all durable after flush" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       tasks =
         for i <- 1..50 do
@@ -255,7 +255,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
   describe "expiry through async flush" do
     test "expired key returns nil after flush" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       past = System.os_time(:millisecond) - 500
       :ok = GenServer.call(pid, {:put, "exp_async", "gone", past})
@@ -266,7 +266,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "live key with TTL is readable after flush" do
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       future = System.os_time(:millisecond) + 60_000
       :ok = GenServer.call(pid, {:put, "live_async", "here", future})
@@ -283,7 +283,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
   describe "ETS consistency with async flush" do
     test "ETS is written synchronously; Bitcask flush happens async" do
       {pid, index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       # Shard uses single-table format: {key, value, expire_at_ms, lfu_counter} in keydir
       ets = :"keydir_#{index}"
@@ -295,7 +295,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
 
     test "delete clears ETS entry" do
       {pid, index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       ets = :"keydir_#{index}"
       :ok = GenServer.call(pid, {:put, "ets_del", "val", 0})
@@ -321,7 +321,7 @@ defmodule Ferricstore.Store.ShardAsyncTest do
       # the NIF did return {:pending, op_id} instead of :ok).
       # This is only observable on Linux where the async path is active.
       {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      on_exit(fn -> try do GenServer.stop(pid) catch :exit, _ -> :ok end; File.rm_rf(dir) end)
 
       # Inject a fake in-flight state — if we're on Linux the real flush would
       # have set this. Directly test the shard's io_complete handler instead.
