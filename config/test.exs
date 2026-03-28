@@ -36,6 +36,10 @@ config :ferricstore, :merge,
 # GenServer.call(shard, :expiry_sweep) explicitly.
 config :ferricstore, :expiry_sweep_interval_ms, 600_000
 
+# Raft snapshot: release cursor every 100 applies (default 1000) so WAL
+# stays small. Large WALs cause 30s+ replay on shard restart, hanging tests.
+config :ferricstore, :release_cursor_interval, 100
+
 # Disable read sampling in tests so stats/LFU counts are deterministic.
 # Benchmarks should override this with @tag read_sample_rate: 100.
 config :ferricstore, :read_sample_rate, 1
