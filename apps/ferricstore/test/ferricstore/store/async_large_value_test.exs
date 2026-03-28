@@ -14,6 +14,19 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
     :ok
   end
 
+  defp eventually(fun, msg, attempts \\ 100) do
+    if fun.() do
+      :ok
+    else
+      if attempts > 0 do
+        Process.sleep(20)
+        eventually(fun, msg, attempts - 1)
+      else
+        flunk("Condition not met: #{msg}")
+      end
+    end
+  end
+
   describe "async write with large values (>64KB)" do
     test "large value is readable immediately after write" do
       big_value = :binary.copy("x", 100_000)
@@ -38,10 +51,16 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
         :ok = Router.put("alv_test:multi_#{i}", val, 0)
       end
 
+      # Large values (>64KB) are stored as nil in ETS and written to Bitcask
+      # asynchronously. Wait for each value to be readable from disk.
       for i <- 1..10 do
-        val = Router.get("alv_test:multi_#{i}")
-        assert val != nil, "Key alv_test:multi_#{i} should not be nil"
-        assert byte_size(val) == 100_000 + i
+        expected_size = 100_000 + i
+        key = "alv_test:multi_#{i}"
+
+        eventually(fn ->
+          val = Router.get(key)
+          val != nil and byte_size(val) == expected_size
+        end, "Key #{key} should have size #{expected_size}")
       end
     end
   end
