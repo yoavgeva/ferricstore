@@ -57,6 +57,19 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
 
   defp ukey(base), do: "err_fmt_#{base}_#{:rand.uniform(999_999)}"
 
+  defp eventually(fun, attempts \\ 50) do
+    if fun.() do
+      :ok
+    else
+      if attempts > 0 do
+        Process.sleep(20)
+        eventually(fun, attempts - 1)
+      else
+        flunk("Condition not met after retries")
+      end
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Setup
   # ---------------------------------------------------------------------------
@@ -154,8 +167,9 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
       k = ukey("wrongtype_str")
       Router.put(k, "string_value", 0)
 
-      store = MockStore.make()
-      # Use the live store for type registry
+      # Wait until key is visible in ETS (Raft commit may take time on slow CI)
+      eventually(fn -> Router.get(k) != nil end)
+
       live_store = build_live_store()
       result = Dispatcher.dispatch("LPUSH", [k, "elem"], live_store)
 
