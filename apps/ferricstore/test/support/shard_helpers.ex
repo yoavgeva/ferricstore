@@ -139,6 +139,27 @@ defmodule Ferricstore.Test.ShardHelpers do
   end
 
   @doc """
+  Forces a WAL rollover on the Raft system. This triggers the segment writer
+  to flush mem tables and allows ra to take snapshots, truncating the WAL.
+
+  Call before shard-kill tests to ensure WAL is small — a 256MB WAL from
+  previous tests causes 30s+ replay on restart, hanging tests.
+  """
+  @spec compact_wal() :: :ok
+  def compact_wal do
+    try do
+      wal_name = :ra_system.derive_names(Ferricstore.Raft.Cluster.system_name()).wal
+      :ra_log_wal.force_roll_over(wal_name)
+      # Give the segment writer time to process the rolled WAL
+      Process.sleep(500)
+    catch
+      _, _ -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Waits until all application-supervised shards are alive and have
   completed their `init/1` (ETS warmed from Bitcask, Raft server started).
 

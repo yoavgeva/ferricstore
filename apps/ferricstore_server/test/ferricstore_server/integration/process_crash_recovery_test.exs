@@ -21,10 +21,11 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
   setup do
     # Space out kills to stay within supervisor max_restarts budget.
-    # Use 1s instead of 2s -- kill_shard_safely has its own 600ms rate limiter.
     Process.sleep(1_000)
     ShardHelpers.wait_shards_alive(30_000)
     ShardHelpers.flush_all_keys()
+    # Compact WAL so restart doesn't replay 6600 tests' worth of history
+    ShardHelpers.compact_wal()
 
     on_exit(fn ->
       :persistent_term.put(:ferricstore_reject_writes, false)
