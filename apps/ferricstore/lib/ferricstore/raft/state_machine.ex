@@ -66,7 +66,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.HLC
   alias Ferricstore.Store.{BitcaskWriter, LFU, ListOps, PrefixIndex, Router, ValueCodec}
 
-  @default_release_cursor_interval 1_000
+  @default_release_cursor_interval 10_000
 
   @type shard_state :: %{
           shard_index: non_neg_integer(),
