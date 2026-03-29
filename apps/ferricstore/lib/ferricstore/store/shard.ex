@@ -366,7 +366,9 @@ defmodule Ferricstore.Store.Shard do
     end
 
     ets_size = :ets.info(keydir, :size)
-    Logger.debug("Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}")
+    # Log recovered keys for debugging (only first 10 to avoid log spam)
+    sample_keys = :ets.tab2list(keydir) |> Enum.take(10) |> Enum.map(fn {k, _v, _e, _l, fid, off, vs} -> "#{k}(fid=#{inspect(fid)},off=#{off},vs=#{vs})" end)
+    Logger.debug("Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}, keys: #{inspect(sample_keys)}")
   end
 
   defp recover_from_log(shard_path, log_name, keydir, prefix_keys, shard_index) do

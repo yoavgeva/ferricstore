@@ -59,13 +59,25 @@ defmodule Ferricstore.GracefulShutdownTest do
   describe "string data survives graceful shutdown" do
     test "single key survives" do
       k = ukey("single")
+      shard_idx = Router.shard_for(k)
       Router.put(k, "before_shutdown")
       ShardHelpers.flush_all_shards()
 
+      # Verify key is in ETS before shutdown
+      keydir = :"keydir_#{shard_idx}"
+      pre_ets = :ets.lookup(keydir, k)
+      require Logger
+      Logger.info("DIAG: key=#{k} shard=#{shard_idx} pre_shutdown_ets=#{inspect(pre_ets)}")
+
       shutdown_and_restart()
 
+      # Check ETS after restart
+      post_ets = :ets.lookup(keydir, k)
+      post_get = Router.get(k)
+      Logger.info("DIAG: key=#{k} shard=#{shard_idx} post_restart_ets=#{inspect(post_ets)} router_get=#{inspect(post_get)}")
+
       ShardHelpers.eventually(fn -> Router.get(k) == "before_shutdown" end,
-        "key should survive graceful shutdown")
+        "key should survive graceful shutdown (key=#{k}, shard=#{shard_idx})")
     end
 
     test "100 keys survive" do
