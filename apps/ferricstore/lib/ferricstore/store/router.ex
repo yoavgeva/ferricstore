@@ -665,7 +665,7 @@ defmodule Ferricstore.Store.Router do
         # Hot key — value is in ETS, sendfile not applicable.
         nil
 
-      {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
+      {:cold, file_id, offset, value_size} when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
         # Cold key — return file ref directly, no GenServer needed.
         data_dir = Application.get_env(:ferricstore, :data_dir, "data")
         shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
@@ -711,7 +711,7 @@ defmodule Ferricstore.Store.Router do
         sampled_read_bookkeeping_fast(keydir, key, lfu)
         {:hot, value}
 
-      {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
+      {:cold, file_id, offset, value_size} when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
         # Value is on disk — return file ref for potential sendfile.
         # Use DataDir directly to avoid GenServer roundtrip.
         data_dir = Application.get_env(:ferricstore, :data_dir, "data")
@@ -805,7 +805,7 @@ defmodule Ferricstore.Store.Router do
         sampled_read_bookkeeping_fast(keydir, key, lfu)
         value
 
-      {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
+      {:cold, file_id, offset, value_size} when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
         # Cold key — value evicted from ETS but disk location known.
         # Read directly from Bitcask via NIF, bypassing the Shard GenServer.
         # The ETS entry has valid file_id/offset from when the write committed,
@@ -888,7 +888,7 @@ defmodule Ferricstore.Store.Router do
           end
         {value, expire_at_ms}
 
-      {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
+      {:cold, file_id, offset, value_size} when is_integer(file_id) and file_id >= 0 and value_size > 0 ->
         # Cold key — read value from disk directly, return with expire_at_ms.
         expire_at_ms =
           try do

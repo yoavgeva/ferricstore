@@ -1457,7 +1457,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # ETS at all after recover_keydir), returns :miss.
   defp warm_from_bitcask(state, key) do
     case :ets.lookup(state.ets, key) do
-      [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) and fid > 0 ->
+      [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
         warm_from_disk(state, key, 0, fid, off)
 
       _ ->
@@ -1468,7 +1468,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp warm_from_bitcask_with_exp(state, key, exp) do
     case :ets.lookup(state.ets, key) do
-      [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) and fid > 0 ->
+      [{^key, nil, _exp, _lfu, fid, off, _vsize}] when is_integer(fid) and fid >= 0 ->
         warm_from_disk(state, key, exp, fid, off)
 
       _ ->
