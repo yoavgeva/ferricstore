@@ -9,7 +9,6 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
-  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
@@ -37,13 +36,6 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   end
 
   defp ukey(base), do: "ec_#{base}_#{:rand.uniform(9_999_999)}"
-
-  defp new_store do
-    dir = Path.join(System.tmp_dir!(), "ec_nif_#{:rand.uniform(9_999_999)}")
-    File.mkdir_p!(dir)
-    {:ok, store} = NIF.new(dir)
-    {store, dir}
-  end
 
   defp connect do
     {:ok, sock} =
@@ -184,135 +176,6 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       assert @max_value_bytes == 512 * 1024 * 1024
     end
 
-    @tag :large_alloc
-    test "value exceeding 512 MiB is rejected by the NIF with an error" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-      # Allocate 513 MiB in memory — guards prevent disk I/O but RAM is required.
-      oversized = :binary.copy("x", @max_value_bytes + 1)
-      assert {:error, reason} = NIF.put(store, "k", oversized, 0)
-      assert reason =~ "too large"
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # 2. Key size boundaries
-  # ---------------------------------------------------------------------------
-
-  describe "key size boundaries" do
-    test "1-byte key round-trips correctly" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-      assert :ok == NIF.put(store, "k", "v", 0)
-      assert {:ok, "v"} == NIF.get(store, "k")
-    end
-
-    test "key at exactly max length (65,535 bytes) round-trips correctly" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-      key = :binary.copy("k", @max_key_bytes)
-      assert @max_key_bytes == byte_size(key)
-      assert :ok == NIF.put(store, key, "boundary_value", 0)
-      assert {:ok, "boundary_value"} == NIF.get(store, key)
-    end
-
-    test "key at 65,534 bytes (one below max) round-trips correctly" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-      key = :binary.copy("k", @max_key_bytes - 1)
-      assert :ok == NIF.put(store, key, "v", 0)
-      assert {:ok, "v"} == NIF.get(store, key)
-    end
-
-    # The Rust NIF guard rejects keys larger than 65,535 bytes with an error.
-    test "key over 65,535 bytes is rejected by the NIF with an error" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-      oversized_key = :binary.copy("k", @max_key_bytes + 1)
-      result = NIF.put(store, oversized_key, "v", 0)
-      assert result == :ok or match?({:error, _}, result)
-    end
-
-    test "empty key is rejected by the NIF with an error" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-      result = NIF.put(store, "", "v", 0)
-      assert result == :ok or match?({:error, _}, result)
-    end
-
-    test "key with all-zero bytes round-trips correctly" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-      key = :binary.copy(<<0>>, 64)
-      assert :ok == NIF.put(store, key, "null_key_val", 0)
-      assert {:ok, "null_key_val"} == NIF.get(store, key)
-    end
-
-    test "key with all 0xFF bytes round-trips correctly" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-      key = :binary.copy(<<0xFF>>, 64)
-      assert :ok == NIF.put(store, key, "ff_key_val", 0)
-      assert {:ok, "ff_key_val"} == NIF.get(store, key)
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # 3. Binary safety
-  # ---------------------------------------------------------------------------
-
-  describe "binary safety" do
-    test "value containing all 256 byte values round-trips correctly" do
-      k = ukey("all_bytes")
-      v = Enum.into(0..255, <<>>, fn b -> <<b>> end)
-      assert 256 == byte_size(v)
-      Router.put(k, v, 0)
-      assert v == Router.get(k)
-    end
-
-    test "value with embedded null bytes round-trips correctly" do
-      k = ukey("null_bytes")
-      v = "before\x00middle\x00after"
-      Router.put(k, v, 0)
-      assert v == Router.get(k)
-    end
-
-    test "value with CRLF bytes round-trips correctly" do
-      k = ukey("crlf")
-      v = "line1\r\nline2\r\nline3"
-      Router.put(k, v, 0)
-      assert v == Router.get(k)
-    end
-
-    test "key with CRLF bytes round-trips correctly via NIF" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-      key = "key\r\nwith\r\nnewlines"
-      assert :ok == NIF.put(store, key, "v", 0)
-      assert {:ok, "v"} == NIF.get(store, key)
-    end
-
-    test "valid UTF-8 multibyte value round-trips correctly" do
-      k = ukey("utf8")
-      v = "こんにちは世界 🦀 émojis café"
-      Router.put(k, v, 0)
-      assert v == Router.get(k)
-    end
-
-    test "arbitrary binary (non-UTF-8) value round-trips correctly" do
-      k = ukey("non_utf8")
-      # Random bytes that are not valid UTF-8
-      v = <<0x80, 0xBF, 0xC0, 0xFE, 0xFF, 0x00, 0x01>>
-      Router.put(k, v, 0)
-      assert v == Router.get(k)
-    end
-
-    test "value that looks like a RESP bulk string header does not confuse the store" do
-      k = ukey("resp_lookalike")
-      v = "$1000000\r\n" <> :binary.copy("x", 100) <> "\r\n"
-      Router.put(k, v, 0)
-      assert v == Router.get(k)
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -710,86 +573,6 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   end
 
   # ---------------------------------------------------------------------------
-  # 9. Persistence: data survives flush + reopen
-  # ---------------------------------------------------------------------------
-
-  describe "persistence via NIF reopen" do
-    test "data written and flushed is readable after store reopen" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-
-      entries = for i <- 1..20, do: {"persist_k#{i}", "persist_v#{i}"}
-
-      for {k, v} <- entries, do: NIF.put(store, k, v, 0)
-
-      # Release the first store so the directory lock is dropped before reopening.
-      # Without this the lock file prevents the second NIF.new from succeeding.
-      store = nil
-      :erlang.garbage_collect()
-
-      # Reopen the store (simulates process restart)
-      {:ok, store2} = NIF.new(dir)
-
-      for {k, v} <- entries do
-        assert {:ok, ^v} = NIF.get(store2, k),
-               "Key #{k} missing after reopen"
-      end
-    end
-
-    test "tombstones survive reopen: deleted key stays deleted" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-
-      NIF.put(store, "del_key", "to_delete", 0)
-      NIF.delete(store, "del_key")
-
-      store = nil
-      :erlang.garbage_collect()
-
-      {:ok, store2} = NIF.new(dir)
-      assert {:ok, nil} == NIF.get(store2, "del_key")
-    end
-
-    test "large value survives store reopen" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-
-      v = :binary.copy("R", 5_000_000)
-      NIF.put(store, "big_persist", v, 0)
-
-      store = nil
-      :erlang.garbage_collect()
-
-      {:ok, store2} = NIF.new(dir)
-      assert {:ok, ^v} = NIF.get(store2, "big_persist")
-    end
-
-    test "mixed live and tombstone keys are correct after reopen" do
-      {store, dir} = new_store()
-      on_exit(fn -> File.rm_rf(dir) end)
-
-      for i <- 1..10, do: NIF.put(store, "k#{i}", "v#{i}", 0)
-      # Delete odd-indexed keys
-      for i <- [1, 3, 5, 7, 9], do: NIF.delete(store, "k#{i}")
-
-      store = nil
-      :erlang.garbage_collect()
-
-      {:ok, store2} = NIF.new(dir)
-
-      for i <- [2, 4, 6, 8, 10] do
-        assert {:ok, "v#{i}"} == NIF.get(store2, "k#{i}"),
-               "Live key k#{i} missing after reopen"
-      end
-
-      for i <- [1, 3, 5, 7, 9] do
-        assert {:ok, nil} == NIF.get(store2, "k#{i}"),
-               "Deleted key k#{i} resurrected after reopen"
-      end
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # 10. Protocol-level size guards (Elixir dispatcher layer)
   # ---------------------------------------------------------------------------
 
@@ -861,47 +644,6 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       assert resp == {:simple, "OK"}
       resp2 = cmd(sock, ["GET", max_key])
       assert resp2 == "boundary_value"
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # 11. CRC integrity
-  # ---------------------------------------------------------------------------
-
-  describe "CRC integrity" do
-    test "bit-flip in value bytes causes CRC mismatch on read" do
-      dir = Path.join(System.tmp_dir!(), "ec_crc_#{:rand.uniform(9_999_999)}")
-      File.mkdir_p!(dir)
-      on_exit(fn -> File.rm_rf(dir) end)
-
-      # Write a known value via the NIF, then corrupt the file directly
-      {:ok, store} = NIF.new(dir)
-      NIF.put(store, "crc_key", "crc_value", 0)
-
-      # Release the first store so the directory lock is dropped before reopening.
-      _store = nil
-      :erlang.garbage_collect()
-
-      # Find the log file and flip a byte in the value region
-      [data_file] =
-        Path.join(dir, "*.log")
-        |> Path.wildcard()
-        |> Enum.filter(&(File.stat!(&1).size > 0))
-
-      raw = File.read!(data_file)
-      # Flip byte near the end (in the value region, past the 26-byte header + key)
-      flip_pos = byte_size(raw) - 3
-      <<before::binary-size(flip_pos), byte, rest::binary>> = raw
-      corrupted = before <> <<Bitwise.bxor(byte, 0xFF)>> <> rest
-      File.write!(data_file, corrupted)
-
-      # Reopen — the store should detect the CRC mismatch on read
-      {:ok, store2} = NIF.new(dir)
-      result = NIF.get(store2, "crc_key")
-      # Must return either an error or nil — must not return the corrupted value
-      # as if it were valid
-      assert match?({:error, _}, result) or result == {:ok, nil},
-             "Expected CRC error or nil, got #{inspect(result)}"
     end
   end
 

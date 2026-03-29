@@ -25,6 +25,35 @@ defmodule FerricstoreServer.ShutdownTest do
     on_exit(fn -> ShardHelpers.wait_shards_alive() end)
   end
 
+  # Reads a key's value directly from .log files using v2 stateless NIFs.
+  # Returns {:ok, value} or :not_found.
+  defp read_key_from_disk(shard_dir, key) do
+    {:ok, files} = File.ls(shard_dir)
+
+    log_files =
+      files
+      |> Enum.filter(&String.ends_with?(&1, ".log"))
+      |> Enum.sort()
+
+    # Scan all log files, collecting (value_offset, log_path) for every
+    # non-tombstone entry that matches `key`. The last one wins (newest write).
+    entries =
+      for log_name <- log_files,
+          log_path = Path.join(shard_dir, log_name),
+          {:ok, records} <- [NIF.v2_scan_file(log_path)],
+          {^key, offset, _vsize, _expire, tombstone} <- records do
+        {offset, log_path, tombstone}
+      end
+
+    case List.last(entries) do
+      {offset, log_path, false} ->
+        NIF.v2_pread_at(log_path, offset)
+
+      _ ->
+        :not_found
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # After stopping a shard, it is no longer alive
   # ---------------------------------------------------------------------------
@@ -90,11 +119,8 @@ defmodule FerricstoreServer.ShutdownTest do
       files = File.ls!(shard_dir)
       assert length(files) > 0, "Shard directory should contain Bitcask data files"
 
-      # Verify the data is recoverable from disk by reading through the NIF.
-      # Open a fresh Bitcask store at the same path to confirm the data was
-      # flushed and is readable independently.
-      {:ok, fresh_store} = NIF.new(shard_dir)
-      {:ok, recovered_value} = NIF.get(fresh_store, key)
+      # Verify the data is recoverable from disk using v2 stateless NIFs.
+      {:ok, recovered_value} = read_key_from_disk(shard_dir, key)
       assert recovered_value == value, "Value should be recoverable from Bitcask on disk"
     end
 
@@ -210,8 +236,7 @@ defmodule FerricstoreServer.ShutdownTest do
       shard_dir = DataDir.shard_data_path(tmp_dir, 99)
       assert File.dir?(shard_dir)
 
-      {:ok, store} = NIF.new(shard_dir)
-      {:ok, recovered} = NIF.get(store, "iso_key")
+      {:ok, recovered} = read_key_from_disk(shard_dir, "iso_key")
       assert recovered == "iso_val", "Data should survive shard stop"
     end
   end
@@ -252,12 +277,11 @@ defmodule FerricstoreServer.ShutdownTest do
       GenServer.stop(pid, :normal, 5_000)
       refute Process.alive?(pid)
 
-      # Open a fresh Bitcask at the shard path and verify all keys survived.
+      # Verify all keys survived using v2 stateless NIFs.
       shard_dir = DataDir.shard_data_path(tmp_dir, 100)
-      {:ok, fresh_store} = NIF.new(shard_dir)
 
       for i <- 1..10 do
-        {:ok, recovered} = NIF.get(fresh_store, "term_key_#{i}")
+        {:ok, recovered} = read_key_from_disk(shard_dir, "term_key_#{i}")
 
         assert recovered == "term_val_#{i}",
                "Key term_key_#{i} should survive graceful shutdown"

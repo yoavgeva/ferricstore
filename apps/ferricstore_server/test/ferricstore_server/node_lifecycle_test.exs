@@ -20,6 +20,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
   alias Ferricstore.DataDir
   alias Ferricstore.Store.{Router, ShardSupervisor}
   alias Ferricstore.Resp.{Encoder, Parser}
+  alias Ferricstore.Bitcask.NIF
   alias FerricstoreServer.Listener
   alias Ferricstore.Test.ShardHelpers
 
@@ -38,6 +39,33 @@ defmodule FerricstoreServer.NodeLifecycleTest do
   # ---------------------------------------------------------------------------
 
   defp ukey(base), do: "nlc_#{base}_#{:rand.uniform(9_999_999)}"
+
+  # Reads a key's value directly from .log files using v2 stateless NIFs.
+  # Returns {:ok, value} or :not_found.
+  defp read_key_from_disk(shard_dir, key) do
+    {:ok, files} = File.ls(shard_dir)
+
+    log_files =
+      files
+      |> Enum.filter(&String.ends_with?(&1, ".log"))
+      |> Enum.sort()
+
+    entries =
+      for log_name <- log_files,
+          log_path = Path.join(shard_dir, log_name),
+          {:ok, records} <- [NIF.v2_scan_file(log_path)],
+          {^key, offset, _vsize, _expire, tombstone} <- records do
+        {offset, log_path, tombstone}
+      end
+
+    case List.last(entries) do
+      {offset, log_path, false} ->
+        NIF.v2_pread_at(log_path, offset)
+
+      _ ->
+        :not_found
+    end
+  end
 
   defp wait_for_new_pid(name, old_pid, attempts \\ 40)
 
@@ -321,12 +349,11 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       GenServer.stop(pid, :normal, 5_000)
       refute Process.alive?(pid)
 
-      # Verify data is on disk by opening a fresh NIF store.
+      # Verify data is on disk using v2 stateless NIFs.
       shard_dir = DataDir.shard_data_path(tmp_dir, 98)
-      {:ok, store} = Ferricstore.Bitcask.NIF.new(shard_dir)
 
       for i <- 1..10 do
-        {:ok, val} = Ferricstore.Bitcask.NIF.get(store, "lifecycle_#{i}")
+        {:ok, val} = read_key_from_disk(shard_dir, "lifecycle_#{i}")
         assert val == "val_#{i}", "Key lifecycle_#{i} should survive graceful stop"
       end
     end

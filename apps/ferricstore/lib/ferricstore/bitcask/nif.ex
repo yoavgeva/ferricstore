@@ -3,28 +3,6 @@ defmodule Ferricstore.Bitcask.NIF do
 
   use Rustler, otp_app: :ferricstore, crate: "ferricstore_bitcask", skip_compilation?: true
 
-  def new(_path), do: :erlang.nif_error(:nif_not_loaded)
-  def get(_store, _key), do: :erlang.nif_error(:nif_not_loaded)
-  def get_zero_copy(_store, _key), do: :erlang.nif_error(:nif_not_loaded)
-  def get_file_ref(_store, _key), do: :erlang.nif_error(:nif_not_loaded)
-  def put(_store, _key, _value, _expire_at_ms), do: :erlang.nif_error(:nif_not_loaded)
-  def delete(_store, _key), do: :erlang.nif_error(:nif_not_loaded)
-  def put_batch(_store, _batch), do: :erlang.nif_error(:nif_not_loaded)
-  def put_batch_async(_store, _batch), do: :erlang.nif_error(:nif_not_loaded)
-  def keys(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def write_hint(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def purge_expired(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def get_all(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def get_batch(_store, _keys), do: :erlang.nif_error(:nif_not_loaded)
-  def get_range(_store, _min_key, _max_key, _max_count), do: :erlang.nif_error(:nif_not_loaded)
-  def read_modify_write(_store, _key, _operation), do: :erlang.nif_error(:nif_not_loaded)
-  def get_all_zero_copy(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def get_batch_zero_copy(_store, _keys), do: :erlang.nif_error(:nif_not_loaded)
-  def get_range_zero_copy(_store, _min_key, _max_key, _max_count), do: :erlang.nif_error(:nif_not_loaded)
-  def shard_stats(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def file_sizes(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def run_compaction(_store, _file_ids), do: :erlang.nif_error(:nif_not_loaded)
-  def available_disk_space(_store), do: :erlang.nif_error(:nif_not_loaded)
   def hnsw_new(_dims, _m, _ef_construction, _metric), do: :erlang.nif_error(:nif_not_loaded)
   def hnsw_add(_index, _key, _vector), do: :erlang.nif_error(:nif_not_loaded)
   def hnsw_delete(_index, _key), do: :erlang.nif_error(:nif_not_loaded)
@@ -50,14 +28,6 @@ defmodule Ferricstore.Bitcask.NIF do
   def cuckoo_create(_capacity, _bucket_size, _max_kicks, _expansion), do: :erlang.nif_error(:nif_not_loaded)
   def cuckoo_serialize(_resource), do: :erlang.nif_error(:nif_not_loaded)
   def cuckoo_deserialize(_data), do: :erlang.nif_error(:nif_not_loaded)
-
-  # -- Tokio async IO NIFs --
-  def get_async(_store, _key), do: :erlang.nif_error(:nif_not_loaded)
-  def delete_async(_store, _key), do: :erlang.nif_error(:nif_not_loaded)
-  def put_batch_tokio_async(_store, _batch), do: :erlang.nif_error(:nif_not_loaded)
-  def write_hint_async(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def purge_expired_async(_store), do: :erlang.nif_error(:nif_not_loaded)
-  def run_compaction_async(_store, _file_ids), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- Count-Min Sketch NIFs --
   def cms_incrby(_resource, _items), do: :erlang.nif_error(:nif_not_loaded)
