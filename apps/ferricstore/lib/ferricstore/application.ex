@@ -293,12 +293,11 @@ defmodule Ferricstore.Application do
     end
     Logger.info("Shutdown: shards flushed")
 
-    # Step 5: Force WAL rollover and wait for segment writer to finish.
+    # Step 5: Force WAL rollover so segment writer can flush mem tables.
     # force_roll_over triggers the WAL to close the current file and hand it
     # to the segment writer (via async cast). We then block on
-    # ra_log_segment_writer:await which does a gen_server:call — it returns
-    # only after the segment writer has drained its mailbox (all pending
-    # mem-table flushes complete). 60s timeout built into ra.
+    # ra_log_segment_writer:await (gen_server:call, 60s timeout) which returns
+    # only after the segment writer has drained its mailbox.
     try do
       names = :ra_system.derive_names(Ferricstore.Raft.Cluster.system_name())
       :ra_log_wal.force_roll_over(names.wal)
@@ -316,6 +315,11 @@ defmodule Ferricstore.Application do
         Logger.warning("Shutdown: WAL rollover failed: #{inspect(reason)}")
     end
     Logger.info("Shutdown: WAL rolled over + segment writer drained")
+
+    # Brief yield: the segment writer sends notifications to ra servers
+    # after flushing segments. Give them time to process before we proceed
+    # to check snapshot state or the caller kills shard processes.
+    Process.sleep(50)
 
     # Step 6: Check snapshot state for each shard and log warning if
     # there are many entries since last snapshot (will need replay on restart)
