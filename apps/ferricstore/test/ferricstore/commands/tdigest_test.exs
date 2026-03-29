@@ -15,7 +15,7 @@ defmodule Ferricstore.Commands.TDigestTest do
     9.  TRIMMED_MEAN tests -- quantile-bounded means
     10. RANK / REVRANK / BYRANK / BYREVRANK -- rank-based queries
     11. Edge cases -- boundary conditions and unusual inputs
-    12. Stress tests (tagged :perf) -- performance and memory
+    12. Stress tests -- performance and memory
     13. Integration -- dispatcher routing, catalog, full lifecycle
   """
   use ExUnit.Case, async: true
@@ -1383,11 +1383,10 @@ defmodule Ferricstore.Commands.TDigestTest do
   end
 
   # ===========================================================================
-  # 12. Stress tests (tagged :perf)
+  # 12. Stress tests
   # ===========================================================================
 
   describe "stress tests" do
-    @tag :perf
     test "100K adds, quantile query < 100ms" do
       store = MockStore.make()
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
@@ -1406,7 +1405,6 @@ defmodule Ferricstore.Commands.TDigestTest do
       assert elapsed < 100, "quantile query took #{elapsed}ms, expected < 100ms"
     end
 
-    @tag :perf
     @tag :slow
     test "1M adds, memory < 100KB" do
       digest = Core.new(100)
@@ -1421,7 +1419,6 @@ defmodule Ferricstore.Commands.TDigestTest do
         "memory usage #{info.memory_usage} bytes, expected < 100KB"
     end
 
-    @tag :perf
     test "sequential adds from 10 batches" do
       store = MockStore.make()
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
@@ -1441,7 +1438,6 @@ defmodule Ferricstore.Commands.TDigestTest do
       assert_in_delta total, 1000.0, 1.0
     end
 
-    @tag :perf
     test "merge 100 digests" do
       store = MockStore.make()
 
@@ -1462,7 +1458,6 @@ defmodule Ferricstore.Commands.TDigestTest do
       assert_in_delta merged_weight, 1000.0, 1.0
     end
 
-    @tag :perf
     test "repeated create/add/query cycle 1000 times" do
       store = MockStore.make()
 

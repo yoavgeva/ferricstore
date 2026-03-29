@@ -370,7 +370,7 @@ defmodule Ferricstore.HLCTest do
       assert length(all_timestamps) == 50_000
     end
 
-    @tag :perf
+    @tag :bench
     test "now_ms() throughput exceeds 1M calls/sec (no GenServer bottleneck)" do
       # Warm up.
       for _ <- 1..1_000, do: HLC.now_ms()

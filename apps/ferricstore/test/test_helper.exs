@@ -1,4 +1,4 @@
-# :perf — slow throughput tests; run with `mix test --include perf`
+# :bench — long-running throughput/latency benchmarks; run with `mix test --include bench`
 # :linux_io_uring — tests that require Linux + io_uring kernel support (≥ 5.1).
 #   Always excluded from the default run (`mix test`) on all platforms.
 #   In CI, the dedicated workflow step runs them with `mix test --only linux_io_uring`
@@ -21,7 +21,7 @@
 # :bench — long-running throughput benchmarks (30s+ per test). Excluded by default.
 #   Run with `mix test test/ferricstore/cluster/throughput_bench_test.exs --include bench`.
 ExUnit.start(
-  exclude: [:perf, :linux_io_uring, :large_alloc, :cluster, :jepsen, :legacy_hot_cache, :bench, :shard_kill, :compaction, :conn_lifecycle, :concurrency],
+  exclude: [:bench, :linux_io_uring, :large_alloc, :cluster, :jepsen, :legacy_hot_cache, :shard_kill, :compaction, :conn_lifecycle, :concurrency],
   formatters: [ExUnit.CLIFormatter, Ferricstore.Test.AuditFormatter]
 )
 

@@ -242,7 +242,7 @@ defmodule Ferricstore.Store.PrefixInterningTest do
   # -------------------------------------------------------------------
 
   describe "performance: prefix scan is faster than full scan" do
-    @tag :perf
+    @tag :bench
     @tag timeout: 300_000
     test "SCAN MATCH 'target:*' uses prefix index for O(matching) lookup" do
       store = real_store()

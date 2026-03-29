@@ -11,14 +11,14 @@ defmodule Ferricstore.Bitcask.AllNifYieldBenchmarkTest do
 
   ## Running
 
-      mix test apps/ferricstore/test/ferricstore/bitcask/all_nif_yield_benchmark_test.exs --include perf
+      mix test apps/ferricstore/test/ferricstore/bitcask/all_nif_yield_benchmark_test.exs --include bench
 
-  Tagged `:perf` so these are excluded from the default `mix test` run.
+  Tagged `:bench` so these are excluded from the default `mix test` run.
   """
 
   use ExUnit.Case, async: false
 
-  @moduletag :perf
+  @moduletag :bench
   @moduletag timeout: 300_000
 
   alias Ferricstore.Bitcask.NIF

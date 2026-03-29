@@ -20,12 +20,11 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
 
   ## Running
 
-      mix test apps/ferricstore/test/ferricstore/bitcask/new_nif_integration_test.exs --include perf
+      mix test apps/ferricstore/test/ferricstore/bitcask/new_nif_integration_test.exs
   """
 
   use ExUnit.Case, async: false
 
-  @moduletag :perf
   @moduletag timeout: 300_000
 
   alias Ferricstore.Bitcask.NIF

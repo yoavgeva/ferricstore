@@ -3,11 +3,11 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
   Micro-benchmarks that prove specific hot-path performance issues
   and verify that fixes deliver measurable improvement.
 
-  Run with: mix test test/ferricstore/bench/perf_regression_test.exs --include perf --timeout 120000
+  Run with: mix test test/ferricstore/bench/perf_regression_test.exs --include bench --timeout 120000
   """
   use ExUnit.Case, async: false
 
-  @moduletag :perf
+  @moduletag :bench
 
   # ---------------------------------------------------------------------------
   # 1. RESP Parser: Application.get_env vs persistent_term

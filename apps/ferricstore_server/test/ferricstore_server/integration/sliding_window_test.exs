@@ -279,7 +279,7 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
   # ---------------------------------------------------------------------------
 
   describe "sliding window delivery" do
-    @tag :perf
+    @tag :bench
     test "fast commands before a slow command get responses delivered first", %{port: port} do
       sock = connect_and_hello(port)
       k = ukey("fast_before_slow")
@@ -323,7 +323,7 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
       :gen_tcp.close(sock)
     end
 
-    @tag :perf
+    @tag :bench
     test "multiple fast commands before slow command all arrive early", %{port: port} do
       sock = connect_and_hello(port)
       k1 = ukey("multi_fast_a")
@@ -365,7 +365,7 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
       :gen_tcp.close(sock)
     end
 
-    @tag :perf
+    @tag :bench
     test "fast commands AFTER a slow command are blocked until slow completes", %{port: port} do
       sock = connect_and_hello(port)
 

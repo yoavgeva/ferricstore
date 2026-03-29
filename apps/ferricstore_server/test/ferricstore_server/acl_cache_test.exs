@@ -481,7 +481,7 @@ defmodule FerricstoreServer.AclCacheTest do
   # ---------------------------------------------------------------------------
 
   describe "performance" do
-    @tag :perf
+    @tag :bench
     test "100K cached permission checks complete in under 50ms" do
       # Build a cache matching the default user (commands: :all)
       cache = %{
@@ -531,7 +531,7 @@ defmodule FerricstoreServer.AclCacheTest do
              "100K cached checks took #{elapsed_ms}ms, expected < 50ms"
     end
 
-    @tag :perf
+    @tag :bench
     test "100K cached permission checks with denied_commands complete in under 50ms" do
       cache = %{
         commands: :all,
@@ -573,7 +573,7 @@ defmodule FerricstoreServer.AclCacheTest do
              "100K cached checks (with denials) took #{elapsed_ms}ms, expected < 50ms"
     end
 
-    @tag :perf
+    @tag :bench
     test "100K cached permission checks with MapSet commands complete in under 50ms" do
       cache = %{
         commands: MapSet.new(~w(GET SET DEL HSET HGET LPUSH RPOP ZADD INFO PING)),

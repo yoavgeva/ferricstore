@@ -24,14 +24,14 @@ defmodule Ferricstore.Bitcask.ZeroCopySchedulerTest do
 
   ## Running
 
-      mix test test/ferricstore/bitcask/zero_copy_scheduler_test.exs --include perf --timeout 120000
+      mix test test/ferricstore/bitcask/zero_copy_scheduler_test.exs --include bench --timeout 120000
 
-  Tagged `:perf` because these tests use large datasets and measure timing.
+  Tagged `:bench` because these tests use large datasets and measure timing.
   """
 
   use ExUnit.Case, async: false
 
-  @moduletag :perf
+  @moduletag :bench
   @moduletag timeout: 120_000
 
   alias Ferricstore.Bitcask.NIF

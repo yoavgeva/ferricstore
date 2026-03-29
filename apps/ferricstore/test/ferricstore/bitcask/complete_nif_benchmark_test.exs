@@ -2,14 +2,14 @@ defmodule Ferricstore.Bitcask.CompleteNifBenchmarkTest do
   @moduledoc """
   Comprehensive benchmark of EVERY NIF function in FerricStore.
 
-  Run with: mix test apps/ferricstore/test/ferricstore/bitcask/complete_nif_benchmark_test.exs --include perf
+  Run with: mix test apps/ferricstore/test/ferricstore/bitcask/complete_nif_benchmark_test.exs --include bench
   """
 
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
 
-  @moduletag :perf
+  @moduletag :bench
 
   # ============================================================================
   # Helpers

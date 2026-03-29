@@ -6,17 +6,17 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   throughput, pipelining, concurrent clients, large values, TTL expiry under
   load, connection churn, and shard distribution.
 
-  All tests are tagged `@moduletag :perf` so they can be excluded in CI with
-  `--exclude perf` and included locally with `--include perf`.
+  All tests are tagged `@moduletag :bench` so they can be excluded in CI with
+  `--exclude bench` and included locally with `--include bench`.
 
   Run with:
 
-      mix test test/ferricstore/integration/performance_test.exs --include perf
+      mix test test/ferricstore/integration/performance_test.exs --include bench
   """
 
   use ExUnit.Case, async: false
 
-  @moduletag :perf
+  @moduletag :bench
 
   alias Ferricstore.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
@@ -152,7 +152,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   # ===========================================================================
 
   describe "TCP throughput (sequential)" do
-    @tag :perf
+    @tag :bench
     test "1000 sequential PINGs complete within 5 seconds", %{port: port} do
       sock = connect_and_hello(port)
 
@@ -170,7 +170,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         "1000 sequential PINGs took #{elapsed}ms, expected < 5000ms"
     end
 
-    @tag :perf
+    @tag :bench
     test "1000 sequential SETs complete within 10 seconds", %{port: port} do
       sock = connect_and_hello(port)
 
@@ -188,7 +188,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         "1000 sequential SETs took #{elapsed}ms, expected < 10000ms"
     end
 
-    @tag :perf
+    @tag :bench
     test "1000 sequential GETs complete within 10 seconds", %{port: port} do
       sock = connect_and_hello(port)
 
@@ -219,7 +219,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   # ===========================================================================
 
   describe "TCP throughput (pipelining)" do
-    @tag :perf
+    @tag :bench
     test "pipeline 1000 PING commands in one TCP write completes within 2 seconds", %{
       port: port
     } do
@@ -245,7 +245,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         "Pipeline 1000 PINGs took #{elapsed}ms, expected < 2000ms"
     end
 
-    @tag :perf
+    @tag :bench
     test "pipeline 5000 SET commands in batches of 1000", %{port: port} do
       sock = connect_and_hello(port)
 
@@ -276,7 +276,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         "5000 pipelined SETs (5 batches) took #{elapsed}ms, expected < 30000ms"
     end
 
-    @tag :perf
+    @tag :bench
     test "pipeline is faster than sequential for 1000 PINGs", %{port: port} do
       # Sequential measurement
       sock_seq = connect_and_hello(port)
@@ -319,7 +319,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   # ===========================================================================
 
   describe "concurrent client throughput" do
-    @tag :perf
+    @tag :bench
     test "10 clients each send 100 SETs concurrently within 10 seconds", %{port: port} do
       {elapsed, results} =
         measure(fn ->
@@ -350,7 +350,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         "10 concurrent clients x 100 SETs took #{elapsed}ms, expected < 10000ms"
     end
 
-    @tag :perf
+    @tag :bench
     test "50 clients each send 10 GETs concurrently", %{port: port} do
       # Pre-fill keys
       sock = connect_and_hello(port)
@@ -398,7 +398,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
 
   describe "memory stability" do
     @tag timeout: 180_000
-    @tag :perf
+    @tag :bench
     test "write 10000 keys via Router, verify DBSIZE, delete all, verify DBSIZE returns to baseline" do
       # Use Router directly to avoid TCP pipeline complexity.
       # The point of this test is memory stability, not TCP throughput.
@@ -430,7 +430,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   # ===========================================================================
 
   describe "large value performance" do
-    @tag :perf
+    @tag :bench
     test "SET and GET a 1MB value completes within 2 seconds", %{port: port} do
       sock = connect_and_hello(port)
       large_1mb = :binary.copy("A", 1_000_000)
@@ -451,7 +451,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
         "1MB SET+GET took #{elapsed}ms, expected < 2000ms"
     end
 
-    @tag :perf
+    @tag :bench
     test "SET and GET a 10MB value completes within 10 seconds", %{port: port} do
       sock = connect_and_hello(port)
       large_10mb = :binary.copy("B", 10_000_000)
@@ -478,7 +478,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   # ===========================================================================
 
   describe "ETS cache hot path" do
-    @tag :perf
+    @tag :bench
     test "1000 Router.get calls on a cached key average < 100 microseconds each" do
       key = "ets_hot_#{:rand.uniform(9_999_999)}"
 
@@ -511,7 +511,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   # ===========================================================================
 
   describe "shard distribution" do
-    @tag :perf
+    @tag :bench
     test "1000 keys are distributed across all #{@shard_count} shards with no shard > 60%" do
       keys = for i <- 1..1_000, do: "shard_dist_#{i}"
 
@@ -545,7 +545,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   # ===========================================================================
 
   describe "TTL expiry under load" do
-    @tag :perf
+    @tag :bench
     test "1000 keys with PX 200ms TTL are all expired after waiting", %{port: port} do
       # Write 1000 keys with 200ms TTL concurrently across 10 clients
       results =
@@ -595,7 +595,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   # ===========================================================================
 
   describe "connection rate" do
-    @tag :perf
+    @tag :bench
     test "200 sequential connect-PING-disconnect cycles within 10 seconds", %{port: port} do
       {elapsed, _} =
         measure(fn ->
@@ -617,7 +617,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
   # ===========================================================================
 
   describe "pipeline correctness under load" do
-    @tag :perf
+    @tag :bench
     test "5 concurrent clients each pipeline 200 commands with correct responses", %{
       port: port
     } do

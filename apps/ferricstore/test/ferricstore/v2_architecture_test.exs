@@ -601,7 +601,7 @@ defmodule Ferricstore.V2ArchitectureTest do
   # =========================================================================
 
   describe "performance" do
-    @describetag :perf
+    @describetag :bench
     test "29. Hot read latency < 1us (single ETS lookup)", %{dir: _dir} do
       keydir = :ets.new(:v2_perf_hot, [:set, :public, {:read_concurrency, true}])
 
@@ -623,7 +623,7 @@ defmodule Ferricstore.V2ArchitectureTest do
       :ets.delete(keydir)
     end
 
-    @tag :perf
+    @tag :bench
     test "31. 100 concurrent cold reads faster than serialized", %{dir: dir} do
       path = data_file(dir, 1)
 

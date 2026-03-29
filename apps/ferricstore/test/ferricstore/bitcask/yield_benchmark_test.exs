@@ -17,14 +17,14 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
 
   ## Running
 
-      mix test test/ferricstore/bitcask/yield_benchmark_test.exs --include perf --timeout 120000
+      mix test test/ferricstore/bitcask/yield_benchmark_test.exs --include bench --timeout 120000
 
-  Tagged `:perf` because these tests use large datasets and measure timing.
+  Tagged `:bench` because these tests use large datasets and measure timing.
   """
 
   use ExUnit.Case, async: false
 
-  @moduletag :perf
+  @moduletag :bench
   @moduletag timeout: 120_000
 
   alias Ferricstore.Bitcask.NIF
@@ -110,7 +110,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
   # ===========================================================================
 
   describe "yield frequency" do
-    @tag :perf
+    @tag :bench
     test "yielding NIFs yield at appropriate intervals for 100K keys" do
       store = setup_store_with_n_keys(100_000, 10)
 
@@ -136,7 +136,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
   # ===========================================================================
 
   describe "scheduler responsiveness" do
-    @tag :perf
+    @tag :bench
     test "scheduler stays responsive during 100K key iteration" do
       store = setup_store_with_n_keys(100_000, 100)
       {:ok, pinger} = GenServer.start(PingServer, [])
@@ -171,7 +171,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
   # ===========================================================================
 
   describe "adaptive yielding" do
-    @tag :perf
+    @tag :bench
     test "yielding adapts to item size — large values cost more per key" do
       # 10K small keys (10 bytes)
       store_small = setup_store_with_n_keys(10_000, 10)
@@ -221,7 +221,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
   # ===========================================================================
 
   describe "yield overhead" do
-    @tag :perf
+    @tag :bench
     test "yield overhead is less than 5% of total time" do
       store = setup_store_with_n_keys(50_000, 50)
 
@@ -263,7 +263,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
   # ===========================================================================
 
   describe "get_all large values" do
-    @tag :perf
+    @tag :bench
     test "get_all with 1K large values (10KB each) stays responsive" do
       store = setup_store_with_n_keys(1_000, 10_000)
       {:ok, pinger} = GenServer.start(PingServer, [])
@@ -299,7 +299,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
   # ===========================================================================
 
   describe "HNSW search yield" do
-    @tag :perf
+    @tag :bench
     test "HNSW search on 10K vectors consumes timeslice properly" do
       {:ok, index} = NIF.hnsw_new(128, 16, 200, "l2")
 
@@ -345,7 +345,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
   # ===========================================================================
 
   describe "optimal check interval benchmark" do
-    @tag :perf
+    @tag :bench
     test "current check interval achieves good throughput and responsiveness" do
       store = setup_store_with_n_keys(50_000, 50)
 
@@ -405,7 +405,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
   # ===========================================================================
 
   describe "get_batch responsiveness" do
-    @tag :perf
+    @tag :bench
     test "get_batch with 10K keys stays responsive" do
       store = setup_store_with_n_keys(10_000, 100)
       pad = 5
@@ -447,7 +447,7 @@ defmodule Ferricstore.Bitcask.YieldBenchmarkTest do
   # ===========================================================================
 
   describe "get_range responsiveness" do
-    @tag :perf
+    @tag :bench
     test "get_range with 10K results stays responsive" do
       store = setup_store_with_n_keys(10_000, 100)
       {:ok, pinger} = GenServer.start(PingServer, [])

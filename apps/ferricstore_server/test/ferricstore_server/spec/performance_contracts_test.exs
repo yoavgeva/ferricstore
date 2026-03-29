@@ -13,16 +13,16 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
   regressions (e.g. a hot path accidentally hitting disk, a missing ETS lookup,
   a GenServer bottleneck) without flaking on variable-speed CI runners.
 
-  Tagged `@moduletag :perf` — excluded from the default `mix test` run.
+  Tagged `@moduletag :bench` — excluded from the default `mix test` run.
   Run with:
 
-      mix test test/ferricstore/spec/performance_contracts_test.exs --include perf
+      mix test test/ferricstore/spec/performance_contracts_test.exs --include bench
 
   """
 
   use ExUnit.Case, async: false
 
-  @moduletag :perf
+  @moduletag :bench
   @moduletag timeout: 120_000
 
   alias Ferricstore.Resp.{Encoder, Parser}
@@ -146,7 +146,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
   # ===========================================================================
 
   describe "PC-001: GET latency on warm key" do
-    @tag :perf
+    @tag :bench
     test "1000 Router.get calls on a warm key complete in < 1000ms (avg < 1ms)" do
       key = ukey("warm_get")
       Router.put(key, "warm_value")
@@ -178,7 +178,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
   # ===========================================================================
 
   describe "PC-002: SET latency via TCP" do
-    @tag :perf
+    @tag :bench
     test "100 sequential SETs complete in < 2000ms (avg < 20ms each)" do
       sock = connect_and_hello()
 
@@ -208,7 +208,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
   # ===========================================================================
 
   describe "PC-003: pipeline of 10 commands" do
-    @tag :perf
+    @tag :bench
     test "pipeline of 10 SET+GET commands completes in < 50ms" do
       sock = connect_and_hello()
 
@@ -241,7 +241,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
         "Pipeline of 10 commands took #{elapsed}ms, expected < 50ms"
     end
 
-    @tag :perf
+    @tag :bench
     test "pipeline of 10 PINGs completes in < 50ms" do
       sock = connect_and_hello()
 
@@ -271,7 +271,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
   # ===========================================================================
 
   describe "PC-004: SCAN 1000 keys" do
-    @tag :perf
+    @tag :bench
     test "SCAN iterating over 1000 keys completes in < 500ms" do
       sock = connect_and_hello()
 
@@ -339,7 +339,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
   # ===========================================================================
 
   describe "PC-005: ETS hot cache speedup" do
-    @tag :perf
+    @tag :bench
     test "warm Router.get is faster than cold GenServer.call path" do
       key = ukey("hot_cold")
       Router.put(key, "test_value")

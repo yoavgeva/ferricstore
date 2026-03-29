@@ -35,15 +35,11 @@ defmodule Ferricstore.Bitcask.NIFSchedulerSafetyTest do
 
   ## Running
 
-      mix test test/ferricstore/bitcask/nif_scheduler_safety_test.exs --include perf --timeout 120000
-
-  Tagged `:perf` because these tests are intentionally slow (large datasets,
-  I/O pressure, thread pool saturation).
+      mix test test/ferricstore/bitcask/nif_scheduler_safety_test.exs --timeout 120000
   """
 
   use ExUnit.Case, async: false
 
-  @moduletag :perf
   @moduletag timeout: 120_000
 
   alias Ferricstore.Bitcask.NIF

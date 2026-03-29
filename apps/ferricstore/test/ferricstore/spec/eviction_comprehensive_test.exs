@@ -17,9 +17,9 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
     * Concurrent access during eviction
     * Stress and throughput under sustained eviction pressure
 
-  Tests tagged `:perf` are excluded from the default test run. Execute with:
+  Run with:
 
-      mix test apps/ferricstore/test/ferricstore/spec/eviction_comprehensive_test.exs --include perf
+      mix test apps/ferricstore/test/ferricstore/spec/eviction_comprehensive_test.exs --include legacy_hot_cache
   """
 
   use ExUnit.Case, async: false
@@ -1170,11 +1170,10 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
   end
 
   # ===========================================================================
-  # Stress tests (7, tagged :perf)
+  # Stress tests (7)
   # ===========================================================================
 
   describe "stress" do
-    @tag :perf
     @tag timeout: 300_000
     test "1: 10K keys, fill cache to pressure, evict, verify all readable" do
       future = System.os_time(:millisecond) + 300_000
@@ -1208,7 +1207,6 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
              "Data loss detected for #{length(failures)} keys: #{inspect(Enum.take(failures, 10))}"
     end
 
-    @tag :perf
     @tag timeout: 120_000
     test "2: rapid access pattern: 100 hot keys accessed 1000x, 900 cold keys accessed 1x" do
       future = System.os_time(:millisecond) + 120_000
@@ -1247,7 +1245,6 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
              "Expected at least 60/100 heavily-accessed keys to survive, got #{hot_surviving}"
     end
 
-    @tag :perf
     @tag timeout: 120_000
     test "3: 50 concurrent readers + eviction running: no crashes" do
       for i <- 1..200 do
@@ -1290,7 +1287,6 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       end
     end
 
-    @tag :perf
     @tag timeout: 120_000
     test "4: eviction throughput: 1000 evictions in <5s" do
       future = System.os_time(:millisecond) + 120_000
@@ -1330,7 +1326,6 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       end
     end
 
-    @tag :perf
     @tag timeout: 120_000
     test "5: memory actually decreases after eviction (hot_cache ETS memory check)" do
       future = System.os_time(:millisecond) + 120_000
@@ -1355,7 +1350,6 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
              "Hot cache memory should decrease after eviction: before=#{mem_before}, after=#{mem_after}"
     end
 
-    @tag :perf
     @tag timeout: 120_000
     test "6: eviction + concurrent writes: new keys survive, old cold keys evicted" do
       future = System.os_time(:millisecond) + 120_000
@@ -1401,7 +1395,6 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       end
     end
 
-    @tag :perf
     @tag timeout: 120_000
     test "7: 100 eviction cycles: stable memory, no growth, all keys readable" do
       future = System.os_time(:millisecond) + 120_000
