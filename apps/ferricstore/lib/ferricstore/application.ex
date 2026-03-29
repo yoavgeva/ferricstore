@@ -266,16 +266,56 @@ defmodule Ferricstore.Application do
     try do
       wal_name = :ra_system.derive_names(Ferricstore.Raft.Cluster.system_name()).wal
       :ra_log_wal.force_roll_over(wal_name)
-      Process.sleep(200)
+      # Give segment writer time to process the rolled WAL
+      Process.sleep(500)
     catch
       _, _ -> :ok
     end
     Logger.info("Shutdown: WAL rolled over")
 
+    # Step 6: Check snapshot state for each shard and log warning if
+    # there are many entries since last snapshot (will need replay on restart)
+    for i <- 0..(shard_count - 1) do
+      try do
+        server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+
+        case :ra.member_overview(server_id) do
+          {:ok, overview} ->
+            check_snapshot_gap(i, overview)
+
+          {:ok, overview, _leader} ->
+            check_snapshot_gap(i, overview)
+
+          _ ->
+            :ok
+        end
+      catch
+        _, _ -> :ok
+      end
+    end
+
     elapsed = System.monotonic_time(:millisecond) - t0
     Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
     state
+  end
+
+  defp check_snapshot_gap(shard_index, overview) do
+    last_applied = Map.get(overview, :last_applied, 0)
+    snapshot_index = Map.get(overview, :snapshot_index, 0)
+    # -1 means no snapshot ever taken
+    snapshot_index = if snapshot_index == -1, do: 0, else: snapshot_index
+    gap = last_applied - snapshot_index
+
+    if gap > 5_000 do
+      Logger.warning(
+        "Shutdown: shard #{shard_index} has #{gap} entries since last snapshot " <>
+          "(last_applied=#{last_applied}, snapshot_index=#{snapshot_index}). " <>
+          "Next restart will replay these entries. Consider reducing release_cursor_interval."
+      )
+    else
+      Logger.info("Shutdown: shard #{shard_index} snapshot gap=#{gap} (ok)")
+    end
   end
 
   # ---------------------------------------------------------------------------
