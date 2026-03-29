@@ -40,13 +40,6 @@ config :ferricstore, :expiry_sweep_interval_ms, 600_000
 # stays small. Large WALs cause 30s+ replay on shard restart, hanging tests.
 config :ferricstore, :release_cursor_interval, 100
 
-# Disable ra recovery checkpoints in test. Recovery checkpoints skip WAL
-# replay on restart, but our state machine state is just metadata (ETS name,
-# paths) — the actual keydir data is in ETS which is cleared on restart.
-# Without replay, recover_keydir rebuilds from disk, which can fail on CI
-# (Linux/Docker overlayfs). Forcing WAL replay ensures apply/3 populates ETS.
-config :ferricstore, :min_recovery_checkpoint_interval, 0
-
 # Disable read sampling in tests so stats/LFU counts are deterministic.
 # Benchmarks should override this with @tag read_sample_rate: 100.
 config :ferricstore, :read_sample_rate, 1

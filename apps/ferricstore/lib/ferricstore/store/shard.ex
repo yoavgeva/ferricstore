@@ -192,6 +192,15 @@ defmodule Ferricstore.Store.Shard do
       BloomRegistry.create_table(index)
     end
 
+    # v2: recover ETS keydir from hint files or by scanning log files BEFORE
+    # starting Raft. This ensures cold entries ({key, nil, ..., fid, off, vsize})
+    # are in ETS when ra replays WAL entries via apply/3. Without this, replayed
+    # read-modify-write commands (INCR, APPEND, etc.) see ETS misses during
+    # replay and start from nil instead of the correct prior value.
+    # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
+    # Must run BEFORE recover_promoted so PM: markers are in ETS.
+    recover_keydir(path, keydir, prefix_keys, index)
+
     # Start the Raft server for this shard.
     # Application-supervised shards use the global ra system + Batcher.
     # Sandbox shards with a private ra system start their own ra server
@@ -209,11 +218,6 @@ defmodule Ferricstore.Store.Shard do
       else
         {start_raft_if_available(index, path, active_file_id, active_file_path, ets), nil}
       end
-
-    # v2: recover ETS keydir from hint files or by scanning log files.
-    # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
-    # Must run BEFORE recover_promoted so PM: markers are in ETS.
-    recover_keydir(path, keydir, prefix_keys, index)
 
     # Recover promoted collection instances (skip for sandbox -- no promoted data)
     promoted =
