@@ -770,21 +770,10 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
   # ------------------------------------------------------------------
 
   describe "hint file with more entries than log" do
-    @tag :skip
-    @tag :known_bug
-    test "BUG: stale hint causes tombstoned keys to resurrect on reopen" do
-      # KNOWN BUG: When a hint file exists for a file ID, the store loads
-      # ONLY from the hint and does NOT replay the log tail for entries
-      # written after the hint was generated. This means tombstones (deletes)
-      # written after write_hint are silently lost on recovery.
-      #
-      # Root cause: store.rs open() line 105-120 -- when fid_hint_path.exists(),
-      # the code loads from the hint and skips log replay entirely. It should
-      # either:
-      #   (a) replay the log tail after the hint-covered region, or
-      #   (b) always refresh the hint before closing.
-      #
-      # Impact: Keys deleted after the last write_hint will reappear on reopen.
+    test "stale hint does not resurrect tombstoned keys on reopen" do
+      # Regression test: previously, hint-based recovery skipped the log tail,
+      # so tombstones written after write_hint were lost. Fixed by replay_log_from
+      # in store.rs which replays records past the hint's last known offset.
       dir = tmp_dir()
       on_exit(fn -> File.rm_rf(dir) end)
 
@@ -814,7 +803,7 @@ defmodule Ferricstore.Bitcask.NIFRecoveryBugHuntTest do
                "key stale_#{i} must survive (was not deleted)"
       end
 
-      # These SHOULD be nil but the stale hint resurrects them
+      # Tombstoned keys must stay deleted after hint-based recovery
       for i <- 11..20 do
         assert {:ok, nil} == NIF.get(store3, "stale_#{i}"),
                "key stale_#{i} must be deleted (tombstoned after hint write)"
