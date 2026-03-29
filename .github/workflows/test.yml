@@ -127,7 +127,7 @@ jobs:
 
       - name: Run io_uring + scheduler stress tests (Linux, io_uring available)
         if: always() && runner.os == 'Linux' && steps.uring.outputs.available == 'true'
-        run: mix test --only linux_io_uring
+        run: mix test apps/ferricstore/test --only linux_io_uring
 
       - name: Upload test audit logs
         if: always()
