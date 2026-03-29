@@ -111,7 +111,10 @@ defmodule Ferricstore.Raft.Cluster do
       # replay on restart. Zero cost during normal operation. Default 0
       # (disabled) in ra — we enable with a low threshold so any ordered
       # shutdown writes a checkpoint.
-      min_recovery_checkpoint_interval: 1
+      # In test, set to 0 (disabled) via config to force WAL replay, which
+      # rebuilds ETS via apply/3 — more reliable than recover_keydir on CI.
+      min_recovery_checkpoint_interval:
+        Application.get_env(:ferricstore, :min_recovery_checkpoint_interval, 1)
     }
 
     case :ra.start_server(ra_sys, server_config) do
