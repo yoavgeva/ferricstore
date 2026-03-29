@@ -80,6 +80,7 @@ defmodule FerricstoreServer.GracefulShutdownTest do
     recv_response(sock)
   end
 
+
   defp await_all_writes_on_disk do
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
 
@@ -115,8 +116,27 @@ defmodule FerricstoreServer.GracefulShutdownTest do
       end
     end
 
-    # Wait for restart
-    ShardHelpers.wait_shards_alive(30_000)
+    # Wait for all infrastructure before marking ready.
+    ShardHelpers.eventually(fn ->
+      shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
+
+      shards_alive = Enum.all?(0..(shard_count_val - 1), fn i ->
+        pid = Process.whereis(Ferricstore.Store.Router.shard_name(i))
+        is_pid(pid) and Process.alive?(pid)
+      end)
+
+      raft_ready = shards_alive and Enum.all?(0..(shard_count_val - 1), fn i ->
+        try do
+          server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+          match?({:ok, _, _}, :ra.members(server_id, 1_000))
+        catch
+          :exit, _ -> false
+        end
+      end)
+
+      shards_alive and raft_ready
+    end, "shards + raft leaders should be ready after restart", 200, 100)
+
     Ferricstore.Health.set_ready(true)
   end
 
