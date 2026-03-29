@@ -276,8 +276,7 @@ defmodule Ferricstore.Bitcask.ProbNIFSafetyTest do
     end
 
     test "create/destroy 1000 times — no memory growth", %{dir: dir} do
-      :erlang.garbage_collect()
-      mem_before = :erlang.memory(:total)
+      mem_before = NIF.rust_allocated_bytes()
 
       for i <- 1..1_000 do
         path = bloom_path(dir, "leak_#{i}")
@@ -285,11 +284,10 @@ defmodule Ferricstore.Bitcask.ProbNIFSafetyTest do
         NIF.bloom_delete(filter)
       end
 
-      :erlang.garbage_collect()
-      mem_after = :erlang.memory(:total)
+      mem_after = NIF.rust_allocated_bytes()
 
-      assert mem_after - mem_before < 20_000_000,
-        "memory grew by #{mem_after - mem_before} bytes after 1000 create/destroy cycles"
+      assert mem_after - mem_before < 1_000_000,
+        "Rust memory grew by #{mem_after - mem_before} bytes after 1000 create/destroy cycles"
     end
 
     test "add 100K items, delete structure — memory freed", %{dir: dir} do
