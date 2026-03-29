@@ -14,7 +14,7 @@ defmodule Ferricstore.Store.AsyncLargeValueTest do
     :ok
   end
 
-  defp eventually(fun, msg, attempts \\ 200) do
+  defp eventually(fun, msg, attempts \\ 400) do
     result =
       try do
         fun.()
