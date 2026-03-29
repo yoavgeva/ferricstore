@@ -53,6 +53,39 @@ defmodule FerricstoreServer.Application do
     end
   end
 
+  @impl true
+  def prep_stop(state) do
+    Logger.info("FerricstoreServer: graceful shutdown starting")
+
+    # Step 1: Stop accepting new connections.
+    # Suspending the listener rejects new TCP connections while existing
+    # ones continue to be served.
+    try do
+      :ranch.suspend_listener(FerricstoreServer.Listener)
+      Logger.info("FerricstoreServer: listener suspended (no new connections)")
+    catch
+      _, _ -> :ok
+    end
+
+    # Step 2: Give active connections a grace period to finish in-flight
+    # commands. Connections that are idle will be closed by the supervisor.
+    # Connections mid-command get time to complete.
+    grace_ms = Application.get_env(:ferricstore, :shutdown_grace_ms, 2_000)
+    active = try do
+      :ranch.procs(FerricstoreServer.Listener, :connections) |> length()
+    catch
+      _, _ -> 0
+    end
+
+    if active > 0 do
+      Logger.info("FerricstoreServer: waiting #{grace_ms}ms for #{active} active connections")
+      Process.sleep(grace_ms)
+    end
+
+    Logger.info("FerricstoreServer: graceful shutdown complete")
+    state
+  end
+
   # ---------------------------------------------------------------------------
   # :pg scope for ACL cache invalidation
   # ---------------------------------------------------------------------------
