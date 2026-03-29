@@ -80,11 +80,26 @@ defmodule FerricstoreServer.GracefulShutdownTest do
     recv_response(sock)
   end
 
+  defp await_all_writes_on_disk do
+    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      Enum.all?(0..(shard_count - 1), fn i ->
+        keydir = :"keydir_#{i}"
+        pending = :ets.select_count(keydir, [{{:_, :_, :_, :_, :pending, :_, :_}, [], [true]}])
+        pending == 0
+      end)
+    end, "all ETS entries should have real file_id (not :pending)", 50, 100)
+  end
+
   defp shutdown_and_restart do
     # Graceful core shutdown (flush batchers, writers, shards, WAL)
     # We skip server prep_stop (suspend_listener) because we need the
     # listener to stay active for reconnection after restart.
     Ferricstore.Application.prep_stop(nil)
+
+    # Wait for all async BitcaskWriter writes to finish updating ETS
+    await_all_writes_on_disk()
 
     # Kill all shards to simulate process restart
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)

@@ -26,9 +26,27 @@ defmodule Ferricstore.GracefulShutdownTest do
   # Simulates a graceful shutdown + restart cycle.
   # Calls prep_stop (flushes everything), then kills all shards via
   # supervisor restart. On restart, shards recover from disk + WAL.
+  # Waits until all ETS entries across all shards have been flushed to disk
+  # (file_id is a real integer, not :pending). This ensures BitcaskWriter has
+  # finished its async writes before we proceed to kill shards.
+  defp await_all_writes_on_disk do
+    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+
+    ShardHelpers.eventually(fn ->
+      Enum.all?(0..(shard_count - 1), fn i ->
+        keydir = :"keydir_#{i}"
+        pending = :ets.select_count(keydir, [{{:_, :_, :_, :_, :pending, :_, :_}, [], [true]}])
+        pending == 0
+      end)
+    end, "all ETS entries should have real file_id (not :pending)", 50, 100)
+  end
+
   defp shutdown_and_restart do
     # Graceful flush — batchers, writers, shards, WAL
     Ferricstore.Application.prep_stop(nil)
+
+    # Wait for all async BitcaskWriter writes to finish updating ETS
+    await_all_writes_on_disk()
 
     # Kill all shards (simulates process restart after shutdown)
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
@@ -59,25 +77,13 @@ defmodule Ferricstore.GracefulShutdownTest do
   describe "string data survives graceful shutdown" do
     test "single key survives" do
       k = ukey("single")
-      shard_idx = Router.shard_for(k)
       Router.put(k, "before_shutdown")
       ShardHelpers.flush_all_shards()
 
-      # Verify key is in ETS before shutdown
-      keydir = :"keydir_#{shard_idx}"
-      pre_ets = :ets.lookup(keydir, k)
-      require Logger
-      Logger.info("DIAG: key=#{k} shard=#{shard_idx} pre_shutdown_ets=#{inspect(pre_ets)}")
-
       shutdown_and_restart()
 
-      # Check ETS after restart
-      post_ets = :ets.lookup(keydir, k)
-      post_get = Router.get(k)
-      Logger.info("DIAG: key=#{k} shard=#{shard_idx} post_restart_ets=#{inspect(post_ets)} router_get=#{inspect(post_get)}")
-
       ShardHelpers.eventually(fn -> Router.get(k) == "before_shutdown" end,
-        "key should survive graceful shutdown (key=#{k}, shard=#{shard_idx})")
+        "key should survive graceful shutdown")
     end
 
     test "100 keys survive" do
