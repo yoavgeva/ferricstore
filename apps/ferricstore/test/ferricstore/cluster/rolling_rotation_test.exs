@@ -111,8 +111,8 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       end
 
       # Allow the WAL to settle before removing the data directory.
-      Process.sleep(200)
-      File.rm_rf!(tmp_base)
+      Process.sleep(1_000)
+      File.rm_rf(tmp_base)
     end)
 
     %{
@@ -178,7 +178,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       members = for i <- 1..@cluster_size, do: {:"rot_member_#{i}", node()}
 
       {:ok, started, not_started} =
-        :ra.start_cluster(@ra_system, :rolling_rotation_cluster, @machine, members)
+        start_cluster_with_retry(@ra_system, :rolling_rotation_cluster, @machine, members)
 
       assert length(started) == @cluster_size,
              "All #{@cluster_size} members should start, not_started: #{inspect(not_started)}"
@@ -458,7 +458,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       members = for i <- 1..@cluster_size, do: {:"qb_member_#{i}", node()}
 
       {:ok, _started, []} =
-        :ra.start_cluster(@ra_system, :quorum_boundary_cluster, @machine, members)
+        start_cluster_with_retry(@ra_system, :quorum_boundary_cluster, @machine, members)
 
       leader = wait_for_stable_leader(members)
 
@@ -520,7 +520,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       members = for i <- 1..@cluster_size, do: {:"del_member_#{i}", node()}
 
       {:ok, _started, []} =
-        :ra.start_cluster(@ra_system, :delete_rotation_cluster, @machine, members)
+        start_cluster_with_retry(@ra_system, :delete_rotation_cluster, @machine, members)
 
       leader = wait_for_stable_leader(members)
 
@@ -594,7 +594,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       members = for i <- 1..@cluster_size, do: {:"batch_member_#{i}", node()}
 
       {:ok, _started, []} =
-        :ra.start_cluster(@ra_system, :batch_rotation_cluster, @machine, members)
+        start_cluster_with_retry(@ra_system, :batch_rotation_cluster, @machine, members)
 
       leader = wait_for_stable_leader(members)
 
@@ -630,6 +630,43 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       Logger.info("[Batch writes] Batch replication verified")
 
       cleanup_members(members)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Cluster start helper (retries on :cluster_not_formed)
+  # ---------------------------------------------------------------------------
+
+  defp start_cluster_with_retry(system, name, machine, members, attempts \\ 3) do
+    case :ra.start_cluster(system, name, machine, members) do
+      {:ok, _, _} = result ->
+        result
+
+      {:error, :cluster_not_formed} when attempts > 1 ->
+        # Clean up and retry — servers started but couldn't elect leader
+        for {_server_name, _node} = id <- members do
+          try do
+            :ra.stop_server(system, id)
+          catch
+            _, _ -> :ok
+          end
+
+          try do
+            :ra.force_delete_server(system, id)
+          catch
+            _, _ -> :ok
+          end
+        end
+
+        Process.sleep(500)
+        start_cluster_with_retry(system, name, machine, members, attempts - 1)
+
+      {:error, :cluster_not_formed} ->
+        # Also try start_or_restart_cluster as fallback
+        :ra.start_or_restart_cluster(system, name, machine, members)
+
+      other ->
+        other
     end
   end
 
@@ -688,16 +725,16 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
     query_leader_via(leader)
   end
 
+  @query_mfa {Ferricstore.Test.KvMachine, :identity, []}
+
   # Performs a consistent query via a specific member (should be leader or will redirect).
   defp query_leader_via(member) do
-    query_fn = fn state -> state end
-
-    case :ra.consistent_query(member, query_fn, @ra_timeout) do
+    case :ra.consistent_query(member, @query_mfa, @ra_timeout) do
       {:ok, {_, state}, _} -> state
       {:ok, state, _} -> state
       {:timeout, _} ->
         # Retry with longer timeout
-        case :ra.consistent_query(member, query_fn, @ra_timeout * 2) do
+        case :ra.consistent_query(member, @query_mfa, @ra_timeout * 2) do
           {:ok, {_, state}, _} -> state
           {:ok, state, _} -> state
           other -> raise "Consistent query failed on #{inspect(member)}: #{inspect(other)}"
