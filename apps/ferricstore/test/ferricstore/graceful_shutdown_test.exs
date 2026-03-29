@@ -3,8 +3,9 @@ defmodule Ferricstore.GracefulShutdownTest do
   Tests that graceful shutdown preserves all data and that restart
   resumes from the same point — no data loss, no duplicate processing.
 
-  These tests write data, call FerricStore.shutdown(), stop and restart
-  the relevant processes, and verify all data is intact.
+  Each test runs in a fresh temp data directory to avoid contamination
+  from other tests. Shards are restarted with the clean dir before
+  each test and restored to the original dir after.
   """
 
   use ExUnit.Case, async: false
@@ -14,41 +15,25 @@ defmodule Ferricstore.GracefulShutdownTest do
 
   setup do
     ShardHelpers.wait_shards_alive()
-    ShardHelpers.flush_all_keys()
+
+    # Save original data_dir and switch to a fresh temp dir
+    original_dir = Application.get_env(:ferricstore, :data_dir)
+    tmp_dir = Path.join(System.tmp_dir!(), "gsd_test_#{:rand.uniform(9_999_999)}")
+    File.mkdir_p!(tmp_dir)
+    Application.put_env(:ferricstore, :data_dir, tmp_dir)
+
+    # Restart shards so they pick up the new data_dir
+    restart_all_shards()
 
     on_exit(fn ->
-      ShardHelpers.wait_shards_alive()
+      # Restore original data_dir and restart shards
+      Application.put_env(:ferricstore, :data_dir, original_dir)
+      restart_all_shards()
+      File.rm_rf(tmp_dir)
     end)
   end
 
-  defp ukey(base), do: "gsd_#{base}_#{:rand.uniform(9_999_999)}"
-
-  # Simulates a graceful shutdown + restart cycle.
-  # Calls prep_stop (flushes everything), then kills all shards via
-  # supervisor restart. On restart, shards recover from disk + WAL.
-  # Waits until all ETS entries across all shards have been flushed to disk
-  # (file_id is a real integer, not :pending). This ensures BitcaskWriter has
-  # finished its async writes before we proceed to kill shards.
-  defp await_all_writes_on_disk do
-    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
-
-    ShardHelpers.eventually(fn ->
-      Enum.all?(0..(shard_count - 1), fn i ->
-        keydir = :"keydir_#{i}"
-        pending = :ets.select_count(keydir, [{{:_, :_, :_, :_, :pending, :_, :_}, [], [true]}])
-        pending == 0
-      end)
-    end, "all ETS entries should have real file_id (not :pending)", 50, 100)
-  end
-
-  defp shutdown_and_restart do
-    # Graceful flush — batchers, writers, shards, WAL
-    Ferricstore.Application.prep_stop(nil)
-
-    # Wait for all async BitcaskWriter writes to finish updating ETS
-    await_all_writes_on_disk()
-
-    # Kill all shards (simulates process restart after shutdown)
+  defp restart_all_shards do
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
 
     for i <- 0..(shard_count - 1) do
@@ -58,17 +43,33 @@ defmodule Ferricstore.GracefulShutdownTest do
       if pid && Process.alive?(pid) do
         ref = Process.monitor(pid)
         Process.exit(pid, :kill)
-
-        receive do
-          {:DOWN, ^ref, _, _, _} -> :ok
-        after
-          5_000 -> :ok
-        end
+        receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
       end
     end
 
-    # Wait for full write path readiness: shards alive + raft leaders +
-    # a real write succeeds through the Batcher → ra → Bitcask pipeline.
+    ShardHelpers.wait_shards_alive(30_000)
+    Ferricstore.Health.set_ready(true)
+  end
+
+  defp ukey(base), do: "gsd_#{base}_#{:rand.uniform(9_999_999)}"
+
+  defp shutdown_and_restart do
+    Ferricstore.Application.prep_stop(nil)
+
+    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+
+    for i <- 0..(shard_count - 1) do
+      name = Router.shard_name(i)
+      pid = Process.whereis(name)
+
+      if pid && Process.alive?(pid) do
+        ref = Process.monitor(pid)
+        Process.exit(pid, :kill)
+        receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
+      end
+    end
+
+    # Wait for full readiness: shards alive + raft leaders + write path works
     ShardHelpers.eventually(fn ->
       shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
 
@@ -91,7 +92,6 @@ defmodule Ferricstore.GracefulShutdownTest do
       end
     end, "full write path should be ready after restart", 300, 200)
 
-    # NOW mark ready — everything is actually up
     Ferricstore.Health.set_ready(true)
   end
 
@@ -154,7 +154,6 @@ defmodule Ferricstore.GracefulShutdownTest do
   describe "TTL survives graceful shutdown" do
     test "key with TTL still has TTL after restart" do
       k = ukey("ttl")
-      # Set with 60 second TTL — won't expire during test
       Router.put(k, "with_ttl", 60_000 + System.os_time(:millisecond))
       ShardHelpers.flush_all_shards()
 

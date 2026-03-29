@@ -2,12 +2,8 @@ defmodule FerricstoreServer.GracefulShutdownTest do
   @moduledoc """
   Tests that the TCP server shuts down gracefully and resumes correctly.
 
-  Verifies:
-  - Data written via TCP survives shutdown + restart
-  - Listener suspends (rejects new connections during shutdown)
-  - Active connections get grace period
-  - Server accepts connections again after restart
-  - Data from before and after restart coexist
+  Each test runs in a fresh temp data directory to avoid contamination
+  from other tests.
   """
 
   use ExUnit.Case, async: false
@@ -18,13 +14,43 @@ defmodule FerricstoreServer.GracefulShutdownTest do
 
   setup do
     ShardHelpers.wait_shards_alive()
-    ShardHelpers.flush_all_keys()
+
+    # Save original data_dir and switch to a fresh temp dir
+    original_dir = Application.get_env(:ferricstore, :data_dir)
+    tmp_dir = Path.join(System.tmp_dir!(), "gsd_tcp_test_#{:rand.uniform(9_999_999)}")
+    File.mkdir_p!(tmp_dir)
+    Application.put_env(:ferricstore, :data_dir, tmp_dir)
+
+    restart_all_shards()
     Ferricstore.Health.set_ready(true)
 
     on_exit(fn ->
+      Application.put_env(:ferricstore, :data_dir, original_dir)
+      restart_all_shards()
       Ferricstore.Health.set_ready(true)
-      ShardHelpers.wait_shards_alive()
+      File.rm_rf(tmp_dir)
     end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Shard lifecycle helpers
+  # ---------------------------------------------------------------------------
+
+  defp restart_all_shards do
+    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+
+    for i <- 0..(shard_count - 1) do
+      name = Ferricstore.Store.Router.shard_name(i)
+      pid = Process.whereis(name)
+
+      if pid && Process.alive?(pid) do
+        ref = Process.monitor(pid)
+        Process.exit(pid, :kill)
+        receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
+      end
+    end
+
+    ShardHelpers.wait_shards_alive(30_000)
   end
 
   # ---------------------------------------------------------------------------
@@ -80,29 +106,9 @@ defmodule FerricstoreServer.GracefulShutdownTest do
     recv_response(sock)
   end
 
-
-  defp await_all_writes_on_disk do
-    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
-
-    Ferricstore.Test.ShardHelpers.eventually(fn ->
-      Enum.all?(0..(shard_count - 1), fn i ->
-        keydir = :"keydir_#{i}"
-        pending = :ets.select_count(keydir, [{{:_, :_, :_, :_, :pending, :_, :_}, [], [true]}])
-        pending == 0
-      end)
-    end, "all ETS entries should have real file_id (not :pending)", 50, 100)
-  end
-
   defp shutdown_and_restart do
-    # Graceful core shutdown (flush batchers, writers, shards, WAL)
-    # We skip server prep_stop (suspend_listener) because we need the
-    # listener to stay active for reconnection after restart.
     Ferricstore.Application.prep_stop(nil)
 
-    # Wait for all async BitcaskWriter writes to finish updating ETS
-    await_all_writes_on_disk()
-
-    # Kill all shards to simulate process restart
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
 
     for i <- 0..(shard_count - 1) do
@@ -116,8 +122,7 @@ defmodule FerricstoreServer.GracefulShutdownTest do
       end
     end
 
-    # Wait for full write path readiness: shards alive + raft leaders +
-    # a real write succeeds through the Batcher → ra → Bitcask pipeline.
+    # Wait for full readiness
     ShardHelpers.eventually(fn ->
       shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
 
@@ -126,14 +131,12 @@ defmodule FerricstoreServer.GracefulShutdownTest do
         alive = is_pid(pid) and Process.alive?(pid)
 
         alive and try do
-          # Verify ra leader is elected
           server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
           match?({:ok, _, _}, :ra.members(server_id, 200))
         catch
           :exit, _ -> false
         end
       end) and try do
-        # Verify end-to-end write path works (Batcher → ra → Bitcask)
         Ferricstore.Store.Router.put("__readiness_probe__", "ok", 0)
         Ferricstore.Store.Router.delete("__readiness_probe__")
         true
