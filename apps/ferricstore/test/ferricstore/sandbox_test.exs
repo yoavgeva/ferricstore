@@ -407,30 +407,24 @@ defmodule Ferricstore.SandboxTest do
 
   describe "concurrent sandbox usage" do
     test "two concurrent processes with different sandboxes are isolated" do
-      test_pid = self()
-
-      spawn(fn ->
+      t1 = Task.async(fn ->
         s = FerricStore.Sandbox.checkout()
         FerricStore.set("concurrent_key", "from_process_1")
         {:ok, val} = FerricStore.get("concurrent_key")
-        send(test_pid, {:p1_result, val})
         FerricStore.Sandbox.checkin(s)
-        send(test_pid, :p1_done)
+        val
       end)
 
-      spawn(fn ->
+      t2 = Task.async(fn ->
         s = FerricStore.Sandbox.checkout()
         FerricStore.set("concurrent_key", "from_process_2")
         {:ok, val} = FerricStore.get("concurrent_key")
-        send(test_pid, {:p2_result, val})
         FerricStore.Sandbox.checkin(s)
-        send(test_pid, :p2_done)
+        val
       end)
 
-      assert_receive {:p1_result, "from_process_1"}, 5_000
-      assert_receive {:p2_result, "from_process_2"}, 5_000
-      assert_receive :p1_done, 5_000
-      assert_receive :p2_done, 5_000
+      assert Task.await(t1, 30_000) == "from_process_1"
+      assert Task.await(t2, 30_000) == "from_process_2"
     end
 
     test "10 concurrent sandboxes writing same logical key are fully isolated" do

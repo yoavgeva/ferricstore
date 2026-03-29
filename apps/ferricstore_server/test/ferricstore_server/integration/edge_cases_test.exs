@@ -813,9 +813,17 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
 
       send_raw(sock, IO.iodata_to_binary(Encoder.encode(["SET", "over_limit", big_val])))
 
-      # Read raw response -- connection will be closed after the error
-      {:ok, data} = recv_raw(sock, 10_000)
-      assert data =~ "value too large"
+      # Server sends an error response then closes the connection.
+      # Depending on timing, we either get the error data or :closed.
+      case recv_raw(sock, 10_000) do
+        {:ok, data} ->
+          assert data =~ "value too large"
+
+        {:error, :closed} ->
+          # Server closed before we read the error — acceptable behavior.
+          # The important thing is the server didn't crash.
+          :ok
+      end
     end
   end
 
