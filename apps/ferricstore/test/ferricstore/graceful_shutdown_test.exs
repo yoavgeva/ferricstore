@@ -67,8 +67,8 @@ defmodule Ferricstore.GracefulShutdownTest do
       end
     end
 
-    # Wait for all infrastructure to be ready before setting the ready flag.
-    # Use short ra timeout (200ms) to avoid burning 1s per shard per attempt.
+    # Wait for full write path readiness: shards alive + raft leaders +
+    # a real write succeeds through the Batcher → ra → Bitcask pipeline.
     ShardHelpers.eventually(fn ->
       shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
 
@@ -82,8 +82,14 @@ defmodule Ferricstore.GracefulShutdownTest do
         catch
           :exit, _ -> false
         end
-      end)
-    end, "shards + raft leaders should be ready after restart", 300, 200)
+      end) and try do
+        Router.put("__readiness_probe__", "ok", 0)
+        Router.delete("__readiness_probe__")
+        true
+      catch
+        :exit, _ -> false
+      end
+    end, "full write path should be ready after restart", 300, 200)
 
     # NOW mark ready — everything is actually up
     Ferricstore.Health.set_ready(true)
