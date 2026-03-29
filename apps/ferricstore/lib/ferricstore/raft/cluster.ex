@@ -106,7 +106,12 @@ defmodule Ferricstore.Raft.Cluster do
       initial_members: [server_id],
       machine: {:module, Ferricstore.Raft.StateMachine, machine_config},
       log_init_args: %{uid: shard_uid(shard_index)},
-      system: ra_sys
+      system: ra_sys,
+      # Recovery checkpoints: written during graceful shutdown, skip WAL
+      # replay on restart. Zero cost during normal operation. Default 0
+      # (disabled) in ra — we enable with a low threshold so any ordered
+      # shutdown writes a checkpoint.
+      min_recovery_checkpoint_interval: 1
     }
 
     case :ra.start_server(ra_sys, server_config) do
