@@ -527,28 +527,7 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
     end
   end
 
-  # ===========================================================================
-  # ERR-005: NOLEADER — skipped (cluster only, single-node)
-  # ===========================================================================
-
-  describe "ERR-005: NOLEADER write (cluster only)" do
-    @tag :skip
-    test "write without leader returns NOLEADER" do
-      # Cluster-only scenario. Would require killing the Raft leader
-      # and immediately issuing a write command.
-      :ok
-    end
-  end
-
-  # ===========================================================================
-  # ERR-018: CLUSTERDOWN — skipped (cluster only)
-  # ===========================================================================
-
-  describe "ERR-018: CLUSTERDOWN (cluster only)" do
-    @tag :skip
-    test "command during cluster partition returns CLUSTERDOWN" do
-      # Cluster-only scenario.
-      :ok
-    end
-  end
+  # ERR-005: NOLEADER and ERR-018: CLUSTERDOWN are cluster-only error codes.
+  # They require multi-node :peer clusters and are covered by cluster tests
+  # (mix test --include cluster).
 end
