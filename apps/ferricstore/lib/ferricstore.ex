@@ -122,6 +122,25 @@ defmodule FerricStore do
     Ferricstore.Health.ready?()
   end
 
+  @doc """
+  Gracefully shuts down FerricStore, flushing all pending data to disk.
+
+  Flushes Raft batchers, BitcaskWriters, shard pending writes, and
+  triggers a WAL rollover. Call before stopping the application to
+  ensure zero data loss.
+
+  ## Examples
+
+      FerricStore.shutdown()
+      Application.stop(:ferricstore)
+
+  """
+  @spec shutdown() :: :ok
+  def shutdown do
+    Ferricstore.Application.prep_stop(nil)
+    :ok
+  end
+
   # ---------------------------------------------------------------------------
   # Types
   # ---------------------------------------------------------------------------

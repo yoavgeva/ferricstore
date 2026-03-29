@@ -217,15 +217,63 @@ defmodule Ferricstore.Application do
 
   @impl true
   def prep_stop(state) do
-    # Mark the node as not ready so Kubernetes stops routing traffic
-    # before the supervision tree begins shutting down.
+    t0 = System.monotonic_time(:millisecond)
+
+    # Step 1: Mark not ready — Kubernetes stops routing traffic
     Ferricstore.Health.set_ready(false)
+    Logger.info("Shutdown: marked not ready")
 
     :telemetry.execute(
       [:ferricstore, :node, :shutdown_started],
-      %{uptime_ms: System.monotonic_time(:millisecond)},
+      %{uptime_ms: t0},
       %{}
     )
+
+    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+
+    # Step 2: Flush all Raft batchers — drain pending commands to Raft
+    for i <- 0..(shard_count - 1) do
+      try do
+        Ferricstore.Raft.Batcher.flush(i)
+      catch
+        :exit, _ -> :ok
+      end
+    end
+    Logger.info("Shutdown: batchers flushed")
+
+    # Step 3: Flush all BitcaskWriters — drain deferred disk writes
+    try do
+      Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
+    catch
+      :exit, _ -> :ok
+    end
+    Logger.info("Shutdown: BitcaskWriters flushed")
+
+    # Step 4: Flush all shards — hint files + fsync
+    # (terminate/1 on each shard will also do this, but doing it here
+    # while the system is still healthy is more reliable)
+    for i <- 0..(shard_count - 1) do
+      name = Ferricstore.Store.Router.shard_name(i)
+      try do
+        GenServer.call(name, :flush, 5_000)
+      catch
+        :exit, _ -> :ok
+      end
+    end
+    Logger.info("Shutdown: shards flushed")
+
+    # Step 5: Force WAL rollover so segment writer can flush mem tables
+    try do
+      wal_name = :ra_system.derive_names(Ferricstore.Raft.Cluster.system_name()).wal
+      :ra_log_wal.force_roll_over(wal_name)
+      Process.sleep(200)
+    catch
+      _, _ -> :ok
+    end
+    Logger.info("Shutdown: WAL rolled over")
+
+    elapsed = System.monotonic_time(:millisecond) - t0
+    Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
     state
   end
