@@ -302,9 +302,18 @@ defmodule Ferricstore.Application do
     try do
       names = :ra_system.derive_names(Ferricstore.Raft.Cluster.system_name())
       :ra_log_wal.force_roll_over(names.wal)
-      :ra_log_segment_writer.await(names.segment_writer)
+
+      try do
+        :ra_log_segment_writer.await(names.segment_writer)
+      catch
+        :exit, {:timeout, _} ->
+          Logger.error("Shutdown: segment writer await timed out after 60s — WAL data may not be fully flushed to segments")
+        :exit, {:noproc, _} ->
+          Logger.warning("Shutdown: segment writer not running, skipping await")
+      end
     catch
-      _, _ -> :ok
+      _, reason ->
+        Logger.warning("Shutdown: WAL rollover failed: #{inspect(reason)}")
     end
     Logger.info("Shutdown: WAL rolled over + segment writer drained")
 
