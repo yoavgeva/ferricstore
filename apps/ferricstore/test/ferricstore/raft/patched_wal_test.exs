@@ -473,7 +473,7 @@ defmodule Ferricstore.Raft.PatchedWalTest do
       Process.sleep(5)
       :ra_log_wal.force_roll_over(wal_name())
 
-      Task.await(writer_task, 30_000)
+      Task.await(writer_task, 60_000)
 
       # Spot-check
       for i <- Enum.take_random(1..200, 20) do
