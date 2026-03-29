@@ -249,6 +249,37 @@ defmodule Ferricstore.Application do
     end
     Logger.info("Shutdown: BitcaskWriters flushed")
 
+    # Step 3b: Fsync all active Bitcask log files.
+    # BitcaskWriter uses v2_append_batch_nosync (data in OS page cache only).
+    # Without fsync, a subsequent Process.exit(:kill) can lose unsynced data
+    # on Linux (Docker overlayfs). macOS APFS retains page cache across kills.
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+
+    for i <- 0..(shard_count - 1) do
+      try do
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
+        active_file_path = :persistent_term.get({:ferricstore_active_file_path, i}, nil)
+
+        if active_file_path && File.exists?(active_file_path) do
+          Ferricstore.Bitcask.NIF.v2_fsync(active_file_path)
+        else
+          # Fallback: fsync all log files in the shard directory
+          case File.ls(shard_path) do
+            {:ok, files} ->
+              files
+              |> Enum.filter(&String.ends_with?(&1, ".log"))
+              |> Enum.each(fn f ->
+                Ferricstore.Bitcask.NIF.v2_fsync(Path.join(shard_path, f))
+              end)
+            _ -> :ok
+          end
+        end
+      catch
+        _, _ -> :ok
+      end
+    end
+    Logger.info("Shutdown: Bitcask files fsynced")
+
     # Step 4: Flush all shards — hint files + fsync
     # (terminate/1 on each shard will also do this, but doing it here
     # while the system is still healthy is more reliable)

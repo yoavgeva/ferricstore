@@ -316,6 +316,8 @@ defmodule Ferricstore.Store.Shard do
           |> Enum.filter(&String.ends_with?(&1, ".log"))
           |> Enum.sort()
 
+        Logger.debug("Shard #{shard_index}: recover_keydir scanning #{length(log_files)} log file(s) at #{shard_path}")
+
         # Try hint files first for faster recovery
         hint_files =
           files
@@ -359,9 +361,12 @@ defmodule Ferricstore.Store.Shard do
           end)
         end
 
-      {:error, _} ->
-        :ok
+      {:error, reason} ->
+        Logger.warning("Shard #{shard_index}: recover_keydir failed to list #{shard_path}: #{inspect(reason)}")
     end
+
+    ets_size = :ets.info(keydir, :size)
+    Logger.debug("Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}")
   end
 
   defp recover_from_log(shard_path, log_name, keydir, prefix_keys, shard_index) do

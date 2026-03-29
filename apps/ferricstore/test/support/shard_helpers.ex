@@ -36,6 +36,21 @@ defmodule Ferricstore.Test.ShardHelpers do
     # Also flush background BitcaskWriter processes so deferred writes
     # from StateMachine.apply are on disk before tests verify disk state.
     Ferricstore.Store.BitcaskWriter.flush_all()
+
+    # Fsync all active Bitcask log files. BitcaskWriter uses nosync writes
+    # (data in OS page cache only). Without explicit fsync, data can be lost
+    # if a shard is killed before the OS flushes to disk (especially on Linux).
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    for i <- 0..(shard_count - 1) do
+      try do
+        active_path = :persistent_term.get({:ferricstore_active_file_path, i}, nil)
+        if active_path && File.exists?(active_path) do
+          Ferricstore.Bitcask.NIF.v2_fsync(active_path)
+        end
+      catch
+        _, _ -> :ok
+      end
+    end
   end
 
   @doc """
