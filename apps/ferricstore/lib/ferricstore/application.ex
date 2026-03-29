@@ -293,15 +293,15 @@ defmodule Ferricstore.Application do
     end
     Logger.info("Shutdown: shards flushed")
 
-    # Step 5: Force WAL rollover so segment writer can flush mem tables.
+    # Step 5: Force WAL rollover.
+    # Triggers the WAL to close its current file and hand mem tables to the
+    # segment writer. The segment writer processes asynchronously, but this
+    # is safe: Bitcask data is already on disk (sync NIF in apply/3), and
+    # the ra WAL is fsynced by ra itself. The rollover just helps ra compact
+    # its log — not required for correctness.
     try do
       wal_name = :ra_system.derive_names(Ferricstore.Raft.Cluster.system_name()).wal
       :ra_log_wal.force_roll_over(wal_name)
-      # Give segment writer time to process the rolled WAL.
-      # Note: ra_log_segment_writer:await/1 blocks until the segment writer
-      # drains its mailbox, but this can interfere with ra server state during
-      # test restarts. The 500ms sleep is conservative but safe.
-      Process.sleep(500)
     catch
       _, _ -> :ok
     end
