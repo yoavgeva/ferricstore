@@ -467,4 +467,69 @@ defmodule Ferricstore.Test.ShardHelpers do
       end
     end
   end
+
+  @doc """
+  Sets up an isolated test environment with a fresh temp data directory.
+
+  Switches `Application.get_env(:ferricstore, :data_dir)` to a new temp dir
+  and restarts all shards so they pick up the clean directory. Returns a map
+  with `:original_dir` and `:tmp_dir` for use in `on_exit`.
+
+  Use in `setup` callbacks for tests that need complete isolation from other
+  tests (e.g. graceful shutdown, crash recovery):
+
+      setup do
+        ctx = ShardHelpers.setup_isolated_data_dir()
+
+        on_exit(fn ->
+          ShardHelpers.teardown_isolated_data_dir(ctx)
+        end)
+      end
+  """
+  @spec setup_isolated_data_dir() :: %{original_dir: binary(), tmp_dir: binary()}
+  def setup_isolated_data_dir do
+    wait_shards_alive()
+
+    original_dir = Application.get_env(:ferricstore, :data_dir)
+    tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_isolated_#{:rand.uniform(9_999_999)}")
+    File.mkdir_p!(tmp_dir)
+    Application.put_env(:ferricstore, :data_dir, tmp_dir)
+
+    kill_and_restart_all_shards()
+
+    %{original_dir: original_dir, tmp_dir: tmp_dir}
+  end
+
+  @doc """
+  Tears down the isolated test environment created by `setup_isolated_data_dir/0`.
+
+  Restores the original data directory, restarts shards, and deletes the temp dir.
+  """
+  @spec teardown_isolated_data_dir(%{original_dir: binary(), tmp_dir: binary()}) :: :ok
+  def teardown_isolated_data_dir(%{original_dir: original_dir, tmp_dir: tmp_dir}) do
+    Application.put_env(:ferricstore, :data_dir, original_dir)
+    kill_and_restart_all_shards()
+    File.rm_rf(tmp_dir)
+    :ok
+  end
+
+  # Kills all application-supervised shards and waits for the supervisor
+  # to restart them. Used by isolated data dir setup/teardown.
+  defp kill_and_restart_all_shards do
+    shard_count = shard_count()
+
+    for i <- 0..(shard_count - 1) do
+      name = Router.shard_name(i)
+      pid = Process.whereis(name)
+
+      if pid && Process.alive?(pid) do
+        ref = Process.monitor(pid)
+        Process.exit(pid, :kill)
+        receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
+      end
+    end
+
+    wait_shards_alive(30_000)
+    Ferricstore.Health.set_ready(true)
+  end
 end

@@ -14,41 +14,8 @@ defmodule Ferricstore.GracefulShutdownTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup do
-    ShardHelpers.wait_shards_alive()
-
-    # Save original data_dir and switch to a fresh temp dir
-    original_dir = Application.get_env(:ferricstore, :data_dir)
-    tmp_dir = Path.join(System.tmp_dir!(), "gsd_test_#{:rand.uniform(9_999_999)}")
-    File.mkdir_p!(tmp_dir)
-    Application.put_env(:ferricstore, :data_dir, tmp_dir)
-
-    # Restart shards so they pick up the new data_dir
-    restart_all_shards()
-
-    on_exit(fn ->
-      # Restore original data_dir and restart shards
-      Application.put_env(:ferricstore, :data_dir, original_dir)
-      restart_all_shards()
-      File.rm_rf(tmp_dir)
-    end)
-  end
-
-  defp restart_all_shards do
-    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
-
-    for i <- 0..(shard_count - 1) do
-      name = Router.shard_name(i)
-      pid = Process.whereis(name)
-
-      if pid && Process.alive?(pid) do
-        ref = Process.monitor(pid)
-        Process.exit(pid, :kill)
-        receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
-      end
-    end
-
-    ShardHelpers.wait_shards_alive(30_000)
-    Ferricstore.Health.set_ready(true)
+    ctx = ShardHelpers.setup_isolated_data_dir()
+    on_exit(fn -> ShardHelpers.teardown_isolated_data_dir(ctx) end)
   end
 
   defp ukey(base), do: "gsd_#{base}_#{:rand.uniform(9_999_999)}"
