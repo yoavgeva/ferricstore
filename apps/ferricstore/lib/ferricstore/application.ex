@@ -293,15 +293,22 @@ defmodule Ferricstore.Application do
     end
     Logger.info("Shutdown: shards flushed")
 
-    # Step 5: Force WAL rollover.
-    # Triggers the WAL to close its current file and hand mem tables to the
-    # segment writer. The segment writer processes asynchronously, but this
-    # is safe: Bitcask data is already on disk (sync NIF in apply/3), and
-    # the ra WAL is fsynced by ra itself. The rollover just helps ra compact
-    # its log — not required for correctness.
+    # Step 5: Force WAL rollover and poll until segment writer finishes.
+    # After force_roll_over, the old WAL file is handed to the segment writer.
+    # When the segment writer finishes processing it, the old WAL file is deleted.
+    # We poll for the old file's deletion — concrete, no side effects.
     try do
+      ra_dir = Path.join(data_dir, "ra")
       wal_name = :ra_system.derive_names(Ferricstore.Raft.Cluster.system_name()).wal
+
+      # Snapshot WAL files before rollover
+      wal_files_before = list_wal_files(ra_dir)
+
       :ra_log_wal.force_roll_over(wal_name)
+
+      # Poll until the pre-rollover WAL files are deleted by segment writer.
+      # Max 5s (100 × 50ms). Logs warning on timeout.
+      await_wal_files_consumed(ra_dir, wal_files_before, 100, 50)
     catch
       _, _ -> :ok
     end
@@ -332,6 +339,29 @@ defmodule Ferricstore.Application do
     Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
     state
+  end
+
+  defp list_wal_files(ra_dir) do
+    case File.ls(ra_dir) do
+      {:ok, files} -> Enum.filter(files, &String.ends_with?(&1, ".wal"))
+      _ -> []
+    end
+  end
+
+  defp await_wal_files_consumed(_ra_dir, [], _max, _interval), do: :ok
+  defp await_wal_files_consumed(_ra_dir, _old_files, 0, _interval) do
+    Logger.warning("Shutdown: segment writer still processing WAL files after timeout")
+  end
+  defp await_wal_files_consumed(ra_dir, old_files, attempts, interval) do
+    current = list_wal_files(ra_dir)
+    remaining = Enum.filter(old_files, fn f -> f in current end)
+
+    if remaining == [] do
+      :ok
+    else
+      Process.sleep(interval)
+      await_wal_files_consumed(ra_dir, old_files, attempts - 1, interval)
+    end
   end
 
   defp check_snapshot_gap(shard_index, overview) do
