@@ -75,6 +75,43 @@ defmodule Ferricstore.HealthReadinessTest do
     end
   end
 
+  describe "FerricStore.await_ready/1" do
+    test "returns :ok when system is ready" do
+      assert FerricStore.await_ready(timeout: 5_000) == :ok
+    end
+
+    test "returns :ok quickly (not waiting full timeout)" do
+      {elapsed, :ok} = :timer.tc(fn -> FerricStore.await_ready(timeout: 10_000) end)
+      assert elapsed < 5_000_000, "should return in <5s, took #{div(elapsed, 1000)}ms"
+    end
+
+    test "raises on timeout when not ready" do
+      Health.set_ready(false)
+
+      assert_raise RuntimeError, ~r/not ready/, fn ->
+        FerricStore.await_ready(timeout: 500, interval: 50)
+      end
+
+      Health.set_ready(true)
+    end
+  end
+
+  describe "FerricStore.health/0" do
+    test "returns health map" do
+      result = FerricStore.health()
+      assert is_map(result)
+      assert Map.has_key?(result, :status)
+      assert Map.has_key?(result, :shard_count)
+      assert Map.has_key?(result, :shards)
+    end
+  end
+
+  describe "FerricStore.ready?/0" do
+    test "returns boolean" do
+      assert is_boolean(FerricStore.ready?())
+    end
+  end
+
   describe "Health.ready?/0" do
     test "returns true when set" do
       Health.set_ready(true)

@@ -33,6 +33,96 @@ defmodule FerricStore do
   alias Ferricstore.Store.Router
 
   # ---------------------------------------------------------------------------
+  # Readiness
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Blocks until FerricStore is fully ready to serve requests.
+
+  Polls `Health.check/0` until all shards are alive and all Raft leaders
+  are elected. Returns `:ok` when ready, raises on timeout.
+
+  Call this in your application's `start/2` after FerricStore is in your
+  supervision tree, or in test setup, to ensure writes won't fail.
+
+  ## Options
+
+    * `:timeout` - max milliseconds to wait (default: 30_000)
+    * `:interval` - polling interval in ms (default: 100)
+
+  ## Examples
+
+      # In your Application.start/2:
+      def start(_type, _args) do
+        children = [
+          {FerricStore, []},
+          MyApp.Repo,
+          MyAppWeb.Endpoint
+        ]
+        opts = [strategy: :one_for_one, name: MyApp.Supervisor]
+        {:ok, pid} = Supervisor.start_link(children, opts)
+
+        FerricStore.await_ready()
+        {:ok, pid}
+      end
+
+      # With custom timeout:
+      FerricStore.await_ready(timeout: 60_000)
+
+  """
+  @spec await_ready(keyword()) :: :ok
+  def await_ready(opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 30_000)
+    interval = Keyword.get(opts, :interval, 100)
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    do_await_ready(deadline, interval)
+  end
+
+  defp do_await_ready(deadline, interval) do
+    case Ferricstore.Health.check() do
+      %{status: :ok} ->
+        :ok
+
+      _ ->
+        if System.monotonic_time(:millisecond) > deadline do
+          raise "FerricStore not ready within timeout. Check shard health with FerricStore.health()"
+        end
+
+        Process.sleep(interval)
+        do_await_ready(deadline, interval)
+    end
+  end
+
+  @doc """
+  Returns the current health status without blocking.
+
+  ## Examples
+
+      iex> FerricStore.health()
+      %{status: :ok, shard_count: 4, shards: [...], uptime_seconds: 120}
+
+  """
+  @spec health() :: Ferricstore.Health.health_result()
+  def health do
+    Ferricstore.Health.check()
+  end
+
+  @doc """
+  Returns `true` if FerricStore is ready to serve requests.
+
+  ## Examples
+
+      iex> FerricStore.ready?()
+      true
+
+  """
+  @spec ready?() :: boolean()
+  def ready? do
+    Ferricstore.Health.ready?()
+  end
+
+  # ---------------------------------------------------------------------------
   # Types
   # ---------------------------------------------------------------------------
 
