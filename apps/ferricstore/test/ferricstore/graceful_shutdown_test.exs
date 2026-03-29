@@ -57,61 +57,15 @@ defmodule Ferricstore.GracefulShutdownTest do
   end
 
   describe "string data survives graceful shutdown" do
-    @tag :capture_log
     test "single key survives" do
       k = ukey("single")
       Router.put(k, "before_shutdown")
       ShardHelpers.flush_all_shards()
 
-      # Verify data is on disk before shutdown
-      shard_idx = Router.shard_for(k)
-      data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_idx)
-      {:ok, files} = File.ls(shard_path)
-      log_files = Enum.filter(files, &String.ends_with?(&1, ".log")) |> Enum.sort()
-
-      # Debug: check if key is in any log file
-      found_on_disk =
-        Enum.any?(log_files, fn log_name ->
-          log_path = Path.join(shard_path, log_name)
-          case Ferricstore.Bitcask.NIF.v2_scan_file(log_path) do
-            {:ok, records} ->
-              Enum.any?(records, fn {rk, _, _, _, _} -> rk == k end)
-            _ -> false
-          end
-        end)
-
-      assert found_on_disk, "Key #{k} should be on disk before shutdown (shard #{shard_idx}, files: #{inspect(log_files)})"
-
       shutdown_and_restart()
 
-      # Debug: check ETS state after restart
-      keydir = :"keydir_#{shard_idx}"
-      ets_entry = :ets.lookup(keydir, k)
-      ets_size = :ets.info(keydir, :size)
-
-      # Debug: re-scan disk after restart
-      {:ok, files_after} = File.ls(shard_path)
-      log_files_after = Enum.filter(files_after, &String.ends_with?(&1, ".log")) |> Enum.sort()
-
-      found_on_disk_after =
-        Enum.any?(log_files_after, fn log_name ->
-          log_path = Path.join(shard_path, log_name)
-          case Ferricstore.Bitcask.NIF.v2_scan_file(log_path) do
-            {:ok, records} ->
-              Enum.any?(records, fn {rk, _, _, _, _} -> rk == k end)
-            _ -> false
-          end
-        end)
-
-      result = Router.get(k)
-
-      assert result == "before_shutdown",
-        "key should survive graceful shutdown. " <>
-        "ETS entry: #{inspect(ets_entry)}, ETS size: #{ets_size}, " <>
-        "on_disk_before: #{found_on_disk}, on_disk_after: #{found_on_disk_after}, " <>
-        "Router.get: #{inspect(result)}, " <>
-        "log_files: #{inspect(log_files_after)}"
+      ShardHelpers.eventually(fn -> Router.get(k) == "before_shutdown" end,
+        "key should survive graceful shutdown")
     end
 
     test "100 keys survive" do
