@@ -68,27 +68,22 @@ defmodule Ferricstore.GracefulShutdownTest do
     end
 
     # Wait for all infrastructure to be ready before setting the ready flag.
-    # Health.check with ready=false returns :starting, so we check the
-    # individual components directly first.
+    # Use short ra timeout (200ms) to avoid burning 1s per shard per attempt.
     ShardHelpers.eventually(fn ->
       shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
 
-      shards_alive = Enum.all?(0..(shard_count_val - 1), fn i ->
+      Enum.all?(0..(shard_count_val - 1), fn i ->
         pid = Process.whereis(Router.shard_name(i))
-        is_pid(pid) and Process.alive?(pid)
-      end)
+        alive = is_pid(pid) and Process.alive?(pid)
 
-      raft_ready = shards_alive and Enum.all?(0..(shard_count_val - 1), fn i ->
-        try do
+        alive and try do
           server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-          match?({:ok, _, _}, :ra.members(server_id, 1_000))
+          match?({:ok, _, _}, :ra.members(server_id, 200))
         catch
           :exit, _ -> false
         end
       end)
-
-      shards_alive and raft_ready
-    end, "shards + raft leaders should be ready after restart", 200, 100)
+    end, "shards + raft leaders should be ready after restart", 300, 200)
 
     # NOW mark ready — everything is actually up
     Ferricstore.Health.set_ready(true)
