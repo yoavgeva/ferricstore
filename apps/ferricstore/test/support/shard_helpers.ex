@@ -486,30 +486,46 @@ defmodule Ferricstore.Test.ShardHelpers do
         end)
       end
   """
-  @spec setup_isolated_data_dir() :: %{original_dir: binary(), tmp_dir: binary()}
+  @spec setup_isolated_data_dir() :: :ok
   def setup_isolated_data_dir do
     wait_shards_alive()
 
-    original_dir = Application.get_env(:ferricstore, :data_dir)
-    tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_isolated_#{:rand.uniform(9_999_999)}")
-    File.mkdir_p!(tmp_dir)
-    Application.put_env(:ferricstore, :data_dir, tmp_dir)
+    # Wipe all shard data directories and restart shards.
+    # This gives each test a clean filesystem — no stale log records
+    # from previous tests to confuse recover_keydir after restart.
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    shard_count = shard_count()
 
-    kill_and_restart_all_shards()
+    # Kill all shards first
+    for i <- 0..(shard_count - 1) do
+      name = Router.shard_name(i)
+      pid = Process.whereis(name)
+      if pid && Process.alive?(pid) do
+        ref = Process.monitor(pid)
+        Process.exit(pid, :kill)
+        receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
+      end
+    end
 
-    %{original_dir: original_dir, tmp_dir: tmp_dir}
+    # Wipe shard data directories (shards are dead, safe to delete)
+    for i <- 0..(shard_count - 1) do
+      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
+      File.rm_rf!(shard_path)
+    end
+
+    # Supervisor restarts shards with fresh empty dirs
+    wait_shards_alive(30_000)
+    Ferricstore.Health.set_ready(true)
+    :ok
   end
 
   @doc """
-  Tears down the isolated test environment created by `setup_isolated_data_dir/0`.
-
-  Restores the original data directory, restarts shards, and deletes the temp dir.
+  Tears down the isolated test environment. Ensures shards are alive
+  for the next test.
   """
-  @spec teardown_isolated_data_dir(%{original_dir: binary(), tmp_dir: binary()}) :: :ok
-  def teardown_isolated_data_dir(%{original_dir: original_dir, tmp_dir: tmp_dir}) do
-    Application.put_env(:ferricstore, :data_dir, original_dir)
-    kill_and_restart_all_shards()
-    File.rm_rf(tmp_dir)
+  @spec teardown_isolated_data_dir(:ok) :: :ok
+  def teardown_isolated_data_dir(:ok) do
+    wait_shards_alive()
     :ok
   end
 
