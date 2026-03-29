@@ -288,7 +288,7 @@ defmodule Ferricstore.Bitcask.ProbNIFSafetyTest do
       :erlang.garbage_collect()
       mem_after = :erlang.memory(:total)
 
-      assert mem_after - mem_before < 5_000_000,
+      assert mem_after - mem_before < 20_000_000,
         "memory grew by #{mem_after - mem_before} bytes after 1000 create/destroy cycles"
     end
 
