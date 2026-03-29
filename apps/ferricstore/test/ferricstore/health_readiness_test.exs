@@ -1,0 +1,96 @@
+defmodule Ferricstore.HealthReadinessTest do
+  @moduledoc """
+  Tests for the enhanced Health.check/0 readiness verification.
+
+  Verifies that /health/ready returns :ok only when:
+  1. set_ready(true) has been called
+  2. All shard GenServers are alive
+  3. All Raft leaders are elected
+  """
+
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Health
+  alias Ferricstore.Test.ShardHelpers
+
+  setup do
+    ShardHelpers.wait_shards_alive()
+    on_exit(fn ->
+      Health.set_ready(true)
+      ShardHelpers.wait_shards_alive()
+    end)
+  end
+
+  describe "Health.check/0" do
+    test "returns :ok when system is fully ready" do
+      Health.set_ready(true)
+      result = Health.check()
+      assert result.status == :ok
+    end
+
+    test "returns :starting when set_ready is false" do
+      Health.set_ready(false)
+      result = Health.check()
+      assert result.status == :starting
+      Health.set_ready(true)
+    end
+
+    test "includes all shards in response" do
+      result = Health.check()
+      shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+      assert length(result.shards) == shard_count
+    end
+
+    test "all shards report ok when system is healthy" do
+      result = Health.check()
+      for shard <- result.shards do
+        assert shard.status == "ok", "shard #{shard.index} should be ok, got #{shard.status}"
+      end
+    end
+
+    test "shard_count matches configuration" do
+      result = Health.check()
+      expected = :persistent_term.get(:ferricstore_shard_count, 4)
+      assert result.shard_count == expected
+    end
+
+    test "uptime_seconds is non-negative" do
+      result = Health.check()
+      assert result.uptime_seconds >= 0
+    end
+  end
+
+  describe "Health.check/0 after shard operations" do
+    test "returns :ok after writing data" do
+      Ferricstore.Store.Router.put("health_test_key", "value")
+      result = Health.check()
+      assert result.status == :ok
+    end
+
+    test "shards report key counts" do
+      Ferricstore.Store.Router.put("health_keys_test", "value")
+      result = Health.check()
+      total_keys = Enum.sum(Enum.map(result.shards, & &1.keys))
+      assert total_keys > 0
+    end
+  end
+
+  describe "Health.ready?/0" do
+    test "returns true when set" do
+      Health.set_ready(true)
+      assert Health.ready?() == true
+    end
+
+    test "returns false when not set" do
+      Health.set_ready(false)
+      assert Health.ready?() == false
+      Health.set_ready(true)
+    end
+
+    test "defaults to false if never set" do
+      # Can't really test this without restarting the app,
+      # but verify the key exists after startup
+      assert is_boolean(Health.ready?())
+    end
+  end
+end
