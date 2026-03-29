@@ -137,6 +137,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   # ============================================================================
 
   describe "scheduler safety: bloom NIFs run on Normal scheduler" do
+    @describetag :bench
     setup do
       dir = tmp_dir()
       on_exit(fn -> File.rm_rf(dir) end)
@@ -163,6 +164,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   end
 
   describe "scheduler safety: cuckoo NIFs run on Normal scheduler" do
+    @describetag :bench
     test "cuckoo operations stay off DirtyIo" do
       :erlang.system_flag(:scheduler_wall_time, true)
       Process.sleep(5)
@@ -188,6 +190,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   end
 
   describe "scheduler safety: CMS NIFs run on Normal scheduler" do
+    @describetag :bench
     test "CMS operations stay off DirtyIo" do
       :erlang.system_flag(:scheduler_wall_time, true)
       Process.sleep(5)
@@ -211,6 +214,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   end
 
   describe "scheduler safety: TopK NIFs run on Normal scheduler" do
+    @describetag :bench
     test "TopK operations stay off DirtyIo" do
       :erlang.system_flag(:scheduler_wall_time, true)
       Process.sleep(5)
@@ -233,6 +237,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   end
 
   describe "scheduler safety: TDigest NIFs run on Normal scheduler" do
+    @describetag :bench
     test "TDigest operations stay off DirtyIo" do
       :erlang.system_flag(:scheduler_wall_time, true)
       Process.sleep(5)
@@ -255,6 +260,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   end
 
   describe "scheduler safety: HNSW NIFs run on Normal scheduler" do
+    @describetag :bench
     test "HNSW operations stay off DirtyIo" do
       :erlang.system_flag(:scheduler_wall_time, true)
       Process.sleep(5)
@@ -281,6 +287,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   end
 
   describe "scheduler safety: tracking allocator runs on Normal scheduler" do
+    @describetag :bench
     test "rust_allocated_bytes stays off DirtyIo" do
       :erlang.system_flag(:scheduler_wall_time, true)
       Process.sleep(5)
@@ -700,6 +707,7 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   end
 
   describe "tracking allocator: reports allocation data" do
+    @describetag :bench
     test "rust_allocated_bytes returns a non-negative integer" do
       # With #[cfg(test)] on the global allocator, the cdylib uses System
       # allocator and the counter stays at 0. The NIF should still be callable.
