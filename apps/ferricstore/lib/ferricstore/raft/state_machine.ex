@@ -179,14 +179,14 @@ defmodule Ferricstore.Raft.StateMachine do
   """
   @impl true
   def apply(meta, {:put, key, value, expire_at_ms}, state) do
-    result = do_put(state, key, value, expire_at_ms)
+    result = with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:delete, key}, state) do
-    result = do_delete(state, key)
+    result = with_pending_writes(state, fn -> do_delete(state, key) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -195,10 +195,14 @@ defmodule Ferricstore.Raft.StateMachine do
   def apply(meta, {:batch, commands}, state) do
     old_count = state.applied_count
 
+    # All commands in a batch share one pending-writes buffer so they
+    # are flushed in a single v2_append_batch_nosync NIF call.
     {results, new_count} =
-      Enum.map_reduce(commands, old_count, fn cmd, count ->
-        result = apply_single(state, cmd)
-        {result, count + 1}
+      with_pending_writes(state, fn ->
+        Enum.map_reduce(commands, old_count, fn cmd, count ->
+          result = apply_single(state, cmd)
+          {result, count + 1}
+        end)
       end)
 
     new_state = %{state | applied_count: new_count}
@@ -207,6 +211,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:cross_shard_tx, shard_batches}, state) do
     old_count = state.applied_count
+    Process.put(:sm_pending_writes, [])
 
     shard_results =
       Enum.reduce(shard_batches, %{}, fn {shard_idx, queue, sandbox_namespace}, acc ->
@@ -236,6 +241,7 @@ defmodule Ferricstore.Raft.StateMachine do
         Map.put(acc, shard_idx, results)
       end)
 
+    flush_pending_writes(state)
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, shard_results)
   end
@@ -245,112 +251,112 @@ defmodule Ferricstore.Raft.StateMachine do
   # and individual {:put}/{:delete} entries. This handler remains for WAL
   # replay of entries written before the compound-key migration.
   def apply(meta, {:list_op, key, operation}, state) do
-    result = do_list_op(state, key, operation)
+    result = with_pending_writes(state, fn -> do_list_op(state, key, operation) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:compound_put, compound_key, value, expire_at_ms}, state) do
-    result = do_put(state, compound_key, value, expire_at_ms)
+    result = with_pending_writes(state, fn -> do_put(state, compound_key, value, expire_at_ms) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:compound_delete, compound_key}, state) do
-    result = do_delete(state, compound_key)
+    result = with_pending_writes(state, fn -> do_delete(state, compound_key) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:compound_delete_prefix, prefix}, state) do
-    result = do_delete_prefix(state, prefix)
+    result = with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:incr, key, delta}, state) do
-    result = do_incr(state, key, delta)
+    result = with_pending_writes(state, fn -> do_incr(state, key, delta) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:incr_float, key, delta}, state) do
-    result = do_incr_float(state, key, delta)
+    result = with_pending_writes(state, fn -> do_incr_float(state, key, delta) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:append, key, suffix}, state) do
-    result = do_append(state, key, suffix)
+    result = with_pending_writes(state, fn -> do_append(state, key, suffix) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:getset, key, new_value}, state) do
-    result = do_getset(state, key, new_value)
+    result = with_pending_writes(state, fn -> do_getset(state, key, new_value) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:getdel, key}, state) do
-    result = do_getdel(state, key)
+    result = with_pending_writes(state, fn -> do_getdel(state, key) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:getex, key, expire_at_ms}, state) do
-    result = do_getex(state, key, expire_at_ms)
+    result = with_pending_writes(state, fn -> do_getex(state, key, expire_at_ms) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:setrange, key, offset, value}, state) do
-    result = do_setrange(state, key, offset, value)
+    result = with_pending_writes(state, fn -> do_setrange(state, key, offset, value) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:cas, key, expected, new_value, ttl_ms}, state) do
-    result = do_cas(state, key, expected, new_value, ttl_ms)
+    result = with_pending_writes(state, fn -> do_cas(state, key, expected, new_value, ttl_ms) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:lock, key, owner, ttl_ms}, state) do
-    result = do_lock(state, key, owner, ttl_ms)
+    result = with_pending_writes(state, fn -> do_lock(state, key, owner, ttl_ms) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:unlock, key, owner}, state) do
-    result = do_unlock(state, key, owner)
+    result = with_pending_writes(state, fn -> do_unlock(state, key, owner) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:extend, key, owner, ttl_ms}, state) do
-    result = do_extend(state, key, owner, ttl_ms)
+    result = with_pending_writes(state, fn -> do_extend(state, key, owner, ttl_ms) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:ratelimit_add, key, window_ms, max, count}, state) do
-    result = do_ratelimit_add(state, key, window_ms, max, count, nil)
+    result = with_pending_writes(state, fn -> do_ratelimit_add(state, key, window_ms, max, count, nil) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -358,7 +364,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # 6-tuple variant: shard pre-computes now_ms for deterministic replay.
   def apply(meta, {:ratelimit_add, key, window_ms, max, count, now_ms}, state) do
-    result = do_ratelimit_add(state, key, window_ms, max, count, now_ms)
+    result = with_pending_writes(state, fn -> do_ratelimit_add(state, key, window_ms, max, count, now_ms) end)
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -978,53 +984,77 @@ defmodule Ferricstore.Raft.StateMachine do
     do_ratelimit_add(state, key, window_ms, max, count, now_ms)
   end
 
+  # Wraps a block of state machine operations with batched disk writes.
+  # Initializes the pending-writes buffer, runs the block, then flushes
+  # all accumulated writes in a single v2_append_batch_nosync NIF call.
+  # Guarantees: no :pending entries in ETS after this returns.
+  defp with_pending_writes(state, fun) do
+    Process.put(:sm_pending_writes, [])
+    result = fun.()
+    flush_pending_writes(state)
+    result
+  end
+
   defp do_put(state, key, value, expire_at_ms) do
     ets_val = value_for_ets(value)
     disk_val = to_disk_binary(value)
 
-    if ets_val != nil do
-      # Fast path: small value (< hot_cache_max_value_size).
-      # Insert into ETS immediately with :pending file_id so reads work
-      # instantly from ETS. Defer the Bitcask write to the background
-      # BitcaskWriter process (~1us cast vs ~50us sync NIF).
-      :ets.insert(
-        state.ets,
-        {key, ets_val, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
-      )
+    # Insert into ETS immediately so subsequent read-modify-write commands
+    # (INCR, APPEND, etc.) in the same batch see the correct value.
+    # The file_id is :pending — flush_pending_writes will update it with
+    # the real offset after the batch NIF call.
+    :ets.insert(
+      state.ets,
+      {key, ets_val, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
+    )
 
-      sm_prefix_track(state, key)
+    sm_prefix_track(state, key)
 
-      BitcaskWriter.write(
-        state.shard_index,
-        state.active_file_path,
-        state.active_file_id,
-        state.ets,
-        key,
-        disk_val,
-        expire_at_ms
-      )
+    # Accumulate for batch disk write — flushed by flush_pending_writes
+    # at the end of apply/3 before returning to ra.
+    pending = Process.get(:sm_pending_writes, [])
+    Process.put(:sm_pending_writes, [{key, disk_val, expire_at_ms} | pending])
 
-      :ok
-    else
-      # Slow path: large value (>= hot_cache_max_value_size).
-      # ETS stores nil for the value, so cold reads need a valid Bitcask
-      # offset immediately. Must write synchronously.
-      case NIF.v2_append_batch_nosync(state.active_file_path, [{key, disk_val, expire_at_ms}]) do
-        {:ok, [{offset, value_size}]} ->
-          :ets.insert(
-            state.ets,
-            {key, nil, expire_at_ms, LFU.initial(), state.active_file_id, offset, value_size}
-          )
+    :ok
+  end
 
-          sm_prefix_track(state, key)
-          :ok
+  # Flushes all accumulated disk writes in a single NIF call, then updates
+  # ETS entries with real file_id/offset. Called at the end of every apply/3
+  # — no :pending entries remain after this returns.
+  defp flush_pending_writes(state) do
+    case Process.put(:sm_pending_writes, []) do
+      [] ->
+        :ok
 
-        {:ok, _} ->
-          :ok
+      pending when is_list(pending) ->
+        # Reverse to preserve insertion order (we prepend during accumulation)
+        batch = Enum.reverse(pending)
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+        case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
+          {:ok, locations} ->
+            Enum.zip(batch, locations)
+            |> Enum.each(fn {{key, _val, _exp}, {offset, value_size}} ->
+              # Update ETS: replace :pending with real file_id and offset.
+              # Use update_element to avoid overwriting the value (a concurrent
+              # read-modify-write in the same batch may have changed it).
+              try do
+                :ets.update_element(state.ets, key, [
+                  {5, state.active_file_id},
+                  {6, offset},
+                  {7, value_size}
+                ])
+              rescue
+                ArgumentError -> :ok
+              end
+            end)
+
+          {:error, reason} ->
+            require Logger
+            Logger.error("StateMachine flush_pending_writes failed: #{inspect(reason)}")
+        end
+
+      _ ->
+        :ok
     end
   end
 
