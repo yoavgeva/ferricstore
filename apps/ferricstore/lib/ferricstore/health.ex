@@ -125,8 +125,20 @@ defmodule Ferricstore.Health do
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
     shards = collect_shard_info(shard_count)
 
+    # Readiness requires: flag set + all shards alive + all Raft leaders elected
+    all_shards_ok = Enum.all?(shards, fn s -> s.status == "ok" end)
+    raft_ready = check_raft_leaders(shard_count)
+
+    status =
+      cond do
+        not ready?() -> :starting
+        not all_shards_ok -> :starting
+        not raft_ready -> :starting
+        true -> :ok
+      end
+
     %{
-      status: if(ready?(), do: :ok, else: :starting),
+      status: status,
       shard_count: shard_count,
       shards: shards,
       uptime_seconds: Stats.uptime_seconds()
@@ -136,6 +148,25 @@ defmodule Ferricstore.Health do
   # ---------------------------------------------------------------------------
   # Private
   # ---------------------------------------------------------------------------
+
+  # Checks that every shard's Raft server has an elected leader.
+  # Without a leader, writes will fail. Returns true if all leaders
+  # are elected, false if any shard has no leader.
+  @spec check_raft_leaders(non_neg_integer()) :: boolean()
+  defp check_raft_leaders(shard_count) do
+    Enum.all?(0..(shard_count - 1), fn i ->
+      server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+
+      try do
+        case :ra.members(server_id, 1_000) do
+          {:ok, _members, _leader} -> true
+          _ -> false
+        end
+      catch
+        :exit, _ -> false
+      end
+    end)
+  end
 
   @spec collect_shard_info(non_neg_integer()) :: [shard_info()]
   defp collect_shard_info(shard_count) do
