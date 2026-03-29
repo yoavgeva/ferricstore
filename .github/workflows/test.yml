@@ -106,16 +106,17 @@ jobs:
           elixir --sname ci_jepsen --cookie ferricstore_test -S mix test --include jepsen --timeout 120000
         continue-on-error: true
 
-      - name: Run performance tests
-        run: mix test --only perf --timeout 120000
+      - name: Run benchmark tests
+        run: mix test --only bench --timeout 120000
         continue-on-error: true
 
       - name: Run large allocation tests
+        if: always()
         run: mix test --only large_alloc --timeout 120000
         continue-on-error: true
 
       - name: Check io_uring availability (Linux only)
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         id: uring
         run: |
           if cat /proc/sys/kernel/io_uring_disabled 2>/dev/null | grep -q "^0$"; then
@@ -125,7 +126,7 @@ jobs:
           fi
 
       - name: Run io_uring + scheduler stress tests (Linux, io_uring available)
-        if: runner.os == 'Linux' && steps.uring.outputs.available == 'true'
+        if: always() && runner.os == 'Linux' && steps.uring.outputs.available == 'true'
         run: mix test --only linux_io_uring
 
       - name: Upload test audit logs
