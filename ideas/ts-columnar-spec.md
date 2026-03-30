@@ -397,6 +397,8 @@ Per-series write throughput is bounded only by file append syscall latency (~333
 
 Writes never touch sealed partitions. New samples always append to the open partition tail.
 
+**File descriptor management:** All `.col` file access goes through `FerricStore.TS.FdManager.get_fd(series_name)`. v1 implementation: open all fds at startup, require `ulimit -n 65536`. This interface allows swapping in an LRU fd pool later for 100K+ series without changing any caller code.
+
 ### 4.2 Two-Level Pruning
 
 Before any columnar file is touched, LMDB eliminates irrelevant partitions:
