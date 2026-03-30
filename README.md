@@ -1,5 +1,10 @@
 # FerricStore
 
+[![Hex.pm](https://img.shields.io/hexpm/v/ferricstore.svg)](https://hex.pm/packages/ferricstore)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/ferricstore)
+[![CI](https://github.com/yoavgeva/ferricstore/actions/workflows/test.yml/badge.svg)](https://github.com/yoavgeva/ferricstore/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **The Redis-compatible store where every write is durable by default.**
 
 FerricStore is a distributed, crash-safe key-value store with Redis wire protocol (RESP3). Every write goes through Raft consensus and is fsync'd to disk before the client gets OK. No "enable persistence" checkbox. No "hope the AOF rewrite finishes before the crash." Your data survives kill -9, node failures, and power loss — automatically.
