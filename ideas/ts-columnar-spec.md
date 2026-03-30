@@ -72,7 +72,7 @@ struct PartitionEntry {
     ts_max:     i64,  // latest timestamp ms
     val_min:    f64,  // minimum value — for value pruning
     val_max:    f64,  // maximum value
-    codec:      u8,   // 0=raw 1=alp 2=neats (v2)
+    codec:      u8,   // 0=raw 1=alp 2=neats
     sealed:     u8,   // 0=open 1=sealed
     _pad:       [u8;6],
 }
@@ -112,7 +112,7 @@ type SeriesKey = [u8; 8];
 struct SeriesMeta {
     name_len:     u16,
     name:         [u8; 128],  // series name string
-    codec:        u8,         // 0=raw 1=alp 2=neats (v2)
+    codec:        u8,         // 0=raw 1=alp 2=neats
     retention_ms: u64,
     grace_ms:     u64,
     labels_len:   u16,
@@ -654,18 +654,47 @@ Example — temperature sensor:
 
 Timestamps are monotonic integers — the ideal input for ALP Case 1. Frame-of-Reference on regular timestamps produces residuals that are all identical (e.g., all 1000 for 1-second intervals), which bit-pack to near-zero bits per sample. This is equivalent compression to delta-delta encoding, but with SIMD-native encode and decode (8 values per AVX2 instruction) instead of sequential bit-twiddling.
 
-One codec, one decode path, one SIMD implementation. No delta-delta. No Gorilla XOR.
+No delta-delta. No Gorilla XOR.
 
-**Implementation:** The C++ reference implementation is MIT-licensed (`github.com/cwida/ALP`). Reimplement the core in Rust (~500 lines) or wrap via FFI. ALP decode in Rust NIF (hot path, SIMD). ALP encode in Elixir (background seal, 200ms is fine).
+**Implementation:** The C++ reference implementation is MIT-licensed (`github.com/cwida/ALP`). Reimplement the core in Rust (~500 lines) or wrap via FFI. ALP decode in Rust NIF (hot path, SIMD). ALP encode in Elixir (background seal).
 
-### 6.2 Future Codecs (v2)
+### 6.2 NeaTS — Learned Compression with Random Access
 
-- **NeaTS** (ICDE 2025): Learned compression with O(log n) random access into compressed data. Fits the time series with nonlinear functions + small bounded residuals. Enables narrow range queries without decompressing entire partitions. Marked v2 — only relevant when narrow-range query optimization is needed.
-- **Chimp** and **Sprintz**: Dropped. ALP dominates Chimp on compression ratio and decode speed. ALP handles timestamps natively, eliminating the need for Sprintz.
+**Paper:** Guerra, Vinciguerra, Boffa, Ferragina (ICDE 2025). Open source at `github.com/and-gue/NeaTS`.
 
-### 6.3 Codec Auto-Selection (v2)
+NeaTS fits the time series with a sequence of nonlinear functions (linear, quadratic, exponential, logarithmic) plus small bounded residuals:
 
-When NeaTS is added, the `CodecProbe` module in Elixir probes at seal time:
+```
+Samples 0–450:    y ≈ 42x + 0.1      (linear trend)
+Samples 451–890:  y ≈ 42 * e^0.001x  (exponential growth)
+Residuals: tiny, stored in few bits each via ALP
+```
+
+**The critical property:** O(log n) random access into compressed data. With ALP, reading sample 10,000 requires decoding samples 1–9,999 sequentially. With NeaTS, reading sample 10,000 means: look up which function covers position 10,000 in the function index, evaluate the function, add the residual.
+
+**Impact on narrow range queries:**
+
+```
+TS.RANGE ts:click FROM 09:30 TO 09:35
+  (query 5 minutes inside a sealed 1-hour partition)
+
+With ALP:
+  Decode entire partition from start → filter to range
+  108M samples decoded at 30K/s, ~9M needed → 12× wasted work
+
+With NeaTS:
+  Binary search function index for 09:30 offset
+  Evaluate function + residuals for those ~9M samples only
+  12× less decode work for narrow range queries
+```
+
+**For value filtering (`WHERE value > x`):** NeaTS lets you evaluate the filter against the function approximation first. If the entire function segment is below the threshold, skip it without decoding residuals. Fast rejection of irrelevant regions.
+
+NeaTS works best on smooth data (views, temperature, revenue). For bursty data (errors, spikes), the function fit is poor and ALP is better. The `CodecProbe` auto-selects.
+
+### 6.3 Codec Auto-Selection
+
+The `CodecProbe` module in Elixir probes at seal time — one extra pass over the value column that's already in memory. Adds ~1ms to a seal.
 
 ```elixir
 defmodule FerricStore.TS.CodecProbe do
@@ -681,12 +710,37 @@ defmodule FerricStore.TS.CodecProbe do
         end
     end
   end
+
+  defp measure_smoothness(values) do
+    # Coefficient of variation of consecutive deltas, inverted to 0–1
+    deltas = values |> Enum.chunk_every(2, 1, :discard)
+                    |> Enum.map(fn [a, b] -> b - a end)
+    mean   = Enum.sum(deltas) / length(deltas)
+    abs_mean = max(abs(mean), 1.0)
+    variance = deltas |> Enum.map(fn d -> (d - mean) * (d - mean) end)
+                      |> Enum.sum()
+                      |> Kernel./(length(deltas))
+    # 0.0 = very bursty, 1.0 = perfectly smooth
+    1.0 / (1.0 + :math.sqrt(variance) / abs_mean)
+  end
 end
 ```
 
-Codec lock-in after 3 consistent partitions. Per-partition codec stored in LMDB `PartitionEntry.codec` field — mixed codecs within one series file are fully supported. The decode path reads the `codec` byte and uses the right decoder per partition.
+**How it works in practice:**
 
-Only relevant when NeaTS is implemented as an alternative. For v1, all partitions use ALP.
+```
+ts:views:post:123    → smoothness=0.85, neats_fit=0.03 → :neats_alp
+ts:likes:post:123    → smoothness=0.08                 → :alp
+ts:errors            → smoothness=0.02                 → :alp
+ts:revenue           → smoothness=0.78, neats_fit=0.06 → :neats_alp
+ts:temperature       → smoothness=0.92, neats_fit=0.01 → :neats_alp
+```
+
+**Codec lock-in after 3 consistent partitions:**
+
+After 3 consecutive partitions pick the same codec, the probe stops running and the codec is locked. If the series behaviour changes (post goes viral — smooth views suddenly spike), smoothness drops, `codec_locked` resets, and the probe re-evaluates.
+
+Per-partition codec stored in LMDB `PartitionEntry.codec` field — mixed codecs within one series file are fully supported. The decode path reads the `codec` byte and uses the right decoder per partition.
 
 ### 6.4 Labels Section Format
 
@@ -733,13 +787,13 @@ All Rust NIFs follow the project's established patterns:
 | `ts_lmdb_upsert` NIF | Rust | LMDB `heed` binding — thin wrapper |
 | `TS.Encoding.encode_values` | Elixir | Background seal — 200ms fine, clean GC |
 | `TS.Encoding.encode_timestamps` | Elixir | Background seal — 200ms fine, clean GC |
-| `TS.Encoding.neats_fit` (v2) | Elixir | Math + background — Nx or pure Elixir |
-| `TS.CodecProbe.pick` (v2) | Elixir | 1ms math on 1000 samples — trivially Elixir |
+| `TS.Encoding.neats_fit` | Elixir | Math + background — Nx or pure Elixir |
+| `TS.CodecProbe.pick` | Elixir | 1ms math on 1000 samples — trivially Elixir |
 | `TS.PartitionSealer` GenServer | Elixir | Orchestration — pure OTP |
 | `TS.CompactionWorker` GenServer | Elixir | Orchestration — pure OTP |
 | `TS.RetentionSweeper` GenServer | Elixir | Orchestration — pure OTP |
 | `TS.Counter` (TS.INCR) | Elixir | ETS INCR — Elixir native |
-| `TS.Pipeline` parser (v2) | Elixir | Keyword parsing — pure Elixir |
+| `TS.Pipeline` parser | Elixir | Keyword parsing — pure Elixir |
 | All command dispatch | Elixir | RESP parsing already Elixir |
 | File appends | Elixir | `File.write!` — fine for background |
 | LMDB metadata logic | Elixir | Calls thin Rust NIFs, logic in Elixir |
@@ -763,9 +817,16 @@ fn ts_scan_range(env: Env, args: &[Term]) -> Result<Term, Error> {
     let bucket_ms = args[5].decode::<u64>()?;
 
     tokio_rt().spawn(async move {
-        let bytes  = pread_range(fd, from_off, to_off - from_off).await?;  // io_uring
-        let values = alp_decode_simd(&bytes.value_section);                 // AVX2
-        let ts     = alp_decode_simd(&bytes.ts_section);                    // AVX2
+        let bytes = pread_range(fd, from_off, to_off - from_off).await?;  // io_uring
+        let codec = bytes.codec_byte();
+        let (ts, values) = match codec {
+            CODEC_ALP   => (alp_decode_simd(&bytes.ts_section),
+                            alp_decode_simd(&bytes.value_section)),
+            CODEC_NEATS => (alp_decode_simd(&bytes.ts_section),
+                            neats_decode(&bytes.value_section, from_ts, to_ts)),
+            _           => (raw_decode(&bytes.ts_section),
+                            raw_decode(&bytes.value_section)),
+        };
         let result = aggregate(ts, values, agg, bucket_ms);
         send_result(pid, result);
     });
@@ -787,27 +848,33 @@ defmodule FerricStore.TS.PartitionSealer do
       raw = File.read!(col_file_path(series_name))
       {timestamps, values} = parse_raw_partition(raw, partition_id)
 
+      # Codec probe — pure Elixir math, ~1ms
+      codec = FerricStore.TS.CodecProbe.pick(values)
+
       # Encoding — pure Elixir, background, slow is fine
       encoded_ts  = FerricStore.TS.Encoding.encode_timestamps(timestamps)
-      encoded_val = FerricStore.TS.Encoding.encode_values(values)
+      encoded_val = case codec do
+        :alp       -> FerricStore.TS.Encoding.alp_encode(values)
+        :neats_alp -> FerricStore.TS.Encoding.neats_encode(values)
+      end
 
       # val_min/val_max computed during encode — free, one pass
       {val_min, val_max} = FerricStore.TS.Encoding.minmax(values)
 
       # Write encoded bytes — Elixir File.write
-      write_partition(series_name, day, encoded_ts, encoded_val)
+      write_partition(series_name, partition_id, encoded_ts, encoded_val)
 
       # LMDB update — thin Rust NIF, ~1μs
       Nif.ts_lmdb_upsert(
         series_hash(series_name), partition_id,
-        build_entry(encoded_ts, encoded_val, timestamps, val_min, val_max, :alp)
+        build_entry(encoded_ts, encoded_val, timestamps, val_min, val_max, codec)
       )
     end)
   end
 end
 ```
 
-### 7.6 The Nx Option for NeaTS (v2)
+### 7.6 The Nx Option for NeaTS
 
 NeaTS function fitting (linear regression, polynomial fit) involves matrix operations on small arrays (~1000 samples). This is exactly what the Nx library handles — EXLA backend compiles these to native code and can use BLAS if available.
 
@@ -1247,9 +1314,9 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 
 ---
 
-## 11. Command Surface — Versioned
+## 11. Command Surface
 
-### 11.1 v1 Commands
+### 11.1 Commands
 
 | Command | Description |
 |---|---|
@@ -1257,26 +1324,16 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 | `TS.GET key` | Get latest sample |
 | `TS.RANGE key FROM to TO [AGG type BUCKET ms] [WHERE value op threshold] [FILL value]` | Range query with optional aggregation, filtering, and fill |
 | `TS.MRANGE FROM to TO FILTER label=value [AGG type BUCKET ms] [WHERE ...]` | Cross-series range query |
+| `TS.FILTER key FROM to TO WHERE expr [LIMIT n]` | Sample-level value filtering with SIMD evaluation |
 | `TS.CREATE key [RETENTION ms] [WARM_CACHE_CHUNKS n] [CHUNK_GRACE ms] [LABELS k v ...]` | Create a series |
 | `TS.INFO key` | Series metadata and coverage |
 | `TS.CREATERULE src dst AGG type BUCKET ms` | Create compaction rule |
 | `TS.ALTER key [RETENTION ms] [LABELS k v ...]` | Alter series parameters |
-
-### 11.2 v1.1 Commands
-
-| Command | Description |
-|---|---|
-| `TS.FILTER key FROM to TO WHERE expr [LIMIT n]` | Sample-level value filtering with SIMD evaluation |
-
-### 11.3 v2 Commands
-
-| Command | Description |
-|---|---|
 | `TS.STAT key PERCENTILE n FROM to TO [BUCKET ms]` | Percentile queries (t-digest) |
 | `TS.COMPUTE "expr" FROM to TO [AGG type BUCKET ms]` | Cross-series arithmetic |
 | `TS.PIPELINE [FILTER ...] \| RANGE \| WHERE \| AGG \| COMPUTE \| TOPN \| LIMIT` | Chained operations in single NIF call |
 
-### 11.4 Command Comparison Table
+### 11.2 Command Comparison Table
 
 | Command | RedisTimeSeries | FerricStore TS |
 |---|---|---|
@@ -1286,10 +1343,10 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 | `TS.CREATERULE` | ✓ required | ✓ optional — ad-hoc `AGG` works without it |
 | `TS.GET` | ✓ | ✓ |
 | `TS.INFO` | ✓ | ✓ |
-| `TS.FILTER` | ✗ | ✓ (v1.1) |
-| `TS.COMPUTE` | ✗ | ✓ (v2) |
-| `TS.STAT` (PERCENTILE, TOPN, CORR, ANOMALY) | ✗ | ✓ (v2) |
-| `TS.PIPELINE` | ✗ | ✓ (v2) |
+| `TS.FILTER` | ✗ | ✓ |
+| `TS.COMPUTE` | ✗ | ✓ |
+| `TS.STAT` (PERCENTILE, TOPN, CORR, ANOMALY) | ✗ | ✓ |
+| `TS.PIPELINE` | ✗ | ✓ |
 
 ---
 
@@ -1304,7 +1361,7 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 | RAM for 30d / 1000 series | low (columnar disk) | low (Parquet disk) | low (PG disk) | **~450GB** | **~2–6GB** (configurable) |
 | Storage cost (30d) | NVMe cheap | Parquet cheap | NVMe cheap | RAM expensive | NVMe cheap |
 | SQL / JOINs | Full SQL | Full SQL | Full SQL + JOINs | TS.MRANGE only | TS.MRANGE only |
-| Compression | columnar | Parquet | Hypercore | Gorilla in RAM | ALP on disk |
+| Compression | columnar | Parquet | Hypercore | Gorilla in RAM | ALP + NeaTS on disk |
 | Single-threaded bottleneck | No | No | No | **Yes** (Redis core) | No (per-series GenServer) |
 | Infrastructure | Separate service | Separate service | Separate service | Separate service | **Zero — embedded** |
 | Consistency | eventual/async | eventual/async | PG ACID | async replication | **Raft quorum** |
@@ -1321,32 +1378,22 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 
 ## 13. Implementation Order
 
-### Phase 1 — v1: Core TS + ALP + LMDB + Retention
-
-- Columnar file format + LMDB partition index
-- `TS.ADD`, `TS.GET`, `TS.RANGE` (with `WHERE`, `AGG`, `FILL`)
-- `TS.MRANGE` with label filtering
-- `TS.CREATE`, `TS.INFO`, `TS.CREATERULE`, `TS.ALTER`
-- ALP encode (Elixir) + ALP decode (Rust NIF, AVX2)
-- `PartitionSealer`, `RetentionSweeper`, `CompactionWorker` GenServers
-- Hole punching retention (Linux + macOS)
-- Warm cache (WARM_CACHE_CHUNKS)
-- io_uring batched reads
-
-### Phase 2 — v1.1: TS.FILTER + Labels
-
-- `TS.FILTER` with SIMD value filtering (`ts_simd_filter` NIF)
-- Labels section in columnar files (dedup string table)
-- Label-based MRANGE with LMDB value pruning
-
-### Phase 3 — v2: Advanced Codecs + Analytics
-
-- NeaTS codec with O(log n) random access
-- `CodecProbe` auto-selection module
-- `TS.STAT` (PERCENTILE, TOPN, CORR, ANOMALY)
-- `TS.COMPUTE` cross-series arithmetic
-- `TS.PIPELINE` chained operations
-- Nx integration for NeaTS function fitting
+1. Columnar file format + LMDB (partition index + series registry)
+2. `TS.CREATE`, `TS.ADD`, `TS.GET` — basic write/read path
+3. ALP encode (Elixir) + ALP decode (Rust NIF, AVX2)
+4. `PartitionSealer` GenServer + auto-tuned partition intervals
+5. `TS.RANGE` with `WHERE`, `AGG`, `FILL` + io_uring batched reads
+6. NeaTS codec + `CodecProbe` auto-selection
+7. `TS.MRANGE` with label filtering + LMDB value pruning
+8. `TS.FILTER` with SIMD value filtering (`ts_simd_filter` NIF)
+9. Labels section in columnar files (dedup string table)
+10. Warm cache (`WARM_CACHE_CHUNKS`)
+11. `RetentionSweeper` + hole punching (Linux + macOS)
+12. `CompactionWorker` + `TS.CREATERULE` + WAL backfill
+13. `TS.INFO`, `TS.ALTER`
+14. `TS.STAT` (PERCENTILE, TOPN, CORR, ANOMALY)
+15. `TS.COMPUTE` cross-series arithmetic
+16. `TS.PIPELINE` chained operations
 
 ---
 
