@@ -54,6 +54,12 @@ jobs:
           shared-key: ${{ matrix.job.target }}-${{ matrix.nif }}
           workspaces: ${{ env.NIF_DIRECTORY }}
 
+      - name: Install GNU tar (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gnu-tar
+          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> $GITHUB_PATH
+
       - name: Build precompiled NIF
         uses: philss/rustler-precompiled-action@v1.1.5
         id: build
