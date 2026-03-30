@@ -619,7 +619,18 @@ end
 **Routing TS.ADD to the right writer:**
 
 ```elixir
-def handle_ts_add(series_name, timestamp, value) do
+def handle_ts_add(series_name, timestamp, value, opts \\ []) do
+  # Auto-create series if it doesn't exist
+  unless ETS.member?(:ts_series_meta, series_name) do
+    labels = Keyword.get(opts, :labels, [])
+    # Raft quorum — one-time cost (~1-5ms) on first write
+    FerricStore.Raft.propose({:ts_create, series_name, %{
+      retention: default_retention(),
+      chunk_grace: default_grace(),
+      labels: labels
+    }})
+  end
+
   # Find or start the writer for this series
   writer = case Registry.lookup(TS.WriterRegistry, series_name) do
     [{pid, _}] -> pid
@@ -631,6 +642,23 @@ def handle_ts_add(series_name, timestamp, value) do
   :ok  # ack immediately
 end
 ```
+
+**Auto-creation:** If `TS.ADD` targets a series that doesn't exist, the series is created automatically with default config. This goes through Raft quorum (structural command) — ~1-5ms one-time cost. Every subsequent `TS.ADD` to the same series is async with no Raft involvement. Labels can be set on the first `TS.ADD`:
+
+```
+# Explicit create (optional — for custom retention/grace):
+TS.CREATE ts:post:456:view RETENTION 7776000000 LABELS post_id 456 type view
+
+# Auto-create on first write (default config):
+TS.ADD ts:post:456:view 1700000001000 42 LABELS post_id 456 type view
+  → series doesn't exist → Raft create (1-5ms) → then buffer sample
+
+# Subsequent writes (async, no Raft):
+TS.ADD ts:post:456:view 1700000002000 55
+  → series exists → buffer → ack (~100ns)
+```
+
+`TS.CREATE` is still useful for setting non-default retention, grace period, or warm cache config. Auto-create uses defaults: `RETENTION 0` (no expiry), `CHUNK_GRACE 60000` (60s), `WARM_CACHE_CHUNKS 0`.
 
 **Why per-series GenServer:**
 
