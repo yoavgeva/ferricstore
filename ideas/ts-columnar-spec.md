@@ -183,7 +183,7 @@ struct RuleEntry {
 }
 ```
 
-On startup, rules are loaded into ETS alongside series metadata. The `CompactionWorker` reads from ETS to know which rules to apply after each partition seal.
+On startup, rules are loaded into ETS alongside series metadata. The `PartitionSealer` reads from ETS to pass rules into the seal NIF.
 
 **Write path — one LMDB write per partition seal:**
 
@@ -991,9 +991,8 @@ All Rust NIFs follow the project's established patterns:
 | `ts_seal_partition` NIF | Rust | Sort + codec probe + ALP/NeaTS encode — CPU-intensive at scale |
 | `ts_lmdb_scan` NIF | Rust | LMDB `heed` binding — thin wrapper |
 | `ts_lmdb_upsert` NIF | Rust | LMDB `heed` binding — thin wrapper |
-| `TS.PartitionSealer` GenServer | Elixir | Orchestration — reads raw bytes, calls NIF, writes result |
-| `TS.Writer` GenServer (per series) | Elixir | Batched writes — mailbox serialization, flush timer |
-| `TS.CompactionWorker` GenServer | Elixir | Orchestration — pure OTP |
+| `TS.PartitionSealer` GenServer | Elixir | Orchestration — reads raw bytes, calls NIF, writes result, sends rollups |
+| `TS.Writer` GenServer (per series) | Elixir | Batched writes + rollup accumulator — mailbox serialization, flush timer |
 | `TS.RetentionSweeper` GenServer | Elixir | Orchestration — pure OTP |
 | `TS.Counter` (TS.INCR) | Elixir | ETS INCR — Elixir native |
 | `TS.Pipeline` parser | Elixir | Keyword parsing — pure Elixir |
@@ -1053,26 +1052,117 @@ defmodule FerricStore.TS.PartitionSealer do
       raw = File.read!(col_file_path(series_name))
       raw_partition = extract_raw_partition(raw, partition_id)
 
-      # 2. Sort + encode in Rust NIF (~60ms for 9M samples)
-      #    Sorts by timestamp, probes codec, encodes, computes min/max
-      #    Returns via OwnedEnv::send_and_clear
-      {:ok, result} = Nif.ts_seal_partition(raw_partition)
-      # result = %{encoded_ts, encoded_val, codec, ts_min, ts_max, val_min, val_max}
+      # 2. Look up rollup rules for this series
+      rules = ETS.lookup(:ts_compaction_rules, series_name)
+      # e.g., [{dst: "ts:click:per_hour", agg: :sum, bucket_ms: 3600000}, ...]
 
-      # 3. Write encoded bytes — Elixir File.write
+      # 3. Sort + dedup + aggregate + encode in ONE Rust NIF call (~60ms)
+      #    Single pass after sort: dedup, accumulate rollup buckets, encode
+      {:ok, result} = Nif.ts_seal_partition(raw_partition, rules)
+      # result = %{
+      #   encoded_ts, encoded_val, codec, ts_min, ts_max, val_min, val_max,
+      #   rollups: [%{dst: "ts:click:per_hour", buckets: [{t, value}, ...]}]
+      # }
+
+      # 4. Write encoded bytes — Elixir File.write
       write_partition(series_name, partition_id, result.encoded_ts, result.encoded_val)
 
-      # 4. LMDB update — thin Rust NIF, ~1μs
+      # 5. LMDB update — thin Rust NIF, ~1μs
       Nif.ts_lmdb_upsert(
         series_hash(series_name), partition_id,
         build_entry(result)
       )
+
+      # 6. Send rollup results to destination Writers as accumulate messages
+      Enum.each(result.rollups, fn %{dst: dst, buckets: buckets} ->
+        writer = find_or_start_writer(dst)
+        Enum.each(buckets, fn {bucket_ts, value} ->
+          GenServer.cast(writer, {:accumulate, bucket_ts, value})
+        end)
+      end)
     end)
   end
 end
 ```
 
-The Elixir Task owns the lifecycle: read → call NIF → write → LMDB. If the Task crashes, the Tokio task's result is dropped — no memory leak. The NIF does the CPU-intensive work (sort, probe, encode, NeaTS fitting), Elixir does the I/O and orchestration.
+**Combined seal pass in the Rust NIF:**
+
+```rust
+// ts_seal_partition: one loop does dedup + aggregate + encode
+// After TimSort (O(n) for almost-sorted TS data):
+
+let mut prev_ts = i64::MIN;
+for sample in &sorted_samples {
+    // Dedup: skip if same timestamp as previous (last-write-wins)
+    if sample.timestamp == prev_ts { continue; }
+    prev_ts = sample.timestamp;
+
+    // Aggregate: accumulate into each rollup rule's buckets
+    for rule in &rules {
+        let bucket = (sample.timestamp / rule.bucket_ms) * rule.bucket_ms;
+        rule.accumulate(bucket, sample.value);  // sum/count/min/max
+    }
+
+    // Encode: feed into ALP/NeaTS encoder
+    ts_encoder.push(sample.timestamp);
+    val_encoder.push(sample.value);
+}
+```
+
+O(n log n) sort + O(n) single pass for dedup + aggregate + encode. No separate CompactionWorker process. No second read or decode.
+
+**Rollup Writer accumulator:**
+
+The destination series Writer holds partial aggregations in its GenServer state. Only complete buckets are flushed to the .col file:
+
+```elixir
+# In the per-series Writer for ts:click:per_hour:
+
+def handle_cast({:accumulate, bucket_ts, value}, state) do
+  buckets = Map.update(state.rollup_buckets, bucket_ts, value,
+    fn existing -> apply_agg(state.agg_type, existing, value) end)
+
+  {:noreply, %{state | rollup_buckets: buckets}}
+end
+
+def handle_info(:check_complete_buckets, state) do
+  now = System.system_time(:millisecond)
+
+  {complete, pending} = Map.split_with(state.rollup_buckets,
+    fn {bucket_ts, _} -> bucket_ts + state.bucket_ms < now end)
+
+  # Flush complete buckets to .col file
+  Enum.each(complete, fn {bucket_ts, value} ->
+    append_to_file(state.fd, bucket_ts, value)
+  end)
+
+  {:noreply, %{state | rollup_buckets: pending}}
+end
+```
+
+**Crash recovery — re-aggregate from sealed source partitions:**
+
+On restart, incomplete rollup buckets are lost from memory. The recovery reads sealed source partitions to rebuild accumulators:
+
+```elixir
+def recover_rollup_accumulators(rule) do
+  # Last complete bucket in the destination .col file
+  last_written = read_last_timestamp(rule.dst)
+  next_bucket  = last_written + rule.bucket_ms
+
+  # Sealed source partitions that contribute to incomplete buckets
+  partitions = Nif.ts_lmdb_scan(
+    series_hash(rule.src), partition_id_from(next_bucket), :infinity)
+
+  # Decode and re-aggregate — same deterministic result
+  Enum.each(partitions, fn entry ->
+    decoded = Nif.ts_scan_range(entry.fd, entry.ts_offset, entry.val_offset, ...)
+    accumulate_into_writer(rule.dst, decoded, rule.agg, rule.bucket_ms)
+  end)
+end
+```
+
+Cost: ~60ms per incomplete bucket per rule, one-time on restart.
 
 ---
 
@@ -1083,9 +1173,8 @@ The Elixir Task owns the lifecycle: read → call NIF → write → LMDB. If the
 | `FerricStore.Supervisor` | `one_for_one` | Root supervisor |
 | `FerricStore.TS.Registry` | `permanent` | ETS owner for series metadata and compaction rules |
 | `FerricStore.TS.WriterSupervisor` | `permanent` | DynamicSupervisor for per-series TS.Writer GenServers |
-| `FerricStore.TS.PartitionSealer` | `permanent` | Seals closed partitions on a tick schedule (every 10s) |
+| `FerricStore.TS.PartitionSealer` | `permanent` | Seals closed partitions + computes rollup aggregations in one pass |
 | `FerricStore.TS.RetentionSweeper` | `permanent` | Deletes partitions beyond retention window (every 1h) |
-| `FerricStore.TS.CompactionWorker` | `transient` | Runs per-series compaction rules (hourly → daily rollups) |
 
 **Telemetry Events:**
 
@@ -1407,11 +1496,11 @@ Client: TS.CREATERULE ts:views ts:views:per_hour AGG sum BUCKET 3600000
    b. Insert into ETS :ts_compaction_rules
    c. Leader only: trigger retroactive backfill (see below)
 
-3. CompactionWorker on all nodes now knows:
-   "When ts:views seals a partition, also aggregate into ts:views:per_hour"
+3. PartitionSealer on all nodes now knows:
+   "When ts:views seals a partition, pass this rule to the seal NIF"
 ```
 
-The rule is stored in LMDB `rules` db — durable, included in snapshots, available immediately on startup. The `CompactionWorker` reads rules from ETS (populated from LMDB on boot) after each partition seal.
+The rule is stored in LMDB `rules` db — durable, included in snapshots, available immediately on startup. The `PartitionSealer` reads rules from ETS (populated from LMDB on boot) and passes them to `ts_seal_partition` NIF, which computes rollup aggregations in the same pass as sort + encode.
 
 **Backfill runs on each node independently** — every node has the same sealed partitions (deterministic encoding), so each node reads its own .col file and produces the same aggregated result.
 
@@ -1713,7 +1802,7 @@ Reads:       Served from local LMDB + local .col files
 9. Labels section in columnar files (dedup string table)
 10. Warm cache (`WARM_CACHE_CHUNKS`)
 11. `RetentionSweeper` + hole punching (Linux + macOS)
-12. `CompactionWorker` + `TS.CREATERULE` + WAL backfill
+12. `TS.CREATERULE` + rollup accumulator in Writer + restart recovery
 13. `TS.INFO`, `TS.ALTER`
 14. `TS.STAT` (PERCENTILE, TOPN, CORR, ANOMALY)
 15. `TS.COMPUTE` cross-series arithmetic
