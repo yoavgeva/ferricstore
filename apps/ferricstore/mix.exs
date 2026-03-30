@@ -35,18 +35,18 @@ defmodule Ferricstore.MixProject do
     [
       main: "getting-started",
       extras: [
-        "guides/getting-started.md",
-        "guides/embedded-mode.md",
-        "guides/standalone-mode.md",
-        "guides/commands.md",
-        "guides/configuration.md",
-        "guides/architecture.md",
-        "guides/deployment.md",
-        "guides/security.md",
-        "guides/extensions.md"
+        "../../guides/getting-started.md",
+        "../../guides/embedded-mode.md",
+        "../../guides/standalone-mode.md",
+        "../../guides/commands.md",
+        "../../guides/configuration.md",
+        "../../guides/architecture.md",
+        "../../guides/deployment.md",
+        "../../guides/security.md",
+        "../../guides/extensions.md"
       ],
       groups_for_extras: [
-        Guides: Path.wildcard("guides/*.md")
+        Guides: Path.wildcard("../../guides/*.md")
       ],
       source_url: "https://github.com/yoavgeva/ferricstore",
       homepage_url: "https://github.com/yoavgeva/ferricstore"
@@ -58,7 +58,6 @@ defmodule Ferricstore.MixProject do
       description: "Distributed persistent key-value cache with Redis wire protocol (RESP3), Raft consensus, and Bitcask storage engine.",
       files: [
         "lib",
-        "guides",
         "native/ferricstore_bitcask/.cargo",
         "native/ferricstore_bitcask/src",
         "native/ferricstore_bitcask/Cargo*",
