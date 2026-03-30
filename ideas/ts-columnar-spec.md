@@ -366,18 +366,26 @@ The LMDB write in step 6 is the commit point. If it succeeds, the partition is s
 
 ### 4.1 Write Path
 
+`TS.ADD` uses async replication — write locally, ack immediately, replicate in background. No Raft quorum wait. This matches FerricStore's existing async mode for KV data.
+
 ```
-Client: TS.ADD ts:click 1700000001000 42
+Client → Node A (any node):
 
-1. Async columnar file append              (~3μs, non-blocking)
-2. Done.
+  TS.ADD ts:click 1700000001000 42
+
+  1. Append to local .col file               (~3μs)
+  2. Ack to client                            ← immediate
+  3. Replicate to other nodes in background   ← fire-and-forget
+     Other nodes append to their local .col files
 ```
 
-One syscall. No LMDB write, no ETS write.
+One syscall, one ack. No LMDB write, no ETS write, no Raft round-trip.
 
-LMDB is single-writer — one write transaction at a time across the entire env. Updating partition metadata on every `TS.ADD` would cap total throughput at ~200K samples/sec across all series (LMDB commit = `msync` ≈ 5μs). Instead, LMDB is only written at **seal time** — one transaction per partition seal.
+**Why async, not quorum:** Time series samples are append-only, arrive continuously, and losing a few on crash is acceptable. At 30K/s with ~10ms replication lag, a crash loses ~300 samples — the next 300 arrive in 10ms. Quorum would add 1-5ms latency to every write for a durability guarantee that time series data doesn't need.
 
-For the open (current) partition, `row_count` and `ts_max` are derived from the file at query time:
+**Structural commands use Raft quorum** (see §11.5 for the full split).
+
+LMDB is only written at **seal time** — one transaction per partition seal. For the open (current) partition, `row_count` and `ts_max` are derived from the file at query time:
 
 ```rust
 // No LMDB needed for the open partition:
@@ -385,7 +393,7 @@ row_count = (file_size - header_size - sealed_bytes) / 16  // 16 bytes per sampl
 ts_max    = pread(fd, file_size - 16, 8)                   // last timestamp in file
 ```
 
-This eliminates the LMDB bottleneck entirely. Per-series write throughput is bounded only by file append syscall latency (~333K samples/sec per series). Total throughput is bounded by NVMe bandwidth — at 16 bytes/sample and 5GB/s, that's ~312M samples/sec theoretical.
+Per-series write throughput is bounded only by file append syscall latency (~333K samples/sec per series). Total throughput is bounded by NVMe bandwidth — at 16 bytes/sample and 5GB/s, that's ~312M samples/sec theoretical.
 
 Writes never touch sealed partitions. New samples always append to the open partition tail.
 
@@ -1193,70 +1201,56 @@ Hole punching reclaims disk blocks immediately on filesystems that support it. F
 
 ## 10. WAL-Backed Internals
 
-### 10.1 Two-Layer Storage Model
+### 10.1 Two-Tier Replication Model
 
-Every `TS.ADD` passes through Raft before being applied to ETS and the columnar file:
-
-```
-Client: TS.ADD ts:views:post:123 1700000001000 42
-
-Raft WAL entry:
-  {index: 18847, term: 3, command: {ts_add, "ts:views:post:123", 1700000001000, 42.0}}
-
-Applied to:
-  Columnar file     ← persisted, compressed, partitioned
-  Raft WAL          ← durable, retained for log_retention_hours
-```
-
-The columnar file is a **materialised view** of the WAL. The WAL is the source of truth. If they diverge (corruption, bug, partial write), the WAL wins and the columnar file is reconstructed from it.
+TS uses a split replication model: async for sample data, Raft quorum for structural commands.
 
 ```
-Layer 1: Raft WAL (event log)
-  Every TS.ADD in order, with original timestamps and values
-  Durable and append-only
-  Bounded by: log_retention_hours (default: 168h / 7 days)
+Async replication (sample data):
+  TS.ADD → write to local .col file → ack client → replicate async
+  No Raft WAL entry. Columnar file IS the durable store.
+  Trade-off: crash may lose last ~10ms of unreplicated samples.
 
-Layer 2: Columnar file (materialised view)
-  Optimised for query — compressed, partitioned, LMDB indexed
-  Derived from Layer 1
-  Can be fully reconstructed from Layer 1 within retention window
+Raft quorum (structural commands):
+  TS.CREATE, TS.ALTER, TS.CREATERULE → proposed through ra
+  {:ts_expire, ...}  → retention sweep
+  {:ts_seal, ...}    → partition sealed
+  All nodes apply at the same log index. Consistency guaranteed.
 ```
+
+The Raft WAL contains structural commands only — not individual samples. This keeps the WAL small and avoids the Raft throughput ceiling for high-volume sample ingestion.
+
+The columnar file is the source of truth for sample data. Each node has its own copy, kept in sync by async replication. Sealed partitions are identical across nodes (same input → deterministic encoding).
 
 ### 10.2 Automatic Reconstruction
+
+Since samples are not in the Raft WAL, reconstruction uses **peer replication** — copy the `.col` file from another node that has it intact.
 
 On every read from a sealed partition, the NIF verifies a checksum stored in the LMDB partition entry. On mismatch:
 
 ```elixir
 defmodule FerricStore.TS.Reconstruction do
 
-  def rebuild_from_wal(series_name) do
-    # 1. Delete the corrupted columnar file
+  def rebuild_from_peer(series_name) do
+    # 1. Find a healthy peer that has this series
+    peer = find_peer_with_series(series_name)
+
+    # 2. Stream the .col file from peer
     File.rm!(col_file_path(series_name))
+    stream_file_from_peer(peer, series_name, col_file_path(series_name))
 
-    # 2. Create a fresh empty file
-    file_fd = File.open!(col_file_path(series_name), [:write, :binary])
-
-    # 3. Walk the Raft WAL for this series
-    :ra.log_fold(
-      server_ref(),
-      fn
-        {_index, _term, {ts_add, ^series_name, ts, val}} ->
-          FerricStore.TS.FileWriter.append(file_fd, ts, val)
-        _ -> :ok
-      end,
-      :ok
-    )
-
-    # 4. Re-seal and encode all partitions that are old enough
-    FerricStore.TS.PartitionSealer.seal_all_closed(series_name)
-
-    # 5. Rebuild LMDB partition index from the new file
+    # 3. Rebuild LMDB partition index from the new file
     FerricStore.TS.LmdbIndex.rebuild_for_series(series_name)
+
+    :telemetry.execute(
+      [:ferricstore, :ts, :reconstruction, :completed],
+      %{series: series_name, source: peer}
+    )
   end
 end
 ```
 
-The user never sees this. Telemetry fires so operators are alerted.
+Same mechanism as new-node bootstrap (§11.3), but for a single series. The user never sees this — the read that detected corruption blocks briefly while the file is streamed, then serves correct data.
 
 ### 10.3 CREATERULE — Raft Flow and Storage
 
@@ -1279,59 +1273,49 @@ Client: TS.CREATERULE ts:views ts:views:per_hour AGG sum BUCKET 3600000
 
 The rule is stored in LMDB `rules` db — durable, included in snapshots, available immediately on startup. The `CompactionWorker` reads rules from ETS (populated from LMDB on boot) after each partition seal.
 
-**Backfill runs only on the leader** — the backfilled samples are proposed as regular `{:ts_add}` commands through Raft, so all nodes receive them. No node does independent backfill.
+**Backfill runs on each node independently** — every node has the same sealed partitions (deterministic encoding), so each node reads its own .col file and produces the same aggregated result.
 
 ### 10.4 CREATERULE Retroactive Backfill
 
-When `TS.CREATERULE` is called on a series that already has history, the leader attempts to backfill the destination series. The quality depends on how much WAL remains.
+When `TS.CREATERULE` is called on a series that already has history, each node backfills the destination series from its local sealed partitions. Since samples are not in the Raft WAL, backfill reads directly from the columnar file.
 
-**Case 1 — Full WAL coverage (series younger than log_retention_hours):**
+**Case 1 — Bucket ≥ partition interval (can re-aggregate):**
 ```
-Series started 3 days ago. WAL retention = 7 days.
-All events still in WAL.
-
-TS.CREATERULE ts:views ts:views:per_hour AGG sum BUCKET 3600000
-
-Action: replay all ts_add events through the AGG function
-Result: per_hour series populated from day 1, event-accurate
-```
-
-**Case 2 — Partial WAL, bucket ≥ partition interval (good quality backfill):**
-```
-Series started 90 days ago. WAL retention = 7 days.
-Partition interval = 1 hour. Days 1–83: sealed hourly partitions.
+Series has 90 days of history. Partition interval = 1 hour.
 
 TS.CREATERULE ts:views ts:views:per_week AGG sum BUCKET 604800000
 
 Action:
-  Phase A — columnar backfill (days 1–83):
-    Read sealed partitions, re-aggregate to weekly buckets
-    Lossless for sum, count, min, max
-    Approximate for avg (correct if row counts stored in partition entry)
+  Read all sealed partitions from .col file
+  Re-aggregate: hourly values → weekly buckets (sum of sums)
+  Lossless for sum, count, min, max
+  Approximate for avg (correct if row counts stored in partition entry)
 
-  Phase B — WAL backfill (days 84–90):
-    Replay raw ts_add events through AGG function
-    Exact values
+  Open partition: read raw bytes, aggregate directly
 
-Result: per_week series populated from day 1
-        exact for days 84–90, re-aggregated for days 1–83
+Result: per_week series populated from the start, re-aggregated
 ```
 
-**Case 3 — Partial WAL, bucket < partition interval (cannot backfill beyond WAL):**
+**Case 2 — Bucket < partition interval (cannot disaggregate):**
 ```
-Series started 90 days ago. WAL retention = 7 days.
-Partition interval = 1 day. User wants hourly rollup.
+Series has 90 days of history. Partition interval = 1 day.
+User wants hourly rollup.
 
 TS.CREATERULE ts:views ts:views:per_hour AGG sum BUCKET 3600000
 
 Action:
-  Cannot reconstruct hourly data from daily partitions.
-  WAL backfill (days 84–90): exact.
+  Sealed daily partitions cannot be broken into hours —
+  the individual sample timestamps are compressed, but decoding them
+  IS possible (ALP/NeaTS decode gives back exact timestamps).
 
-Result: per_hour series starts from day 84.
-        Days 1–83 marked as missing in TS.INFO.
-        Return value includes a warning.
+  Decode each sealed partition → re-aggregate into hourly buckets
+  This works because sealed partitions contain all original samples,
+  just compressed. Decoding is the full inverse.
+
+Result: per_hour series populated from the start, exact
 ```
+
+> **Note:** Unlike a WAL-based approach, columnar backfill always has access to all samples within RETENTION — they're in the .col file, just compressed. The only data that's truly gone is beyond the RETENTION window (hole-punched).
 
 ### 10.5 TS.INFO Coverage Output
 
@@ -1344,10 +1328,8 @@ series:           ts:views:post:123:per_week
 source_series:    ts:views:post:123
 agg:              sum BUCKET 1w
 coverage:
-  type:           mixed
-  approx_range:   2024-01-01 → 2024-03-22  (re-aggregated from sealed partitions)
-  exact_range:    2024-03-22 → today        (replayed from WAL, event-accurate)
-  missing_range:  none
+  range:          2024-01-01 → today    (backfilled from sealed partitions + live)
+  missing_range:  none                  (only if data was beyond RETENTION at rule creation)
 sample_count:     13 weeks
 ```
 
@@ -1365,7 +1347,7 @@ On every `TS.ADD ts:views:post:123`, FerricStore automatically appends:
 XADD ts:changes:views:post:123 * ts 1700000001000 val 42
 ```
 
-The consumer uses existing `XREAD` / `XREADGROUP` commands. When `MIRROR_STREAM` is added to an existing series, FerricStore seeds the stream from the WAL (within `log_retention_hours`).
+The consumer uses existing `XREAD` / `XREADGROUP` commands. When `MIRROR_STREAM` is added to an existing series, FerricStore seeds the stream by decoding sealed partitions from the columnar file — all data within RETENTION is available for seeding.
 
 ### 10.7 Practical Recommendation
 
@@ -1377,10 +1359,10 @@ TS.CREATERULE ts:views:post:* ts:views:post:*:per_hour AGG sum BUCKET 3600000
 TS.CREATERULE ts:views:post:* ts:views:post:*:per_day  AGG sum BUCKET 86400000
 
 # Now per_hour and per_day series are built in real-time from the start.
-# No WAL retention concern. No backfill gaps. Perfect coverage always.
+# No backfill needed. Perfect coverage always.
 ```
 
-Rules defined at creation = event-accurate coverage for the lifetime of the series.
+Rules defined at creation = event-accurate coverage for the lifetime of the series. Retroactive backfill works too (decodes sealed partitions), but defining rules upfront is simpler.
 
 ---
 
@@ -1388,12 +1370,24 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 
 ### 11.1 How TS Data Replicates
 
-All TS mutations flow through Raft. Every node applies the same commands in the same order:
+TS uses two replication channels:
 
+**Async replication (sample data):**
+```
+TS.ADD ts:click 1700000001000 42.0
+
+  Node A (receiving node):
+    1. Append to local .col file → ack client
+    2. Send sample to Node B, C in background (fire-and-forget)
+    3. B, C append to their local .col files
+```
+
+No Raft. No quorum wait. Each node has its own copy of the .col file, kept in sync by async replication. Nodes may be a few milliseconds behind — acceptable for time series reads.
+
+**Raft quorum (structural commands):**
 ```
 Raft log entries for TS:
 
-  {ts_add, "ts:click", 1700000001000, 42.0}             ← sample write
   {ts_create, "ts:click", %{retention: ...}}              ← series creation
   {ts_alter, "ts:click", %{retention: ...}}               ← series modification
   {ts_createrule, "ts:click", "ts:click:per_hour", ...}   ← compaction rule
@@ -1401,13 +1395,7 @@ Raft log entries for TS:
   {ts_seal, "ts:click", partition_5}                       ← partition sealed
 ```
 
-Each node independently:
-- Appends samples to its local `.col` file
-- Writes to its local LMDB
-- Punches holes for expired partitions
-- Seals partitions with ALP/NeaTS encoding
-
-The Raft log ensures all nodes converge to the same state. Sealing and retention are deterministic — same input data, same codec probe result, same encoded bytes.
+All nodes apply structural commands at the same log index. Sealing and retention are deterministic — same input data, same codec probe result, same encoded bytes.
 
 ### 11.2 Raft Snapshot Contents
 
@@ -1487,16 +1475,25 @@ No manual intervention. The TS snapshot mechanism is the same whether the node i
 ### 11.5 Consistency Guarantees
 
 ```
+Sample data: Async replication — eventual consistency
+             Nodes may be ~10ms behind the writing node
+             On crash: last ~10ms of unreplicated samples may be lost
+             Acceptable trade-off for time series event data
+
+Structure:   Raft quorum — strong consistency
+             TS.CREATE, TS.ALTER, TS.CREATERULE, ts_expire, ts_seal
+             All nodes apply at the same log index
+
 Retention:   Consensus-driven via {:ts_expire, ...} Raft commands
              All nodes expire the same partitions at the same log index
 
 Sealing:     Deterministic — same raw bytes → same ALP/NeaTS encoding
-             Leader proposes {:ts_seal, series, partition_id}
+             {:ts_seal} proposed through Raft
              All nodes seal independently, produce identical results
 
 Reads:       Served from local LMDB + local .col files
              No network hop for queries (reads are local)
-             Linearizable if reading from leader, stale-ok from followers
+             May be slightly behind the writing node for recent data
 ```
 
 ---
