@@ -23,13 +23,12 @@ The solution is **columnar files with LMDB indexing**: each series gets a single
 
 ## 2. Storage Architecture
 
-### 2.1 The Three-Layer Model
+### 2.1 The Two-Layer Model
 
-The storage model has three parts working together:
+The storage model has two parts:
 
 - **Columnar file per series** — all samples for one series in one append-only file
-- **LMDB partition index** — a memory-mapped B-tree holding partition metadata for all series, durable and instantly queryable at startup with no rebuild
-- **Bitcask** — series registry only, one entry per series pointing to its file
+- **LMDB** — two databases in one mmap'd env: partition index (per-day metadata) and series registry (per-series config). Durable, instantly queryable at startup with no rebuild.
 
 ```
 data/
@@ -38,7 +37,7 @@ data/
     ts_temperature.col
     ...
   meta/
-    partition_index.lmdb   ← metadata for every partition of every series
+    ts_index.lmdb          ← partition index + series registry in one file
 ```
 
 Cross-series queries go from millions of file ops (old chunks) to one per series, preceded by a fast LMDB range scan that resolves byte offsets without touching any columnar file.
@@ -47,19 +46,14 @@ Cross-series queries go from millions of file ops (old chunks) to one per series
 
 LMDB is a memory-mapped B-tree key-value store — embedded, no server process, ACID, and as fast as RAM once the OS pages are warm. The same file FerricStore uses for Raft metadata. Used inside OpenLDAP, Tor, and Meilisearch for exactly this pattern.
 
-#### Why Not Bitcask for the Partition Index
+LMDB holds two databases in the same env (same mmap'd file, one `msync`):
 
-| | Bitcask | LMDB |
-|---|---|---|
-| Range scan by (series, day) | O(n) — hash table, must scan all keys | O(log n) — B-tree cursor |
-| Durable on crash | Yes | Yes — ACID |
-| Startup rebuild | Reads hint files, rebuilds keydir (~500ms for 10K series) | No rebuild — mmap, instant |
-| Val min/max pruning | Requires loading every entry | Durable in-place, zero extra reads |
-| Memory | Entire keydir in RAM | OS pages on demand |
+- **`partitions`** — per-day partition metadata (byte offsets, min/max, codec, sealed flag)
+- **`series`** — per-series config (name, codec, retention, grace, labels)
 
-Bitcask is a hash table — excellent for point lookups, terrible for range scans. The partition index is fundamentally a range-scan workload (give me all partitions for series X in time range Y). LMDB's B-tree is the right data structure.
+No Bitcask involvement in TS at all. Bitcask remains FerricStore's KV storage engine — TS is a separate subsystem with its own storage.
 
-**Key and value layout:**
+#### Partition Index — Key and Value Layout
 
 ```rust
 // Key: 12 bytes, fixed-width, sortable
@@ -96,13 +90,72 @@ heed = "0.20"
 ```rust
 let env = EnvOpenOptions::new()
     .map_size(10 * 1024 * 1024 * 1024)  // 10GB virtual — not physical RAM
-    .open("meta/partition_index.lmdb")?;
+    .max_dbs(2)
+    .open("meta/ts_index.lmdb")?;
 
-let db: Database<OwnedType<[u8;12]>, OwnedType<[u8;64]>> =
-    env.create_database(None)?;
+let partitions: Database<OwnedType<[u8;12]>, OwnedType<[u8;64]>> =
+    env.create_database(Some("partitions"))?;
+
+let series: Database<OwnedType<[u8;8]>, OwnedType<[u8;256]>> =
+    env.create_database(Some("series"))?;
 ```
 
-The `map_size` is virtual address space, not RAM. For 10K series × 90 days = 900K entries × 76 bytes = ~68MB on disk. LMDB pages in only what queries touch.
+The `map_size` is virtual address space, not RAM. For 10K series × 90 days = 900K partition entries × 76 bytes + 10K series entries × 264 bytes = ~71MB on disk. LMDB pages in only what queries touch.
+
+#### Series Registry — Key and Value Layout
+
+```rust
+// Key: 8 bytes (xxHash64 of series name)
+type SeriesKey = [u8; 8];
+
+// Value: up to 256 bytes, fixed-width
+struct SeriesMeta {
+    name_len:     u16,
+    name:         [u8; 128],  // series name string
+    codec:        u8,         // 0=raw 1=alp 2=neats (v2)
+    retention_ms: u64,
+    grace_ms:     u64,
+    labels_len:   u16,
+    labels:       [u8; 96],   // packed label key-value pairs
+    created_at:   u64,
+    _pad:         [u8; 5],
+}
+```
+
+**TS.CREATE writes one entry:**
+
+```rust
+fn ts_create_series(name: &str, meta: SeriesMeta) {
+    let mut txn = env.begin_rw_txn()?;
+    let key = xxhash64(name).to_be_bytes();
+    txn.put(series_db, &key, &meta.as_bytes(), WriteFlags::empty())?;
+    txn.commit()?;
+}
+```
+
+**Startup — populate ETS from LMDB:**
+
+```rust
+// Cursor scan all series — one sequential B-tree traversal
+fn ts_load_all_series() -> Vec<SeriesMeta> {
+    let txn = env.begin_ro_txn()?;
+    let mut cursor = series_db.open_ro_cursor(&txn)?;
+    cursor.iter()
+        .map(|(_, v)| SeriesMeta::from_bytes(v))
+        .collect()
+}
+```
+
+```elixir
+# On startup: LMDB → ETS, ~5ms for 10K series
+series_list = Nif.ts_load_all_series()
+Enum.each(series_list, fn meta ->
+  ETS.insert(:ts_series_meta, {meta.name, meta})
+  Enum.each(meta.labels, fn {k, v} ->
+    ETS.insert(:ts_label_index, {meta.name, k, v})
+  end)
+end)
+```
 
 **Write path — one LMDB write per partition seal:**
 
@@ -139,13 +192,12 @@ For 10K series × 7-day query = 70K entries, all returned in one sequential B-tr
 
 ```
 FerricStore starts:
-  Open LMDB env → mmap the file                (~1ms)
-  All partition metadata is immediately addressable
-  Zero rebuild. Zero file header reads.
-  OS loads LMDB pages on first access (demand paging).
+  1. Open LMDB env → mmap the file                   (~1ms)
+     All partition metadata is immediately addressable
+  2. Cursor scan series_registry → populate ETS       (~5ms for 10K series)
+     :ts_series_meta and :ts_label_index filled
+  3. Done. No Bitcask keydir rebuild. No file header reads.
 ```
-
-Compare to ETS rebuild: reading 10K file headers = 30MB of I/O, 900K ETS inserts = ~500ms–2s. LMDB eliminates this entirely.
 
 ### 2.3 Columnar File Layout
 
@@ -178,22 +230,20 @@ New samples append to the open partition tail. The file only grows forward.
 ### 2.4 Full Storage Architecture Diagram
 
 ```
-ETS:
-  :ts_label_index    — series_name → label set      (small, rebuild cheap on restart)
-  :ts_series_meta    — series_name → file path, codec, retention
-  :ts_warm_cache     — recently decoded sealed partitions   (volatile by design)
+ETS (volatile, populated from LMDB on startup):
+  :ts_series_meta    — series_name → file path, codec, retention   (hot-path cache)
+  :ts_label_index    — series_name → label set                     (MRANGE filter)
+  :ts_warm_cache     — {series, day} → decoded samples             (decode cache, opt-in)
 
-LMDB  (meta/partition_index.lmdb):
-  (series_hash, day) → PartitionEntry               (durable, mmap-fast, ~68MB for 10K×90d)
+LMDB  (meta/ts_index.lmdb):
+  series db:     series_hash → SeriesMeta                (source of truth for series config)
+  partitions db: (series_hash, day) → PartitionEntry     (source of truth for partition metadata)
 
 Columnar files  (data/ts/*.col):
-  All sample data — timestamp + value columns        (grows at tail, append-only)
-
-Bitcask:
-  Series registry — "ts:click" → file path + codec  (one entry per series)
+  All sample data — timestamp + value columns            (grows at tail, append-only)
 ```
 
-Each layer owns exactly what it is good at. ETS owns metadata and decode caches. LMDB owns durable queryable partition metadata. Columnar files own raw data. Bitcask owns the series registry.
+Two layers. ETS is a volatile cache populated from LMDB on startup (~5ms). LMDB is the durable source of truth for all metadata. Columnar files hold raw sample data.
 
 ---
 
@@ -230,8 +280,8 @@ When a day boundary passes (+ grace period), the `PartitionSealer` GenServer:
 3. ALP-encode the value column in a parallel Tokio task
 4. Compute `val_min`, `val_max` over the value column (one pass, free — already in memory for encoding)
 5. Write encoded bytes back in-place (always smaller — safe)
-6. **Write one LMDB entry** with `ts_min`, `ts_max`, `val_min`, `val_max`, offsets, `sealed=true`
-7. Update Bitcask series entry's `sample_count` field
+6. **Update LMDB partition entry** with `ts_min`, `ts_max`, `val_min`, `val_max`, offsets, `sealed=true`
+7. Update LMDB series entry's `sample_count` field
 
 ### 3.4 Idempotency and Crash Safety
 
@@ -282,9 +332,9 @@ Both levels of pruning happen inside the LMDB B-tree scan — one pass, no disk 
 ```
 TS.RANGE ts:click FROM -7d TO now
 
-1. Bitcask lookup "ts:click" → file path                        (~50ns)
-2. LMDB range scan: series_hash + day_range → 7 PartitionEntry  (~5μs)
-3. io_uring: submit 7 byte ranges in one batch                   (~100μs + I/O)
+1. ETS lookup :ts_series_meta "ts:click" → file path             (~1μs)
+2. LMDB range scan: series_hash + day_range → 7 PartitionEntry   (~5μs)
+3. io_uring: submit 7 byte ranges in one batch                    (~100μs + I/O)
 4. Tokio: ALP decode + filter to exact timestamp range
 5. Return results
 ```
@@ -896,7 +946,7 @@ TS.CREATE ts:likes:post:* RETENTION 31536000000
 TS.CREATE ts:trending:* RETENTION 604800000
 ```
 
-Retention is stored in the Bitcask series entry and the ETS `:ts_series_meta` table. The `RetentionSweeper` reads it from ETS — no disk access needed to decide what to sweep.
+Retention is stored in the LMDB series entry and cached in ETS `:ts_series_meta`. The `RetentionSweeper` reads it from ETS — no disk access needed to decide what to sweep.
 
 ### 9.6 Changing Retention (TS.ALTER)
 
@@ -910,7 +960,7 @@ TS.ALTER ts:views:post:* RETENTION 15552000000
 TS.ALTER ts:views:post:* RETENTION 2592000000
 ```
 
-`TS.ALTER` updates the Bitcask entry and ETS metadata. If retention is shortened, the `RetentionSweeper` is signalled to run immediately for that series.
+`TS.ALTER` updates the LMDB series entry and ETS metadata. If retention is shortened, the `RetentionSweeper` is signalled to run immediately for that series.
 
 ### 9.7 Rollup Retention
 
@@ -959,15 +1009,16 @@ Compare to RedisTimeSeries storing the same 90-day views history in RAM: 2.5TB �
 
 ### 9.9 Retention vs Compaction
 
-| | Retention | Compaction (Bitcask merge) |
+Retention and file compaction are different operations:
+
+| | Retention | File Compaction |
 |---|---|---|
-| What it removes | Expired time series partitions | Dead Bitcask entries (tombstones, overwritten keys) |
-| When it runs | RetentionSweeper, hourly | MergeWorker, triggered by dead byte ratio |
-| Mechanism | LMDB delete + hole punch | Bitcask file rewrite |
-| Affects | Columnar `.col` files + LMDB | Bitcask `.cask` files |
+| What it removes | Expired time series partitions | Dead space in `.col` files after many hole punches |
+| When it runs | RetentionSweeper, hourly | When dead bytes exceed 50% of file size |
+| Mechanism | LMDB delete + hole punch | Rewrite `.col` file excluding dead regions |
 | User-visible | Data disappears after RETENTION window | Disk space reclaimed, no visible change |
 
-They run independently. Retention cleans up the columnar TS data. Bitcask merge cleans up the series registry. Both are necessary. Neither replaces the other.
+Hole punching reclaims disk blocks immediately on filesystems that support it. File compaction is only needed as a fallback or when sparse files accumulate excessive fragmentation.
 
 ---
 
@@ -1204,7 +1255,7 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 | Single-threaded bottleneck | No | No | No | **Yes** (Redis core) | No (per-series GenServer) |
 | Infrastructure | Separate service | Separate service | Separate service | Separate service | **Zero — embedded** |
 | Consistency | eventual/async | eventual/async | PG ACID | async replication | **Raft quorum** |
-| Persistence on crash | WAL | WAL | WAL | RDB/AOF (slow restore) | Bitcask hint-file (fast restore) |
+| Persistence on crash | WAL | WAL | WAL | RDB/AOF (slow restore) | LMDB mmap (instant restore) |
 
 **Positioning:**
 
