@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
 
 env:
-  MIX_ENV: prod
+  MIX_ENV: dev
 
 jobs:
   publish:
