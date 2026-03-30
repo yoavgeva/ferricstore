@@ -406,6 +406,16 @@ When a partition interval elapses (+ grace period), the `PartitionSealer` GenSer
 
 **Out-of-order timestamps:** Samples are appended in arrival order during the open phase. The sort in step 2a fixes any out-of-order arrivals. After sealing, timestamps are guaranteed monotonic — ALP compresses perfectly, NeaTS can binary search.
 
+**Duplicate timestamps:** Two `TS.ADD` with the same series and timestamp — both are written to the open partition. At seal time, the Rust NIF uses a stable sort (preserves arrival order), then deduplicates adjacent entries — last-write-wins. Zero cost on the write path, one linear pass during seal:
+
+```rust
+// Inside ts_seal_partition:
+samples.sort_by_key(|s| s.timestamp);          // stable sort — arrival order preserved
+samples.dedup_by(|a, b| a.timestamp == b.timestamp);  // keep last (last-write-wins)
+```
+
+After seal, every timestamp is unique. No double-counting in aggregations, no ambiguity in `TS.GET`.
+
 ### 3.4 Idempotency and Crash Safety
 
 The seal operation is **idempotent**. If the process crashes mid-seal, the raw bytes remain intact in the columnar file. On restart, the `PartitionSealer` re-detects the unsealed partition (LMDB entry has `sealed=0` or is missing) and re-seals it.
