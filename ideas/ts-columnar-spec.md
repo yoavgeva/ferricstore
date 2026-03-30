@@ -33,11 +33,16 @@ The storage model has two parts:
 ```
 data/
   ts/
-    ts_click.col           ← all 90 days in one file
-    ts_temperature.col
-    ...
+    hot/
+      ts_click.col           ← hot series, own file
+      ts_temperature.col
+      ...
+    cold/
+      shard_0000.col         ← 1000 sparse series grouped per shard
+      shard_0001.col
+      ...
   meta/
-    ts_index.lmdb          ← partition index + series registry in one file
+    ts_index.lmdb            ← partition index + series registry in one file
 ```
 
 Cross-series queries go from millions of file ops (old chunks) to one per series, preceded by a fast LMDB range scan that resolves byte offsets without touching any columnar file.
@@ -289,9 +294,6 @@ ts_click.col
 │  All N values, contiguous, growing at tail               │
 │  Open partition: raw 8-byte IEEE 754 float64             │
 │  Sealed partition: ALP encoded in-place                  │
-├─────────────────────────────────────────────────────────┤
-│  LABELS SECTION                                          │
-│  Deduplicated string table + per-sample index            │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -310,11 +312,118 @@ LMDB  (meta/ts_index.lmdb):
   partitions db: (series_hash, partition_id) → PartitionEntry  (source of truth for partition metadata)
   rules db:      (src_hash, dst_hash) → RuleEntry              (compaction rules)
 
-Columnar files  (data/ts/*.col):
-  All sample data — timestamp + value columns            (grows at tail, append-only)
+Columnar files  (data/ts/hot/*.col + data/ts/cold/*.col):
+  Hot: one .col per series. Cold: shared shard .col files  (grows at tail, append-only)
 ```
 
 Two layers. ETS is a volatile cache populated from LMDB on startup (~5ms). LMDB is the durable source of truth for all metadata. Columnar files hold raw sample data.
+
+### 2.6 Hot/Cold Series Tiering
+
+At scale, most series are sparse. A typical deployment with 1M posts × 6 engagement types = 6M series, but 99% receive <10 samples/day. Giving every series its own .col file, Writer GenServer, and fd wastes resources:
+
+```
+6M series without tiering:
+  6M .col files      → filesystem inode exhaustion (ext4 default: 10M inodes)
+  6M Writers         → 6GB BEAM process memory doing nothing
+  6M fds             → kernel memory, pool churn
+  Most files: 0-160 bytes of actual data
+```
+
+**Solution: auto-tier series into hot (own file) and cold (shared shard file).**
+
+```
+data/
+  ts/
+    hot/
+      ts_post_456_view.col         ← 50K samples/day, own file
+      ts_post_456_like.col         ← 2K samples/day, own file
+      ...60K hot files...
+    cold/
+      shard_0000.col               ← 1000 sparse series grouped together
+      shard_0001.col
+      ...5,940 shard files...
+  meta/
+    ts_index.lmdb
+```
+
+**Tier classification — auto-detected by sample rate:**
+
+```elixir
+defp classify_series(samples_per_day) do
+  if samples_per_day > 100, do: :hot, else: :cold
+end
+```
+
+First partition always starts cold. After first seal, the system measures sample rate and promotes to hot if needed. Demotion back to cold happens if rate drops below threshold for 3 consecutive partitions.
+
+**How cold shard files work:**
+
+Multiple sparse series share one .col file. Each series gets its own byte range within the shard, tracked by LMDB partition entries (same as hot — just different file path).
+
+```
+shard_0042.col (1000 sparse series):
+
+  [series_A samples] [series_B samples] [series_C samples] ...
+  ^                  ^                  ^
+  LMDB entry:        LMDB entry:        LMDB entry:
+  offset=0, len=32   offset=32, len=48  offset=80, len=16
+```
+
+At seal time, the ColdWriter groups samples by series, sorts within each series, encodes each group with ALP:
+
+```
+Before seal (arrival order in shard):
+  [A t=1000 v=1] [B t=1001 v=5] [A t=2000 v=1] [B t=5000 v=3]
+
+After seal (grouped, sorted, encoded):
+  [ALP(A: t=1000,v=1 | t=2000,v=1)] [ALP(B: t=1001,v=5 | t=5000,v=3)]
+
+Each series' byte range in LMDB → queries work identically to hot files.
+```
+
+**Writers:**
+
+```
+Hot series:  own Writer GenServer per series (as described in §4.1)
+Cold series: one ColdWriter GenServer per shard (~1000 series per shard)
+             multiplexes writes, batches across all series in the shard
+
+Total Writers for 6M series (99% cold):
+  60K hot Writers + 5,940 ColdWriters = ~66K processes = ~66MB
+  vs 6M Writers = 6GB
+```
+
+**Promotion/demotion:**
+
+```
+Cold → Hot promotion:
+  After seal, sample_rate > 100/day for this series
+  1. Create new hot .col file for the series
+  2. Move future writes to new hot Writer
+  3. Historical data stays in cold shard (read-only, still queryable)
+  4. Update LMDB SeriesMeta: tier = :hot, file_path = new path
+
+Hot → Cold demotion:
+  After 3 consecutive seals with sample_rate < 100/day
+  1. Next partition writes go to a cold shard
+  2. Historical hot .col file stays (read-only, still queryable)
+  3. Update LMDB SeriesMeta: tier = :cold, shard_id = N
+```
+
+**Queries are tier-transparent:**
+
+```
+TS.RANGE ts:post:999888:view FROM -7d TO now
+
+1. ETS lookup → file path (hot .col or cold shard .col)
+2. LMDB scan → partition entries with byte offsets
+3. pread(file, offset, length)              ← same for hot or cold
+4. Decode → return
+
+The query path doesn't know or care about tiers.
+Only file path and byte offsets change — both are in LMDB.
+```
 
 ---
 
@@ -949,15 +1058,22 @@ After 3 consecutive partitions pick the same codec, the probe stops running and 
 
 Per-partition codec stored in LMDB `PartitionEntry.codec` field — mixed codecs within one series file are fully supported. The decode path reads the `codec` byte and uses the right decoder per partition.
 
-### 6.4 Labels Section Format
+### 6.4 Labels — Per-Series Only
 
-Labels are deduplicated using a string table to avoid repeating common label sets across samples:
+Labels are metadata on the series, not on individual samples. Stored in `SeriesMeta` in LMDB, cached in ETS `:ts_label_index`. The columnar .col file contains no label data — only timestamps and values.
 
-- **String table:** length-prefixed list of unique label strings
-- **Per-sample label index:** varint index into string table (1–2 bytes typical)
-- **If all samples share the same labels** (common case): `flags` bit 0 = `1`, single label entry, no per-sample index
+```
+TS.CREATE ts:post:456:view LABELS post_id 456 type view
+TS.CREATE ts:post:456:like LABELS post_id 456 type like
 
-> **Note:** For event data with region/device labels, all samples in a partition typically share the same label set. The flags bit optimization reduces the labels section to a single string entry — effectively zero per-sample overhead.
+TS.MRANGE FROM -24h TO now FILTER post_id=456
+  → ETS :ts_label_index scan → [ts:post:456:view, ts:post:456:like, ...]
+  → LMDB scan per matching series → io_uring → decode → return
+```
+
+This matches the Prometheus model: labels define the series identity. Different label values = different series. No per-sample label storage, no per-sample label filtering, no label section in the .col file.
+
+For use cases like engagement types (view/like/laugh/hate/share/comment), create one series per (entity, engagement_type) pair. The hot/cold tiering in §2.6 handles the resulting high series count efficiently — sparse series share shard files with minimal overhead.
 
 ---
 
@@ -1172,7 +1288,8 @@ Cost: ~60ms per incomplete bucket per rule, one-time on restart.
 |---|---|---|
 | `FerricStore.Supervisor` | `one_for_one` | Root supervisor |
 | `FerricStore.TS.Registry` | `permanent` | ETS owner for series metadata and compaction rules |
-| `FerricStore.TS.WriterSupervisor` | `permanent` | DynamicSupervisor for per-series TS.Writer GenServers |
+| `FerricStore.TS.WriterSupervisor` | `permanent` | DynamicSupervisor for per-series hot TS.Writer GenServers |
+| `FerricStore.TS.ColdWriterSupervisor` | `permanent` | DynamicSupervisor for per-shard ColdWriter GenServers |
 | `FerricStore.TS.PartitionSealer` | `permanent` | Seals closed partitions + computes rollup aggregations in one pass |
 | `FerricStore.TS.RetentionSweeper` | `permanent` | Deletes partitions beyond retention window (every 1h) |
 
@@ -1183,6 +1300,9 @@ Cost: ~60ms per incomplete bucket per rule, one-time on restart.
 | `[:ferricstore, :ts, :partition, :sealed]` | `bytes_before, bytes_after, duration_ms, sample_count` | `series, day, compression_ratio` |
 | `[:ferricstore, :ts, :partition, :seal_failed]` | `duration_ms` | `series, day, reason` |
 | `[:ferricstore, :ts, :retention, :dropped]` | `partitions_dropped, bytes_freed` | `series, cutoff_day` |
+| `[:ferricstore, :ts, :sample, :dropped_late]` | `timestamp` | `series, partition_id` |
+| `[:ferricstore, :ts, :tier, :promoted]` | `sample_rate` | `series, from: :cold, to: :hot` |
+| `[:ferricstore, :ts, :tier, :demoted]` | `sample_rate` | `series, from: :hot, to: :cold` |
 | `[:ferricstore, :ts, :reconstruction, :completed]` | `duration_ms, entries_replayed` | `series, trigger` |
 
 ---
@@ -1799,7 +1919,7 @@ Reads:       Served from local LMDB + local .col files
 6. NeaTS codec + `CodecProbe` auto-selection
 7. `TS.MRANGE` with label filtering + LMDB value pruning
 8. `TS.FILTER` with SIMD value filtering (`ts_simd_filter` NIF)
-9. Labels section in columnar files (dedup string table)
+9. Hot/cold series tiering + ColdWriter shard files
 10. Warm cache (`WARM_CACHE_CHUNKS`)
 11. `RetentionSweeper` + hole punching (Linux + macOS)
 12. `TS.CREATERULE` + rollup accumulator in Writer + restart recovery
