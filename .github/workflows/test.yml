@@ -108,7 +108,7 @@ jobs:
 
       - name: Run large allocation tests
         if: always()
-        run: mix test --only large_alloc --timeout 120000
+        run: mix test apps/ferricstore/test --only large_alloc --timeout 120000
         continue-on-error: true
 
       - name: Check io_uring availability (Linux only)
