@@ -46,10 +46,11 @@ Cross-series queries go from millions of file ops (old chunks) to one per series
 
 LMDB is a memory-mapped B-tree key-value store — embedded, no server process, ACID, and as fast as RAM once the OS pages are warm. The same file FerricStore uses for Raft metadata. Used inside OpenLDAP, Tor, and Meilisearch for exactly this pattern.
 
-LMDB holds two databases in the same env (same mmap'd file, one `msync`):
+LMDB holds three databases in the same env (same mmap'd file, one `msync`):
 
 - **`partitions`** — per-interval partition metadata (byte offsets, min/max, codec, sealed flag)
 - **`series`** — per-series config (name, codec, retention, grace, labels)
+- **`rules`** — compaction rules (source → destination series, aggregation type, bucket size)
 
 No Bitcask involvement in TS at all. Bitcask remains FerricStore's KV storage engine — TS is a separate subsystem with its own storage.
 
@@ -90,7 +91,7 @@ heed = "0.20"
 ```rust
 let env = EnvOpenOptions::new()
     .map_size(10 * 1024 * 1024 * 1024)  // 10GB virtual — not physical RAM
-    .max_dbs(2)
+    .max_dbs(3)
     .open("meta/ts_index.lmdb")?;
 
 let partitions: Database<OwnedType<[u8;12]>, OwnedType<[u8;64]>> =
@@ -98,6 +99,9 @@ let partitions: Database<OwnedType<[u8;12]>, OwnedType<[u8;64]>> =
 
 let series: Database<OwnedType<[u8;8]>, OwnedType<[u8;256]>> =
     env.create_database(Some("series"))?;
+
+let rules: Database<OwnedType<[u8;16]>, OwnedType<[u8;64]>> =
+    env.create_database(Some("rules"))?;
 ```
 
 The `map_size` is virtual address space, not RAM. Actual disk usage depends on partition interval — more partitions = more LMDB entries, but still small. At 1-hour intervals: 10K series × 2,160 partitions (90d) × 76 bytes + 10K series entries × 264 bytes = ~1.6GB. At 1-day intervals: ~71MB. LMDB pages in only what queries touch.
@@ -156,6 +160,30 @@ Enum.each(series_list, fn meta ->
   end)
 end)
 ```
+
+#### Compaction Rules — Key and Value Layout
+
+```rust
+// Key: 16 bytes (source series hash + destination series hash)
+struct RuleKey {
+    src_hash: u64,   // xxHash64 of source series name
+    dst_hash: u64,   // xxHash64 of destination series name
+}
+
+// Value: 64 bytes, fixed-width
+struct RuleEntry {
+    src_name_len: u16,
+    src_name:     [u8; 20],  // truncated, full name in series db
+    dst_name_len: u16,
+    dst_name:     [u8; 20],
+    agg_type:     u8,        // 0=sum 1=avg 2=min 3=max 4=count
+    bucket_ms:    u64,
+    created_at:   u64,
+    _pad:         [u8; 5],
+}
+```
+
+On startup, rules are loaded into ETS alongside series metadata. The `CompactionWorker` reads from ETS to know which rules to apply after each partition seal.
 
 **Write path — one LMDB write per partition seal:**
 
@@ -278,8 +306,9 @@ ETS (volatile, populated from LMDB on startup):
   :ts_warm_cache     — {series, day} → decoded samples             (decode cache, opt-in)
 
 LMDB  (meta/ts_index.lmdb):
-  series db:     series_hash → SeriesMeta                (source of truth for series config)
-  partitions db: (series_hash, day) → PartitionEntry     (source of truth for partition metadata)
+  series db:     series_hash → SeriesMeta                      (source of truth for series config)
+  partitions db: (series_hash, partition_id) → PartitionEntry  (source of truth for partition metadata)
+  rules db:      (src_hash, dst_hash) → RuleEntry              (compaction rules)
 
 Columnar files  (data/ts/*.col):
   All sample data — timestamp + value columns            (grows at tail, append-only)
@@ -1229,9 +1258,32 @@ end
 
 The user never sees this. Telemetry fires so operators are alerted.
 
-### 10.3 CREATERULE Retroactive Backfill
+### 10.3 CREATERULE — Raft Flow and Storage
 
-When `TS.CREATERULE` is called on a series that already has history, FerricStore attempts to backfill the destination series. The quality depends on how much WAL remains.
+`TS.CREATERULE` flows through Raft like all mutations:
+
+```
+Client: TS.CREATERULE ts:views ts:views:per_hour AGG sum BUCKET 3600000
+
+1. Leader proposes Raft command:
+   {:ts_createrule, "ts:views", "ts:views:per_hour", :sum, 3600000}
+
+2. All nodes apply (state machine callback):
+   a. Write rule to LMDB rules db
+   b. Insert into ETS :ts_compaction_rules
+   c. Leader only: trigger retroactive backfill (see below)
+
+3. CompactionWorker on all nodes now knows:
+   "When ts:views seals a partition, also aggregate into ts:views:per_hour"
+```
+
+The rule is stored in LMDB `rules` db — durable, included in snapshots, available immediately on startup. The `CompactionWorker` reads rules from ETS (populated from LMDB on boot) after each partition seal.
+
+**Backfill runs only on the leader** — the backfilled samples are proposed as regular `{:ts_add}` commands through Raft, so all nodes receive them. No node does independent backfill.
+
+### 10.4 CREATERULE Retroactive Backfill
+
+When `TS.CREATERULE` is called on a series that already has history, the leader attempts to backfill the destination series. The quality depends on how much WAL remains.
 
 **Case 1 — Full WAL coverage (series younger than log_retention_hours):**
 ```
@@ -1281,7 +1333,7 @@ Result: per_hour series starts from day 84.
         Return value includes a warning.
 ```
 
-### 10.4 TS.INFO Coverage Output
+### 10.5 TS.INFO Coverage Output
 
 After `TS.CREATERULE`, `TS.INFO` on the destination series shows exactly what data it contains:
 
@@ -1299,7 +1351,7 @@ coverage:
 sample_count:     13 weeks
 ```
 
-### 10.5 MIRROR_STREAM
+### 10.6 MIRROR_STREAM
 
 For users who need to stream every `TS.ADD` to an external system, `MIRROR_STREAM` connects TS writes to a FerricStore Stream key automatically:
 
@@ -1315,7 +1367,7 @@ XADD ts:changes:views:post:123 * ts 1700000001000 val 42
 
 The consumer uses existing `XREAD` / `XREADGROUP` commands. When `MIRROR_STREAM` is added to an existing series, FerricStore seeds the stream from the WAL (within `log_retention_hours`).
 
-### 10.6 Practical Recommendation
+### 10.7 Practical Recommendation
 
 **Define compaction rules at series creation time.** The retroactive backfill is a recovery mechanism, not a workflow.
 
@@ -1341,11 +1393,12 @@ All TS mutations flow through Raft. Every node applies the same commands in the 
 ```
 Raft log entries for TS:
 
-  {ts_add, "ts:click", 1700000001000, 42.0}       ← sample write
-  {ts_create, "ts:click", %{retention: ...}}        ← series creation
-  {ts_alter, "ts:click", %{retention: ...}}         ← series modification
-  {ts_expire, "ts:click", [partition_1, partition_2]} ← retention sweep
-  {ts_seal, "ts:click", partition_5}                 ← partition sealed
+  {ts_add, "ts:click", 1700000001000, 42.0}             ← sample write
+  {ts_create, "ts:click", %{retention: ...}}              ← series creation
+  {ts_alter, "ts:click", %{retention: ...}}               ← series modification
+  {ts_createrule, "ts:click", "ts:click:per_hour", ...}   ← compaction rule
+  {ts_expire, "ts:click", [partition_1, partition_2]}      ← retention sweep
+  {ts_seal, "ts:click", partition_5}                       ← partition sealed
 ```
 
 Each node independently:
