@@ -404,19 +404,67 @@ ts.io_uring_queue_depth = 32
 
 The warm cache is an ETS table keyed by `{series_name, day}` holding the fully decoded sample list from a sealed partition. It is populated lazily on first read — no proactive warming.
 
-```elixir
-# Read path for sealed partitions:
-# 1. Check ETS warm cache             → return immediately if hit
-# 2. Issue io_uring pread for misses   → ALP SIMD decode → store in warm cache → return
+**Read path for sealed partitions:**
 
-# Warm cache entry lifecycle:
-# - Inserted on first disk read of a sealed partition
-# - Evicted LRU when ts.warm_cache_max_mb is exceeded
-# - Invalidated if the partition is re-sealed (shouldn't happen, but handled)
-# - Open partitions are NEVER cached (they're still being written to)
+```
+TS.RANGE ts:click FROM -30d TO now
+
+1. LMDB scan → 30 PartitionEntry
+
+2. For each partition, check ETS warm cache:
+   HIT  → return decoded samples directly           (~10μs)
+   MISS → add to io_uring batch
+
+3. io_uring pread all misses → ALP SIMD decode
+
+4. Store decoded results in warm cache:
+   Cache at limit? → LRU evict oldest entries first
+                     ETS.delete frees memory immediately
+                   → Insert new entries
+
+5. Return all results (hits + freshly decoded)
 ```
 
-The warm cache gives operators a knob that says: "I know my dashboard queries the last 24 hours constantly — keep those 24 sealed partitions decoded in RAM so they serve at ETS speed, not disk speed." The RAM cost is ~28KB × 24 = 672KB per series. For 1000 series that's 672MB — a fraction of what RedisTimeSeries would need to keep the same history in RAM.
+**Warm cache entry lifecycle:**
+- Inserted on first disk read of a sealed partition
+- Evicted LRU when `ts.warm_cache_max_mb` is exceeded
+- Open partitions are NEVER cached (they're still being written to)
+
+**Eviction under memory pressure:**
+
+The query always succeeds. When the cache is full and new decoded partitions need to be cached, LRU entries are evicted first. `ETS.delete` frees memory immediately — the BEAM's ETS allocator owns it, no OS-level leak.
+
+```
+Cache at 1024MB limit, query needs 6 new partitions:
+
+  ETS.delete({ts:temperature, day_old_1})    ← freed, ~28KB reclaimed
+  ETS.delete({ts:temperature, day_old_2})    ← freed, ~28KB reclaimed
+  ...enough space...
+  ETS.insert({ts:click, day_new_1}, decoded) ← cached for next query
+  ...
+```
+
+**Transient memory during large queries:**
+
+Decoded partitions exist briefly in the Rust Tokio task and the calling Elixir process before entering ETS. This transient memory is outside the warm cache budget. To bound it, `ts_scan_range` decodes in batches of `ts.io_uring_queue_depth` (default 32) partitions:
+
+```
+TS.MRANGE across 10K series × 30 days = 300K partitions
+
+Without batching: 300K × 28KB = 8.4GB transient  ← bad
+
+With batching (queue_depth=32):
+  for each batch of 32 partitions:
+    io_uring pread 32 → decode → send to Elixir → Rust buffer freed
+    Peak transient: 32 × 28KB = 896KB             ← bounded
+
+  Elixir side aggregates incrementally per batch
+  Never holds all raw samples at once
+```
+
+The warm cache limit controls **long-lived** cached data. Transient decode memory is bounded by `ts.io_uring_queue_depth` — a separate knob.
+
+The warm cache gives operators a knob that says: "keep frequently-queried sealed partitions decoded in RAM so they serve at ETS speed, not disk speed." The RAM cost is ~28KB × 24 = 672KB per series. For 1000 series that's 672MB — a fraction of what RedisTimeSeries would need to keep the same history in RAM.
 
 ### 5.5 RAM Cost Comparison
 
