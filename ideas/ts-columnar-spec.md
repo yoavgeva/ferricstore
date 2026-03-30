@@ -346,13 +346,21 @@ The grace period matters. Event pipelines have tail latency — a sample timesta
 
 When a partition interval elapses (+ grace period), the `PartitionSealer` GenServer:
 
-1. Read the open partition's raw bytes from the columnar file
-2. ALP-encode the timestamp column in a Tokio task
-3. ALP-encode the value column in a parallel Tokio task
-4. Compute `val_min`, `val_max` over the value column (one pass, free — already in memory for encoding)
-5. Write encoded bytes back in-place (always smaller — safe)
-6. **Write LMDB partition entry** with `ts_min`, `ts_max`, `val_min`, `val_max`, offsets, `sealed=true` — this is the first and only LMDB write for this partition (no writes during the open phase)
-7. Update LMDB series entry's `sample_count` field (same transaction)
+1. Read the open partition's raw bytes from the columnar file (Elixir `File.read`)
+2. Call `ts_seal_partition` Rust NIF (Tokio async) which:
+   a. Sort all samples by timestamp (out-of-order arrivals → sorted)
+   b. Probe smoothness → pick codec (ALP or NeaTS)
+   c. Encode timestamp column (ALP)
+   d. Encode value column (ALP or NeaTS)
+   e. Compute `ts_min`, `ts_max`, `val_min`, `val_max` (free — one pass during encode)
+   f. Return encoded bytes + metadata via `OwnedEnv::send_and_clear`
+3. Write encoded bytes back to `.col` file (Elixir `File.write`)
+4. **Write LMDB partition entry** with `ts_min`, `ts_max`, `val_min`, `val_max`, offsets, `sealed=true` — this is the first and only LMDB write for this partition (no writes during the open phase)
+5. Update LMDB series entry's `sample_count` field (same transaction)
+
+**Why sort + encode in Rust:** At 30K/s with 5-min partitions, each seal processes 9M samples. Elixir: ~2.2s (sort + encode). Rust: ~60ms. With 100 series sealing concurrently, Elixir uses 27s of CPU vs Rust's 750ms. At scale, Elixir sealing starves the BEAM schedulers.
+
+**Out-of-order timestamps:** Samples are appended in arrival order during the open phase. The sort in step 2a fixes any out-of-order arrivals. After sealing, timestamps are guaranteed monotonic — ALP compresses perfectly, NeaTS can binary search.
 
 ### 3.4 Idempotency and Crash Safety
 
@@ -488,6 +496,8 @@ With batching (1ms flush interval):
 ```
 
 **Trade-off:** Up to 1ms of latency before the sample hits disk. For time series dashboards that refresh every 5 seconds, this is invisible.
+
+**TS.GET (latest sample):** The open partition is unsorted (samples in arrival order). The `TS.Writer` GenServer tracks `max_timestamp` and `latest_value` in its state — updated on each `TS.ADD`. `TS.GET` reads from the Writer's state directly (~1μs GenServer.call), no file scan needed.
 
 LMDB is only written at **seal time** — one transaction per partition seal. For the open (current) partition, `row_count` and `ts_max` are derived from the file at query time:
 
@@ -837,7 +847,7 @@ NeaTS works best on smooth data (views, temperature, revenue). For bursty data (
 
 ### 6.3 Codec Auto-Selection
 
-The `CodecProbe` module in Elixir probes at seal time — one extra pass over the value column that's already in memory. Adds ~1ms to a seal.
+Codec probing runs inside the `ts_seal_partition` Rust NIF — same Tokio task that sorts and encodes. One pass over the value column to measure smoothness, then pick ALP or NeaTS. The logic:
 
 ```elixir
 defmodule FerricStore.TS.CodecProbe do
@@ -901,16 +911,14 @@ Labels are deduplicated using a string table to avoid repeating common label set
 
 ### 7.1 The Rule
 
-**Rust if and only if:**
+**Rust if:**
 1. The operation requires SIMD (AVX2) — Elixir has no access to SIMD instructions
 2. The operation requires io_uring — no Elixir interface exists
-3. The operation is on the query hot path AND the user is waiting for it
+3. The operation is CPU-intensive and would starve BEAM schedulers at scale (sort + encode millions of samples)
 
-**Elixir for everything else.**
+**Elixir for:** orchestration, file I/O, command dispatch, supervision — anything where the BEAM's scheduling, GC, and observability matter more than raw throughput.
 
-If it runs in the background and the user never waits for it, it belongs in Elixir. If it runs on the query hot path and the user waits for it, it belongs in Rust.
-
-**Why this matters:** Rust NIFs allocate memory outside the BEAM heap. The GC cannot see these allocations. If a NIF is used for background work, the developer must manually manage when memory is freed. Elixir processes allocate on the BEAM heap — when a process exits, everything is freed. A `Task` that seals one partition leaves zero memory behind.
+**Memory discipline:** Rust NIFs allocate outside the BEAM heap. All Rust NIF work runs in Tokio tasks with bounded lifetime — task ends, memory freed. The Elixir `PartitionSealer` Task that calls the NIF owns the lifecycle: if it crashes, the Tokio task's result is dropped, no leak.
 
 ### 7.2 NIF Consistency
 
@@ -926,19 +934,17 @@ All Rust NIFs follow the project's established patterns:
 |---|---|---|
 | `ts_scan_range` NIF | Rust | SIMD AVX2 decode + io_uring — user waits |
 | `ts_simd_filter` NIF | Rust | SIMD value column scan — user waits |
+| `ts_seal_partition` NIF | Rust | Sort + codec probe + ALP/NeaTS encode — CPU-intensive at scale |
 | `ts_lmdb_scan` NIF | Rust | LMDB `heed` binding — thin wrapper |
 | `ts_lmdb_upsert` NIF | Rust | LMDB `heed` binding — thin wrapper |
-| `TS.Encoding.encode_values` | Elixir | Background seal — 200ms fine, clean GC |
-| `TS.Encoding.encode_timestamps` | Elixir | Background seal — 200ms fine, clean GC |
-| `TS.Encoding.neats_fit` | Elixir | Math + background — Nx or pure Elixir |
-| `TS.CodecProbe.pick` | Elixir | 1ms math on 1000 samples — trivially Elixir |
-| `TS.PartitionSealer` GenServer | Elixir | Orchestration — pure OTP |
+| `TS.PartitionSealer` GenServer | Elixir | Orchestration — reads raw bytes, calls NIF, writes result |
+| `TS.Writer` GenServer (per series) | Elixir | Batched writes — mailbox serialization, flush timer |
 | `TS.CompactionWorker` GenServer | Elixir | Orchestration — pure OTP |
 | `TS.RetentionSweeper` GenServer | Elixir | Orchestration — pure OTP |
 | `TS.Counter` (TS.INCR) | Elixir | ETS INCR — Elixir native |
 | `TS.Pipeline` parser | Elixir | Keyword parsing — pure Elixir |
 | All command dispatch | Elixir | RESP parsing already Elixir |
-| File appends | Elixir | `File.write!` — fine for background |
+| File I/O (read/write .col) | Elixir | `File.read!/write!` — orchestrated by Elixir, raw bytes passed to NIF |
 | LMDB metadata logic | Elixir | Calls thin Rust NIFs, logic in Elixir |
 
 ### 7.4 Rust NIF Functions
@@ -947,8 +953,9 @@ All Rust NIFs follow the project's established patterns:
 |---|---|---|
 | `ts_scan_range(fd, from_off, to_off, agg, bucket_ms)` | SIMD decode + io_uring | Seek, read, AVX2 decode, aggregate — user waits |
 | `ts_simd_filter(bytes, op, threshold)` | SIMD value scan | TS.FILTER hot path — user waits |
-| `ts_lmdb_scan(hash, from_day, to_day, val_min, val_max)` | LMDB heed binding | Range scan partition index |
-| `ts_lmdb_upsert(hash, day, entry)` | LMDB heed binding | Write one partition entry |
+| `ts_seal_partition(raw_bytes)` | Sort + encode at scale | Sort 9M samples, codec probe, ALP/NeaTS encode — ~60ms vs ~2.2s in Elixir |
+| `ts_lmdb_scan(hash, from_id, to_id, val_min, val_max)` | LMDB heed binding | Range scan partition index |
+| `ts_lmdb_upsert(hash, partition_id, entry)` | LMDB heed binding | Write one partition entry |
 
 ```rust
 fn ts_scan_range(env: Env, args: &[Term]) -> Result<Term, Error> {
@@ -988,58 +995,30 @@ defmodule FerricStore.TS.PartitionSealer do
   # Runs as a Task — spawns, works, exits. GC cleans up.
   def seal(series_name, partition_id) do
     Task.start(fn ->
+      # 1. Read raw bytes — Elixir File.read
       raw = File.read!(col_file_path(series_name))
-      {timestamps, values} = parse_raw_partition(raw, partition_id)
+      raw_partition = extract_raw_partition(raw, partition_id)
 
-      # Codec probe — pure Elixir math, ~1ms
-      codec = FerricStore.TS.CodecProbe.pick(values)
+      # 2. Sort + encode in Rust NIF (~60ms for 9M samples)
+      #    Sorts by timestamp, probes codec, encodes, computes min/max
+      #    Returns via OwnedEnv::send_and_clear
+      {:ok, result} = Nif.ts_seal_partition(raw_partition)
+      # result = %{encoded_ts, encoded_val, codec, ts_min, ts_max, val_min, val_max}
 
-      # Encoding — pure Elixir, background, slow is fine
-      encoded_ts  = FerricStore.TS.Encoding.encode_timestamps(timestamps)
-      encoded_val = case codec do
-        :alp       -> FerricStore.TS.Encoding.alp_encode(values)
-        :neats_alp -> FerricStore.TS.Encoding.neats_encode(values)
-      end
+      # 3. Write encoded bytes — Elixir File.write
+      write_partition(series_name, partition_id, result.encoded_ts, result.encoded_val)
 
-      # val_min/val_max computed during encode — free, one pass
-      {val_min, val_max} = FerricStore.TS.Encoding.minmax(values)
-
-      # Write encoded bytes — Elixir File.write
-      write_partition(series_name, partition_id, encoded_ts, encoded_val)
-
-      # LMDB update — thin Rust NIF, ~1μs
+      # 4. LMDB update — thin Rust NIF, ~1μs
       Nif.ts_lmdb_upsert(
         series_hash(series_name), partition_id,
-        build_entry(encoded_ts, encoded_val, timestamps, val_min, val_max, codec)
+        build_entry(result)
       )
     end)
   end
 end
 ```
 
-### 7.6 The Nx Option for NeaTS
-
-NeaTS function fitting (linear regression, polynomial fit) involves matrix operations on small arrays (~1000 samples). This is exactly what the Nx library handles — EXLA backend compiles these to native code and can use BLAS if available.
-
-```elixir
-defmodule FerricStore.TS.Encoding do
-  import Nx.Defn
-
-  defn linear_fit(xs, ys) do
-    # Ordinary least squares — Nx compiles to native, BLAS-accelerated
-    n    = Nx.size(xs)
-    sx   = Nx.sum(xs)
-    sy   = Nx.sum(ys)
-    sxx  = Nx.sum(Nx.multiply(xs, xs))
-    sxy  = Nx.sum(Nx.multiply(xs, ys))
-    a    = (n * sxy - sx * sy) / (n * sxx - sx * sx)
-    b    = (sy - a * sx) / n
-    {a, b}
-  end
-end
-```
-
-This stays in Elixir, runs fast enough for background work, and avoids any Rust allocation for the fitting step.
+The Elixir Task owns the lifecycle: read → call NIF → write → LMDB. If the Task crashes, the Tokio task's result is dropped — no memory leak. The NIF does the CPU-intensive work (sort, probe, encode, NeaTS fitting), Elixir does the I/O and orchestration.
 
 ---
 
