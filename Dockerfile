@@ -19,7 +19,7 @@ RUN mix local.hex --force && mix local.rebar --force
 ENV MIX_ENV=prod
 ENV FERRICSTORE_BUILD_NIF=1
 
-# Copy mix files first for dependency caching
+# Copy mix files (all apps needed for umbrella resolution)
 COPY mix.exs mix.lock ./
 COPY apps/ferricstore/mix.exs apps/ferricstore/mix.exs
 COPY apps/ferricstore_server/mix.exs apps/ferricstore_server/mix.exs
@@ -27,13 +27,13 @@ COPY apps/ferricstore_ecto/mix.exs apps/ferricstore_ecto/mix.exs
 COPY apps/ferricstore_session/mix.exs apps/ferricstore_session/mix.exs
 COPY config/config.exs config/prod.exs config/runtime.exs config/
 
-# Copy Rust source and all application source
+# Copy source — only core + server for the standalone Docker image
 COPY apps/ferricstore/native apps/ferricstore/native
 COPY apps/ferricstore/lib apps/ferricstore/lib
 COPY apps/ferricstore/priv apps/ferricstore/priv
 COPY apps/ferricstore_server/lib apps/ferricstore_server/lib
-COPY apps/ferricstore_ecto/lib apps/ferricstore_ecto/lib
-COPY apps/ferricstore_session/lib apps/ferricstore_session/lib
+# Stub lib dirs for ecto/session so umbrella compiles
+RUN mkdir -p apps/ferricstore_ecto/lib apps/ferricstore_session/lib
 COPY rel rel
 
 RUN mix deps.get --only prod
