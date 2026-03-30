@@ -70,6 +70,7 @@ jobs:
           mix hex.publish --replace --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+          HEX_PUBLISH: "1"
 
       - name: Publish ferricstore_session
         run: |
@@ -77,3 +78,4 @@ jobs:
           mix hex.publish --replace --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+          HEX_PUBLISH: "1"

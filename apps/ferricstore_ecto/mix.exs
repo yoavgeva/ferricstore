@@ -39,8 +39,15 @@ defmodule FerricstoreEcto.MixProject do
   end
 
   defp deps do
+    ferricstore_dep =
+      if System.get_env("HEX_PUBLISH") do
+        {:ferricstore, "~> 0.1"}
+      else
+        {:ferricstore, in_umbrella: true}
+      end
+
     [
-      {:ferricstore, in_umbrella: true},
+      ferricstore_dep,
       {:ecto, "~> 3.11"},
       {:ecto_sql, "~> 3.11"},
       {:ecto_sqlite3, "~> 0.17", only: :test},

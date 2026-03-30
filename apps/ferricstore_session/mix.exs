@@ -34,8 +34,15 @@ defmodule FerricstoreSession.MixProject do
   end
 
   defp deps do
+    ferricstore_dep =
+      if System.get_env("HEX_PUBLISH") do
+        {:ferricstore, "~> 0.1"}
+      else
+        {:ferricstore, in_umbrella: true}
+      end
+
     [
-      {:ferricstore, in_umbrella: true},
+      ferricstore_dep,
       {:plug, "~> 1.14"},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false}
     ]
