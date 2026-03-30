@@ -322,8 +322,8 @@ When a partition interval elapses (+ grace period), the `PartitionSealer` GenSer
 3. ALP-encode the value column in a parallel Tokio task
 4. Compute `val_min`, `val_max` over the value column (one pass, free — already in memory for encoding)
 5. Write encoded bytes back in-place (always smaller — safe)
-6. **Update LMDB partition entry** with `ts_min`, `ts_max`, `val_min`, `val_max`, offsets, `sealed=true`
-7. Update LMDB series entry's `sample_count` field
+6. **Write LMDB partition entry** with `ts_min`, `ts_max`, `val_min`, `val_max`, offsets, `sealed=true` — this is the first and only LMDB write for this partition (no writes during the open phase)
+7. Update LMDB series entry's `sample_count` field (same transaction)
 
 ### 3.4 Idempotency and Crash Safety
 
@@ -341,10 +341,24 @@ The LMDB write in step 6 is the commit point. If it succeeds, the partition is s
 Client: TS.ADD ts:click 1700000001000 42
 
 1. Async columnar file append              (~3μs, non-blocking)
-2. LMDB upsert: update row_count, ts_max  (~5μs, batched)
+2. Done.
 ```
 
-Writes never touch sealed partitions. New samples always append to the open (current day) partition tail. No ETS involvement — the columnar file is the single write target.
+One syscall. No LMDB write, no ETS write.
+
+LMDB is single-writer — one write transaction at a time across the entire env. Updating partition metadata on every `TS.ADD` would cap total throughput at ~200K samples/sec across all series (LMDB commit = `msync` ≈ 5μs). Instead, LMDB is only written at **seal time** — one transaction per partition seal.
+
+For the open (current) partition, `row_count` and `ts_max` are derived from the file at query time:
+
+```rust
+// No LMDB needed for the open partition:
+row_count = (file_size - header_size - sealed_bytes) / 16  // 16 bytes per sample
+ts_max    = pread(fd, file_size - 16, 8)                   // last timestamp in file
+```
+
+This eliminates the LMDB bottleneck entirely. Per-series write throughput is bounded only by file append syscall latency (~333K samples/sec per series). Total throughput is bounded by NVMe bandwidth — at 16 bytes/sample and 5GB/s, that's ~312M samples/sec theoretical.
+
+Writes never touch sealed partitions. New samples always append to the open partition tail.
 
 ### 4.2 Two-Level Pruning
 
