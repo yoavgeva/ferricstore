@@ -60,20 +60,20 @@ jobs:
       - name: Publish ferricstore (core)
         run: |
           cd apps/ferricstore
-          mix hex.publish --yes
+          mix hex.publish --replace --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
       - name: Publish ferricstore_ecto
         run: |
           cd apps/ferricstore_ecto
-          mix hex.publish --yes
+          mix hex.publish --replace --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
       - name: Publish ferricstore_session
         run: |
           cd apps/ferricstore_session
-          mix hex.publish --yes
+          mix hex.publish --replace --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
