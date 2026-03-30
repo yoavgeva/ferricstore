@@ -987,45 +987,33 @@ This fallback is slower but functionally correct. The LMDB deletion alone preven
 
 ### 9.3 RetentionSweeper GenServer
 
+Retention must be consensus-driven — all nodes in the Raft cluster must agree on what's expired. The `RetentionSweeper` runs **only on the leader** and proposes retention commands through Raft. Followers apply the same deletions when they process the replicated log entry.
+
 ```elixir
 defmodule FerricStore.TS.RetentionSweeper do
   use GenServer
 
-  # Ticks every 1 hour by default
+  # Ticks every 1 hour by default (leader only)
   # Configurable: ts.retention_sweep_interval_ms
 
   def handle_info(:sweep, state) do
-    now_ms   = System.system_time(:millisecond)
+    # Only the leader proposes retention commands
+    unless FerricStore.Raft.is_leader?(), do: {:noreply, state}
 
-    # Get all series with a RETENTION policy from ETS
+    now_ms = System.system_time(:millisecond)
+
     series_list = ETS.select(:ts_series_meta, [{:_, :_, :_, :"$retention_ms", :_}])
 
-    Enum.each(series_list, fn {name, file_path, retention_ms, _} ->
+    Enum.each(series_list, fn {name, _file_path, retention_ms, _} ->
       cutoff_ms = now_ms - retention_ms
 
-      # LMDB range scan: all partitions for this series where ts_max < cutoff
       expired = Nif.ts_lmdb_scan_before(series_hash(name), cutoff_ms)
 
-      Enum.each(expired, fn entry ->
-        # Punch holes in columnar file — Rust NIF, ~1μs per partition
-        Nif.ts_punch_partition(
-          file_fd(file_path),
-          entry.ts_offset, entry.ts_len
-        )
-        Nif.ts_punch_partition(
-          file_fd(file_path),
-          entry.val_offset, entry.val_len
-        )
-        # Delete from LMDB partition index — now invisible to queries
-        Nif.ts_lmdb_delete(series_hash(name), entry.partition_id)
-
-        # Telemetry
-        :telemetry.execute(
-          [:ferricstore, :ts, :retention, :dropped],
-          %{bytes_freed: entry.ts_len + entry.val_len},
-          %{series: name, partition_id: entry.partition_id}
-        )
-      end)
+      unless Enum.empty?(expired) do
+        # Propose through Raft — all nodes will apply this
+        partition_ids = Enum.map(expired, & &1.partition_id)
+        FerricStore.Raft.propose({:ts_expire, name, partition_ids})
+      end
     end)
 
     schedule_next_sweep(state)
@@ -1034,7 +1022,37 @@ defmodule FerricStore.TS.RetentionSweeper do
 end
 ```
 
-One LMDB scan + one hole punch per expired partition. No file rewriting. No read blackout. Safe to run while queries are in-flight.
+**Raft state machine apply — runs on ALL nodes (leader + followers):**
+
+```elixir
+# In the Raft state machine apply/2 callback:
+def apply(_meta, {:ts_expire, series_name, partition_ids}, state) do
+  file_path = ETS.lookup(:ts_series_meta, series_name).file_path
+
+  Enum.each(partition_ids, fn partition_id ->
+    entry = Nif.ts_lmdb_get(series_hash(series_name), partition_id)
+
+    # Punch holes in columnar file
+    Nif.ts_punch_partition(file_fd(file_path), entry.ts_offset, entry.ts_len)
+    Nif.ts_punch_partition(file_fd(file_path), entry.val_offset, entry.val_len)
+
+    # Delete from LMDB partition index
+    Nif.ts_lmdb_delete(series_hash(series_name), partition_id)
+  end)
+
+  :telemetry.execute(
+    [:ferricstore, :ts, :retention, :dropped],
+    %{partitions_dropped: length(partition_ids)},
+    %{series: series_name}
+  )
+
+  {state, :ok}
+end
+```
+
+Every node applies the same `{:ts_expire, series, partitions}` command from the Raft log. All nodes punch the same holes, delete the same LMDB entries, at the same log index. Retention is consistent across the cluster.
+
+One LMDB scan + one Raft proposal per sweep on the leader. One hole punch per expired partition on every node. No file rewriting. No read blackout. Safe to run while queries are in-flight.
 
 ### 9.4 Day-Level Granularity
 
@@ -1314,9 +1332,125 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 
 ---
 
-## 11. Command Surface
+## 11. Replication & New-Node Bootstrap
 
-### 11.1 Commands
+### 11.1 How TS Data Replicates
+
+All TS mutations flow through Raft. Every node applies the same commands in the same order:
+
+```
+Raft log entries for TS:
+
+  {ts_add, "ts:click", 1700000001000, 42.0}       ← sample write
+  {ts_create, "ts:click", %{retention: ...}}        ← series creation
+  {ts_alter, "ts:click", %{retention: ...}}         ← series modification
+  {ts_expire, "ts:click", [partition_1, partition_2]} ← retention sweep
+  {ts_seal, "ts:click", partition_5}                 ← partition sealed
+```
+
+Each node independently:
+- Appends samples to its local `.col` file
+- Writes to its local LMDB
+- Punches holes for expired partitions
+- Seals partitions with ALP/NeaTS encoding
+
+The Raft log ensures all nodes converge to the same state. Sealing and retention are deterministic — same input data, same codec probe result, same encoded bytes.
+
+### 11.2 Raft Snapshot Contents
+
+The WAL only retains `log_retention_hours` (default: 7 days). The columnar files hold the full history (up to RETENTION). When a new node joins or a follower falls too far behind, ra sends a snapshot instead of replaying the WAL.
+
+**The TS snapshot includes:**
+
+```
+Snapshot:
+  1. LMDB file    — meta/ts_index.lmdb          (~71MB for 10K series)
+     Contains: series registry + all partition entries
+     This is the complete metadata — no rebuild needed
+
+  2. Columnar files — data/ts/*.col               (size depends on retention)
+     Contains: all sample data for all series
+     Expired partitions are hole-punched (sparse) — zero bytes transferred
+
+  3. ETS is NOT included
+     Rebuilt from LMDB on snapshot install (~5ms)
+```
+
+### 11.3 New-Node Bootstrap
+
+```
+Node D joins a 3-node cluster (A=leader, B, C):
+
+1. Node D starts, joins Raft group
+   ra detects: follower has no state → needs full snapshot
+
+2. Leader A streams snapshot to D:
+   a. LMDB file (small, sent first)          → D can see metadata immediately
+   b. Columnar files (streamed in chunks)     → D receives series one at a time
+
+3. As each .col file arrives, D can serve reads for that series
+   Not blocked on full transfer completing
+
+4. After snapshot install completes:
+   a. D opens LMDB → populates ETS            (~5ms)
+   b. D is now a full replica
+
+5. Leader streams WAL entries from snapshot index forward
+   D applies new TS.ADD entries as they arrive
+   D is now caught up and participating in consensus
+```
+
+**Transfer size is bounded by retention:**
+
+```
+Retention = 30d, 10K series at 1 sample/sec:
+  LMDB:    ~71MB
+  .col:    10K × 30 × 28KB = ~8.4GB
+  Total:   ~8.5GB
+
+Retention = 90d, 1M series at mixed rates:
+  LMDB:    ~1.6GB
+  .col:    ~3.8TB
+  Total:   ~3.8TB (same as disk footprint — no amplification)
+```
+
+Expired partitions (hole-punched regions) are sparse — they contain zero bytes and are skipped during transfer. A series with 90 days of data but 30-day retention only transfers 30 days of actual bytes.
+
+### 11.4 Follower Falls Behind (Longer Than WAL Retention)
+
+```
+Node B was down for 10 days. WAL retention = 7 days.
+Node B's last applied index is older than the oldest WAL entry.
+
+ra handles this automatically:
+  1. Leader detects: follower's last index < WAL start
+  2. Leader sends full snapshot (same as new-node bootstrap)
+  3. B installs snapshot, catches up from WAL forward
+  4. B is a full replica again
+```
+
+No manual intervention. The TS snapshot mechanism is the same whether the node is new or recovering.
+
+### 11.5 Consistency Guarantees
+
+```
+Retention:   Consensus-driven via {:ts_expire, ...} Raft commands
+             All nodes expire the same partitions at the same log index
+
+Sealing:     Deterministic — same raw bytes → same ALP/NeaTS encoding
+             Leader proposes {:ts_seal, series, partition_id}
+             All nodes seal independently, produce identical results
+
+Reads:       Served from local LMDB + local .col files
+             No network hop for queries (reads are local)
+             Linearizable if reading from leader, stale-ok from followers
+```
+
+---
+
+## 12. Command Surface
+
+### 12.1 Commands
 
 | Command | Description |
 |---|---|
@@ -1333,7 +1467,7 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 | `TS.COMPUTE "expr" FROM to TO [AGG type BUCKET ms]` | Cross-series arithmetic |
 | `TS.PIPELINE [FILTER ...] \| RANGE \| WHERE \| AGG \| COMPUTE \| TOPN \| LIMIT` | Chained operations in single NIF call |
 
-### 11.2 Command Comparison Table
+### 12.2 Command Comparison Table
 
 | Command | RedisTimeSeries | FerricStore TS |
 |---|---|---|
@@ -1350,7 +1484,7 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 
 ---
 
-## 12. Comparison
+## 13. Comparison
 
 | Capability | QuestDB | InfluxDB 3.0 | TimescaleDB | RedisTimeSeries | FerricStore TS |
 |---|---|---|---|---|---|
@@ -1376,7 +1510,7 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 
 ---
 
-## 13. Implementation Order
+## 14. Implementation Order
 
 1. Columnar file format + LMDB (partition index + series registry)
 2. `TS.CREATE`, `TS.ADD`, `TS.GET` — basic write/read path
