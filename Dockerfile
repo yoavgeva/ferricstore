@@ -27,17 +27,20 @@ COPY apps/ferricstore_ecto/mix.exs apps/ferricstore_ecto/mix.exs
 COPY apps/ferricstore_session/mix.exs apps/ferricstore_session/mix.exs
 COPY config/config.exs config/prod.exs config/runtime.exs config/
 
-RUN mix deps.get --only prod
-RUN mix deps.compile
-
-# Copy Rust source and build NIF
+# Copy Rust source early so deps.compile can build the NIF
 COPY apps/ferricstore/native apps/ferricstore/native
+
+RUN mix deps.get --only prod
+
+# Build NIF first, then compile all deps
 RUN cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
 RUN mkdir -p apps/ferricstore/priv/native && \
     cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so \
        apps/ferricstore/priv/native/libferricstore_bitcask.so && \
     cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so \
        apps/ferricstore/priv/native/ferricstore_bitcask.so
+
+RUN mix deps.compile
 
 # Copy application source, priv, and release config
 COPY apps/ferricstore/lib apps/ferricstore/lib
