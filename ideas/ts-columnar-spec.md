@@ -373,58 +373,106 @@ Client → Node A (any node):
 
   TS.ADD ts:click 1700000001000 42
 
-  1. Message to TS.Writer GenServer           (~100ns, mailbox insert)
-  2. Ack to client                            ← immediate
-  3. TS.Writer flushes batch to .col file     ← every 1ms or 1000 samples
-  4. Replicate batch to other nodes           ← fire-and-forget
+  1. GenServer.cast to TS.Writer for ts:click  (~100ns, mailbox insert)
+  2. Ack to client                              ← immediate, before flush
+  3. TS.Writer flushes batch to .col file       ← every 1ms or 1000 samples
+  4. Replicate batch to other nodes             ← fire-and-forget
 ```
 
 **Why async, not quorum:** Time series samples are append-only, arrive continuously, and losing a few on crash is acceptable. At 30K/s with ~10ms replication lag, a crash loses ~300 samples — the next 300 arrive in 10ms. Quorum would add 1-5ms latency to every write for a durability guarantee that time series data doesn't need.
 
+**Ack before flush (Option C):** The client gets `:ok` when the sample enters the GenServer mailbox, not when it hits disk. If the node crashes before flush, buffered samples (up to 1ms worth) are lost. This is the same trade-off every TSDB makes — Prometheus, InfluxDB, VictoriaMetrics, and Redis all ack from buffer and flush periodically. The 1ms buffer window is smaller than what any competitor accepts.
+
 **Structural commands use Raft quorum** (see §11.5 for the full split).
 
-**TS.Writer — batched writes:**
+**TS.Writer — one GenServer per series, batched writes:**
 
-A single `TS.Writer` GenServer per node receives all `TS.ADD` messages. Samples accumulate in the mailbox and are flushed in batches — grouped by series, one `write()` syscall per series per flush.
+Each series gets its own `TS.Writer` GenServer, started on demand via `DynamicSupervisor`. This gives per-series parallelism — no series blocks another, and each GenServer handles its own flush timer and fd.
 
 ```elixir
 defmodule FerricStore.TS.Writer do
   use GenServer
 
-  # Flush every 1ms or when buffer reaches 1000 samples per series
+  # Flush every 1ms or when buffer reaches 1000 samples
   @flush_interval_ms 1
   @flush_threshold 1000
 
-  def handle_cast({:ts_add, series, timestamp, value}, state) do
-    state = buffer_sample(state, series, timestamp, value)
+  def start_link(series_name) do
+    GenServer.start_link(__MODULE__, series_name,
+      name: {:via, Registry, {TS.WriterRegistry, series_name}})
+  end
 
-    if buffer_size(state, series) >= @flush_threshold do
-      state = flush_series(state, series)
+  def init(series_name) do
+    schedule_flush()
+    {:ok, %{
+      series: series_name,
+      fd: FerricStore.TS.FdManager.get_fd(series_name),
+      buffer: [],
+      count: 0
+    }}
+  end
+
+  def handle_cast({:ts_add, timestamp, value}, state) do
+    state = %{state |
+      buffer: [{timestamp, value} | state.buffer],
+      count: state.count + 1
+    }
+
+    if state.count >= @flush_threshold do
+      {:noreply, flush(state)}
+    else
+      {:noreply, state}
     end
-
-    {:noreply, state}
   end
 
   def handle_info(:flush, state) do
-    state = flush_all(state)
     schedule_flush()
-    {:noreply, state}
+    {:noreply, flush(state)}
   end
 
-  defp flush_series(state, series) do
-    fd = FerricStore.TS.FdManager.get_fd(series)
-    batch = get_buffer(state, series)
+  defp flush(%{count: 0} = state), do: state
+  defp flush(state) do
+    batch = Enum.reverse(state.buffer)
 
     # One write syscall for the entire batch
-    # 30 samples × 16 bytes = 480 bytes per write
-    :file.write(fd, encode_batch(batch))
+    :file.write(state.fd, encode_batch(batch))
 
     # Queue for async replication
-    FerricStore.TS.Replicator.queue(series, batch)
+    FerricStore.TS.Replicator.queue(state.series, batch)
 
-    clear_buffer(state, series)
+    %{state | buffer: [], count: 0}
   end
 end
+```
+
+**Routing TS.ADD to the right writer:**
+
+```elixir
+def handle_ts_add(series_name, timestamp, value) do
+  # Find or start the writer for this series
+  writer = case Registry.lookup(TS.WriterRegistry, series_name) do
+    [{pid, _}] -> pid
+    [] -> DynamicSupervisor.start_child(TS.WriterSupervisor,
+            {TS.Writer, series_name}) |> elem(1)
+  end
+
+  GenServer.cast(writer, {:ts_add, timestamp, value})
+  :ok  # ack immediately
+end
+```
+
+**Why per-series GenServer:**
+
+```
+Single GenServer (all series):
+  150K messages/sec in one mailbox — bottleneck at scale
+  One series flush blocks all others
+
+Per-series GenServer:
+  ts:click → its own writer (30K msg/sec — comfortable)
+  ts:temp  → its own writer (30K msg/sec — comfortable)
+  Parallel flushes, no series blocks another
+  GenServer overhead: ~1KB per process × 10K series = 10MB
 ```
 
 **Why batching matters:**
@@ -432,16 +480,12 @@ end
 ```
 Without batching (30K/s per series):
   30,000 write() syscalls/sec per series
-  5 series = 150,000 syscalls/sec
 
 With batching (1ms flush interval):
   30 samples/flush × 16 bytes = 480 bytes per write()
   1,000 write() syscalls/sec per series
-  5 series = 5,000 syscalls/sec
   30x fewer syscalls
 ```
-
-The GenServer mailbox naturally serializes all writes — no concurrent file access, no O_APPEND concerns, no mutex. Samples for the same series are ordered by arrival time in the mailbox.
 
 **Trade-off:** Up to 1ms of latency before the sample hits disk. For time series dashboards that refresh every 5 seconds, this is invisible.
 
@@ -1005,7 +1049,7 @@ This stays in Elixir, runs fast enough for background work, and avoids any Rust 
 |---|---|---|
 | `FerricStore.Supervisor` | `one_for_one` | Root supervisor |
 | `FerricStore.TS.Registry` | `permanent` | ETS owner for series metadata and compaction rules |
-| `FerricStore.TS.Writer` | `permanent` | Batched write path — receives all TS.ADD, flushes every 1ms |
+| `FerricStore.TS.WriterSupervisor` | `permanent` | DynamicSupervisor for per-series TS.Writer GenServers |
 | `FerricStore.TS.PartitionSealer` | `permanent` | Seals closed partitions on a tick schedule (every 10s) |
 | `FerricStore.TS.RetentionSweeper` | `permanent` | Deletes partitions beyond retention window (every 1h) |
 | `FerricStore.TS.CompactionWorker` | `transient` | Runs per-series compaction rules (hourly → daily rollups) |
