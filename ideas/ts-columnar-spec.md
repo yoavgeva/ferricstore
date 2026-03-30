@@ -15,8 +15,7 @@ The solution is **columnar files with LMDB indexing**: each series gets a single
 | Storage per 86,400 samples (1/sec day) | ~2.76 MB | ~28 KB | ~100x compression |
 | Range scan (full day) | 86,400 pread() calls | 1 pread() call | 86,400x fewer syscalls |
 | Cold read latency (1 day) | ~4.3s (86,400 × 50μs) | ~200μs | ~21,500x faster |
-| Hot read (ETS, last window) | ETS ordered_set | ETS ordered_set | No change |
-| Write latency | ~3μs ETS + async Bitcask | Same (sealing is async) | No change |
+| Write latency | ~3μs async file append | Same (sealing is async) | No change |
 
 > **Note:** Compression ratios assume typical event count data — smooth monotonic values stored as float64. ALP maps these to integers and bit-packs them. Highly random values compress less but ALP degrades gracefully.
 
@@ -182,8 +181,7 @@ New samples append to the open partition tail. The file only grows forward.
 ETS:
   :ts_label_index    — series_name → label set      (small, rebuild cheap on restart)
   :ts_series_meta    — series_name → file path, codec, retention
-  :ts_hot_cache      — recent raw samples            (volatile by design)
-  :ts_warm_cache     — recently decoded partitions   (volatile by design)
+  :ts_warm_cache     — recently decoded sealed partitions   (volatile by design)
 
 LMDB  (meta/partition_index.lmdb):
   (series_hash, day) → PartitionEntry               (durable, mmap-fast, ~68MB for 10K×90d)
@@ -195,7 +193,7 @@ Bitcask:
   Series registry — "ts:click" → file path + codec  (one entry per series)
 ```
 
-Each layer owns exactly what it is good at. ETS owns hot volatile state. LMDB owns durable queryable metadata. Columnar files own raw data. Bitcask owns the series registry.
+Each layer owns exactly what it is good at. ETS owns metadata and decode caches. LMDB owns durable queryable partition metadata. Columnar files own raw data. Bitcask owns the series registry.
 
 ---
 
@@ -207,7 +205,7 @@ Every day partition in a series passes through four states:
 
 | State | Storage | Reads | Writes | Transition |
 |---|---|---|---|---|
-| **Open** | Raw 8-byte values appended to columnar file tail | ETS hot (recent) or raw pread from file | Direct ETS insert + async file append | Day boundary passes |
+| **Open** | Raw 8-byte values appended to columnar file tail | pread from file (raw, no decode needed) | Async file append | Day boundary passes |
 | **Sealing** | Raw bytes being compressed in-place (read-only window) | Raw bytes (compression in progress) | Rejected — partition is closed | Compression completes |
 | **Sealed** | ALP-compressed in columnar file | io_uring pread + SIMD decode | Not applicable — immutable | Retention policy expires it |
 | **Expired** | Hole-punched (sparse) | N/A — removed from LMDB index | N/A | — |
@@ -250,12 +248,11 @@ The LMDB write in step 6 is the commit point. If it succeeds, the partition is s
 ```
 Client: TS.ADD ts:click 1700000001000 42
 
-1. ETS hot cache insert                    (~1μs)
-2. Async columnar file append              (background, non-blocking)
-3. LMDB upsert: update row_count, ts_max  (~5μs, batched)
+1. Async columnar file append              (~3μs, non-blocking)
+2. LMDB upsert: update row_count, ts_max  (~5μs, batched)
 ```
 
-Writes never touch sealed partitions. New samples always append to the open (current day) partition tail.
+Writes never touch sealed partitions. New samples always append to the open (current day) partition tail. No ETS involvement — the columnar file is the single write target.
 
 ### 4.2 Two-Level Pruning
 
@@ -330,8 +327,8 @@ Without io_uring (plain sequential `pread()` loop) each syscall round-trip costs
 
 | Query | Latency (io_uring) | Bottleneck |
 |---|---|---|
-| Last 5 min | `<100μs` | ETS `ordered_set` — no disk |
-| Last 24 hours | `~200–300μs` | ETS + 1 pread + decode |
+| Last 5 min (open partition) | `~50–100μs` | 1 pread — raw bytes, no decode needed |
+| Last 24 hours | `~200–300μs` | 1 open pread + 1 sealed pread + decode |
 | Yesterday's hourly totals (24 partitions) | `~120–180μs` | 24 parallel preads + decode |
 | 30 days of daily totals | `~230–270μs` | 30 parallel preads + decode |
 | 7 days raw (7 partitions) | `~500μs–1ms` | Decode is now the bottleneck |
@@ -342,37 +339,34 @@ Without io_uring (plain sequential `pread()` loop) each syscall round-trip costs
 
 ## 5. Memory Tiering
 
-### 5.1 Four-Tier Model
+### 5.1 Three-Tier Model
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Tier 0 — ETS hot window                  ~3μs reads    │
-│  Raw samples for the last HOT_WINDOW duration           │
-│  Controlled by: HOT_WINDOW per series                   │
-│  Default: last open partition only                      │
-├─────────────────────────────────────────────────────────┤
-│  Tier 1 — ETS warm cache                  ~10–50μs reads│
+│  Tier 0 — ETS warm cache                  ~10–50μs reads│
 │  Recently-accessed sealed partitions, decoded in ETS    │
 │  Controlled by: WARM_CACHE_CHUNKS per series            │
 │  Eviction: LRU, evicts decoded partitions when limit hit│
+│  Default: 0 (disabled — opt-in per series)              │
 ├─────────────────────────────────────────────────────────┤
-│  Tier 2 — NVMe sealed partitions          ~150–500μs    │
-│  All sealed history, compressed on disk                 │
+│  Tier 1 — NVMe columnar files             ~50–500μs     │
+│  All data: open partitions (raw) + sealed (ALP-encoded) │
 │  Controlled by: RETENTION per series                    │
-│  Read path: io_uring batched pread + in-memory decode   │
+│  Read path: io_uring batched pread + SIMD decode        │
 ├─────────────────────────────────────────────────────────┤
-│  Tier 3 — Expired (deleted)                             │
+│  Tier 2 — Expired (deleted)                             │
 │  Beyond RETENTION window                                │
 │  Managed by: RetentionSweeper GenServer                 │
 └─────────────────────────────────────────────────────────┘
 ```
+
+Open partitions (current day) are raw 8-byte values — a `pread()` returns usable data with no decode step. Sealed partitions require ALP SIMD decode. The warm cache eliminates repeated decode of the same sealed partition.
 
 ### 5.2 TS.CREATE Parameters
 
 ```
 TS.CREATE key
   [RETENTION ms]              existing — total history to keep
-  [HOT_WINDOW ms]             new — how much raw sample data stays in ETS
   [WARM_CACHE_CHUNKS n]       new — how many recently-accessed sealed partitions
                                     stay decoded in ETS after first read
                                     Default: 0 (opt-in per series)
@@ -382,24 +376,20 @@ TS.CREATE key
 **Examples:**
 
 ```
-# Dashboard series — query last 2h constantly, history up to 90 days
-TS.CREATE ts:click RETENTION 7776000000 HOT_WINDOW 7200000 WARM_CACHE_CHUNKS 24
+# Dashboard series — query last 24h constantly, history up to 90 days
+TS.CREATE ts:click RETENTION 7776000000 WARM_CACHE_CHUNKS 24
 
-# IoT sensor — only need last 5 min hot, keep 1 year history
-TS.CREATE ts:temperature RETENTION 31536000000 HOT_WINDOW 300000 WARM_CACHE_CHUNKS 0
+# IoT sensor — keep 1 year history, rarely queried
+TS.CREATE ts:temperature RETENTION 31536000000 WARM_CACHE_CHUNKS 0
 
 # Billing metric — keep 30 days, entire history accessed regularly
-TS.CREATE ts:revenue RETENTION 2592000000 HOT_WINDOW 3600000 WARM_CACHE_CHUNKS 720
+TS.CREATE ts:revenue RETENTION 2592000000 WARM_CACHE_CHUNKS 720
 ```
 
 ### 5.3 Global Config
 
 ```elixir
 # ferricstore.conf
-
-# Hard RAM ceiling for all TS ETS hot windows combined.
-# When hit, oldest open partitions are force-sealed and evicted.
-ts.hot_cache_max_mb = 512
 
 # Hard RAM ceiling for all TS ETS warm caches combined.
 # When hit, LRU eviction across all series.
@@ -415,15 +405,15 @@ ts.io_uring_queue_depth = 32
 The warm cache is an ETS table keyed by `{series_name, day}` holding the fully decoded sample list from a sealed partition. It is populated lazily on first read — no proactive warming.
 
 ```elixir
-# Read path in ts_scan_range:
-# 1. Check Tier 0 (ETS hot)         → return immediately if hit
-# 2. Check Tier 1 (ETS warm cache)  → return immediately if hit
-# 3. Issue io_uring batch for misses → decode → insert into warm cache → return
+# Read path for sealed partitions:
+# 1. Check ETS warm cache             → return immediately if hit
+# 2. Issue io_uring pread for misses   → ALP SIMD decode → store in warm cache → return
 
 # Warm cache entry lifecycle:
 # - Inserted on first disk read of a sealed partition
 # - Evicted LRU when ts.warm_cache_max_mb is exceeded
 # - Invalidated if the partition is re-sealed (shouldn't happen, but handled)
+# - Open partitions are NEVER cached (they're still being written to)
 ```
 
 The warm cache gives operators a knob that says: "I know my dashboard queries the last 24 hours constantly — keep those 24 sealed partitions decoded in RAM so they serve at ETS speed, not disk speed." The RAM cost is ~28KB × 24 = 672KB per series. For 1000 series that's 672MB — a fraction of what RedisTimeSeries would need to keep the same history in RAM.
@@ -432,31 +422,29 @@ The warm cache gives operators a knob that says: "I know my dashboard queries th
 
 Scenario: 1000 series, 30-day retention, querying last 24 hours frequently.
 
-| System | Hot data in RAM | History storage | Total RAM for TS | 30-day disk cost |
+| System | Data in RAM | History storage | Total RAM for TS | 30-day disk cost |
 |---|---|---|---|---|
 | RedisTimeSeries | All 30 days (required) | RAM only | ~450GB | $0 |
-| FerricStore TS (no warm cache) | Last open partition only | NVMe sealed | ~2GB | ~840MB NVMe |
-| FerricStore TS (24h warm cache) | Last day hot + 23h warm decoded | NVMe for older history | ~6GB | ~760MB NVMe |
+| FerricStore TS (no warm cache) | Metadata only | NVMe columnar files | ~100MB | ~840MB NVMe |
+| FerricStore TS (24h warm cache) | 24 decoded sealed partitions/series | NVMe for older history | ~700MB | ~840MB NVMe |
 | FerricStore TS (max warm) | Full 30d warm decoded | NVMe (backup only) | ~450GB | ~840MB NVMe |
 
-The bottom row shows that FerricStore can optionally match RedisTimeSeries's all-in-RAM behaviour at the same RAM cost — but with NVMe as a durable backup underneath. The sweet spot is the third row: 24h warm cache gives near-RAM performance for the most commonly queried window at 1/75th the RAM cost.
+The sweet spot is the third row: 24h warm cache gives near-RAM performance for the most commonly queried window at 1/640th the RAM cost. Without warm cache, FerricStore uses only ~100MB of RAM for 1000 series — just metadata. All reads go through io_uring at ~200–500μs.
 
 > **Note:** `WARM_CACHE_CHUNKS 0` is the default — no warm cache, all cold reads go straight to io_uring. Useful for write-heavy series where history is rarely queried (IoT sensors, log aggregation). Opt-in per series.
 
 ### 5.6 Prefetch Optimisation
 
-For `TS.RANGE` queries that span both ETS and disk, the NIF can overlap disk I/O with ETS serving:
+For `TS.RANGE` queries spanning multiple partitions, the NIF overlaps warm cache lookups with disk I/O:
 
 ```rust
 // ts_scan_range with prefetch:
-// 1. Identify which partitions are in ETS (hit) vs columnar file (miss)
+// 1. Check warm cache for all partitions in the query range
 // 2. Submit io_uring reads for all misses immediately (non-blocking)
-// 3. While reads are in flight, collect ETS hits
-// 4. When reads complete, decode and merge
-// Net effect: disk latency is hidden behind ETS serving time
+// 3. While reads are in flight, collect warm cache hits
+// 4. When reads complete, decode, store in warm cache, and merge
+// Net effect: warm cache serving hides disk latency for misses
 ```
-
-For queries where the ETS portion takes longer than the disk read (large hot window, small sealed range), the effective cold read latency approaches zero from the user's perspective.
 
 ---
 
@@ -851,13 +839,13 @@ Different event types warrant different retention periods:
 
 ```
 # Views — high volume, 90 days
-TS.CREATE ts:views:post:* RETENTION 7776000000 HOT_WINDOW 86400000
+TS.CREATE ts:views:post:* RETENTION 7776000000
 
 # Likes — low volume, keep longer
-TS.CREATE ts:likes:post:* RETENTION 31536000000 HOT_WINDOW 86400000
+TS.CREATE ts:likes:post:* RETENTION 31536000000
 
 # Trending scores (computed) — keep short, recomputable
-TS.CREATE ts:trending:* RETENTION 604800000 HOT_WINDOW 7200000
+TS.CREATE ts:trending:* RETENTION 604800000
 ```
 
 Retention is stored in the Bitcask series entry and the ETS `:ts_series_meta` table. The `RetentionSweeper` reads it from ETS — no disk access needed to decide what to sweep.
@@ -948,7 +936,6 @@ Raft WAL entry:
   {index: 18847, term: 3, command: {ts_add, "ts:views:post:123", 1700000001000, 42.0}}
 
 Applied to:
-  ETS hot cache     ← volatile, evicts after HOT_WINDOW
   Columnar file     ← persisted, compressed, partitioned
   Raft WAL          ← durable, retained for log_retention_hours
 ```
@@ -1118,7 +1105,7 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 | `TS.GET key` | Get latest sample |
 | `TS.RANGE key FROM to TO [AGG type BUCKET ms] [WHERE value op threshold] [FILL value]` | Range query with optional aggregation, filtering, and fill |
 | `TS.MRANGE FROM to TO FILTER label=value [AGG type BUCKET ms] [WHERE ...]` | Cross-series range query |
-| `TS.CREATE key [RETENTION ms] [HOT_WINDOW ms] [WARM_CACHE_CHUNKS n] [CHUNK_GRACE ms] [LABELS k v ...]` | Create a series |
+| `TS.CREATE key [RETENTION ms] [WARM_CACHE_CHUNKS n] [CHUNK_GRACE ms] [LABELS k v ...]` | Create a series |
 | `TS.INFO key` | Series metadata and coverage |
 | `TS.CREATERULE src dst AGG type BUCKET ms` | Create compaction rule |
 | `TS.ALTER key [RETENTION ms] [LABELS k v ...]` | Alter series parameters |
@@ -1159,7 +1146,7 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 | Capability | QuestDB | InfluxDB 3.0 | TimescaleDB | RedisTimeSeries | FerricStore TS |
 |---|---|---|---|---|---|
 | Write latency | ~1–5ms | ~1–5ms | ~2–10ms | ~0.1–0.5ms | **~3μs** |
-| Hot read (recent) | ~1ms | ~1ms | ~1–5ms | ~0.1–0.5ms | **~3–100μs** |
+| Hot read (recent) | ~1ms | ~1ms | ~1–5ms | ~0.1–0.5ms | **~50–100μs** (open partition pread) |
 | Warm read (last 24h) | ~1ms | ~1ms | ~1–5ms | ~0.1ms (RAM) | **~10–50μs** (warm cache) |
 | Cold read (30d history) | ~24ms / 100M rows | ~100ms range | ~1s / 100M rows | ~0.1ms (RAM) | **~230–270μs** (io_uring) |
 | RAM for 30d / 1000 series | low (columnar disk) | low (Parquet disk) | low (PG disk) | **~450GB** | **~2–6GB** (configurable) |
@@ -1191,7 +1178,7 @@ Rules defined at creation = event-accurate coverage for the lifetime of the seri
 - ALP encode (Elixir) + ALP decode (Rust NIF, AVX2)
 - `PartitionSealer`, `RetentionSweeper`, `CompactionWorker` GenServers
 - Hole punching retention (Linux + macOS)
-- Memory tiering (HOT_WINDOW, WARM_CACHE_CHUNKS)
+- Warm cache (WARM_CACHE_CHUNKS)
 - io_uring batched reads
 
 ### Phase 2 — v1.1: TS.FILTER + Labels
