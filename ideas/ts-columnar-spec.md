@@ -28,7 +28,7 @@ The solution is **columnar files with LMDB indexing**: each series gets a single
 The storage model has two parts:
 
 - **Columnar file per series** — all samples for one series in one append-only file
-- **LMDB** — two databases in one mmap'd env: partition index (per-day metadata) and series registry (per-series config). Durable, instantly queryable at startup with no rebuild.
+- **LMDB** — two databases in one mmap'd env: partition index (per-interval metadata) and series registry (per-series config). Durable, instantly queryable at startup with no rebuild.
 
 ```
 data/
@@ -48,7 +48,7 @@ LMDB is a memory-mapped B-tree key-value store — embedded, no server process, 
 
 LMDB holds two databases in the same env (same mmap'd file, one `msync`):
 
-- **`partitions`** — per-day partition metadata (byte offsets, min/max, codec, sealed flag)
+- **`partitions`** — per-interval partition metadata (byte offsets, min/max, codec, sealed flag)
 - **`series`** — per-series config (name, codec, retention, grace, labels)
 
 No Bitcask involvement in TS at all. Bitcask remains FerricStore's KV storage engine — TS is a separate subsystem with its own storage.
@@ -59,8 +59,8 @@ No Bitcask involvement in TS at all. Bitcask remains FerricStore's KV storage en
 // Key: 12 bytes, fixed-width, sortable
 // Sorts by series then chronologically within series
 struct PartitionKey {
-    series_hash: u64,  // xxHash64 of series name
-    day:         u32,  // unix day number (days since epoch)
+    series_hash:  u64,  // xxHash64 of series name
+    partition_id: u32,  // = timestamp_ms / partition_interval_ms
 }
 
 // Value: 64 bytes, fixed-width
@@ -78,7 +78,7 @@ struct PartitionEntry {
 }
 ```
 
-Fixed-width key and value means LMDB uses direct byte comparators — no parsing, no allocation. The sort order (series_hash + day) puts all partitions for one series physically adjacent in the B-tree, so a range scan for one series is a sequential read.
+Fixed-width key and value means LMDB uses direct byte comparators — no parsing, no allocation. The sort order (series_hash + partition_id) puts all partitions for one series physically adjacent in the B-tree, so a range scan for one series is a sequential read. Mixed partition intervals within one series are supported — each entry's `ts_min`/`ts_max` defines its exact bounds.
 
 **Rust crate:** `heed` v0.20 — MIT licensed, used by Meilisearch.
 
@@ -100,7 +100,7 @@ let series: Database<OwnedType<[u8;8]>, OwnedType<[u8;256]>> =
     env.create_database(Some("series"))?;
 ```
 
-The `map_size` is virtual address space, not RAM. For 10K series × 90 days = 900K partition entries × 76 bytes + 10K series entries × 264 bytes = ~71MB on disk. LMDB pages in only what queries touch.
+The `map_size` is virtual address space, not RAM. Actual disk usage depends on partition interval — more partitions = more LMDB entries, but still small. At 1-hour intervals: 10K series × 2,160 partitions (90d) × 76 bytes + 10K series entries × 264 bytes = ~1.6GB. At 1-day intervals: ~71MB. LMDB pages in only what queries touch.
 
 #### Series Registry — Key and Value Layout
 
@@ -160,9 +160,9 @@ end)
 **Write path — one LMDB write per partition seal:**
 
 ```rust
-fn ts_upsert_partition(series_hash: u64, day: u32, entry: PartitionEntry) {
+fn ts_upsert_partition(series_hash: u64, partition_id: u32, entry: PartitionEntry) {
     let mut txn = env.begin_rw_txn()?;
-    let key = encode_key(series_hash, day);
+    let key = encode_key(series_hash, partition_id);
     txn.put(db, &key, &entry.as_bytes(), WriteFlags::empty())?;
     txn.commit()?;  // single msync — fast, durable
 }
@@ -173,20 +173,21 @@ fn ts_upsert_partition(series_hash: u64, day: u32, entry: PartitionEntry) {
 ```rust
 // "Give me all partitions for ts:click in the last 7 days"
 let series_hash = xxhash64("ts:click");
-let from_key    = encode_key(series_hash, today - 7);
-let to_key      = encode_key(series_hash, today);
+let from_ts     = now_ms - 7 * 86_400_000;
+let from_id     = (from_ts / partition_interval_ms) as u32;
+let to_id       = (now_ms / partition_interval_ms) as u32;
 
 let txn      = env.begin_ro_txn()?;
-let mut cursor = db.open_ro_cursor(&txn)?;
+let mut cursor = partitions_db.open_ro_cursor(&txn)?;
 
 let entries: Vec<PartitionEntry> = cursor
-    .iter_from(from_key)
-    .take_while(|(k, _)| k <= to_key)
+    .iter_from(encode_key(series_hash, from_id))
+    .take_while(|(k, _)| k <= encode_key(series_hash, to_id))
     .map(|(_, v)| PartitionEntry::from_bytes(v))
     .collect();
 ```
 
-For 10K series × 7-day query = 70K entries, all returned in one sequential B-tree traversal.
+Sequential B-tree traversal. Number of entries depends on partition interval — auto-tuned per series.
 
 **Startup behaviour:**
 
@@ -199,7 +200,48 @@ FerricStore starts:
   3. Done. No Bitcask keydir rebuild. No file header reads.
 ```
 
-### 2.3 Columnar File Layout
+### 2.3 Auto-Tuned Partition Interval
+
+Partition interval is auto-tuned per series based on observed sample rate. The user does not configure it.
+
+**After the first partition seals, the system measures and adjusts:**
+
+```elixir
+defp auto_partition_interval(samples_per_second) do
+  cond do
+    samples_per_second > 100   -> 300_000      # >100/s  → 5 min
+    samples_per_second > 10    -> 3_600_000    # >10/s   → 1 hour
+    samples_per_second > 0.1   -> 86_400_000   # >0.1/s  → 1 day
+    true                       -> 604_800_000  # sparse  → 1 week
+  end
+end
+```
+
+The first partition always uses 1-day default. After it seals, the system counts `row_count / partition_duration_seconds` and picks the right interval for future partitions. The interval is stored in the LMDB `SeriesMeta` and re-evaluated on each seal.
+
+**Why auto-tuning matters for queries:**
+
+```
+"Last 5 minutes" query at 30K samples/sec:
+
+Day partitions:    read entire day (~GB compressed), decode 2.6B samples, discard 99.7%
+5-min partitions:  read 1 partition (~14KB), decode 9M samples, use all of it
+
+Auto-tuning picks 5-min for 30K/s → precise reads, no waste.
+```
+
+Smaller partitions also give finer-grained LMDB pruning — each partition has a tighter `val_min`/`val_max` range, so `WHERE value > X` skips more partitions.
+
+**Mixed intervals within one series are supported.** If the sample rate changes (e.g., traffic spike), the interval adjusts. Historical partitions keep their original interval. The LMDB scan uses `ts_min`/`ts_max` from each `PartitionEntry` to resolve exact bounds — the query path doesn't assume uniform interval.
+
+| Sample rate | Interval | Partitions per 90d | LMDB entries | Seal size |
+|---|---|---|---|---|
+| 30K/s | 5 min | 25,920 | 25,920 × 76B = 2MB | ~14KB compressed |
+| 100/s | 1 hour | 2,160 | 2,160 × 76B = 164KB | ~14KB compressed |
+| 1/s | 1 day | 90 | 90 × 76B = 7KB | ~28KB compressed |
+| 0.01/s | 1 week | 13 | 13 × 76B = 1KB | ~1KB compressed |
+
+### 2.4 Columnar File Layout
 
 The partition index lives entirely in LMDB. The columnar file is pure data:
 
@@ -227,7 +269,7 @@ ts_click.col
 
 New samples append to the open partition tail. The file only grows forward.
 
-### 2.4 Full Storage Architecture Diagram
+### 2.5 Full Storage Architecture Diagram
 
 ```
 ETS (volatile, populated from LMDB on startup):
@@ -251,7 +293,7 @@ Two layers. ETS is a volatile cache populated from LMDB on startup (~5ms). LMDB 
 
 ### 3.1 Partition States
 
-Every day partition in a series passes through four states:
+Every partition in a series passes through four states:
 
 | State | Storage | Reads | Writes | Transition |
 |---|---|---|---|---|
@@ -264,16 +306,16 @@ Every day partition in a series passes through four states:
 
 The `PartitionSealer` GenServer monitors active series. A partition is sealed when both conditions are true:
 
-- The day boundary has passed (e.g., midnight UTC for the previous day's partition)
+- The partition's time interval has elapsed (e.g., the 5-minute or 1-hour window has closed)
 - A configurable grace period has elapsed (default: 60 seconds) to allow late-arriving samples
 
-The grace period matters. Event pipelines have tail latency — a sample timestamped `23:59:55` may arrive at FerricStore at `00:00:05` due to network or processing delay. Sealing immediately at the day boundary would discard it. With a 60-second grace, it lands in the correct partition before sealing.
+The grace period matters. Event pipelines have tail latency — a sample timestamped at the partition boundary may arrive seconds later due to network or processing delay. Sealing immediately would discard it. With a 60-second grace, it lands in the correct partition before sealing.
 
 > **Note:** Grace period is configurable per series via `TS.CREATE ... CHUNK_GRACE 30000` (milliseconds). High-frequency IoT series can use 5 seconds. Event pipelines with async flush jobs should use 120 seconds.
 
 ### 3.3 What Happens During Sealing
 
-When a day boundary passes (+ grace period), the `PartitionSealer` GenServer:
+When a partition interval elapses (+ grace period), the `PartitionSealer` GenServer:
 
 1. Read the open partition's raw bytes from the columnar file
 2. ALP-encode the timestamp column in a Tokio task
@@ -314,7 +356,7 @@ TS.FILTER ts:temperature FROM -90d TO now WHERE value > 37.5
 Level 1 — LMDB time pruning (in memory, ~1μs per series):
   Scan LMDB entries for ts:temperature
   ts_max < query_from → skip (partition predates the query window)
-  → Prunes irrelevant day partitions
+  → Prunes irrelevant partitions
 
 Level 2 — LMDB value pruning (same LMDB scan, zero extra cost):
   val_max < 37.5 → skip (no sample in this partition exceeds threshold)
@@ -346,7 +388,7 @@ TS.MRANGE FROM -30d TO now FILTER event_type=click WHERE value > 1000
 
 1. ETS label lookup → 10K matching series                        (~1ms)
 2. LMDB scan per series:
-     For each series: scan 30 day entries
+     For each series: scan partition entries in time range
      val_max < 1000 → skip partition (value pruning in LMDB)
      Remaining: maybe 3K series × ~10 days = 30K byte ranges    (~50ms)
 3. io_uring: 30K reads submitted in one batch                    (one ring write)
@@ -355,7 +397,7 @@ TS.MRANGE FROM -30d TO now FILTER event_type=click WHERE value > 1000
 6. Coordinator merges results
 ```
 
-The `WHERE value > 1000` prunes entire day partitions in LMDB before any columnar file read. A series where click counts are always < 1000 never touches disk at all.
+The `WHERE value > 1000` prunes entire partitions in LMDB before any columnar file read. A series where click counts are always < 1000 never touches disk at all. Smaller auto-tuned intervals give tighter `val_min`/`val_max` ranges per partition — more effective pruning.
 
 > **Note:** io_uring ring size is 4096 SQEs. For queries exceeding this (>4096 byte ranges), batch in chunks of ~3000 SQEs with completion draining between batches.
 
@@ -363,7 +405,7 @@ The `WHERE value > 1000` prunes entire day partitions in LMDB before any columna
 
 With io_uring batch submission, all reads are submitted in one ring write and served by NVMe in parallel.
 
-**Correct math for 30 daily partitions (30 × 28KB = 840KB total):**
+**Example: 30 partitions (30 × 28KB = 840KB total):**
 
 ```
 NVMe sequential read at 5GB/s:   ~168μs
@@ -726,10 +768,10 @@ defmodule FerricStore.TS.PartitionSealer do
   use GenServer
 
   # Runs as a Task — spawns, works, exits. GC cleans up.
-  def seal(series_name, day) do
+  def seal(series_name, partition_id) do
     Task.start(fn ->
       raw = File.read!(col_file_path(series_name))
-      {timestamps, values} = parse_raw_partition(raw, day)
+      {timestamps, values} = parse_raw_partition(raw, partition_id)
 
       # Encoding — pure Elixir, background, slow is fine
       encoded_ts  = FerricStore.TS.Encoding.encode_timestamps(timestamps)
@@ -743,7 +785,7 @@ defmodule FerricStore.TS.PartitionSealer do
 
       # LMDB update — thin Rust NIF, ~1μs
       Nif.ts_lmdb_upsert(
-        series_hash(series_name), day_number(day),
+        series_hash(series_name), partition_id,
         build_entry(encoded_ts, encoded_val, timestamps, val_min, val_max, :alp)
       )
     end)
@@ -879,10 +921,9 @@ defmodule FerricStore.TS.RetentionSweeper do
 
     Enum.each(series_list, fn {name, file_path, retention_ms, _} ->
       cutoff_ms = now_ms - retention_ms
-      cutoff_day = day_number(cutoff_ms)
 
-      # LMDB range scan: all partitions for this series older than cutoff
-      expired = Nif.ts_lmdb_scan_before(series_hash(name), cutoff_day)
+      # LMDB range scan: all partitions for this series where ts_max < cutoff
+      expired = Nif.ts_lmdb_scan_before(series_hash(name), cutoff_ms)
 
       Enum.each(expired, fn entry ->
         # Punch holes in columnar file — Rust NIF, ~1μs per partition
@@ -895,13 +936,13 @@ defmodule FerricStore.TS.RetentionSweeper do
           entry.val_offset, entry.val_len
         )
         # Delete from LMDB partition index — now invisible to queries
-        Nif.ts_lmdb_delete(series_hash(name), entry.day)
+        Nif.ts_lmdb_delete(series_hash(name), entry.partition_id)
 
         # Telemetry
         :telemetry.execute(
           [:ferricstore, :ts, :retention, :dropped],
           %{bytes_freed: entry.ts_len + entry.val_len},
-          %{series: name, day: entry.day}
+          %{series: name, partition_id: entry.partition_id}
         )
       end)
     end)
@@ -916,20 +957,20 @@ One LMDB scan + one hole punch per expired partition. No file rewriting. No read
 
 ### 9.4 Day-Level Granularity
 
-Retention deletes entire day partitions, not individual samples:
+Retention deletes entire partitions, not individual samples. Granularity matches the auto-tuned partition interval:
 
 ```
-RETENTION 30d  →  delete any partition where day < today - 30
+RETENTION 30d, partition interval = 1 hour:
+  → delete any partition where ts_max < now - 30d
+  → granularity: 1 hour (last expired partition may be up to 1h past the cutoff)
 
-Series with samples at:
-  2024-01-01 09:00  ← in the deleted partition (day -90)
-  2024-01-01 23:59  ← also deleted (same partition)
-  2024-03-02 00:01  ← kept (day -29, within retention)
+RETENTION 30d, partition interval = 1 day:
+  → same logic, but granularity: 1 day
 ```
 
-Day-granularity is predictable, fast, and matches how operators think about retention.
+Partition-level retention is predictable and fast — one LMDB delete + one hole punch per expired partition. The auto-tuned interval ensures high-frequency series (5-min partitions) get fine-grained retention while low-frequency series (weekly partitions) have minimal overhead.
 
-> **Note on low-frequency series:** A series with only 1 sample per day still gets a full day partition. Overhead: one LMDB entry (76 bytes) + one 8-byte timestamp + one 8-byte value = ~92 bytes minimum. ALP encoding of a single-sample partition adds the codec header (~52 bytes). Total: ~144 bytes per day partition. For a 365-day retention, that's ~52KB — negligible.
+> **Note on low-frequency series:** A series with 1 sample per week still gets a full weekly partition. Overhead: one LMDB entry (76 bytes) + minimal data. For a 365-day retention with weekly partitions, that's 52 entries = ~4KB — negligible.
 
 ### 9.5 Per-Series Retention Policies
 
@@ -1104,18 +1145,16 @@ Action: replay all ts_add events through the AGG function
 Result: per_hour series populated from day 1, event-accurate
 ```
 
-**Case 2 — Partial WAL, bucket ≥ 1 day (good quality backfill):**
+**Case 2 — Partial WAL, bucket ≥ partition interval (good quality backfill):**
 ```
 Series started 90 days ago. WAL retention = 7 days.
-Days 1–83: only sealed columnar partitions (day-level granularity)
-Days 84–90: WAL entries exist
+Partition interval = 1 hour. Days 1–83: sealed hourly partitions.
 
 TS.CREATERULE ts:views ts:views:per_week AGG sum BUCKET 604800000
 
 Action:
   Phase A — columnar backfill (days 1–83):
-    Read sealed day-level partitions
-    Re-aggregate: 7 day values → 1 week value (sum of sums)
+    Read sealed partitions, re-aggregate to weekly buckets
     Lossless for sum, count, min, max
     Approximate for avg (correct if row counts stored in partition entry)
 
@@ -1127,15 +1166,15 @@ Result: per_week series populated from day 1
         exact for days 84–90, re-aggregated for days 1–83
 ```
 
-**Case 3 — Partial WAL, bucket < 1 day (cannot backfill beyond WAL):**
+**Case 3 — Partial WAL, bucket < partition interval (cannot backfill beyond WAL):**
 ```
 Series started 90 days ago. WAL retention = 7 days.
-User wants hourly rollup. Days 1–83: only day-level partitions.
+Partition interval = 1 day. User wants hourly rollup.
 
 TS.CREATERULE ts:views ts:views:per_hour AGG sum BUCKET 3600000
 
 Action:
-  Cannot reconstruct hourly data from day-level partitions.
+  Cannot reconstruct hourly data from daily partitions.
   WAL backfill (days 84–90): exact.
 
 Result: per_hour series starts from day 84.
@@ -1155,7 +1194,7 @@ source_series:    ts:views:post:123
 agg:              sum BUCKET 1w
 coverage:
   type:           mixed
-  approx_range:   2024-01-01 → 2024-03-22  (re-aggregated from day partitions)
+  approx_range:   2024-01-01 → 2024-03-22  (re-aggregated from sealed partitions)
   exact_range:    2024-03-22 → today        (replayed from WAL, event-accurate)
   missing_range:  none
 sample_count:     13 weeks
