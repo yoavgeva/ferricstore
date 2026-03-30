@@ -342,6 +342,50 @@ The grace period matters. Event pipelines have tail latency — a sample timesta
 
 > **Note:** Grace period is configurable per series via `TS.CREATE ... CHUNK_GRACE 30000` (milliseconds). High-frequency IoT series can use 5 seconds. Event pipelines with async flush jobs should use 120 seconds.
 
+**During the grace period, two Writers are alive per series:**
+
+```
+Partition interval = 5 min. Grace = 60s.
+
+t=300000 → partition 1 opens, partition 0 enters grace
+           Writer for partition 0: accepts late samples with t < 300000
+           Writer for partition 1: accepts new samples with t >= 300000
+
+t=360000 → grace expires
+           Writer for partition 0 flushes final batch, shuts down
+           PartitionSealer seals partition 0
+           Writer for partition 1 continues
+```
+
+**Write routing by timestamp:**
+
+```elixir
+def handle_ts_add(series_name, timestamp, value) do
+  partition_id = div(timestamp, partition_interval(series_name))
+
+  case find_writer(series_name, partition_id) do
+    {:ok, pid} ->
+      # Writer exists (current or grace window) — append
+      GenServer.cast(pid, {:ts_add, timestamp, value})
+
+    :sealed ->
+      # Partition already sealed, sample arrived after grace
+      # Drop silently, emit telemetry
+      :telemetry.execute([:ferricstore, :ts, :sample, :dropped_late],
+        %{timestamp: timestamp}, %{series: series_name, partition_id: partition_id})
+
+    :not_started ->
+      # New partition — start Writer via DynamicSupervisor
+      {:ok, pid} = start_writer(series_name, partition_id)
+      GenServer.cast(pid, {:ts_add, timestamp, value})
+  end
+
+  :ok
+end
+```
+
+Samples arriving after the grace period are dropped — the partition is sealed and immutable. The client already received `:ok` (ack-before-flush). Telemetry tracks drop rate so operators can tune `CHUNK_GRACE` if needed. At steady state, this is 2 Writers per series during the grace window, then back to 1.
+
 ### 3.3 What Happens During Sealing
 
 When a partition interval elapses (+ grace period), the `PartitionSealer` GenServer:
