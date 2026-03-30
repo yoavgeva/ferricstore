@@ -14,7 +14,8 @@ defmodule FerricstoreEcto.MixProject do
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      package: package()
     ]
   end
 
@@ -28,12 +29,22 @@ defmodule FerricstoreEcto.MixProject do
     ]
   end
 
+  defp package do
+    [
+      description: "Ecto integration for FerricStore — query cache and cached repo.",
+      licenses: ["MIT"],
+      links: %{"GitHub" => "https://github.com/yoavgeva/ferricstore"},
+      files: ["lib", "mix.exs"]
+    ]
+  end
+
   defp deps do
     [
       {:ferricstore, in_umbrella: true},
       {:ecto, "~> 3.11"},
       {:ecto_sql, "~> 3.11"},
       {:ecto_sqlite3, "~> 0.17", only: :test},
+      {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:jason, "~> 1.4"}
     ]
   end

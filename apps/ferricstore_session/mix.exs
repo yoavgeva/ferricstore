@@ -14,7 +14,7 @@ defmodule FerricstoreSession.MixProject do
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      description: "Plug.Session.Store adapter backed by FerricStore"
+      package: package()
     ]
   end
 
@@ -24,10 +24,20 @@ defmodule FerricstoreSession.MixProject do
     ]
   end
 
+  defp package do
+    [
+      description: "Plug.Session.Store adapter backed by FerricStore.",
+      licenses: ["MIT"],
+      links: %{"GitHub" => "https://github.com/yoavgeva/ferricstore"},
+      files: ["lib", "mix.exs"]
+    ]
+  end
+
   defp deps do
     [
       {:ferricstore, in_umbrella: true},
-      {:plug, "~> 1.14"}
+      {:plug, "~> 1.14"},
+      {:ex_doc, "~> 0.35", only: :dev, runtime: false}
     ]
   end
 end

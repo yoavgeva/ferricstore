@@ -56,12 +56,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Publish core package only. Server, ecto, and session apps will be
-      # published separately once they have proper package metadata and the
-      # core package is live on Hex.
+      # Publish in dependency order: core first, then packages that depend on it
       - name: Publish ferricstore (core)
         run: |
           cd apps/ferricstore
+          mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Publish ferricstore_ecto
+        run: |
+          cd apps/ferricstore_ecto
+          mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+      - name: Publish ferricstore_session
+        run: |
+          cd apps/ferricstore_session
           mix hex.publish --yes
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

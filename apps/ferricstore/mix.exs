@@ -43,7 +43,7 @@ defmodule Ferricstore.MixProject do
       ],
       licenses: ["MIT"],
       links: %{
-        "GitHub" => "https://github.com/YoavGivati/ferricstore"
+        "GitHub" => "https://github.com/yoavgeva/ferricstore"
       }
     ]
   end
