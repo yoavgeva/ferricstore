@@ -15,7 +15,10 @@ permissions:
   attestations: write
 
 jobs:
-  build_release:
+  # -------------------------------------------------------------------------
+  # Linux builds: use rustler-precompiled-action with cross-compilation
+  # -------------------------------------------------------------------------
+  build_linux:
     name: NIF ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
     strategy:
@@ -23,13 +26,8 @@ jobs:
       matrix:
         nif: ["2.16"]
         job:
-          # macOS
-          - { target: aarch64-apple-darwin,        os: macos-15 }
-          - { target: x86_64-apple-darwin,         os: macos-15 }
-          # Linux glibc
           - { target: aarch64-unknown-linux-gnu,   os: ubuntu-22.04, use-cross: true }
           - { target: x86_64-unknown-linux-gnu,    os: ubuntu-22.04, use-cross: true }
-          # Linux musl
           - { target: aarch64-unknown-linux-musl,  os: ubuntu-22.04, use-cross: true }
           - { target: x86_64-unknown-linux-musl,   os: ubuntu-22.04, use-cross: true }
 
@@ -54,12 +52,6 @@ jobs:
           shared-key: ${{ matrix.job.target }}-${{ matrix.nif }}
           workspaces: ${{ env.NIF_DIRECTORY }}
 
-      - name: Install GNU tar (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install gnu-tar
-          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> $GITHUB_PATH
-
       - name: Build precompiled NIF
         uses: philss/rustler-precompiled-action@v1.1.5
         id: build
@@ -68,7 +60,7 @@ jobs:
           project-version: ${{ env.PROJECT_VERSION }}
           target: ${{ matrix.job.target }}
           nif-version: ${{ matrix.nif }}
-          use-cross: ${{ matrix.job.use-cross || false }}
+          use-cross: ${{ matrix.job.use-cross }}
           project-dir: ${{ env.NIF_DIRECTORY }}
 
       - name: Artifact attestation
@@ -87,3 +79,99 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: ${{ steps.build.outputs.file-path }}
+
+  # -------------------------------------------------------------------------
+  # macOS builds: native cargo build (no cross, no rustler-precompiled-action)
+  # The action always installs cross which fails on macOS (ENOEXEC).
+  # -------------------------------------------------------------------------
+  build_macos:
+    name: NIF ${{ matrix.nif }} - ${{ matrix.target }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        nif: ["2.16"]
+        include:
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin,  os: macos-15 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract project version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/.*@version "\(.*\)"/\1/p' apps/ferricstore/mix.exs)
+          echo "PROJECT_VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-precomp
+          shared-key: ${{ matrix.target }}-${{ matrix.nif }}
+          workspaces: ${{ env.NIF_DIRECTORY }}
+
+      - name: Build NIF
+        env:
+          RUSTLER_NIF_VERSION: ${{ matrix.nif }}
+        run: |
+          cd ${{ env.NIF_DIRECTORY }}
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package tarball
+        run: |
+          TARGET=${{ matrix.target }}
+          NIF_VERSION=${{ matrix.nif }}
+          VERSION=${{ env.PROJECT_VERSION }}
+          LIB_NAME="libferricstore_bitcask"
+
+          # Find the built library
+          if [ -f "${{ env.NIF_DIRECTORY }}/target/${TARGET}/release/${LIB_NAME}.dylib" ]; then
+            LIB_FILE="${LIB_NAME}.dylib"
+          elif [ -f "${{ env.NIF_DIRECTORY }}/target/${TARGET}/release/${LIB_NAME}.so" ]; then
+            LIB_FILE="${LIB_NAME}.so"
+          else
+            echo "ERROR: Could not find built library"
+            ls -la "${{ env.NIF_DIRECTORY }}/target/${TARGET}/release/"
+            exit 1
+          fi
+
+          SRC="${{ env.NIF_DIRECTORY }}/target/${TARGET}/release/${LIB_FILE}"
+          ARCHIVE_NAME="${{ env.PROJECT_NAME }}-v${VERSION}-nif-${NIF_VERSION}-${TARGET}"
+          ARCHIVE_FILE="${ARCHIVE_NAME}.tar.gz"
+
+          mkdir -p "${ARCHIVE_NAME}"
+          cp "${SRC}" "${ARCHIVE_NAME}/${LIB_FILE}"
+          tar -czf "${ARCHIVE_FILE}" "${ARCHIVE_NAME}"
+
+          # Generate checksum
+          shasum -a 256 "${ARCHIVE_FILE}" | cut -d ' ' -f 1 > "${ARCHIVE_FILE}.sha256"
+
+          echo "ARCHIVE_FILE=${ARCHIVE_FILE}" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+
+      - name: Artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ env.ARCHIVE_FILE }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            ${{ env.ARCHIVE_FILE }}
+            ${{ env.ARCHIVE_FILE }}.sha256
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            ${{ env.ARCHIVE_FILE }}
+            ${{ env.ARCHIVE_FILE }}.sha256
