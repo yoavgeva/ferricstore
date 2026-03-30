@@ -55,7 +55,7 @@ jobs:
           workspaces: ${{ env.NIF_DIRECTORY }}
 
       - name: Build precompiled NIF
-        uses: philss/rustler-precompiled-action@v1.1.4
+        uses: philss/rustler-precompiled-action@v1.1.5
         id: build
         with:
           project-name: ${{ env.PROJECT_NAME }}
