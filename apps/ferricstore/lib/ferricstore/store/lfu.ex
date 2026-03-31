@@ -46,6 +46,12 @@ defmodule Ferricstore.Store.LFU do
       Application.get_env(:ferricstore, :lfu_decay_time, 1))
     :persistent_term.put(:ferricstore_lfu_log_factor,
       Application.get_env(:ferricstore, :lfu_log_factor, 10))
+
+    # Atomics for the per-minute initial value cache.
+    # Slot 1: cached minute, Slot 2: packed initial value.
+    # Avoids persistent_term.put once per minute (global GC in embedded).
+    ref = :atomics.new(2, signed: false)
+    :persistent_term.put(:ferricstore_lfu_initial_ref, ref)
     :ok
   end
 
@@ -59,14 +65,16 @@ defmodule Ferricstore.Store.LFU do
   @spec initial() :: non_neg_integer()
   def initial do
     current_min = now_minutes()
+    ref = :persistent_term.get(:ferricstore_lfu_initial_ref)
 
-    case :persistent_term.get(:ferricstore_lfu_initial_cache, nil) do
-      {^current_min, packed} ->
-        packed
+    case :atomics.get(ref, 1) do
+      ^current_min ->
+        :atomics.get(ref, 2)
 
       _ ->
         packed = pack(current_min, @initial_counter)
-        :persistent_term.put(:ferricstore_lfu_initial_cache, {current_min, packed})
+        :atomics.put(ref, 1, current_min)
+        :atomics.put(ref, 2, packed)
         packed
     end
   end
