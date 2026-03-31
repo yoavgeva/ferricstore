@@ -3092,7 +3092,7 @@ defmodule Ferricstore.Store.Shard do
   # nil (cold) to avoid copying large binaries on every :ets.lookup.
   defp ets_insert(state, key, value, expire_at_ms) do
     value_for_ets = value_for_ets(value)
-    :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), 0, 0, 0})
+    :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
 
     if state.prefix_keys do
       PrefixIndex.track(state.prefix_keys, key, state.index)
