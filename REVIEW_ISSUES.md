@@ -137,10 +137,8 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 
 ### M8: SMOVE type enforcement gap
 **File:** `commands/set.ex:335-354`
-**Status:** TOCTOU DOCUMENTED (not triggerable in tests)
-**Test result:** 4 tests pass — basic type safety works (WRONGTYPE returned for wrong dest type, source preserved). The race between check and write can't be triggered in single-threaded tests but the code path is documented.
-
-**Proposed fix:** Reorder to: write destination → delete source (add before remove).
+**Status:** FIXED BY C6 (Mini-Percolator locks both keys)
+**Test result:** 4 tests pass. The TOCTOU window between type check and write no longer exists — CrossShardOp locks both source and destination keys before executing. No other operation can modify the destination while locked.
 
 ### M9: StateMachine uses nosync without coordinated fsync
 **File:** `raft/state_machine.ex:1024-1059`
@@ -173,5 +171,5 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 | M5 | MEDIUM | N/A | FIXED |
 | M6 | MEDIUM | N/A | NOT A BUG |
 | M7 | MEDIUM | N/A | FIXED |
-| M8 | MEDIUM | Documented | TODO — reorder ops |
+| M8 | MEDIUM | 4 pass | FIXED BY C6 (locked) |
 | M9 | MEDIUM | N/A | ACCEPTED |
