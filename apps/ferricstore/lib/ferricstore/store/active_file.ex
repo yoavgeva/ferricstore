@@ -35,7 +35,7 @@ defmodule Ferricstore.Store.ActiveFile do
   """
   @spec init(non_neg_integer()) :: :ok
   def init(_shard_count) do
-    mode = Application.get_env(:ferricstore, :mode, :standalone)
+    mode = Ferricstore.Mode.current()
     :persistent_term.put(@mode_key, mode)
 
     if mode == :embedded do
@@ -59,7 +59,7 @@ defmodule Ferricstore.Store.ActiveFile do
   """
   @spec publish(non_neg_integer(), non_neg_integer(), binary(), binary()) :: :ok
   def publish(shard_index, file_id, file_path, shard_data_path) do
-    case :persistent_term.get(@mode_key, :standalone) do
+    case :persistent_term.get(@mode_key, :embedded) do
       :standalone ->
         :persistent_term.put({:ferricstore_active_file, shard_index}, {file_id, file_path, shard_data_path})
 
@@ -80,7 +80,7 @@ defmodule Ferricstore.Store.ActiveFile do
   """
   @spec get(non_neg_integer()) :: {non_neg_integer(), binary(), binary()}
   def get(shard_index) do
-    case :persistent_term.get(@mode_key, :standalone) do
+    case :persistent_term.get(@mode_key, :embedded) do
       :standalone ->
         :persistent_term.get({:ferricstore_active_file, shard_index})
 
