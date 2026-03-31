@@ -16,19 +16,10 @@ defmodule Ferricstore.Store.ActiveFileTest do
 
     # Save original active file state for shard 0 so we can restore it
     orig_af = ActiveFile.get(0)
-    orig_max = Application.get_env(:ferricstore, :max_active_file_size)
 
     on_exit(fn ->
-      # Restore active file for shard 0 if a test modified it
       {fid, path, data_path} = orig_af
       ActiveFile.publish(0, fid, path, data_path)
-
-      if orig_max do
-        Application.put_env(:ferricstore, :max_active_file_size, orig_max)
-      else
-        Application.delete_env(:ferricstore, :max_active_file_size)
-      end
-
       ShardHelpers.flush_all_keys()
     end)
 
@@ -91,48 +82,19 @@ defmodule Ferricstore.Store.ActiveFileTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Configurable max-active-file-size
+  # Configurable max-active-file-size (init-time only, via config.exs)
   # ---------------------------------------------------------------------------
 
   describe "max-active-file-size config" do
     test "default is 256MB" do
-      Application.delete_env(:ferricstore, :max_active_file_size)
-      default = Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024)
-      assert default == 256 * 1024 * 1024
+      assert :persistent_term.get(:ferricstore_max_active_file_size) == 256 * 1024 * 1024
     end
 
-    test "CONFIG SET max-active-file-size updates Application env" do
-      assert :ok = Ferricstore.Config.set("max-active-file-size", "134217728")
-      assert Application.get_env(:ferricstore, :max_active_file_size) == 134_217_728
-    end
-
-    test "CONFIG GET max-active-file-size returns current value" do
-      Ferricstore.Config.set("max-active-file-size", "536870912")
-      assert Ferricstore.Config.get_value("max-active-file-size") == "536870912"
-    end
-
-    test "CONFIG SET rejects values below 1MB" do
-      result = Ferricstore.Config.set("max-active-file-size", "1000")
-      assert {:error, msg} = result
-      assert msg =~ "min 1MB"
-    end
-
-    test "CONFIG SET rejects non-integer values" do
-      result = Ferricstore.Config.set("max-active-file-size", "abc")
-      assert {:error, _} = result
-    end
-
-    test "shard reads max_active_file_size from Application env at runtime" do
-      # Set a custom value
-      Application.put_env(:ferricstore, :max_active_file_size, 512 * 1024 * 1024)
-
-      # Verify the shard would use this value (we can't easily trigger rotation
-      # in a unit test, but we can verify the config is read correctly)
-      assert Application.get_env(:ferricstore, :max_active_file_size) == 512 * 1024 * 1024
-
-      # Change it at runtime via CONFIG SET
-      Ferricstore.Config.set("max-active-file-size", "134217728")
-      assert Application.get_env(:ferricstore, :max_active_file_size) == 134_217_728
+    test "shard reads max_active_file_size from persistent_term at init" do
+      # Shards cache this in state at init. Verify persistent_term is the source.
+      val = :persistent_term.get(:ferricstore_max_active_file_size)
+      assert is_integer(val)
+      assert val >= 1_048_576
     end
   end
 end

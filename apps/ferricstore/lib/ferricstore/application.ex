@@ -87,6 +87,11 @@ defmodule Ferricstore.Application do
     # on file rotation — critical for embedded mode with many host processes.
     Ferricstore.Store.ActiveFile.init(shard_count)
 
+    # Publish max_active_file_size once at startup. Shards read this via
+    # persistent_term.get (~5ns) at init. Never written again at runtime.
+    :persistent_term.put(:ferricstore_max_active_file_size,
+      Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024))
+
     # Initialize MemoryGuard persistent_term flags (default: not full).
     # MemoryGuard.perform_check will update these every 100ms.
     :persistent_term.put(:ferricstore_keydir_full, false)

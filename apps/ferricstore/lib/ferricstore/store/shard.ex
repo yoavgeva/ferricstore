@@ -266,7 +266,7 @@ defmodule Ferricstore.Store.Shard do
 
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
-    max_file_size = Application.get_env(:ferricstore, :max_active_file_size, @default_max_active_file_size)
+    max_file_size = :persistent_term.get(:ferricstore_max_active_file_size, @default_max_active_file_size)
 
     {:ok, %__MODULE__{ets: keydir, keydir: keydir,
                        prefix_keys: prefix_keys, index: index, data_dir: data_dir,
@@ -416,11 +416,6 @@ defmodule Ferricstore.Store.Shard do
     # Store flush interval in process dictionary so handle_info can reschedule.
     Process.put(:flush_interval_ms, ms)
     {:noreply, state}
-  end
-
-  @impl true
-  def handle_call({:update_max_active_file_size, size}, _from, state) when is_integer(size) and size >= 1_048_576 do
-    {:reply, :ok, %{state | max_active_file_size: size}}
   end
 
   @impl true

@@ -1,30 +1,21 @@
 defmodule Ferricstore.Store.ActiveFile do
   @moduledoc """
-  Tracks the active log file for each shard without `persistent_term.put`.
+  Tracks the active log file for each shard.
 
-  ## Problem
+  Two strategies based on deployment mode (`:standalone` vs `:embedded`):
 
-  The previous approach stored `{file_id, file_path, shard_data_path}` in
-  `persistent_term`. This gives ~5ns reads but every `persistent_term.put`
-  (on file rotation) triggers a **global GC across all BEAM processes**.
-  In embedded mode, a host app with 50K LiveView/Channel processes would
-  experience GC latency spikes on every file rotation.
+  ## Standalone mode (default, ferricstore_server)
 
-  ## Solution: single atomics counter + process dictionary cache
+  Uses `persistent_term` directly — ~5ns reads. The `persistent_term.put`
+  on file rotation triggers a global GC, but in standalone mode there are
+  only ~20 processes so the GC cost is trivial (~microseconds).
 
-  1. A single `:atomics` counter (1 integer) is bumped on any shard's file
-     rotation. Reading it costs ~5ns.
-  2. An ETS table holds `{shard_index, file_id, file_path, shard_data_path}`.
-  3. Callers cache the ETS value in their **process dictionary** keyed by
-     `{:active_file_cache, shard_index}` along with the generation at read time.
-  4. On read: compare cached generation to current atomic — if equal, use
-     cache (~15ns total). If stale, re-read ETS (~100ns), update cache.
-  5. On rotation: Shard updates ETS + bumps the global atomic. No global GC.
+  ## Embedded mode
 
-  Using a global counter instead of per-shard means a rotation on shard 0
-  invalidates caches for all shards. This causes at most `shard_count` extra
-  ETS reads (one per shard, one per caller process). Since rotation happens
-  ~once per 25 seconds, this false invalidation is negligible.
+  Uses atomics generation counter + process dictionary cache — ~15ns reads
+  on the hot path. On file rotation, only an ETS re-read (~100ns) happens
+  per caller process. No global GC, which matters when the host app has
+  50K+ LiveView/Channel processes.
 
   ## Usage
 
@@ -37,19 +28,25 @@ defmodule Ferricstore.Store.ActiveFile do
 
   @table :ferricstore_active_files
   @atomics_key :ferricstore_active_file_gen
+  @mode_key :ferricstore_active_file_mode
 
   @doc """
-  Initializes the ETS table and atomics counter. Called once from Application.start.
+  Initializes the registry. Called once from Application.start.
   """
   @spec init(non_neg_integer()) :: :ok
   def init(_shard_count) do
-    if :ets.whereis(@table) == :undefined do
-      :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
-    end
+    mode = Application.get_env(:ferricstore, :mode, :standalone)
+    :persistent_term.put(@mode_key, mode)
 
-    unless :persistent_term.get(@atomics_key, nil) do
-      ref = :atomics.new(1, signed: false)
-      :persistent_term.put(@atomics_key, ref)
+    if mode == :embedded do
+      if :ets.whereis(@table) == :undefined do
+        :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+      end
+
+      unless :persistent_term.get(@atomics_key, nil) do
+        ref = :atomics.new(1, signed: false)
+        :persistent_term.put(@atomics_key, ref)
+      end
     end
 
     :ok
@@ -58,31 +55,41 @@ defmodule Ferricstore.Store.ActiveFile do
   @doc """
   Publishes the active file metadata for a shard.
 
-  Called from `Shard.init/1` and `Shard.maybe_rotate_file/1`. Updates the
-  ETS table and bumps the global generation counter so callers invalidate
-  their process dictionary cache on next read.
+  Called from `Shard.init/1` and `Shard.maybe_rotate_file/1`.
   """
   @spec publish(non_neg_integer(), non_neg_integer(), binary(), binary()) :: :ok
   def publish(shard_index, file_id, file_path, shard_data_path) do
-    :ets.insert(@table, {shard_index, file_id, file_path, shard_data_path})
-    ref = :persistent_term.get(@atomics_key)
-    :atomics.add(ref, 1, 1)
+    case :persistent_term.get(@mode_key, :standalone) do
+      :standalone ->
+        :persistent_term.put({:ferricstore_active_file, shard_index}, {file_id, file_path, shard_data_path})
+
+      :embedded ->
+        :ets.insert(@table, {shard_index, file_id, file_path, shard_data_path})
+        ref = :persistent_term.get(@atomics_key)
+        :atomics.add(ref, 1, 1)
+    end
+
     :ok
   end
 
   @doc """
   Returns `{file_id, file_path, shard_data_path}` for the given shard.
 
-  Uses a two-level cache:
-  1. Process dictionary (L1, ~10ns) — checked first via generation match
-  2. ETS table (L2, ~100ns) — on cache miss or generation mismatch
-
-  The global atomics counter (~5ns read) detects staleness. After the first
-  ETS read, subsequent calls for the same shard hit the process dictionary
-  until any shard rotates its file.
+  Standalone: `persistent_term.get` (~5ns).
+  Embedded: atomics check + process dictionary cache (~15ns hot, ~100ns cold).
   """
   @spec get(non_neg_integer()) :: {non_neg_integer(), binary(), binary()}
   def get(shard_index) do
+    case :persistent_term.get(@mode_key, :standalone) do
+      :standalone ->
+        :persistent_term.get({:ferricstore_active_file, shard_index})
+
+      :embedded ->
+        get_embedded(shard_index)
+    end
+  end
+
+  defp get_embedded(shard_index) do
     ref = :persistent_term.get(@atomics_key)
     current_gen = :atomics.get(ref, 1)
 
