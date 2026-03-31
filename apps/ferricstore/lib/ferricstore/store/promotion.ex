@@ -162,24 +162,38 @@ defmodule Ferricstore.Store.Promotion do
     pm_prefix = "PM:"
     pm_len = byte_size(pm_prefix)
 
+    # Match PM: keys with either a binary value (hot) or nil (cold, needs pread).
+    # After recover_keydir, PM: entries may be cold (value=nil, offset>0).
     match_spec = [
-      {{:"$1", :"$2", :_, :_, :_, :_, :_},
+      {{:"$1", :"$2", :_, :_, :"$3", :"$4", :_},
        [{:andalso,
          {:is_binary, :"$1"},
          {:andalso,
            {:>=, {:byte_size, :"$1"}, pm_len},
-           {:andalso,
-             {:==, {:binary_part, :"$1", 0, pm_len}, pm_prefix},
-             {:is_binary, :"$2"}}}}],
-       [{{:"$1", :"$2"}}]}
+           {:==, {:binary_part, :"$1", 0, pm_len}, pm_prefix}}}],
+       [{{:"$1", :"$2", :"$3", :"$4"}}]}
     ]
 
     all_markers =
       :ets.select(keydir, match_spec)
-      |> Enum.map(fn {full_key, value} ->
+      |> Enum.map(fn {full_key, value, fid, offset} ->
         <<"PM:", redis_key::binary>> = full_key
-        {redis_key, value}
+
+        # If value is nil (cold entry), read the type string from disk
+        type_str =
+          if is_binary(value) do
+            value
+          else
+            file_path = Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
+            case NIF.v2_pread_at(file_path, offset) do
+              {:ok, v} when is_binary(v) -> v
+              _ -> nil
+            end
+          end
+
+        {redis_key, type_str}
       end)
+      |> Enum.filter(fn {_, type_str} -> is_binary(type_str) end)
       |> Enum.uniq_by(fn {redis_key, _} -> redis_key end)
 
     Enum.reduce(all_markers, %{}, fn {redis_key, type_str}, acc ->
