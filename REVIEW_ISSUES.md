@@ -46,10 +46,10 @@
 
 ### H2: volatile_lru and allkeys_lru eviction don't implement actual LRU
 **File:** `memory_guard.ex:343, 361-363`
-**Status:** BUG CONFIRMED
-**Test result:** Test proves eviction evicts recently-accessed keys (high ldt) while stale keys (low ldt) survive. The `_` catch-all at line 361 takes arbitrary ETS fold order instead of sorting by access time.
+**Status:** FIXED (commit 8d300c9)
+**Test result:** Previously evicted recently-accessed keys while stale keys survived. Now correctly evicts stale keys first.
 
-**Proposed fix:** Add explicit case clauses for `volatile_lru` and `allkeys_lru` that sort by `ldt` ascending via `LFU.unpack(lfu) |> elem(0)`.
+**Fix:** Added explicit case clauses for `volatile_lru` and `allkeys_lru` that sort by `ldt` (last access time) ascending via `LFU.unpack(lfu) |> elem(0)`. All eviction policies verified correct: volatile_ttl sorts by TTL, volatile/allkeys_lfu sorts by frequency counter, volatile/allkeys_lru sorts by access time, noeviction skips.
 
 ### H3: compound_get_meta hardcodes expiry=0 when reading from promoted store
 **File:** `store/shard.ex:592-604`
@@ -151,7 +151,7 @@
 | C4 | CRITICAL | Confirmed | FIXED |
 | C5 | CRITICAL | N/A | ACCEPTED |
 | H1 | HIGH | 2 pass | FIXED (removed File.ls syscall) |
-| H2 | HIGH | Confirmed | TODO — sort by ldt |
+| H2 | HIGH | Confirmed | FIXED |
 | H3 | HIGH | Written | TODO — needs shard_kill verify |
 | H4 | HIGH | Confirmed | TODO — add fid>0 guard |
 | H5 | HIGH | Confirmed | TODO — handle past timestamps |
