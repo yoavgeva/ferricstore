@@ -562,7 +562,7 @@ defmodule Ferricstore.Store.Shard do
           {:hit, value, _exp} -> {:reply, value, state}
           :expired -> {:reply, nil, state}
           :miss ->
-            case promoted_read(dedicated_path, compound_key) do
+            case promoted_read(dedicated_path, compound_key, state.keydir) do
               {:ok, nil} -> {:reply, nil, state}
               {:ok, value} ->
                 ets_insert(state, compound_key, value, 0)
@@ -590,7 +590,7 @@ defmodule Ferricstore.Store.Shard do
           {:hit, value, expire_at_ms} -> {:reply, {value, expire_at_ms}, state}
           :expired -> {:reply, nil, state}
           :miss ->
-            case promoted_read(dedicated_path, compound_key) do
+            case promoted_read(dedicated_path, compound_key, state.keydir) do
               {:ok, nil} -> {:reply, nil, state}
               {:ok, value} ->
                 ets_insert(state, compound_key, value, 0)
@@ -632,11 +632,11 @@ defmodule Ferricstore.Store.Shard do
         end
 
       dedicated_path ->
-        # Promoted -- write to ETS + dedicated Bitcask via v2
-        ets_insert(state, compound_key, value, expire_at_ms)
-
+        # Promoted -- write to dedicated Bitcask first (get offset), then ETS with location
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
-          {:ok, _} -> {:reply, :ok, state}
+          {:ok, {offset, record_size}} ->
+            ets_insert_with_location(state, compound_key, value, expire_at_ms, 0, offset, record_size)
+            {:reply, :ok, state}
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
             {:reply, {:error, reason}, state}
@@ -665,11 +665,11 @@ defmodule Ferricstore.Store.Shard do
         {:reply, :ok, new_state}
 
       dedicated_path ->
-        # Promoted -- write to ETS + dedicated Bitcask via v2
-        ets_insert(state, compound_key, value, expire_at_ms)
-
+        # Promoted -- write to dedicated Bitcask first (get offset), then ETS with location
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
-          {:ok, _} -> {:reply, :ok, state}
+          {:ok, {offset, record_size}} ->
+            ets_insert_with_location(state, compound_key, value, expire_at_ms, 0, offset, record_size)
+            {:reply, :ok, state}
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
             {:reply, {:error, reason}, state}
@@ -3523,35 +3523,35 @@ defmodule Ferricstore.Store.Shard do
   # Reads a key from a promoted dedicated Bitcask directory (v2 path-based).
   # Scans ETS first (compound keys are warmed into ETS on recover).
   # Falls back to scanning the dedicated log file for the key.
-  defp promoted_read(dedicated_path, compound_key) do
+  defp promoted_read(dedicated_path, compound_key, keydir) do
     active = promoted_active_file(dedicated_path)
-    # The key's offset is in ETS — try v2_pread_at if we have location info.
-    # For promoted stores, entries are recovered with fid=0, which means
-    # they point to the dedicated 00000.log. Use scan as fallback.
-    # In Bitcask log-structured format, the LAST record for a key wins.
-    # We must find the last entry matching the key and check if it's a tombstone.
-    case NIF.v2_scan_file(active) do
-      {:ok, records} ->
-        # Find the last record for this key (last entry wins in log-structured stores)
-        last_entry =
-          records
-          |> Enum.filter(fn {k, _off, _vsize, _exp, _is_tomb} -> k == compound_key end)
-          |> List.last()
 
-        case last_entry do
-          nil ->
-            {:ok, nil}
+    # Try O(1) pread using offset from ETS keydir.
+    # Promoted writes now store {file_id=0, offset, value_size} in ETS.
+    case :ets.lookup(keydir, compound_key) do
+      [{^compound_key, _value, _exp, _lfu, 0, offset, _vsize}] when offset > 0 ->
+        # Have a valid offset — direct pread, O(1)
+        NIF.v2_pread_at(active, offset)
 
-          {_key, _offset, _vsize, _exp, true} ->
-            # Last entry is a tombstone -- key is deleted
-            {:ok, nil}
+      _ ->
+        # No offset (pre-fix data or recovery) — fall back to scan.
+        # This path will only be hit for data written before this fix.
+        case NIF.v2_scan_file(active) do
+          {:ok, records} ->
+            last_entry =
+              records
+              |> Enum.filter(fn {k, _off, _vsize, _exp, _is_tomb} -> k == compound_key end)
+              |> List.last()
 
-          {_key, offset, _vsize, _exp, false} ->
-            NIF.v2_pread_at(active, offset)
+            case last_entry do
+              nil -> {:ok, nil}
+              {_key, _offset, _vsize, _exp, true} -> {:ok, nil}
+              {_key, offset, _vsize, _exp, false} -> NIF.v2_pread_at(active, offset)
+            end
+
+          {:error, reason} ->
+            {:error, reason}
         end
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
