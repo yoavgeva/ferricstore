@@ -86,15 +86,18 @@ defmodule Ferricstore.CrossShardOp do
         # Use the caller's shard-local store if provided, otherwise build one.
         execute_same_shard(shard_map, execute_fn, caller_store)
       else
-        # Cross-shard: check durability mode
-        namespace = Keyword.get(opts, :namespace) || extract_namespace(hd(keys))
+        # Cross-shard: check durability mode for ALL involved keys.
+        # If any key is in an async namespace, return CROSSSLOT.
+        has_async =
+          Enum.any?(keys, fn key ->
+            ns = Keyword.get(opts, :namespace) || extract_namespace(key)
+            NamespaceConfig.durability_for(ns) == :async
+          end)
 
-        case NamespaceConfig.durability_for(namespace) do
-          :async ->
-            {:error, @crossslot_error}
-
-          :quorum ->
-            execute_cross_shard(keys_with_roles, shard_map, execute_fn, opts)
+        if has_async do
+          {:error, @crossslot_error}
+        else
+          execute_cross_shard(keys_with_roles, shard_map, execute_fn, opts)
         end
       end
     end

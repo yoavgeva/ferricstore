@@ -153,7 +153,54 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
   end
 
   # ---------------------------------------------------------------------------
-  # 4. Compound key lock mapping
+  # 4. Mixed namespace — any async key returns CROSSSLOT
+  # ---------------------------------------------------------------------------
+
+  describe "mixed namespace durability" do
+    test "CROSSSLOT when source is async, dest is quorum" do
+      src = "asyncns:src_#{:rand.uniform(9_999_999)}"
+      dst = "quorumns:dst_#{:rand.uniform(9_999_999)}"
+
+      # Ensure cross-shard
+      if Router.shard_for(src) == Router.shard_for(dst) do
+        # Skip if they happen to route to same shard
+        :ok
+      else
+        NamespaceConfig.set("asyncns", "durability", "async")
+        NamespaceConfig.set("quorumns", "durability", "quorum")
+
+        # Set up source
+        shard = Router.shard_name(Router.shard_for(src))
+        GenServer.call(shard, {:tx_execute, [{"SADD", [src, "member"]}], nil}, 10_000)
+
+        result = Set.handle("SMOVE", [src, dst, "member"], %{})
+        assert {:error, msg} = result
+        assert String.contains?(msg, "CROSSSLOT")
+      end
+    end
+
+    test "CROSSSLOT when dest is async, source is quorum" do
+      src = "quorumns:src2_#{:rand.uniform(9_999_999)}"
+      dst = "asyncns:dst2_#{:rand.uniform(9_999_999)}"
+
+      if Router.shard_for(src) == Router.shard_for(dst) do
+        :ok
+      else
+        NamespaceConfig.set("asyncns", "durability", "async")
+        NamespaceConfig.set("quorumns", "durability", "quorum")
+
+        shard = Router.shard_name(Router.shard_for(src))
+        GenServer.call(shard, {:tx_execute, [{"SADD", [src, "member"]}], nil}, 10_000)
+
+        result = Set.handle("SMOVE", [src, dst, "member"], %{})
+        assert {:error, msg} = result
+        assert String.contains?(msg, "CROSSSLOT")
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 5. Compound key lock mapping
   # ---------------------------------------------------------------------------
 
   describe "compound key lock mapping" do
