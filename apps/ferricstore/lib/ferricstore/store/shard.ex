@@ -2532,33 +2532,60 @@ defmodule Ferricstore.Store.Shard do
 
     # v2 compaction: for each file_id, collect live key offsets from ETS,
     # copy them to a new file, then replace the old file.
-    Enum.each(file_ids, fn fid ->
-      source = file_path(sp, fid)
-      dest = Path.join(sp, "compact_#{fid}.log")
+    # Track statistics for the merge scheduler.
+    {total_written, total_dropped, total_reclaimed} =
+      Enum.reduce(file_ids, {0, 0, 0}, fn fid, {written, dropped, reclaimed} ->
+        source = file_path(sp, fid)
 
-      offsets =
-        :ets.foldl(
-          fn {_key, _value, _exp, _lfu, f, off, _vsize}, acc ->
-            if f == fid, do: [off | acc], else: acc
-          end,
-          [],
-          state.keydir
-        )
+        offsets =
+          :ets.foldl(
+            fn {_key, _value, _exp, _lfu, f, off, _vsize}, acc ->
+              if f == fid, do: [off | acc], else: acc
+            end,
+            [],
+            state.keydir
+          )
 
-      if offsets != [] do
-        case NIF.v2_copy_records(source, dest, offsets) do
-          {:ok, _results} ->
-            File.rename!(dest, source)
+        if offsets != [] do
+          old_size =
+            case File.stat(source) do
+              {:ok, %{size: s}} -> s
+              _ -> 0
+            end
 
-          {:error, reason} ->
-            Logger.error("Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}")
-            # Clean up partial dest file if it exists
-            File.rm(dest)
+          dest = Path.join(sp, "compact_#{fid}.log")
+
+          case NIF.v2_copy_records(source, dest, offsets) do
+            {:ok, _results} ->
+              File.rename!(dest, source)
+
+              new_size =
+                case File.stat(source) do
+                  {:ok, %{size: s}} -> s
+                  _ -> 0
+                end
+
+              {written + length(offsets), dropped, reclaimed + max(old_size - new_size, 0)}
+
+            {:error, reason} ->
+              Logger.error("Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}")
+              File.rm(dest)
+              {written, dropped, reclaimed}
+          end
+        else
+          # All entries in this file are dead — delete the file entirely
+          old_size =
+            case File.stat(source) do
+              {:ok, %{size: s}} -> s
+              _ -> 0
+            end
+
+          File.rm(source)
+          {written, dropped, reclaimed + old_size}
         end
-      end
-    end)
+      end)
 
-    {:reply, :ok, state}
+    {:reply, {:ok, {total_written, total_dropped, total_reclaimed}}, state}
   end
 
   def handle_call(:available_disk_space, _from, state) do
