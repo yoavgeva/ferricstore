@@ -142,8 +142,8 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 
 ### M9: StateMachine uses nosync without coordinated fsync
 **File:** `raft/state_machine.ex:1024-1059`
-**Status:** ACCEPTED TRADE-OFF
-**Test result:** N/A — Raft log replay recovers the data on follower restart. No data loss from cluster perspective.
+**Status:** NOT A BUG
+**Test result:** N/A — Raft WAL is fsynced by ra. On follower crash, Raft log replay re-applies the command, re-writing to Bitcask. Raft log is the source of truth, Bitcask is a materialized view. No data loss.
 
 ---
 
@@ -172,4 +172,4 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 | M6 | MEDIUM | N/A | NOT A BUG |
 | M7 | MEDIUM | N/A | FIXED |
 | M8 | MEDIUM | 4 pass | FIXED BY C6 (locked) |
-| M9 | MEDIUM | N/A | ACCEPTED |
+| M9 | MEDIUM | N/A | NOT A BUG |
