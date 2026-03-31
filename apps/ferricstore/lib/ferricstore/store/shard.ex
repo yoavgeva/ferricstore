@@ -59,6 +59,10 @@ defmodule Ferricstore.Store.Shard do
   # Configurable via :max_active_file_size application env.
   @default_max_active_file_size 256 * 1024 * 1024
 
+  # Write count threshold before compacting a promoted dedicated file.
+  # After this many writes/deletes, dead entries are purged.
+  @dedicated_compaction_threshold 1000
+
   # Maximum pending entries before triggering a synchronous flush.
   # Bounds worst-case shard process heap growth during write bursts.
   @max_pending_size 10_000
@@ -635,8 +639,9 @@ defmodule Ferricstore.Store.Shard do
         # Promoted -- write to dedicated Bitcask first (get offset), then ETS with location
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
           {:ok, {offset, record_size}} ->
-            ets_insert_with_location(state, compound_key, value, expire_at_ms, 0, offset, record_size)
-            {:reply, :ok, state}
+            active_fid = promoted_active_fid(dedicated_path)
+            ets_insert_with_location(state, compound_key, value, expire_at_ms, active_fid, offset, record_size)
+            {:reply, :ok, bump_promoted_writes(state, redis_key)}
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
             {:reply, {:error, reason}, state}
@@ -668,8 +673,9 @@ defmodule Ferricstore.Store.Shard do
         # Promoted -- write to dedicated Bitcask first (get offset), then ETS with location
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
           {:ok, {offset, record_size}} ->
-            ets_insert_with_location(state, compound_key, value, expire_at_ms, 0, offset, record_size)
-            {:reply, :ok, state}
+            active_fid = promoted_active_fid(dedicated_path)
+            ets_insert_with_location(state, compound_key, value, expire_at_ms, active_fid, offset, record_size)
+            {:reply, :ok, bump_promoted_writes(state, redis_key)}
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
             {:reply, {:error, reason}, state}
@@ -705,7 +711,7 @@ defmodule Ferricstore.Store.Shard do
         case promoted_tombstone(dedicated_path, compound_key) do
           {:ok, _} ->
             ets_delete_key(state, compound_key)
-            {:reply, :ok, state}
+            {:reply, :ok, bump_promoted_writes(state, redis_key)}
 
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted tombstone failed: #{inspect(reason)}")
@@ -744,7 +750,7 @@ defmodule Ferricstore.Store.Shard do
         case promoted_tombstone(dedicated_path, compound_key) do
           {:ok, _} ->
             ets_delete_key(state, compound_key)
-            {:reply, :ok, state}
+            {:reply, :ok, bump_promoted_writes(state, redis_key)}
 
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted tombstone failed: #{inspect(reason)}")
@@ -3516,8 +3522,13 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   # Returns the dedicated path for a promoted key, or nil.
+  # Returns the dedicated path for a promoted key, or nil if not promoted.
   defp promoted_store(state, redis_key) do
-    Map.get(state.promoted_instances, redis_key)
+    case Map.get(state.promoted_instances, redis_key) do
+      %{path: path} -> path
+      path when is_binary(path) -> path  # backwards compat during migration
+      nil -> nil
+    end
   end
 
   # Reads a key from a promoted dedicated Bitcask directory (v2 path-based).
@@ -3571,6 +3582,148 @@ defmodule Ferricstore.Store.Shard do
     Path.join(dedicated_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
   end
 
+  # Returns the file_id of the current active file in a dedicated directory.
+  defp promoted_active_fid(dedicated_path) do
+    case File.ls(dedicated_path) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.ends_with?(&1, ".log"))
+        |> Enum.map(fn name -> name |> String.trim_trailing(".log") |> String.to_integer() end)
+        |> Enum.max(fn -> 0 end)
+
+      _ -> 0
+    end
+  end
+
+  # Increments the write counter for a promoted instance and triggers
+  # compaction when the threshold is reached.
+  defp bump_promoted_writes(state, redis_key) do
+    case Map.get(state.promoted_instances, redis_key) do
+      %{path: path, writes: writes} ->
+        new_writes = writes + 1
+
+        if new_writes >= @dedicated_compaction_threshold do
+          state = compact_dedicated(state, redis_key, path)
+          new_promoted = Map.put(state.promoted_instances, redis_key, %{path: path, writes: 0})
+          %{state | promoted_instances: new_promoted}
+        else
+          new_promoted = Map.put(state.promoted_instances, redis_key, %{path: path, writes: new_writes})
+          %{state | promoted_instances: new_promoted}
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  # Compacts a dedicated promoted Bitcask by rewriting live entries to a new file.
+  #
+  # Steps:
+  # 1. Scan ETS for live compound keys belonging to this collection
+  # 2. Write them to a new file (next file_id)
+  # 3. Update ETS entries with new file_id + offsets
+  # 4. Delete old file(s)
+  defp compact_dedicated(state, redis_key, dedicated_path) do
+    alias Ferricstore.Store.{CompoundKey, Promotion}
+
+    # Determine the prefix for this collection's compound keys
+    prefix = promoted_prefix_for(state, redis_key)
+
+    if prefix == nil do
+      Logger.warning("Shard #{state.index}: cannot determine prefix for promoted key #{inspect(redis_key)}, skipping compaction")
+      state
+    else
+      # Find the current active file_id and compute the next
+      old_fid = promoted_active_fid(dedicated_path)
+      new_fid = old_fid + 1
+      new_file = dedicated_file_path(dedicated_path, new_fid)
+      File.touch!(new_file)
+
+      # Collect live entries from ETS
+      now = System.os_time(:millisecond)
+
+      live_entries =
+        :ets.foldl(
+          fn {key, value, exp, _lfu, _fid, _off, _vsize}, acc ->
+            if is_binary(key) and value != nil and String.starts_with?(key, prefix) and
+                 (exp == 0 or exp > now) do
+              [{key, value, exp} | acc]
+            else
+              acc
+            end
+          end,
+          [],
+          state.keydir
+        )
+
+      if live_entries == [] do
+        # Nothing to compact — remove the new empty file
+        File.rm(new_file)
+        state
+      else
+        # Write all live entries to the new file
+        batch = Enum.map(live_entries, fn {k, v, exp} -> {k, v, exp} end)
+
+        case NIF.v2_append_batch(new_file, batch) do
+          {:ok, results} ->
+            # Update ETS with new file_id + offsets
+            live_entries
+            |> Enum.zip(results)
+            |> Enum.each(fn {{key, value, expire_at_ms}, {offset, value_size}} ->
+              value_for_ets = value_for_ets(value)
+              :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), new_fid, offset, value_size})
+            end)
+
+            # Delete old files (all files with fid < new_fid)
+            case File.ls(dedicated_path) do
+              {:ok, files} ->
+                Enum.each(files, fn name ->
+                  if String.ends_with?(name, ".log") do
+                    fid = name |> String.trim_trailing(".log") |> String.to_integer()
+                    if fid < new_fid do
+                      File.rm(Path.join(dedicated_path, name))
+                    end
+                  end
+                end)
+
+              _ -> :ok
+            end
+
+            Logger.debug(
+              "Shard #{state.index}: compacted dedicated #{inspect(redis_key)} " <>
+                "(#{length(live_entries)} live entries, fid #{old_fid} -> #{new_fid})"
+            )
+
+            :telemetry.execute(
+              [:ferricstore, :dedicated, :compaction],
+              %{live_entries: length(live_entries), old_fid: old_fid, new_fid: new_fid},
+              %{shard_index: state.index, redis_key: redis_key}
+            )
+
+            state
+
+          {:error, reason} ->
+            Logger.error("Shard #{state.index}: dedicated compaction write failed: #{inspect(reason)}")
+            File.rm(new_file)
+            state
+        end
+      end
+    end
+  end
+
+  # Determines the compound key prefix for a promoted redis key by checking
+  # the promotion marker type in ETS.
+  defp promoted_prefix_for(state, redis_key) do
+    mk = Ferricstore.Store.Promotion.marker_key(redis_key)
+
+    case :ets.lookup(state.keydir, mk) do
+      [{^mk, "hash", _, _, _, _, _}] -> "H:" <> redis_key <> <<0>>
+      [{^mk, "set", _, _, _, _, _}] -> "S:" <> redis_key <> <<0>>
+      [{^mk, "zset", _, _, _, _, _}] -> "Z:" <> redis_key <> <<0>>
+      _ -> nil
+    end
+  end
+
   # After a compound_put to the shared Bitcask, checks whether the
   # collection should be promoted. Triggers for hash (H:), set (S:),
   # and sorted set (Z:) compound keys when the entry count exceeds the
@@ -3614,7 +3767,7 @@ defmodule Ferricstore.Store.Shard do
                    state.index
                  ) do
               {:ok, dedicated_store} ->
-                new_promoted = Map.put(state.promoted_instances, redis_key, dedicated_store)
+                new_promoted = Map.put(state.promoted_instances, redis_key, %{path: dedicated_store, writes: 0})
                 %{state | promoted_instances: new_promoted}
 
               {:error, _reason} ->

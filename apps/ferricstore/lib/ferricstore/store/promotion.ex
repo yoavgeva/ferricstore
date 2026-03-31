@@ -224,7 +224,7 @@ defmodule Ferricstore.Store.Promotion do
               :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), fid, offset, 0})
           end)
 
-          Map.put(acc, redis_key, dedicated_path)
+          Map.put(acc, redis_key, %{path: dedicated_path, writes: 0})
 
         {:error, reason} ->
           Logger.error(
