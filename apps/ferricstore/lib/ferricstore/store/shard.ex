@@ -55,8 +55,9 @@ defmodule Ferricstore.Store.Shard do
   @default_sweep_interval_ms 1_000
   @default_max_keys_per_sweep 100
 
-  # Maximum active file size before rotation (256 MB).
-  @max_active_file_size 256 * 1024 * 1024
+  # Default maximum active file size before rotation (256 MB).
+  # Configurable via :max_active_file_size application env.
+  @default_max_active_file_size 256 * 1024 * 1024
 
   # Maximum pending entries before triggering a synchronous flush.
   # Bounds worst-case shard process heap growth during write bursts.
@@ -97,7 +98,10 @@ defmodule Ferricstore.Store.Shard do
     # For sandbox shards with Raft: the private ra system and server ID.
     # When set, the shard submits directly to ra (no Batcher).
     sandbox_ra_system: nil,
-    sandbox_ra_server_id: nil
+    sandbox_ra_server_id: nil,
+    # Maximum active file size before rotation. Cached from Application env
+    # at init time. Updated via handle_cast(:update_max_active_file_size, n).
+    max_active_file_size: 256 * 1024 * 1024
   ]
 
   # -------------------------------------------------------------------
@@ -254,14 +258,16 @@ defmodule Ferricstore.Store.Shard do
       end
     end
 
-    # Publish active file metadata to persistent_term (skip for sandbox --
+    # Publish active file metadata to ActiveFile registry (skip for sandbox --
     # sandbox shards don't use the async write path through Router)
     unless sandbox? do
-      publish_active_file(index, active_file_id, active_file_path, path)
+      Ferricstore.Store.ActiveFile.publish(index, active_file_id, active_file_path, path)
     end
 
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
+    max_file_size = Application.get_env(:ferricstore, :max_active_file_size, @default_max_active_file_size)
+
     {:ok, %__MODULE__{ets: keydir, keydir: keydir,
                        prefix_keys: prefix_keys, index: index, data_dir: data_dir,
                        shard_data_path: path,
@@ -273,7 +279,8 @@ defmodule Ferricstore.Store.Shard do
                        raft?: raft?,
                        sandbox?: sandbox?,
                        sandbox_ra_system: sandbox_ra_system,
-                       sandbox_ra_server_id: sandbox_ra_server_id},
+                       sandbox_ra_server_id: sandbox_ra_server_id,
+                       max_active_file_size: max_file_size},
      {:continue, {:flush_interval, flush_ms}}}
   end
 
@@ -409,6 +416,11 @@ defmodule Ferricstore.Store.Shard do
     # Store flush interval in process dictionary so handle_info can reschedule.
     Process.put(:flush_interval_ms, ms)
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_call({:update_max_active_file_size, size}, _from, state) when is_integer(size) and size >= 1_048_576 do
+    {:reply, :ok, %{state | max_active_file_size: size}}
   end
 
   @impl true
@@ -2911,25 +2923,18 @@ defmodule Ferricstore.Store.Shard do
     Enum.reduce(locations, 0, fn {_offset, size}, acc -> acc + size end)
   end
 
-  defp maybe_rotate_file(%{active_file_size: size} = state) when size >= @max_active_file_size do
-    write_hint_for_file(state, state.active_file_id)
-    new_id = state.active_file_id + 1
-    sp = state.shard_data_path
-    new_path = file_path(sp, new_id)
-    File.touch!(new_path)
-    publish_active_file(state.index, new_id, new_path, sp)
-    %{state | active_file_id: new_id, active_file_path: new_path, active_file_size: 0}
-  end
-
-  defp maybe_rotate_file(state), do: state
-
-  # Publishes active file metadata to persistent_term so the Router's fast
-  # async write path can read it without a GenServer.call (~5ns lookup).
-  # Called from init/1 and maybe_rotate_file/1.
-  @spec publish_active_file(non_neg_integer(), non_neg_integer(), binary(), binary()) :: :ok
-  defp publish_active_file(index, file_id, file_path, shard_data_path) do
-    :persistent_term.put({:ferricstore_active_file, index}, {file_id, file_path, shard_data_path})
-    :ok
+  defp maybe_rotate_file(state) do
+    if state.active_file_size >= state.max_active_file_size do
+      write_hint_for_file(state, state.active_file_id)
+      new_id = state.active_file_id + 1
+      sp = state.shard_data_path
+      new_path = file_path(sp, new_id)
+      File.touch!(new_path)
+      Ferricstore.Store.ActiveFile.publish(state.index, new_id, new_path, sp)
+      %{state | active_file_id: new_id, active_file_path: new_path, active_file_size: 0}
+    else
+      state
+    end
   end
 
   defp write_hint_for_file(state, target_fid) do

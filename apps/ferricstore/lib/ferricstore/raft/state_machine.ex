@@ -550,7 +550,7 @@ defmodule Ferricstore.Raft.StateMachine do
         }
       else
         {file_id, file_path, shard_data_path} =
-          :persistent_term.get({:ferricstore_active_file, shard_idx})
+          Ferricstore.Store.ActiveFile.get(shard_idx)
 
         %{
           keydir: :"keydir_#{shard_idx}",

@@ -80,7 +80,8 @@ defmodule Ferricstore.Config do
     "keydir-max-ram",
     "hot-cache-max-ram",
     "hot-cache-min-ram",
-    "hot-cache-max-value-size"
+    "hot-cache-max-value-size",
+    "max-active-file-size"
   ])
 
   # Valid eviction policy names (string form used by Redis CONFIG SET)
@@ -436,7 +437,8 @@ defmodule Ferricstore.Config do
       "keydir-max-ram" => Integer.to_string(Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)),
       "hot-cache-max-ram" => read_hot_cache_max_ram(),
       "hot-cache-min-ram" => Integer.to_string(Application.get_env(:ferricstore, :hot_cache_min_ram, 64 * 1024 * 1024)),
-      "hot-cache-max-value-size" => Integer.to_string(Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536))
+      "hot-cache-max-value-size" => Integer.to_string(Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536)),
+      "max-active-file-size" => Integer.to_string(Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024))
     }
 
     Map.merge(@legacy_rw_defaults, Map.merge(read_only, read_write))
@@ -587,6 +589,13 @@ defmodule Ferricstore.Config do
     end
   end
 
+  defp validate_param("max-active-file-size", value) do
+    case Integer.parse(value) do
+      {n, ""} when n >= 1_048_576 -> :ok
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'max-active-file-size' (min 1MB)"}
+    end
+  end
+
   defp validate_param(_key, _value), do: :ok
 
   # -------------------------------------------------------------------
@@ -649,6 +658,22 @@ defmodule Ferricstore.Config do
     {n, ""} = Integer.parse(value)
     Application.put_env(:ferricstore, :hot_cache_max_value_size, n)
     :persistent_term.put(:ferricstore_hot_cache_max_value_size, n)
+  end
+
+  defp apply_side_effect("max-active-file-size", value) do
+    {n, ""} = Integer.parse(value)
+    Application.put_env(:ferricstore, :max_active_file_size, n)
+
+    # Push to all running shards so they don't need Application.get_env per flush.
+    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    for i <- 0..(shard_count - 1) do
+      name = Ferricstore.Store.Router.shard_name(i)
+      try do
+        GenServer.call(name, {:update_max_active_file_size, n}, 5_000)
+      catch
+        :exit, _ -> :ok
+      end
+    end
   end
 
   defp apply_side_effect("notify-keyspace-events", value) do

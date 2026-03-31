@@ -269,7 +269,7 @@ defmodule Ferricstore.Store.Router do
     end
     disk_value = to_disk_binary(value)
     PrefixIndex.track(PrefixIndex.table_name(idx), key, idx)
-    {file_id, file_path, _} = :persistent_term.get({:ferricstore_active_file, idx})
+    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
 
     if value_for_ets == nil do
       # Large value: sync NIF write to get offset, then ETS with real location.
@@ -300,7 +300,7 @@ defmodule Ferricstore.Store.Router do
     :ets.delete(keydir, key)
     PrefixIndex.untrack(PrefixIndex.table_name(idx), key, idx)
 
-    {_, file_path, _} = :persistent_term.get({:ferricstore_active_file, idx})
+    {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
     Ferricstore.Store.BitcaskWriter.delete(idx, file_path, key)
 
     WriteVersion.increment(idx)
