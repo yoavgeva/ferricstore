@@ -310,11 +310,21 @@ defmodule Ferricstore.Store.Promotion do
   end
 
   # Returns all .log files in a directory as [{file_id, full_path}], sorted by file_id.
+  # Cleans up leftover compact_*.log temp files from crashed compaction.
   defp list_log_files(dir) do
     case File.ls(dir) do
       {:ok, files} ->
+        # Delete leftover compaction temp files (same as shared shard C2 fix)
+        Enum.each(files, fn name ->
+          if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
+            File.rm(Path.join(dir, name))
+          end
+        end)
+
         files
-        |> Enum.filter(&String.ends_with?(&1, ".log"))
+        |> Enum.filter(fn name ->
+          String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_")
+        end)
         |> Enum.map(fn name ->
           fid = name |> String.trim_trailing(".log") |> String.to_integer()
           {fid, Path.join(dir, name)}
