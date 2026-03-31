@@ -18,8 +18,8 @@
 
 ### C3: Cross-shard transaction pending writes not isolated per shard
 **File:** `raft/state_machine.ex:212-246`
-**Status:** NOT A BUG
-**Test result:** 3 tests pass — writes land in correct shard files. The `build_cross_shard_store` closures write via `BitcaskWriter.write` with per-shard paths, bypassing `:sm_pending_writes` entirely. The flush at line 244 is a no-op.
+**Status:** NOT A BUG — dead code removed (commit ccfef8a)
+**Test result:** 3 tests pass — writes land in correct shard files. The `build_cross_shard_store` closures write via `BitcaskWriter.write` with per-shard paths, bypassing `:sm_pending_writes` entirely. The `Process.put(:sm_pending_writes, [])` and `flush_pending_writes(state)` were dead code — removed.
 
 ### C4: Batcher pending map not drained on crash/restart
 **File:** `raft/batcher.ex:132-141`
@@ -147,7 +147,7 @@
 |-------|----------|-------------|--------|
 | C1 | CRITICAL | N/A | FIXED |
 | C2 | CRITICAL | 3 pass | FIXED |
-| C3 | CRITICAL | 3 pass | NOT A BUG |
+| C3 | CRITICAL | 3 pass | NOT A BUG — dead code removed |
 | C4 | CRITICAL | Confirmed | TODO — add terminate/2 |
 | C5 | CRITICAL | N/A | ACCEPTED |
 | H1 | HIGH | 2 pass | FIXED (perf — removed syscall) |
