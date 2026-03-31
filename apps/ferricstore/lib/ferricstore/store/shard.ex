@@ -578,6 +578,9 @@ defmodule Ferricstore.Store.Shard do
           :miss ->
             case promoted_read(dedicated_path, compound_key, state.keydir) do
               {:ok, nil} -> {:reply, nil, state}
+              {:ok, value, exp} ->
+                ets_insert(state, compound_key, value, exp)
+                {:reply, value, state}
               {:ok, value} ->
                 ets_insert(state, compound_key, value, 0)
                 {:reply, value, state}
@@ -606,6 +609,9 @@ defmodule Ferricstore.Store.Shard do
           :miss ->
             case promoted_read(dedicated_path, compound_key, state.keydir) do
               {:ok, nil} -> {:reply, nil, state}
+              {:ok, value, exp} ->
+                ets_insert(state, compound_key, value, exp)
+                {:reply, {value, exp}, state}
               {:ok, value} ->
                 ets_insert(state, compound_key, value, 0)
                 {:reply, {value, 0}, state}
@@ -3574,16 +3580,23 @@ defmodule Ferricstore.Store.Shard do
   # Reads a key from a promoted dedicated Bitcask directory (v2 path-based).
   # Scans ETS first (compound keys are warmed into ETS on recover).
   # Falls back to scanning the dedicated log file for the key.
+  # Returns {:ok, value} or {:ok, value, expire_at_ms} depending on path.
+  # The scan fallback returns expiry; the pread fast path does not (callers
+  # should read expiry from ETS when the fast path is used).
   defp promoted_read(dedicated_path, compound_key, keydir) do
     # Try O(1) pread using file_id + offset from ETS keydir.
     case :ets.lookup(keydir, compound_key) do
-      [{^compound_key, _value, _exp, _lfu, fid, offset, _vsize}] when is_integer(fid) and offset > 0 ->
+      [{^compound_key, _value, exp, _lfu, fid, offset, _vsize}] when is_integer(fid) and offset > 0 ->
         file_path = dedicated_file_path(dedicated_path, fid)
-        NIF.v2_pread_at(file_path, offset)
+
+        case NIF.v2_pread_at(file_path, offset) do
+          {:ok, value} -> {:ok, value, exp}
+          other -> other
+        end
 
       _ ->
         # No valid offset — fall back to scan of the active file.
-        # This path is hit for pre-fix data or when ETS has offset=0.
+        # Scan returns expiry per record, so we can pass it through.
         active = Ferricstore.Store.Promotion.find_active(dedicated_path)
 
         case NIF.v2_scan_file(active) do
@@ -3596,7 +3609,11 @@ defmodule Ferricstore.Store.Shard do
             case last_entry do
               nil -> {:ok, nil}
               {_key, _offset, _vsize, _exp, true} -> {:ok, nil}
-              {_key, offset, _vsize, _exp, false} -> NIF.v2_pread_at(active, offset)
+              {_key, offset, _vsize, exp, false} ->
+                case NIF.v2_pread_at(active, offset) do
+                  {:ok, value} -> {:ok, value, exp}
+                  other -> other
+                end
             end
 
           {:error, reason} ->
