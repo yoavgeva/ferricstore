@@ -1,12 +1,10 @@
 defmodule Ferricstore.Review.H2LruEvictionTest do
   @moduledoc """
-  Proves that volatile_lru and allkeys_lru eviction policies do NOT implement
-  actual LRU ordering.
+  Verifies that volatile_lru and allkeys_lru eviction policies implement
+  actual LRU ordering — evicting least recently accessed keys first.
 
-  Bug: memory_guard.ex lines 361-363 fall through to a default clause that takes
-  the first 5 entries from ETS fold order instead of sorting by last access time
-  (ldt). As a result, recently-accessed keys can be evicted while stale keys
-  survive — the opposite of correct LRU behavior.
+  Previously the code fell through to a default clause that took arbitrary
+  ETS fold order. Now it sorts by ldt (last decrement time) ascending.
   """
 
   use ExUnit.Case, async: false
@@ -31,8 +29,8 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
     :ok
   end
 
-  describe "volatile_lru eviction does not respect last access time" do
-    test "recently-accessed keys may be evicted over stale keys" do
+  describe "volatile_lru eviction respects last access time" do
+    test "stale keys are evicted before recently-accessed keys" do
       far_future = System.os_time(:millisecond) + 3_600_000
 
       # Stale keys: ldt 100 minutes ago.
@@ -66,27 +64,25 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
 
       assert length(evicted) > 0, "expected eviction to occur"
 
-      # Under correct LRU, evicted keys should have the OLDEST ldt values.
-      # Collect ldt from evicted and survived sets.
       evicted_ldts = ldts_for(evicted)
       survived_ldts = ldts_for(survived)
 
-      # If LRU were correct: max(evicted_ldts) <= min(survived_ldts).
-      # The buggy code ignores ldt entirely, so this invariant is violated
-      # whenever a fresh key is evicted while a stale key survives.
+      # Correct LRU: all evicted keys have older ldt than all survived keys.
+      # max(evicted_ldts) <= min(survived_ldts)
       if survived_ldts != [] and evicted_ldts != [] do
         oldest_survivor = Enum.min(survived_ldts)
         newest_evicted = Enum.max(evicted_ldts)
 
-        assert newest_evicted >= oldest_survivor,
-               "BUG NOT REPRODUCED: eviction accidentally matched LRU order. " <>
+        assert newest_evicted <= oldest_survivor,
+               "LRU violated: evicted key (ldt=#{newest_evicted}) is newer than " <>
+                 "surviving key (ldt=#{oldest_survivor}). " <>
                  "evicted_ldts=#{inspect(evicted_ldts)}, survived_ldts=#{inspect(survived_ldts)}"
       end
     end
   end
 
-  describe "allkeys_lru eviction does not respect last access time" do
-    test "recently-accessed keys may be evicted over stale keys" do
+  describe "allkeys_lru eviction respects last access time" do
+    test "stale keys are evicted before recently-accessed keys" do
       far_future = System.os_time(:millisecond) + 3_600_000
 
       old_ldt = (LFU.now_minutes() - 100) &&& 0xFFFF
@@ -125,8 +121,9 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
         oldest_survivor = Enum.min(survived_ldts)
         newest_evicted = Enum.max(evicted_ldts)
 
-        assert newest_evicted >= oldest_survivor,
-               "BUG NOT REPRODUCED: eviction accidentally matched LRU order. " <>
+        assert newest_evicted <= oldest_survivor,
+               "LRU violated: evicted key (ldt=#{newest_evicted}) is newer than " <>
+                 "surviving key (ldt=#{oldest_survivor}). " <>
                  "evicted_ldts=#{inspect(evicted_ldts)}, survived_ldts=#{inspect(survived_ldts)}"
       end
     end

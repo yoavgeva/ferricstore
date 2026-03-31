@@ -358,9 +358,12 @@ defmodule Ferricstore.MemoryGuard do
                   eligible
                   |> Enum.sort_by(fn {_k, _exp, lfu} -> Ferricstore.Store.LFU.effective_counter(lfu) end)
                   |> Enum.take(5)
-                _ ->
-                  # LRU fallback: take first 5 from sample
-                  Enum.take(eligible, 5)
+                p when p in [:volatile_lru, :allkeys_lru] ->
+                  # Sort by last access time ascending (evict least recently used first).
+                  # ldt is packed in the upper 16 bits of the LFU field.
+                  eligible
+                  |> Enum.sort_by(fn {_k, _exp, lfu} -> Ferricstore.Store.LFU.unpack(lfu) |> elem(0) end)
+                  |> Enum.take(5)
               end
 
             # Eviction = set value to nil. Key stays in keydir, data stays on disk.
