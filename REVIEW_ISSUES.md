@@ -1,175 +1,236 @@
-# FerricStore Code Review — Functionality Issues
+# FerricStore Code Review — Round 2
 
-## CRITICAL (data loss, crashes, or consensus violations)
+## CRITICAL (security, data loss, crashes)
 
-### C6: Multi-key commands silently operate across shards without atomicity
-**File:** `commands/set.ex`, `commands/generic.ex`, `commands/list.ex`
-**Status:** FIXED (commits d957426, 1f44a76, ae958aa)
-**Test result:** 30 tests pass — same-shard fast path, cross-shard quorum (lock→intent→execute→unlock), async CROSSSLOT, concurrent ops, lock expiry, intent resolver, compound keys, mixed namespaces.
+### R2-C1: Deleted user ACL cache becomes nil, granting full access
+**File:** `connection.ex:2515, 2659`
+**Area:** Connection + ACL
 
-**Fix:** Mini-Percolator protocol for cross-shard atomicity:
-- **Quorum mode:** per-key locking through Raft consensus. Lock (ascending shard order) → write intent with value hashes → execute with locked_put/locked_delete → delete intent → unlock. Batch locks per shard. TTL 5s. Max 3 retries with backoff. Intent resolver for crash recovery. Parallel unlock via Task.async.
-- **Async mode:** CROSSSLOT error if ANY involved key is async, with message suggesting hash tags or quorum mode.
-- **Same-shard:** zero overhead, execute directly.
-- **Commands wrapped:** SMOVE, RENAME, RENAMENX, COPY, SDIFFSTORE, SINTERSTORE, SUNIONSTORE, LMOVE/RPOPLPUSH.
-- Regular writes to locked keys rejected. Reads never blocked.
+When a user is deleted via ACL DELUSER, `acl_cache` becomes nil. `check_command_cached(nil, _cmd)` returns `:ok` — all commands allowed. Deleted users get full access on active connections.
 
-### C1: Compaction result type mismatch — merge scheduler crashes on every merge
-**File:** `merge/scheduler.ex:286-317`, `store/shard.ex:2518-2551`
-**Status:** FIXED (commit e661d13)
-**Test result:** N/A (crash was obvious from code inspection)
+### R2-C2: CrossShardOp locks/intents stored in process dictionary — lost on shard restart
+**File:** `state_machine.ex:1569-1652`
+**Area:** CrossShardOp
 
-**Fix:** `run_compaction` now returns `{:ok, {written, dropped, reclaimed}}` with real stats.
+Locks and intents use `Process.put/get` with no snapshot handler. If a shard crashes mid-operation, locks and intents are lost. Other clients can acquire locks on the same keys, causing concurrent writes and data corruption.
 
-### C2: Leftover compaction temp files crash shard startup
-**File:** `store/shard.ex:295-318, 2527`
-**Status:** FIXED (commit 098b600)
-**Test result:** 3 tests pass — shard starts, temp files cleaned, data survives.
+### R2-C3: Lock expiry during slow execute — data corruption
+**File:** `cross_shard_op.ex:35`, `state_machine.ex:1622-1632`
+**Area:** CrossShardOp
 
-**Fix:** On startup, delete `compact_*.log` files and skip them in file_id scan.
+Lock TTL is 5s. If execute_fn takes >5s, locks expire mid-execution. Another operation locks the same keys and executes concurrently. Both operations modify the same keys.
 
-### C3: Cross-shard transaction pending writes not isolated per shard
-**File:** `raft/state_machine.ex:212-246`
-**Status:** NOT A BUG — dead code removed (commit ccfef8a)
-**Test result:** 3 tests pass — writes land in correct shard files. The `build_cross_shard_store` closures write via `BitcaskWriter.write` with per-shard paths, bypassing `:sm_pending_writes` entirely. The `Process.put(:sm_pending_writes, [])` and `flush_pending_writes(state)` were dead code — removed.
+### R2-C4: GEOSEARCH BYBOX incorrect distance calculation
+**File:** `geo.ex:644-648`
+**Area:** Geo
 
-### C4: Batcher pending map not drained on crash/restart
-**File:** `raft/batcher.ex:132-141`
-**Status:** FIXED (commit 62e4947)
-**Test result:** Callers via the async path (`write_async` with delegated `from`) hung indefinitely when Batcher died. Direct `Batcher.write` callers were safe (GenServer.call monitors the process).
+Uses Haversine for rectangular bounding box, which is geometrically incorrect. Returns wrong results for large boxes or coordinates far from the equator.
 
-**Fix:** Added `trap_exit` in init + `terminate/2` that replies `{:error, :batcher_terminated}` to all callers in `slots.froms`, `pending`, and `flush_waiters`. Same semantics as Redis: client gets an error, outcome is unknown, client decides whether to retry. No internal retry — prevents double-INCR on non-idempotent commands.
+### R2-C5: Embedded API bypasses ACL entirely
+**File:** `ferricstore.ex:5245-5986`
+**Area:** Transaction + ACL
 
-### C5: No fsync after BitcaskWriter flush
-**File:** `store/bitcask_writer.ex:283-320`
-**Status:** ACCEPTED TRADE-OFF
-**Test result:** N/A — this is the async durability contract (same as Redis AOF `appendfsync everysec`). Quorum writes go through Raft WAL which fsyncs. Document the ~1ms async window.
+The embedded Elixir API (`Ferricstore.multi/1`, `Ferricstore.pipeline/1`) has no ACL checks. Any host application code gets full access, bypassing all authorization.
 
 ---
 
 ## HIGH (incorrect behavior, wrong results)
 
-### H1: Promoted write file_id race with file rotation
-**File:** `store/shard.ex:638-649, 672-683`
-**Status:** FIXED (commit 57756be)
-**Test result:** 2 tests pass — race does NOT manifest because GenServer serializes all ops. But `promoted_active_fid` was doing a `File.ls` syscall on every promoted write unnecessarily.
+### R2-H1: Intent write failure not detected — lock leak
+**File:** `cross_shard_op.ex:148`
+**Area:** CrossShardOp
 
-**Fix:** `promoted_write` now returns `{fid, offset, record_size}` by parsing fid from the path. Removed `promoted_active_fid` entirely — saves one syscall per promoted write.
+`write_intent` return value not checked. If coordinator shard is down, locks are held on other shards but no intent exists for crash recovery. Locks stuck for 5s TTL.
 
-### H2: volatile_lru and allkeys_lru eviction don't implement actual LRU
-**File:** `memory_guard.ex:343, 361-363`
-**Status:** FIXED (commit 8d300c9)
-**Test result:** Previously evicted recently-accessed keys while stale keys survived. Now correctly evicts stale keys first.
+### R2-H2: Write intent outside try block — lock leak on exception
+**File:** `cross_shard_op.ex:148-150`
+**Area:** CrossShardOp
 
-**Fix:** Added explicit case clauses for `volatile_lru` and `allkeys_lru` that sort by `ldt` (last access time) ascending via `LFU.unpack(lfu) |> elem(0)`. All eviction policies verified correct: volatile_ttl sorts by TTL, volatile/allkeys_lfu sorts by frequency counter, volatile/allkeys_lru sorts by access time, noeviction skips.
+`write_intent` is called before the `try` block. If it throws (network error, timeout), locks are not released.
 
-### H3: compound_get_meta hardcodes expiry=0 when reading from promoted store
-**File:** `store/shard.ex:592-604`
-**Status:** NOT A BUG IN PRACTICE
-**Test result:** Test passes — HTTL returns correct TTL after shard restart. `recover_promoted` populates ALL dedicated entries into ETS with correct expiry from the Bitcask record. The `compound_get_meta` cold read path (hardcoded expiry=0) is never hit because entries are always warm after recovery. MemoryGuard eviction sets value=nil but preserves expiry, so `compound_get_meta` reads the cached expiry from the ETS hot path.
+### R2-H3: Intent resolver doesn't clean up associated locks
+**File:** `intent_resolver.ex:30-87`
+**Area:** CrossShardOp
 
-The hardcoded expiry=0 in the cold path is dead code for promoted keys, but could be fixed defensively if promoted_read is ever changed to not pre-load all entries.
+Resolver deletes stale intents but NOT the associated locks on other shards. Locks remain held until TTL expiry.
 
-### H4: ets_lookup matches cold entries with fid=0, off=0
-**File:** `store/shard.ex:3194-3196`
-**Status:** FIXED (commits 95f6e46, 8322b43)
-**Test result:** 3 tests verify: (1) ets_insert uses `:pending` fid, (2) GET on unflushed large value triggers flush and returns correct data, (3) after flush, ETS has real fid/vsize.
+### R2-H4: No lock cleanup for expired entries — memory leak
+**File:** `state_machine.ex:1574-1600`
+**Area:** CrossShardOp
 
-**Fix:** `ets_insert` now uses `:pending` as fid (root cause fix). Also added safety guard in `warm_from_store` — if `:pending` ever leaks to the cold read path, returns explicit error instead of silently reading wrong data.
+Expired locks are never proactively removed from the process dictionary map. They accumulate over time, growing unbounded.
 
-### H5: EXPIREAT/PEXPIREAT accept past timestamps
-**File:** `commands/expiry.ex:112-124`
-**Status:** FIXED (commit 76ec163)
-**Test result:** 11 tests verify: past timestamps delete key, zero deletes key, non-existent key returns 0, future timestamps set TTL correctly.
+### R2-H5: ZADD missing NX+XX, GT+LT, GT+NX conflict checks
+**File:** `sorted_set.ex:668-676`
+**Area:** Data Structures
 
-**Fix:** `set_expiry_at_seconds` and `set_expiry_at_ms` now check `ts <= HLC.now_ms()`. Past or zero → `delete_if_exists`. Future → `apply_expiry`. Same pattern as EXPIRE/PEXPIRE. Works in quorum, async, and multi-node (decision is on leader, Raft replicates the resulting delete/put command).
+Accepts mutually exclusive options silently. Redis returns "ERR syntax error". NX+XX, GT+LT, GT+NX combinations should be rejected.
 
-### H6: Batch applied result count mismatch silently truncates
-**File:** `raft/batcher.ex:339-351`
-**Status:** FIXED (defensive check added)
-**Test result:** 2 tests pass as regression guard. Can't trigger today but the defensive check ensures explicit `{:error, :batch_result_mismatch}` to all callers + error log instead of silent hang if it ever does.
+### R2-H6: SET missing NX+XX conflict check
+**File:** `strings.ex:628-634`
+**Area:** Data Structures
 
-### H7: Promoted collection recovery — partial output not cleaned
-**File:** `store/promotion.ex:202-207`
-**Status:** NOT TESTED (same pattern as C2)
+`SET key value NX XX` doesn't fail — silently does nothing. Redis rejects with syntax error.
 
-**Proposed fix:** Filter out `compact_*.log` in `list_log_files` — same cleanup as shared shard.
+### R2-H7: ZSCORE/ZMSCORE/ZSCAN return unformatted scores
+**File:** `sorted_set.ex:101-110, 452, 523-534`
+**Area:** Data Structures
+
+Raw score strings returned instead of formatted. Inconsistent with ZRANGE WITHSCORES which uses `format_score()`.
+
+### R2-H8: EXPIRE/PEXPIRE with negative TTL deletes instead of returning 0
+**File:** `expiry.ex:82-106`
+**Area:** Data Structures
+
+`EXPIRE key -1` returns 1 and deletes the key. Redis returns 0 and does NOT delete.
+
+### R2-H9: Vector VSEARCH/VGET crash on corrupted data
+**File:** `vector.ex:130, 179, 295`
+**Area:** Probabilistic + Vectors
+
+`binary_to_term()` called without try/rescue. Corrupted vector entry crashes the entire query instead of returning an error.
+
+### R2-H10: TopK cache coherency race — duplicate mmap handles
+**File:** `topk.ex:177-208`
+**Area:** Probabilistic
+
+Two concurrent processes on cache miss both open the file and cache it. Creates duplicate mmap handles — memory leak, potential use-after-free.
+
+### R2-H11: SUBSCRIBE/PSUBSCRIBE max_subscriptions error returns unhandled tuple
+**File:** `connection.ex:1267, 1319`
+**Area:** Connection
+
+When max_subscriptions exceeded, returns `{:error_reply, ...}` which doesn't match the `handle_command` case statement. Causes runtime error on pipelined SUBSCRIBE.
+
+### R2-H12: Sendfile error path missing fallback — client hangs
+**File:** `connection.ex:1743-1747`
+**Area:** Connection
+
+`do_sendfile_get` can return `:fallback` but `fast_get` doesn't handle it. Command silently dropped, client hangs waiting for response.
+
+### R2-H13: WriteVersion increments for failed conditional writes — spurious WATCH failures
+**File:** `router.ex:140-143`, `shard.ex:909-910`
+**Area:** Transactions
+
+`SET key val NX` that doesn't set (key exists) still increments write-version. WATCH thinks the key was modified, causing false transaction aborts.
 
 ---
 
-## MEDIUM (degraded behavior, missing guarantees)
+## MEDIUM (degraded behavior, compatibility issues)
 
-### M1: Async retry buffer doesn't preserve command order
-**File:** `raft/async_apply_worker.ex:349-389`
-**Status:** FIXED (commit 5a0ec37)
-**Test result:** 3 tests verify FIFO order preserved with `:queue`.
+### R2-M1: Unlock failures silently ignored — lock leak until TTL
+**File:** `cross_shard_op.ex:241-252`
+**Area:** CrossShardOp
 
-**Fix:** Replaced list prepend with `:queue` — O(1) add-to-back, O(1) take-from-front. Commands A, B, C that fail in order are retried as A, B, C (not C, B, A).
+`parallel_unlock` doesn't check Task results. If a shard is unreachable, unlock is never delivered. Lock held for full 5s TTL.
 
-### M2: warm_ets_after_cold_read bypasses hot cache size limit
-**File:** `store/router.ex:954-963`
-**Status:** NOT A BUG (size check already exists)
-**Test result:** Test confirms the size check at line 955 works correctly — large values stay nil in ETS after cold read. Test serves as regression guard.
+### R2-M2: JSON path quoted string parsing accepts malformed paths
+**File:** `json.ex:663-669`
+**Area:** JSON
 
-### M3: Compound scan for promoted keys relies entirely on ETS
-**File:** `store/shard.ex:762-776`
-**Status:** NOT TESTED
+`$["unclosed` parses as key="" silently. Redis rejects with syntax error.
 
-**Proposed fix:** During `prefix_scan_entries`, pread values that are nil in ETS.
+### R2-M3: JSON unquoted integer as object key — type confusion
+**File:** `json.ex:671-676`
+**Area:** JSON
 
-### M4: Hint file recovery ignores NIF-returned file_id
-**File:** `store/shard.ex:344-349`
-**Status:** NOT A BUG
-**Test result:** N/A — the filename-derived fid IS the correct source of truth. Hint file `00005.hint` describes entries in `00005.log`. The NIF's internal `file_id` is redundant metadata read from the binary format. Using the filename is consistent with Bitcask hint file semantics.
+`$[0]` on object `{"0": "value"}` fails. Parsed as array index (integer), not string key.
 
-### M5: run_compaction returns :ok without statistics
-**File:** `store/shard.ex:2518-2551`
-**Status:** FIXED (commit e661d13)
+### R2-M4: XREADGROUP doesn't support BLOCK
+**File:** `stream.ex:229-237`
+**Area:** Streams
 
-### M6: cross_shard_tx :tx_deleted_keys not shared across shards
-**File:** `raft/state_machine.ex:212-246, line 220`
-**Status:** NOT A BUG
-**Test result:** N/A — resetting per shard is correct. Keys are shard-specific; a DEL on shard 0 and GET on shard 1 are always different keys. `:tx_deleted_keys` only needs to track deletes within one shard's command queue for read-your-own-deletes semantics.
+Redis 7+ allows `XREADGROUP BLOCK`. FerricStore only supports non-blocking XREADGROUP.
 
-### M7: File.rm error in compaction cleanup can crash the shard
-**File:** `store/shard.ex:2546`
-**Status:** FIXED (commit e661d13)
+### R2-M5: Bloom/Cuckoo/CMS registries lose metadata on recovery
+**File:** `bloom_registry.ex:268-289`, `cuckoo_registry.ex:199-204`
+**Area:** Probabilistic
 
-### M8: SMOVE type enforcement gap
-**File:** `commands/set.ex:335-354`
-**Status:** FIXED BY C6 (Mini-Percolator locks both keys)
-**Test result:** 4 tests pass. The TOCTOU window between type check and write no longer exists — CrossShardOp locks both source and destination keys before executing. No other operation can modify the destination while locked.
+After restart, `BF.INFO` returns estimated capacity/error_rate instead of original values. `derive_metadata()` is an approximation.
 
-### M9: StateMachine uses nosync without coordinated fsync
-**File:** `raft/state_machine.ex:1024-1059`
-**Status:** NOT A BUG
-**Test result:** N/A — Raft WAL is fsynced by ra. On follower crash, Raft log replay re-applies the command, re-writing to Bitcask. Raft log is the source of truth, Bitcask is a materialized view. No data loss.
+### R2-M6: BF.ADD/MADD NIF errors not checked
+**File:** `bloom.ex:93, 106`
+**Area:** Probabilistic
+
+NIF return value not checked for `{:error, reason}`. Silent failures if mmap is corrupted.
+
+### R2-M7: TOPK.LIST WITHCOUNT NIF errors unchecked — crash
+**File:** `topk.ex:127-128`
+**Area:** Probabilistic
+
+If either NIF call fails, code crashes with pattern match error instead of returning error message.
+
+### R2-M8: Vector sentinel key pollution in VCREATE
+**File:** `vector.ex:87-88, 203`
+**Area:** Vectors
+
+VCREATE stores sentinel key `V:collection\0__hnsw_meta__`. VINFO subtracts 1 for count. After restart, if sentinel not recovered, count is off by 1.
+
+### R2-M9: Namespace config changes don't update in-flight batcher slots
+**File:** `batcher.ex:460-492`, `namespace_config.ex:460-510`
+**Area:** Namespace
+
+Config change clears ns_cache but doesn't update window_ms in already-queued slots. Commands may experience wrong commit window.
+
+### R2-M10: ACL not re-checked at EXEC time for queued MULTI commands
+**File:** `connection.ex:1363-1380, 1985-1988`
+**Area:** ACL
+
+Commands queued in MULTI are not re-validated at EXEC time. If admin revokes permissions between MULTI and EXEC, queued commands still execute.
+
+### R2-M11: WATCH/EXEC race — watches_clean? doesn't distinguish shard-down from key-modified
+**File:** `coordinator.ex:257-267`
+**Area:** Transactions
+
+If `Router.get_version(key)` throws (shard unavailable), `watches_clean?` returns false — same as "key modified". Transaction aborts without telling the client the shard is down.
+
+---
+
+## LOW (minor, acceptable deviations)
+
+### R2-L1: PUBLISH delivery count may be inaccurate
+**File:** `pubsub.ex:160-184`
+**Area:** Pub/Sub
+
+`send(pid, ...)` is async. If subscriber crashes between check and send, count is inflated. Acceptable BEAM semantics.
+
+### R2-L2: XACK doesn't validate ID exists in stream
+**File:** `stream.ex:886-906`
+**Area:** Streams
+
+ACKing a non-existent ID returns 0 (correct), but no distinction between "not pending" and "never existed". Matches Redis behavior.
+
+### R2-L3: XREAD sequence overflow at boundary
+**File:** `stream.ex:989-994`
+**Area:** Streams
+
+`{ms, seq + 1}` has no bounds check. Extremely unlikely in practice (requires 2^64 sequence numbers).
+
+### R2-L4: CF.DEL errors not propagated
+**File:** `cuckoo.ex:104`
+**Area:** Probabilistic
+
+Returns NIF result directly without wrapping errors. Inconsistent with CF.ADD error handling but functionally correct.
+
+### R2-L5: TDIGEST.MERGE COMPRESSION 0 not validated
+**File:** `tdigest.ex:454`
+**Area:** Probabilistic
+
+`COMPRESSION 0` causes runtime error from Core instead of client-friendly error.
+
+### R2-L6: Empty response for UNSUBSCRIBE with no channels
+**File:** `connection.ex:1286`
+**Area:** Connection
+
+Returns empty list `[]` instead of proper RESP response. May confuse clients.
 
 ---
 
 ## Summary
 
-| Issue | Severity | Test Result | Status |
-|-------|----------|-------------|--------|
-| C6 | CRITICAL | 30 pass | FIXED (Mini-Percolator) |
-| C1 | CRITICAL | N/A | FIXED |
-| C2 | CRITICAL | 3 pass | FIXED |
-| C3 | CRITICAL | 3 pass | NOT A BUG — dead code removed |
-| C4 | CRITICAL | Confirmed | FIXED |
-| C5 | CRITICAL | N/A | ACCEPTED |
-| H1 | HIGH | 2 pass | FIXED (removed File.ls syscall) |
-| H2 | HIGH | Confirmed | FIXED |
-| H3 | HIGH | Passes | NOT A BUG (recovery loads expiry correctly) |
-| H4 | HIGH | Confirmed | FIXED |
-| H5 | HIGH | Confirmed | FIXED |
-| H6 | HIGH | Latent | FIXED (defensive check) |
-| H7 | HIGH | 1 pass | FIXED |
-| M1 | MEDIUM | Confirmed | FIXED |
-| M2 | MEDIUM | Not a bug | Regression guard added |
-| M3 | MEDIUM | 2 pass | FIXED |
-| M4 | MEDIUM | N/A | NOT A BUG |
-| M5 | MEDIUM | N/A | FIXED |
-| M6 | MEDIUM | N/A | NOT A BUG |
-| M7 | MEDIUM | N/A | FIXED |
-| M8 | MEDIUM | 4 pass | FIXED BY C6 (locked) |
-| M9 | MEDIUM | N/A | NOT A BUG |
+| Severity | Count | Key Areas |
+|----------|-------|-----------|
+| CRITICAL | 5 | ACL bypass (C1, C5), CrossShardOp locks (C2, C3), Geo math (C4) |
+| HIGH | 13 | CrossShardOp leaks (H1-H4), Redis compat (H5-H8), Crashes (H9-H12), WATCH (H13) |
+| MEDIUM | 11 | CrossShardOp (M1), JSON/Streams (M2-M4), Probabilistic (M5-M8), Namespace/ACL (M9-M11) |
+| LOW | 6 | Pub/Sub, Streams, Cuckoo, TDigest, Connection |
