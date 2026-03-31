@@ -53,10 +53,10 @@
 
 ### H3: compound_get_meta hardcodes expiry=0 when reading from promoted store
 **File:** `store/shard.ex:592-604`
-**Status:** BUG (test written, needs :shard_kill to verify)
-**Test result:** Test creates a promoted hash, sets HEXPIRE on a field, kills shard, checks HTTL after restart. Expected to fail because promoted_read returns value without expiry, and ETS is populated with expire_at_ms=0.
+**Status:** NOT A BUG IN PRACTICE
+**Test result:** Test passes — HTTL returns correct TTL after shard restart. `recover_promoted` populates ALL dedicated entries into ETS with correct expiry from the Bitcask record. The `compound_get_meta` cold read path (hardcoded expiry=0) is never hit because entries are always warm after recovery. MemoryGuard eviction sets value=nil but preserves expiry, so `compound_get_meta` reads the cached expiry from the ETS hot path.
 
-**Proposed fix:** Change `promoted_read` to return `{:ok, value, expire_at_ms}`. The Bitcask record on disk contains the expiry.
+The hardcoded expiry=0 in the cold path is dead code for promoted keys, but could be fixed defensively if promoted_read is ever changed to not pre-load all entries.
 
 ### H4: ets_lookup matches cold entries with fid=0, off=0
 **File:** `store/shard.ex:3194-3196`
@@ -152,7 +152,7 @@
 | C5 | CRITICAL | N/A | ACCEPTED |
 | H1 | HIGH | 2 pass | FIXED (removed File.ls syscall) |
 | H2 | HIGH | Confirmed | FIXED |
-| H3 | HIGH | Written | TODO — needs shard_kill verify |
+| H3 | HIGH | Passes | NOT A BUG (recovery loads expiry correctly) |
 | H4 | HIGH | Confirmed | FIXED |
 | H5 | HIGH | Confirmed | FIXED |
 | H6 | HIGH | Latent | Regression guard added |
