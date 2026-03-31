@@ -5,6 +5,7 @@ if config_env() == :prod do
   # Core
   # ---------------------------------------------------------------------------
   config :ferricstore,
+    mode: :standalone,
     port: String.to_integer(System.get_env("FERRICSTORE_PORT", "6379")),
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),

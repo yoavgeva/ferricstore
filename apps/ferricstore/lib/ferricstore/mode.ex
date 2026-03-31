@@ -69,7 +69,7 @@ defmodule Ferricstore.Mode do
   """
   @spec current() :: t()
   def current do
-    Application.get_env(:ferricstore, :mode, :standalone)
+    Application.get_env(:ferricstore, :mode, :embedded)
   end
 
   @doc """
