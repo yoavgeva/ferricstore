@@ -3,31 +3,16 @@
 ## CRITICAL (data loss, crashes, or consensus violations)
 
 ### C6: Multi-key commands silently operate across shards without atomicity
-**File:** `commands/set.ex` (SMOVE, SDIFFSTORE, SINTERSTORE, SUNIONSTORE), `commands/generic.ex` (RENAME, RENAMENX, COPY)
-**Status:** OPEN
+**File:** `commands/set.ex`, `commands/generic.ex`, `commands/list.ex`
+**Status:** FIXED (commits d957426, 1f44a76, ae958aa)
+**Test result:** 30 tests pass — same-shard fast path, cross-shard quorum (lock→intent→execute→unlock), async CROSSSLOT, concurrent ops, lock expiry, intent resolver, compound keys, mixed namespaces.
 
-Multi-key commands that touch two or more keys don't validate that all keys hash to the same shard. If source and destination are on different shards, the operations go to different Shard GenServers — not atomic, not serialized.
-
-**Data loss scenario (SMOVE):**
-1. `SMOVE src dst member` where src is on shard 0, dst on shard 1
-2. Delete from shard 0 succeeds
-3. Put to shard 1 fails (crash, timeout, memory pressure)
-4. Member is gone from src but never added to dst — lost
-
-**Data loss scenario (RENAME):**
-1. `RENAME old new` where old is on shard 0, new on shard 1
-2. Read old from shard 0, write to shard 1, delete from shard 0
-3. If write to shard 1 fails after delete from shard 0 — key lost
-
-**Affected commands:** SMOVE, SDIFFSTORE, SINTERSTORE, SUNIONSTORE, RENAME, RENAMENX, COPY
-
-**Redis behavior:** Redis Cluster returns `CROSSSLOT` error when multi-key commands target different hash slots. FerricStore only checks this in MULTI/EXEC transactions, not in individual multi-key commands.
-
-**Proposed fix:** Two options:
-1. **Validate same-shard** — before executing, check `Router.shard_for(key1) == Router.shard_for(key2)` for all key pairs. Return `CROSSSLOT` error if different. Simple, matches Redis Cluster behavior. Users can use hash tags `{tag}` to force same-shard routing.
-2. **Cross-shard atomic execution** — wrap multi-key commands in the existing `cross_shard_tx` mechanism when keys span shards. More complex but transparent to users.
-
-Option 1 is recommended — it's what Redis does, it's simple, and it surfaces the problem to the user who can fix it with hash tags.
+**Fix:** Mini-Percolator protocol for cross-shard atomicity:
+- **Quorum mode:** per-key locking through Raft consensus. Lock (ascending shard order) → write intent with value hashes → execute with locked_put/locked_delete → delete intent → unlock. Batch locks per shard. TTL 5s. Max 3 retries with backoff. Intent resolver for crash recovery. Parallel unlock via Task.async.
+- **Async mode:** CROSSSLOT error if ANY involved key is async, with message suggesting hash tags or quorum mode.
+- **Same-shard:** zero overhead, execute directly.
+- **Commands wrapped:** SMOVE, RENAME, RENAMENX, COPY, SDIFFSTORE, SINTERSTORE, SUNIONSTORE, LMOVE/RPOPLPUSH.
+- Regular writes to locked keys rejected. Reads never blocked.
 
 ### C1: Compaction result type mismatch — merge scheduler crashes on every merge
 **File:** `merge/scheduler.ex:286-317`, `store/shard.ex:2518-2551`
@@ -170,7 +155,7 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 
 | Issue | Severity | Test Result | Status |
 |-------|----------|-------------|--------|
-| C6 | CRITICAL | N/A | OPEN — needs same-shard guard |
+| C6 | CRITICAL | 30 pass | FIXED (Mini-Percolator) |
 | C1 | CRITICAL | N/A | FIXED |
 | C2 | CRITICAL | 3 pass | FIXED |
 | C3 | CRITICAL | 3 pass | NOT A BUG — dead code removed |
