@@ -86,10 +86,8 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 
 ### H6: Batch applied result count mismatch silently truncates
 **File:** `raft/batcher.ex:339-351`
-**Status:** LATENT BUG (regression guard added)
-**Test result:** 2 tests pass — all concurrent callers receive replies. The bug can't trigger currently because StateMachine returns correct result counts. Tests serve as regression guard.
-
-**Proposed fix:** Add length check before `Enum.zip`. Reply error to all callers on mismatch.
+**Status:** FIXED (defensive check added)
+**Test result:** 2 tests pass as regression guard. Can't trigger today but the defensive check ensures explicit `{:error, :batch_result_mismatch}` to all callers + error log instead of silent hang if it ever does.
 
 ### H7: Promoted collection recovery — partial output not cleaned
 **File:** `store/promotion.ex:202-207`
@@ -166,7 +164,7 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 | H3 | HIGH | Passes | NOT A BUG (recovery loads expiry correctly) |
 | H4 | HIGH | Confirmed | FIXED |
 | H5 | HIGH | Confirmed | FIXED |
-| H6 | HIGH | Latent | Regression guard added |
+| H6 | HIGH | Latent | FIXED (defensive check) |
 | H7 | HIGH | 1 pass | FIXED |
 | M1 | MEDIUM | Confirmed | FIXED |
 | M2 | MEDIUM | Not a bug | Regression guard added |

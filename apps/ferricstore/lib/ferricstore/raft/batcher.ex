@@ -344,8 +344,21 @@ defmodule Ferricstore.Raft.Batcher do
             # Batch command: result should be {:ok, results_list}
             case result do
               {:ok, results} when is_list(results) ->
-                Enum.zip(froms, results)
-                |> Enum.each(fn {from, r} -> GenServer.reply(from, r) end)
+                if length(results) == length(froms) do
+                  Enum.zip(froms, results)
+                  |> Enum.each(fn {from, r} -> GenServer.reply(from, r) end)
+                else
+                  # Result count mismatch — reply error to ALL callers to
+                  # prevent silent hangs from Enum.zip truncation.
+                  Logger.error(
+                    "Batcher: batch result count mismatch — " <>
+                      "#{length(froms)} callers but #{length(results)} results"
+                  )
+
+                  Enum.each(froms, fn from ->
+                    GenServer.reply(from, {:error, :batch_result_mismatch})
+                  end)
+                end
 
               other ->
                 # Unexpected shape -- reply to all with the raw result
