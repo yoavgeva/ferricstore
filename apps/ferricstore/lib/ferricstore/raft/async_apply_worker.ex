@@ -182,8 +182,9 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
        shard_id: Ferricstore.Raft.Cluster.shard_server_id(shard_index),
        # %{correlation_ref => {command_or_batch, retry_count}}
        pending: %{},
-       # Commands buffered when ra server is down, retried on timer
-       retry_buffer: []
+       # Commands buffered when ra server is down, retried on timer.
+       # Uses :queue for O(1) FIFO — preserves submission order on retry.
+       retry_buffer: :queue.new()
      }}
   end
 
@@ -307,31 +308,32 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
     end
   end
 
-  # Retry timer: flush the retry buffer
-  def handle_info(:retry_buffer, %{retry_buffer: []} = state) do
-    {:noreply, state}
-  end
-
+  # Retry timer: flush the retry buffer (FIFO order preserved by :queue)
   def handle_info(:retry_buffer, state) do
-    {to_retry, to_drop} =
-      Enum.split_with(state.retry_buffer, fn {_commands, retry_count} ->
-        retry_count < @max_retries
+    if :queue.is_empty(state.retry_buffer) do
+      {:noreply, state}
+    else
+      items = :queue.to_list(state.retry_buffer)
+
+      {to_retry, to_drop} =
+        Enum.split_with(items, fn {_commands, retry_count} ->
+          retry_count < @max_retries
+        end)
+
+      Enum.each(to_drop, fn {commands, retry_count} ->
+        Logger.warning(
+          "AsyncApplyWorker: shard #{state.shard_index} dropping #{length(commands)} buffered commands after #{retry_count} retries"
+        )
       end)
 
-    # Drop commands that exceeded retry limit
-    Enum.each(to_drop, fn {commands, retry_count} ->
-      Logger.warning(
-        "AsyncApplyWorker: shard #{state.shard_index} dropping #{length(commands)} buffered commands after #{retry_count} retries"
-      )
-    end)
+      # Resubmit in FIFO order (oldest first)
+      new_state =
+        Enum.reduce(to_retry, %{state | retry_buffer: :queue.new()}, fn {commands, retry_count}, acc ->
+          do_pipeline_submit(acc, acc.shard_id, commands, retry_count + 1)
+        end)
 
-    # Resubmit remaining
-    new_state =
-      Enum.reduce(to_retry, %{state | retry_buffer: []}, fn {commands, retry_count}, acc ->
-        do_pipeline_submit(acc, acc.shard_id, commands, retry_count + 1)
-      end)
-
-    {:noreply, new_state}
+      {:noreply, new_state}
+    end
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -372,16 +374,17 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   end
 
   defp buffer_for_retry(state, commands, retry_count) do
-    new_buffer = [{commands, retry_count} | state.retry_buffer]
+    was_empty = :queue.is_empty(state.retry_buffer)
+    new_buffer = :queue.in({commands, retry_count}, state.retry_buffer)
 
     # Schedule retry if this is the first item in the buffer
-    if state.retry_buffer == [] do
+    if was_empty do
       Process.send_after(self(), :retry_buffer, @retry_interval_ms)
     end
 
     :telemetry.execute(
       [:ferricstore, :async_apply, :raft_retry],
-      %{pending_count: map_size(state.pending), buffer_size: length(new_buffer)},
+      %{pending_count: map_size(state.pending), buffer_size: :queue.len(new_buffer)},
       %{shard_index: state.shard_index, reason: :noproc}
     )
 
