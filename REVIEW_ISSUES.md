@@ -23,10 +23,10 @@
 
 ### C4: Batcher pending map not drained on crash/restart
 **File:** `raft/batcher.ex:132-141`
-**Status:** BUG CONFIRMED
-**Test result:** Callers via the async path (`write_async` with delegated `from`) hang indefinitely when Batcher dies. Direct `Batcher.write` callers are safe (GenServer.call monitors the process).
+**Status:** FIXED (commit 62e4947)
+**Test result:** Callers via the async path (`write_async` with delegated `from`) hung indefinitely when Batcher died. Direct `Batcher.write` callers were safe (GenServer.call monitors the process).
 
-**Proposed fix:** Add `terminate/2` that replies `{:error, :batcher_terminated}` to all pending callers.
+**Fix:** Added `trap_exit` in init + `terminate/2` that replies `{:error, :batcher_terminated}` to all callers in `slots.froms`, `pending`, and `flush_waiters`. Same semantics as Redis: client gets an error, outcome is unknown, client decides whether to retry. No internal retry — prevents double-INCR on non-idempotent commands.
 
 ### C5: No fsync after BitcaskWriter flush
 **File:** `store/bitcask_writer.ex:283-320`
@@ -148,9 +148,9 @@
 | C1 | CRITICAL | N/A | FIXED |
 | C2 | CRITICAL | 3 pass | FIXED |
 | C3 | CRITICAL | 3 pass | NOT A BUG — dead code removed |
-| C4 | CRITICAL | Confirmed | TODO — add terminate/2 |
+| C4 | CRITICAL | Confirmed | FIXED |
 | C5 | CRITICAL | N/A | ACCEPTED |
-| H1 | HIGH | 2 pass | FIXED (perf — removed syscall) |
+| H1 | HIGH | 2 pass | FIXED (removed File.ls syscall) |
 | H2 | HIGH | Confirmed | TODO — sort by ldt |
 | H3 | HIGH | Written | TODO — needs shard_kill verify |
 | H4 | HIGH | Confirmed | TODO — add fid>0 guard |
