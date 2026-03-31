@@ -109,9 +109,8 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 
 ### M4: Hint file recovery ignores NIF-returned file_id
 **File:** `store/shard.ex:344-349`
-**Status:** NOT TESTED
-
-**Proposed fix:** Use NIF-returned `file_id` instead of filename-derived one.
+**Status:** NOT A BUG
+**Test result:** N/A — the filename-derived fid IS the correct source of truth. Hint file `00005.hint` describes entries in `00005.log`. The NIF's internal `file_id` is redundant metadata read from the binary format. Using the filename is consistent with Bitcask hint file semantics.
 
 ### M5: run_compaction returns :ok without statistics
 **File:** `store/shard.ex:2518-2551`
@@ -119,9 +118,8 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 
 ### M6: cross_shard_tx :tx_deleted_keys not shared across shards
 **File:** `raft/state_machine.ex:212-246, line 220`
-**Status:** NOT TESTED
-
-**Proposed fix:** Initialize `:tx_deleted_keys` once before the reduce loop.
+**Status:** NOT A BUG
+**Test result:** N/A — resetting per shard is correct. Keys are shard-specific; a DEL on shard 0 and GET on shard 1 are always different keys. `:tx_deleted_keys` only needs to track deletes within one shard's command queue for read-your-own-deletes semantics.
 
 ### M7: File.rm error in compaction cleanup can crash the shard
 **File:** `store/shard.ex:2546`
@@ -156,13 +154,13 @@ The hardcoded expiry=0 in the cold path is dead code for promoted keys, but coul
 | H4 | HIGH | Confirmed | FIXED |
 | H5 | HIGH | Confirmed | FIXED |
 | H6 | HIGH | Latent | Regression guard added |
-| H7 | HIGH | Not tested | TODO — same as C2 pattern |
+| H7 | HIGH | 1 pass | FIXED |
 | M1 | MEDIUM | Confirmed | FIXED |
 | M2 | MEDIUM | Not a bug | Regression guard added |
-| M3 | MEDIUM | Not tested | TODO |
-| M4 | MEDIUM | Not tested | TODO |
+| M3 | MEDIUM | 2 pass | FIXED |
+| M4 | MEDIUM | N/A | NOT A BUG |
 | M5 | MEDIUM | N/A | FIXED |
-| M6 | MEDIUM | Not tested | TODO |
+| M6 | MEDIUM | N/A | NOT A BUG |
 | M7 | MEDIUM | N/A | FIXED |
 | M8 | MEDIUM | Documented | TODO — reorder ops |
 | M9 | MEDIUM | N/A | ACCEPTED |
