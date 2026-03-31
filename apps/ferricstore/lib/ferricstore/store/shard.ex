@@ -2926,6 +2926,13 @@ defmodule Ferricstore.Store.Shard do
       new_path = file_path(sp, new_id)
       File.touch!(new_path)
       Ferricstore.Store.ActiveFile.publish(state.index, new_id, new_path, sp)
+
+      # Notify the merge scheduler that a rotation happened.
+      # file_count = new_id + 1 (files are 0-indexed: 0, 1, ..., new_id)
+      unless state.sandbox? do
+        Ferricstore.Merge.Scheduler.notify_rotation(state.index, new_id + 1)
+      end
+
       %{state | active_file_id: new_id, active_file_path: new_path, active_file_size: 0}
     else
       state

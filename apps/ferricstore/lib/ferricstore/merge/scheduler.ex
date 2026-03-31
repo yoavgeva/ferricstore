@@ -1,35 +1,33 @@
 defmodule Ferricstore.Merge.Scheduler do
   @moduledoc """
-  Per-shard merge scheduler that monitors fragmentation and triggers compaction.
+  Per-shard merge scheduler that triggers compaction when file rotation occurs.
 
-  Each shard has its own `Scheduler` GenServer. The scheduler periodically
-  polls the shard's Bitcask NIF for fragmentation statistics and decides
-  whether a merge is needed based on configurable thresholds.
+  Each shard has its own `Scheduler` GenServer. Instead of polling every 30s
+  with expensive `File.ls` calls that block the Shard GenServer, the scheduler
+  is event-driven: the Shard notifies it on file rotation via `notify_rotation/2`.
 
   ## Merge modes
 
   The scheduler supports three merge modes per the spec (section 2E):
 
-  * **Hot mode** -- Event-driven, can trigger anytime. When fragmentation
-    exceeds the threshold, the scheduler immediately attempts a merge (subject
-    to the node-level semaphore). This is the default mode.
+  * **Hot mode** -- Event-driven, can trigger anytime. When the file count
+    reaches `min_files_for_merge` after a rotation, the scheduler attempts
+    a merge (subject to the node-level semaphore). This is the default mode.
 
-  * **Bulk mode** -- Scheduled merge during a configurable time window (e.g.
-    02:00-04:00). Outside the window, no merges are triggered regardless of
-    fragmentation. Inside the window, the scheduler checks fragmentation and
-    merges if above threshold.
+  * **Bulk mode** -- Only merges during a configurable time window (e.g.
+    02:00-04:00). Outside the window, rotations are noted but no merge
+    is triggered. Inside the window, file count is checked.
 
   * **Age mode** -- Like bulk mode but only merges files older than a
     configurable age threshold, within a time window.
 
   ## Merge lifecycle
 
-  1. Scheduler polls shard stats on a timer.
-  2. If fragmentation exceeds threshold and mode allows, scheduler requests
-     the node-level semaphore.
-  3. If semaphore is acquired, scheduler writes a merge manifest.
-  4. Scheduler selects the most fragmented non-active files for incremental merge.
-  5. Scheduler checks that sufficient disk space is available.
+  1. Shard rotates its active file and casts `{:file_rotated, file_count}`.
+  2. Scheduler checks file count against `min_files_for_merge` and mode.
+  3. If merge is needed, scheduler requests the node-level semaphore.
+  4. If semaphore is acquired, scheduler writes a merge manifest.
+  5. Scheduler selects non-active files for incremental merge.
   6. Scheduler calls the shard's `run_compaction` via GenServer.call.
   7. On completion, scheduler deletes the manifest and releases the semaphore.
   8. On failure, scheduler logs the error, deletes the manifest, releases semaphore.
@@ -40,8 +38,6 @@ defmodule Ferricstore.Merge.Scheduler do
 
       config :ferricstore, :merge,
         mode: :hot,
-        check_interval_ms: 30_000,
-        fragmentation_threshold: 0.4,
         min_files_for_merge: 2,
         max_files_per_merge: 10,
         merge_window: {2, 4},
@@ -59,8 +55,6 @@ defmodule Ferricstore.Merge.Scheduler do
   # Default configuration
   # -------------------------------------------------------------------
 
-  @default_check_interval_ms 30_000
-  @default_fragmentation_threshold 0.4
   @default_min_files_for_merge 2
   @default_max_files_per_merge 10
   @default_mode :hot
@@ -71,8 +65,6 @@ defmodule Ferricstore.Merge.Scheduler do
 
   @type config :: %{
           mode: merge_mode(),
-          check_interval_ms: pos_integer(),
-          fragmentation_threshold: float(),
           min_files_for_merge: pos_integer(),
           max_files_per_merge: pos_integer(),
           merge_window: {non_neg_integer(), non_neg_integer()},
@@ -87,7 +79,10 @@ defmodule Ferricstore.Merge.Scheduler do
     merging: false,
     last_merge_at: nil,
     merge_count: 0,
-    total_bytes_reclaimed: 0
+    total_bytes_reclaimed: 0,
+    # Tracks the current file count from the last rotation notification.
+    # Initialized to 0; updated by :file_rotated casts from the Shard.
+    file_count: 0
   ]
 
   # -------------------------------------------------------------------
@@ -118,6 +113,25 @@ defmodule Ferricstore.Merge.Scheduler do
   def scheduler_name(index), do: :"Ferricstore.Merge.Scheduler.#{index}"
 
   @doc """
+  Called by the Shard when it rotates to a new active file.
+
+  The `file_count` is the total number of log files (old + new active).
+  This is the primary trigger for merge — no polling needed.
+  """
+  @spec notify_rotation(non_neg_integer(), non_neg_integer()) :: :ok
+  def notify_rotation(shard_index, file_count) do
+    name = scheduler_name(shard_index)
+
+    try do
+      GenServer.cast(name, {:file_rotated, file_count})
+    catch
+      :exit, _ -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Returns the current status of the merge scheduler for observability.
   """
   @spec status(non_neg_integer() | GenServer.server()) :: map()
@@ -130,7 +144,8 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   @doc """
-  Forces an immediate merge check, bypassing the timer. Used in tests.
+  Forces an immediate merge check, bypassing the event-driven trigger.
+  Used in tests and for manual compaction via INFO/DEBUG commands.
   """
   @spec trigger_check(non_neg_integer() | GenServer.server()) :: :ok
   def trigger_check(index_or_server) when is_integer(index_or_server) do
@@ -165,8 +180,6 @@ defmodule Ferricstore.Merge.Scheduler do
     # Recover from any interrupted merge on startup.
     Manifest.recover_if_needed(shard_data_dir, index)
 
-    schedule_check(config.check_interval_ms)
-
     {:ok, state}
   end
 
@@ -179,6 +192,7 @@ defmodule Ferricstore.Merge.Scheduler do
       last_merge_at: state.last_merge_at,
       merge_count: state.merge_count,
       total_bytes_reclaimed: state.total_bytes_reclaimed,
+      file_count: state.file_count,
       config: state.config
     }
 
@@ -191,12 +205,13 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   @impl true
-  def handle_info(:check, state) do
+  def handle_cast({:file_rotated, file_count}, state) do
+    state = %{state | file_count: file_count}
     new_state = maybe_merge(state)
-    schedule_check(state.config.check_interval_ms)
     {:noreply, new_state}
   end
 
+  @impl true
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -216,7 +231,8 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   defp should_merge?(state) do
-    mode_allows_merge?(state.config) and fragmentation_above_threshold?(state)
+    state.file_count >= state.config.min_files_for_merge and
+      mode_allows_merge?(state.config)
   end
 
   defp mode_allows_merge?(%{mode: :hot}), do: true
@@ -238,19 +254,6 @@ defmodule Ferricstore.Merge.Scheduler do
     else
       # Wraps around midnight, e.g. 22:00-04:00
       hour >= start_hour or hour < end_hour
-    end
-  end
-
-  defp fragmentation_above_threshold?(state) do
-    shard_name = Router.shard_name(state.shard_index)
-
-    case safe_call(shard_name, :shard_stats) do
-      {:ok, {_total, _live, _dead, file_count, _keys, frag_ratio}} ->
-        file_count >= state.config.min_files_for_merge and
-          frag_ratio >= state.config.fragmentation_threshold
-
-      _ ->
-        false
     end
   end
 
@@ -383,21 +386,9 @@ defmodule Ferricstore.Merge.Scheduler do
   # Private: helpers
   # -------------------------------------------------------------------
 
-  defp schedule_check(interval_ms) do
-    Process.send_after(self(), :check, interval_ms)
-  end
-
   defp build_config(overrides) do
     %{
       mode: Map.get(overrides, :mode, app_config(:mode, @default_mode)),
-      check_interval_ms:
-        Map.get(overrides, :check_interval_ms, app_config(:check_interval_ms, @default_check_interval_ms)),
-      fragmentation_threshold:
-        Map.get(
-          overrides,
-          :fragmentation_threshold,
-          app_config(:fragmentation_threshold, @default_fragmentation_threshold)
-        ),
       min_files_for_merge:
         Map.get(
           overrides,
@@ -440,13 +431,13 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   defp format_bytes(bytes) when bytes >= 1_073_741_824,
-    do: "#{Float.round(bytes / 1_073_741_824, 2)} GiB"
+    do: "#{Float.round(bytes / 1_073_741_824, 2)} GB"
 
   defp format_bytes(bytes) when bytes >= 1_048_576,
-    do: "#{Float.round(bytes / 1_048_576, 2)} MiB"
+    do: "#{Float.round(bytes / 1_048_576, 2)} MB"
 
-  defp format_bytes(bytes) when bytes >= 1024,
-    do: "#{Float.round(bytes / 1024, 2)} KiB"
+  defp format_bytes(bytes) when bytes >= 1_024,
+    do: "#{Float.round(bytes / 1_024, 2)} KB"
 
   defp format_bytes(bytes), do: "#{bytes} B"
 end
