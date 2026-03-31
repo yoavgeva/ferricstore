@@ -67,10 +67,10 @@
 
 ### H5: EXPIREAT/PEXPIREAT accept past timestamps
 **File:** `commands/expiry.ex:112-124`
-**Status:** BUG CONFIRMED
-**Test result:** 7 tests prove: (1) EXPIREAT with past timestamp stores expiry instead of deleting, (2) EXPIREAT 0 converts to expire_at_ms=0 (the "no expiry" sentinel), making the key immortal, (3) contrast with EXPIRE which correctly handles non-positive values.
+**Status:** FIXED (commit 76ec163)
+**Test result:** 11 tests verify: past timestamps delete key, zero deletes key, non-existent key returns 0, future timestamps set TTL correctly.
 
-**Proposed fix:** Check if timestamp is in the past. If so, delete the key. Also handle timestamp=0 as a delete (not "no expiry").
+**Fix:** `set_expiry_at_seconds` and `set_expiry_at_ms` now check `ts <= HLC.now_ms()`. Past or zero → `delete_if_exists`. Future → `apply_expiry`. Same pattern as EXPIRE/PEXPIRE. Works in quorum, async, and multi-node (decision is on leader, Raft replicates the resulting delete/put command).
 
 ### H6: Batch applied result count mismatch silently truncates
 **File:** `raft/batcher.ex:339-351`
@@ -91,10 +91,10 @@
 
 ### M1: Async retry buffer doesn't preserve command order
 **File:** `raft/async_apply_worker.ex:349-389`
-**Status:** BUG CONFIRMED
-**Test result:** 3 tests prove: (1) `buffer_for_retry` prepends, reversing order, (2) retry handler iterates buffer head-to-tail processing C before A, (3) pure-logic proof of reversed iteration order.
+**Status:** FIXED (commit 5a0ec37)
+**Test result:** 3 tests verify FIFO order preserved with `:queue`.
 
-**Proposed fix:** Append instead of prepend, or use `:queue` for O(1) FIFO.
+**Fix:** Replaced list prepend with `:queue` — O(1) add-to-back, O(1) take-from-front. Commands A, B, C that fail in order are retried as A, B, C (not C, B, A).
 
 ### M2: warm_ets_after_cold_read bypasses hot cache size limit
 **File:** `store/router.ex:954-963`
@@ -154,10 +154,10 @@
 | H2 | HIGH | Confirmed | FIXED |
 | H3 | HIGH | Written | TODO — needs shard_kill verify |
 | H4 | HIGH | Confirmed | FIXED |
-| H5 | HIGH | Confirmed | TODO — handle past timestamps |
+| H5 | HIGH | Confirmed | FIXED |
 | H6 | HIGH | Latent | Regression guard added |
 | H7 | HIGH | Not tested | TODO — same as C2 pattern |
-| M1 | MEDIUM | Confirmed | TODO — append not prepend |
+| M1 | MEDIUM | Confirmed | FIXED |
 | M2 | MEDIUM | Not a bug | Regression guard added |
 | M3 | MEDIUM | Not tested | TODO |
 | M4 | MEDIUM | Not tested | TODO |
