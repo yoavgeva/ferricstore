@@ -76,9 +76,10 @@ defmodule Ferricstore.Review.C4BatcherPendingDrainTest do
       # Monitor before kill so we don't race
       ref = Process.monitor(batcher_pid)
 
-      # Kill the Batcher while the caller is waiting for a reply
-      Process.exit(batcher_pid, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^batcher_pid, _reason}, 2_000
+      # Stop the Batcher while the caller is waiting for a reply.
+      # GenServer.stop triggers terminate/2 which drains pending callers.
+      spawn(fn -> GenServer.stop(batcher_pid, :shutdown, 5_000) end)
+      assert_receive {:DOWN, ^ref, :process, ^batcher_pid, _reason}, 5_000
 
       # Now try to get the caller's result. If the bug exists, the caller
       # hangs until the 8s GenServer.call timeout. If fixed (terminate/2

@@ -267,6 +267,10 @@ defmodule Ferricstore.Raft.Batcher do
 
   @impl true
   def init(opts) do
+    # Trap exits so terminate/2 is called on shutdown, allowing us to
+    # reply to all pending callers instead of leaving them hung.
+    Process.flag(:trap_exit, true)
+
     shard_id = Keyword.fetch!(opts, :shard_id)
     shard_index = Keyword.fetch!(opts, :shard_index)
     max_batch_size = Keyword.get(opts, :max_batch_size, @default_max_batch_size)
@@ -397,6 +401,39 @@ defmodule Ferricstore.Raft.Batcher do
   # from previous implementation). Silently discard.
   def handle_info(_msg, state) do
     {:noreply, state}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    # Reply to all callers waiting in unflushed slots.
+    Enum.each(state.slots, fn {_slot_key, slot} ->
+      Enum.each(slot.froms, fn from ->
+        safe_reply(from, {:error, :batcher_terminated})
+      end)
+    end)
+
+    # Reply to all callers waiting for in-flight Raft commands.
+    Enum.each(state.pending, fn {_corr, {froms, _kind}} ->
+      Enum.each(froms, fn from ->
+        safe_reply(from, {:error, :batcher_terminated})
+      end)
+    end)
+
+    # Reply to flush barrier waiters.
+    Enum.each(state.flush_waiters, fn from ->
+      safe_reply(from, {:error, :batcher_terminated})
+    end)
+
+    :ok
+  end
+
+  # Replies to a caller, catching errors if the caller already exited.
+  defp safe_reply(from, msg) do
+    try do
+      GenServer.reply(from, msg)
+    catch
+      _, _ -> :ok
+    end
   end
 
   # ---------------------------------------------------------------------------
