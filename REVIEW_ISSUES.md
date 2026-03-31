@@ -60,10 +60,10 @@
 
 ### H4: ets_lookup matches cold entries with fid=0, off=0
 **File:** `store/shard.ex:3194-3196`
-**Status:** BUG CONFIRMED
-**Test result:** 3 tests prove: (1) `ets_insert` stores fid=0 not `:pending` for large values, (2) cold read at fid=0/off=0 returns seed data instead of the large value, (3) Router.async_write path works correctly in contrast.
+**Status:** FIXED (commits 95f6e46, 8322b43)
+**Test result:** 3 tests verify: (1) ets_insert uses `:pending` fid, (2) GET on unflushed large value triggers flush and returns correct data, (3) after flush, ETS has real fid/vsize.
 
-**Proposed fix:** Add guards `when fid > 0 and vsize > 0` to the cold read pattern. Entries with fid=0 are pending writes — treat as `:miss`.
+**Fix:** `ets_insert` now uses `:pending` as fid (root cause fix). Also added safety guard in `warm_from_store` — if `:pending` ever leaks to the cold read path, returns explicit error instead of silently reading wrong data.
 
 ### H5: EXPIREAT/PEXPIREAT accept past timestamps
 **File:** `commands/expiry.ex:112-124`
@@ -153,7 +153,7 @@
 | H1 | HIGH | 2 pass | FIXED (removed File.ls syscall) |
 | H2 | HIGH | Confirmed | FIXED |
 | H3 | HIGH | Written | TODO — needs shard_kill verify |
-| H4 | HIGH | Confirmed | TODO — add fid>0 guard |
+| H4 | HIGH | Confirmed | FIXED |
 | H5 | HIGH | Confirmed | TODO — handle past timestamps |
 | H6 | HIGH | Latent | Regression guard added |
 | H7 | HIGH | Not tested | TODO — same as C2 pattern |
