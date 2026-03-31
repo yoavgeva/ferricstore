@@ -483,13 +483,7 @@ defmodule Ferricstore.Store.Router do
   defp to_disk_binary(v) when is_binary(v), do: v
 
   defp async_submit_to_raft(idx, command) do
-    shard_id = Ferricstore.Raft.Cluster.shard_server_id(idx)
-
-    try do
-      :ra.pipeline_command(shard_id, command)
-    catch
-      :exit, _ -> :ok
-    end
+    Ferricstore.Raft.AsyncApplyWorker.replicate(idx, [command])
   end
 
   # -------------------------------------------------------------------
@@ -1012,6 +1006,9 @@ defmodule Ferricstore.Store.Router do
       if exists_fast?(key) do
         :ok
       else
+        # Nudge MemoryGuard to run eviction immediately (async, non-blocking).
+        # Without this, the next eviction cycle is up to 100ms away.
+        Ferricstore.MemoryGuard.nudge()
         {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}
       end
     else

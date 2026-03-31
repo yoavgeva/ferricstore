@@ -13,7 +13,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.NamespaceConfig
-  alias Ferricstore.Raft.Batcher
+  alias Ferricstore.Raft.{AsyncApplyWorker, Batcher}
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -34,6 +34,15 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
   # Helper to generate unique keys with a specific prefix
   defp pkey(prefix, base), do: "#{prefix}:async_dur_#{base}_#{:rand.uniform(9_999_999)}"
 
+  # Drains both Batcher and AsyncApplyWorker for all shards to ensure
+  # async writes are fully applied before assertions.
+  defp drain_async do
+    for i <- 0..3 do
+      Batcher.flush(i)
+      AsyncApplyWorker.drain(i)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Namespace configuration with async durability
   # ---------------------------------------------------------------------------
@@ -47,9 +56,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       shard = Router.shard_for(k)
 
       assert :ok == Batcher.write(shard, {:put, k, "async_value", 0})
-
-      # Give async worker time to process if needed
-      Process.sleep(50)
+      drain_async()
       assert "async_value" == Router.get(k)
     end
 
@@ -69,8 +76,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
         end
       end
 
-      # Wait for async processing
-      Process.sleep(100)
+      drain_async()
 
       for k <- keys do
         assert "val_#{k}" == Router.get(k),
@@ -86,8 +92,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       shard = Router.shard_for(k)
 
       assert :ok == Batcher.write(shard, {:put, k, "ttl_val", future})
-
-      Process.sleep(50)
+      drain_async()
 
       {value, expire_at_ms} = Router.get_meta(k)
       assert value == "ttl_val"
@@ -101,11 +106,11 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       shard = Router.shard_for(k)
 
       assert :ok == Batcher.write(shard, {:put, k, "deleteme", 0})
-      Process.sleep(50)
+      drain_async()
       assert "deleteme" == Router.get(k)
 
       assert :ok == Batcher.write(shard, {:delete, k})
-      Process.sleep(50)
+      drain_async()
       assert nil == Router.get(k)
     end
   end
@@ -163,7 +168,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       assert :ok == Batcher.write(shard_idx, {:put, async_key, "async_v", 0})
       assert :ok == Batcher.write(shard_idx, {:put, quorum_key, "quorum_v", 0})
 
-      Process.sleep(50)
+      drain_async()
 
       assert "async_v" == Router.get(async_key)
       assert "quorum_v" == Router.get(quorum_key)
@@ -183,7 +188,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       k2 = pkey("switch_ns", "after_switch")
       shard2 = Router.shard_for(k2)
       assert :ok == Batcher.write(shard2, {:put, k2, "async_era", 0})
-      Process.sleep(50)
+      drain_async()
       assert "async_era" == Router.get(k2)
 
       # Both values should still be readable
@@ -209,7 +214,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
         Batcher.write(shard, {:put, k, "w", 0})
       end
 
-      Process.sleep(50)
+      drain_async()
 
       for _ <- 1..5 do
         k = pkey("lat_quorum", "warmup")
@@ -231,7 +236,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
           us
         end
 
-      Process.sleep(100)
+      drain_async()
 
       # Measure quorum latency
       quorum_times =
@@ -279,7 +284,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
         end
 
       keys = Task.await_many(tasks, 10_000)
-      Process.sleep(200)
+      drain_async()
 
       for {k, i} <- Enum.with_index(keys, 1) do
         assert "conc_val_#{i}" == Router.get(k),

@@ -3,36 +3,38 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   GenServer that processes async write batches for a single FerricStore shard.
 
   Per spec section 2F.3, when a namespace has durability mode `:async`, the
-  write path bypasses Raft consensus (`:ra.process_command/2`) and instead
-  writes directly to the shard's Bitcask store and ETS hot cache. This trades
-  strong consistency (quorum acknowledgement) for lower write latency.
+  write path writes to local Bitcask + ETS first (for immediate read-your-write),
+  then submits the command to Raft in the background for replication to followers.
 
   ## How it works
 
   1. The `Batcher` detects that a slot has `:async` durability when the
-     namespace's commit window fires.
-  2. Instead of calling `:ra.process_command/2` (which blocks until quorum),
-     the Batcher sends the batch to the `AsyncApplyWorker` via `apply_batch/2`.
-  3. `apply_batch/2` replies immediately with `:ok` (non-blocking cast).
-  4. The worker processes commands sequentially: for each `:put` it calls
-     `NIF.put_batch/2` to write to Bitcask and updates both the keydir and
-     hot_cache ETS tables. For `:delete` it calls `NIF.delete/2` and removes
-     from ETS.
+     namespace's commit window fires, OR `Router.async_write` writes locally
+     and forwards the command here for Raft submission.
+  2. `apply_batch/2` replies immediately with `:ok` (non-blocking cast).
+  3. The worker processes commands sequentially: for each `:put` it calls
+     `NIF.put_batch/2` to write to Bitcask and updates the keydir ETS table.
+     For `:delete` it calls `NIF.delete/2` and removes from ETS.
+  4. After local application, the batch is submitted to Raft via
+     `ra:pipeline_command/3` with a correlation ref. The worker handles
+     the `ra_event` response:
+     - `{:applied, ...}` -- command committed, remove from in-flight map.
+     - `{:rejected, {:not_leader, leader, corr}}` -- resubmit to the
+       hinted leader.
+     - `:exit` / noproc -- buffer for retry on a timer.
   5. After each batch completes, a telemetry event is emitted with timing
      and batch size measurements.
 
-  ## Design rationale
+  ## Raft submission guarantee
 
-  In single-node mode, "async durability" simplifies to "write to disk but
-  don't wait for Raft quorum". Since the only member is the local node, Raft
-  consensus is effectively a no-op beyond the WAL write. By bypassing Raft
-  entirely for async namespaces, we eliminate the serialization through the
-  ra process and the WAL append + fsync overhead, achieving significantly
-  lower write latency.
+  Unlike fire-and-forget `pipeline_command/2`, this worker tracks every
+  submission with a correlation ref and retries on failure. This ensures
+  async writes are **eventually consistent** -- the command will reach the
+  Raft log as long as the cluster is alive, even if the leader changes
+  during submission.
 
-  In a future multi-node deployment, this worker could be extended to
-  submit commands to Raft in the background (fire-and-forget) for eventual
-  replication to followers.
+  The client still gets `:ok` before Raft commits (that's the async contract),
+  but the command is guaranteed to enter the Raft log eventually.
 
   ## Process registration
 
@@ -41,12 +43,20 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
 
   ## Telemetry
 
-  After each batch is processed:
+  After each batch is processed locally:
 
       :telemetry.execute(
         [:ferricstore, :async_apply, :batch],
         %{duration_us: integer(), batch_size: integer()},
         %{shard_index: integer()}
+      )
+
+  On Raft submission failure + retry:
+
+      :telemetry.execute(
+        [:ferricstore, :async_apply, :raft_retry],
+        %{pending_count: integer()},
+        %{shard_index: integer(), reason: atom()}
       )
   """
 
@@ -61,6 +71,11 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
           | {:delete, binary()}
+
+  # Max retry attempts before dropping a command (prevents unbounded growth)
+  @max_retries 10
+  # Retry interval when ra server is down
+  @retry_interval_ms 500
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -105,8 +120,20 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   end
 
   @doc """
+  Submits commands to Raft only (no local Bitcask/ETS write).
+
+  Used by `Router.async_write` which has already written locally and just
+  needs the command replicated through Raft. The worker handles correlation
+  tracking and retries on rejection.
+  """
+  @spec replicate(non_neg_integer(), [command()]) :: :ok
+  def replicate(shard_index, commands) do
+    GenServer.cast(worker_name(shard_index), {:replicate, commands})
+  end
+
+  @doc """
   Blocks until all previously enqueued async batches for `shard_index` have
-  been applied.
+  been applied AND all in-flight Raft submissions have been resolved.
 
   Since the worker is a GenServer that processes messages sequentially, a
   synchronous `call` placed after all prior `cast`s will not be handled
@@ -151,7 +178,12 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
 
     {:ok,
      %{
-       shard_index: shard_index
+       shard_index: shard_index,
+       shard_id: Ferricstore.Raft.Cluster.shard_server_id(shard_index),
+       # %{correlation_ref => {command_or_batch, retry_count}}
+       pending: %{},
+       # Commands buffered when ra server is down, retried on timer
+       retry_buffer: []
      }}
   end
 
@@ -168,6 +200,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   def handle_cast({:apply_batch, commands}, state) do
     start_time = System.monotonic_time(:microsecond)
 
+    # Step 1: Apply locally (Bitcask + ETS)
     apply_commands(state.shard_index, commands)
 
     duration_us = System.monotonic_time(:microsecond) - start_time
@@ -178,11 +211,185 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
       %{shard_index: state.shard_index}
     )
 
+    # Step 2: Submit to Raft for replication (non-blocking, tracked)
+    new_state = submit_to_raft(state, commands)
+
+    {:noreply, new_state}
+  end
+
+  def handle_cast({:replicate, []}, state) do
     {:noreply, state}
   end
 
+  def handle_cast({:replicate, commands}, state) do
+    # Raft submission only — local write already done by Router.async_write
+    new_state = submit_to_raft(state, commands)
+    {:noreply, new_state}
+  end
+
   # ---------------------------------------------------------------------------
-  # Private: command application
+  # ra_event handling — applied / rejected
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def handle_info({:ra_event, _leader, {:applied, applied_list}}, state) do
+    new_pending =
+      Enum.reduce(applied_list, state.pending, fn {corr, _result}, pending ->
+        Map.delete(pending, corr)
+      end)
+
+    {:noreply, %{state | pending: new_pending}}
+  end
+
+  def handle_info({:ra_event, _from, {:rejected, {:not_leader, maybe_leader, corr}}}, state) do
+    case Map.pop(state.pending, corr) do
+      {nil, _pending} ->
+        {:noreply, state}
+
+      {{commands, retry_count}, new_pending} ->
+        new_state = %{state | pending: new_pending}
+
+        if retry_count >= @max_retries do
+          Logger.warning(
+            "AsyncApplyWorker: shard #{state.shard_index} dropping async batch after #{@max_retries} retries"
+          )
+
+          :telemetry.execute(
+            [:ferricstore, :async_apply, :raft_dropped],
+            %{batch_size: length(commands), retries: retry_count},
+            %{shard_index: state.shard_index}
+          )
+
+          {:noreply, new_state}
+        else
+          # Resubmit to the hinted leader
+          leader =
+            if maybe_leader not in [nil, :undefined],
+              do: maybe_leader,
+              else: state.shard_id
+
+          :telemetry.execute(
+            [:ferricstore, :async_apply, :raft_retry],
+            %{pending_count: map_size(new_state.pending) + 1},
+            %{shard_index: state.shard_index, reason: :not_leader}
+          )
+
+          new_state = do_pipeline_submit(new_state, leader, commands, retry_count + 1)
+          {:noreply, new_state}
+        end
+    end
+  end
+
+  def handle_info({:ra_event, _from, {:rejected, {_reason, _hint, corr}}}, state) do
+    case Map.pop(state.pending, corr) do
+      {nil, _pending} ->
+        {:noreply, state}
+
+      {{commands, retry_count}, new_pending} ->
+        new_state = %{state | pending: new_pending}
+
+        if retry_count >= @max_retries do
+          Logger.warning(
+            "AsyncApplyWorker: shard #{state.shard_index} dropping async batch after #{@max_retries} retries (rejected)"
+          )
+
+          {:noreply, new_state}
+        else
+          :telemetry.execute(
+            [:ferricstore, :async_apply, :raft_retry],
+            %{pending_count: map_size(new_state.pending) + 1},
+            %{shard_index: state.shard_index, reason: :rejected}
+          )
+
+          new_state = do_pipeline_submit(new_state, state.shard_id, commands, retry_count + 1)
+          {:noreply, new_state}
+        end
+    end
+  end
+
+  # Retry timer: flush the retry buffer
+  def handle_info(:retry_buffer, %{retry_buffer: []} = state) do
+    {:noreply, state}
+  end
+
+  def handle_info(:retry_buffer, state) do
+    {to_retry, to_drop} =
+      Enum.split_with(state.retry_buffer, fn {_commands, retry_count} ->
+        retry_count < @max_retries
+      end)
+
+    # Drop commands that exceeded retry limit
+    Enum.each(to_drop, fn {commands, retry_count} ->
+      Logger.warning(
+        "AsyncApplyWorker: shard #{state.shard_index} dropping #{length(commands)} buffered commands after #{retry_count} retries"
+      )
+    end)
+
+    # Resubmit remaining
+    new_state =
+      Enum.reduce(to_retry, %{state | retry_buffer: []}, fn {commands, retry_count}, acc ->
+        do_pipeline_submit(acc, acc.shard_id, commands, retry_count + 1)
+      end)
+
+    {:noreply, new_state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  # ---------------------------------------------------------------------------
+  # Private: Raft submission with correlation tracking
+  # ---------------------------------------------------------------------------
+
+  # Submits a batch of commands to Raft via pipeline_command/3 with a
+  # correlation ref. Tracks the ref in state.pending for retry on rejection.
+  defp submit_to_raft(state, commands) do
+    do_pipeline_submit(state, state.shard_id, commands, 0)
+  end
+
+  defp do_pipeline_submit(state, target, commands, retry_count) do
+    corr = make_ref()
+
+    raft_command =
+      case commands do
+        [single] -> single
+        batch -> {:batch, batch}
+      end
+
+    try do
+      case :ra.pipeline_command(target, raft_command, corr, :normal) do
+        :ok ->
+          %{state | pending: Map.put(state.pending, corr, {commands, retry_count})}
+
+        {:error, _reason} ->
+          # ra server returned error — buffer for retry
+          buffer_for_retry(state, commands, retry_count)
+      end
+    catch
+      :exit, _ ->
+        # ra server is down (noproc) — buffer for retry
+        buffer_for_retry(state, commands, retry_count)
+    end
+  end
+
+  defp buffer_for_retry(state, commands, retry_count) do
+    new_buffer = [{commands, retry_count} | state.retry_buffer]
+
+    # Schedule retry if this is the first item in the buffer
+    if state.retry_buffer == [] do
+      Process.send_after(self(), :retry_buffer, @retry_interval_ms)
+    end
+
+    :telemetry.execute(
+      [:ferricstore, :async_apply, :raft_retry],
+      %{pending_count: map_size(state.pending), buffer_size: length(new_buffer)},
+      %{shard_index: state.shard_index, reason: :noproc}
+    )
+
+    %{state | retry_buffer: new_buffer}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: local command application (Bitcask + ETS)
   # ---------------------------------------------------------------------------
 
   # Applies a list of commands directly to the shard's Bitcask and ETS.

@@ -146,6 +146,19 @@ defmodule Ferricstore.MemoryGuard do
     GenServer.call(__MODULE__, :force_check)
   end
 
+  @doc """
+  Triggers an immediate memory check + eviction cycle without blocking the caller.
+
+  Called from the write path when a key is rejected due to memory pressure.
+  This kicks off eviction immediately rather than waiting up to 100ms for the
+  next periodic check. Uses `cast` so the write path returns the error to the
+  client without waiting for the eviction to complete.
+  """
+  @spec nudge() :: :ok
+  def nudge do
+    GenServer.cast(__MODULE__, :nudge)
+  end
+
   @impl true
   def init(opts) do
     interval_ms = Keyword.get(opts, :interval_ms, default_interval())
@@ -206,6 +219,11 @@ defmodule Ferricstore.MemoryGuard do
   def handle_call(:force_check, _from, state) do
     new_state = perform_check(state)
     {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_cast(:nudge, state) do
+    {:noreply, perform_check(state)}
   end
 
   @impl true

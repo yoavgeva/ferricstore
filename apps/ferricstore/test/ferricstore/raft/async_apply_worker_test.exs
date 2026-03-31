@@ -59,9 +59,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
       shard_index = Router.shard_for(k)
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k, "async_val", 0}])
-
-      # Give the async worker time to process
-      Process.sleep(50)
+      AsyncApplyWorker.drain(shard_index)
       assert "async_val" == Router.get(k)
     end
 
@@ -81,7 +79,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
         end)
 
       :ok = AsyncApplyWorker.apply_batch(shard_idx, commands)
-      Process.sleep(50)
+      AsyncApplyWorker.drain(shard_idx)
 
       for k <- shard_keys do
         assert "batch_val" == Router.get(k)
@@ -98,7 +96,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
 
       # Delete via async worker
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:delete, k}])
-      Process.sleep(50)
+      AsyncApplyWorker.drain(shard_index)
 
       assert nil == Router.get(k)
     end
@@ -121,7 +119,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
             {:delete, k2}
           ])
 
-        Process.sleep(50)
+        AsyncApplyWorker.drain(shard_idx)
         assert "new_val" == Router.get(k1)
         assert nil == Router.get(k2)
       else
@@ -130,7 +128,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
             {:put, k1, "new_val", 0}
           ])
 
-        Process.sleep(50)
+        AsyncApplyWorker.drain(shard_idx)
         assert "new_val" == Router.get(k1)
       end
     end
@@ -141,7 +139,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
       future = System.os_time(:millisecond) + 60_000
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k, "ttl_val", future}])
-      Process.sleep(50)
+      AsyncApplyWorker.drain(shard_index)
 
       {value, expire_at_ms} = Router.get_meta(k)
       assert value == "ttl_val"

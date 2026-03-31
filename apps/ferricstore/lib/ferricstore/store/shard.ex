@@ -869,6 +869,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     if is_new and Ferricstore.MemoryGuard.reject_writes?() do
+      Ferricstore.MemoryGuard.nudge()
       {:reply, {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}, state}
     else
       if state.raft? do

@@ -1,0 +1,365 @@
+defmodule Ferricstore.MemoryGuardNudgeTest do
+  @moduledoc """
+  Tests for `MemoryGuard.nudge/0` — the async eviction trigger fired
+  when a write is rejected due to keydir pressure.
+
+  Covers: nudge triggers eviction, nudge is idempotent under storm,
+  nudge updates persistent_term flags, nudge from router write path,
+  nudge from shard write path, nudge when MemoryGuard is busy.
+  """
+
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.MemoryGuard
+  alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
+
+  setup do
+    ShardHelpers.flush_all_keys()
+
+    original_state = :sys.get_state(MemoryGuard)
+    orig_reject = :persistent_term.get(:ferricstore_reject_writes, false)
+    orig_keydir = :persistent_term.get(:ferricstore_keydir_full, false)
+
+    on_exit(fn ->
+      :sys.replace_state(MemoryGuard, fn _current -> original_state end)
+      :persistent_term.put(:ferricstore_reject_writes, orig_reject)
+      :persistent_term.put(:ferricstore_keydir_full, orig_keydir)
+      ShardHelpers.flush_all_keys()
+    end)
+
+    :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  defp force_reject_mode do
+    :sys.replace_state(MemoryGuard, fn state ->
+      %{state | last_pressure_level: :reject, eviction_policy: :noeviction}
+    end)
+    :persistent_term.put(:ferricstore_reject_writes, true)
+    :persistent_term.put(:ferricstore_keydir_full, true)
+  end
+
+  # ---------------------------------------------------------------------------
+  # nudge/0 unit tests
+  # ---------------------------------------------------------------------------
+
+  describe "nudge/0 basic behavior" do
+    test "nudge returns :ok immediately (non-blocking)" do
+      assert :ok = MemoryGuard.nudge()
+    end
+
+    test "nudge triggers a check cycle that emits telemetry" do
+      test_pid = self()
+      handler_id = "nudge-check-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :memory, :check],
+        fn _event, measurements, metadata, config ->
+          send(config.test_pid, {:check_emitted, measurements, metadata})
+        end,
+        %{test_pid: test_pid}
+      )
+
+      MemoryGuard.nudge()
+
+      assert_receive {:check_emitted, measurements, metadata}, 1000
+      assert is_integer(measurements.total_bytes)
+      assert metadata.pressure_level in [:ok, :warning, :pressure, :reject]
+
+      :telemetry.detach(handler_id)
+    end
+
+    test "nudge updates persistent_term flags" do
+      # Start with forced reject state
+      force_reject_mode()
+      assert :persistent_term.get(:ferricstore_reject_writes) == true
+      assert :persistent_term.get(:ferricstore_keydir_full) == true
+
+      # Reset the GenServer state back to ok (but leave persistent_term stale)
+      :sys.replace_state(MemoryGuard, fn state ->
+        %{state | last_pressure_level: :ok, eviction_policy: :volatile_lru}
+      end)
+
+      # nudge should recalculate and update persistent_term based on actual ETS memory
+      MemoryGuard.nudge()
+      # Give the cast time to process
+      Process.sleep(50)
+
+      # Under normal test conditions, actual memory is well below thresholds
+      assert :persistent_term.get(:ferricstore_keydir_full) == false
+      assert :persistent_term.get(:ferricstore_reject_writes) == false
+    end
+
+    test "nudge is idempotent — multiple rapid nudges don't crash" do
+      # Fire 100 nudges rapidly (simulates storm of rejected writes)
+      for _ <- 1..100 do
+        assert :ok = MemoryGuard.nudge()
+      end
+
+      # MemoryGuard should still be alive and responsive
+      assert Process.alive?(Process.whereis(MemoryGuard))
+      assert is_map(MemoryGuard.stats())
+    end
+
+    test "nudge under concurrent load from multiple processes" do
+      tasks =
+        for _ <- 1..50 do
+          Task.async(fn ->
+            MemoryGuard.nudge()
+          end)
+        end
+
+      results = Task.await_many(tasks, 5000)
+      assert Enum.all?(results, &(&1 == :ok))
+
+      # MemoryGuard survives the storm
+      assert Process.alive?(Process.whereis(MemoryGuard))
+      stats = MemoryGuard.stats()
+      assert stats.pressure_level in [:ok, :warning, :pressure, :reject]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # nudge triggered from write rejection path
+  # ---------------------------------------------------------------------------
+
+  describe "nudge triggered by Router.put rejection" do
+    test "rejected new-key write nudges MemoryGuard" do
+      test_pid = self()
+      handler_id = "nudge-router-#{System.unique_integer([:positive])}"
+
+      # Attach telemetry to detect the check cycle triggered by nudge
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :memory, :check],
+        fn _event, _measurements, _metadata, config ->
+          send(config.test_pid, :nudge_check_fired)
+        end,
+        %{test_pid: test_pid}
+      )
+
+      force_reject_mode()
+
+      # Drain any pending check events from MemoryGuard's periodic timer
+      receive do
+        :nudge_check_fired -> :ok
+      after
+        200 -> :ok
+      end
+
+      # This put should be rejected AND trigger a nudge
+      result = Router.put("nudge_test_new_key", "value", 0)
+      assert {:error, msg} = result
+      assert msg =~ "KEYDIR_FULL"
+
+      # The nudge should have triggered a check cycle
+      assert_receive :nudge_check_fired, 1000
+
+      :telemetry.detach(handler_id)
+    end
+
+    test "existing key update does NOT nudge (no rejection)" do
+      # Write key before pressure
+      assert :ok = Router.put("pre_existing", "old", 0)
+
+      test_pid = self()
+      handler_id = "nudge-no-fire-#{System.unique_integer([:positive])}"
+
+      force_reject_mode()
+
+      # Drain the periodic check events and nudge from force_reject
+      Process.sleep(150)
+      # Flush mailbox
+      flush_messages()
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :memory, :check],
+        fn _event, _measurements, _metadata, config ->
+          send(config.test_pid, :unexpected_nudge)
+        end,
+        %{test_pid: test_pid}
+      )
+
+      # Update existing key — should succeed, no nudge
+      assert :ok = Router.put("pre_existing", "new", 0)
+
+      # Should NOT receive a nudge-triggered check within a short window.
+      # (The periodic timer fires every 100ms, so we only wait 50ms to
+      # distinguish nudge from periodic.)
+      refute_receive :unexpected_nudge, 50
+
+      :telemetry.detach(handler_id)
+    end
+
+    test "after nudge + eviction, next write may succeed" do
+      # Write some keys with TTL that are evictable under volatile_lru
+      for i <- 1..10 do
+        expire = System.os_time(:millisecond) + 60_000
+        Router.put("evictable_#{i}", "v", expire)
+      end
+
+      # Switch to reject with eviction enabled (volatile_lru, not noeviction).
+      # But set keydir_full so check_keydir_full rejects new keys.
+      :sys.replace_state(MemoryGuard, fn state ->
+        %{state | last_pressure_level: :reject, eviction_policy: :volatile_lru}
+      end)
+      :persistent_term.put(:ferricstore_keydir_full, true)
+      :persistent_term.put(:ferricstore_reject_writes, false)
+
+      # New key rejected via keydir_full check
+      result = Router.put("blocked_key", "v", 0)
+      assert {:error, msg} = result
+      assert msg =~ "KEYDIR_FULL"
+
+      # nudge fires → perform_check recalculates from actual ETS memory
+      # Under normal test conditions, actual pressure is :ok
+      Process.sleep(50)
+
+      # persistent_term should be updated by the nudge check
+      # (actual ETS memory is well below the keydir_max_ram threshold)
+      assert :persistent_term.get(:ferricstore_keydir_full) == false
+
+      # Now the write should succeed
+      assert :ok = Router.put("blocked_key", "v", 0)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "edge cases" do
+    test "nudge when MemoryGuard has tiny budget (always reject)" do
+      # Set a 1-byte budget so every check lands on :reject
+      MemoryGuard.reconfigure(%{max_memory_bytes: 1, keydir_max_ram: 1})
+
+      MemoryGuard.nudge()
+      Process.sleep(50)
+
+      # Should be in reject state after nudge recalculates
+      stats = MemoryGuard.stats()
+      assert stats.pressure_level == :reject
+    end
+
+    test "nudge when MemoryGuard has huge budget (always ok)" do
+      MemoryGuard.reconfigure(%{max_memory_bytes: 100_000_000_000, keydir_max_ram: 100_000_000_000})
+
+      force_reject_mode()
+      assert :persistent_term.get(:ferricstore_keydir_full) == true
+
+      MemoryGuard.nudge()
+      Process.sleep(50)
+
+      # With a 100GB budget, actual usage is well below thresholds
+      assert :persistent_term.get(:ferricstore_keydir_full) == false
+      assert :persistent_term.get(:ferricstore_reject_writes) == false
+    end
+
+    test "nudge does not reschedule periodic timer" do
+      # The periodic timer should continue independently of nudge calls.
+      # Verify by checking that periodic checks still fire after nudges.
+      test_pid = self()
+      handler_id = "nudge-periodic-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :memory, :check],
+        fn _event, _measurements, _metadata, config ->
+          send(config.test_pid, :periodic_check)
+        end,
+        %{test_pid: test_pid}
+      )
+
+      # Fire several nudges
+      for _ <- 1..10, do: MemoryGuard.nudge()
+
+      # Periodic checks should still fire (100ms interval)
+      # We should see at least 2 checks within 300ms (nudge + periodic)
+      assert_receive :periodic_check, 500
+      assert_receive :periodic_check, 500
+
+      :telemetry.detach(handler_id)
+    end
+
+    test "nudge while force_check is running concurrently" do
+      # force_check is a synchronous call, nudge is async cast.
+      # They should not deadlock or crash when concurrent.
+      task = Task.async(fn -> MemoryGuard.force_check() end)
+
+      for _ <- 1..10 do
+        MemoryGuard.nudge()
+      end
+
+      assert :ok = Task.await(task, 5000)
+      assert Process.alive?(Process.whereis(MemoryGuard))
+    end
+
+    test "nudge after reconfigure doesn't use stale budgets" do
+      # Reconfigure to tiny budget
+      MemoryGuard.reconfigure(%{max_memory_bytes: 1, keydir_max_ram: 1})
+      MemoryGuard.nudge()
+      Process.sleep(50)
+
+      stats = MemoryGuard.stats()
+      assert stats.pressure_level == :reject
+
+      # Reconfigure to huge budget
+      MemoryGuard.reconfigure(%{max_memory_bytes: 100_000_000_000, keydir_max_ram: 100_000_000_000})
+      MemoryGuard.nudge()
+      Process.sleep(50)
+
+      stats = MemoryGuard.stats()
+      assert stats.pressure_level == :ok
+    end
+
+    test "rapid rejection storm: nudge doesn't flood MemoryGuard mailbox dangerously" do
+      # Use a 1-byte budget so nudge's recalculation still yields :reject
+      # (actual ETS memory > 1 byte). This prevents the nudge from clearing
+      # the persistent_term flags mid-storm, which would make writes succeed.
+      MemoryGuard.reconfigure(%{max_memory_bytes: 1, keydir_max_ram: 1, eviction_policy: :noeviction})
+      MemoryGuard.force_check()
+
+      assert MemoryGuard.reject_writes?() == true
+
+      # Simulate 500 rejected writes from concurrent clients
+      tasks =
+        for i <- 1..500 do
+          Task.async(fn ->
+            Router.put("storm_key_#{i}", "v", 0)
+          end)
+        end
+
+      results = Task.await_many(tasks, 10_000)
+
+      # All should be rejected
+      assert Enum.all?(results, fn
+        {:error, msg} -> String.contains?(msg, "KEYDIR_FULL")
+        _ -> false
+      end)
+
+      # MemoryGuard should still be alive and responsive despite 500 nudge casts
+      assert Process.alive?(Process.whereis(MemoryGuard))
+
+      # It should drain the mailbox and be responsive to a sync call
+      assert is_map(MemoryGuard.stats())
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Internal helpers
+  # ---------------------------------------------------------------------------
+
+  defp flush_messages do
+    receive do
+      _ -> flush_messages()
+    after
+      0 -> :ok
+    end
+  end
+end
