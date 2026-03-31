@@ -211,7 +211,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:cross_shard_tx, shard_batches}, state) do
     old_count = state.applied_count
-    Process.put(:sm_pending_writes, [])
 
     shard_results =
       Enum.reduce(shard_batches, %{}, fn {shard_idx, queue, sandbox_namespace}, acc ->
@@ -241,7 +240,6 @@ defmodule Ferricstore.Raft.StateMachine do
         Map.put(acc, shard_idx, results)
       end)
 
-    flush_pending_writes(state)
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, shard_results)
   end
