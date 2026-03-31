@@ -226,26 +226,26 @@ defmodule Ferricstore.CrossShardOp do
   # Unlock helpers
   # ---------------------------------------------------------------------------
 
+  # Unlock all shards in parallel — no ordering needed for release.
   defp unlock_all(sorted_shards, lock_map, owner_ref) do
-    Enum.each(sorted_shards, fn shard_idx ->
-      keys_to_unlock = Map.get(lock_map, shard_idx, [])
-
-      if keys_to_unlock != [] do
-        shard_id = Cluster.shard_server_id(shard_idx)
-        :ra.process_command(shard_id, {:unlock_keys, keys_to_unlock, owner_ref})
-      end
-    end)
+    parallel_unlock(sorted_shards, lock_map, owner_ref)
   end
 
   defp unlock_acquired(locked_shards, lock_map, owner_ref) do
-    Enum.each(locked_shards, fn shard_idx ->
-      keys_to_unlock = Map.get(lock_map, shard_idx, [])
+    parallel_unlock(locked_shards, lock_map, owner_ref)
+  end
 
-      if keys_to_unlock != [] do
+  defp parallel_unlock(shards, lock_map, owner_ref) do
+    shards
+    |> Enum.filter(fn idx -> Map.get(lock_map, idx, []) != [] end)
+    |> Enum.map(fn shard_idx ->
+      Task.async(fn ->
+        keys_to_unlock = Map.get(lock_map, shard_idx, [])
         shard_id = Cluster.shard_server_id(shard_idx)
         :ra.process_command(shard_id, {:unlock_keys, keys_to_unlock, owner_ref})
-      end
+      end)
     end)
+    |> Task.await_many(5_000)
   end
 
   # ---------------------------------------------------------------------------

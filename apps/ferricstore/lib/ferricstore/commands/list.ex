@@ -3,6 +3,7 @@ defmodule Ferricstore.Commands.List do
   Handles Redis list commands using compound key storage.
   """
 
+  alias Ferricstore.CrossShardOp
   alias Ferricstore.Store.{ListOps, TypeRegistry}
   alias Ferricstore.Waiters
 
@@ -120,7 +121,14 @@ defmodule Ferricstore.Commands.List do
 
   def handle("LMOVE", [source, destination, from_str, to_str], store) do
     with {:ok, from_dir} <- parse_lr_direction(from_str), {:ok, to_dir} <- parse_lr_direction(to_str) do
-      ListOps.execute_lmove(source, destination, store, from_dir, to_dir)
+      CrossShardOp.execute(
+        [{source, :read_write}, {destination, :write}],
+        fn unified_store ->
+          ListOps.execute_lmove(source, destination, unified_store, from_dir, to_dir)
+        end,
+        store: store,
+        intent: %{command: :lmove, keys: %{source: source, dest: destination}}
+      )
     else :error -> {:error, "ERR syntax error"} end
   end
   def handle("LMOVE", _, _), do: {:error, "ERR wrong number of arguments for 'lmove' command"}
