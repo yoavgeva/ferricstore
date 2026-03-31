@@ -3018,6 +3018,11 @@ defmodule Ferricstore.Store.Shard do
       [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil ->
         {:ok, value}
 
+      [{^key, nil, _exp, _lfu, :pending, _off, _vsize}] ->
+        # Not yet flushed to disk — should never reach here. If it does,
+        # it means ets_lookup_warm failed to catch the :pending sentinel.
+        {:error, "ERR internal: pending entry reached cold read path for #{inspect(key)}"}
+
       [{^key, nil, _exp, _lfu, fid, off, _vsize}] ->
         # Cold key -- pread from disk
         p = file_path(state.shard_data_path, fid)
