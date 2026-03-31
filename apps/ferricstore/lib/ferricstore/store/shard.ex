@@ -646,11 +646,10 @@ defmodule Ferricstore.Store.Shard do
         end
 
       dedicated_path ->
-        # Promoted -- write to dedicated Bitcask first (get offset), then ETS with location
+        # Promoted -- write to dedicated Bitcask first (get fid+offset), then ETS with location
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
-          {:ok, {offset, record_size}} ->
-            active_fid = promoted_active_fid(dedicated_path)
-            ets_insert_with_location(state, compound_key, value, expire_at_ms, active_fid, offset, record_size)
+          {:ok, {fid, offset, record_size}} ->
+            ets_insert_with_location(state, compound_key, value, expire_at_ms, fid, offset, record_size)
             {:reply, :ok, bump_promoted_writes(state, redis_key)}
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
@@ -680,11 +679,10 @@ defmodule Ferricstore.Store.Shard do
         {:reply, :ok, new_state}
 
       dedicated_path ->
-        # Promoted -- write to dedicated Bitcask first (get offset), then ETS with location
+        # Promoted -- write to dedicated Bitcask first (get fid+offset), then ETS with location
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
-          {:ok, {offset, record_size}} ->
-            active_fid = promoted_active_fid(dedicated_path)
-            ets_insert_with_location(state, compound_key, value, expire_at_ms, active_fid, offset, record_size)
+          {:ok, {fid, offset, record_size}} ->
+            ets_insert_with_location(state, compound_key, value, expire_at_ms, fid, offset, record_size)
             {:reply, :ok, bump_promoted_writes(state, redis_key)}
           {:error, reason} ->
             Logger.error("Shard #{state.index}: promoted write failed: #{inspect(reason)}")
@@ -3603,9 +3601,16 @@ defmodule Ferricstore.Store.Shard do
   end
 
   # Writes a key-value pair to the promoted dedicated Bitcask directory.
+  # Returns {:ok, {fid, offset, record_size}} where fid is derived from the
+  # file path, avoiding a separate File.ls syscall.
   defp promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
     active = Ferricstore.Store.Promotion.find_active(dedicated_path)
-    NIF.v2_append_record(active, compound_key, value, expire_at_ms)
+    fid = parse_fid_from_path(active)
+
+    case NIF.v2_append_record(active, compound_key, value, expire_at_ms) do
+      {:ok, {offset, record_size}} -> {:ok, {fid, offset, record_size}}
+      {:error, _} = err -> err
+    end
   end
 
   # Writes a tombstone for a key in the promoted dedicated Bitcask directory.
@@ -3614,22 +3619,14 @@ defmodule Ferricstore.Store.Shard do
     NIF.v2_append_tombstone(active, compound_key)
   end
 
+  # Parses the file_id from a log file path like ".../00005.log" -> 5
+  defp parse_fid_from_path(path) do
+    path |> Path.basename() |> String.trim_trailing(".log") |> String.to_integer()
+  end
+
   # Builds the file path for a specific file_id in a dedicated directory.
   defp dedicated_file_path(dedicated_path, file_id) do
     Path.join(dedicated_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
-  end
-
-  # Returns the file_id of the current active file in a dedicated directory.
-  defp promoted_active_fid(dedicated_path) do
-    case File.ls(dedicated_path) do
-      {:ok, files} ->
-        files
-        |> Enum.filter(&String.ends_with?(&1, ".log"))
-        |> Enum.map(fn name -> name |> String.trim_trailing(".log") |> String.to_integer() end)
-        |> Enum.max(fn -> 0 end)
-
-      _ -> 0
-    end
   end
 
   # Increments the write counter for a promoted instance and triggers
@@ -3671,7 +3668,8 @@ defmodule Ferricstore.Store.Shard do
       state
     else
       # Find the current active file_id and compute the next
-      old_fid = promoted_active_fid(dedicated_path)
+      active = Ferricstore.Store.Promotion.find_active(dedicated_path)
+      old_fid = parse_fid_from_path(active)
       new_fid = old_fid + 1
       new_file = dedicated_file_path(dedicated_path, new_fid)
       File.touch!(new_file)
