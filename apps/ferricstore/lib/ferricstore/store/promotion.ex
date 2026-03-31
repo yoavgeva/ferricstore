@@ -111,7 +111,7 @@ defmodule Ferricstore.Store.Promotion do
       {:ok, dedicated_path} ->
         if entries != [] do
           batch = Enum.map(entries, fn {k, v, exp} -> {k, v, exp} end)
-          dedicated_active = find_active_file(dedicated_path)
+          dedicated_active = find_active(dedicated_path)
 
           case NIF.v2_append_batch(dedicated_active, batch) do
             {:ok, _locations} -> :ok
@@ -124,7 +124,7 @@ defmodule Ferricstore.Store.Promotion do
         # v2: write tombstones to the shared Bitcask log for migrated keys.
         # Entries STAY in ETS so compound_scan/compound_count/compound_get
         # continue to work immediately after promotion.
-        active_path = find_active_file(shard_data_path)
+        active_path = find_active(shard_data_path)
 
         Enum.each(entries, fn {key, _value, _exp} ->
           case NIF.v2_append_tombstone(active_path, key) do
@@ -187,39 +187,42 @@ defmodule Ferricstore.Store.Promotion do
 
       case open_dedicated(data_dir, shard_index, type, redis_key) do
         {:ok, dedicated_path} ->
-          # v2: scan dedicated log files to recover entries into ETS
-          dedicated_active = find_active_file(dedicated_path)
+          # Scan ALL log files in the dedicated directory (sorted by file_id).
+          # This handles crash recovery when compaction left both old and new files:
+          # later files overwrite earlier entries (last-write-wins), same as shared shard.
+          log_files = list_log_files(dedicated_path)
 
-          case NIF.v2_scan_file(dedicated_active) do
-            {:ok, records} ->
-              # Build a map of the latest state per key (last-writer-wins)
-              final_state =
-                Enum.reduce(records, %{}, fn {key, offset, value_size, expire_at_ms, is_tombstone}, acc ->
-                  if is_tombstone do
-                    Map.put(acc, key, :tombstone)
-                  else
-                    Map.put(acc, key, {:live, offset, value_size, expire_at_ms})
-                  end
-                end)
-
-              Enum.each(final_state, fn
-                {key, :tombstone} ->
-                  :ets.delete(keydir, key)
-
-                {key, {:live, offset, _value_size, expire_at_ms}} ->
-                  # Read the actual value from disk so compound_scan finds it
-                  value =
-                    case NIF.v2_pread_at(dedicated_active, offset) do
-                      {:ok, v} when v != nil -> v
-                      _ -> nil
+          final_state =
+            Enum.reduce(log_files, %{}, fn {fid, file_path}, acc ->
+              case NIF.v2_scan_file(file_path) do
+                {:ok, records} ->
+                  Enum.reduce(records, acc, fn {key, offset, value_size, expire_at_ms, is_tombstone}, inner_acc ->
+                    if is_tombstone do
+                      Map.put(inner_acc, key, :tombstone)
+                    else
+                      Map.put(inner_acc, key, {:live, fid, file_path, offset, value_size, expire_at_ms})
                     end
+                  end)
 
-                  :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), 0, offset, 0})
-              end)
+                _ ->
+                  acc
+              end
+            end)
 
-            _ ->
-              :ok
-          end
+          Enum.each(final_state, fn
+            {key, :tombstone} ->
+              :ets.delete(keydir, key)
+
+            {key, {:live, fid, file_path, offset, _value_size, expire_at_ms}} ->
+              # Read the actual value from disk so compound_scan finds it
+              value =
+                case NIF.v2_pread_at(file_path, offset) do
+                  {:ok, v} when v != nil -> v
+                  _ -> nil
+                end
+
+              :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), fid, offset, 0})
+          end)
 
           Map.put(acc, redis_key, dedicated_path)
 
@@ -249,7 +252,7 @@ defmodule Ferricstore.Store.Promotion do
     type_label = type_label(type)
 
     # v2: write tombstone for the marker key
-    active_path = find_active_file(shard_data_path)
+    active_path = find_active(shard_data_path)
 
     case NIF.v2_append_tombstone(active_path, mk) do
       {:ok, _} -> :ok
@@ -283,19 +286,29 @@ defmodule Ferricstore.Store.Promotion do
   defp type_label(:zset), do: "zset"
 
   # Finds the active (highest numbered) .log file in a shard data directory.
-  defp find_active_file(shard_data_path) do
-    case File.ls(shard_data_path) do
-      {:ok, files} ->
-        max_id =
-          files
-          |> Enum.filter(&String.ends_with?(&1, ".log"))
-          |> Enum.map(fn name -> name |> String.trim_trailing(".log") |> String.to_integer() end)
-          |> Enum.max(fn -> 0 end)
+  @doc "Returns the active (highest file_id) log file path in a dedicated directory."
+  @spec find_active(binary()) :: binary()
+  def find_active(path) do
+    case list_log_files(path) do
+      [] -> Path.join(path, "00000.log")
+      files -> files |> List.last() |> elem(1)
+    end
+  end
 
-        Path.join(shard_data_path, "#{String.pad_leading(Integer.to_string(max_id), 5, "0")}.log")
+  # Returns all .log files in a directory as [{file_id, full_path}], sorted by file_id.
+  defp list_log_files(dir) do
+    case File.ls(dir) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.ends_with?(&1, ".log"))
+        |> Enum.map(fn name ->
+          fid = name |> String.trim_trailing(".log") |> String.to_integer()
+          {fid, Path.join(dir, name)}
+        end)
+        |> Enum.sort_by(fn {fid, _} -> fid end)
 
       _ ->
-        Path.join(shard_data_path, "00000.log")
+        []
     end
   end
 end

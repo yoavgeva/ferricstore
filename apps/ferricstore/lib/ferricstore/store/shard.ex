@@ -3524,18 +3524,17 @@ defmodule Ferricstore.Store.Shard do
   # Scans ETS first (compound keys are warmed into ETS on recover).
   # Falls back to scanning the dedicated log file for the key.
   defp promoted_read(dedicated_path, compound_key, keydir) do
-    active = promoted_active_file(dedicated_path)
-
-    # Try O(1) pread using offset from ETS keydir.
-    # Promoted writes now store {file_id=0, offset, value_size} in ETS.
+    # Try O(1) pread using file_id + offset from ETS keydir.
     case :ets.lookup(keydir, compound_key) do
-      [{^compound_key, _value, _exp, _lfu, 0, offset, _vsize}] when offset > 0 ->
-        # Have a valid offset — direct pread, O(1)
-        NIF.v2_pread_at(active, offset)
+      [{^compound_key, _value, _exp, _lfu, fid, offset, _vsize}] when is_integer(fid) and offset > 0 ->
+        file_path = dedicated_file_path(dedicated_path, fid)
+        NIF.v2_pread_at(file_path, offset)
 
       _ ->
-        # No offset (pre-fix data or recovery) — fall back to scan.
-        # This path will only be hit for data written before this fix.
+        # No valid offset — fall back to scan of the active file.
+        # This path is hit for pre-fix data or when ETS has offset=0.
+        active = Ferricstore.Store.Promotion.find_active(dedicated_path)
+
         case NIF.v2_scan_file(active) do
           {:ok, records} ->
             last_entry =
@@ -3557,19 +3556,19 @@ defmodule Ferricstore.Store.Shard do
 
   # Writes a key-value pair to the promoted dedicated Bitcask directory.
   defp promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
-    active = promoted_active_file(dedicated_path)
+    active = Ferricstore.Store.Promotion.find_active(dedicated_path)
     NIF.v2_append_record(active, compound_key, value, expire_at_ms)
   end
 
   # Writes a tombstone for a key in the promoted dedicated Bitcask directory.
   defp promoted_tombstone(dedicated_path, compound_key) do
-    active = promoted_active_file(dedicated_path)
+    active = Ferricstore.Store.Promotion.find_active(dedicated_path)
     NIF.v2_append_tombstone(active, compound_key)
   end
 
-  # Returns the active log file path for a promoted dedicated directory.
-  defp promoted_active_file(dedicated_path) do
-    Path.join(dedicated_path, "00000.log")
+  # Builds the file path for a specific file_id in a dedicated directory.
+  defp dedicated_file_path(dedicated_path, file_id) do
+    Path.join(dedicated_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
   end
 
   # After a compound_put to the shared Bitcask, checks whether the
