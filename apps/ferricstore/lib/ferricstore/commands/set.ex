@@ -19,6 +19,7 @@ defmodule Ferricstore.Commands.Set do
 
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.TypeRegistry
+  alias Ferricstore.CrossShardOp
 
   @presence_marker "1"
 
@@ -333,24 +334,14 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SMOVE", [source, destination, member], store) do
-    with :ok <- TypeRegistry.check_type(source, :set, store),
-         :ok <- TypeRegistry.check_type(destination, :set, store) do
-      compound_key = CompoundKey.set_member(source, member)
-
-      if store.compound_get.(source, compound_key) == nil do
-        0
-      else
-        # Remove from source
-        store.compound_delete.(source, compound_key)
-        maybe_cleanup_empty_set(source, 1, store)
-
-        # Add to destination (check_or_set for destination since it may not exist)
-        TypeRegistry.check_or_set(destination, :set, store)
-        dst_key = CompoundKey.set_member(destination, member)
-        store.compound_put.(destination, dst_key, @presence_marker, 0)
-        1
-      end
-    end
+    CrossShardOp.execute(
+      [{source, :read_write}, {destination, :write}],
+      fn unified_store ->
+        do_smove(source, destination, member, unified_store)
+      end,
+      intent: %{command: :smove, keys: %{source: source, dest: destination}, value_hashes: %{}},
+      store: store
+    )
   end
 
   def handle("SMOVE", _args, _store) do
@@ -362,13 +353,23 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SDIFFSTORE", [destination | [_ | _] = keys], store) do
-    with :ok <- check_all_types(keys, store) do
-      first_set = get_members_set(hd(keys), store)
-      rest_sets = Enum.map(tl(keys), fn key -> get_members_set(key, store) end)
-      result = Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))
+    keys_with_roles =
+      [{destination, :write}] ++ Enum.map(keys, fn k -> {k, :read} end)
 
-      store_set_at(destination, result, store)
-    end
+    CrossShardOp.execute(
+      keys_with_roles,
+      fn unified_store ->
+        with :ok <- check_all_types(keys, unified_store) do
+          first_set = get_members_set(hd(keys), unified_store)
+          rest_sets = Enum.map(tl(keys), fn key -> get_members_set(key, unified_store) end)
+          result = Enum.reduce(rest_sets, first_set, &MapSet.difference(&2, &1))
+
+          store_set_at(destination, result, unified_store)
+        end
+      end,
+      intent: %{command: :sdiffstore, keys: %{dest: destination, sources: keys}, value_hashes: %{}},
+      store: store
+    )
   end
 
   def handle("SDIFFSTORE", _args, _store) do
@@ -380,17 +381,27 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SINTERSTORE", [destination | [_ | _] = keys], store) do
-    with :ok <- check_all_types(keys, store) do
-      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
+    keys_with_roles =
+      [{destination, :write}] ++ Enum.map(keys, fn k -> {k, :read} end)
 
-      result =
-        case sets do
-          [first | rest] -> Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
-          [] -> MapSet.new()
+    CrossShardOp.execute(
+      keys_with_roles,
+      fn unified_store ->
+        with :ok <- check_all_types(keys, unified_store) do
+          sets = Enum.map(keys, fn key -> get_members_set(key, unified_store) end)
+
+          result =
+            case sets do
+              [first | rest] -> Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
+              [] -> MapSet.new()
+            end
+
+          store_set_at(destination, result, unified_store)
         end
-
-      store_set_at(destination, result, store)
-    end
+      end,
+      intent: %{command: :sinterstore, keys: %{dest: destination, sources: keys}, value_hashes: %{}},
+      store: store
+    )
   end
 
   def handle("SINTERSTORE", _args, _store) do
@@ -402,12 +413,22 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
 
   def handle("SUNIONSTORE", [destination | [_ | _] = keys], store) do
-    with :ok <- check_all_types(keys, store) do
-      sets = Enum.map(keys, fn key -> get_members_set(key, store) end)
-      result = Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))
+    keys_with_roles =
+      [{destination, :write}] ++ Enum.map(keys, fn k -> {k, :read} end)
 
-      store_set_at(destination, result, store)
-    end
+    CrossShardOp.execute(
+      keys_with_roles,
+      fn unified_store ->
+        with :ok <- check_all_types(keys, unified_store) do
+          sets = Enum.map(keys, fn key -> get_members_set(key, unified_store) end)
+          result = Enum.reduce(sets, MapSet.new(), &MapSet.union(&2, &1))
+
+          store_set_at(destination, result, unified_store)
+        end
+      end,
+      intent: %{command: :sunionstore, keys: %{dest: destination, sources: keys}, value_hashes: %{}},
+      store: store
+    )
   end
 
   def handle("SUNIONSTORE", _args, _store) do
@@ -448,6 +469,28 @@ defmodule Ferricstore.Commands.Set do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  # Core SMOVE logic, extracted for use inside CrossShardOp.execute.
+  defp do_smove(source, destination, member, store) do
+    with :ok <- TypeRegistry.check_type(source, :set, store),
+         :ok <- TypeRegistry.check_type(destination, :set, store) do
+      compound_key = CompoundKey.set_member(source, member)
+
+      if store.compound_get.(source, compound_key) == nil do
+        0
+      else
+        # Remove from source
+        store.compound_delete.(source, compound_key)
+        maybe_cleanup_empty_set(source, 1, store)
+
+        # Add to destination (check_or_set for destination since it may not exist)
+        TypeRegistry.check_or_set(destination, :set, store)
+        dst_key = CompoundKey.set_member(destination, member)
+        store.compound_put.(destination, dst_key, @presence_marker, 0)
+        1
+      end
+    end
+  end
 
   # Clears any existing set at `destination`, writes `members` as a new set,
   # and returns the member count.

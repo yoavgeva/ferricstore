@@ -341,6 +341,47 @@ defmodule Ferricstore.Store.CompoundKey do
 
   """
   @spec internal_key?(binary()) :: boolean()
+  @doc """
+  Extracts the Redis-level key from a compound key.
+
+  For compound keys like `S:myset\\0member`, returns `"myset"`.
+  For type metadata keys like `T:myset`, returns `"myset"`.
+  For plain (non-compound) keys, returns the key as-is.
+
+  Used by the cross-shard lock checking logic to determine which Redis key
+  a compound Raft write affects.
+
+  ## Examples
+
+      iex> Ferricstore.Store.CompoundKey.extract_redis_key("S:myset" <> <<0>> <> "member")
+      "myset"
+
+      iex> Ferricstore.Store.CompoundKey.extract_redis_key("H:hash" <> <<0>> <> "field")
+      "hash"
+
+      iex> Ferricstore.Store.CompoundKey.extract_redis_key("T:mykey")
+      "mykey"
+
+      iex> Ferricstore.Store.CompoundKey.extract_redis_key("plain_key")
+      "plain_key"
+
+  """
+  @spec extract_redis_key(binary()) :: binary()
+  def extract_redis_key(<<"H:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(<<"L:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(<<"S:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(<<"Z:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(<<"T:", rest::binary>>), do: rest
+  def extract_redis_key(<<"V:", rest::binary>>), do: extract_before_separator(rest)
+  def extract_redis_key(key), do: key
+
+  defp extract_before_separator(rest) do
+    case :binary.split(rest, @separator) do
+      [redis_key, _sub_key] -> redis_key
+      [redis_key] -> redis_key
+    end
+  end
+
   def internal_key?(<<"H:", _rest::binary>>), do: true
   def internal_key?(<<"L:", _rest::binary>>), do: true
   def internal_key?(<<"S:", _rest::binary>>), do: true

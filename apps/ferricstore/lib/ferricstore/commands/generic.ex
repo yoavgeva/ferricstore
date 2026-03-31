@@ -27,6 +27,8 @@ defmodule Ferricstore.Commands.Generic do
     * `WAIT numreplicas timeout` -- returns 0 immediately (no replication)
   """
 
+  alias Ferricstore.CrossShardOp
+
   @doc """
   Handles a generic key command.
 
@@ -76,19 +78,26 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("RENAME", [key, newkey], store) do
-    case store.get_meta.(key) do
-      nil ->
-        {:error, "ERR no such key"}
+    CrossShardOp.execute(
+      [{key, :read_write}, {newkey, :write}],
+      fn unified_store ->
+        case unified_store.get_meta.(key) do
+          nil ->
+            {:error, "ERR no such key"}
 
-      {value, expire_at_ms} ->
-        store.put.(newkey, value, expire_at_ms)
+          {value, expire_at_ms} ->
+            unified_store.put.(newkey, value, expire_at_ms)
 
-        if key != newkey do
-          store.delete.(key)
+            if key != newkey do
+              unified_store.delete.(key)
+            end
+
+            :ok
         end
-
-        :ok
-    end
+      end,
+      intent: %{command: :rename, keys: %{source: key, dest: newkey}, value_hashes: %{}},
+      store: store
+    )
   end
 
   def handle("RENAME", _args, _store) do
@@ -100,23 +109,30 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("RENAMENX", [key, newkey], store) do
-    case store.get_meta.(key) do
-      nil ->
-        {:error, "ERR no such key"}
+    CrossShardOp.execute(
+      [{key, :read_write}, {newkey, :write}],
+      fn unified_store ->
+        case unified_store.get_meta.(key) do
+          nil ->
+            {:error, "ERR no such key"}
 
-      {_value, _expire_at_ms} when key == newkey ->
-        # Same key -- always 0 since destination "exists"
-        0
+          {_value, _expire_at_ms} when key == newkey ->
+            # Same key -- always 0 since destination "exists"
+            0
 
-      {value, expire_at_ms} ->
-        if store.exists?.(newkey) do
-          0
-        else
-          store.put.(newkey, value, expire_at_ms)
-          store.delete.(key)
-          1
+          {value, expire_at_ms} ->
+            if unified_store.exists?.(newkey) do
+              0
+            else
+              unified_store.put.(newkey, value, expire_at_ms)
+              unified_store.delete.(key)
+              1
+            end
         end
-    end
+      end,
+      intent: %{command: :renamenx, keys: %{source: key, dest: newkey}, value_hashes: %{}},
+      store: store
+    )
   end
 
   def handle("RENAMENX", _args, _store) do
@@ -130,7 +146,14 @@ defmodule Ferricstore.Commands.Generic do
   def handle("COPY", [source, destination | opts], store) do
     case parse_copy_opts(opts) do
       {:ok, replace?} ->
-        do_copy(source, destination, replace?, store)
+        CrossShardOp.execute(
+          [{source, :read}, {destination, :write}],
+          fn unified_store ->
+            do_copy(source, destination, replace?, unified_store)
+          end,
+          intent: %{command: :copy, keys: %{source: source, dest: destination}, value_hashes: %{}},
+          store: store
+        )
 
       {:error, _} = err ->
         err

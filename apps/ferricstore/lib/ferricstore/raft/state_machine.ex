@@ -179,14 +179,34 @@ defmodule Ferricstore.Raft.StateMachine do
   """
   @impl true
   def apply(meta, {:put, key, value, expire_at_ms}, state) do
-    result = with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    result =
+      case check_key_lock(state, redis_key, nil) do
+        :ok ->
+          with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
+
+        {:error, :key_locked} ->
+          {:error, :key_locked}
+      end
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:delete, key}, state) do
-    result = with_pending_writes(state, fn -> do_delete(state, key) end)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    result =
+      case check_key_lock(state, redis_key, nil) do
+        :ok ->
+          with_pending_writes(state, fn -> do_delete(state, key) end)
+
+        {:error, :key_locked} ->
+          {:error, :key_locked}
+      end
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -256,21 +276,51 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   def apply(meta, {:compound_put, compound_key, value, expire_at_ms}, state) do
-    result = with_pending_writes(state, fn -> do_put(state, compound_key, value, expire_at_ms) end)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+
+    result =
+      case check_key_lock(state, redis_key, nil) do
+        :ok ->
+          with_pending_writes(state, fn -> do_put(state, compound_key, value, expire_at_ms) end)
+
+        {:error, :key_locked} ->
+          {:error, :key_locked}
+      end
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:compound_delete, compound_key}, state) do
-    result = with_pending_writes(state, fn -> do_delete(state, compound_key) end)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+
+    result =
+      case check_key_lock(state, redis_key, nil) do
+        :ok ->
+          with_pending_writes(state, fn -> do_delete(state, compound_key) end)
+
+        {:error, :key_locked} ->
+          {:error, :key_locked}
+      end
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:compound_delete_prefix, prefix}, state) do
-    result = with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
+
+    result =
+      case check_key_lock(state, redis_key, nil) do
+        :ok ->
+          with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
+
+        {:error, :key_locked} ->
+          {:error, :key_locked}
+      end
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -363,6 +413,99 @@ defmodule Ferricstore.Raft.StateMachine do
   # 6-tuple variant: shard pre-computes now_ms for deterministic replay.
   def apply(meta, {:ratelimit_add, key, window_ms, max, count, now_ms}, state) do
     result = with_pending_writes(state, fn -> do_ratelimit_add(state, key, window_ms, max, count, now_ms) end)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Cross-shard operation commands (mini-percolator)
+  #
+  # These commands support the CrossShardOp protocol: per-key locking through
+  # Raft consensus, intent records for crash recovery, and locked writes.
+  # ---------------------------------------------------------------------------
+
+  def apply(meta, {:lock_keys, keys, owner_ref, expire_at_ms}, state) do
+    result = do_lock_keys(state, keys, owner_ref, expire_at_ms)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:unlock_keys, keys, owner_ref}, state) do
+    result = do_unlock_keys(state, keys, owner_ref)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:cross_shard_intent, owner_ref, intent_map}, state) do
+    result = do_write_intent(state, owner_ref, intent_map)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:delete_intent, owner_ref}, state) do
+    result = do_delete_intent(state, owner_ref)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:get_intents}, state) do
+    result = do_get_intents(state)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:locked_put, key, value, expire_at_ms, owner_ref}, state) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    result =
+      case check_key_lock(state, redis_key, owner_ref) do
+        :ok ->
+          with_pending_writes(state, fn -> do_put(state, key, value, expire_at_ms) end)
+
+        {:error, _} = err ->
+          err
+      end
+
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:locked_delete, key, owner_ref}, state) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    result =
+      case check_key_lock(state, redis_key, owner_ref) do
+        :ok ->
+          with_pending_writes(state, fn -> do_delete(state, key) end)
+
+        {:error, _} = err ->
+          err
+      end
+
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:locked_delete_prefix, prefix, owner_ref}, state) do
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
+
+    result =
+      case check_key_lock(state, redis_key, owner_ref) do
+        :ok ->
+          with_pending_writes(state, fn -> do_delete_prefix(state, prefix) end)
+
+        {:error, _} = err ->
+          err
+      end
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -907,11 +1050,21 @@ defmodule Ferricstore.Raft.StateMachine do
   # ---------------------------------------------------------------------------
 
   defp apply_single(state, {:put, key, value, expire_at_ms}) do
-    do_put(state, key, value, expire_at_ms)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    case check_key_lock(state, redis_key, nil) do
+      :ok -> do_put(state, key, value, expire_at_ms)
+      {:error, :key_locked} -> {:error, :key_locked}
+    end
   end
 
   defp apply_single(state, {:delete, key}) do
-    do_delete(state, key)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
+
+    case check_key_lock(state, redis_key, nil) do
+      :ok -> do_delete(state, key)
+      {:error, :key_locked} -> {:error, :key_locked}
+    end
   end
 
   defp apply_single(state, {:list_op, key, operation}) do
@@ -919,15 +1072,30 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp apply_single(state, {:compound_put, compound_key, value, expire_at_ms}) do
-    do_put(state, compound_key, value, expire_at_ms)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+
+    case check_key_lock(state, redis_key, nil) do
+      :ok -> do_put(state, compound_key, value, expire_at_ms)
+      {:error, :key_locked} -> {:error, :key_locked}
+    end
   end
 
   defp apply_single(state, {:compound_delete, compound_key}) do
-    do_delete(state, compound_key)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
+
+    case check_key_lock(state, redis_key, nil) do
+      :ok -> do_delete(state, compound_key)
+      {:error, :key_locked} -> {:error, :key_locked}
+    end
   end
 
   defp apply_single(state, {:compound_delete_prefix, prefix}) do
-    do_delete_prefix(state, prefix)
+    redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(prefix)
+
+    case check_key_lock(state, redis_key, nil) do
+      :ok -> do_delete_prefix(state, prefix)
+      {:error, :key_locked} -> {:error, :key_locked}
+    end
   end
 
   defp apply_single(state, {:incr, key, delta}) do
@@ -1387,6 +1555,100 @@ defmodule Ferricstore.Raft.StateMachine do
       _ ->
         {:error, "DISTLOCK lock does not exist or has expired"}
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: cross-shard key locking (mini-percolator)
+  # ---------------------------------------------------------------------------
+
+  # Lock map is stored in a process dictionary key per shard. This avoids
+  # adding a field to the Raft state struct (which would require migration).
+  # The process dictionary persists across apply/3 calls because ra runs the
+  # state machine in a dedicated process.
+
+  @cross_shard_locks_key :cross_shard_locks
+  @cross_shard_intents_key :cross_shard_intents
+
+  # Locks all keys atomically. If any key is already locked by a different
+  # owner (and not expired), rejects the entire batch.
+  defp do_lock_keys(_state, keys, owner_ref, expire_at_ms) do
+    locks = Process.get(@cross_shard_locks_key, %{})
+    now = System.os_time(:millisecond)
+
+    # Check all keys first (all-or-nothing)
+    conflict =
+      Enum.find(keys, fn key ->
+        case Map.get(locks, key) do
+          nil -> false
+          {^owner_ref, _exp} -> false
+          {_other, exp} -> exp > now
+        end
+      end)
+
+    if conflict do
+      {:error, :keys_locked}
+    else
+      # All keys available — lock them
+      new_locks =
+        Enum.reduce(keys, locks, fn key, acc ->
+          Map.put(acc, key, {owner_ref, expire_at_ms})
+        end)
+
+      Process.put(@cross_shard_locks_key, new_locks)
+      :ok
+    end
+  end
+
+  # Unlocks keys owned by the given owner_ref. Silently ignores keys not
+  # locked or locked by a different owner.
+  defp do_unlock_keys(_state, keys, owner_ref) do
+    locks = Process.get(@cross_shard_locks_key, %{})
+
+    new_locks =
+      Enum.reduce(keys, locks, fn key, acc ->
+        case Map.get(acc, key) do
+          {^owner_ref, _exp} -> Map.delete(acc, key)
+          _ -> acc
+        end
+      end)
+
+    Process.put(@cross_shard_locks_key, new_locks)
+    :ok
+  end
+
+  # Checks whether a key is locked by someone other than owner_ref.
+  # Returns :ok if the key is unlocked, expired, or owned by owner_ref.
+  # Returns {:error, :key_locked} if locked by another owner.
+  defp check_key_lock(_state, key, owner_ref) do
+    locks = Process.get(@cross_shard_locks_key, %{})
+    now = System.os_time(:millisecond)
+
+    case Map.get(locks, key) do
+      nil -> :ok
+      {^owner_ref, _exp} -> :ok
+      {_other, exp} when exp <= now -> :ok
+      {_other, _exp} -> {:error, :key_locked}
+    end
+  end
+
+  # Writes an intent record. Intents are stored in process dictionary
+  # (per shard, persistent across apply/3 calls). Used for crash recovery.
+  defp do_write_intent(_state, owner_ref, intent_map) do
+    intents = Process.get(@cross_shard_intents_key, %{})
+    Process.put(@cross_shard_intents_key, Map.put(intents, owner_ref, intent_map))
+    :ok
+  end
+
+  # Deletes an intent record.
+  defp do_delete_intent(_state, owner_ref) do
+    intents = Process.get(@cross_shard_intents_key, %{})
+    Process.put(@cross_shard_intents_key, Map.delete(intents, owner_ref))
+    :ok
+  end
+
+  # Returns all intent records. Used by the intent resolver and tests.
+  defp do_get_intents(_state) do
+    Process.get(@cross_shard_intents_key, %{})
   end
 
   # ---------------------------------------------------------------------------
