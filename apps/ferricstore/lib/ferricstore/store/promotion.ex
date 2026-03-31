@@ -112,9 +112,16 @@ defmodule Ferricstore.Store.Promotion do
         if entries != [] do
           batch = Enum.map(entries, fn {k, v, exp} -> {k, v, exp} end)
           dedicated_active = find_active(dedicated_path)
+          dedicated_fid = dedicated_active |> Path.basename() |> String.trim_trailing(".log") |> String.to_integer()
 
           case NIF.v2_append_batch(dedicated_active, batch) do
-            {:ok, _locations} -> :ok
+            {:ok, locations} ->
+              # Update ETS entries with dedicated file locations so cold reads
+              # (after eviction) use the dedicated path, not the shared shard.
+              Enum.zip(entries, locations)
+              |> Enum.each(fn {{k, _v, _exp}, {offset, value_size}} ->
+                :ets.update_element(keydir, k, [{5, dedicated_fid}, {6, offset}, {7, value_size}])
+              end)
 
             {:error, reason} ->
               Logger.error("Promotion: v2_append_batch failed for #{inspect(redis_key)}: #{inspect(reason)}")

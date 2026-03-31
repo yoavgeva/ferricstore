@@ -781,10 +781,10 @@ defmodule Ferricstore.Store.Shard do
         results = prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
         {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
 
-      _dedicated_path ->
-        # Promoted -- all entries are in ETS (recovered via v2_scan_file on init).
-        # Use ETS prefix scan instead of reading all keys from dedicated Bitcask.
-        results = prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
+      dedicated_path ->
+        # Promoted -- ETS entries point to the dedicated file (fid/offset
+        # updated during promote_collection!). Use dedicated_path for cold reads.
+        results = prefix_scan_entries(state.keydir, prefix, dedicated_path)
         {:reply, Enum.sort_by(results, fn {field, _} -> field end), state}
     end
   end
