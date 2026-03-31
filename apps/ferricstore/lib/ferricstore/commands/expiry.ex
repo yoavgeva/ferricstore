@@ -111,14 +111,27 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp set_expiry_at_seconds(key, ts_str, store) do
     case Integer.parse(ts_str) do
-      {ts, ""} -> apply_expiry(key, ts * 1_000, store)
+      {ts, ""} ->
+        expire_at_ms = ts * 1_000
+        if expire_at_ms <= Ferricstore.HLC.now_ms() do
+          delete_if_exists(key, store)
+        else
+          apply_expiry(key, expire_at_ms, store)
+        end
+
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
   defp set_expiry_at_ms(key, ts_str, store) do
     case Integer.parse(ts_str) do
-      {ts, ""} -> apply_expiry(key, ts, store)
+      {ts, ""} ->
+        if ts <= Ferricstore.HLC.now_ms() do
+          delete_if_exists(key, store)
+        else
+          apply_expiry(key, ts, store)
+        end
+
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
