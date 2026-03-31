@@ -56,29 +56,26 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
   # C2: MemoryGuard publishes pressure to persistent_term
   # ---------------------------------------------------------------
 
-  describe "C2: MemoryGuard persistent_term pressure publishing" do
-    test "MemoryGuard publishes keydir_full to persistent_term" do
-      # After force_check, the persistent_term should be set
+  describe "C2: MemoryGuard atomics pressure publishing" do
+    test "MemoryGuard publishes keydir_full to atomics" do
       Ferricstore.MemoryGuard.force_check()
-      result = :persistent_term.get(:ferricstore_keydir_full, :not_set)
-      assert result in [true, false]
-    end
-
-    test "MemoryGuard publishes reject_writes to persistent_term" do
-      Ferricstore.MemoryGuard.force_check()
-      result = :persistent_term.get(:ferricstore_reject_writes, :not_set)
-      assert result in [true, false]
-    end
-
-    test "keydir_full? reads from persistent_term (no GenServer.call)" do
-      # Force check to populate persistent_term
-      Ferricstore.MemoryGuard.force_check()
-      # The function should return a boolean without error
       result = Ferricstore.MemoryGuard.keydir_full?()
       assert result in [true, false]
     end
 
-    test "reject_writes? reads from persistent_term" do
+    test "MemoryGuard publishes reject_writes to atomics" do
+      Ferricstore.MemoryGuard.force_check()
+      result = Ferricstore.MemoryGuard.reject_writes?()
+      assert result in [true, false]
+    end
+
+    test "keydir_full? reads from atomics (no GenServer.call)" do
+      Ferricstore.MemoryGuard.force_check()
+      result = Ferricstore.MemoryGuard.keydir_full?()
+      assert result in [true, false]
+    end
+
+    test "reject_writes? reads from atomics" do
       Ferricstore.MemoryGuard.force_check()
       result = Ferricstore.MemoryGuard.reject_writes?()
       assert result in [true, false]

@@ -103,7 +103,8 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec reject_writes?() :: boolean()
   def reject_writes? do
-    :persistent_term.get(:ferricstore_reject_writes, false)
+    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    :atomics.get(ref, 2) == 1
   end
 
   @doc """
@@ -118,7 +119,28 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec keydir_full?() :: boolean()
   def keydir_full? do
-    :persistent_term.get(:ferricstore_keydir_full, false)
+    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    :atomics.get(ref, 1) == 1
+  end
+
+  @doc """
+  Directly sets the keydir_full flag. For use in tests only.
+  """
+  @spec set_keydir_full(boolean()) :: :ok
+  def set_keydir_full(value) do
+    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    :atomics.put(ref, 1, if(value, do: 1, else: 0))
+    :ok
+  end
+
+  @doc """
+  Directly sets the reject_writes flag. For use in tests only.
+  """
+  @spec set_reject_writes(boolean()) :: :ok
+  def set_reject_writes(value) do
+    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    :atomics.put(ref, 2, if(value, do: 1, else: 0))
+    :ok
   end
 
   @doc """
@@ -288,12 +310,13 @@ defmodule Ferricstore.MemoryGuard do
         maybe_evict(state)
     end
 
-    # Publish pressure levels to persistent_term for lock-free hot-path reads.
+    # Publish pressure levels to atomics for lock-free hot-path reads.
     # Callers (Router.check_keydir_full, Shard.put) read these instead of
     # GenServer.call, eliminating the MemoryGuard process as a contention point.
-    :persistent_term.put(:ferricstore_keydir_full, stats.keydir_pressure_level == :reject)
-    :persistent_term.put(:ferricstore_reject_writes,
-      stats.pressure_level == :reject and state.eviction_policy == :noeviction)
+    # Atomics avoid the global GC that persistent_term.put would trigger every 100ms.
+    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    :atomics.put(ref, 1, if(stats.keydir_pressure_level == :reject, do: 1, else: 0))
+    :atomics.put(ref, 2, if(stats.pressure_level == :reject and state.eviction_policy == :noeviction, do: 1, else: 0))
 
     %{state | last_pressure_level: stats.pressure_level, keydir_pressure_level: stats.keydir_pressure_level}
   end

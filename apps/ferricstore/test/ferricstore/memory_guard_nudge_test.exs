@@ -18,13 +18,13 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
     ShardHelpers.flush_all_keys()
 
     original_state = :sys.get_state(MemoryGuard)
-    orig_reject = :persistent_term.get(:ferricstore_reject_writes, false)
-    orig_keydir = :persistent_term.get(:ferricstore_keydir_full, false)
+    orig_reject = MemoryGuard.reject_writes?()
+    orig_keydir = MemoryGuard.keydir_full?()
 
     on_exit(fn ->
       :sys.replace_state(MemoryGuard, fn _current -> original_state end)
-      :persistent_term.put(:ferricstore_reject_writes, orig_reject)
-      :persistent_term.put(:ferricstore_keydir_full, orig_keydir)
+      MemoryGuard.set_reject_writes(orig_reject)
+      MemoryGuard.set_keydir_full(orig_keydir)
       ShardHelpers.flush_all_keys()
     end)
 
@@ -39,8 +39,8 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
     :sys.replace_state(MemoryGuard, fn state ->
       %{state | last_pressure_level: :reject, eviction_policy: :noeviction}
     end)
-    :persistent_term.put(:ferricstore_reject_writes, true)
-    :persistent_term.put(:ferricstore_keydir_full, true)
+    MemoryGuard.set_reject_writes(true)
+    MemoryGuard.set_keydir_full(true)
   end
 
   # ---------------------------------------------------------------------------
@@ -77,8 +77,8 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
     test "nudge updates persistent_term flags" do
       # Start with forced reject state
       force_reject_mode()
-      assert :persistent_term.get(:ferricstore_reject_writes) == true
-      assert :persistent_term.get(:ferricstore_keydir_full) == true
+      assert MemoryGuard.reject_writes?() == true
+      assert MemoryGuard.keydir_full?() == true
 
       # Reset the GenServer state back to ok (but leave persistent_term stale)
       :sys.replace_state(MemoryGuard, fn state ->
@@ -91,8 +91,8 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       Process.sleep(50)
 
       # Under normal test conditions, actual memory is well below thresholds
-      assert :persistent_term.get(:ferricstore_keydir_full) == false
-      assert :persistent_term.get(:ferricstore_reject_writes) == false
+      assert MemoryGuard.keydir_full?() == false
+      assert MemoryGuard.reject_writes?() == false
     end
 
     test "nudge is idempotent — multiple rapid nudges don't crash" do
@@ -209,8 +209,8 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       :sys.replace_state(MemoryGuard, fn state ->
         %{state | last_pressure_level: :reject, eviction_policy: :volatile_lru}
       end)
-      :persistent_term.put(:ferricstore_keydir_full, true)
-      :persistent_term.put(:ferricstore_reject_writes, false)
+      MemoryGuard.set_keydir_full(true)
+      MemoryGuard.set_reject_writes(false)
 
       # New key rejected via keydir_full check
       result = Router.put("blocked_key", "v", 0)
@@ -223,7 +223,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
 
       # persistent_term should be updated by the nudge check
       # (actual ETS memory is well below the keydir_max_ram threshold)
-      assert :persistent_term.get(:ferricstore_keydir_full) == false
+      assert MemoryGuard.keydir_full?() == false
 
       # Now the write should succeed
       assert :ok = Router.put("blocked_key", "v", 0)
@@ -251,14 +251,14 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       MemoryGuard.reconfigure(%{max_memory_bytes: 100_000_000_000, keydir_max_ram: 100_000_000_000})
 
       force_reject_mode()
-      assert :persistent_term.get(:ferricstore_keydir_full) == true
+      assert MemoryGuard.keydir_full?() == true
 
       MemoryGuard.nudge()
       Process.sleep(50)
 
       # With a 100GB budget, actual usage is well below thresholds
-      assert :persistent_term.get(:ferricstore_keydir_full) == false
-      assert :persistent_term.get(:ferricstore_reject_writes) == false
+      assert MemoryGuard.keydir_full?() == false
+      assert MemoryGuard.reject_writes?() == false
     end
 
     test "nudge does not reschedule periodic timer" do

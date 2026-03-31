@@ -23,14 +23,14 @@ defmodule Ferricstore.Commands.KeydirFullTest do
 
     # Save the original MemoryGuard state so we can restore it after each test.
     original_state = :sys.get_state(MemoryGuard)
-    orig_reject = :persistent_term.get(:ferricstore_reject_writes, false)
-    orig_keydir = :persistent_term.get(:ferricstore_keydir_full, false)
+    orig_reject = MemoryGuard.reject_writes?()
+    orig_keydir = MemoryGuard.keydir_full?()
 
     on_exit(fn ->
       # Restore MemoryGuard to its original state (both GenServer and persistent_term).
       :sys.replace_state(MemoryGuard, fn _current -> original_state end)
-      :persistent_term.put(:ferricstore_reject_writes, orig_reject)
-      :persistent_term.put(:ferricstore_keydir_full, orig_keydir)
+      MemoryGuard.set_reject_writes(orig_reject)
+      MemoryGuard.set_keydir_full(orig_keydir)
       ShardHelpers.flush_all_keys()
     end)
 
@@ -47,8 +47,8 @@ defmodule Ferricstore.Commands.KeydirFullTest do
       %{state | last_pressure_level: :reject, eviction_policy: :noeviction}
     end)
     # Also update persistent_term so the hot-path reads see the change
-    :persistent_term.put(:ferricstore_reject_writes, true)
-    :persistent_term.put(:ferricstore_keydir_full, true)
+    MemoryGuard.set_reject_writes(true)
+    MemoryGuard.set_keydir_full(true)
   end
 
   # Forces MemoryGuard into ok pressure (no rejection).
@@ -56,8 +56,8 @@ defmodule Ferricstore.Commands.KeydirFullTest do
     :sys.replace_state(MemoryGuard, fn state ->
       %{state | last_pressure_level: :ok, eviction_policy: :noeviction}
     end)
-    :persistent_term.put(:ferricstore_reject_writes, false)
-    :persistent_term.put(:ferricstore_keydir_full, false)
+    MemoryGuard.set_reject_writes(false)
+    MemoryGuard.set_keydir_full(false)
   end
 
   # Forces MemoryGuard into reject pressure but with a non-noeviction policy.
@@ -67,8 +67,8 @@ defmodule Ferricstore.Commands.KeydirFullTest do
       %{state | last_pressure_level: :reject, eviction_policy: :volatile_lru}
     end)
     # volatile_lru + reject = don't reject writes (eviction handles it)
-    :persistent_term.put(:ferricstore_reject_writes, false)
-    :persistent_term.put(:ferricstore_keydir_full, false)
+    MemoryGuard.set_reject_writes(false)
+    MemoryGuard.set_keydir_full(false)
   end
 
   # ---------------------------------------------------------------------------
