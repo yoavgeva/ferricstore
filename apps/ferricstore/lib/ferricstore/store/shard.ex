@@ -295,9 +295,19 @@ defmodule Ferricstore.Store.Shard do
   defp discover_active_file(shard_path) do
     case File.ls(shard_path) do
       {:ok, files} ->
+        # Clean up leftover compaction temp files from a previous crash.
+        # These are always incomplete — if compaction had finished, the
+        # rename would have replaced the original and the temp is gone.
+        Enum.each(files, fn name ->
+          if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
+            File.rm(Path.join(shard_path, name))
+            Logger.warning("Shard: removed leftover compaction temp file #{name}")
+          end
+        end)
+
         max_id =
           Enum.reduce(files, -1, fn name, best ->
-            if String.ends_with?(name, ".log") do
+            if String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_") do
               id = name |> String.trim_trailing(".log") |> String.to_integer()
               max(id, best)
             else
