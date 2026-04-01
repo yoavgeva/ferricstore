@@ -9,6 +9,14 @@ defmodule Ferricstore.Transaction.Coordinator do
   Cross-shard transactions submit a single Raft log entry to an "anchor shard"
   containing commands for ALL involved shards. The StateMachine's `apply/3`
   writes to all shards' ETS tables and Bitcask files in one deterministic pass.
+
+  ## WATCH conflict detection
+
+  WATCH uses per-key value hashes (`:erlang.phash2/1` of the value) rather
+  than per-shard write-version counters. At WATCH time the connection snapshots
+  `phash2(Router.get(key))` for each watched key. At EXEC time `watches_clean?/1`
+  re-reads each key and compares hashes. This eliminates false-positive aborts
+  caused by unrelated writes to the same shard (the old shard-version approach).
   """
 
   alias Ferricstore.Store.Router
@@ -257,9 +265,9 @@ defmodule Ferricstore.Transaction.Coordinator do
   defp watches_clean?(watched) when map_size(watched) == 0, do: true
 
   defp watches_clean?(watched) do
-    Enum.all?(watched, fn {key, saved_version} ->
+    Enum.all?(watched, fn {key, saved_hash} ->
       try do
-        Router.get_version(key) == saved_version
+        :erlang.phash2(Router.get(key)) == saved_hash
       catch
         :exit, _ -> false
       end

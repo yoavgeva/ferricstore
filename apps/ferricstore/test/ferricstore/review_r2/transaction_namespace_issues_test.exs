@@ -22,7 +22,6 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
-  # WriteVersion is per-shard; tested indirectly via Router.get_version/1
   alias Ferricstore.Transaction.Coordinator
   alias Ferricstore.Test.ShardHelpers
 
@@ -246,9 +245,9 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(key, "original", 0)
 
-      # Capture the write version (simulates WATCH).
-      version = Router.get_version(key)
-      watched = %{key => version}
+      # Capture the value hash (simulates WATCH).
+      hash = :erlang.phash2(Router.get(key))
+      watched = %{key => hash}
 
       # No modification to key — EXEC should succeed.
       queue = [{"SET", [key, "updated_by_tx"]}]
@@ -265,14 +264,14 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(key, "original", 0)
 
-      # WATCH the key.
-      version = Router.get_version(key)
-      watched = %{key => version}
+      # WATCH the key (snapshot value hash).
+      hash = :erlang.phash2(Router.get(key))
+      watched = %{key => hash}
 
       # Another client modifies the key between WATCH and EXEC.
       Router.put(key, "changed_by_other", 0)
 
-      # EXEC should detect the version mismatch and abort.
+      # EXEC should detect the value hash mismatch and abort.
       queue = [{"SET", [key, "should_not_apply"]}]
       result = Coordinator.execute(queue, watched, nil)
 
@@ -287,10 +286,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(key, "exists", 0)
 
-      version = Router.get_version(key)
-      watched = %{key => version}
+      hash = :erlang.phash2(Router.get(key))
+      watched = %{key => hash}
 
-      # Delete the key — should bump the write version for that shard.
+      # Delete the key — value changes from "exists" to nil, hash changes.
       Router.delete(key)
 
       queue = [{"SET", [key, "should_not_apply"]}]
@@ -307,9 +306,9 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       Router.put(key_a, "a_orig", 0)
       Router.put(key_b, "b_orig", 0)
 
-      version_a = Router.get_version(key_a)
-      version_b = Router.get_version(key_b)
-      watched = %{key_a => version_a, key_b => version_b}
+      hash_a = :erlang.phash2(Router.get(key_a))
+      hash_b = :erlang.phash2(Router.get(key_b))
+      watched = %{key_a => hash_a, key_b => hash_b}
 
       # Modify only key_b.
       Router.put(key_b, "b_changed", 0)
@@ -327,14 +326,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
     end
 
     @tag timeout: 30_000
-    test "WATCH uses per-shard write version — write to different key on same shard triggers abort" do
-      # WriteVersion is per-shard, not per-key. Writing to ANY key on the
-      # same shard increments the version. This means WATCH can produce
-      # false positives (abort even though the watched key wasn't modified).
-      # This is by design — safe but conservative.
-      #
-      # Use keys_on_same_shard() directly (without prefixing) to ensure
-      # both keys route to the same shard.
+    test "write to different key on same shard does NOT abort WATCH (value-hash semantics)" do
+      # Value-hash WATCH compares phash2(value) per key, not per-shard
+      # version counters. Writing to an unrelated key on the same shard
+      # does not change the watched key's value, so EXEC succeeds.
       {key_a, key_b} = ShardHelpers.keys_on_same_shard()
 
       # Sanity check: both keys must route to the same shard.
@@ -343,34 +338,33 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(key_a, "watched_val", 0)
 
-      version_a = Router.get_version(key_a)
-      watched = %{key_a => version_a}
+      hash_a = :erlang.phash2(Router.get(key_a))
+      watched = %{key_a => hash_a}
 
-      # Write to key_b which is on the SAME shard — bumps the shard version.
+      # Write to key_b which is on the SAME shard — does NOT affect key_a's value.
       Router.put(key_b, "unrelated_write", 0)
 
       queue = [{"GET", [key_a]}]
       result = Coordinator.execute(queue, watched, nil)
 
-      # Per-shard versioning means this WILL abort (false positive).
-      # This documents the expected behavior.
-      assert result == nil,
-        "per-shard version means writing any key on the shard aborts WATCH"
+      # Value-hash semantics: no false positive — EXEC succeeds.
+      assert is_list(result),
+        "value-hash WATCH should not abort for unrelated writes on the same shard"
+      assert result == ["watched_val"]
     end
 
     @tag timeout: 30_000
-    test "WATCH version check uses get_version which goes through GenServer" do
-      # Verify that get_version returns a consistent, incrementing value.
-      key = "r2m11:version_#{System.unique_integer([:positive])}"
+    test "WATCH value hash changes when value changes" do
+      key = "r2m11:hash_#{System.unique_integer([:positive])}"
 
       Router.put(key, "v1", 0)
-      v1 = Router.get_version(key)
+      h1 = :erlang.phash2(Router.get(key))
 
       Router.put(key, "v2", 0)
-      v2 = Router.get_version(key)
+      h2 = :erlang.phash2(Router.get(key))
 
-      # Version should have incremented.
-      assert v2 > v1, "write version should increment after a write (v1=#{v1}, v2=#{v2})"
+      # Hash should differ because the value changed.
+      assert h1 != h2, "value hash should change when value changes (h1=#{h1}, h2=#{h2})"
     end
 
     @tag timeout: 30_000
@@ -379,14 +373,15 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       Router.put(key, "0", 0)
 
-      # Two tasks both WATCH the same key and try to INCR it.
-      # Only one should succeed; the other should see a version conflict.
+      # Ten tasks all WATCH the same key (snapshot same value hash "0")
+      # and try to SET it to different values. The first to execute changes
+      # the value, so subsequent tasks see a hash mismatch and abort.
       results =
         1..10
         |> Enum.map(fn i ->
           Task.async(fn ->
-            version = Router.get_version(key)
-            watched = %{key => version}
+            hash = :erlang.phash2(Router.get(key))
+            watched = %{key => hash}
             queue = [{"SET", [key, Integer.to_string(i)]}]
             Coordinator.execute(queue, watched, nil)
           end)
@@ -397,9 +392,178 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       aborted = Enum.count(results, &(&1 == nil))
 
       # At least one should succeed, and at least some should abort due
-      # to contention (since they all read the same version).
+      # to contention (since they all snapshot the same value hash).
       assert succeeded >= 1, "at least one WATCH/EXEC should succeed"
       assert succeeded + aborted == 10, "all results should be either list or nil"
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # WATCH with value hash — H13 fix regression guards
+  # ---------------------------------------------------------------------------
+
+  describe "WATCH with value hash (H13 fix)" do
+    @tag timeout: 30_000
+    test "SET NX skip does not abort WATCH" do
+      key = "h13:nx_skip_#{System.unique_integer([:positive])}"
+
+      # Create the key so SET NX will be a no-op.
+      Router.put(key, "original", 0)
+
+      # WATCH: snapshot value hash.
+      hash = :erlang.phash2(Router.get(key))
+      watched = %{key => hash}
+
+      # SET NX is a no-op (key exists), value unchanged.
+      # In a real flow this would be inside the MULTI queue, but we simulate
+      # the scenario: another connection runs SET NX between WATCH and EXEC.
+      store = build_real_store()
+      assert nil == Ferricstore.Commands.Strings.handle("SET", [key, "nope", "NX"], store)
+
+      # EXEC should succeed — value hash unchanged.
+      queue = [{"GET", [key]}]
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert is_list(result), "EXEC should succeed after NX skip, got: #{inspect(result)}"
+      assert result == ["original"]
+    end
+
+    @tag timeout: 30_000
+    test "actual value change aborts WATCH" do
+      key = "h13:changed_#{System.unique_integer([:positive])}"
+
+      Router.put(key, "original", 0)
+
+      hash = :erlang.phash2(Router.get(key))
+      watched = %{key => hash}
+
+      # Another client changes the value.
+      Router.put(key, "new_value", 0)
+
+      queue = [{"SET", [key, "should_not_apply"]}]
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert result == nil, "EXEC should abort when value actually changed"
+      assert Router.get(key) == "new_value"
+    end
+
+    @tag timeout: 30_000
+    test "DEL aborts WATCH" do
+      key = "h13:del_#{System.unique_integer([:positive])}"
+
+      Router.put(key, "exists", 0)
+
+      hash = :erlang.phash2(Router.get(key))
+      watched = %{key => hash}
+
+      Router.delete(key)
+
+      queue = [{"SET", [key, "should_not_apply"]}]
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert result == nil, "EXEC should abort when watched key is deleted"
+      assert Router.get(key) == nil
+    end
+
+    @tag timeout: 30_000
+    test "idempotent write does not abort WATCH" do
+      key = "h13:idempotent_#{System.unique_integer([:positive])}"
+
+      Router.put(key, "hello", 0)
+
+      hash = :erlang.phash2(Router.get(key))
+      watched = %{key => hash}
+
+      # Write the same value — phash2 should match.
+      Router.put(key, "hello", 0)
+
+      queue = [{"GET", [key]}]
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert is_list(result),
+        "EXEC should succeed for idempotent write (same value), got: #{inspect(result)}"
+      assert result == ["hello"]
+    end
+
+    @tag timeout: 30_000
+    test "write to different key on same shard does not abort WATCH" do
+      {key_a, key_b} = ShardHelpers.keys_on_same_shard()
+
+      assert Router.shard_for(key_a) == Router.shard_for(key_b),
+        "test infrastructure: keys should be on the same shard"
+
+      Router.put(key_a, "watched", 0)
+
+      hash_a = :erlang.phash2(Router.get(key_a))
+      watched = %{key_a => hash_a}
+
+      # Write to key_b on the same shard — key_a's value is unchanged.
+      Router.put(key_b, "unrelated", 0)
+
+      queue = [{"GET", [key_a]}]
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert is_list(result),
+        "EXEC should succeed — unrelated key on same shard, got: #{inspect(result)}"
+      assert result == ["watched"]
+    end
+
+    @tag timeout: 30_000
+    test "WATCH on non-existent key — creating the key aborts" do
+      key = "h13:nonexist_#{System.unique_integer([:positive])}"
+
+      # WATCH a key that doesn't exist (value is nil).
+      hash = :erlang.phash2(nil)
+      watched = %{key => hash}
+
+      # Another client creates the key.
+      Router.put(key, "created", 0)
+
+      queue = [{"GET", [key]}]
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert result == nil, "EXEC should abort when non-existent watched key is created"
+    end
+
+    @tag timeout: 30_000
+    test "WATCH on non-existent key — stays non-existent succeeds" do
+      key = "h13:stays_nil_#{System.unique_integer([:positive])}"
+
+      # WATCH a key that doesn't exist.
+      hash = :erlang.phash2(nil)
+      watched = %{key => hash}
+
+      # Nobody touches the key.
+      queue = [{"SET", [key, "created_by_tx"]}]
+      result = Coordinator.execute(queue, watched, nil)
+
+      assert is_list(result), "EXEC should succeed when non-existent key stays absent"
+      assert result == [:ok]
+      assert Router.get(key) == "created_by_tx"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helper: build a real store map for direct handler invocation
+  # ---------------------------------------------------------------------------
+
+  defp build_real_store do
+    %{
+      get: &Router.get/1,
+      get_meta: &Router.get_meta/1,
+      put: &Router.put/3,
+      delete: &Router.delete/1,
+      exists?: &Router.exists?/1,
+      keys: &Router.keys/0,
+      flush: fn -> :ok end,
+      dbsize: &Router.dbsize/0,
+      incr: &Router.incr/2,
+      incr_float: &Router.incr_float/2,
+      append: &Router.append/2,
+      getset: &Router.getset/2,
+      getdel: &Router.getdel/1,
+      getex: &Router.getex/2,
+      setrange: &Router.setrange/3
+    }
   end
 end

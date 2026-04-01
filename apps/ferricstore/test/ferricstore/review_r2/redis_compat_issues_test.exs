@@ -335,18 +335,17 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       # Create the key
       Router.put(key, "original", 0)
 
-      # WATCH: capture version
-      version = Router.get_version(key)
-      watched = %{key => version}
+      # WATCH: capture value hash
+      hash = :erlang.phash2(Router.get(key))
+      watched = %{key => hash}
 
       # Within MULTI, queue SET NX (will fail since key exists)
-      # EXEC should succeed because version didn't change
+      # EXEC should succeed because value hash didn't change
       queue = [{"SET", [key, "should_not_write", "NX"]}]
 
       result = Ferricstore.Transaction.Coordinator.execute(queue, watched, nil)
 
-      # If R2-H13 bug is present: result == nil (WATCH detected false conflict)
-      # If fixed: result == [nil] (NX returned nil, but tx committed)
+      # Value-hash WATCH: NX skip doesn't change the value, so hash matches.
       assert result == [nil],
              "R2-H13: EXEC should succeed with [nil] (NX skip), got: #{inspect(result)}"
 
@@ -365,8 +364,8 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       # Create key_a so SET NX will fail on it
       Router.put(key_a, "original", 0)
 
-      # Client A: WATCH key_a
-      version_a = Router.get_version(key_a)
+      # Client A: WATCH key_a (snapshot value hash)
+      hash_a = :erlang.phash2(Router.get(key_a))
 
       # Client B: cross-shard MULTI with SET NX on key_a (fails) + SET key_b
       client_b_queue = [
@@ -375,17 +374,16 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       ]
       Ferricstore.Transaction.Coordinator.execute(client_b_queue, %{}, nil)
 
-      # Client A: version should be unchanged since key_a was not modified
-      version_a_after = Router.get_version(key_a)
+      # Client A: value hash should be unchanged since key_a was not modified.
+      # With value-hash WATCH, the cross-shard WriteVersion.increment is
+      # irrelevant -- we compare phash2(value) not shard versions.
+      hash_a_after = :erlang.phash2(Router.get(key_a))
 
-      # BUG (R2-H13): Cross-shard Coordinator unconditionally increments
-      # WriteVersion for ALL involved shards after Raft apply, even when
-      # no write occurred on that shard. This poisons Client A's WATCH.
-      assert version_a == version_a_after,
-             "R2-H13: Cross-shard NX skip bumped version from #{version_a} to #{version_a_after}"
+      assert hash_a == hash_a_after,
+             "R2-H13: value hash should be unchanged after NX skip"
 
       # Client A: EXEC with watched key -- should succeed
-      watched_a = %{key_a => version_a}
+      watched_a = %{key_a => hash_a}
       client_a_queue = [{"SET", [key_a, "updated_by_a"]}]
       result = Ferricstore.Transaction.Coordinator.execute(client_a_queue, watched_a, nil)
 

@@ -1232,8 +1232,8 @@ defmodule FerricstoreServer.Connection do
     try do
       new_watched =
         Enum.reduce(keys, state.watched_keys, fn key, acc ->
-          version = Router.get_version(key)
-          Map.put(acc, key, version)
+          hash = :erlang.phash2(Router.get(key))
+          Map.put(acc, key, hash)
         end)
 
       {:continue, Encoder.encode(:ok), %{state | watched_keys: new_watched}}
