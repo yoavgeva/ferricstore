@@ -329,8 +329,8 @@ Returns empty list `[]` instead of proper RESP response. May confuse clients.
 | C3 | CRITICAL | FIXED — 20 key limit |
 | C4 | CRITICAL | FIXED — degree comparison |
 | C5 | CRITICAL | NOT A BUG — embedded is trusted |
-| H1 | HIGH | Regression guard |
-| H2 | HIGH | Regression guard |
+| H1 | HIGH | NOT A BUG — shard can't fail between lock and intent |
+| H2 | HIGH | NOT A BUG — same as H1 |
 | H3 | HIGH | FIXED — resolver unlocks keys |
 | H4 | HIGH | FIXED — expired locks pruned |
 | H5 | HIGH | FIXED — ZADD flag conflicts |
@@ -338,9 +338,9 @@ Returns empty list `[]` instead of proper RESP response. May confuse clients.
 | H7 | HIGH | FIXED — score formatting |
 | H8 | HIGH | FIXED — EXPIRE -1 returns error |
 | H9 | HIGH | FIXED — vector try/rescue |
-| H10 | HIGH | Regression guard |
-| H11 | HIGH | Regression guard |
-| H12 | HIGH | Regression guard |
+| H10 | HIGH | NOT A BUG — Rustler GC handles duplicate refs |
+| H11 | HIGH | FIXED — RESP-encoded error |
+| H12 | HIGH | FIXED — sendfile fallback to normal GET |
 | H13 | HIGH | FIXED — WATCH value hash |
 | M1-M11 | MEDIUM | TODO |
 | L1-L6 | LOW | Accepted / documented |
