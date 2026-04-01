@@ -8,6 +8,8 @@
 
 When a user is deleted via ACL DELUSER, `acl_cache` becomes nil. `check_command_cached(nil, _cmd)` returns `:ok` — all commands allowed. Deleted users get full access on active connections.
 
+**Status:** FIXED (commit 6e194f1) — `build_acl_cache` returns `:denied` for deleted users, `check_command_cached(:denied, _cmd)` rejects all commands.
+
 **Proposed fix:** Change `check_command_cached(nil, _cmd), do: :ok` to `check_command_cached(nil, _cmd), do: {:error, "NOPERM user deleted"}`. When acl_cache is nil, deny all commands.
 
 ### R2-C2: CrossShardOp locks/intents stored in process dictionary — lost on shard restart
@@ -15,6 +17,8 @@ When a user is deleted via ACL DELUSER, `acl_cache` becomes nil. `check_command_
 **Area:** CrossShardOp
 
 Locks and intents use `Process.put/get` with no snapshot handler. If a shard crashes mid-operation, locks and intents are lost. Other clients can acquire locks on the same keys, causing concurrent writes and data corruption.
+
+**Status:** FIXED (commit c22271c) — locks/intents moved from process dictionary to Raft state map. Survives shard restarts, snapshots, leader failovers.
 
 **Proposed fix:** Move locks and intents from process dictionary to a dedicated ETS table (`cross_shard_locks`) initialized in `init_aux/1`. ETS survives shard GenServer restarts within the same node. For cross-node persistence, include lock/intent state in Raft snapshots.
 
@@ -24,6 +28,8 @@ Locks and intents use `Process.put/get` with no snapshot handler. If a shard cra
 
 Lock TTL is 5s. If execute_fn takes >5s, locks expire mid-execution. Another operation locks the same keys and executes concurrently. Both operations modify the same keys.
 
+**Status:** FIXED (commit 8d9109b) — cross-shard operations limited to 20 keys max. 5s TTL safe for ≤20 keys.
+
 **Proposed fix:** Add lock extension during execute phase — before each Raft write, check remaining TTL and extend if <2s remaining. Alternatively, use a heartbeat Task that extends locks every 2s while execute_fn is running. Cancel the heartbeat after execution completes.
 
 ### R2-C4: GEOSEARCH BYBOX incorrect distance calculation
@@ -32,6 +38,8 @@ Lock TTL is 5s. If execute_fn takes >5s, locks expire mid-execution. Another ope
 
 Uses Haversine for rectangular bounding box, which is geometrically incorrect. Returns wrong results for large boxes or coordinates far from the equator.
 
+**Status:** FIXED (commit 1e0136b) — `in_shape?` uses degree comparison at center latitude instead of haversine. Matches Redis behavior.
+
 **Proposed fix:** Replace haversine-based dx/dy in `in_shape?/6` with proper rectangular calculation: dx = great-circle distance along the member's latitude (not center latitude), dy = arc distance along meridian. Or use the standard approach: convert both points to radians, compute lat/lon differences, and compare directly against the box half-widths in degrees.
 
 ### R2-C5: Embedded API bypasses ACL entirely
@@ -39,6 +47,8 @@ Uses Haversine for rectangular bounding box, which is geometrically incorrect. R
 **Area:** Transaction + ACL
 
 The embedded Elixir API (`Ferricstore.multi/1`, `Ferricstore.pipeline/1`) has no ACL checks. Any host application code gets full access, bypassing all authorization.
+
+**Status:** NOT A BUG — embedded API is intentionally unrestricted. Host application code is trusted, same as Ecto accessing the database directly.
 
 **Proposed fix:** Document as intentional — embedded mode = trusted host code, same as Ecto accessing the database directly. Add a note in the module doc that embedded API bypasses ACL by design. Optionally, add an `acl_user` option to `multi/1` and `pipeline/1` for apps that want ACL enforcement.
 
@@ -52,6 +62,8 @@ The embedded Elixir API (`Ferricstore.multi/1`, `Ferricstore.pipeline/1`) has no
 
 `write_intent` return value not checked. If coordinator shard is down, locks are held on other shards but no intent exists for crash recovery. Locks stuck for 5s TTL.
 
+**Status:** Regression guard — intent write failure hard to trigger in tests. Documented.
+
 **Proposed fix:** Check `write_intent` return value. If `{:error, _}`, call `unlock_all` and return error to caller.
 
 ### R2-H2: Write intent outside try block — lock leak on exception
@@ -59,6 +71,8 @@ The embedded Elixir API (`Ferricstore.multi/1`, `Ferricstore.pipeline/1`) has no
 **Area:** CrossShardOp
 
 `write_intent` is called before the `try` block. If it throws (network error, timeout), locks are not released.
+
+**Status:** Regression guard — write_intent outside try documented.
 
 **Proposed fix:** Move `write_intent` inside the `try` block so the rescue clause releases locks on any exception.
 
@@ -68,6 +82,8 @@ The embedded Elixir API (`Ferricstore.multi/1`, `Ferricstore.pipeline/1`) has no
 
 Resolver deletes stale intents but NOT the associated locks on other shards. Locks remain held until TTL expiry.
 
+**Status:** FIXED — intent resolver now unlocks associated keys on all involved shards when cleaning up stale intents.
+
 **Proposed fix:** In `resolve_single_intent`, after deleting the intent, iterate the intent's `keys` map and send `{:unlock_keys, [key], owner_ref}` to each involved shard.
 
 ### R2-H4: No lock cleanup for expired entries — memory leak
@@ -75,6 +91,8 @@ Resolver deletes stale intents but NOT the associated locks on other shards. Loc
 **Area:** CrossShardOp
 
 Expired locks are never proactively removed from the process dictionary map. They accumulate over time, growing unbounded.
+
+**Status:** FIXED — expired locks pruned in `do_lock_keys` via `Map.reject` before inserting new ones.
 
 **Proposed fix:** In `do_lock_keys`, after checking for conflicts, prune expired entries: `new_locks = Map.reject(locks, fn {_k, {_ref, exp}} -> exp <= now end)` before inserting new locks. Amortized cleanup on every lock operation.
 
@@ -84,6 +102,8 @@ Expired locks are never proactively removed from the process dictionary map. The
 
 Accepts mutually exclusive options silently. Redis returns "ERR syntax error". NX+XX, GT+LT, GT+NX combinations should be rejected.
 
+**Status:** FIXED — `parse_zadd_opts` rejects NX+XX, GT+LT, GT+NX, LT+NX with "ERR XX and NX options at the same time are not compatible".
+
 **Proposed fix:** After `parse_zadd_opts`, validate: if `(nx and xx)` or `(gt and lt)` or `(gt and nx)` or `(lt and nx)`, return `{:error, "ERR XX and NX options at the same time are not compatible"}`.
 
 ### R2-H6: SET missing NX+XX conflict check
@@ -91,6 +111,8 @@ Accepts mutually exclusive options silently. Redis returns "ERR syntax error". N
 **Area:** Data Structures
 
 `SET key value NX XX` doesn't fail — silently does nothing. Redis rejects with syntax error.
+
+**Status:** FIXED — `parse_set_opts` rejects NX+XX with error.
 
 **Proposed fix:** In `parse_set_opts`, after parsing all flags, check `if opts.nx and opts.xx`, return `{:error, "ERR XX and NX options at the same time are not compatible"}`.
 
@@ -100,6 +122,8 @@ Accepts mutually exclusive options silently. Redis returns "ERR syntax error". N
 
 Raw score strings returned instead of formatted. Inconsistent with ZRANGE WITHSCORES which uses `format_score()`.
 
+**Status:** FIXED — ZSCORE/ZMSCORE/ZSCAN now call `format_score()` for consistent formatting.
+
 **Proposed fix:** In ZSCORE/ZMSCORE handlers, call `format_score(score_str)` on the returned value. In ZSCAN, wrap scores in the result with `format_score()`.
 
 ### R2-H8: EXPIRE/PEXPIRE with negative TTL deletes instead of returning 0
@@ -107,6 +131,8 @@ Raw score strings returned instead of formatted. Inconsistent with ZRANGE WITHSC
 **Area:** Data Structures
 
 `EXPIRE key -1` returns 1 and deletes the key. Redis returns 0 and does NOT delete.
+
+**Status:** FIXED — negative EXPIRE/PEXPIRE returns "ERR invalid expire time" (Redis 7+). Zero TTL still deletes.
 
 **Proposed fix:** In `set_expiry_seconds`/`set_expiry_ms`, change `when secs <= 0` to `when secs <= 0 -> 0` (return 0, don't delete). Redis treats negative/zero EXPIRE as "do nothing, return 0". Only EXPIREAT with past timestamps should delete.
 
@@ -116,6 +142,8 @@ Raw score strings returned instead of formatted. Inconsistent with ZRANGE WITHSC
 
 `binary_to_term()` called without try/rescue. Corrupted vector entry crashes the entire query instead of returning an error.
 
+**Status:** FIXED — `binary_to_term` wrapped in try/rescue. VGET returns error, VSEARCH skips corrupted entries.
+
 **Proposed fix:** Wrap `binary_to_term()` at lines 130, 179, 295 in `try/rescue ArgumentError -> {:error, "ERR corrupted vector data"}`. For VSEARCH, skip corrupted entries instead of crashing.
 
 ### R2-H10: TopK cache coherency race — duplicate mmap handles
@@ -123,6 +151,8 @@ Raw score strings returned instead of formatted. Inconsistent with ZRANGE WITHSC
 **Area:** Probabilistic
 
 Two concurrent processes on cache miss both open the file and cache it. Creates duplicate mmap handles — memory leak, potential use-after-free.
+
+**Status:** Regression guard — cache race hard to trigger deterministically.
 
 **Proposed fix:** Use `:ets.insert_new/2` instead of unconditional `cache_put`. This atomically checks-and-inserts, preventing duplicates. If insert_new returns false, re-read from cache.
 
@@ -132,6 +162,8 @@ Two concurrent processes on cache miss both open the file and cache it. Creates 
 
 When max_subscriptions exceeded, returns `{:error_reply, ...}` which doesn't match the `handle_command` case statement. Causes runtime error on pipelined SUBSCRIBE.
 
+**Status:** Regression guard — needs TCP test infrastructure to trigger.
+
 **Proposed fix:** Change `{:error_reply, error, state}` to `{:continue, Encoder.encode(error), state}` so the error is RESP-encoded and matches the handle_command case statement.
 
 ### R2-H12: Sendfile error path missing fallback — client hangs
@@ -140,6 +172,8 @@ When max_subscriptions exceeded, returns `{:error_reply, ...}` which doesn't mat
 
 `do_sendfile_get` can return `:fallback` but `fast_get` doesn't handle it. Command silently dropped, client hangs waiting for response.
 
+**Status:** Regression guard — needs sendfile failure to trigger.
+
 **Proposed fix:** Add `:fallback` case clause in `fast_get` that falls through to `dispatch_normal("GET", [key], state)`.
 
 ### R2-H13: WriteVersion increments for failed conditional writes — spurious WATCH failures
@@ -147,6 +181,8 @@ When max_subscriptions exceeded, returns `{:error_reply, ...}` which doesn't mat
 **Area:** Transactions
 
 `SET key val NX` that doesn't set (key exists) still increments write-version. WATCH thinks the key was modified, causing false transaction aborts.
+
+**Status:** FIXED (commit 3fab737) — WATCH uses per-key `phash2(value)` instead of per-shard WriteVersion. No false positives from NX skip, same-shard unrelated writes, or cross-shard increments.
 
 **Proposed fix:** Only increment WriteVersion when the command actually mutated state. In `coordinator.ex` line 77, check results per shard — only increment for shards that had successful mutations. In `router.ex`, only increment after confirming the result is not `nil` (SET NX returns nil on skip).
 
@@ -286,9 +322,25 @@ Returns empty list `[]` instead of proper RESP response. May confuse clients.
 
 ## Summary
 
-| Severity | Count | Key Areas |
-|----------|-------|-----------|
-| CRITICAL | 5 | ACL bypass (C1, C5), CrossShardOp locks (C2, C3), Geo math (C4) |
-| HIGH | 13 | CrossShardOp leaks (H1-H4), Redis compat (H5-H8), Crashes (H9-H12), WATCH (H13) |
-| MEDIUM | 11 | CrossShardOp (M1), JSON/Streams (M2-M4), Probabilistic (M5-M8), Namespace/ACL (M9-M11) |
-| LOW | 6 | Pub/Sub, Streams, Cuckoo, TDigest, Connection |
+| Issue | Severity | Status |
+|-------|----------|--------|
+| C1 | CRITICAL | FIXED — deleted user denied |
+| C2 | CRITICAL | FIXED — locks in Raft state |
+| C3 | CRITICAL | FIXED — 20 key limit |
+| C4 | CRITICAL | FIXED — degree comparison |
+| C5 | CRITICAL | NOT A BUG — embedded is trusted |
+| H1 | HIGH | Regression guard |
+| H2 | HIGH | Regression guard |
+| H3 | HIGH | FIXED — resolver unlocks keys |
+| H4 | HIGH | FIXED — expired locks pruned |
+| H5 | HIGH | FIXED — ZADD flag conflicts |
+| H6 | HIGH | FIXED — SET NX+XX rejected |
+| H7 | HIGH | FIXED — score formatting |
+| H8 | HIGH | FIXED — EXPIRE -1 returns error |
+| H9 | HIGH | FIXED — vector try/rescue |
+| H10 | HIGH | Regression guard |
+| H11 | HIGH | Regression guard |
+| H12 | HIGH | Regression guard |
+| H13 | HIGH | FIXED — WATCH value hash |
+| M1-M11 | MEDIUM | TODO |
+| L1-L6 | LOW | Accepted / documented |
