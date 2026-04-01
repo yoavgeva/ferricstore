@@ -250,28 +250,60 @@ defmodule Ferricstore.CrossShardOp do
   end
 
   defp parallel_unlock(shards, lock_map, owner_ref) do
-    shard_tasks =
+    to_unlock =
       shards
       |> Enum.filter(fn idx -> Map.get(lock_map, idx, []) != [] end)
-      |> Enum.map(fn shard_idx ->
-        {shard_idx,
+      |> Enum.map(fn idx -> {idx, Map.get(lock_map, idx, [])} end)
+
+    # Fire-and-forget retry task — caller doesn't wait for retries.
+    # First attempt is inline (fast path), retries are async.
+    failed = attempt_unlock(to_unlock, owner_ref)
+
+    if failed != [] do
+      # Retry failed unlocks in a background task with backoff.
+      # Stops after lock TTL expires (no point retrying expired locks).
+      Task.start(fn -> retry_unlock(failed, owner_ref, @lock_ttl_ms) end)
+    end
+  end
+
+  defp attempt_unlock(shards_keys, owner_ref) do
+    tasks =
+      Enum.map(shards_keys, fn {shard_idx, keys} ->
+        {shard_idx, keys,
          Task.async(fn ->
-           keys_to_unlock = Map.get(lock_map, shard_idx, [])
            shard_id = Cluster.shard_server_id(shard_idx)
-           :ra.process_command(shard_id, {:unlock_keys, keys_to_unlock, owner_ref})
+           :ra.process_command(shard_id, {:unlock_keys, keys, owner_ref})
          end)}
       end)
 
-    results = Task.await_many(Enum.map(shard_tasks, fn {_idx, task} -> task end), 5_000)
+    results = Task.await_many(Enum.map(tasks, fn {_, _, task} -> task end), 5_000)
 
-    Enum.zip(shard_tasks, results)
-    |> Enum.each(fn {{shard_idx, _task}, result} ->
+    Enum.zip(tasks, results)
+    |> Enum.filter(fn {{_idx, _keys, _task}, result} ->
       case result do
-        {:ok, :ok, _} -> :ok
-        other ->
-          Logger.warning("CrossShardOp: unlock failed on shard #{shard_idx}: #{inspect(other)} — lock will expire via TTL")
+        {:ok, :ok, _} -> false
+        _ -> true
       end
     end)
+    |> Enum.map(fn {{idx, keys, _task}, _result} -> {idx, keys} end)
+  end
+
+  defp retry_unlock([], _owner_ref, _remaining_ms), do: :ok
+  defp retry_unlock(_failed, _owner_ref, remaining_ms) when remaining_ms <= 0, do: :ok
+
+  defp retry_unlock(failed, owner_ref, remaining_ms) do
+    Process.sleep(500)
+
+    still_failed = attempt_unlock(failed, owner_ref)
+
+    if still_failed != [] do
+      Logger.warning(
+        "CrossShardOp: unlock retry failed on shards #{inspect(Enum.map(still_failed, &elem(&1, 0)))} — " <>
+          "#{remaining_ms - 500}ms until TTL expiry"
+      )
+
+      retry_unlock(still_failed, owner_ref, remaining_ms - 500)
+    end
   end
 
   # ---------------------------------------------------------------------------
