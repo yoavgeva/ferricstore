@@ -1264,8 +1264,8 @@ defmodule FerricstoreServer.Connection do
     current_count = MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
 
     if current_count + length(channels) > @max_subscriptions do
-      {:error_reply,
-       {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}, state}
+      {:continue,
+       Encoder.encode({:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}), state}
     else
       {responses, new_state} =
         Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
@@ -1316,8 +1316,8 @@ defmodule FerricstoreServer.Connection do
     current_count = MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
 
     if current_count + length(patterns) > @max_subscriptions do
-      {:error_reply,
-       {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}, state}
+      {:continue,
+       Encoder.encode({:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}), state}
     else
       {responses, new_state} =
         Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
