@@ -316,20 +316,20 @@ defmodule FerricStore do
   @doc """
   Deletes `key` from the store.
 
-  Returns `:ok` regardless of whether the key existed.
+  Returns `{:ok, 1}` if the key was deleted, `{:ok, 0}` if it did not exist.
 
   ## Examples
 
       iex> FerricStore.set("session:temp", "data")
       :ok
       iex> FerricStore.del("session:temp")
-      :ok
+      {:ok, 1}
 
       iex> FerricStore.del("nonexistent:key")
-      :ok
+      {:ok, 0}
 
   """
-  @spec del(key()) :: :ok
+  @spec del(key()) :: {:ok, non_neg_integer()} | {:error, binary()}
   def del(key) do
     resolved_key = sandbox_key(key)
     store = build_compound_store(resolved_key)
