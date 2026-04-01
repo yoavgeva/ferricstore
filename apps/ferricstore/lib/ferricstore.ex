@@ -1273,8 +1273,10 @@ defmodule FerricStore do
         [to_string(score * 1.0), member]
       end)
 
-    result = Ferricstore.Commands.SortedSet.handle("ZADD", [resolved_key | args], store)
-    {:ok, result}
+    case Ferricstore.Commands.SortedSet.handle("ZADD", [resolved_key | args], store) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   @doc """
@@ -1310,21 +1312,23 @@ defmodule FerricStore do
     args = [resolved_key, to_string(start), to_string(stop)]
     args = if with_scores, do: args ++ ["WITHSCORES"], else: args
 
-    result = Ferricstore.Commands.SortedSet.handle("ZRANGE", args, store)
+    case Ferricstore.Commands.SortedSet.handle("ZRANGE", args, store) do
+      {:error, _} = err ->
+        err
 
-    if with_scores and is_list(result) and result != [] do
-      # ZRANGE WITHSCORES returns flat list: [member, score_str, member, score_str, ...]
-      pairs =
-        result
-        |> Enum.chunk_every(2)
-        |> Enum.map(fn [member, score_str] ->
-          {score, ""} = Float.parse(score_str)
-          {member, score}
-        end)
+      result when with_scores and is_list(result) and result != [] ->
+        pairs =
+          result
+          |> Enum.chunk_every(2)
+          |> Enum.map(fn [member, score_str] ->
+            {score, _} = Float.parse(score_str)
+            {member, score}
+          end)
 
-      {:ok, pairs}
-    else
-      {:ok, result}
+        {:ok, pairs}
+
+      result ->
+        {:ok, result}
     end
   end
 
@@ -1350,11 +1354,14 @@ defmodule FerricStore do
     store = build_compound_store(resolved_key)
 
     case Ferricstore.Commands.SortedSet.handle("ZSCORE", [resolved_key, member], store) do
+      {:error, _} = err ->
+        err
+
       nil ->
         {:ok, nil}
 
       score_str when is_binary(score_str) ->
-        {score, ""} = Float.parse(score_str)
+        {score, _} = Float.parse(score_str)
         {:ok, score}
     end
   end
@@ -1378,8 +1385,11 @@ defmodule FerricStore do
   def zcard(key) do
     resolved_key = sandbox_key(key)
     store = build_compound_store(resolved_key)
-    result = Ferricstore.Commands.SortedSet.handle("ZCARD", [resolved_key], store)
-    {:ok, result}
+
+    case Ferricstore.Commands.SortedSet.handle("ZCARD", [resolved_key], store) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   @doc """
@@ -1402,8 +1412,11 @@ defmodule FerricStore do
   def zrem(key, members) when is_list(members) do
     resolved_key = sandbox_key(key)
     store = build_compound_store(resolved_key)
-    result = Ferricstore.Commands.SortedSet.handle("ZREM", [resolved_key | members], store)
-    {:ok, result}
+
+    case Ferricstore.Commands.SortedSet.handle("ZREM", [resolved_key | members], store) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   # ---------------------------------------------------------------------------
