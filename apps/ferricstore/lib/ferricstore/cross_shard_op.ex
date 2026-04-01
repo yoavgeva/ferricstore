@@ -34,10 +34,14 @@ defmodule Ferricstore.CrossShardOp do
 
   @lock_ttl_ms 5_000
   @max_retries 3
+  @max_cross_shard_keys 20
 
   @crossslot_error "CROSSSLOT Keys in request don't hash to the same slot. " <>
                       "Use hash tags {tag} to colocate keys, or switch namespace to quorum durability: " <>
                       "CONFIG SET namespace myns durability quorum"
+
+  @too_many_keys_error "ERR cross-shard operation exceeds max key limit (#{@max_cross_shard_keys}). " <>
+                          "Use hash tags {tag} to colocate keys on the same shard."
 
   @typedoc "Role for a key in a cross-shard operation."
   @type key_role :: :read | :write | :read_write
@@ -94,10 +98,15 @@ defmodule Ferricstore.CrossShardOp do
             NamespaceConfig.durability_for(ns) == :async
           end)
 
-        if has_async do
-          {:error, @crossslot_error}
-        else
-          execute_cross_shard(keys_with_roles, shard_map, execute_fn, opts)
+        cond do
+          has_async ->
+            {:error, @crossslot_error}
+
+          length(keys) > @max_cross_shard_keys ->
+            {:error, @too_many_keys_error}
+
+          true ->
+            execute_cross_shard(keys_with_roles, shard_map, execute_fn, opts)
         end
       end
     end
