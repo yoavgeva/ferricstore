@@ -1126,8 +1126,11 @@ defmodule FerricStore do
   def sadd(key, members) when is_list(members) do
     resolved_key = sandbox_key(key)
     store = build_compound_store(resolved_key)
-    result = Ferricstore.Commands.Set.handle("SADD", [resolved_key | members], store)
-    {:ok, result}
+
+    case Ferricstore.Commands.Set.handle("SADD", [resolved_key | members], store) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   @doc """
@@ -1150,8 +1153,11 @@ defmodule FerricStore do
   def srem(key, members) when is_list(members) do
     resolved_key = sandbox_key(key)
     store = build_compound_store(resolved_key)
-    result = Ferricstore.Commands.Set.handle("SREM", [resolved_key | members], store)
-    {:ok, result}
+
+    case Ferricstore.Commands.Set.handle("SREM", [resolved_key | members], store) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   @doc """
@@ -1175,8 +1181,11 @@ defmodule FerricStore do
   def smembers(key) do
     resolved_key = sandbox_key(key)
     store = build_compound_store(resolved_key)
-    result = Ferricstore.Commands.Set.handle("SMEMBERS", [resolved_key], store)
-    {:ok, result}
+
+    case Ferricstore.Commands.Set.handle("SMEMBERS", [resolved_key], store) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   @doc """
@@ -1225,8 +1234,11 @@ defmodule FerricStore do
   def scard(key) do
     resolved_key = sandbox_key(key)
     store = build_compound_store(resolved_key)
-    result = Ferricstore.Commands.Set.handle("SCARD", [resolved_key], store)
-    {:ok, result}
+
+    case Ferricstore.Commands.Set.handle("SCARD", [resolved_key], store) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   # ---------------------------------------------------------------------------
