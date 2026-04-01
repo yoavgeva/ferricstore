@@ -168,3 +168,21 @@ If patched `ra_log_wal` can't load, falls back to unpatched silently. 10x slower
 | HIGH | 7 | Embedded API errors (H1,H2), DBSIZE/RANDOMKEY (H3,H4), SCAN (H5), FLUSHDB (H6), CAS TTL (H7) |
 | MEDIUM | 7 | Mode doc (M1), Cluster role (M2), Config validation (M3), API consistency (M4,M5), Clock (M6), Sandbox cleanup (M7) |
 | LOW | 5 | Bitmap edge case, INFO stats, feature stubs, health/WAL |
+
+---
+
+## Future: FERRICSTORE.RESET command (operational)
+
+A "reset this node" command that clears local state for one or all shards
+and re-syncs from the Raft leader via snapshot. Useful for:
+- Fixing data corruption on one node without affecting others
+- Re-syncing after disk failure or manual intervention
+- No customer data loss — leader still has everything
+
+```
+FERRICSTORE.RESET SHARD 0    # reset shard 0 on this node
+FERRICSTORE.RESET ALL        # reset all shards on this node
+```
+
+ra already handles snapshot install when followers fall behind. This
+command would trigger it manually. Not needed for v1.
