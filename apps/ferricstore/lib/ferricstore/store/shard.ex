@@ -2076,8 +2076,9 @@ defmodule Ferricstore.Store.Shard do
 
 
     # Pre-compute absolute expiry before entering Raft so the state machine
-    # apply/3 remains deterministic (no System.os_time calls).
-    expire_at_ms = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: nil
+    # apply/3 remains deterministic (no clock calls inside apply).
+    # Use HLC for consistency across all code paths and multi-node.
+    expire_at_ms = if ttl_ms, do: Ferricstore.HLC.now_ms() + ttl_ms, else: nil
     result = raft_write(state, {:cas, key, expected, new_value, expire_at_ms})
 
     case result do
@@ -2121,8 +2122,8 @@ defmodule Ferricstore.Store.Shard do
 
 
     # Pre-compute absolute expiry before entering Raft so the state machine
-    # apply/3 remains deterministic.
-    expire_at_ms = System.os_time(:millisecond) + ttl_ms
+    # apply/3 remains deterministic. Use HLC for multi-node consistency.
+    expire_at_ms = Ferricstore.HLC.now_ms() + ttl_ms
     result = raft_write(state, {:lock, key, owner, expire_at_ms})
 
     case result do
@@ -2220,8 +2221,8 @@ defmodule Ferricstore.Store.Shard do
 
 
     # Pre-compute absolute expiry before entering Raft so the state machine
-    # apply/3 remains deterministic.
-    expire_at_ms = System.os_time(:millisecond) + ttl_ms
+    # apply/3 remains deterministic. Use HLC for multi-node consistency.
+    expire_at_ms = Ferricstore.HLC.now_ms() + ttl_ms
     result = raft_write(state, {:extend, key, owner, expire_at_ms})
 
     case result do
