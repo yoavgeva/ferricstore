@@ -314,27 +314,34 @@ defmodule FerricStore do
   end
 
   @doc """
-  Deletes `key` from the store.
+  Deletes one or more keys from the store.
 
-  Returns `{:ok, 1}` if the key was deleted, `{:ok, 0}` if it did not exist.
+  Accepts a single key or a list of keys. Returns `{:ok, count}` where
+  count is the number of keys that were actually deleted.
 
   ## Examples
 
-      iex> FerricStore.set("session:temp", "data")
-      :ok
-      iex> FerricStore.del("session:temp")
+      iex> FerricStore.set("k1", "v1")
+      iex> FerricStore.del("k1")
       {:ok, 1}
 
-      iex> FerricStore.del("nonexistent:key")
+      iex> FerricStore.del("nonexistent")
       {:ok, 0}
 
-  """
-  @spec del(key()) :: {:ok, non_neg_integer()} | {:error, binary()}
-  def del(key) do
-    resolved_key = sandbox_key(key)
-    store = build_compound_store(resolved_key)
+      iex> FerricStore.set("a", "1")
+      iex> FerricStore.set("b", "2")
+      iex> FerricStore.del(["a", "b", "c"])
+      {:ok, 2}
 
-    case Ferricstore.Commands.Strings.handle("DEL", [resolved_key], store) do
+  """
+  @spec del(key() | [key()]) :: {:ok, non_neg_integer()} | {:error, binary()}
+  def del(key) when is_binary(key), do: del([key])
+
+  def del(keys) when is_list(keys) do
+    resolved_keys = Enum.map(keys, &sandbox_key/1)
+    store = build_compound_store(hd(resolved_keys))
+
+    case Ferricstore.Commands.Strings.handle("DEL", resolved_keys, store) do
       {:error, _} = err -> err
       count -> {:ok, count}
     end
