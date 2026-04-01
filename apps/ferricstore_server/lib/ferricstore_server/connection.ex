@@ -1744,6 +1744,7 @@ defmodule FerricstoreServer.Connection do
         case do_sendfile_get(key, path, offset, size, state) do
           {:sent, new_state} -> {:continue, "", new_state}
           {:error_after_header, _reason} -> {:quit, "", state}
+          :fallback -> dispatch_normal("GET", [key], state)
         end
 
       {:cold_ref, _path, _offset, _size} ->
