@@ -407,7 +407,11 @@ defmodule Ferricstore.Raft.Batcher do
   # Invalidate the namespace config cache when config changes.
   # Sent by NamespaceConfig after any set/reset operation.
   def handle_info(:ns_config_changed, state) do
-    {:noreply, %{state | ns_cache: %{}}}
+    # Flush all open slots immediately so queued commands with the old
+    # window_ms are processed. Next commands create fresh slots with
+    # the new config values.
+    new_state = flush_all_slots(state)
+    {:noreply, %{new_state | ns_cache: %{}}}
   end
 
   # Catch-all for unexpected messages (e.g. stale Task results, DOWN messages
