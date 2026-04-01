@@ -287,8 +287,10 @@ defmodule Ferricstore.Commands.Json do
 
   def handle("JSON.MGET", args, store) when length(args) >= 2 do
     {keys, [path]} = Enum.split(args, length(args) - 1)
-    segments = parse_path(path)
-    Enum.map(keys, &mget_one(&1, segments, store))
+    case parse_path(path) do
+      :error -> {:error, "ERR invalid JSONPath syntax"}
+      segments -> Enum.map(keys, &mget_one(&1, segments, store))
+    end
   end
 
   def handle("JSON.MGET", _args, _store) do
@@ -371,6 +373,8 @@ defmodule Ferricstore.Commands.Json do
 
       :not_found ->
         {:error, "ERR path does not exist"}
+
+      {:error, _} = err -> err
     end
   end
 
@@ -390,6 +394,8 @@ defmodule Ferricstore.Commands.Json do
 
       :not_found ->
         {:error, "ERR path does not exist"}
+
+      {:error, _} = err -> err
     end
   end
 
@@ -409,6 +415,8 @@ defmodule Ferricstore.Commands.Json do
 
       :not_found ->
         {:error, "ERR path does not exist"}
+
+      {:error, _} = err -> err
     end
   end
 
@@ -432,6 +440,8 @@ defmodule Ferricstore.Commands.Json do
 
       :not_found ->
         0
+
+      {:error, _} = err -> err
     end
   end
 
@@ -482,7 +492,13 @@ defmodule Ferricstore.Commands.Json do
   end
 
   defp set_on_existing_key(root, key, path, new_value, nx?, xx?, store) do
-    segments = parse_path(path)
+    case parse_path(path) do
+      :error -> {:error, "ERR invalid JSONPath syntax"}
+      segments -> do_set_on_existing(root, key, segments, new_value, nx?, xx?, store)
+    end
+  end
+
+  defp do_set_on_existing(root, key, segments, new_value, nx?, xx?, store) do
     path_exists? = get_at_path(root, segments) != :not_found
 
     if blocked_by_flags?(nx?, xx?, path_exists?) do
@@ -512,6 +528,7 @@ defmodule Ferricstore.Commands.Json do
     case get_at_path(root, parse_path(path)) do
       {:ok, val} -> Jason.encode!(val)
       :not_found -> nil
+      {:error, _} = err -> err
     end
   end
 
@@ -614,10 +631,18 @@ defmodule Ferricstore.Commands.Json do
 
   # Parses a JSONPath string into a list of path segments.
   # Supports: $, $.field, $.field.subfield, $[0], $.field[0].name
-  @spec parse_path(binary()) :: [binary() | non_neg_integer()]
+  @spec parse_path(binary()) :: [binary() | non_neg_integer()] | :error
   defp parse_path("$"), do: []
   defp parse_path(<<"$", rest::binary>>), do: parse_path_segments(rest, [])
-  defp parse_path(_), do: []
+  defp parse_path(_), do: :error
+
+  # Validates path and calls fun with segments. Returns error for malformed paths.
+  defp with_valid_path(path, fun) do
+    case parse_path(path) do
+      :error -> {:error, "ERR invalid JSONPath syntax"}
+      segments -> fun.(segments)
+    end
+  end
 
   defp parse_path_segments(<<>>, acc), do: Enum.reverse(acc)
 
@@ -629,7 +654,7 @@ defmodule Ferricstore.Commands.Json do
   defp parse_path_segments(<<"[", rest::binary>>, acc) do
     case read_bracket(rest) do
       {:ok, segment, remainder} -> parse_path_segments(remainder, [segment | acc])
-      :error -> Enum.reverse(acc)
+      :error -> :error
     end
   end
 
@@ -682,6 +707,7 @@ defmodule Ferricstore.Commands.Json do
   # Gets a value at a parsed path within a decoded JSON structure.
   @spec get_at_path(term(), [binary() | non_neg_integer()]) ::
           {:ok, term()} | :not_found
+  defp get_at_path(_value, :error), do: {:error, "ERR invalid JSONPath syntax"}
   defp get_at_path(value, []), do: {:ok, value}
 
   defp get_at_path(map, [key | rest]) when is_map(map) and is_binary(key) do
@@ -742,6 +768,7 @@ defmodule Ferricstore.Commands.Json do
   # Deletes a value at a parsed path within a decoded JSON structure.
   @spec delete_at_path(term(), [binary() | non_neg_integer()]) ::
           {:ok, term()} | :not_found
+  defp delete_at_path(_value, :error), do: {:error, "ERR invalid JSONPath syntax"}
   defp delete_at_path(_value, []), do: :not_found
 
   defp delete_at_path(map, [key]) when is_map(map) and is_binary(key) do

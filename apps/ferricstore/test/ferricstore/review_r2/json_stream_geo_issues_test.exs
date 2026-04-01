@@ -201,39 +201,27 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
 
   describe "R2-M2: JSON malformed path parsing" do
     @tag :review_r2
-    test "JSON.GET with unclosed bracket path returns root document instead of error" do
+    test "JSON.GET with unclosed bracket path returns error" do
       key = ukey("json_m2")
       doc = %{"secret" => "data", "public" => "info"}
       {store, key} = store_with_json(key, doc)
 
-      # A malformed path: opening bracket but no closing bracket
       result = Json.handle("JSON.GET", [key, ~s($["unclosed)], store)
 
-      # BUG MANIFESTATION: The malformed path `$["unclosed` should return an error,
-      # but instead parse_path returns [] (empty segments) and get_at_path returns
-      # the root document. This assertion documents the bug.
-      # A correct implementation should return {:error, "ERR invalid JSONPath"} or nil.
-      refute match?({:error, _}, result),
-             "R2-M2 BUG PRESENT: malformed path should return error but currently returns a value"
-
-      # The bug causes the entire root document to be returned
-      assert is_binary(result), "malformed path returns the entire document as JSON string"
-      decoded = Jason.decode!(result)
-      assert decoded == doc,
-             "R2-M2 BUG: $[\"unclosed returns the whole root document instead of an error"
+      assert {:error, msg} = result
+      assert msg =~ "invalid JSONPath"
     end
 
     @tag :review_r2
-    test "JSON.GET with unclosed single-quote bracket also returns root" do
+    test "JSON.GET with unclosed single-quote bracket returns error" do
       key = ukey("json_m2b")
       doc = %{"key" => "value"}
       {store, key} = store_with_json(key, doc)
 
       result = Json.handle("JSON.GET", [key, "$['unclosed"], store)
 
-      # Same bug: missing ] causes parse_path to return [] => root document
-      assert is_binary(result)
-      assert Jason.decode!(result) == doc
+      assert {:error, msg} = result
+      assert msg =~ "invalid JSONPath"
     end
 
     @tag :review_r2
