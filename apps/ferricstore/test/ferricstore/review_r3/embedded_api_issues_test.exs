@@ -220,61 +220,27 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
   # ===========================================================================
 
   describe "R3-M5: sismember return type" do
-    test "sismember returns bare true, not {:ok, true}" do
+    test "sismember returns {:ok, true} for existing member" do
       {:ok, 1} = FerricStore.sadd("r3m5_set", ["member1"])
 
-      result = FerricStore.sismember("r3m5_set", "member1")
-
-      # Document the CURRENT behavior: bare boolean
-      assert result === true,
-        "sismember on existing member returned: #{inspect(result)}"
-
-      # This is the inconsistency: every other set operation returns {:ok, _}
-      # but sismember returns a bare boolean.
-      refute match?({:ok, true}, result),
-        "sismember now returns {:ok, true} — R3-M5 may be fixed. Got: #{inspect(result)}"
+      assert {:ok, true} = FerricStore.sismember("r3m5_set", "member1")
     end
 
-    test "sismember returns bare false, not {:ok, false}" do
+    test "sismember returns {:ok, false} for missing member" do
       {:ok, 1} = FerricStore.sadd("r3m5_set2", ["member1"])
 
-      result = FerricStore.sismember("r3m5_set2", "nonexistent")
-
-      assert result === false,
-        "sismember on missing member returned: #{inspect(result)}"
-
-      refute match?({:ok, false}, result),
-        "sismember now returns {:ok, false} — R3-M5 may be fixed. Got: #{inspect(result)}"
+      assert {:ok, false} = FerricStore.sismember("r3m5_set2", "nonexistent")
     end
 
-    test "sismember on non-existent key returns bare false" do
-      result = FerricStore.sismember("r3m5_nonexistent", "anything")
-
-      assert result === false,
-        "sismember on missing key returned: #{inspect(result)}"
+    test "sismember returns {:ok, false} for non-existent key" do
+      assert {:ok, false} = FerricStore.sismember("r3m5_nonexistent", "anything")
     end
 
-    test "sismember return type differs from other set operations" do
-      # Demonstrate the inconsistency:
-      # sadd, srem, smembers, scard all return {:ok, _}
-      # sismember returns bare boolean
+    test "sismember return type consistent with other set operations" do
       {:ok, 2} = FerricStore.sadd("r3m5_set3", ["a", "b"])
-
-      {:ok, members} = FerricStore.smembers("r3m5_set3")
-      assert is_list(members)
-
-      {:ok, count} = FerricStore.scard("r3m5_set3")
-      assert is_integer(count)
-
-      # sismember breaks the pattern
-      is_member = FerricStore.sismember("r3m5_set3", "a")
-      assert is_boolean(is_member), "sismember did not return boolean: #{inspect(is_member)}"
-
-      # If the API were consistent, this would work:
-      # {:ok, is_member} = FerricStore.sismember("r3m5_set3", "a")
-      # But it doesn't because sismember returns bare boolean.
-      refute is_tuple(is_member),
-        "sismember should return bare boolean (documenting current behavior)"
+      {:ok, _members} = FerricStore.smembers("r3m5_set3")
+      {:ok, _count} = FerricStore.scard("r3m5_set3")
+      {:ok, _is_member} = FerricStore.sismember("r3m5_set3", "a")
     end
   end
 end

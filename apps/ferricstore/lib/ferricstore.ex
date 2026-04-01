@@ -1201,28 +1201,31 @@ defmodule FerricStore do
   @doc """
   Checks whether `member` is a member of the set stored at `key`.
 
-  Returns `true` if the member exists in the set, `false` otherwise.
-  Returns `false` if the key does not exist.
+  Returns `{:ok, true}` if the member exists, `{:ok, false}` otherwise.
+  Returns `{:ok, false}` if the key does not exist.
 
   ## Examples
 
       iex> FerricStore.sadd("article:42:tags", ["elixir", "rust"])
       iex> FerricStore.sismember("article:42:tags", "elixir")
-      true
+      {:ok, true}
 
       iex> FerricStore.sismember("article:42:tags", "python")
-      false
+      {:ok, false}
 
       iex> FerricStore.sismember("nonexistent", "member")
-      false
+      {:ok, false}
 
   """
-  @spec sismember(key(), binary()) :: boolean()
+  @spec sismember(key(), binary()) :: {:ok, boolean()} | {:error, binary()}
   def sismember(key, member) do
     resolved_key = sandbox_key(key)
     store = build_compound_store(resolved_key)
-    result = Ferricstore.Commands.Set.handle("SISMEMBER", [resolved_key, member], store)
-    result == 1
+
+    case Ferricstore.Commands.Set.handle("SISMEMBER", [resolved_key, member], store) do
+      {:error, _} = err -> err
+      result -> {:ok, result == 1}
+    end
   end
 
   @doc """
