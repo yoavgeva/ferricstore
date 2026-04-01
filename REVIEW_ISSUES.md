@@ -345,5 +345,10 @@ Returns empty list `[]` instead of proper RESP response. May confuse clients.
 | M1 | MEDIUM | FIXED — unlock retry with backoff |
 | M2 | MEDIUM | FIXED — malformed path returns error |
 | M3 | MEDIUM | NOT A BUG — matches Redis JSONPath spec |
-| M4-M11 | MEDIUM | TODO |
+| M4 | MEDIUM | FIXED — XREADGROUP BLOCK support |
+| M5 | MEDIUM | FIXED — .meta file for bloom metadata |
+| M6 | MEDIUM | FIXED — NIF error wrapping |
+| M7 | MEDIUM | FIXED — with/else guard on NIF calls |
+| M8 | MEDIUM | NOT A BUG — code checks sentinel before subtracting |
+| M9-M11 | MEDIUM | TODO |
 | L1-L6 | LOW | Accepted / documented |
