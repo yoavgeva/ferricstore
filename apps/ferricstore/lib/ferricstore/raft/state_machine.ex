@@ -117,7 +117,11 @@ defmodule Ferricstore.Raft.StateMachine do
       ets: config.ets,
       prefix_keys: Map.get(config, :prefix_keys, PrefixIndex.table_name(config.shard_index)),
       applied_count: 0,
-      release_cursor_interval: interval
+      release_cursor_interval: interval,
+      # Cross-shard operation locks and intents — persisted in Raft state
+      # so they survive shard restarts, snapshots, and leader failovers.
+      cross_shard_locks: %{},
+      cross_shard_intents: %{}
     }
   end
 
@@ -426,30 +430,30 @@ defmodule Ferricstore.Raft.StateMachine do
   # ---------------------------------------------------------------------------
 
   def apply(meta, {:lock_keys, keys, owner_ref, expire_at_ms}, state) do
-    result = do_lock_keys(state, keys, owner_ref, expire_at_ms)
+    {new_state, result} = do_lock_keys(state, keys, owner_ref, expire_at_ms)
     old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
+    new_state = %{new_state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:unlock_keys, keys, owner_ref}, state) do
-    result = do_unlock_keys(state, keys, owner_ref)
+    {new_state, result} = do_unlock_keys(state, keys, owner_ref)
     old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
+    new_state = %{new_state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:cross_shard_intent, owner_ref, intent_map}, state) do
-    result = do_write_intent(state, owner_ref, intent_map)
+    {new_state, result} = do_write_intent(state, owner_ref, intent_map)
     old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
+    new_state = %{new_state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   def apply(meta, {:delete_intent, owner_ref}, state) do
-    result = do_delete_intent(state, owner_ref)
+    {new_state, result} = do_delete_intent(state, owner_ref)
     old_count = state.applied_count
-    new_state = %{state | applied_count: old_count + 1}
+    new_state = %{new_state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
@@ -1566,16 +1570,13 @@ defmodule Ferricstore.Raft.StateMachine do
   # The process dictionary persists across apply/3 calls because ra runs the
   # state machine in a dedicated process.
 
-  @cross_shard_locks_key :cross_shard_locks
-  @cross_shard_intents_key :cross_shard_intents
-
   # Locks all keys atomically. If any key is already locked by a different
   # owner (and not expired), rejects the entire batch.
-  defp do_lock_keys(_state, keys, owner_ref, expire_at_ms) do
-    locks = Process.get(@cross_shard_locks_key, %{})
+  # Returns {new_state, result} — locks are persisted in Raft state.
+  defp do_lock_keys(state, keys, owner_ref, expire_at_ms) do
+    locks = Map.get(state, :cross_shard_locks, %{})
     now = System.os_time(:millisecond)
 
-    # Check all keys first (all-or-nothing)
     conflict =
       Enum.find(keys, fn key ->
         case Map.get(locks, key) do
@@ -1586,23 +1587,21 @@ defmodule Ferricstore.Raft.StateMachine do
       end)
 
     if conflict do
-      {:error, :keys_locked}
+      {state, {:error, :keys_locked}}
     else
-      # All keys available — lock them
       new_locks =
         Enum.reduce(keys, locks, fn key, acc ->
           Map.put(acc, key, {owner_ref, expire_at_ms})
         end)
 
-      Process.put(@cross_shard_locks_key, new_locks)
-      :ok
+      {%{state | cross_shard_locks: new_locks}, :ok}
     end
   end
 
-  # Unlocks keys owned by the given owner_ref. Silently ignores keys not
-  # locked or locked by a different owner.
-  defp do_unlock_keys(_state, keys, owner_ref) do
-    locks = Process.get(@cross_shard_locks_key, %{})
+  # Unlocks keys owned by the given owner_ref.
+  # Returns {new_state, :ok}.
+  defp do_unlock_keys(state, keys, owner_ref) do
+    locks = Map.get(state, :cross_shard_locks, %{})
 
     new_locks =
       Enum.reduce(keys, locks, fn key, acc ->
@@ -1612,15 +1611,12 @@ defmodule Ferricstore.Raft.StateMachine do
         end
       end)
 
-    Process.put(@cross_shard_locks_key, new_locks)
-    :ok
+    {%{state | cross_shard_locks: new_locks}, :ok}
   end
 
   # Checks whether a key is locked by someone other than owner_ref.
-  # Returns :ok if the key is unlocked, expired, or owned by owner_ref.
-  # Returns {:error, :key_locked} if locked by another owner.
-  defp check_key_lock(_state, key, owner_ref) do
-    locks = Process.get(@cross_shard_locks_key, %{})
+  defp check_key_lock(state, key, owner_ref) do
+    locks = Map.get(state, :cross_shard_locks, %{})
     now = System.os_time(:millisecond)
 
     case Map.get(locks, key) do
@@ -1631,24 +1627,21 @@ defmodule Ferricstore.Raft.StateMachine do
     end
   end
 
-  # Writes an intent record. Intents are stored in process dictionary
-  # (per shard, persistent across apply/3 calls). Used for crash recovery.
-  defp do_write_intent(_state, owner_ref, intent_map) do
-    intents = Process.get(@cross_shard_intents_key, %{})
-    Process.put(@cross_shard_intents_key, Map.put(intents, owner_ref, intent_map))
-    :ok
+  # Writes an intent record. Returns {new_state, :ok}.
+  defp do_write_intent(state, owner_ref, intent_map) do
+    intents = Map.get(state, :cross_shard_intents, %{})
+    {%{state | cross_shard_intents: Map.put(intents, owner_ref, intent_map)}, :ok}
   end
 
-  # Deletes an intent record.
-  defp do_delete_intent(_state, owner_ref) do
-    intents = Process.get(@cross_shard_intents_key, %{})
-    Process.put(@cross_shard_intents_key, Map.delete(intents, owner_ref))
-    :ok
+  # Deletes an intent record. Returns {new_state, :ok}.
+  defp do_delete_intent(state, owner_ref) do
+    intents = Map.get(state, :cross_shard_intents, %{})
+    {%{state | cross_shard_intents: Map.delete(intents, owner_ref)}, :ok}
   end
 
-  # Returns all intent records. Used by the intent resolver and tests.
-  defp do_get_intents(_state) do
-    Process.get(@cross_shard_intents_key, %{})
+  # Returns all intent records.
+  defp do_get_intents(state) do
+    Map.get(state, :cross_shard_intents, %{})
   end
 
   # ---------------------------------------------------------------------------
