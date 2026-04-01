@@ -642,9 +642,16 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp in_shape?(_dist_m, lng, lat, center_lng, center_lat, %{shape: {:box, width_m, height_m}}) do
-    dx = haversine(center_lat, center_lng, center_lat, lng)
-    dy = haversine(center_lat, center_lng, lat, center_lng)
-    dx <= width_m / 2 and dy <= height_m / 2
+    # Convert box dimensions from meters to degrees at center latitude.
+    # 1 degree latitude ≈ 111,320 meters (constant).
+    # 1 degree longitude ≈ 111,320 * cos(latitude) meters (varies with latitude).
+    # Then compare member coordinates directly against the degree-based box.
+    # This matches Redis behavior and avoids the haversine center-latitude bug.
+    lat_half_deg = height_m / 2.0 / 111_320.0
+    cos_lat = :math.cos(center_lat * :math.pi / 180.0)
+    lon_half_deg = if cos_lat > 0, do: width_m / 2.0 / (111_320.0 * cos_lat), else: 180.0
+
+    abs(lat - center_lat) <= lat_half_deg and abs(lng - center_lng) <= lon_half_deg
   end
 
   defp sort_matches(matches, %{sort: :asc}) do
