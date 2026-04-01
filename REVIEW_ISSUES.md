@@ -164,8 +164,20 @@ If patched `ra_log_wal` can't load, falls back to unpatched silently. 10x slower
 
 | Severity | Count | Key Areas |
 |----------|-------|-----------|
-| CRITICAL | 1 | Sandbox async write bypass |
-| HIGH | 7 | Embedded API errors (H1,H2), DBSIZE/RANDOMKEY (H3,H4), SCAN (H5), FLUSHDB (H6), CAS TTL (H7) |
-| MEDIUM | 7 | Mode doc (M1), Cluster role (M2), Config validation (M3), API consistency (M4,M5), Clock (M6), Sandbox cleanup (M7) |
-| LOW | 5 | Bitmap edge case, INFO stats, feature stubs, health/WAL |
+| C1 | CRITICAL | NOT A BUG — sandbox routes through GenServer |
+| H1 | HIGH | FIXED — set ops propagate errors |
+| H2 | HIGH | FIXED — sorted set ops propagate errors |
+| H3 | HIGH | NOT A BUG — DBSIZE already filters |
+| H4 | HIGH | NOT A BUG — randomkey filters |
+| H5 | HIGH | Regression guard |
+| H6 | HIGH | FIXED — FLUSHDB clears registries |
+| H7 | HIGH | Regression guard (fallback path) |
+| M1 | MEDIUM | FIXED — mode doc updated |
+| M2 | MEDIUM | TODO — cluster role hardcoded |
+| M3 | MEDIUM | TODO — config cross-validation |
+| M4 | MEDIUM | FIXED — del returns {:ok, count}, multi-key |
+| M5 | MEDIUM | FIXED — sismember returns {:ok, boolean} |
+| M6 | MEDIUM | TODO — clock consistency |
+| M7 | MEDIUM | NOT A BUG — sandbox never publishes |
+| L1-L5 | LOW | Accepted |
 
