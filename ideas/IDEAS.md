@@ -23,3 +23,33 @@ See [acid-transactions.md](acid-transactions.md) for full design.
 Extends to cross-node transactions using Two-Phase Commit (2PC) across Raft groups. PREPARE → vote → COMMIT/ABORT. Hard problems: coordinator crash, network partitions, double latency.
 
 Most users can avoid this with hash tags: `{user}:profile` and `{user}:settings` hash to the same shard.
+
+## FERRICSTORE.RESET — Per-Node Shard Reset
+
+A "reset this node" command that clears local state for one or all shards
+and re-syncs from the Raft leader via snapshot. Useful for:
+
+- Fixing data corruption on one node without affecting others
+- Re-syncing after disk failure or manual intervention
+- No customer data loss — leader still has everything
+
+```
+FERRICSTORE.RESET SHARD 0    # reset shard 0 on this node
+FERRICSTORE.RESET ALL        # reset all shards on this node
+```
+
+ra already handles snapshot install when followers fall behind. This
+command would trigger it manually by deleting local Bitcask + ETS +
+registries for the target shard(s), then requesting a fresh snapshot
+from the Raft leader.
+
+## FLUSHDB Multi-Node Registry Propagation
+
+FLUSHDB currently clears keys via Raft (replicated to all nodes) but
+clears probabilistic registries (Bloom, Cuckoo, CMS mmap handles)
+locally only. On multi-node, followers' registries are not cleared.
+
+Fix: Add a `{:flush_registries, shard_index}` Raft command that each
+node's StateMachine executes to clear local registries. Or include
+registry cleanup in the StateMachine's delete handler when it detects
+a probabilistic key prefix.
