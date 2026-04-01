@@ -333,8 +333,11 @@ defmodule FerricStore do
   def del(key) do
     resolved_key = sandbox_key(key)
     store = build_compound_store(resolved_key)
-    Ferricstore.Commands.Strings.handle("DEL", [resolved_key], store)
-    :ok
+
+    case Ferricstore.Commands.Strings.handle("DEL", [resolved_key], store) do
+      {:error, _} = err -> err
+      count -> {:ok, count}
+    end
   end
 
   @doc """

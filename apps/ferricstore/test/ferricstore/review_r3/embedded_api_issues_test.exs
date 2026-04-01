@@ -174,49 +174,32 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
   # ===========================================================================
 
   describe "R3-M4: del() return value" do
-    test "del returns :ok regardless of whether key existed" do
-      # del currently discards the command handler result and always returns :ok.
-      # This means callers cannot distinguish between:
-      #   - key was deleted (Redis returns 1)
-      #   - key did not exist (Redis returns 0)
-      #   - error occurred
+    test "del returns {:ok, 0} for non-existent key" do
+      result = FerricStore.del("r3m4_nonexistent")
+      assert {:ok, 0} = result
+    end
 
-      # Non-existent key
-      result_miss = FerricStore.del("r3m4_nonexistent")
-      assert result_miss == :ok, "del on missing key: #{inspect(result_miss)}"
-
-      # Existing key
+    test "del returns {:ok, 1} for existing key" do
       :ok = FerricStore.set("r3m4_exists", "value")
-      result_hit = FerricStore.del("r3m4_exists")
-      assert result_hit == :ok, "del on existing key: #{inspect(result_hit)}"
+      result = FerricStore.del("r3m4_exists")
+      assert {:ok, 1} = result
 
       # Verify the key is actually gone
       assert {:ok, nil} = FerricStore.get("r3m4_exists")
     end
 
-    test "del does not return {:ok, count} like other write operations" do
-      # Set operations return {:ok, count}, but del returns bare :ok.
-      # This documents the inconsistency — del should arguably return
-      # {:ok, 1} or {:ok, 0} to match Redis DEL behavior.
+    test "del returns {:ok, count} like other write operations" do
       :ok = FerricStore.set("r3m4_count", "value")
-
       result = FerricStore.del("r3m4_count")
-
-      # This test documents the CURRENT behavior (returns :ok).
-      # If del is fixed to return {:ok, count}, this assertion will fail,
-      # proving the fix landed.
-      refute match?({:ok, _count}, result),
-        "del now returns {:ok, count} — R3-M4 may be fixed. Got: #{inspect(result)}"
+      assert {:ok, _count} = result
     end
 
     test "del on a set key returns :ok (error not surfaced)" do
       {:ok, 2} = FerricStore.sadd("r3m4_set", ["a", "b"])
 
-      # del routes through Commands.Strings.handle("DEL", ...) which may
-      # not clean up compound set keys properly, but the embedded API
-      # discards whatever it returns.
+      # del now returns {:ok, count}
       result = FerricStore.del("r3m4_set")
-      assert result == :ok, "del on set key: #{inspect(result)}"
+      assert {:ok, _count} = result
     end
   end
 
