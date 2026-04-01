@@ -98,6 +98,12 @@ defmodule Ferricstore.Test.ShardHelpers do
       AsyncApplyWorker.drain(i)
     end)
 
+    # Clear cross-shard locks and intents via Raft so tests start clean.
+    Enum.each(0..(shard_count - 1), fn i ->
+      shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+      :ra.process_command(shard_id, {:clear_locks})
+    end)
+
     # Safety net: clear any remaining compound key entries from ETS.
     # After the per-shard deletes and drain above this should be a no-op,
     # but guards against edge cases where NIF tombstones haven't propagated.

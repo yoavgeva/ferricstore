@@ -33,7 +33,7 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
 
   describe "R2-H9: Vector VGET/VSEARCH crash on corrupted data" do
     @tag :review_r2
-    test "VGET on corrupted vector data should not crash the process" do
+    test "VGET on corrupted vector data should return error, not crash" do
       store = MockStore.make()
       collection = ukey("coll")
 
@@ -45,27 +45,14 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
       corrupted_key = "V:" <> collection <> <<0>> <> "corrupted_vec"
       store.compound_put.(collection, corrupted_key, "this_is_not_valid_etf", 0)
 
-      # VGET should not crash. It may return an error or the raw data,
-      # but it must not raise / throw / exit.
-      result =
-        try do
-          Vector.handle("VGET", [collection, "corrupted_vec"], store)
-        rescue
-          e -> {:crashed, e}
-        catch
-          kind, reason -> {:crashed, {kind, reason}}
-        end
+      # VGET should return an error tuple, not crash.
+      result = Vector.handle("VGET", [collection, "corrupted_vec"], store)
 
-      # If the code is correct, result should be an error tuple, not a crash.
-      # Currently this WILL crash with ArgumentError from binary_to_term.
-      # This test documents the bug: if it fails with {:crashed, _}, the bug
-      # is confirmed.
-      refute match?({:crashed, _}, result),
-        "VGET crashed on corrupted data instead of returning an error: #{inspect(result)}"
+      assert result == {:error, "ERR corrupted vector data"}
     end
 
     @tag :review_r2
-    test "VSEARCH should not crash when one vector entry is corrupted" do
+    test "VSEARCH skips corrupted entries and returns valid results" do
       store = MockStore.make()
       collection = ukey("coll")
 
@@ -77,19 +64,16 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
       corrupted_key = "V:" <> collection <> <<0>> <> "corrupted_vec"
       store.compound_put.(collection, corrupted_key, "garbage_bytes", 0)
 
-      # VSEARCH should not crash. It should either skip the corrupted entry
-      # or return an error, but never raise.
+      # VSEARCH should skip the corrupted entry and return only the valid one.
       result =
-        try do
-          Vector.handle("VSEARCH", [collection, "1.0", "0.0", "0.0", "TOP", "10"], store)
-        rescue
-          e -> {:crashed, e}
-        catch
-          kind, reason -> {:crashed, {kind, reason}}
-        end
+        Vector.handle("VSEARCH", [collection, "1.0", "0.0", "0.0", "TOP", "10"], store)
 
-      refute match?({:crashed, _}, result),
-        "VSEARCH crashed on corrupted data instead of handling gracefully: #{inspect(result)}"
+      assert is_list(result), "Expected list result, got: #{inspect(result)}"
+
+      # Result is [key, distance, ...] pairs. Should contain only valid_vec.
+      keys = result |> Enum.chunk_every(2) |> Enum.map(fn [k, _d] -> k end)
+      assert keys == ["valid_vec"]
+      refute "corrupted_vec" in keys
     end
   end
 

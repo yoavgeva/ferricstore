@@ -126,8 +126,14 @@ defmodule Ferricstore.Commands.Vector do
       vec_key = vector_key(collection, key)
 
       case store.compound_get.(collection, vec_key) do
-        nil -> nil
-        encoded -> encoded |> :erlang.binary_to_term() |> format_vector()
+        nil ->
+          nil
+
+        encoded ->
+          case safe_binary_to_term(encoded) do
+            {:ok, floats} -> format_vector(floats)
+            {:error, :corrupted} -> {:error, "ERR corrupted vector data"}
+          end
       end
     end
   end
@@ -175,10 +181,15 @@ defmodule Ferricstore.Commands.Vector do
         entries
         # Exclude the HNSW metadata sentinel key used for index rebuild
         |> Enum.reject(fn {sub_key, _} -> sub_key == "__hnsw_meta__" end)
-        |> Enum.map(fn {sub_key, encoded} ->
-          vec = :erlang.binary_to_term(encoded)
-          dist = compute_distance(metric, query_floats, vec)
-          {sub_key, dist}
+        |> Enum.flat_map(fn {sub_key, encoded} ->
+          case safe_binary_to_term(encoded) do
+            {:ok, vec} ->
+              dist = compute_distance(metric, query_floats, vec)
+              [{sub_key, dist}]
+
+            {:error, :corrupted} ->
+              []
+          end
         end)
         |> Enum.sort_by(fn {_key, dist} -> dist end)
         |> Enum.take(k)
@@ -292,7 +303,18 @@ defmodule Ferricstore.Commands.Vector do
         {:error, "ERR collection '#{collection}' not found"}
 
       encoded ->
-        {:ok, :erlang.binary_to_term(encoded)}
+        case safe_binary_to_term(encoded) do
+          {:ok, term} -> {:ok, term}
+          {:error, :corrupted} -> {:error, "ERR corrupted collection metadata"}
+        end
+    end
+  end
+
+  defp safe_binary_to_term(encoded) do
+    try do
+      {:ok, :erlang.binary_to_term(encoded)}
+    rescue
+      ArgumentError -> {:error, :corrupted}
     end
   end
 

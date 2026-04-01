@@ -81,6 +81,9 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
       if should_cleanup do
         shard_id = Cluster.shard_server_id(shard_idx)
         :ra.process_command(shard_id, {:delete_intent, owner_ref})
+
+        # Also unlock any keys associated with this intent on their respective shards
+        unlock_intent_keys(keys_map, owner_ref)
       end
     end
 
@@ -106,6 +109,18 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
       # In all cases, cleaning up the intent is the correct action.
       _matches = current_hash == stored_hash
       true
+    end)
+  end
+
+  # Unlocks keys listed in the intent's keys map on their respective shards.
+  defp unlock_intent_keys(keys_map, owner_ref) do
+    keys_map
+    |> Map.values()
+    |> Enum.uniq()
+    |> Enum.each(fn key ->
+      shard_idx = Router.shard_for(key)
+      shard_id = Cluster.shard_server_id(shard_idx)
+      :ra.process_command(shard_id, {:unlock_keys, [key], owner_ref})
     end)
   end
 

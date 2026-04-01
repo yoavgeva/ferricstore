@@ -623,7 +623,13 @@ defmodule Ferricstore.Commands.Strings do
 
   defp parse_set_opts(opts), do: parse_set_opts(opts, @set_opts_default)
 
-  defp parse_set_opts([], acc), do: {:ok, acc}
+  defp parse_set_opts([], acc) do
+    if acc.nx and acc.xx do
+      {:error, "ERR XX and NX options at the same time are not compatible"}
+    else
+      {:ok, acc}
+    end
+  end
 
   defp parse_set_opts(["NX" | rest], acc) do
     parse_set_opts(rest, %{acc | nx: true})

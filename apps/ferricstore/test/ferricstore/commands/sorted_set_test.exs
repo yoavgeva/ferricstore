@@ -84,7 +84,8 @@ defmodule Ferricstore.Commands.SortedSetTest do
     test "ZSCORE returns score string" do
       store = MockStore.make()
       SortedSet.handle("ZADD", ["zs", "3.14", "pi"], store)
-      assert "3.14" == SortedSet.handle("ZSCORE", ["zs", "pi"], store)
+      # ZSCORE now formats scores consistently with ZRANGE WITHSCORES
+      assert "3.14000000000000012" == SortedSet.handle("ZSCORE", ["zs", "pi"], store)
     end
 
     test "ZSCORE returns nil for missing member" do
@@ -721,21 +722,19 @@ defmodule Ferricstore.Commands.SortedSetTest do
   end
 
   describe "ZADD option conflict edge cases" do
-    test "ZADD with NX and XX set: new member is not added" do
+    test "ZADD with NX and XX returns error (mutually exclusive flags)" do
       store = MockStore.make()
-      # NX says only add new, XX says only update existing
-      # For a new member: NX passes but XX blocks -> not added
-      assert 0 == SortedSet.handle("ZADD", ["zs", "NX", "XX", "1.0", "a"], store)
-      assert nil == SortedSet.handle("ZSCORE", ["zs", "a"], store)
+      # Redis rejects NX+XX
+      assert {:error, "ERR XX and NX options at the same time are not compatible"} =
+               SortedSet.handle("ZADD", ["zs", "NX", "XX", "1.0", "a"], store)
     end
 
-    test "ZADD with NX and XX set: existing member is not updated" do
+    test "ZADD with NX and XX on existing member returns error" do
       store = MockStore.make()
       SortedSet.handle("ZADD", ["zs", "1.0", "a"], store)
-      # NX says don't update existing, XX says only update existing
-      # For existing: NX blocks -> not updated
-      assert 0 == SortedSet.handle("ZADD", ["zs", "NX", "XX", "5.0", "a"], store)
-      assert "1.0" == SortedSet.handle("ZSCORE", ["zs", "a"], store)
+      # Redis rejects NX+XX regardless of member existence
+      assert {:error, "ERR XX and NX options at the same time are not compatible"} =
+               SortedSet.handle("ZADD", ["zs", "NX", "XX", "5.0", "a"], store)
     end
   end
 

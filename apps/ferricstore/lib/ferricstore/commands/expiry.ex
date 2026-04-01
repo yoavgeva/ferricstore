@@ -81,7 +81,10 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp set_expiry_seconds(key, secs_str, store) do
     case Integer.parse(secs_str) do
-      {secs, ""} when secs <= 0 ->
+      {secs, ""} when secs < 0 ->
+        0
+
+      {0, ""} ->
         delete_if_exists(key, store)
 
       {secs, ""} ->
@@ -94,7 +97,10 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp set_expiry_ms(key, ms_str, store) do
     case Integer.parse(ms_str) do
-      {ms, ""} when ms <= 0 ->
+      {ms, ""} when ms < 0 ->
+        0
+
+      {0, ""} ->
         delete_if_exists(key, store)
 
       {ms, ""} ->

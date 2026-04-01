@@ -104,7 +104,7 @@ defmodule Ferricstore.Commands.SortedSet do
 
       case store.compound_get.(key, compound_key) do
         nil -> nil
-        score_str -> score_str
+        score_str -> format_score_str(score_str)
       end
     end
   end
@@ -449,7 +449,7 @@ defmodule Ferricstore.Commands.SortedSet do
         end
 
       {next_cursor, batch} = paginate(filtered, cursor, count)
-      elements = Enum.flat_map(batch, fn {member, score} -> [member, score] end)
+      elements = Enum.flat_map(batch, fn {member, score} -> [member, format_score_str(score)] end)
       [next_cursor, elements]
     end
   end
@@ -527,7 +527,7 @@ defmodule Ferricstore.Commands.SortedSet do
 
         case store.compound_get.(key, compound_key) do
           nil -> nil
-          score_str -> score_str
+          score_str -> format_score_str(score_str)
         end
       end)
     end
@@ -664,6 +664,15 @@ defmodule Ferricstore.Commands.SortedSet do
     :erlang.float_to_binary(score, [:compact, decimals: 17])
   end
 
+  # Parses a stored score string to float, then formats it consistently.
+  # Ensures ZSCORE, ZMSCORE, and ZSCAN use the same format as ZRANGE WITHSCORES.
+  defp format_score_str(score_str) do
+    case Float.parse(score_str) do
+      {score, ""} -> format_score(score)
+      _ -> score_str
+    end
+  end
+
   # Parse ZADD options and score/member pairs
   defp parse_zadd_opts(args) do
     parse_zadd_opts(args, %{nx: false, xx: false, gt: false, lt: false, ch: false})
@@ -676,23 +685,38 @@ defmodule Ferricstore.Commands.SortedSet do
   defp parse_zadd_opts(["CH" | rest], opts), do: parse_zadd_opts(rest, %{opts | ch: true})
 
   defp parse_zadd_opts(score_member_args, opts) do
-    if rem(length(score_member_args), 2) != 0 or score_member_args == [] do
-      {:error, "ERR wrong number of arguments for 'zadd' command"}
-    else
-      pairs =
-        score_member_args
-        |> Enum.chunk_every(2)
-        |> Enum.reduce_while([], fn [score_str, member], acc ->
-          case parse_score(score_str) do
-            {:ok, score} -> {:cont, [{score, member} | acc]}
-            :error -> {:halt, :error}
-          end
-        end)
+    # Validate mutually exclusive flag combinations (Redis compat)
+    cond do
+      opts.nx and opts.xx ->
+        {:error, "ERR XX and NX options at the same time are not compatible"}
 
-      case pairs do
-        :error -> {:error, "ERR value is not a valid float"}
-        pairs -> {:ok, opts, Enum.reverse(pairs)}
-      end
+      opts.gt and opts.lt ->
+        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+
+      opts.gt and opts.nx ->
+        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+
+      opts.lt and opts.nx ->
+        {:error, "ERR GT, LT, and NX options at the same time are not compatible"}
+
+      rem(length(score_member_args), 2) != 0 or score_member_args == [] ->
+        {:error, "ERR wrong number of arguments for 'zadd' command"}
+
+      true ->
+        pairs =
+          score_member_args
+          |> Enum.chunk_every(2)
+          |> Enum.reduce_while([], fn [score_str, member], acc ->
+            case parse_score(score_str) do
+              {:ok, score} -> {:cont, [{score, member} | acc]}
+              :error -> {:halt, :error}
+            end
+          end)
+
+        case pairs do
+          :error -> {:error, "ERR value is not a valid float"}
+          pairs -> {:ok, opts, Enum.reverse(pairs)}
+        end
     end
   end
 

@@ -464,6 +464,20 @@ defmodule Ferricstore.Raft.StateMachine do
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
+  def apply(meta, {:get_lock_count}, state) do
+    result = map_size(Map.get(state, :cross_shard_locks, %{}))
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:clear_locks}, state) do
+    new_state = %{state | cross_shard_locks: %{}, cross_shard_intents: %{}}
+    old_count = state.applied_count
+    new_state = %{new_state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, :ok)
+  end
+
   def apply(meta, {:locked_put, key, value, expire_at_ms, owner_ref}, state) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
 
@@ -1589,8 +1603,11 @@ defmodule Ferricstore.Raft.StateMachine do
     if conflict do
       {state, {:error, :keys_locked}}
     else
+      # Prune expired locks to prevent unbounded memory growth
+      pruned = Map.reject(locks, fn {_k, {_ref, exp}} -> exp <= now end)
+
       new_locks =
-        Enum.reduce(keys, locks, fn key, acc ->
+        Enum.reduce(keys, pruned, fn key, acc ->
           Map.put(acc, key, {owner_ref, expire_at_ms})
         end)
 

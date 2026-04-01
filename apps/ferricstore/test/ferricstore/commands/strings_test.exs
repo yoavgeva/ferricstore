@@ -246,14 +246,15 @@ defmodule Ferricstore.Commands.StringsTest do
       assert msg =~ "invalid expire"
     end
 
-    test "SET with both NX and XX always returns nil (contradictory flags)" do
-      # Key absent: NX passes, but XX fails → nil
+    test "SET with both NX and XX returns error (mutually exclusive flags)" do
+      # Redis rejects NX+XX regardless of key state
       store_empty = MockStore.make()
-      assert nil == Strings.handle("SET", ["key", "val", "NX", "XX"], store_empty)
+      assert {:error, "ERR XX and NX options at the same time are not compatible"} =
+               Strings.handle("SET", ["key", "val", "NX", "XX"], store_empty)
 
-      # Key present: NX fails → nil
       store_present = MockStore.make(%{"key" => {"old", 0}})
-      assert nil == Strings.handle("SET", ["key", "val", "NX", "XX"], store_present)
+      assert {:error, "ERR XX and NX options at the same time are not compatible"} =
+               Strings.handle("SET", ["key", "val", "NX", "XX"], store_present)
     end
 
     test "SET with EX and PX both specified returns syntax error" do

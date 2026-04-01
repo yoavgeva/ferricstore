@@ -56,9 +56,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       ShardHelpers.compact_wal()
       ShardHelpers.kill_shard_safely(shard_idx)
 
-      # After restart, the process dictionary is gone. The lock should be lost.
-      # BUG: another owner can now lock the same key immediately, proving the
-      # lock was not persisted through the restart.
+      # FIX (c22271c): Locks are now persisted in Raft state and survive restarts.
       new_shard_id = Cluster.shard_server_id(shard_idx)
       new_other_ref = make_ref()
       new_expire = System.os_time(:millisecond) + 30_000
@@ -66,12 +64,12 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       {:ok, result, _} =
         :ra.process_command(new_shard_id, {:lock_keys, [key], new_other_ref, new_expire})
 
-      # This PASSES (proves the bug): the lock is gone after restart
-      assert result == :ok,
-             "R2-C2: Lock should be gone after shard restart (process dictionary lost)"
+      # Lock survives restart -- another owner cannot acquire it
+      assert result == {:error, :keys_locked},
+             "R2-C2: Lock should survive shard restart (persisted in Raft state)"
 
-      # Clean up
-      :ra.process_command(new_shard_id, {:unlock_keys, [key], new_other_ref})
+      # Clean up: unlock with original owner
+      :ra.process_command(new_shard_id, {:unlock_keys, [key], owner_ref})
     end
 
     @tag :shard_kill
@@ -102,13 +100,16 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       ShardHelpers.compact_wal()
       ShardHelpers.kill_shard_safely(coordinator_shard_idx)
 
-      # After restart, intent should be gone (process dictionary lost)
+      # FIX (c22271c): Intents are now persisted in Raft state and survive restarts.
       new_shard_id = Cluster.shard_server_id(coordinator_shard_idx)
       {:ok, intents_after, _} = :ra.process_command(new_shard_id, {:get_intents})
 
-      # BUG: intent is lost -- crash recovery cannot find it
-      refute Map.has_key?(intents_after, owner_ref),
-             "R2-C2: Intent should be gone after shard restart (process dictionary lost)"
+      # Intent survives restart -- crash recovery can find it
+      assert Map.has_key?(intents_after, owner_ref),
+             "R2-C2: Intent should survive shard restart (persisted in Raft state)"
+
+      # Clean up
+      :ra.process_command(new_shard_id, {:delete_intent, owner_ref})
     end
   end
 
@@ -333,16 +334,15 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       {:ok, intents_after, _} = :ra.process_command(coordinator_id, {:get_intents})
       refute Map.has_key?(intents_after, owner_ref), "Intent should be cleaned up"
 
-      # BUG: Lock should ALSO be cleaned up, but it's still there.
-      # The intent resolver only deletes the intent, not the lock.
+      # FIX: Lock should be cleaned up along with the intent.
       {:ok, lock_result, _} =
         :ra.process_command(shard_id, {:lock_keys, [k1], other_ref, expire_at})
 
-      assert lock_result == {:error, :keys_locked},
-             "R2-H3: Lock persists after intent resolver runs -- resolver doesn't clean up locks"
+      assert lock_result == :ok,
+             "R2-H3: Lock should be cleaned up after intent resolver runs"
 
-      # Clean up: manually unlock
-      :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
+      # Clean up
+      :ra.process_command(shard_id, {:unlock_keys, [k1], other_ref})
     end
   end
 
@@ -396,26 +396,24 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
         :ra.process_command(shard_id, {:lock_keys, [key], ref, expired_at})
       end
 
-      # If there were a cleanup mechanism, the lock map would be small.
-      # Without cleanup, it keeps growing. We verify the shard is still
-      # functional (the accumulated entries don't cause errors, just waste memory).
+      # FIX: Trigger a new lock operation which prunes expired entries.
+      # After pruning, the lock map should only contain non-expired entries.
       test_ref = make_ref()
       test_key = "r2h4_after_#{:rand.uniform(1_000_000)}"
 
       {:ok, :ok, _} =
-        :ra.process_command(shard_id, {:lock_keys, [test_key], test_ref, now + 5_000})
+        :ra.process_command(shard_id, {:lock_keys, [test_key], test_ref, now + 30_000})
 
-      {:ok, :ok, _} =
-        :ra.process_command(shard_id, {:unlock_keys, [test_key], test_ref})
+      # Query the cross_shard_locks map size to verify expired entries were pruned.
+      # The map should contain at most the 2 non-expired locks (first_key + test_key),
+      # not 200+ accumulated expired entries.
+      {:ok, lock_count, _} = :ra.process_command(shard_id, {:get_lock_count})
 
-      # This test PASSES, documenting that expired locks are never cleaned up.
-      # The process dictionary map grows monotonically with unique keys.
-      # No assertion failure expected -- the bug is the absence of cleanup,
-      # which manifests as unbounded memory growth over time.
-      assert true,
-             "R2-H4: Expired locks accumulate without cleanup -- memory leak in process dict"
+      assert lock_count <= 5,
+             "R2-H4: Expected expired locks to be pruned, but #{lock_count} entries remain"
 
-      # Clean up the one non-expired lock we created
+      # Clean up
+      :ra.process_command(shard_id, {:unlock_keys, [test_key], test_ref})
       :ra.process_command(shard_id, {:unlock_keys, [first_key], new_ref})
     end
   end

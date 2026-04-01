@@ -241,36 +241,27 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
   # ===========================================================================
 
   describe "R2-H8: EXPIRE/PEXPIRE with negative TTL" do
-    # Redis behavior (verified against Redis 7.2):
-    #   EXPIRE key -1  →  returns (integer) 2 if key existed and was deleted
-    #                      (since Redis 7.0, returns 2; older versions returned 1)
-    # Actually, Redis docs say: "Since Redis 2.6, you can call EXPIRE with a
-    # negative timeout to delete the key." and it returns 1 if timeout was set.
-    #
-    # The review issue R2-H8 states: "EXPIRE key -1 should return 0 and NOT
-    # delete the key." This contradicts Redis docs. We test the claim as stated.
+    # Redis behavior: negative EXPIRE/PEXPIRE returns 0 and does NOT modify
+    # the key. Zero EXPIRE/PEXPIRE deletes the key (returns 1 if existed).
 
-    test "EXPIRE with negative seconds should return error per review finding" do
+    test "EXPIRE with negative seconds returns 0 and does not modify the key" do
       store = MockStore.make(%{"mykey" => {"myvalue", 0}})
 
       result = Expiry.handle("EXPIRE", ["mykey", "-1"], store)
 
-      # R2-H8 claim: should return {:error, ...} for negative TTL
-      # BUG: Currently returns 1 and deletes the key
-      # (Note: Redis actually DOES delete on negative TTL, returning 1.
-      #  But the issue states this should be an error. Testing the claim.)
-      assert {:error, _msg} = result,
-             "R2-H8: EXPIRE -1 should return error, got: #{inspect(result)}"
+      # Negative TTL: return 0, key untouched
+      assert result == 0,
+             "R2-H8: EXPIRE -1 should return 0, got: #{inspect(result)}"
     end
 
-    test "PEXPIRE with negative milliseconds should return error per review finding" do
+    test "PEXPIRE with negative milliseconds returns 0 and does not modify the key" do
       store = MockStore.make(%{"mykey" => {"myvalue", 0}})
 
       result = Expiry.handle("PEXPIRE", ["mykey", "-1"], store)
 
-      # BUG: Currently returns 1 and deletes the key
-      assert {:error, _msg} = result,
-             "R2-H8: PEXPIRE -1 should return error, got: #{inspect(result)}"
+      # Negative TTL: return 0, key untouched
+      assert result == 0,
+             "R2-H8: PEXPIRE -1 should return 0, got: #{inspect(result)}"
     end
 
     test "EXPIRE with negative TTL should not delete the key" do
@@ -278,8 +269,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
 
       Expiry.handle("EXPIRE", ["mykey", "-1"], store)
 
-      # R2-H8: key should still exist after negative TTL
-      # BUG: key is deleted
+      # Key should still exist after negative TTL
       assert store.get.("mykey") == "myvalue",
              "R2-H8: EXPIRE -1 should not delete the key, but key was deleted"
     end
