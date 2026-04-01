@@ -173,11 +173,11 @@ If patched `ra_log_wal` can't load, falls back to unpatched silently. 10x slower
 | H6 | HIGH | FIXED — FLUSHDB clears registries |
 | H7 | HIGH | Regression guard (fallback path) |
 | M1 | MEDIUM | FIXED — mode doc updated |
-| M2 | MEDIUM | TODO — cluster role hardcoded |
-| M3 | MEDIUM | TODO — config cross-validation |
+| M2 | MEDIUM | FIXED — queries ra.members for actual role |
+| M3 | MEDIUM | FIXED — validates min <= max |
 | M4 | MEDIUM | FIXED — del returns {:ok, count}, multi-key |
 | M5 | MEDIUM | FIXED — sismember returns {:ok, boolean} |
-| M6 | MEDIUM | TODO — clock consistency |
+| M6 | MEDIUM | FIXED — HLC consistently |
 | M7 | MEDIUM | NOT A BUG — sandbox never publishes |
 | L1-L5 | LOW | Accepted |
 
