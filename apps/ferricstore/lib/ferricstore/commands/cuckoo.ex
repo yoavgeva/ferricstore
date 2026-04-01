@@ -101,7 +101,11 @@ defmodule Ferricstore.Commands.Cuckoo do
   def handle("CF.DEL", [key, element], store) do
     case get_cuckoo(key, store) do
       nil -> 0
-      {resource, _meta} -> NIF.cuckoo_del(resource, element)
+      {resource, _meta} ->
+        case NIF.cuckoo_del(resource, element) do
+          {:error, reason} -> {:error, "ERR cuckoo del failed: #{inspect(reason)}"}
+          result -> result
+        end
     end
   end
 
