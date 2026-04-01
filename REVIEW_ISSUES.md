@@ -342,5 +342,8 @@ Returns empty list `[]` instead of proper RESP response. May confuse clients.
 | H11 | HIGH | FIXED — RESP-encoded error |
 | H12 | HIGH | FIXED — sendfile fallback to normal GET |
 | H13 | HIGH | FIXED — WATCH value hash |
-| M1-M11 | MEDIUM | TODO |
+| M1 | MEDIUM | FIXED — unlock retry with backoff |
+| M2 | MEDIUM | FIXED — malformed path returns error |
+| M3 | MEDIUM | NOT A BUG — matches Redis JSONPath spec |
+| M4-M11 | MEDIUM | TODO |
 | L1-L6 | LOW | Accepted / documented |
