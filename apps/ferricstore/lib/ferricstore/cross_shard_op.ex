@@ -32,6 +32,8 @@ defmodule Ferricstore.CrossShardOp do
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Cluster
 
+  require Logger
+
   @lock_ttl_ms 5_000
   @max_retries 3
   @max_cross_shard_keys 20
@@ -248,16 +250,28 @@ defmodule Ferricstore.CrossShardOp do
   end
 
   defp parallel_unlock(shards, lock_map, owner_ref) do
-    shards
-    |> Enum.filter(fn idx -> Map.get(lock_map, idx, []) != [] end)
-    |> Enum.map(fn shard_idx ->
-      Task.async(fn ->
-        keys_to_unlock = Map.get(lock_map, shard_idx, [])
-        shard_id = Cluster.shard_server_id(shard_idx)
-        :ra.process_command(shard_id, {:unlock_keys, keys_to_unlock, owner_ref})
+    shard_tasks =
+      shards
+      |> Enum.filter(fn idx -> Map.get(lock_map, idx, []) != [] end)
+      |> Enum.map(fn shard_idx ->
+        {shard_idx,
+         Task.async(fn ->
+           keys_to_unlock = Map.get(lock_map, shard_idx, [])
+           shard_id = Cluster.shard_server_id(shard_idx)
+           :ra.process_command(shard_id, {:unlock_keys, keys_to_unlock, owner_ref})
+         end)}
       end)
+
+    results = Task.await_many(Enum.map(shard_tasks, fn {_idx, task} -> task end), 5_000)
+
+    Enum.zip(shard_tasks, results)
+    |> Enum.each(fn {{shard_idx, _task}, result} ->
+      case result do
+        {:ok, :ok, _} -> :ok
+        other ->
+          Logger.warning("CrossShardOp: unlock failed on shard #{shard_idx}: #{inspect(other)} — lock will expire via TTL")
+      end
     end)
-    |> Task.await_many(5_000)
   end
 
   # ---------------------------------------------------------------------------
