@@ -81,11 +81,12 @@ defmodule Ferricstore.Review.H5ExpireatPastTest do
   # ---------------------------------------------------------------------------
 
   describe "EXPIRE/PEXPIRE handle non-positive values correctly" do
-    test "EXPIRE with negative seconds deletes the key" do
+    test "EXPIRE with negative seconds returns error (Redis 7+)" do
       store = MockStore.make(%{"k" => {"v", 0}})
-      assert 1 == Expiry.handle("EXPIRE", ["k", "-1"], store)
-      assert store.get.("k") == nil
-      assert Expiry.handle("TTL", ["k"], store) == -2
+      assert {:error, msg} = Expiry.handle("EXPIRE", ["k", "-1"], store)
+      assert msg =~ "invalid expire time"
+      # Key not modified
+      assert store.get.("k") == "v"
     end
 
     test "EXPIRE 0 deletes the key" do
@@ -95,11 +96,11 @@ defmodule Ferricstore.Review.H5ExpireatPastTest do
       assert Expiry.handle("TTL", ["k"], store) == -2
     end
 
-    test "PEXPIRE with negative ms deletes the key" do
+    test "PEXPIRE with negative ms returns error (Redis 7+)" do
       store = MockStore.make(%{"k" => {"v", 0}})
-      assert 1 == Expiry.handle("PEXPIRE", ["k", "-1"], store)
-      assert store.get.("k") == nil
-      assert Expiry.handle("PTTL", ["k"], store) == -2
+      assert {:error, msg} = Expiry.handle("PEXPIRE", ["k", "-1"], store)
+      assert msg =~ "invalid expire time"
+      assert store.get.("k") == "v"
     end
   end
 
