@@ -2484,11 +2484,14 @@ defmodule FerricstoreServer.Connection do
   # The `:full_access` atom enables O(1) fast-path checks in
   # `check_command_cached/2` and `check_keys_cached/3`, skipping all MapSet
   # and Catalog operations for the common default-user case.
-  @spec build_acl_cache(binary()) :: acl_cache() | :full_access
+  @spec build_acl_cache(binary()) :: acl_cache() | :full_access | :denied
   defp build_acl_cache(username) do
     case Ferricstore.Acl.get_user(username) do
       nil ->
-        nil
+        # User doesn't exist. For "default" user this means no ACL configured
+        # (allow everything). For any other user, it means the user was deleted
+        # (deny everything).
+        if username == "default", do: :full_access, else: :denied
 
       user ->
         denied = Map.get(user, :denied_commands, MapSet.new())
@@ -2511,8 +2514,11 @@ defmodule FerricstoreServer.Connection do
   # No ETS lookup, no process call — just pattern matching on local state.
   # The `cmd` argument is expected to be already uppercase (from normalise_cmd).
   # Returns `:ok` if permitted, `{:error, reason}` if denied.
-  @spec check_command_cached(acl_cache() | :full_access, binary()) :: :ok | {:error, binary()}
-  defp check_command_cached(nil, _cmd), do: :ok
+  @spec check_command_cached(acl_cache() | :full_access | :denied, binary()) :: :ok | {:error, binary()}
+
+  # Deleted user or unknown user — deny all commands.
+  defp check_command_cached(:denied, _cmd),
+    do: {:error, "NOPERM user session expired or user was deleted"}
 
   # Fast path: unrestricted user — single atom comparison, zero MapSet/map ops.
   # Covers the common default-user case (commands: :all, no denied, keys: :all).
