@@ -194,7 +194,19 @@ defmodule Ferricstore.ReviewR3.EmbeddedApiIssuesTest do
       assert {:ok, _count} = result
     end
 
-    test "del on a set key returns :ok (error not surfaced)" do
+    test "del with list of keys returns count of deleted" do
+      :ok = FerricStore.set("r3m4_multi_a", "a")
+      :ok = FerricStore.set("r3m4_multi_b", "b")
+
+      result = FerricStore.del(["r3m4_multi_a", "r3m4_multi_b", "r3m4_multi_c"])
+      assert {:ok, 2} = result
+
+      # All deleted
+      assert {:ok, nil} = FerricStore.get("r3m4_multi_a")
+      assert {:ok, nil} = FerricStore.get("r3m4_multi_b")
+    end
+
+    test "del on a set key returns {:ok, count}" do
       {:ok, 2} = FerricStore.sadd("r3m4_set", ["a", "b"])
 
       # del now returns {:ok, count}
