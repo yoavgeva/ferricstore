@@ -350,5 +350,7 @@ Returns empty list `[]` instead of proper RESP response. May confuse clients.
 | M6 | MEDIUM | FIXED — NIF error wrapping |
 | M7 | MEDIUM | FIXED — with/else guard on NIF calls |
 | M8 | MEDIUM | NOT A BUG — code checks sentinel before subtracting |
-| M9-M11 | MEDIUM | TODO |
+| M9 | MEDIUM | FIXED — flush slots on config change |
+| M10 | MEDIUM | NOT A BUG — matches Redis (ACL checked at queue time) |
+| M11 | MEDIUM | NOT A BUG — matches Redis (client retries either way) |
 | L1-L6 | LOW | Accepted / documented |
