@@ -228,8 +228,17 @@ defmodule Ferricstore.Commands.Stream do
 
   def handle("XREADGROUP", args, store) do
     case parse_xreadgroup_args(args) do
-      {:ok, group, consumer, count, stream_ids} ->
+      {:ok, group, consumer, count, :no_block, stream_ids} ->
         do_xreadgroup(group, consumer, stream_ids, count, store)
+
+      {:ok, group, consumer, count, {:block, timeout_ms}, stream_ids} ->
+        result = do_xreadgroup(group, consumer, stream_ids, count, store)
+
+        if result == [] do
+          {:block, timeout_ms, stream_ids, count}
+        else
+          result
+        end
 
       {:error, _} = err ->
         err
@@ -1192,12 +1201,24 @@ defmodule Ferricstore.Commands.Stream do
   defp parse_xreadgroup_args(args) do
     case args do
       ["GROUP", group, consumer | rest] ->
+        # COUNT and BLOCK can appear in either order before STREAMS.
         {count, rest2} = parse_xread_count(rest)
+        {block, rest3} = parse_xread_block(rest2)
+        # Handle BLOCK before COUNT
+        {count, rest3} =
+          if count == :infinity do
+            case parse_xread_count(rest3) do
+              {:infinity, _} -> {count, rest3}
+              {n, rest4} -> {n, rest4}
+            end
+          else
+            {count, rest3}
+          end
 
-        case split_at_streams(rest2) do
+        case split_at_streams(rest3) do
           {:ok, keys, ids} when length(keys) == length(ids) and keys != [] ->
             stream_ids = Enum.zip(keys, ids)
-            {:ok, group, consumer, count, stream_ids}
+            {:ok, group, consumer, count, block, stream_ids}
 
           {:ok, _, _} ->
             {:error,
