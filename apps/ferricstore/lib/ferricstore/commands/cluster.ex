@@ -35,9 +35,11 @@ defmodule Ferricstore.Commands.Cluster do
 
     lines =
       Enum.flat_map(shard_infos, fn {index, info} ->
+        role = shard_role(index)
+
         [
           "shard_#{index}:",
-          "  role: leader",
+          "  role: #{role}",
           "  status: #{info.status}",
           "  keys: #{info.keys}",
           "  memory_bytes: #{info.memory_bytes}"
@@ -191,5 +193,20 @@ defmodule Ferricstore.Commands.Cluster do
 
       {index, info}
     end)
+  end
+
+  # Returns "leader" or "follower" for the given shard on this node.
+  defp shard_role(index) do
+    shard_id = Ferricstore.Raft.Cluster.shard_server_id(index)
+
+    case :ra.members(shard_id) do
+      {:ok, _members, ^shard_id} -> "leader"
+      {:ok, _members, _other} -> "follower"
+      _ -> "unknown"
+    end
+  rescue
+    _ -> "unknown"
+  catch
+    _, _ -> "unknown"
   end
 end
