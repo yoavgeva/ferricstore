@@ -90,7 +90,7 @@ defmodule Ferricstore.Commands.Bloom do
 
   def handle("BF.ADD", [key, element], store) do
     {resource, _meta} = ensure_bloom(key, store)
-    NIF.bloom_add(resource, element)
+    nif_result(NIF.bloom_add(resource, element), "bloom add")
   end
 
   def handle("BF.ADD", _args, _store) do
@@ -103,7 +103,7 @@ defmodule Ferricstore.Commands.Bloom do
 
   def handle("BF.MADD", [key | elements], store) when elements != [] do
     {resource, _meta} = ensure_bloom(key, store)
-    NIF.bloom_madd(resource, elements)
+    nif_result(NIF.bloom_madd(resource, elements), "bloom madd")
   end
 
   def handle("BF.MADD", _args, _store) do
@@ -117,7 +117,7 @@ defmodule Ferricstore.Commands.Bloom do
   def handle("BF.EXISTS", [key, element], store) do
     case get_bloom(key, store) do
       nil -> 0
-      {resource, _meta} -> NIF.bloom_exists(resource, element)
+      {resource, _meta} -> nif_result(NIF.bloom_exists(resource, element), "bloom exists")
     end
   end
 
@@ -132,7 +132,7 @@ defmodule Ferricstore.Commands.Bloom do
   def handle("BF.MEXISTS", [key | elements], store) when elements != [] do
     case get_bloom(key, store) do
       nil -> List.duplicate(0, length(elements))
-      {resource, _meta} -> NIF.bloom_mexists(resource, elements)
+      {resource, _meta} -> nif_result(NIF.bloom_mexists(resource, elements), "bloom mexists")
     end
   end
 
@@ -395,4 +395,8 @@ defmodule Ferricstore.Commands.Bloom do
   @spec validate_error_rate(float()) :: :ok | {:error, binary()}
   defp validate_error_rate(rate) when rate > 0.0 and rate < 1.0, do: :ok
   defp validate_error_rate(_), do: {:error, "ERR (0 < error rate range < 1)"}
+
+  # Wraps NIF results — converts raw {:error, reason} to RESP error messages.
+  defp nif_result({:error, reason}, op), do: {:error, "ERR #{op} failed: #{inspect(reason)}"}
+  defp nif_result(result, _op), do: result
 end
