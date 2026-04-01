@@ -1769,6 +1769,11 @@ defmodule FerricStore do
   defp clear_shard_registries(shard_index) do
     # Close mmap handles and delete files for probabilistic structures.
     # create_table on an existing table calls close_all + delete_all_objects.
+    #
+    # NOTE: This runs locally on the node executing FLUSHDB. In single-node
+    # mode, this is sufficient. In multi-node mode, followers clear keys via
+    # Raft but NOT registries — a {:flush_registries} Raft command would be
+    # needed to propagate registry cleanup to all nodes.
     try do Ferricstore.Store.BloomRegistry.create_table(shard_index) rescue _ -> :ok catch _, _ -> :ok end
     try do Ferricstore.Store.CuckooRegistry.create_table(shard_index) rescue _ -> :ok catch _, _ -> :ok end
     try do Ferricstore.Store.CmsRegistry.create_table(shard_index) rescue _ -> :ok catch _, _ -> :ok end
