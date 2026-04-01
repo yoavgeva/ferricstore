@@ -573,10 +573,36 @@ defmodule Ferricstore.Config do
     end
   end
 
-  defp validate_param(key, value) when key in ["keydir-max-ram", "hot-cache-max-ram", "hot-cache-min-ram"] do
+  defp validate_param("hot-cache-max-ram", value) do
+    case Integer.parse(value) do
+      {n, ""} when n > 0 ->
+        min = Application.get_env(:ferricstore, :hot_cache_min_ram, 0)
+        if n < min do
+          {:error, "ERR hot-cache-max-ram (#{n}) must be >= hot-cache-min-ram (#{min})"}
+        else
+          :ok
+        end
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'hot-cache-max-ram'"}
+    end
+  end
+
+  defp validate_param("hot-cache-min-ram", value) do
+    case Integer.parse(value) do
+      {n, ""} when n > 0 ->
+        max = Application.get_env(:ferricstore, :hot_cache_max_ram, :infinity)
+        if max != :infinity and n > max do
+          {:error, "ERR hot-cache-min-ram (#{n}) must be <= hot-cache-max-ram (#{max})"}
+        else
+          :ok
+        end
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'hot-cache-min-ram'"}
+    end
+  end
+
+  defp validate_param("keydir-max-ram", value) do
     case Integer.parse(value) do
       {n, ""} when n > 0 -> :ok
-      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET '#{key}'"}
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'keydir-max-ram'"}
     end
   end
 
