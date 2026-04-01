@@ -4,7 +4,7 @@ defmodule Ferricstore.Mode do
 
   FerricStore supports two operational modes:
 
-    * `:standalone` (default) -- full Redis-compatible server with TCP/TLS
+    * `:standalone` -- full Redis-compatible server with TCP/TLS
       listener, RESP3 protocol handling, HTTP health endpoint, and Prometheus
       metrics endpoint. This is the mode used when FerricStore runs as its own
       OTP application (i.e., as a standalone database server).
@@ -21,7 +21,8 @@ defmodule Ferricstore.Mode do
       # config/config.exs (or runtime.exs)
       config :ferricstore, :mode, :embedded
 
-  When the `:mode` key is not set, FerricStore defaults to `:standalone`.
+  When the `:mode` key is not set, FerricStore defaults to `:embedded`.
+  The `ferricstore_server` release sets `mode: :standalone` in `runtime.exs`.
 
   ## What changes between modes
 
@@ -58,13 +59,14 @@ defmodule Ferricstore.Mode do
   @doc """
   Returns the current operational mode.
 
-  Reads from application env `{:ferricstore, :mode}`. Returns `:standalone`
-  when the key is not set.
+  Reads from application env `{:ferricstore, :mode}`. Defaults to `:embedded`
+  when the key is not set. The `ferricstore_server` release sets `:standalone`
+  in `runtime.exs`.
 
   ## Examples
 
       iex> Ferricstore.Mode.current()
-      :standalone
+      :embedded
 
   """
   @spec current() :: t()
