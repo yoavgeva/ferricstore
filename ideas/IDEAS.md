@@ -43,6 +43,10 @@ command would trigger it manually by deleting local Bitcask + ETS +
 registries for the target shard(s), then requesting a fresh snapshot
 from the Raft leader.
 
+If the shard being reset is the leader on this node, first transfer
+leadership to another node via `ra:transfer_leadership/2` to avoid
+an election gap. Then reset as a follower — no write disruption.
+
 ## FLUSHDB Multi-Node Registry Propagation
 
 FLUSHDB currently clears keys via Raft (replicated to all nodes) but
