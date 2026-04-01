@@ -346,6 +346,7 @@ defmodule Ferricstore.Commands.Bloom do
         case NIF.bloom_create(path, num_bits, num_hashes) do
           {:ok, resource} ->
             BloomRegistry.register(index, key, resource, meta)
+            BloomRegistry.save_meta(path, meta)
             {:ok, resource, meta}
 
           {:error, reason} ->

@@ -210,7 +210,7 @@ defmodule Ferricstore.Store.BloomRegistry do
 
           case NIF.bloom_open(path) do
             {:ok, resource} ->
-              meta = derive_metadata(resource)
+              meta = load_meta(path) || derive_metadata(resource)
               register(index, key, resource, meta)
               count + 1
 
@@ -264,6 +264,38 @@ defmodule Ferricstore.Store.BloomRegistry do
   # cached metadata. Capacity is not stored in the bloom file header,
   # so we estimate it from num_bits and num_hashes using the inverse
   # of the optimal sizing formula.
+  @doc """
+  Saves bloom filter metadata to a companion .meta file.
+  Called once at BF.RESERVE time.
+  """
+  @spec save_meta(binary(), metadata()) :: :ok
+  def save_meta(bloom_path, meta) do
+    meta_path = bloom_path <> ".meta"
+    File.write(meta_path, :erlang.term_to_binary(meta))
+    :ok
+  end
+
+  @doc """
+  Loads bloom filter metadata from the companion .meta file.
+  Returns the metadata map or nil if not found.
+  """
+  @spec load_meta(binary()) :: metadata() | nil
+  def load_meta(bloom_path) do
+    meta_path = bloom_path <> ".meta"
+
+    case File.read(meta_path) do
+      {:ok, data} ->
+        try do
+          :erlang.binary_to_term(data)
+        rescue
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
   @spec derive_metadata(reference()) :: metadata()
   defp derive_metadata(resource) do
     {:ok, {num_bits, _count, num_hashes}} = NIF.bloom_info(resource)
