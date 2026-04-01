@@ -118,15 +118,21 @@ defmodule Ferricstore.Commands.TopK do
 
   def handle("TOPK.LIST", [key], store) do
     with {:ok, ref} <- open_topk(store, key) do
-      NIF.topk_file_list(ref)
+      case NIF.topk_file_list(ref) do
+        {:error, reason} -> {:error, "ERR topk list failed: #{inspect(reason)}"}
+        result -> result
+      end
     end
   end
 
   def handle("TOPK.LIST", [key, "WITHCOUNT"], store) do
-    with {:ok, ref} <- open_topk(store, key) do
-      items = NIF.topk_file_list(ref)
-      counts = NIF.topk_file_count(ref, items)
+    with {:ok, ref} <- open_topk(store, key),
+         items when is_list(items) <- NIF.topk_file_list(ref),
+         counts when is_list(counts) <- NIF.topk_file_count(ref, items) do
       Enum.zip(items, counts) |> Enum.flat_map(fn {elem, count} -> [elem, count] end)
+    else
+      {:error, reason} -> {:error, "ERR topk list failed: #{inspect(reason)}"}
+      other -> {:error, "ERR topk list failed: #{inspect(other)}"}
     end
   end
 
