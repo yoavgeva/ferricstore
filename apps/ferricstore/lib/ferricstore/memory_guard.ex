@@ -455,27 +455,41 @@ defmodule Ferricstore.MemoryGuard do
   defp target_evict(_state, _stats, _target_ratio, _sample_size), do: :ok
 
   # Evicts entries from a single shard's keydir. Returns {count_evicted, bytes_freed}.
+  #
+  # Uses :ets.select/3 with a match spec instead of foldl — the filtering
+  # (value != nil, fid != :pending, TTL check) runs in the ETS C engine.
+  # Cold entries are skipped without creating Erlang terms, saving CPU.
   defp evict_from_shard(shard_index, policy, sample_size, deficit) do
     keydir = :"keydir_#{shard_index}"
     now = System.os_time(:millisecond)
 
     try do
-      # Sample hot entries eligible for eviction.
-      {_count, eligible} =
-        :ets.foldl(fn {key, value, exp, lfu, fid, _off, vsize}, {count, found} ->
-          cond do
-            count >= sample_size -> {count, found}
-            value == nil -> {count, found}
-            fid == :pending -> {count, found}
-            policy in [:volatile_lfu, :volatile_lru] and exp > 0 and exp > now ->
-              {count + 1, [{key, exp, lfu, vsize} | found]}
-            policy == :volatile_ttl and exp > 0 and exp > now ->
-              {count + 1, [{key, exp, lfu, vsize} | found]}
-            policy in [:allkeys_lfu, :allkeys_lru] ->
-              {count + 1, [{key, exp, lfu, vsize} | found]}
-            true -> {count, found}
-          end
-        end, {0, []}, keydir)
+      # Match spec: {key, value, exp, lfu, fid, _off, vsize}
+      #   $1=key, $2=value, $3=exp, $4=lfu, $5=fid, $6=vsize
+      # Guards filter in C: value != nil, fid != :pending, + TTL filter.
+      # Returns {key, exp, lfu, vsize} — cold entries never become Erlang terms.
+      guards =
+        case policy do
+          p when p in [:volatile_lfu, :volatile_lru, :volatile_ttl] ->
+            [{:"/=", :"$2", nil}, {:"/=", :"$5", :pending},
+             {:>, :"$3", 0}, {:>, :"$3", now}]
+          _ ->
+            [{:"/=", :"$2", nil}, {:"/=", :"$5", :pending}]
+        end
+
+      ms = [
+        {
+          {:"$1", :"$2", :"$3", :"$4", :"$5", :_, :"$6"},
+          guards,
+          [{{:"$1", :"$3", :"$4", :"$6"}}]
+        }
+      ]
+
+      eligible =
+        case :ets.select(keydir, ms, sample_size) do
+          {entries, _continuation} -> entries
+          :"$end_of_table" -> []
+        end
 
       if eligible == [] do
         {0, 0}
