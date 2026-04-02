@@ -1,52 +1,115 @@
 defmodule Ferricstore.MemoryGuard do
   @moduledoc """
-  Periodic memory pressure monitor for FerricStore shard ETS tables.
+  Memory pressure monitor and eviction controller for FerricStore.
 
   MemoryGuard runs as a GenServer that checks memory usage every 100ms
-  (configurable). It monitors each shard's ETS table memory consumption
-  and takes action based on configurable pressure thresholds:
+  (configurable) and takes graduated action based on pressure thresholds.
 
-    * **Warning (70%)** -- Logs a warning. No action taken.
-    * **Pressure (85%)** -- Logs an error and emits telemetry. The system
-      should begin considering eviction.
-    * **Reject (95%)** -- Logs a critical error and emits telemetry. New
-      writes should be rejected with an OOM error when the eviction policy
-      is `:noeviction`.
+  ## Data sources
 
-  ## Eviction policies (per spec section 2.4)
+  `compute_stats/1` aggregates memory from multiple sources:
 
-    * `:volatile_lru` (default) -- Evict least recently used keys that have
-      a TTL set. Keys without TTL are never evicted.
+    * **ETS keydir bytes** -- per-shard ETS table memory (`:ets.info(table, :memory)`)
+    * **Rust NIF allocator** -- `NIF.rust_allocated_bytes()` via global `AtomicUsize`
+      counter in `tracking_alloc.rs`. Returns -1 when tracking is not installed
+      (production cdylib), 0+ when active (tests).
+    * **Process RSS** -- `process_rss_bytes()` reads `/proc/self/status` (Linux)
+      or `:memsup` data. Includes ETS, NIF allocations, BEAM heaps, and page
+      cache residency. Only used in standalone mode (not embedded).
+    * **Cgroup limits** -- detects container memory limits via `/sys/fs/cgroup/`
+      and uses that as the effective memory ceiling instead of host RAM.
+
+  ## Pressure levels and actions
+
+  | Level      | Threshold | Eviction          | Promotion    | Evict target | Writes     |
+  |------------|-----------|-------------------|--------------|--------------|------------|
+  | `:ok`      | < 70%     | None              | Hot (normal) | —            | Accepted   |
+  | `:warning` | 70-85%    | Gentle (LFU)      | Hot (normal) | Down to 65%  | Accepted   |
+  | `:pressure`| 85-95%    | Aggressive (LFU)  | Skip (cold)  | Down to 75%  | Accepted   |
+  | `:reject`  | > 95%     | Emergency (LFU)   | Skip (cold)  | Down to 80%  | Accepted*  |
+
+  *Writes rejected only when eviction_policy is `:noeviction`.
+
+  ## Eviction algorithm
+
+  Target-based eviction with LFU ordering:
+
+  1. Compute `bytes_to_free = current_bytes - target_bytes` based on pressure level.
+  2. Sample eligible hot entries from ETS (value != nil, not :pending).
+  3. Sort by effective LFU counter ascending (lowest frequency first).
+  4. Evict by setting value to `nil` in ETS (key stays, disk location stays).
+  5. Subtract each evicted value's `value_size` from deficit.
+  6. Stop when deficit reaches zero or no more eligible entries.
+
+  Sample sizes scale with pressure:
+
+    * `:warning` -- sample 50 per shard, evict as needed
+    * `:pressure` -- sample 200 per shard, evict as needed
+    * `:reject` -- sample 1000 per shard, evict as needed
+
+  ## Promotion skip (anti-thrashing)
+
+  At `:pressure` and `:reject` levels, the `skip_promotion` atomics flag is set.
+  Cold reads (value=nil in ETS, pread from Bitcask) return the value to the caller
+  but do NOT re-cache it in ETS. This prevents evict/re-promote thrashing where
+  MemoryGuard evicts values and the next GET immediately re-caches them.
+
+  The flag is read via `MemoryGuard.skip_promotion?()` (~5ns atomics read) by:
+    * `Router.warm_ets_after_cold_read/5` (direct ETS read path)
+    * `Shard.cold_read_warm_ets/7` (GenServer read path)
+
+  ## Page cache hints (fadvise)
+
+  All pread NIFs (Bitcask cold reads + prob structure reads) use:
+    * `FADV_RANDOM` on file open -- disables kernel readahead (hash-indexed access)
+    * `FADV_DONTNEED` after pread -- hints kernel to evict pages immediately
+
+  This keeps page cache free for genuinely hot data. Linux-only (no-ops on macOS).
+
+  ## Atomics flags (lock-free hot-path reads)
+
+  Three flags published to atomics via persistent_term (~5ns read):
+
+    * **slot 1: `keydir_full`** -- set at `:reject` (95%). Gates new key writes
+      in `Router.check_keydir_full/1`. Updates to existing keys still allowed.
+    * **slot 2: `reject_writes`** -- set at `:reject` + `:noeviction` policy.
+      Gates ALL writes (even updates) in `Router.check_keydir_full/1`.
+    * **slot 3: `skip_promotion`** -- set at `:pressure` (85%). Prevents cold
+      reads from re-caching values in ETS.
+
+  ## Eviction policies
+
+    * `:volatile_lfu` (default) -- Evict least frequently used keys with a TTL.
+    * `:volatile_lru` -- Evict least recently used keys with a TTL.
+    * `:allkeys_lfu` -- Evict least frequently used key regardless of TTL.
     * `:allkeys_lru` -- Evict least recently used key regardless of TTL.
     * `:volatile_ttl` -- Evict the key with the shortest remaining TTL first.
-    * `:noeviction` -- Return OOM error when memory is full. No keys are
-      evicted.
+    * `:noeviction` -- Return OOM error when memory is full. No eviction.
 
   ## Telemetry events
 
-    * `[:ferricstore, :memory, :check]` -- emitted on every check with
-      measurements `%{total_bytes: integer}` and metadata
-      `%{pressure_level: :ok | :warning | :pressure | :reject}`.
+    * `[:ferricstore, :memory, :check]` -- every check cycle (100ms).
+      Measurements: `total_bytes`, `rss_bytes`.
+      Metadata: `pressure_level`, `ratio`, `max_bytes`, `rss_ratio`.
 
-    * `[:ferricstore, :memory, :pressure]` -- emitted on every check with
-      the spec 2.4 pressure level. Measurements include
-      `%{total_bytes: integer, max_bytes: integer, ratio: float}`. Metadata
-      includes `%{level: :ok | :warn | :pressure | :full}`.
+    * `[:ferricstore, :memory, :pressure]` -- every check, spec 2.4 levels.
+      Measurements: `total_bytes`, `max_bytes`, `ratio`.
+      Metadata: `level` (`:ok` | `:warn` | `:pressure` | `:full`).
 
-    * `[:ferricstore, :memory, :recovered]` -- emitted once when pressure drops
-      back to `:ok` from `:pressure` or `:reject`.
+    * `[:ferricstore, :memory, :recovered]` -- once when pressure drops to `:ok`.
 
-    * `[:ferricstore, :hot_cache, :limit_reduced]` -- emitted when the hot_cache
-      budget shrinks due to increasing memory pressure.
+    * `[:ferricstore, :memory, :keydir_pressure]` -- when keydir pressure is
+      `:pressure` or `:reject`. Includes `keydir_bytes`, `keydir_ratio`.
 
-    * `[:ferricstore, :hot_cache, :limit_restored]` -- emitted when the hot_cache
-      budget recovers as memory pressure decreases.
+    * `[:ferricstore, :hot_cache, :limit_reduced]` / `:limit_restored` --
+      hot cache budget changes due to pressure level transitions.
 
   ## Configuration
 
-    * `:memory_guard_interval_ms` -- check interval in milliseconds (default: 100)
-    * `:max_memory_bytes` -- maximum total ETS memory budget in bytes
-    * `:eviction_policy` -- eviction policy atom (default: `:volatile_lru`)
+    * `:memory_guard_interval_ms` -- check interval (default: 100ms)
+    * `:max_memory_bytes` -- maximum total memory budget
+    * `:keydir_max_ram` -- maximum ETS keydir memory
+    * `:eviction_policy` -- eviction policy atom (default: `:volatile_lfu`)
   """
 
   use GenServer
@@ -143,6 +206,29 @@ defmodule Ferricstore.MemoryGuard do
   def set_reject_writes(value) do
     ref = :persistent_term.get(:ferricstore_pressure_flags)
     :atomics.put(ref, 2, if(value, do: 1, else: 0))
+    :ok
+  end
+
+  @doc """
+  Returns true when cold reads should NOT be promoted to hot cache.
+
+  Set at `:pressure` level (85%+). Prevents evict/re-promote thrashing
+  where MemoryGuard evicts values and the next GET re-caches them.
+  Reads from atomics via persistent_term (~5ns).
+  """
+  @spec skip_promotion?() :: boolean()
+  def skip_promotion? do
+    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    :atomics.get(ref, 3) == 1
+  end
+
+  @doc """
+  Directly sets the skip_promotion flag. For use in tests only.
+  """
+  @spec set_skip_promotion(boolean()) :: :ok
+  def set_skip_promotion(value) do
+    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    :atomics.put(ref, 3, if(value, do: 1, else: 0))
     :ok
   end
 
@@ -305,100 +391,129 @@ defmodule Ferricstore.MemoryGuard do
 
       :warning ->
         if state.last_pressure_level not in [:warning, :pressure, :reject] do
-          Logger.warning("MemoryGuard: memory warning")
+          Logger.warning("MemoryGuard: memory warning (#{Float.round(stats.ratio * 100, 1)}%)")
         end
+        # Gentle eviction: evict down to 65% target
+        target_evict(state, stats, 0.65, 50)
 
       :pressure ->
-        Logger.error("MemoryGuard: high memory pressure")
+        Logger.error("MemoryGuard: high memory pressure (#{Float.round(stats.ratio * 100, 1)}%)")
         emit_shard_pressure_events(stats)
+        # Aggressive eviction: evict down to 75% target
+        target_evict(state, stats, 0.75, 200)
 
       :reject ->
-        Logger.critical("MemoryGuard: critical memory")
+        Logger.critical("MemoryGuard: critical memory (#{Float.round(stats.ratio * 100, 1)}%)")
         emit_shard_pressure_events(stats)
-        maybe_evict(state)
+        # Emergency eviction: evict down to 80% target
+        target_evict(state, stats, 0.80, 1000)
     end
 
     # Publish pressure levels to atomics for lock-free hot-path reads.
-    # Callers (Router.check_keydir_full, Shard.put) read these instead of
-    # GenServer.call, eliminating the MemoryGuard process as a contention point.
-    # Atomics avoid the global GC that persistent_term.put would trigger every 100ms.
     ref = :persistent_term.get(:ferricstore_pressure_flags)
+    # Slot 1: keydir_full — reject new key writes (only at :reject)
     :atomics.put(ref, 1, if(stats.keydir_pressure_level == :reject, do: 1, else: 0))
+    # Slot 2: reject_writes — reject ALL writes (only :reject + :noeviction)
     :atomics.put(ref, 2, if(stats.pressure_level == :reject and state.eviction_policy == :noeviction, do: 1, else: 0))
+    # Slot 3: skip_promotion — don't re-cache cold reads (at :pressure and :reject)
+    :atomics.put(ref, 3, if(stats.pressure_level in [:pressure, :reject], do: 1, else: 0))
 
     %{state | last_pressure_level: stats.pressure_level, keydir_pressure_level: stats.keydir_pressure_level}
   end
 
-  # Evicts keys according to the configured eviction policy when memory
-  # pressure is at :pressure or :reject level.
-  defp maybe_evict(%{eviction_policy: :noeviction}), do: :ok
+  # Target-based eviction: evict hot values until memory drops to target_ratio.
+  # sample_size controls how many entries to sample per shard (scales with pressure).
+  # Eviction order is determined by the configured policy (LFU/LRU/TTL).
+  defp target_evict(%{eviction_policy: :noeviction}, _stats, _target_ratio, _sample_size), do: :ok
 
-  defp maybe_evict(%{eviction_policy: policy, shard_count: shard_count}) when policy in [:volatile_lfu, :allkeys_lfu, :volatile_lru, :allkeys_lru, :volatile_ttl] do
-    evicted =
-      Enum.reduce(0..(shard_count - 1), 0, fn i, acc ->
-        keydir = :"keydir_#{i}"
-        now = System.os_time(:millisecond)
+  defp target_evict(%{eviction_policy: policy, shard_count: shard_count} = _state, stats, target_ratio, sample_size)
+       when policy in [:volatile_lfu, :allkeys_lfu, :volatile_lru, :allkeys_lru, :volatile_ttl] do
+    target_bytes = trunc(stats.max_bytes * target_ratio)
+    bytes_to_free = max(0, stats.total_bytes - target_bytes)
 
-        try do
-          # Sample hot entries (value != nil) eligible for eviction.
-          # Use {count, list} accumulator to avoid O(n) length/1 on every iteration.
-          {_count, eligible} =
-            :ets.foldl(fn {key, value, exp, lfu, fid, _off, _vsize}, {count, found} ->
-              cond do
-                count >= 10 -> {count, found}
-                value == nil -> {count, found}  # Already cold, skip
-                fid == :pending -> {count, found}  # Background write pending, skip
-                policy in [:volatile_lfu, :volatile_lru] and exp > 0 and exp > now -> {count + 1, [{key, exp, lfu} | found]}
-                policy == :volatile_ttl and exp > 0 and exp > now -> {count + 1, [{key, exp, lfu} | found]}
-                policy in [:allkeys_lfu, :allkeys_lru] -> {count + 1, [{key, exp, lfu} | found]}
-                true -> {count, found}
-              end
-            end, {0, []}, keydir)
-
-          if eligible != [] do
-            to_evict =
-              case policy do
-                :volatile_ttl ->
-                  # Sort by TTL ascending (evict shortest TTL first)
-                  eligible |> Enum.sort_by(fn {_k, exp, _lfu} -> exp end) |> Enum.take(5)
-                p when p in [:volatile_lfu, :allkeys_lfu] ->
-                  # Sort by effective (decayed) LFU counter ascending
-                  eligible
-                  |> Enum.sort_by(fn {_k, _exp, lfu} -> Ferricstore.Store.LFU.effective_counter(lfu) end)
-                  |> Enum.take(5)
-                p when p in [:volatile_lru, :allkeys_lru] ->
-                  # Sort by last access time ascending (evict least recently used first).
-                  # ldt is packed in the upper 16 bits of the LFU field.
-                  eligible
-                  |> Enum.sort_by(fn {_k, _exp, lfu} -> Ferricstore.Store.LFU.unpack(lfu) |> elem(0) end)
-                  |> Enum.take(5)
-              end
-
-            # Eviction = set value to nil. Key stays in keydir, data stays on disk.
-            # Next GET: keydir hit with nil value -> fall through to Bitcask -> re-warm.
-            evict_count =
-              Enum.reduce(to_evict, 0, fn {key, _exp, _lfu}, cnt ->
-                :ets.update_element(keydir, key, {2, nil})
-                cnt + 1
-              end)
-
-            acc + evict_count
+    if bytes_to_free == 0 do
+      :ok
+    else
+      {total_evicted, _remaining_deficit} =
+        Enum.reduce(0..(shard_count - 1), {0, bytes_to_free}, fn i, {evicted_acc, deficit} ->
+          if deficit <= 0 do
+            {evicted_acc, deficit}
           else
-            acc
+            {shard_evicted, shard_freed} = evict_from_shard(i, policy, sample_size, deficit)
+            {evicted_acc + shard_evicted, deficit - shard_freed}
           end
-        rescue _ -> acc
-        catch _, _ -> acc
-        end
-      end)
+        end)
 
-    if evicted > 0 do
-      Ferricstore.Stats.incr_evicted_keys(evicted)
+      if total_evicted > 0 do
+        Ferricstore.Stats.incr_evicted_keys(total_evicted)
+      end
+
+      :ok
     end
-
-    :ok
   end
 
-  defp maybe_evict(_state), do: :ok
+  defp target_evict(_state, _stats, _target_ratio, _sample_size), do: :ok
+
+  # Evicts entries from a single shard's keydir. Returns {count_evicted, bytes_freed}.
+  defp evict_from_shard(shard_index, policy, sample_size, deficit) do
+    keydir = :"keydir_#{shard_index}"
+    now = System.os_time(:millisecond)
+
+    try do
+      # Sample hot entries eligible for eviction.
+      {_count, eligible} =
+        :ets.foldl(fn {key, value, exp, lfu, fid, _off, vsize}, {count, found} ->
+          cond do
+            count >= sample_size -> {count, found}
+            value == nil -> {count, found}
+            fid == :pending -> {count, found}
+            policy in [:volatile_lfu, :volatile_lru] and exp > 0 and exp > now ->
+              {count + 1, [{key, exp, lfu, vsize} | found]}
+            policy == :volatile_ttl and exp > 0 and exp > now ->
+              {count + 1, [{key, exp, lfu, vsize} | found]}
+            policy in [:allkeys_lfu, :allkeys_lru] ->
+              {count + 1, [{key, exp, lfu, vsize} | found]}
+            true -> {count, found}
+          end
+        end, {0, []}, keydir)
+
+      if eligible == [] do
+        {0, 0}
+      else
+        # Sort by eviction priority (lowest value first = evict first)
+        sorted =
+          case policy do
+            :volatile_ttl ->
+              Enum.sort_by(eligible, fn {_k, exp, _lfu, _vs} -> exp end)
+            p when p in [:volatile_lfu, :allkeys_lfu] ->
+              Enum.sort_by(eligible, fn {_k, _exp, lfu, _vs} ->
+                Ferricstore.Store.LFU.effective_counter(lfu)
+              end)
+            p when p in [:volatile_lru, :allkeys_lru] ->
+              Enum.sort_by(eligible, fn {_k, _exp, lfu, _vs} ->
+                Ferricstore.Store.LFU.unpack(lfu) |> elem(0)
+              end)
+          end
+
+        # Evict until we've freed enough bytes or run out of candidates.
+        {evict_count, bytes_freed} =
+          Enum.reduce_while(sorted, {0, 0}, fn {key, _exp, _lfu, vsize}, {cnt, freed} ->
+            if freed >= deficit do
+              {:halt, {cnt, freed}}
+            else
+              :ets.update_element(keydir, key, {2, nil})
+              {:cont, {cnt + 1, freed + vsize}}
+            end
+          end)
+
+        {evict_count, bytes_freed}
+      end
+    rescue
+      _ -> {0, 0}
+    catch
+      _, _ -> {0, 0}
+    end
+  end
 
   defp compute_stats(state) do
     {keydir_bytes, shard_stats} =

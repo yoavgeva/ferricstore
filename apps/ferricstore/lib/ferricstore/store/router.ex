@@ -966,9 +966,9 @@ defmodule Ferricstore.Store.Router do
   defp warm_ets_after_cold_read(keydir, key, value, _file_id, _offset) do
     # Skip promotion when under memory pressure — prevents evict/re-promote
     # thrashing where MemoryGuard evicts values and cold reads immediately
-    # re-cache them.
+    # re-cache them. skip_promotion? is set at :pressure level (85%+).
     if byte_size(value) <= :persistent_term.get(:ferricstore_hot_cache_max_value_size, @hot_cache_max_value_size)
-       and not Ferricstore.MemoryGuard.keydir_full?() do
+       and not Ferricstore.MemoryGuard.skip_promotion?() do
       try do
         :ets.update_element(keydir, key, {2, value})
       rescue

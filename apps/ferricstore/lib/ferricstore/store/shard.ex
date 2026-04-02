@@ -3530,7 +3530,7 @@ defmodule Ferricstore.Store.Shard do
   defp cold_read_warm_ets(state, key, value, exp, fid, off, vsize) do
     v = value_for_ets(value)
 
-    if v != nil and Ferricstore.MemoryGuard.keydir_full?() do
+    if v != nil and Ferricstore.MemoryGuard.skip_promotion?() do
       # Under pressure — don't re-cache, keep cold
       :ok
     else

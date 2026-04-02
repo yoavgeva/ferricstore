@@ -95,9 +95,11 @@ defmodule Ferricstore.Application do
     :persistent_term.put(:ferricstore_max_active_file_size,
       Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024))
 
-    # Initialize MemoryGuard pressure flags as atomics (2 slots: keydir_full, reject_writes).
-    # Atomics avoid the global GC that persistent_term.put triggers every 100ms.
-    ref = :atomics.new(2, signed: false)
+    # Initialize MemoryGuard pressure flags as atomics (3 slots).
+    # Slot 1: keydir_full (reject new key writes at :reject level)
+    # Slot 2: reject_writes (reject ALL writes at :reject + :noeviction)
+    # Slot 3: skip_promotion (don't re-cache cold reads at :pressure level)
+    ref = :atomics.new(3, signed: false)
     :persistent_term.put(:ferricstore_pressure_flags, ref)
 
     # Initialize keyspace notification events config in persistent_term
