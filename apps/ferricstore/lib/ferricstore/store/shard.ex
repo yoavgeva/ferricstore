@@ -3526,12 +3526,19 @@ defmodule Ferricstore.Store.Shard do
   # Preserves the disk location (file_id, offset, value_size) and expire_at_ms.
   # Values exceeding the hot_cache_max_value_size threshold are NOT warmed --
   # they stay cold (nil) in ETS to avoid expensive binary copies on read.
+  # Under memory pressure, skip warming to prevent evict/re-promote thrashing.
   defp cold_read_warm_ets(state, key, value, exp, fid, off, vsize) do
     v = value_for_ets(value)
-    :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
 
-    if state.prefix_keys do
-      PrefixIndex.track(state.prefix_keys, key, state.index)
+    if v != nil and Ferricstore.MemoryGuard.keydir_full?() do
+      # Under pressure — don't re-cache, keep cold
+      :ok
+    else
+      :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
+
+      if state.prefix_keys do
+        PrefixIndex.track(state.prefix_keys, key, state.index)
+      end
     end
   end
 
