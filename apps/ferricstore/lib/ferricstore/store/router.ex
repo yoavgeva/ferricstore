@@ -1037,6 +1037,34 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc """
+  Routes a probabilistic data structure write command through Raft.
+
+  Extracts the key from the command tuple and dispatches to raft_write
+  with the appropriate shard index. Supports both quorum and async
+  durability modes.
+  """
+  @spec prob_write(tuple()) :: term()
+  def prob_write(command) do
+    key = extract_prob_key(command)
+    idx = shard_for(key)
+    raft_write(idx, key, command)
+  end
+
+  defp extract_prob_key({:bloom_create, key, _, _, _}), do: key
+  defp extract_prob_key({:bloom_add, key, _, _}), do: key
+  defp extract_prob_key({:bloom_madd, key, _, _}), do: key
+  defp extract_prob_key({:cms_create, key, _, _}), do: key
+  defp extract_prob_key({:cms_incrby, key, _}), do: key
+  defp extract_prob_key({:cms_merge, dst_key, _, _, _}), do: dst_key
+  defp extract_prob_key({:cuckoo_create, key, _, _}), do: key
+  defp extract_prob_key({:cuckoo_add, key, _, _}), do: key
+  defp extract_prob_key({:cuckoo_addnx, key, _, _}), do: key
+  defp extract_prob_key({:cuckoo_del, key, _}), do: key
+  defp extract_prob_key({:topk_create, key, _, _, _, _}), do: key
+  defp extract_prob_key({:topk_add, key, _}), do: key
+  defp extract_prob_key({:topk_incrby, key, _}), do: key
+
+  @doc """
   Returns `true` if `key` exists and is not expired.
 
   Uses direct ETS lookup (no GenServer roundtrip) for hot and cold keys.

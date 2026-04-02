@@ -3,64 +3,72 @@ defmodule Ferricstore.Commands.CMSTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.CMS
-  alias Ferricstore.Test.MmapMockStore
+  alias Ferricstore.Test.ProbMockStore
 
   # ===========================================================================
   # CMS.INITBYDIM
   # ===========================================================================
 
+  # Computes the new-style prob file path (base64 encoded key)
+  defp prob_file_path(store, key, ext) do
+    dir = store.prob_dir.()
+    safe = Base.url_encode64(key, padding: false)
+    Path.join(dir, "#{safe}.#{ext}")
+  end
+
   describe "CMS.INITBYDIM" do
     test "creates a new sketch with given dimensions" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
-      assert store.exists?.("mysketch")
+      # Verify the file was created at the base64-encoded path
+      assert File.exists?(prob_file_path(store, "mysketch", "cms"))
     end
 
     test "returns error when key already exists" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert {:error, msg} = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert msg =~ "already exists"
     end
 
     test "returns error with zero width" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYDIM", ["key", "0", "7"], store)
       assert msg =~ "positive integer"
     end
 
     test "returns error with negative depth" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYDIM", ["key", "100", "-1"], store)
       assert msg =~ "positive integer"
     end
 
     test "returns error with non-integer width" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYDIM", ["key", "abc", "7"], store)
       assert msg =~ "not an integer"
     end
 
     test "returns error with non-integer depth" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYDIM", ["key", "100", "abc"], store)
       assert msg =~ "not an integer"
     end
 
     test "returns error with wrong number of arguments (too few)" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYDIM", ["key"], store)
       assert msg =~ "wrong number of arguments"
     end
 
     test "returns error with wrong number of arguments (too many)" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYDIM", ["key", "100", "7", "extra"], store)
       assert msg =~ "wrong number of arguments"
     end
 
     test "returns error with no arguments" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYDIM", [], store)
       assert msg =~ "wrong number of arguments"
     end
@@ -72,13 +80,13 @@ defmodule Ferricstore.Commands.CMSTest do
 
   describe "CMS.INITBYPROB" do
     test "creates a sketch sized for error rate and confidence" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert :ok = CMS.handle("CMS.INITBYPROB", ["mysketch", "0.001", "0.999"], store)
-      assert store.exists?.("mysketch")
+      assert File.exists?(prob_file_path(store, "mysketch", "cms"))
     end
 
     test "sketch dimensions match theoretical formulas" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert :ok = CMS.handle("CMS.INITBYPROB", ["mysketch", "0.01", "0.99"], store)
 
       ["width", width, "depth", depth, "count", 0] =
@@ -92,38 +100,38 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "returns error when key already exists" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert {:error, msg} = CMS.handle("CMS.INITBYPROB", ["mysketch", "0.01", "0.99"], store)
       assert msg =~ "already exists"
     end
 
     test "returns error with zero error rate" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYPROB", ["key", "0", "0.99"], store)
       assert msg =~ "positive number"
     end
 
     test "returns error with negative error rate" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYPROB", ["key", "-0.01", "0.99"], store)
       assert msg =~ "positive number"
     end
 
     test "returns error with probability >= 1" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYPROB", ["key", "0.01", "1.0"], store)
       assert msg =~ "between 0 and 1"
     end
 
     test "returns error with probability <= 0" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, msg} = CMS.handle("CMS.INITBYPROB", ["key", "0.01", "0.0"], store)
       assert msg =~ "between 0 and 1"
     end
 
     test "returns error with wrong number of arguments" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, _} = CMS.handle("CMS.INITBYPROB", ["key"], store)
       assert {:error, _} = CMS.handle("CMS.INITBYPROB", [], store)
     end
@@ -135,19 +143,19 @@ defmodule Ferricstore.Commands.CMSTest do
 
   describe "CMS.INCRBY" do
     test "increments a single element by 1" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert [1] = CMS.handle("CMS.INCRBY", ["mysketch", "elem1", "1"], store)
     end
 
     test "increments a single element by large count" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert [42] = CMS.handle("CMS.INCRBY", ["mysketch", "elem1", "42"], store)
     end
 
     test "increments multiple elements at once" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
 
       result =
@@ -157,7 +165,7 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "increments accumulate for the same element" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert [1] = CMS.handle("CMS.INCRBY", ["mysketch", "elem1", "1"], store)
       assert [2] = CMS.handle("CMS.INCRBY", ["mysketch", "elem1", "1"], store)
@@ -165,38 +173,37 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "returns error when key does not exist" do
-      store = MmapMockStore.make_cms()
-      assert {:error, msg} = CMS.handle("CMS.INCRBY", ["missing", "elem1", "1"], store)
-      assert msg =~ "does not exist"
+      store = ProbMockStore.make_cms()
+      assert {:error, _} = CMS.handle("CMS.INCRBY", ["missing", "elem1", "1"], store)
     end
 
     test "returns error with odd number of element/count args" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert {:error, _} = CMS.handle("CMS.INCRBY", ["mysketch", "elem1"], store)
     end
 
     test "returns error with zero count" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert {:error, msg} = CMS.handle("CMS.INCRBY", ["mysketch", "elem1", "0"], store)
       assert msg =~ "invalid count"
     end
 
     test "returns error with negative count" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert {:error, msg} = CMS.handle("CMS.INCRBY", ["mysketch", "elem1", "-1"], store)
       assert msg =~ "invalid count"
     end
 
     test "returns error with no arguments" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, _} = CMS.handle("CMS.INCRBY", [], store)
     end
 
     test "returns error with only key argument" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert {:error, _} = CMS.handle("CMS.INCRBY", ["mysketch"], store)
     end
@@ -208,20 +215,20 @@ defmodule Ferricstore.Commands.CMSTest do
 
   describe "CMS.QUERY" do
     test "returns 0 for elements never inserted" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       assert [0] = CMS.handle("CMS.QUERY", ["mysketch", "never_seen"], store)
     end
 
     test "returns correct count for inserted element" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["mysketch", "elem1", "5"], store)
       assert [5] = CMS.handle("CMS.QUERY", ["mysketch", "elem1"], store)
     end
 
     test "queries multiple elements at once" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["mysketch", "a", "3", "b", "7"], store)
 
@@ -230,18 +237,17 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "returns error when key does not exist" do
-      store = MmapMockStore.make_cms()
-      assert {:error, msg} = CMS.handle("CMS.QUERY", ["missing", "elem1"], store)
-      assert msg =~ "does not exist"
+      store = ProbMockStore.make_cms()
+      assert {:error, _} = CMS.handle("CMS.QUERY", ["missing", "elem1"], store)
     end
 
     test "returns error with no element arguments" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, _} = CMS.handle("CMS.QUERY", ["key"], store)
     end
 
     test "returns error with no arguments" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, _} = CMS.handle("CMS.QUERY", [], store)
     end
   end
@@ -252,7 +258,7 @@ defmodule Ferricstore.Commands.CMSTest do
 
   describe "CMS.INFO" do
     test "returns width, depth, and count for sketch" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "200", "5"], store)
 
       assert ["width", 200, "depth", 5, "count", 0] =
@@ -260,7 +266,7 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "count reflects total insertions" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["mysketch", "a", "3", "b", "7"], store)
 
@@ -269,13 +275,12 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "returns error when key does not exist" do
-      store = MmapMockStore.make_cms()
-      assert {:error, msg} = CMS.handle("CMS.INFO", ["missing"], store)
-      assert msg =~ "does not exist"
+      store = ProbMockStore.make_cms()
+      assert {:error, _} = CMS.handle("CMS.INFO", ["missing"], store)
     end
 
     test "returns error with wrong number of arguments" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, _} = CMS.handle("CMS.INFO", [], store)
       assert {:error, _} = CMS.handle("CMS.INFO", ["a", "b"], store)
     end
@@ -287,7 +292,7 @@ defmodule Ferricstore.Commands.CMSTest do
 
   describe "CMS.MERGE" do
     test "merges two source sketches into a new destination" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["src1", "100", "7"], store)
       :ok = CMS.handle("CMS.INITBYDIM", ["src2", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["src1", "a", "3"], store)
@@ -301,7 +306,7 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "merges single source sketch" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["src1", "50", "5"], store)
       CMS.handle("CMS.INCRBY", ["src1", "x", "10"], store)
 
@@ -310,7 +315,7 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "merges with weights" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["src1", "100", "7"], store)
       :ok = CMS.handle("CMS.INITBYDIM", ["src2", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["src1", "a", "4"], store)
@@ -327,7 +332,7 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "merges into existing destination (additive)" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["dst", "100", "7"], store)
       :ok = CMS.handle("CMS.INITBYDIM", ["src1", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["dst", "a", "10"], store)
@@ -338,7 +343,7 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "returns error when source sketches have different dimensions" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["src1", "100", "7"], store)
       :ok = CMS.handle("CMS.INITBYDIM", ["src2", "200", "7"], store)
 
@@ -347,7 +352,7 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "returns error when dst and src have different dimensions" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["dst", "200", "7"], store)
       :ok = CMS.handle("CMS.INITBYDIM", ["src1", "100", "7"], store)
 
@@ -356,23 +361,22 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "returns error when source key does not exist" do
-      store = MmapMockStore.make_cms()
-      assert {:error, msg} = CMS.handle("CMS.MERGE", ["dst", "1", "missing"], store)
-      assert msg =~ "does not exist"
+      store = ProbMockStore.make_cms()
+      assert {:error, _} = CMS.handle("CMS.MERGE", ["dst", "1", "missing"], store)
     end
 
     test "returns error when numkeys is zero" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, _} = CMS.handle("CMS.MERGE", ["dst", "0"], store)
     end
 
     test "returns error with no arguments" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, _} = CMS.handle("CMS.MERGE", [], store)
     end
 
     test "returns error with only dst argument" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       assert {:error, _} = CMS.handle("CMS.MERGE", ["dst"], store)
     end
   end
@@ -383,7 +387,7 @@ defmodule Ferricstore.Commands.CMSTest do
 
   describe "accuracy" do
     test "never undercounts (CMS invariant)" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "1000", "7"], store)
 
       true_counts = %{
@@ -405,7 +409,7 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "total_count tracks cumulative insertions" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
 
       CMS.handle("CMS.INCRBY", ["mysketch", "a", "5"], store)
@@ -423,7 +427,7 @@ defmodule Ferricstore.Commands.CMSTest do
 
   describe "edge cases" do
     test "width=1 sketch (degenerate -- all elements hash to same bucket)" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "1", "1"], store)
       CMS.handle("CMS.INCRBY", ["mysketch", "a", "5"], store)
       CMS.handle("CMS.INCRBY", ["mysketch", "b", "3"], store)
@@ -435,14 +439,14 @@ defmodule Ferricstore.Commands.CMSTest do
     end
 
     test "element with empty string" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["mysketch", "", "5"], store)
       assert [5] = CMS.handle("CMS.QUERY", ["mysketch", ""], store)
     end
 
     test "large increment values" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["mysketch", "big", "1000000"], store)
       [est] = CMS.handle("CMS.QUERY", ["mysketch", "big"], store)
@@ -456,21 +460,21 @@ defmodule Ferricstore.Commands.CMSTest do
 
   describe "mmap persistence" do
     test "mmap file exists on disk after create" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
-      path = store.cms_registry.path.("mysketch")
+      path = prob_file_path(store, "mysketch", "cms")
       assert File.exists?(path), "CMS mmap file should exist at #{path}"
     end
 
     test "data persists through the mmap resource" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["mysketch", "elem", "42"], store)
       assert [42] = CMS.handle("CMS.QUERY", ["mysketch", "elem"], store)
     end
 
     test "multiple independent sketches do not interfere" do
-      store = MmapMockStore.make_cms()
+      store = ProbMockStore.make_cms()
       :ok = CMS.handle("CMS.INITBYDIM", ["sketch_a", "100", "7"], store)
       :ok = CMS.handle("CMS.INITBYDIM", ["sketch_b", "100", "7"], store)
       CMS.handle("CMS.INCRBY", ["sketch_a", "x", "10"], store)

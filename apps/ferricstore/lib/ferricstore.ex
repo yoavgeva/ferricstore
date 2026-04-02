@@ -1787,9 +1787,7 @@ defmodule FerricStore do
     # mode, this is sufficient. In multi-node mode, followers clear keys via
     # Raft but NOT registries — a {:flush_registries} Raft command would be
     # needed to propagate registry cleanup to all nodes.
-    try do Ferricstore.Store.BloomRegistry.create_table(shard_index) rescue _ -> :ok catch _, _ -> :ok end
-    try do Ferricstore.Store.CuckooRegistry.create_table(shard_index) rescue _ -> :ok catch _, _ -> :ok end
-    try do Ferricstore.Store.CmsRegistry.create_table(shard_index) rescue _ -> :ok catch _, _ -> :ok end
+    # Legacy registry tables removed — prob structures use stateless pread/pwrite NIFs now.
   end
 
   # ---------------------------------------------------------------------------
@@ -4547,173 +4545,6 @@ defmodule FerricStore do
   end
 
   # ---------------------------------------------------------------------------
-  # Vector operations
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Creates a vector collection for storing and searching high-dimensional embeddings.
-
-  Vector collections enable similarity search (k-nearest neighbors) for
-  recommendation engines, semantic search, and content deduplication.
-
-  ## Parameters
-
-    * `collection` - name of the vector collection
-    * `dims` - number of dimensions per vector (must match all inserted vectors)
-    * `metric` - distance metric: `:cosine`, `:euclidean`, or `:ip` (inner product)
-
-  ## Examples
-
-      iex> FerricStore.vcreate("product:embeddings", 128, :cosine)
-      :ok
-
-  """
-  @spec vcreate(binary(), pos_integer(), atom()) :: :ok | {:error, binary()}
-  def vcreate(collection, dims, metric) do
-    resolved = sandbox_key(collection)
-    store = build_compound_store(resolved)
-    metric_str = Atom.to_string(metric)
-    result = Ferricstore.Commands.Vector.handle("VCREATE", [resolved, to_string(dims), metric_str], store)
-    case result do
-      :ok -> :ok
-      {:error, _} = err -> err
-    end
-  end
-
-  @doc """
-  Adds or updates a named vector in the collection.
-
-  ## Parameters
-
-    * `collection` - the vector collection name
-    * `key` - unique identifier for this vector
-    * `components` - list of float components (length must match collection dims)
-
-  ## Examples
-
-      iex> FerricStore.vadd("product:embeddings", "prod_42", [0.1, 0.8, -0.3, 0.5])
-      :ok
-
-  """
-  @spec vadd(binary(), binary(), [float()]) :: :ok | {:error, binary()}
-  def vadd(collection, key, components) when is_list(components) do
-    resolved = sandbox_key(collection)
-    store = build_compound_store(resolved)
-    comp_strs = Enum.map(components, &to_string(&1 * 1.0))
-    result = Ferricstore.Commands.Vector.handle("VADD", [resolved, key | comp_strs], store)
-    case result do
-      :ok -> :ok
-      {:error, _} = err -> err
-    end
-  end
-
-  @doc """
-  Deletes a vector from the collection by its key.
-
-  ## Returns
-
-    * `{:ok, 1}` if the vector was deleted.
-    * `{:ok, 0}` if the vector did not exist.
-    * `{:error, reason}` on failure.
-
-  ## Examples
-
-      iex> FerricStore.vdel("product:embeddings", "prod_42")
-      {:ok, 1}
-
-  """
-  @spec vdel(binary(), binary()) :: {:ok, 0 | 1} | {:error, binary()}
-  def vdel(collection, key) do
-    resolved = sandbox_key(collection)
-    store = build_compound_store(resolved)
-    result = Ferricstore.Commands.Vector.handle("VDEL", [resolved, key], store)
-    wrap_result(result)
-  end
-
-  @doc """
-  Finds the `k` nearest neighbors to `query_vector` in the collection.
-
-  Returns results ordered by similarity (closest first), using the distance
-  metric configured when the collection was created.
-
-  ## Parameters
-
-    * `collection` - the vector collection name
-    * `query_vector` - list of float components to search for
-    * `k` - number of nearest neighbors to return
-
-  ## Returns
-
-    * `{:ok, results}` - list of `[key, distance]` pairs, closest first.
-    * `{:error, reason}` on failure.
-
-  ## Examples
-
-      iex> FerricStore.vsearch("product:embeddings", [0.1, 0.7, -0.2, 0.6], 3)
-      {:ok, [["prod_42", "0.05"], ["prod_99", "0.12"], ["prod_7", "0.34"]]}
-
-  """
-  @spec vsearch(binary(), [float()], pos_integer()) :: {:ok, list()} | {:error, binary()}
-  def vsearch(collection, query_vector, k) when is_list(query_vector) do
-    resolved = sandbox_key(collection)
-    store = build_compound_store(resolved)
-    comp_strs = Enum.map(query_vector, &to_string(&1 * 1.0))
-    # VSEARCH format: collection f32... TOP k
-    args = [resolved | comp_strs] ++ ["TOP", to_string(k)]
-    result = Ferricstore.Commands.Vector.handle("VSEARCH", args, store)
-    wrap_result(result)
-  end
-
-  @doc """
-  Returns metadata about the vector collection (dimensions, metric, vector count).
-
-  ## Returns
-
-    * `{:ok, info_list}` - flat key-value list of collection properties.
-    * `{:error, reason}` if the collection does not exist.
-
-  ## Examples
-
-      iex> FerricStore.vinfo("product:embeddings")
-      {:ok, ["dimensions", 128, "metric", "cosine", "vector_count", 42]}
-
-  """
-  @spec vinfo(binary()) :: {:ok, list()} | {:error, binary()}
-  def vinfo(collection) do
-    resolved = sandbox_key(collection)
-    store = build_compound_store(resolved)
-    result = Ferricstore.Commands.Vector.handle("VINFO", [resolved], store)
-    wrap_result(result)
-  end
-
-  @doc """
-  Returns the number of vectors stored in the collection.
-
-  ## Returns
-
-    * `{:ok, count}` on success.
-    * `{:error, reason}` if the collection does not exist.
-
-  ## Examples
-
-      iex> FerricStore.vcard("product:embeddings")
-      {:ok, 42}
-
-  """
-  @spec vcard(binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
-  def vcard(collection) do
-    resolved = sandbox_key(collection)
-    store = build_compound_store(resolved)
-    result = Ferricstore.Commands.Vector.handle("VINFO", [resolved], store)
-    case result do
-      {:error, _} = err -> err
-      info when is_list(info) ->
-        count_idx = Enum.find_index(info, &(&1 == "vector_count"))
-        if count_idx, do: {:ok, Enum.at(info, count_idx + 1)}, else: {:ok, 0}
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # Geo operations
   # ---------------------------------------------------------------------------
 
@@ -5496,12 +5327,13 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
 
   defp build_prob_store(resolved_key) do
-    # Probabilistic structures (Bloom, Cuckoo, CMS) use per-shard ETS registry
-    # tables. The command handlers resolve the shard index from the key via
-    # Router.shard_for/1, so we just need the basic store callbacks.
-    # Ensure that the per-shard registry ETS tables exist.
+    # Probabilistic structures route writes through Raft and reads via
+    # stateless pread NIFs. The store needs prob_dir and prob_write.
     index = Router.shard_for(resolved_key)
     ensure_prob_registry_tables(index)
+
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
     %{
       get: &Router.get/1,
@@ -5509,37 +5341,18 @@ defmodule FerricStore do
       put: &Router.put/3,
       delete: &Router.delete/1,
       exists?: &Router.exists?/1,
-      keys: &Router.keys/0
+      keys: &Router.keys/0,
+      prob_dir: fn -> Path.join(shard_data_path, "prob") end,
+      prob_dir_for_key: fn key ->
+        idx = Router.shard_for(key)
+        sp = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        Path.join(sp, "prob")
+      end,
+      prob_write: &Router.prob_write/1
     }
   end
 
-  defp ensure_prob_registry_tables(index) do
-    # Ensure Cuckoo registry table exists
-    cuckoo_name = :"cuckoo_reg_#{index}"
-    case :ets.whereis(cuckoo_name) do
-      :undefined ->
-        try do
-          :ets.new(cuckoo_name, [:set, :public, :named_table, {:read_concurrency, true}])
-        rescue
-          ArgumentError -> :ok
-        end
-      _ -> :ok
-    end
-
-    # Ensure CMS registry table exists
-    cms_name = :"cms_reg_#{index}"
-    case :ets.whereis(cms_name) do
-      :undefined ->
-        try do
-          :ets.new(cms_name, [:set, :public, :named_table, {:read_concurrency, true}])
-        rescue
-          ArgumentError -> :ok
-        end
-      _ -> :ok
-    end
-
-    :ok
-  end
+  defp ensure_prob_registry_tables(_index), do: :ok
 
   # ---------------------------------------------------------------------------
   # Private — TopK store builder

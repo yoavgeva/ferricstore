@@ -7,9 +7,8 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
     3. Count-Min Sketch (CMS)
     4. TopK (CMS + min-heap)
     5. T-Digest (quantile estimation)
-    6. HNSW (vector search)
-    7. Async IO (Tokio runtime)
-    8. Tracking allocator (memory monitoring)
+    6. Async IO (Tokio runtime)
+    7. Tracking allocator (memory monitoring)
 
   Tests verify:
   - Scheduler safety: all NIFs run on Normal scheduler (DirtyIo wall-time stays near zero)
@@ -80,15 +79,6 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   defp create_tdigest(opts \\ []) do
     compression = Keyword.get(opts, :compression, 100.0)
     NIF.tdigest_create(compression)
-  end
-
-  defp create_hnsw(opts \\ []) do
-    dims = Keyword.get(opts, :dims, 8)
-    m = Keyword.get(opts, :m, 16)
-    ef_construction = Keyword.get(opts, :ef_construction, 128)
-    metric = Keyword.get(opts, :metric, "l2")
-    {:ok, resource} = NIF.hnsw_new(dims, m, ef_construction, metric)
-    resource
   end
 
   # Measures total DirtyIo scheduler wall-time delta.
@@ -259,33 +249,6 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
     end
   end
 
-  describe "scheduler safety: HNSW NIFs run on Normal scheduler" do
-    @describetag :bench
-    test "HNSW operations stay off DirtyIo" do
-      :erlang.system_flag(:scheduler_wall_time, true)
-      Process.sleep(5)
-      dirty_before = sum_dirty_io_time()
-
-      index = create_hnsw(dims: 8)
-
-      for i <- 1..1_000 do
-        vec = for d <- 1..8, do: (i + d) * 1.0
-        NIF.hnsw_add(index, "v#{i}", vec)
-      end
-
-      query = for d <- 1..8, do: (500 + d) * 1.0
-      NIF.hnsw_search(index, query, 10, 200)
-      NIF.vsearch_nif(index, query, 10, 200)
-
-      dirty_after = sum_dirty_io_time()
-      :erlang.system_flag(:scheduler_wall_time, false)
-
-      dirty_delta = dirty_after - dirty_before
-      assert dirty_delta < 1_000_000,
-        "DirtyIo delta #{dirty_delta} suggests HNSW NIF ran on DirtyIo"
-    end
-  end
-
   describe "scheduler safety: tracking allocator runs on Normal scheduler" do
     @describetag :bench
     test "rust_allocated_bytes stays off DirtyIo" do
@@ -309,42 +272,6 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
   # ============================================================================
   # PART 2: Yield verification
   # ============================================================================
-
-  describe "yield: HNSW search with 5K vectors yields to scheduler" do
-    test "pinger stays responsive during large HNSW search" do
-      index = create_hnsw(dims: 16, ef_construction: 200)
-
-      # Build 5K-vector index
-      for i <- 1..5_000 do
-        vec = for d <- 1..16, do: :rand.uniform() * 100.0
-        {:ok, _} = NIF.hnsw_add(index, "v#{i}", vec)
-      end
-
-      {_pid, ping} = start_pinger()
-
-      query = for _ <- 1..16, do: :rand.uniform() * 100.0
-
-      task =
-        Task.async(fn ->
-          NIF.vsearch_nif(index, query, 10, 200)
-        end)
-
-      responses =
-        for _ <- 1..30 do
-          Process.sleep(2)
-          ping.()
-        end
-
-      Task.await(task, 30_000)
-
-      valid_pings = Enum.filter(responses, &is_integer/1)
-      assert length(valid_pings) > 0, "pinger never responded during HNSW search"
-      max_ping = Enum.max(valid_pings)
-
-      assert max_ping < 50_000,
-        "max ping #{max_ping}us during HNSW search -- scheduler may be blocked"
-    end
-  end
 
   describe "yield: bloom bulk add yields to scheduler" do
     setup do
@@ -542,25 +469,6 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
     end
   end
 
-  describe "memory: HNSW NIF resources freed on GC" do
-    test "create/destroy 1000 HNSW indices -- no significant memory growth" do
-      mem_before = :erlang.memory(:total)
-
-      for i <- 1..1000 do
-        {:ok, _idx} = NIF.hnsw_new(4, 8, 32, "l2")
-        if rem(i, 100) == 0, do: :erlang.garbage_collect()
-      end
-
-      :erlang.garbage_collect()
-      Process.sleep(50)
-      mem_after = :erlang.memory(:total)
-
-      growth = mem_after - mem_before
-      assert growth < 10_000_000,
-        "memory grew by #{growth} bytes after 1000 HNSW create cycles"
-    end
-  end
-
   # ============================================================================
   # PART 4: Cross-NIF interaction
   # ============================================================================
@@ -604,48 +512,6 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
     end
   end
 
-  describe "cross-NIF: HNSW search during bloom adds -- no deadlock" do
-    setup do
-      dir = tmp_dir()
-      on_exit(fn -> File.rm_rf(dir) end)
-      %{dir: dir}
-    end
-
-    test "concurrent HNSW search and bloom adds complete without deadlock", %{dir: dir} do
-      index = create_hnsw(dims: 8)
-      {bloom, _path} = create_bloom(dir, num_bits: 1_000_000)
-
-      # Pre-populate HNSW
-      for i <- 1..1_000 do
-        vec = for d <- 1..8, do: (i + d) * 1.0
-        NIF.hnsw_add(index, "v#{i}", vec)
-      end
-
-      # Run bloom adds and HNSW searches concurrently
-      bloom_task =
-        Task.async(fn ->
-          for i <- 1..10_000 do
-            NIF.bloom_add(bloom, "bloom_key_#{i}")
-          end
-
-          :bloom_done
-        end)
-
-      hnsw_task =
-        Task.async(fn ->
-          for _ <- 1..100 do
-            query = for d <- 1..8, do: :rand.uniform() * 1000.0
-            NIF.hnsw_search(index, query, 5, 100)
-          end
-
-          :hnsw_done
-        end)
-
-      assert Task.await(bloom_task, 30_000) == :bloom_done
-      assert Task.await(hnsw_task, 30_000) == :hnsw_done
-    end
-  end
-
   describe "cross-NIF: all probabilistic NIFs concurrent -- no contention" do
     setup do
       dir = tmp_dir()
@@ -653,13 +519,12 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
       %{dir: dir}
     end
 
-    test "bloom + cuckoo + CMS + TopK + TDigest + HNSW all running concurrently", %{dir: dir} do
+    test "bloom + cuckoo + CMS + TopK + TDigest all running concurrently", %{dir: dir} do
       {bloom, _} = create_bloom(dir, num_bits: 100_000)
       cuckoo = create_cuckoo(capacity: 2048)
       cms = create_cms(width: 500, depth: 5)
       topk = create_topk(k: 10, width: 100, depth: 7)
       digest = create_tdigest(compression: 100.0)
-      index = create_hnsw(dims: 4)
 
       tasks = [
         Task.async(fn ->
@@ -684,14 +549,6 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
           vals = for i <- 1..5_000, do: i * 1.0
           NIF.tdigest_add(digest, vals)
           :tdigest_done
-        end),
-        Task.async(fn ->
-          for i <- 1..500 do
-            vec = for d <- 1..4, do: (i + d) * 1.0
-            NIF.hnsw_add(index, "h#{i}", vec)
-          end
-
-          :hnsw_done
         end)
       ]
 
@@ -702,7 +559,6 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
       assert :cms_done in results
       assert :topk_done in results
       assert :tdigest_done in results
-      assert :hnsw_done in results
     end
   end
 
@@ -871,21 +727,6 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
     end
   end
 
-  describe "error handling: HNSW" do
-    test "hnsw_new with dims=0 returns error" do
-      assert {:error, _} = NIF.hnsw_new(0, 16, 128, "l2")
-    end
-
-    test "hnsw_new with unknown metric returns error" do
-      assert {:error, _} = NIF.hnsw_new(3, 16, 128, "manhattan")
-    end
-
-    test "hnsw_add with wrong dimension returns error" do
-      {:ok, index} = NIF.hnsw_new(3, 16, 128, "l2")
-      assert {:error, _} = NIF.hnsw_add(index, "bad", [1.0, 2.0])
-    end
-  end
-
   # ============================================================================
   # PART 8: Correctness edge cases
   # ============================================================================
@@ -1012,33 +853,4 @@ defmodule Ferricstore.Bitcask.NewNIFIntegrationTest do
     end
   end
 
-  describe "correctness: HNSW search accuracy" do
-    test "nearest neighbor is the exact match" do
-      index = create_hnsw(dims: 3)
-      NIF.hnsw_add(index, "close", [1.1, 0.1, 0.1])
-      NIF.hnsw_add(index, "far", [10.0, 10.0, 10.0])
-
-      {:ok, results} = NIF.hnsw_search(index, [1.0, 0.0, 0.0], 1, 50)
-      [{key, _dist}] = results
-      assert key == "close"
-    end
-
-    test "delete removes from search results" do
-      index = create_hnsw(dims: 3)
-      NIF.hnsw_add(index, "a", [1.0, 0.0, 0.0])
-      NIF.hnsw_add(index, "b", [0.0, 1.0, 0.0])
-
-      NIF.hnsw_delete(index, "a")
-
-      {:ok, results} = NIF.hnsw_search(index, [1.0, 0.0, 0.0], 5, 50)
-      keys = Enum.map(results, fn {k, _} -> k end)
-      refute "a" in keys, "deleted key still in search results"
-    end
-
-    test "empty index search returns empty" do
-      index = create_hnsw(dims: 3)
-      {:ok, results} = NIF.hnsw_search(index, [1.0, 0.0, 0.0], 5, 50)
-      assert results == []
-    end
-  end
 end

@@ -9,7 +9,6 @@ defmodule Ferricstore.DataDir do
     data/shard_0/ ... shard_N/      (shared Bitcask per shard)
     dedicated/shard_0/ ... shard_N/ (for future promoted collections)
     prob/shard_0/ ... shard_N/      (probabilistic structure files)
-    vectors/shard_0/ ... shard_N/   (vector collection files)
     raft/shard_0/ ... shard_N/      (Raft WAL - managed by ra)
     registry/                        (merge scheduler state)
     hints/                           (hot cache warm-up files)
@@ -33,12 +32,12 @@ defmodule Ferricstore.DataDir do
 
   require Logger
 
-  @top_level_dirs ~w(data dedicated prob vectors raft registry hints)
+  @top_level_dirs ~w(data dedicated prob raft registry hints)
 
   @doc """
   Creates the full directory layout under `data_dir`.
 
-  For each of `data/`, `dedicated/`, `prob/`, `vectors/`, and `raft/`,
+  For each of `data/`, `dedicated/`, `prob/`, and `raft/`,
   per-shard subdirectories `shard_0` through `shard_{N-1}` are created.
   `registry/` and `hints/` are top-level directories without per-shard
   subdirectories.
@@ -63,7 +62,7 @@ defmodule Ferricstore.DataDir do
     File.mkdir_p!(data_dir)
 
     # Directories that get per-shard subdirectories
-    sharded_dirs = ~w(data dedicated prob vectors raft)
+    sharded_dirs = ~w(data dedicated prob raft)
 
     for dir <- sharded_dirs, i <- 0..(shard_count - 1) do
       File.mkdir_p!(Path.join([data_dir, dir, "shard_#{i}"]))

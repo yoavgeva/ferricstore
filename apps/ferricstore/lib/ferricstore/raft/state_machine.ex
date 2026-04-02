@@ -115,6 +115,7 @@ defmodule Ferricstore.Raft.StateMachine do
       active_file_id: config.active_file_id,
       active_file_path: config.active_file_path,
       ets: config.ets,
+      data_dir: Map.get(config, :data_dir, Path.dirname(config.shard_data_path)),
       prefix_keys: Map.get(config, :prefix_keys, PrefixIndex.table_name(config.shard_index)),
       applied_count: 0,
       release_cursor_interval: interval,
@@ -530,6 +531,158 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   # ---------------------------------------------------------------------------
+  # Probabilistic data structure commands (bloom, CMS, cuckoo, TopK)
+  #
+  # These commands replicate prob mutations through Raft so that followers
+  # apply the same NIF writes to their local prob files. Read commands
+  # (BF.EXISTS, CMS.QUERY, etc.) bypass Raft and go directly to the local
+  # stateless pread NIF.
+  # ---------------------------------------------------------------------------
+
+  # -- Bloom --
+
+  def apply(meta, {:bloom_create, key, num_bits, num_hashes, prob_meta}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "bloom")
+      ensure_prob_dir(state)
+      NIF.bloom_file_create(path, num_bits, num_hashes)
+      do_put(state, key, :erlang.term_to_binary(prob_meta), 0)
+      :ok
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  def apply(meta, {:bloom_add, key, element, auto_create_params}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "bloom")
+      ensure_prob_dir(state)
+      auto_create_bloom_if_needed(state, path, key, auto_create_params)
+      NIF.bloom_file_add(path, element)
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  def apply(meta, {:bloom_madd, key, elements, auto_create_params}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "bloom")
+      ensure_prob_dir(state)
+      auto_create_bloom_if_needed(state, path, key, auto_create_params)
+      NIF.bloom_file_madd(path, elements)
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  # -- CMS --
+
+  def apply(meta, {:cms_create, key, width, depth}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "cms")
+      ensure_prob_dir(state)
+      NIF.cms_file_create(path, width, depth)
+      meta_val = {:cms_meta, %{width: width, depth: depth}}
+      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      :ok
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  def apply(meta, {:cms_incrby, key, items}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "cms")
+      NIF.cms_file_incrby(path, items)
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  # src_paths are pre-resolved absolute paths (sources may be on different shards)
+  def apply(meta, {:cms_merge, dst_key, src_paths, weights, create_params}, state) do
+    result = do_prob_command(state, fn ->
+      dst_path = prob_path(state, dst_key, "cms")
+      ensure_prob_dir(state)
+      unless File.exists?(dst_path) do
+        %{width: w, depth: d} = create_params
+        NIF.cms_file_create(dst_path, w, d)
+        meta_val = {:cms_meta, %{width: w, depth: d}}
+        do_put(state, dst_key, :erlang.term_to_binary(meta_val), 0)
+      end
+      NIF.cms_file_merge(dst_path, src_paths, weights)
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  # -- Cuckoo --
+
+  def apply(meta, {:cuckoo_create, key, capacity, bucket_size}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      ensure_prob_dir(state)
+      NIF.cuckoo_file_create(path, capacity, bucket_size)
+      meta_val = {:cuckoo_meta, %{capacity: capacity}}
+      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      :ok
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  def apply(meta, {:cuckoo_add, key, element, auto_create_params}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      ensure_prob_dir(state)
+      auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
+      NIF.cuckoo_file_add(path, element)
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  def apply(meta, {:cuckoo_addnx, key, element, auto_create_params}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      ensure_prob_dir(state)
+      auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
+      NIF.cuckoo_file_addnx(path, element)
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  def apply(meta, {:cuckoo_del, key, element}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      NIF.cuckoo_file_del(path, element)
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  # -- TopK --
+
+  def apply(meta, {:topk_create, key, k, width, depth, decay}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "topk")
+      ensure_prob_dir(state)
+      NIF.topk_file_create_v2(path, k, width, depth, decay)
+      meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
+      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      :ok
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  def apply(meta, {:topk_add, key, elements}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "topk")
+      NIF.topk_file_add_v2(path, elements)
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  def apply(meta, {:topk_incrby, key, pairs}, state) do
+    result = do_prob_command(state, fn ->
+      path = prob_path(state, key, "topk")
+      NIF.topk_file_incrby_v2(path, pairs)
+    end)
+    bump_applied(meta, state, result)
+  end
+
+  # ---------------------------------------------------------------------------
   # HLC-wrapped commands (spec 2G.6)
   #
   # When the Batcher stamps a command with an HLC timestamp, it wraps the
@@ -915,11 +1068,15 @@ defmodule Ferricstore.Raft.StateMachine do
         cross_shard_delete_prefix(ctx, prefix, local_delete)
       end,
       prob_dir: fn ->
-        Path.join([data_dir, "prob", "shard_#{ctx.index}"])
+        Path.join(ctx.shard_data_path, "prob")
       end,
-      vectors_dir: fn ->
-        Path.join([data_dir, "vectors", "shard_#{ctx.index}"])
-      end
+      prob_write: fn command ->
+        # Within cross-shard tx, prob writes are applied directly
+        # (the state machine is already applying through Raft)
+        apply_prob_locally(ctx, command)
+      end,
+      shard_index: ctx.index,
+      data_dir: data_dir
     }
   end
 
@@ -1168,6 +1325,129 @@ defmodule Ferricstore.Raft.StateMachine do
     do_ratelimit_add(state, key, window_ms, max, count, now_ms)
   end
 
+  # -- Probabilistic data structure commands in batch/cross_shard_tx --
+
+  defp apply_single(state, {:bloom_create, key, num_bits, num_hashes, prob_meta}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "bloom")
+      ensure_prob_dir(state)
+      NIF.bloom_file_create(path, num_bits, num_hashes)
+      do_put(state, key, :erlang.term_to_binary(prob_meta), 0)
+      :ok
+    end)
+  end
+
+  defp apply_single(state, {:bloom_add, key, element, auto_create_params}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "bloom")
+      ensure_prob_dir(state)
+      auto_create_bloom_if_needed(state, path, key, auto_create_params)
+      NIF.bloom_file_add(path, element)
+    end)
+  end
+
+  defp apply_single(state, {:bloom_madd, key, elements, auto_create_params}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "bloom")
+      ensure_prob_dir(state)
+      auto_create_bloom_if_needed(state, path, key, auto_create_params)
+      NIF.bloom_file_madd(path, elements)
+    end)
+  end
+
+  defp apply_single(state, {:cms_create, key, width, depth}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "cms")
+      ensure_prob_dir(state)
+      NIF.cms_file_create(path, width, depth)
+      meta_val = {:cms_meta, %{width: width, depth: depth}}
+      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      :ok
+    end)
+  end
+
+  defp apply_single(state, {:cms_incrby, key, items}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "cms")
+      NIF.cms_file_incrby(path, items)
+    end)
+  end
+
+  defp apply_single(state, {:cms_merge, dst_key, src_paths, weights, create_params}) do
+    do_prob_command(state, fn ->
+      dst_path = prob_path(state, dst_key, "cms")
+      ensure_prob_dir(state)
+      unless File.exists?(dst_path) do
+        %{width: w, depth: d} = create_params
+        NIF.cms_file_create(dst_path, w, d)
+        meta_val = {:cms_meta, %{width: w, depth: d}}
+        do_put(state, dst_key, :erlang.term_to_binary(meta_val), 0)
+      end
+      NIF.cms_file_merge(dst_path, src_paths, weights)
+    end)
+  end
+
+  defp apply_single(state, {:cuckoo_create, key, capacity, bucket_size}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      ensure_prob_dir(state)
+      NIF.cuckoo_file_create(path, capacity, bucket_size)
+      meta_val = {:cuckoo_meta, %{capacity: capacity}}
+      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      :ok
+    end)
+  end
+
+  defp apply_single(state, {:cuckoo_add, key, element, auto_create_params}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      ensure_prob_dir(state)
+      auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
+      NIF.cuckoo_file_add(path, element)
+    end)
+  end
+
+  defp apply_single(state, {:cuckoo_addnx, key, element, auto_create_params}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      ensure_prob_dir(state)
+      auto_create_cuckoo_if_needed(state, path, key, auto_create_params)
+      NIF.cuckoo_file_addnx(path, element)
+    end)
+  end
+
+  defp apply_single(state, {:cuckoo_del, key, element}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "cuckoo")
+      NIF.cuckoo_file_del(path, element)
+    end)
+  end
+
+  defp apply_single(state, {:topk_create, key, k, width, depth, decay}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "topk")
+      ensure_prob_dir(state)
+      NIF.topk_file_create_v2(path, k, width, depth, decay)
+      meta_val = {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
+      do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      :ok
+    end)
+  end
+
+  defp apply_single(state, {:topk_add, key, elements}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "topk")
+      NIF.topk_file_add_v2(path, elements)
+    end)
+  end
+
+  defp apply_single(state, {:topk_incrby, key, pairs}) do
+    do_prob_command(state, fn ->
+      path = prob_path(state, key, "topk")
+      NIF.topk_file_incrby_v2(path, pairs)
+    end)
+  end
+
   # Wraps a block of state machine operations with batched disk writes.
   # Initializes the pending-writes buffer, runs the block, then flushes
   # all accumulated writes in a single v2_append_batch_nosync NIF call.
@@ -1251,6 +1531,10 @@ defmodule Ferricstore.Raft.StateMachine do
     # Without this, a background PUT arriving after the tombstone would
     # resurrect the key on recovery (Bitcask last-record-wins semantics).
     flush_pending_for_key(state, key)
+
+    # If this key holds prob metadata, delete the associated prob file.
+    # Must happen before the ETS entry is removed so we can read the value.
+    maybe_delete_prob_file(state, key)
 
     # v2: append a tombstone record to the active log file + fsync.
     case NIF.v2_append_tombstone(state.active_file_path, key) do
@@ -1896,5 +2180,102 @@ defmodule Ferricstore.Raft.StateMachine do
     _error -> :ok
   catch
     :exit, _reason -> :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: probabilistic data structure helpers
+  # ---------------------------------------------------------------------------
+
+  # Shorthand for the common prob command pattern: bump applied count +
+  # maybe release cursor.
+  defp bump_applied(meta, state, result) do
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # Prob commands don't write to Bitcask log (they write to their own files),
+  # so they use with_pending_writes to ensure any metadata puts are batched.
+  defp do_prob_command(state, fun) do
+    with_pending_writes(state, fun)
+  end
+
+  # Returns the file path for a probabilistic data structure file.
+  # Uses Base64 URL-safe encoding to handle arbitrary key bytes.
+  defp prob_path(state, key, ext) do
+    safe = Base.url_encode64(key, padding: false)
+    prob_dir = prob_dir(state)
+    Path.join(prob_dir, "#{safe}.#{ext}")
+  end
+
+  # Returns the prob directory for this shard.
+  defp prob_dir(%{shard_data_path: shard_data_path}) do
+    Path.join(shard_data_path, "prob")
+  end
+
+  # Ensures the prob directory exists.
+  defp ensure_prob_dir(state) do
+    dir = prob_dir(state)
+
+    unless File.exists?(dir) do
+      File.mkdir_p!(dir)
+    end
+  end
+
+  # Auto-creates a bloom filter file if it doesn't exist.
+  defp auto_create_bloom_if_needed(state, path, key, auto_create_params) do
+    unless File.exists?(path) do
+      if auto_create_params do
+        %{num_bits: nb, num_hashes: nh} = auto_create_params
+        NIF.bloom_file_create(path, nb, nh)
+        meta_val = {:bloom_meta, Map.merge(auto_create_params, %{path: path})}
+        do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      end
+    end
+  end
+
+  # Applies a prob command locally (used in cross-shard tx context where
+  # the state machine is already running inside Raft apply).
+  defp apply_prob_locally(_ctx, command) do
+    # In cross-shard tx, prob commands go through Router.prob_write
+    # which routes to the correct shard's Raft group.
+    Router.prob_write(command)
+  end
+
+  # Auto-creates a cuckoo filter file if it doesn't exist.
+  defp auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
+    unless File.exists?(path) do
+      if auto_create_params do
+        %{capacity: cap, bucket_size: bs} = auto_create_params
+        NIF.cuckoo_file_create(path, cap, bs)
+        meta_val = {:cuckoo_meta, %{capacity: cap}}
+        do_put(state, key, :erlang.term_to_binary(meta_val), 0)
+      end
+    end
+  end
+
+  # Enhanced do_delete that cleans up prob files.
+  # When a key's value is a prob metadata marker, delete the associated file.
+  defp maybe_delete_prob_file(state, key) do
+    case do_get(state, key) do
+      nil ->
+        :ok
+
+      value when is_binary(value) ->
+        try do
+          case :erlang.binary_to_term(value) do
+            {:bloom_meta, %{path: path}} -> File.rm(path)
+            {:cms_meta, _} -> File.rm(prob_path(state, key, "cms"))
+            {:cuckoo_meta, _} -> File.rm(prob_path(state, key, "cuckoo"))
+            {:topk_meta, %{path: path}} -> File.rm(path)
+            _ -> :ok
+          end
+        rescue
+          _ -> :ok
+        end
+
+      _ ->
+        :ok
+    end
   end
 end

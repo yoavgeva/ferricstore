@@ -34,7 +34,6 @@ pub mod cms;
 pub mod compaction;
 pub mod cuckoo;
 pub mod hint;
-pub mod hnsw;
 pub mod io_backend;
 pub mod keydir;
 pub mod log;
@@ -75,15 +74,8 @@ mod atoms {
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
     let _ = rustler::resource!(ValueBuffer, env);
-    let _ = rustler::resource!(hnsw::HnswResource, env);
-    let _ = rustler::resource!(cuckoo::CuckooResource, env);
-    let _ = rustler::resource!(topk::TopKResource, env);
-    let _ = rustler::resource!(topk::MmapTopKResource, env);
-    let _ = rustler::resource!(cms::CmsResource, env);
-    let _ = rustler::resource!(bloom::BloomResource, env);
     tdigest::register_resource(env);
     tdigest::register_mmap_resource(env);
-    hnsw::register_mmap_resource(env);
     true
 }
 

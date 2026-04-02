@@ -1,14 +1,11 @@
-defmodule Ferricstore.Test.MmapMockStore do
+defmodule Ferricstore.Test.ProbMockStore do
   @moduledoc """
-  Creates a mock store with mmap-backed registry callbacks for probabilistic
-  data structures (Bloom, Cuckoo, CMS).
+  Creates a mock store with stateless NIF-backed callbacks for
+  probabilistic data structures (Bloom, Cuckoo, CMS, TopK).
 
-  Each call to `make_cuckoo/0` or `make_cms/0` returns a store map with a
-  `cuckoo_registry` or `cms_registry` key containing callback functions
-  that manage NIF resources in an Agent.
+  Each call to `make_cuckoo/0`, `make_cms/0`, or `make_bloom/0` returns
+  a store map with a `prob_dir` callback and registry callbacks.
   """
-
-  alias Ferricstore.Bitcask.NIF
 
   @doc """
   Creates a mock store with a cuckoo_registry backed by an Agent and temp dir.
@@ -33,16 +30,15 @@ defmodule Ferricstore.Test.MmapMockStore do
       path: fn key ->
         safe = String.replace(key, ~r/[^a-zA-Z0-9_.\-]/, "_")
         Path.join(tmp_dir, "#{safe}.cuckoo")
-      end
+      end,
+      dir: tmp_dir
     }
 
-    exists_fn = fn key ->
-      Agent.get(pid, fn state -> Map.has_key?(state, key) end)
-    end
-
+    # Note: exists? is intentionally omitted so the handler falls back
+    # to File.exists? on the base64-encoded path.
     %{
       cuckoo_registry: registry,
-      exists?: exists_fn
+      prob_dir: fn -> tmp_dir end
     }
   end
 
@@ -69,16 +65,26 @@ defmodule Ferricstore.Test.MmapMockStore do
       path: fn key ->
         safe = String.replace(key, ~r/[^a-zA-Z0-9_.\-]/, "_")
         Path.join(tmp_dir, "#{safe}.cms")
-      end
+      end,
+      dir: tmp_dir
     }
 
-    exists_fn = fn key ->
-      Agent.get(pid, fn state -> Map.has_key?(state, key) end)
+    get_fn = fn key ->
+      Agent.get(pid, fn state ->
+        case Map.get(state, key) do
+          {_resource, _meta} -> :exists
+          nil -> nil
+        end
+      end)
     end
 
+    # Note: exists? is intentionally omitted so the handler falls back
+    # to File.exists? on the base64-encoded path, which works with the
+    # stateless pread/pwrite NIF architecture.
     %{
       cms_registry: registry,
-      exists?: exists_fn
+      get: get_fn,
+      prob_dir: fn -> tmp_dir end
     }
   end
 
@@ -105,22 +111,29 @@ defmodule Ferricstore.Test.MmapMockStore do
       path: fn key ->
         safe = String.replace(key, ~r/[^a-zA-Z0-9_.\-]/, "_")
         Path.join(tmp_dir, "#{safe}.bloom")
-      end
+      end,
+      dir: tmp_dir
     }
 
-    exists_fn = fn key ->
-      Agent.get(pid, fn state -> Map.has_key?(state, key) end)
-    end
-
+    # Note: exists? is intentionally omitted so the handler falls back
+    # to File.exists? on the base64-encoded path.
     %{
       bloom_registry: registry,
-      exists?: exists_fn
+      prob_dir: fn -> tmp_dir end
     }
   end
 
   defp make_tmp_dir(prefix) do
-    dir = Path.join(System.tmp_dir!(), "ferricstore_test_#{prefix}_#{:erlang.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "ferricstore_test_#{prefix}_#{:os.getpid()}_#{:erlang.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     dir
   end
+end
+
+# Backward-compatible alias for the old name
+defmodule Ferricstore.Test.MmapMockStore do
+  @moduledoc false
+  defdelegate make_cuckoo(), to: Ferricstore.Test.ProbMockStore
+  defdelegate make_cms(), to: Ferricstore.Test.ProbMockStore
+  defdelegate make_bloom(), to: Ferricstore.Test.ProbMockStore
 end

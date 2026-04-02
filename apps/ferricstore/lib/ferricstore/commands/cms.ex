@@ -1,30 +1,13 @@
 defmodule Ferricstore.Commands.CMS do
   @moduledoc """
-  Count-Min Sketch commands backed by mmap NIF resources.
+  Count-Min Sketch commands routed through Raft for replication.
 
-  Each CMS is a memory-mapped file on disk managed by a Rust NIF.
-  Files live at `data_dir/prob/shard_N/KEY.cms`. The mmap handle (NIF
-  resource) is cached in a per-shard ETS table via `CmsRegistry` so that
-  repeated operations avoid re-opening the file.
-
-  ## Supported Commands
-
-    * `CMS.INITBYDIM key width depth` -- creates a new CMS
-    * `CMS.INITBYPROB key error probability` -- creates sized by target accuracy
-    * `CMS.INCRBY key element count [element count ...]` -- increments
-    * `CMS.QUERY key element [element ...]` -- queries counts
-    * `CMS.MERGE dst numkeys src [src ...] [WEIGHTS w ...]` -- merges
-    * `CMS.INFO key` -- returns sketch metadata
-
-  ## Resource caching
-
-  On first access, the NIF resource is opened from the `.cms` file and
-  cached in `CmsRegistry`. Subsequent operations on the same key reuse
-  the cached handle.
+  Write commands (CMS.INITBYDIM, CMS.INITBYPROB, CMS.INCRBY, CMS.MERGE)
+  route through Raft via `store.prob_write`. Read commands (CMS.QUERY,
+  CMS.INFO) use stateless pread NIFs on local files.
   """
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.{CmsRegistry, Router}
 
   # -------------------------------------------------------------------
   # Public command handler
@@ -36,8 +19,13 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.INITBYDIM", [key, width_str, depth_str], store) do
     with {:ok, width} <- parse_pos_integer(width_str, "width"),
          {:ok, depth} <- parse_pos_integer(depth_str, "depth"),
-         :ok <- check_not_exists(store, key) do
-      create_cms(key, width, depth, store)
+         :ok <- check_not_exists(key, store) do
+      result = do_prob_write(store, {:cms_create, key, width, depth})
+      case result do
+        {:ok, _} -> :ok
+        :ok -> :ok
+        other -> other
+      end
     end
   end
 
@@ -47,10 +35,15 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.INITBYPROB", [key, error_str, prob_str], store) do
     with {:ok, error} <- parse_pos_float(error_str, "error"),
          {:ok, prob} <- parse_prob_float(prob_str, "probability"),
-         :ok <- check_not_exists(store, key) do
+         :ok <- check_not_exists(key, store) do
       width = ceil(:math.exp(1) / error)
       depth = ceil(:math.log(1.0 / prob))
-      create_cms(key, width, depth, store)
+      result = do_prob_write(store, {:cms_create, key, width, depth})
+      case result do
+        {:ok, _} -> :ok
+        :ok -> :ok
+        other -> other
+      end
     end
   end
 
@@ -58,26 +51,23 @@ defmodule Ferricstore.Commands.CMS do
     do: {:error, "ERR wrong number of arguments for 'cms.initbyprob' command"}
 
   def handle("CMS.INCRBY", [key | rest], store) when rest != [] do
-    with {:ok, pairs} <- parse_element_count_pairs(rest),
-         {:ok, ref} <- get_sketch(store, key) do
-      items = Enum.map(pairs, fn {element, count} -> {element, count} end)
-
-      case NIF.cms_incrby(ref, items) do
-        {:ok, counts} -> counts
-        {:error, reason} -> {:error, "ERR CMS incrby failed: #{reason}"}
-      end
+    with {:ok, pairs} <- parse_element_count_pairs(rest) do
+      result = do_prob_write(store, {:cms_incrby, key, pairs})
+      normalize_result(result)
     end
   end
 
   def handle("CMS.INCRBY", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'cms.incrby' command"}
 
+  # CMS.QUERY — local stateless pread
   def handle("CMS.QUERY", [key | elements], store) when elements != [] do
-    with {:ok, ref} <- get_sketch(store, key) do
-      case NIF.cms_query(ref, elements) do
-        {:ok, counts} -> counts
-        {:error, reason} -> {:error, "ERR CMS query failed: #{reason}"}
-      end
+    path = prob_path(store, key, "cms")
+
+    case NIF.cms_file_query(path, elements) do
+      {:ok, counts} -> counts
+      {:error, :enoent} -> {:error, "ERR CMS: key does not exist"}
+      {:error, reason} -> {:error, "ERR CMS query failed: #{inspect(reason)}"}
     end
   end
 
@@ -86,27 +76,50 @@ defmodule Ferricstore.Commands.CMS do
 
   def handle("CMS.MERGE", [dst, numkeys_str | rest], store) do
     with {:ok, numkeys} <- parse_pos_integer(numkeys_str, "numkeys"),
-         {:ok, src_keys, weights} <- parse_merge_args(rest, numkeys),
-         {:ok, src_refs} <- load_source_sketches(store, src_keys),
-         {:ok, src_infos} <- get_sketch_infos(src_refs),
-         :ok <- validate_merge_dimensions(src_infos) do
-      {first_w, first_d, _} = hd(src_infos)
-      apply_merge_to_dst(store, dst, first_w, first_d, src_refs, weights)
+         {:ok, src_keys, weights} <- parse_merge_args(rest, numkeys) do
+      # Validate source sketches exist and get dimensions
+      first_info = cms_file_info_for_key(store, hd(src_keys))
+
+      case first_info do
+        {:error, _} = err -> err
+        {:ok, {first_w, first_d, _}} ->
+          # Validate all sources have same dimensions
+          all_valid = Enum.all?(src_keys, fn k ->
+            case cms_file_info_for_key(store, k) do
+              {:ok, {w, d, _}} -> w == first_w and d == first_d
+              _ -> false
+            end
+          end)
+
+          if all_valid do
+            create_params = %{width: first_w, depth: first_d}
+            # Pre-resolve source paths — sources may be on different shards
+            src_paths = Enum.map(src_keys, &prob_path(store, &1, "cms"))
+            result = do_prob_write(store, {:cms_merge, dst, src_paths, weights, create_params})
+            normalize_result(result)
+          else
+            {:error, "ERR CMS: width/depth of src sketches must be equal"}
+          end
+      end
     end
   end
 
   def handle("CMS.MERGE", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'cms.merge' command"}
 
+  # CMS.INFO — local stateless pread
   def handle("CMS.INFO", [key], store) do
-    with {:ok, ref} <- get_sketch(store, key) do
-      case NIF.cms_info(ref) do
-        {:ok, {width, depth, count}} ->
-          ["width", width, "depth", depth, "count", count]
+    path = prob_path(store, key, "cms")
 
-        {:error, reason} ->
-          {:error, "ERR CMS info failed: #{reason}"}
-      end
+    case NIF.cms_file_info(path) do
+      {:ok, {width, depth, count}} ->
+        ["width", width, "depth", depth, "count", count]
+
+      {:error, :enoent} ->
+        {:error, "ERR CMS: key does not exist"}
+
+      {:error, reason} ->
+        {:error, "ERR CMS info failed: #{inspect(reason)}"}
     end
   end
 
@@ -114,271 +127,86 @@ defmodule Ferricstore.Commands.CMS do
     do: {:error, "ERR wrong number of arguments for 'cms.info' command"}
 
   # ---------------------------------------------------------------------------
-  # Deletion (called from DEL / UNLINK handlers)
+  # Deletion
   # ---------------------------------------------------------------------------
 
   @spec nif_delete(binary(), map()) :: :ok
   def nif_delete(key, store) do
-    case resolve_registry(store) do
-      {:ets, index, _data_dir} ->
-        CmsRegistry.delete(index, key)
-
-      {:callback, registry} ->
-        case registry.get.(key) do
-          nil ->
-            :ok
-
-          {resource, _meta} ->
-            NIF.cms_close(resource)
-            registry.delete.(key)
-            :ok
-        end
-    end
-  end
-
-  # Internal API for Top-K
-  @doc false
-  def new_sketch(width, depth, path) do
-    case NIF.cms_create_file(path, width, depth) do
-      {:ok, ref} -> ref
-      {:error, reason} -> raise "CMS create failed: #{reason}"
-    end
-  end
-
-  @doc false
-  def increment(ref, element, count) do
-    case NIF.cms_incrby(ref, [{element, count}]) do
-      {:ok, [min_count]} -> {ref, min_count}
-      {:error, reason} -> raise "CMS incrby failed: #{reason}"
-    end
-  end
-
-  @doc false
-  def estimate(ref, element) do
-    case NIF.cms_query(ref, [element]) do
-      {:ok, [count]} -> count
-      {:error, reason} -> raise "CMS query failed: #{reason}"
-    end
-  end
-
-  @doc false
-  def sketch_info(ref) do
-    case NIF.cms_info(ref) do
-      {:ok, info} -> info
-      {:error, reason} -> raise "CMS info failed: #{reason}"
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private: registry resolution
-  # ---------------------------------------------------------------------------
-
-  @spec resolve_registry(map()) ::
-          {:ets, non_neg_integer(), binary()}
-          | {:callback, map()}
-  defp resolve_registry(%{cms_registry: registry}) when is_map(registry) do
-    {:callback, registry}
-  end
-
-  defp resolve_registry(_store) do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    {:ets, nil, data_dir}
-  end
-
-  @spec resolve_registry_for_key(binary(), map()) ::
-          {:ets, non_neg_integer(), binary()}
-          | {:callback, map()}
-  defp resolve_registry_for_key(_key, %{cms_registry: registry}) when is_map(registry) do
-    {:callback, registry}
-  end
-
-  defp resolve_registry_for_key(key, _store) do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    index = Router.shard_for(key)
-    {:ets, index, data_dir}
+    path = prob_path(store, key, "cms")
+    File.rm(path)
+    :ok
   end
 
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp check_not_exists(store, key) do
-    case get_cms(key, store) do
-      nil -> :ok
-      _ -> {:error, "ERR item already exists"}
+  defp prob_path(store, key, ext) do
+    safe = Base.url_encode64(key, padding: false)
+    prob_dir = resolve_prob_dir(store, key)
+    Path.join(prob_dir, "#{safe}.#{ext}")
+  end
+
+  defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn), do: prob_dir_fn.()
+  defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
+  defp resolve_prob_dir(%{cms_registry: %{dir: dir}}, _key), do: dir
+  defp resolve_prob_dir(_store, key) do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    idx = Ferricstore.Store.Router.shard_for(key)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+    Path.join(shard_path, "prob")
+  end
+
+  # Routes a prob write command through Raft (production) or directly via
+  # NIF (test mode when store lacks prob_write).
+  defp do_prob_write(store, command) do
+    case Map.get(store, :prob_write) do
+      nil -> apply_prob_locally(store, command)
+      write_fn -> write_fn.(command)
     end
   end
 
-  @spec get_cms(binary(), map()) :: {reference(), map()} | nil
-  defp get_cms(key, store) do
-    case resolve_registry_for_key(key, store) do
-      {:ets, index, data_dir} ->
-        case CmsRegistry.open_or_lookup(index, key, data_dir) do
-          {:ok, resource, meta} -> {resource, meta}
-          :not_found -> nil
-        end
+  defp apply_prob_locally(store, {:cms_create, key, width, depth}) do
+    path = prob_path(store, key, "cms")
+    File.mkdir_p!(Path.dirname(path))
+    NIF.cms_file_create(path, width, depth)
+  end
 
-      {:callback, registry} ->
-        case registry.get.(key) do
-          nil -> nil
-          {resource, meta} -> {resource, meta}
-        end
+  defp apply_prob_locally(store, {:cms_incrby, key, items}) do
+    path = prob_path(store, key, "cms")
+    NIF.cms_file_incrby(path, items)
+  end
+
+  # src_paths are pre-resolved absolute paths from the handler
+  defp apply_prob_locally(store, {:cms_merge, dst_key, src_paths, weights, create_params}) do
+    dst_path = prob_path(store, dst_key, "cms")
+    File.mkdir_p!(Path.dirname(dst_path))
+    unless File.exists?(dst_path) do
+      %{width: w, depth: d} = create_params
+      NIF.cms_file_create(dst_path, w, d)
     end
+    NIF.cms_file_merge(dst_path, src_paths, weights)
   end
 
-  defp get_sketch(store, key) do
-    case get_cms(key, store) do
-      nil ->
-        # Key not in CMS registry -- check if another type owns it (WRONGTYPE)
-        if key_held_by_other_type?(key, store) do
-          {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-        else
-          {:error, "ERR CMS: key does not exist"}
-        end
-      {resource, _meta} -> {:ok, resource}
-    end
+  defp check_not_exists(key, store) do
+    exists =
+      case Map.get(store, :exists?) do
+        nil -> File.exists?(prob_path(store, key, "cms"))
+        exists_fn -> exists_fn.(key)
+      end
+
+    if exists, do: {:error, "ERR item already exists"}, else: :ok
   end
 
-  # Checks whether a key is held by another probabilistic data structure type
-  defp key_held_by_other_type?(key, store) do
-    # Check TopK path in main store (TopK stores {:topk_path, _})
-    case Map.get(store, :get) do
-      nil ->
-        false
-
-      get_fn ->
-        case get_fn.(key) do
-          nil -> false
-          {:topk_path, _} -> true
-          {:tdigest_path, _} -> true
-          _ -> true
-        end
-    end
+  defp cms_file_info_for_key(store, key) do
+    path = prob_path(store, key, "cms")
+    NIF.cms_file_info(path)
   end
 
-  defp create_cms(key, width, depth, store) do
-    meta = %{width: width, depth: depth}
-
-    case resolve_registry_for_key(key, store) do
-      {:ets, index, data_dir} ->
-        path = CmsRegistry.cms_path(data_dir, index, key)
-
-        case NIF.cms_create_file(path, width, depth) do
-          {:ok, resource} ->
-            CmsRegistry.register(index, key, resource, meta)
-            :ok
-
-          {:error, reason} ->
-            {:error, "ERR CMS create failed: #{reason}"}
-        end
-
-      {:callback, registry} ->
-        path = registry.path.(key)
-
-        case NIF.cms_create_file(path, width, depth) do
-          {:ok, resource} ->
-            registry.put.(key, resource, meta)
-            :ok
-
-          {:error, reason} ->
-            {:error, "ERR CMS create failed: #{reason}"}
-        end
-    end
-  end
-
-  defp get_sketch_infos(refs) do
-    results =
-      Enum.reduce_while(refs, [], fn ref, acc ->
-        case NIF.cms_info(ref) do
-          {:ok, info} -> {:cont, [info | acc]}
-          {:error, reason} -> {:halt, {:error, "ERR CMS info failed: #{reason}"}}
-        end
-      end)
-
-    case results do
-      {:error, _} = err -> err
-      infos -> {:ok, Enum.reverse(infos)}
-    end
-  end
-
-  defp apply_merge_to_dst(store, dst, first_w, first_d, src_refs, weights) do
-    case get_sketch(store, dst) do
-      {:ok, existing_ref} ->
-        case NIF.cms_info(existing_ref) do
-          {:ok, {ew, ed, _}} ->
-            if ew != first_w or ed != first_d do
-              {:error, "ERR CMS: width/depth of src and dst must be equal"}
-            else
-              sources = Enum.zip(src_refs, weights)
-
-              case NIF.cms_merge(existing_ref, sources) do
-                :ok -> :ok
-                {:error, reason} -> {:error, "ERR CMS merge failed: #{reason}"}
-              end
-            end
-
-          {:error, reason} ->
-            {:error, "ERR CMS info failed: #{reason}"}
-        end
-
-      {:error, "ERR CMS: key does not exist"} ->
-        # Create new dest sketch
-        meta = %{width: first_w, depth: first_d}
-
-        case resolve_registry_for_key(dst, store) do
-          {:ets, index, data_dir} ->
-            path = CmsRegistry.cms_path(data_dir, index, dst)
-
-            case NIF.cms_create_file(path, first_w, first_d) do
-              {:ok, dest_ref} ->
-                CmsRegistry.register(index, dst, dest_ref, meta)
-                sources = Enum.zip(src_refs, weights)
-
-                case NIF.cms_merge(dest_ref, sources) do
-                  :ok -> :ok
-                  {:error, reason} -> {:error, "ERR CMS merge failed: #{reason}"}
-                end
-
-              {:error, reason} ->
-                {:error, "ERR CMS create failed: #{reason}"}
-            end
-
-          {:callback, registry} ->
-            path = registry.path.(dst)
-
-            case NIF.cms_create_file(path, first_w, first_d) do
-              {:ok, dest_ref} ->
-                registry.put.(dst, dest_ref, meta)
-                sources = Enum.zip(src_refs, weights)
-
-                case NIF.cms_merge(dest_ref, sources) do
-                  :ok -> :ok
-                  {:error, reason} -> {:error, "ERR CMS merge failed: #{reason}"}
-                end
-
-              {:error, reason} ->
-                {:error, "ERR CMS create failed: #{reason}"}
-            end
-        end
-
-      {:error, _} = err ->
-        err
-    end
-  end
-
-  defp load_source_sketches(store, src_keys) do
-    results = Enum.map(src_keys, &get_sketch(store, &1))
-    error = Enum.find(results, &match?({:error, _}, &1))
-    if error, do: error, else: {:ok, Enum.map(results, fn {:ok, s} -> s end)}
-  end
-
-  defp validate_merge_dimensions(infos) do
-    {first_w, first_d, _} = hd(infos)
-
-    if Enum.all?(infos, fn {w, d, _} -> w == first_w and d == first_d end),
-      do: :ok,
-      else: {:error, "ERR CMS: width/depth of src sketches must be equal"}
-  end
+  defp normalize_result({:ok, result}), do: result
+  defp normalize_result(:ok), do: :ok
+  defp normalize_result({:error, _} = err), do: err
+  defp normalize_result(other), do: other
 
   defp parse_pos_integer(str, label) do
     case Integer.parse(str) do

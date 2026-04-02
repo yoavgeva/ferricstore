@@ -1,81 +1,21 @@
 defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
   @moduledoc """
-  Regression tests proving issues found in code review R2 for vector and
+  Regression tests proving issues found in code review R2 for
   probabilistic data structures:
 
-    * R2-H9:  Vector VSEARCH/VGET crash on corrupted data
     * R2-H10: TopK cache coherency race (regression guard)
     * R2-M5:  Bloom/Cuckoo registries lose metadata on recovery (regression guard)
     * R2-M6:  BF.ADD NIF errors not checked (regression guard)
     * R2-M7:  TOPK.LIST WITHCOUNT NIF errors unchecked (regression guard)
-    * R2-M8:  Vector sentinel key pollution in VINFO count
   """
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.Vector
   alias Ferricstore.Commands.Bloom
   alias Ferricstore.Commands.TopK
   alias Ferricstore.Test.MockStore
 
   # Unique key helper to avoid collisions
   defp ukey(prefix), do: "#{prefix}_#{:erlang.unique_integer([:positive])}"
-
-  # ---------------------------------------------------------------------------
-  # R2-H9: Vector VSEARCH/VGET crash on corrupted data
-  #
-  # The bug: VGET calls `:erlang.binary_to_term(encoded)` on whatever bytes
-  # are stored at the vector key. VSEARCH does the same inside its Enum.map
-  # over compound_scan results. If a key contains corrupted or non-ETF binary
-  # data, `binary_to_term` raises `ArgumentError`, crashing the process.
-  #
-  # Expected: return an error tuple, not crash the caller.
-  # ---------------------------------------------------------------------------
-
-  describe "R2-H9: Vector VGET/VSEARCH crash on corrupted data" do
-    @tag :review_r2
-    test "VGET on corrupted vector data should return error, not crash" do
-      store = MockStore.make()
-      collection = ukey("coll")
-
-      # Create a valid collection
-      :ok = Vector.handle("VCREATE", [collection, "3", "cosine"], store)
-
-      # Manually inject corrupted binary via compound_put.
-      # This simulates disk corruption or a bug that wrote garbage bytes.
-      corrupted_key = "V:" <> collection <> <<0>> <> "corrupted_vec"
-      store.compound_put.(collection, corrupted_key, "this_is_not_valid_etf", 0)
-
-      # VGET should return an error tuple, not crash.
-      result = Vector.handle("VGET", [collection, "corrupted_vec"], store)
-
-      assert result == {:error, "ERR corrupted vector data"}
-    end
-
-    @tag :review_r2
-    test "VSEARCH skips corrupted entries and returns valid results" do
-      store = MockStore.make()
-      collection = ukey("coll")
-
-      # Create collection and add a valid vector
-      :ok = Vector.handle("VCREATE", [collection, "3", "cosine"], store)
-      :ok = Vector.handle("VADD", [collection, "valid_vec", "1.0", "0.0", "0.0"], store)
-
-      # Inject a corrupted entry directly
-      corrupted_key = "V:" <> collection <> <<0>> <> "corrupted_vec"
-      store.compound_put.(collection, corrupted_key, "garbage_bytes", 0)
-
-      # VSEARCH should skip the corrupted entry and return only the valid one.
-      result =
-        Vector.handle("VSEARCH", [collection, "1.0", "0.0", "0.0", "TOP", "10"], store)
-
-      assert is_list(result), "Expected list result, got: #{inspect(result)}"
-
-      # Result is [key, distance, ...] pairs. Should contain only valid_vec.
-      keys = result |> Enum.chunk_every(2) |> Enum.map(fn [k, _d] -> k end)
-      assert keys == ["valid_vec"]
-      refute "corrupted_vec" in keys
-    end
-  end
 
   # ---------------------------------------------------------------------------
   # R2-H10: TopK cache coherency race (regression guard)
@@ -333,119 +273,4 @@ defmodule Ferricstore.ReviewR2.ProbabilisticIssuesTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # R2-M8: Vector sentinel key pollution in VINFO count
-  #
-  # The bug: VCREATE stores a sentinel key `V:collection\0__hnsw_meta__` in
-  # the compound key space. VINFO subtracts 1 from the raw compound_count if
-  # the sentinel exists. If the subtraction logic is wrong, VINFO reports
-  # N+1 or N-1 vectors instead of N.
-  #
-  # This test creates a collection, adds exactly N vectors, and verifies
-  # VINFO reports exactly N (not N+1 from the sentinel, not N-1 from
-  # over-correction).
-  # ---------------------------------------------------------------------------
-
-  describe "R2-M8: Vector sentinel key pollution in VINFO count" do
-    @tag :review_r2
-    test "VINFO vector_count matches exact number of added vectors" do
-      store = MockStore.make()
-      collection = ukey("coll_sentinel")
-      n = 5
-
-      :ok = Vector.handle("VCREATE", [collection, "3", "cosine"], store)
-
-      # Add exactly N vectors
-      for i <- 1..n do
-        :ok = Vector.handle("VADD", [collection, "vec_#{i}", "1.0", "2.0", "3.0"], store)
-      end
-
-      result = Vector.handle("VINFO", [collection], store)
-      info = list_to_info_map(result)
-
-      assert info["vector_count"] == n,
-        "Expected vector_count == #{n}, got #{inspect(info["vector_count"])}. " <>
-        "Sentinel key may be polluting the count."
-    end
-
-    @tag :review_r2
-    test "VINFO vector_count is 0 for empty collection (not -1 from sentinel overcorrection)" do
-      store = MockStore.make()
-      collection = ukey("coll_empty")
-
-      :ok = Vector.handle("VCREATE", [collection, "4", "l2"], store)
-
-      result = Vector.handle("VINFO", [collection], store)
-      info = list_to_info_map(result)
-
-      assert info["vector_count"] == 0,
-        "Expected vector_count == 0 for empty collection, got #{inspect(info["vector_count"])}"
-    end
-
-    @tag :review_r2
-    test "VINFO vector_count stays correct after add/delete cycle" do
-      store = MockStore.make()
-      collection = ukey("coll_cycle")
-      n = 10
-
-      :ok = Vector.handle("VCREATE", [collection, "2", "l2"], store)
-
-      # Add N vectors
-      for i <- 1..n do
-        :ok = Vector.handle("VADD", [collection, "v_#{i}", "1.0", "0.0"], store)
-      end
-
-      info = list_to_info_map(Vector.handle("VINFO", [collection], store))
-      assert info["vector_count"] == n
-
-      # Delete half
-      for i <- 1..div(n, 2) do
-        Vector.handle("VDEL", [collection, "v_#{i}"], store)
-      end
-
-      info2 = list_to_info_map(Vector.handle("VINFO", [collection], store))
-      assert info2["vector_count"] == n - div(n, 2),
-        "Expected #{n - div(n, 2)} vectors after deleting #{div(n, 2)}, " <>
-        "got #{inspect(info2["vector_count"])}"
-    end
-
-    @tag :review_r2
-    test "VSEARCH result count matches VINFO vector_count (no sentinel in results)" do
-      store = MockStore.make()
-      collection = ukey("coll_search_count")
-      n = 4
-
-      :ok = Vector.handle("VCREATE", [collection, "2", "l2"], store)
-
-      for i <- 1..n do
-        :ok = Vector.handle("VADD", [collection, "v_#{i}", "#{i}.0", "0.0"], store)
-      end
-
-      # VSEARCH with k > n should return exactly n results
-      search_result = Vector.handle(
-        "VSEARCH",
-        [collection, "1.0", "0.0", "TOP", "100"],
-        store
-      )
-
-      keys = search_result |> Enum.chunk_every(2) |> Enum.map(fn [k, _d] -> k end)
-      assert length(keys) == n,
-        "VSEARCH returned #{length(keys)} results but VINFO shows #{n} vectors. " <>
-        "Sentinel key __hnsw_meta__ may be leaking into search results."
-
-      # No sentinel key should appear in results
-      refute "__hnsw_meta__" in keys,
-        "Sentinel key __hnsw_meta__ appeared in VSEARCH results"
-    end
-  end
-
-  # ===========================================================================
-  # Helpers
-  # ===========================================================================
-
-  defp list_to_info_map(list) do
-    list
-    |> Enum.chunk_every(2)
-    |> Enum.into(%{}, fn [k, v] -> {k, v} end)
-  end
 end

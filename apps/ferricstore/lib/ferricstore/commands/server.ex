@@ -121,7 +121,36 @@ defmodule Ferricstore.Commands.Server do
   def handle("FLUSHDB", args, store) when args in [[], ["ASYNC"], ["SYNC"]] do
     AuditLog.log(:dangerous_command, %{command: "FLUSHDB", args: args})
     store.flush.()
+    # Wipe prob files (bloom, CMS, cuckoo, TopK) across all shards.
+    # store.flush deletes keys via Raft which should clean up files via
+    # maybe_delete_prob_file, but as a safety net we also wipe the prob
+    # directories directly.
+    flush_all_prob_dirs()
     :ok
+  end
+
+  defp flush_all_prob_dirs do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+
+    for i <- 0..(shard_count - 1) do
+      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
+      prob_dir = Path.join(shard_path, "prob")
+
+      if File.exists?(prob_dir) do
+        case File.ls(prob_dir) do
+          {:ok, files} ->
+            Enum.each(files, fn file ->
+              File.rm(Path.join(prob_dir, file))
+            end)
+
+          _ ->
+            :ok
+        end
+      end
+    end
+  rescue
+    _ -> :ok
   end
 
   def handle("FLUSHDB", _args, _store) do

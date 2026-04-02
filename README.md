@@ -166,7 +166,7 @@ Cache 16% of dataset                  Cache 100% of dataset on disk, hot 16% in 
 |------|-----------|---------|-----------------|
 | **Hot** | ETS (in-memory) | ~1-5us | Frequently accessed keys (LFU eviction) |
 | **Cold** | Bitcask (on disk) | ~50-200us (NVMe) | Everything — evicted keys still readable |
-| **Probabilistic** | mmap files | ~1-10us | Bloom, Cuckoo, CMS, TopK, vectors |
+| **Probabilistic** | pread/pwrite files | ~2-3us | Bloom, Cuckoo, CMS, TopK, TDigest |
 
 **Cache without fear.** With RAM-only caches, you limit what you cache because eviction means a database hit. You avoid caching large datasets, expensive queries, or anything where a miss causes a stampede. With disk-backed storage, eviction is a 100us penalty, not a 10ms database roundtrip. Cache everything — your product catalog, your user profiles, your search results. The worst case is a disk read, not a database storm.
 
@@ -185,7 +185,6 @@ Cache 16% of dataset                  Cache 100% of dataset on disk, hot 16% in 
 | Geo | GEOADD, GEOPOS, GEODIST, GEOSEARCH... | 6 |
 | JSON | JSON.SET, JSON.GET, JSON.DEL, JSON.NUMINCRBY... | 13 |
 | Probabilistic | BF.*, CF.*, CMS.*, TOPK.*, TDIGEST.* | 49 |
-| Vector | VCREATE, VADD, VSEARCH, VGET, VDEL... | 8 |
 | Native | CAS, LOCK, UNLOCK, RATELIMIT.ADD, FETCH_OR_COMPUTE | 7 |
 | Transaction | MULTI, EXEC, DISCARD, WATCH | 5 |
 | Pub/Sub | SUBSCRIBE, PUBLISH, PSUBSCRIBE... | 6 |

@@ -15,9 +15,7 @@ defmodule Ferricstore.Test.MockStore do
     {:ok, pid} = Agent.start_link(fn -> initial end)
     tmp_dir = System.tmp_dir!() <> "/ferricstore_mock_#{:erlang.unique_integer([:positive])}"
     prob_dir = Path.join(tmp_dir, "prob")
-    vectors_dir = Path.join(tmp_dir, "vectors")
     File.mkdir_p!(prob_dir)
-    File.mkdir_p!(vectors_dir)
 
     # Per-type resource registries for probabilistic data structures.
     # Each registry is an Agent holding a map of key => {resource, meta}.
@@ -271,8 +269,7 @@ defmodule Ferricstore.Test.MockStore do
           {{:ok, byte_size(new_val)}, new_state}
         end)
       end,
-      prob_dir: fn -> prob_dir end,
-      vectors_dir: fn -> vectors_dir end
+      prob_dir: fn -> prob_dir end
     }
   end
 

@@ -1,6 +1,6 @@
 # Commands Reference
 
-FerricStore implements 250+ commands covering standard Redis data types, probabilistic structures, vector search, and FerricStore-native operations. This guide documents each command with its exact syntax, return values, embedded API equivalent, and Redis compatibility notes.
+FerricStore implements 240+ commands covering standard Redis data types, probabilistic structures, and FerricStore-native operations. This guide documents each command with its exact syntax, return values, embedded API equivalent, and Redis compatibility notes.
 
 ## Redis Compatibility Summary
 
@@ -52,7 +52,6 @@ CLIENT ID/SETNAME/GETNAME/INFO/LIST/TRACKING/CACHING/TRACKINGINFO/GETREDIR, HELL
 These have no Redis equivalent:
 
 `CAS`, `LOCK`, `UNLOCK`, `EXTEND`, `RATELIMIT.ADD`, `FETCH_OR_COMPUTE`, `FETCH_OR_COMPUTE_RESULT`, `FETCH_OR_COMPUTE_ERROR`, `KEY_INFO`,
-`VCREATE`, `VADD`, `VGET`, `VDEL`, `VSEARCH`, `VINFO`, `VLIST`, `VEVICT`,
 `FERRICSTORE.CONFIG`, `FERRICSTORE.METRICS`, `FERRICSTORE.HOTNESS`, `FERRICSTORE.KEY_INFO`,
 `CLUSTER.HEALTH`, `CLUSTER.STATS`, `CLUSTER.KEYSLOT`, `CLUSTER.SLOTS`
 
@@ -997,50 +996,6 @@ T-digests provide accurate rank-based statistics (quantiles, CDF, trimmed means)
 
 ---
 
-## Vector Search Commands
-
-FerricStore-native commands for similarity search over dense float vectors. No Redis equivalent. Collection metadata is stored at `VM:collection`, vector data at `V:collection\0key`.
-
-### VCREATE
-
-Creates a new vector collection.
-
-| | |
-|---|---|
-| **RESP3 syntax** | `VCREATE collection dims metric [M m] [EF ef]` |
-| **Embedded API** | `FerricStore.vcreate(collection, dims, metric)` |
-| **Metrics** | `cosine`, `l2`, `inner_product` |
-| **Defaults** | M=16, EF=128 (reserved for future HNSW index) |
-| **Return** | `+OK` |
-
-### VADD / VGET / VDEL
-
-| Command | Syntax | Return |
-|---------|--------|--------|
-| `VADD` | `VADD collection key float [float ...]` | `+OK` (overwrites existing) |
-| `VGET` | `VGET collection key` | Array of float strings, or null |
-| `VDEL` | `VDEL collection key` | `1` (deleted) or `0` (not found) |
-
-### VSEARCH
-
-Brute-force nearest neighbor search. Adequate for < 100K vectors.
-
-| | |
-|---|---|
-| **RESP3 syntax** | `VSEARCH collection float [float ...] TOP k [EF ef]` |
-| **Embedded API** | `FerricStore.vsearch(collection, vector, k)` |
-| **Return** | Array of `[key, distance, ...]` pairs, sorted by distance ascending |
-
-### VINFO / VLIST / VEVICT
-
-| Command | Syntax | Return |
-|---------|--------|--------|
-| `VINFO` | `VINFO collection` | `[dims, D, metric, M, count, N, m, M, ef, EF]` |
-| `VLIST` | `VLIST [MATCH pattern] [COUNT n]` | Array of collection names |
-| `VEVICT` | `VEVICT collection` | `+OK` (no-op in v1) |
-
----
-
 ## Geo Commands
 
 Geo is implemented on top of Sorted Sets. Members are stored with 52-bit interleaved geohash scores (26 bits per axis, ~0.6mm precision), matching Redis's encoding. No new data structure is needed.
@@ -1281,7 +1236,7 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 8. **FETCH_OR_COMPUTE** -- built-in cache stampede protection that Redis lacks.
 9. **Group commit** -- writes are batched for higher throughput. Individual write latency includes the batch window (default 1ms).
 10. **HLC timestamps** -- expiry uses Hybrid Logical Clock timestamps instead of wall-clock time. Monotonic even during clock skew.
-11. **Compound key storage** -- hash fields, set members, zset members, and vector data are stored as individual Bitcask entries with structured key prefixes, enabling O(1) field-level access without deserializing the entire data structure.
+11. **Compound key storage** -- hash fields, set members, and zset members are stored as individual Bitcask entries with structured key prefixes, enabling O(1) field-level access without deserializing the entire data structure.
 12. **SCAN cursor** -- uses alphabetic key position, not Redis's opaque hash-table cursor. Functionally equivalent but cursor values differ.
 13. **OBJECT ENCODING** -- returns type-specific encodings (`"embstr"`, `"raw"`, `"hashtable"`, `"quicklist"`, `"skiplist"`, `"stream"`) but does not use Redis's memory-optimized internal encodings like `ziplist`, `listpack`, `intset`, or `skiplist` (Redis's native C implementation).
 14. **INFO sections** -- includes FerricStore-specific sections: `raft`, `bitcask`, `ferricstore`, `keydir_analysis`, `namespace_config`.

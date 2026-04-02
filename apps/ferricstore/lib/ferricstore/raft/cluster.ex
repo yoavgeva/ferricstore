@@ -96,7 +96,8 @@ defmodule Ferricstore.Raft.Cluster do
       shard_data_path: shard_data_path,
       active_file_id: active_file_id,
       active_file_path: active_file_path,
-      ets: ets
+      ets: ets,
+      data_dir: Path.dirname(shard_data_path)
     }
 
     server_config = %{

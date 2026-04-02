@@ -20,7 +20,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   Unknown commands return `{:error, "ERR unknown command ..."}`.
   """
 
-  alias Ferricstore.Commands.{Bitmap, Bloom, Client, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Namespace, Native, PubSub, Server, Set, SortedSet, Stream, Strings, Vector}
+  alias Ferricstore.Commands.{Bitmap, Bloom, Client, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Namespace, Native, PubSub, Server, Set, SortedSet, Stream, Strings}
   alias Ferricstore.Commands.CMS
   alias Ferricstore.Commands.TDigest
   alias Ferricstore.Commands.TopK
@@ -43,9 +43,8 @@ defmodule Ferricstore.Commands.Dispatcher do
   @bloom_cmds ~w(BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO)
   @cuckoo_cmds ~w(CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO)
   @cms_cmds ~w(CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO)
-  @topk_cmds ~w(TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.INFO)
+  @topk_cmds ~w(TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO)
   @tdigest_cmds ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.MERGE)
-  @vector_cmds ~w(VCREATE VADD VGET VDEL VSEARCH VINFO VLIST VEVICT)
   @pubsub_cmds ~w(PUBLISH PUBSUB)
   @server_cmds ~w(PING ECHO DBSIZE KEYS FLUSHDB FLUSHALL INFO COMMAND SELECT LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF)
 
@@ -70,7 +69,6 @@ defmodule Ferricstore.Commands.Dispatcher do
       Enum.map(@cms_cmds, &{&1, :cms}) ++
       Enum.map(@topk_cmds, &{&1, :topk}) ++
       Enum.map(@tdigest_cmds, &{&1, :tdigest}) ++
-      Enum.map(@vector_cmds, &{&1, :vector}) ++
       Enum.map(@pubsub_cmds, &{&1, :pubsub}) ++
       Enum.map(@server_cmds, &{&1, :server}) ++
       [
@@ -152,7 +150,6 @@ defmodule Ferricstore.Commands.Dispatcher do
         :cms -> CMS.handle(cmd, args, store)
         :topk -> TopK.handle(cmd, args, store)
         :tdigest -> TDigest.handle(cmd, args, store)
-        :vector -> Vector.handle(cmd, args, store)
         :pubsub -> PubSub.handle(cmd, args)
         :server -> Server.handle(cmd, upcase_subcommand(cmd, args), store)
         :ratelimit -> Native.handle("RATELIMIT.ADD", args, store)

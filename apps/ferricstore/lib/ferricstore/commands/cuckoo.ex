@@ -1,38 +1,13 @@
 defmodule Ferricstore.Commands.Cuckoo do
   @moduledoc """
-  Handles Redis-compatible Cuckoo filter commands backed by mmap NIF resources.
+  Handles Redis-compatible Cuckoo filter commands.
 
-  Each Cuckoo filter is a memory-mapped file on disk managed by a Rust NIF.
-  Files live at `data_dir/prob/shard_N/KEY.cuckoo`. The mmap handle (NIF
-  resource) is cached in a per-shard ETS table via `CuckooRegistry` so that
-  repeated operations avoid re-opening the file.
-
-  ## Supported Commands
-
-    * `CF.RESERVE key capacity` -- creates a new Cuckoo filter
-    * `CF.ADD key element` -- adds an element (auto-creates with defaults if missing)
-    * `CF.ADDNX key element` -- adds only if the element does not already exist
-    * `CF.DEL key element` -- deletes one occurrence of an element
-    * `CF.EXISTS key element` -- checks if an element may exist
-    * `CF.MEXISTS key element [element ...]` -- checks multiple elements
-    * `CF.COUNT key element` -- counts fingerprint occurrences (approximate)
-    * `CF.INFO key` -- returns filter metadata
-
-  ## Resource caching
-
-  On first access, the NIF resource is opened from the `.cuckoo` file and
-  cached in `CuckooRegistry`. Subsequent operations on the same key reuse
-  the cached handle. On shard restart, `CuckooRegistry.recover/2` re-opens
-  all persisted cuckoo files.
-
-  ## Auto-creation
-
-  `CF.ADD` and `CF.ADDNX` auto-create a filter with default capacity (1024)
-  if the key does not exist.
+  Write commands (CF.RESERVE, CF.ADD, CF.ADDNX, CF.DEL) route through
+  Raft via `store.prob_write`. Read commands (CF.EXISTS, CF.MEXISTS,
+  CF.COUNT, CF.INFO) use stateless pread NIFs on local files.
   """
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.{CuckooRegistry, Router}
 
   @default_capacity 1024
   @bucket_size 4
@@ -50,10 +25,15 @@ defmodule Ferricstore.Commands.Cuckoo do
 
   def handle("CF.RESERVE", [key, capacity_str], store) do
     with {:ok, capacity} <- parse_pos_integer(capacity_str, "capacity") do
-      if cuckoo_exists?(key, store) do
+      if cuckoo_file_exists?(key, store) do
         {:error, "ERR item exists"}
       else
-        create_cuckoo(key, capacity, store)
+        result = do_prob_write(store, {:cuckoo_create, key, capacity, @bucket_size})
+        case result do
+          {:ok, _} -> :ok
+          :ok -> :ok
+          other -> other
+        end
       end
     end
   end
@@ -62,15 +42,19 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.reserve' command"}
 
   # ---------------------------------------------------------------------------
-  # CF.ADD key element
+  # CF.ADD key element — write through Raft
   # ---------------------------------------------------------------------------
 
   def handle("CF.ADD", [key, element], store) do
-    {resource, _meta} = ensure_cuckoo(key, store)
+    auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
+    result = do_prob_write(store, {:cuckoo_add, key, element, auto_params})
 
-    case NIF.cuckoo_add(resource, element) do
+    case result do
+      {:ok, 1} -> 1
+      {:ok, _} -> 1
       :ok -> 1
       {:error, _} -> {:error, "ERR filter is full"}
+      other -> other
     end
   end
 
@@ -78,16 +62,17 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.add' command"}
 
   # ---------------------------------------------------------------------------
-  # CF.ADDNX key element
+  # CF.ADDNX key element — write through Raft
   # ---------------------------------------------------------------------------
 
   def handle("CF.ADDNX", [key, element], store) do
-    {resource, _meta} = ensure_cuckoo(key, store)
+    auto_params = %{capacity: @default_capacity, bucket_size: @bucket_size}
+    result = do_prob_write(store, {:cuckoo_addnx, key, element, auto_params})
 
-    case NIF.cuckoo_addnx(resource, element) do
-      0 -> 0
-      1 -> 1
+    case result do
+      {:ok, n} when n in [0, 1] -> n
       {:error, _} -> {:error, "ERR filter is full"}
+      other -> other
     end
   end
 
@@ -95,17 +80,22 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.addnx' command"}
 
   # ---------------------------------------------------------------------------
-  # CF.DEL key element
+  # CF.DEL key element — write through Raft
   # ---------------------------------------------------------------------------
 
   def handle("CF.DEL", [key, element], store) do
-    case get_cuckoo(key, store) do
-      nil -> 0
-      {resource, _meta} ->
-        case NIF.cuckoo_del(resource, element) do
-          {:error, reason} -> {:error, "ERR cuckoo del failed: #{inspect(reason)}"}
-          result -> result
-        end
+    path = prob_path(store, key, "cuckoo")
+
+    if File.exists?(path) do
+      result = do_prob_write(store, {:cuckoo_del, key, element})
+
+      case result do
+        {:ok, n} -> n
+        {:error, reason} -> {:error, "ERR cuckoo del failed: #{inspect(reason)}"}
+        other -> other
+      end
+    else
+      0
     end
   end
 
@@ -113,13 +103,16 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.del' command"}
 
   # ---------------------------------------------------------------------------
-  # CF.EXISTS key element
+  # CF.EXISTS key element — local stateless pread
   # ---------------------------------------------------------------------------
 
   def handle("CF.EXISTS", [key, element], store) do
-    case get_cuckoo(key, store) do
-      nil -> 0
-      {resource, _meta} -> NIF.cuckoo_exists(resource, element)
+    path = prob_path(store, key, "cuckoo")
+
+    case NIF.cuckoo_file_exists(path, element) do
+      {:ok, result} -> result
+      {:error, :enoent} -> 0
+      {:error, reason} -> {:error, "ERR cuckoo exists failed: #{inspect(reason)}"}
     end
   end
 
@@ -127,13 +120,23 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.exists' command"}
 
   # ---------------------------------------------------------------------------
-  # CF.MEXISTS key element [element ...]
+  # CF.MEXISTS key element [element ...] — local stateless pread
   # ---------------------------------------------------------------------------
 
   def handle("CF.MEXISTS", [key | elements], store) when elements != [] do
-    case get_cuckoo(key, store) do
-      nil -> List.duplicate(0, length(elements))
-      {resource, _meta} -> NIF.cuckoo_mexists(resource, elements)
+    path = prob_path(store, key, "cuckoo")
+
+    case File.exists?(path) do
+      false ->
+        List.duplicate(0, length(elements))
+
+      true ->
+        Enum.map(elements, fn element ->
+          case NIF.cuckoo_file_exists(path, element) do
+            {:ok, result} -> result
+            _ -> 0
+          end
+        end)
     end
   end
 
@@ -141,13 +144,16 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.mexists' command"}
 
   # ---------------------------------------------------------------------------
-  # CF.COUNT key element
+  # CF.COUNT key element — local stateless pread
   # ---------------------------------------------------------------------------
 
   def handle("CF.COUNT", [key, element], store) do
-    case get_cuckoo(key, store) do
-      nil -> 0
-      {resource, _meta} -> NIF.cuckoo_count(resource, element)
+    path = prob_path(store, key, "cuckoo")
+
+    case NIF.cuckoo_file_count(path, element) do
+      {:ok, count} -> count
+      {:error, :enoent} -> 0
+      {:error, reason} -> {:error, "ERR cuckoo count failed: #{inspect(reason)}"}
     end
   end
 
@@ -155,27 +161,26 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.count' command"}
 
   # ---------------------------------------------------------------------------
-  # CF.INFO key
+  # CF.INFO key — local stateless pread
   # ---------------------------------------------------------------------------
 
   def handle("CF.INFO", [key], store) do
-    case get_cuckoo(key, store) do
-      nil ->
+    path = prob_path(store, key, "cuckoo")
+
+    case NIF.cuckoo_file_info(path) do
+      {:ok, {num_buckets, bucket_size, fingerprint_size,
+             num_items, num_deletes, total_slots, max_kicks}} ->
+        ["Size", total_slots, "Number of buckets", num_buckets,
+         "Number of filters", 1, "Number of items inserted", num_items,
+         "Number of items deleted", num_deletes, "Bucket size", bucket_size,
+         "Fingerprint size", fingerprint_size, "Max iterations", max_kicks,
+         "Expansion rate", 0]
+
+      {:error, :enoent} ->
         {:error, "ERR not found"}
 
-      {resource, _meta} ->
-        case NIF.cuckoo_info(resource) do
-          {:ok, {num_buckets, bucket_size, fingerprint_size,
-                 num_items, num_deletes, total_slots, max_kicks}} ->
-            ["Size", total_slots, "Number of buckets", num_buckets,
-             "Number of filters", 1, "Number of items inserted", num_items,
-             "Number of items deleted", num_deletes, "Bucket size", bucket_size,
-             "Fingerprint size", fingerprint_size, "Max iterations", max_kicks,
-             "Expansion rate", 0]
-
-          {:error, reason} ->
-            {:error, "ERR cuckoo info failed: #{reason}"}
-        end
+      {:error, reason} ->
+        {:error, "ERR cuckoo info failed: #{inspect(reason)}"}
     end
   end
 
@@ -183,138 +188,90 @@ defmodule Ferricstore.Commands.Cuckoo do
     do: {:error, "ERR wrong number of arguments for 'cf.info' command"}
 
   # ---------------------------------------------------------------------------
-  # Deletion (called from DEL / UNLINK handlers)
+  # Deletion
   # ---------------------------------------------------------------------------
 
   @spec nif_delete(binary(), map()) :: :ok
   def nif_delete(key, store) do
-    case resolve_registry(store) do
-      {:ets, index, _data_dir} ->
-        CuckooRegistry.delete(index, key)
+    path = prob_path(store, key, "cuckoo")
+    File.rm(path)
+    :ok
+  end
 
-      {:callback, registry} ->
-        case registry.get.(key) do
-          nil ->
-            :ok
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
 
-          {resource, _meta} ->
-            NIF.cuckoo_close(resource)
-            registry.delete.(key)
-            :ok
-        end
+  defp prob_path(store, key, ext) do
+    safe = Base.url_encode64(key, padding: false)
+    prob_dir = resolve_prob_dir(store, key)
+    Path.join(prob_dir, "#{safe}.#{ext}")
+  end
+
+  defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn), do: prob_dir_fn.()
+  defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
+  defp resolve_prob_dir(%{cuckoo_registry: %{dir: dir}}, _key), do: dir
+  defp resolve_prob_dir(_store, key) do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    idx = Ferricstore.Store.Router.shard_for(key)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+    Path.join(shard_path, "prob")
+  end
+
+  defp do_prob_write(store, command) do
+    case Map.get(store, :prob_write) do
+      nil -> apply_prob_locally(store, command)
+      write_fn -> write_fn.(command)
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Private: registry resolution
-  # ---------------------------------------------------------------------------
-
-  @spec resolve_registry(map()) ::
-          {:ets, non_neg_integer(), binary()}
-          | {:callback, map()}
-  defp resolve_registry(%{cuckoo_registry: registry}) when is_map(registry) do
-    {:callback, registry}
+  defp apply_prob_locally(store, {:cuckoo_create, key, capacity, bucket_size}) do
+    path = prob_path(store, key, "cuckoo")
+    File.mkdir_p!(Path.dirname(path))
+    NIF.cuckoo_file_create(path, capacity, bucket_size)
   end
 
-  defp resolve_registry(_store) do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    {:ets, nil, data_dir}
-  end
-
-  @spec resolve_registry_for_key(binary(), map()) ::
-          {:ets, non_neg_integer(), binary()}
-          | {:callback, map()}
-  defp resolve_registry_for_key(_key, %{cuckoo_registry: registry}) when is_map(registry) do
-    {:callback, registry}
-  end
-
-  defp resolve_registry_for_key(key, _store) do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    index = Router.shard_for(key)
-    {:ets, index, data_dir}
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private: cuckoo resource access
-  # ---------------------------------------------------------------------------
-
-  @spec get_cuckoo(binary(), map()) :: {reference(), map()} | nil
-  defp get_cuckoo(key, store) do
-    case resolve_registry_for_key(key, store) do
-      {:ets, index, data_dir} ->
-        case CuckooRegistry.open_or_lookup(index, key, data_dir) do
-          {:ok, resource, meta} -> {resource, meta}
-          :not_found -> nil
-        end
-
-      {:callback, registry} ->
-        case registry.get.(key) do
-          nil -> nil
-          {resource, meta} -> {resource, meta}
-        end
+  defp apply_prob_locally(store, {:cuckoo_add, key, element, auto_params}) do
+    path = prob_path(store, key, "cuckoo")
+    File.mkdir_p!(Path.dirname(path))
+    unless File.exists?(path) do
+      if auto_params do
+        %{capacity: cap, bucket_size: bs} = auto_params
+        NIF.cuckoo_file_create(path, cap, bs)
+      end
     end
+    NIF.cuckoo_file_add(path, element)
   end
 
-  @spec cuckoo_exists?(binary(), map()) :: boolean()
-  defp cuckoo_exists?(key, store) do
-    get_cuckoo(key, store) != nil
+  defp apply_prob_locally(store, {:cuckoo_addnx, key, element, auto_params}) do
+    path = prob_path(store, key, "cuckoo")
+    File.mkdir_p!(Path.dirname(path))
+    unless File.exists?(path) do
+      if auto_params do
+        %{capacity: cap, bucket_size: bs} = auto_params
+        NIF.cuckoo_file_create(path, cap, bs)
+      end
+    end
+    NIF.cuckoo_file_addnx(path, element)
   end
 
-  @spec ensure_cuckoo(binary(), map()) :: {reference(), map()}
-  defp ensure_cuckoo(key, store) do
-    case get_cuckoo(key, store) do
+  defp apply_prob_locally(store, {:cuckoo_del, key, element}) do
+    path = prob_path(store, key, "cuckoo")
+    NIF.cuckoo_file_del(path, element)
+  end
+
+  # Checks if a cuckoo filter key already exists. Uses store.exists? when
+  # available (checks Bitcask metadata), falls back to file check.
+  defp cuckoo_file_exists?(key, store) do
+    case Map.get(store, :exists?) do
       nil ->
-        {:ok, resource, meta} = create_cuckoo_internal(key, @default_capacity, store)
-        {resource, meta}
+        path = prob_path(store, key, "cuckoo")
+        File.exists?(path)
 
-      existing ->
-        existing
+      exists_fn ->
+        exists_fn.(key)
     end
   end
-
-  @spec create_cuckoo(binary(), pos_integer(), map()) :: :ok | {:error, binary()}
-  defp create_cuckoo(key, capacity, store) do
-    case create_cuckoo_internal(key, capacity, store) do
-      {:ok, _resource, _meta} -> :ok
-      {:error, _} = err -> err
-    end
-  end
-
-  @spec create_cuckoo_internal(binary(), pos_integer(), map()) ::
-          {:ok, reference(), map()} | {:error, binary()}
-  defp create_cuckoo_internal(key, capacity, store) do
-    meta = %{capacity: capacity}
-
-    case resolve_registry_for_key(key, store) do
-      {:ets, index, data_dir} ->
-        path = CuckooRegistry.cuckoo_path(data_dir, index, key)
-
-        case NIF.cuckoo_create_file(path, capacity, @bucket_size) do
-          {:ok, resource} ->
-            CuckooRegistry.register(index, key, resource, meta)
-            {:ok, resource, meta}
-
-          {:error, reason} ->
-            {:error, "ERR cuckoo create failed: #{reason}"}
-        end
-
-      {:callback, registry} ->
-        path = registry.path.(key)
-
-        case NIF.cuckoo_create_file(path, capacity, @bucket_size) do
-          {:ok, resource} ->
-            registry.put.(key, resource, meta)
-            {:ok, resource, meta}
-
-          {:error, reason} ->
-            {:error, "ERR cuckoo create failed: #{reason}"}
-        end
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private: input validation
-  # ---------------------------------------------------------------------------
 
   @spec parse_pos_integer(binary(), binary()) :: {:ok, pos_integer()} | {:error, binary()}
   defp parse_pos_integer(str, name) do

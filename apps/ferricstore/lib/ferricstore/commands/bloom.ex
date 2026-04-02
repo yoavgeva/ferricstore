@@ -1,11 +1,12 @@
 defmodule Ferricstore.Commands.Bloom do
   @moduledoc """
-  Handles Redis-compatible Bloom filter commands backed by mmap NIF resources.
+  Handles Redis-compatible Bloom filter commands.
 
-  Each Bloom filter is a memory-mapped file on disk managed by a Rust NIF.
-  Files live at `data_dir/prob/shard_N/KEY.bloom`. The mmap handle (NIF
-  resource) is cached in a per-shard ETS table via `BloomRegistry` so that
-  repeated operations avoid re-opening the file.
+  Write commands (BF.RESERVE, BF.ADD, BF.MADD) route through Raft via
+  `store.prob_write` so that mutations are replicated to follower nodes.
+  Read commands (BF.EXISTS, BF.MEXISTS, BF.CARD, BF.INFO) use stateless
+  pread NIFs directly on the local file — no Raft, no mmap, no resource
+  caching.
 
   ## Supported Commands
 
@@ -16,28 +17,9 @@ defmodule Ferricstore.Commands.Bloom do
     * `BF.MEXISTS key element [element ...]` -- checks multiple elements
     * `BF.CARD key` -- returns the number of elements added
     * `BF.INFO key` -- returns filter metadata
-
-  ## Resource caching
-
-  On first access, the NIF resource is opened from the `.bloom` file and
-  cached in `BloomRegistry`. Subsequent operations on the same key reuse
-  the cached handle. On shard restart, `BloomRegistry.recover/2` re-opens
-  all persisted bloom files.
-
-  ## Auto-creation
-
-  `BF.ADD` and `BF.MADD` auto-create a filter with default parameters
-  (error_rate = 0.01, capacity = 100) if the key does not exist.
-
-  ## Deletion
-
-  Calling `nif_delete/2` invokes `NIF.bloom_delete/1` which munmaps the
-  region and unlinks the file from disk.
   """
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.{BloomRegistry, Router}
-
   @default_error_rate 0.01
   @default_capacity 100
 
@@ -45,22 +27,6 @@ defmodule Ferricstore.Commands.Bloom do
   # Public command handler
   # -------------------------------------------------------------------
 
-  @doc """
-  Handles a Bloom filter command.
-
-  ## Parameters
-
-    * `cmd` -- uppercased command name (e.g. `"BF.RESERVE"`, `"BF.ADD"`)
-    * `args` -- list of string arguments
-    * `store` -- injected store map. When `store.bloom_registry` is present
-      (a map with `get`, `put`, `delete`, `path` callbacks), it is used for
-      resource caching. Otherwise, the module falls back to the global
-      `BloomRegistry` ETS tables using `data_dir` from application config.
-
-  ## Returns
-
-  Plain Elixir term: `:ok`, `nil`, integer, list, or `{:error, message}`.
-  """
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
@@ -72,10 +38,19 @@ defmodule Ferricstore.Commands.Bloom do
     with {:ok, error_rate} <- parse_float(error_rate_str, "error_rate"),
          {:ok, capacity} <- parse_pos_integer(capacity_str, "capacity"),
          :ok <- validate_error_rate(error_rate) do
-      if bloom_exists?(key, store) do
+      if bloom_file_exists?(key, store) do
         {:error, "ERR item exists"}
       else
-        create_bloom(key, capacity, error_rate, store)
+        {num_bits, num_hashes} = compute_params(capacity, error_rate)
+        meta = {:bloom_meta, %{path: prob_path(store, key, "bloom"),
+                                num_bits: num_bits, num_hashes: num_hashes,
+                                capacity: capacity, error_rate: error_rate}}
+        result = do_prob_write(store, {:bloom_create, key, num_bits, num_hashes, meta})
+        case result do
+          {:ok, _} -> :ok
+          :ok -> :ok
+          other -> other
+        end
       end
     end
   end
@@ -85,12 +60,13 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   # ---------------------------------------------------------------------------
-  # BF.ADD key element
+  # BF.ADD key element — write through Raft
   # ---------------------------------------------------------------------------
 
   def handle("BF.ADD", [key, element], store) do
-    {resource, _meta} = ensure_bloom(key, store)
-    nif_result(NIF.bloom_add(resource, element), "bloom add")
+    auto_params = default_auto_create_params()
+    result = do_prob_write(store, {:bloom_add, key, element, auto_params})
+    normalize_add_result(result)
   end
 
   def handle("BF.ADD", _args, _store) do
@@ -98,12 +74,13 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   # ---------------------------------------------------------------------------
-  # BF.MADD key element [element ...]
+  # BF.MADD key element [element ...] — write through Raft
   # ---------------------------------------------------------------------------
 
   def handle("BF.MADD", [key | elements], store) when elements != [] do
-    {resource, _meta} = ensure_bloom(key, store)
-    nif_result(NIF.bloom_madd(resource, elements), "bloom madd")
+    auto_params = default_auto_create_params()
+    result = do_prob_write(store, {:bloom_madd, key, elements, auto_params})
+    normalize_add_result(result)
   end
 
   def handle("BF.MADD", _args, _store) do
@@ -111,13 +88,16 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   # ---------------------------------------------------------------------------
-  # BF.EXISTS key element
+  # BF.EXISTS key element — local stateless pread
   # ---------------------------------------------------------------------------
 
   def handle("BF.EXISTS", [key, element], store) do
-    case get_bloom(key, store) do
-      nil -> 0
-      {resource, _meta} -> nif_result(NIF.bloom_exists(resource, element), "bloom exists")
+    path = prob_path(store, key, "bloom")
+
+    case NIF.bloom_file_exists(path, element) do
+      {:ok, result} -> result
+      {:error, :enoent} -> 0
+      {:error, reason} -> {:error, "ERR bloom exists failed: #{inspect(reason)}"}
     end
   end
 
@@ -126,13 +106,16 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   # ---------------------------------------------------------------------------
-  # BF.MEXISTS key element [element ...]
+  # BF.MEXISTS key element [element ...] — local stateless pread
   # ---------------------------------------------------------------------------
 
   def handle("BF.MEXISTS", [key | elements], store) when elements != [] do
-    case get_bloom(key, store) do
-      nil -> List.duplicate(0, length(elements))
-      {resource, _meta} -> nif_result(NIF.bloom_mexists(resource, elements), "bloom mexists")
+    path = prob_path(store, key, "bloom")
+
+    case NIF.bloom_file_mexists(path, elements) do
+      {:ok, results} -> results
+      {:error, :enoent} -> List.duplicate(0, length(elements))
+      {:error, reason} -> {:error, "ERR bloom mexists failed: #{inspect(reason)}"}
     end
   end
 
@@ -141,13 +124,16 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   # ---------------------------------------------------------------------------
-  # BF.CARD key
+  # BF.CARD key — local stateless pread
   # ---------------------------------------------------------------------------
 
   def handle("BF.CARD", [key], store) do
-    case get_bloom(key, store) do
-      nil -> 0
-      {resource, _meta} -> NIF.bloom_card(resource)
+    path = prob_path(store, key, "bloom")
+
+    case NIF.bloom_file_card(path) do
+      {:ok, count} -> count
+      {:error, :enoent} -> 0
+      {:error, reason} -> {:error, "ERR bloom card failed: #{inspect(reason)}"}
     end
   end
 
@@ -156,34 +142,33 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   # ---------------------------------------------------------------------------
-  # BF.INFO key
+  # BF.INFO key — local stateless pread
   # ---------------------------------------------------------------------------
 
   def handle("BF.INFO", [key], store) do
-    case get_bloom(key, store) do
-      nil ->
+    path = prob_path(store, key, "bloom")
+
+    case NIF.bloom_file_info(path) do
+      {:ok, {num_bits, count, num_hashes}} ->
+        # Try to get capacity/error_rate from stored metadata
+        {capacity, error_rate} = recover_bloom_meta(key, store, num_bits, num_hashes)
+
+        [
+          "Capacity", capacity,
+          "Size", count,
+          "Number of filters", 1,
+          "Number of items inserted", count,
+          "Expansion rate", 0,
+          "Error rate", error_rate,
+          "Number of hash functions", num_hashes,
+          "Number of bits", num_bits
+        ]
+
+      {:error, :enoent} ->
         {:error, "ERR not found"}
 
-      {resource, meta} ->
-        case NIF.bloom_info(resource) do
-          {:ok, {num_bits, count, num_hashes}} ->
-            capacity = Map.get(meta, :capacity, @default_capacity)
-            error_rate = Map.get(meta, :error_rate, @default_error_rate)
-
-            [
-              "Capacity", capacity,
-              "Size", count,
-              "Number of filters", 1,
-              "Number of items inserted", count,
-              "Expansion rate", 0,
-              "Error rate", error_rate,
-              "Number of hash functions", num_hashes,
-              "Number of bits", num_bits
-            ]
-
-          {:error, reason} ->
-            {:error, "ERR bloom info failed: #{reason}"}
-        end
+      {:error, reason} ->
+        {:error, "ERR bloom info failed: #{inspect(reason)}"}
     end
   end
 
@@ -195,33 +180,11 @@ defmodule Ferricstore.Commands.Bloom do
   # Deletion (called from DEL / UNLINK handlers)
   # ---------------------------------------------------------------------------
 
-  @doc """
-  Deletes a bloom filter: munmap + unlink the file + remove from cache.
-
-  Returns `:ok` whether or not the key existed (idempotent).
-
-  ## Parameters
-
-    * `key` -- the Redis key
-    * `store` -- the store map (used to resolve registry backend)
-  """
   @spec nif_delete(binary(), map()) :: :ok
   def nif_delete(key, store) do
-    case resolve_registry(store) do
-      {:ets, index, _data_dir} ->
-        BloomRegistry.delete(index, key)
-
-      {:callback, registry} ->
-        case registry.get.(key) do
-          nil ->
-            :ok
-
-          {resource, _meta} ->
-            NIF.bloom_delete(resource)
-            registry.delete.(key)
-            :ok
-        end
-    end
+    path = prob_path(store, key, "bloom")
+    File.rm(path)
+    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -243,127 +206,136 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   # ---------------------------------------------------------------------------
-  # Private: registry resolution
+  # Private helpers
   # ---------------------------------------------------------------------------
 
-  # Two modes of operation:
-  #
-  # 1. **Callback mode** -- `store.bloom_registry` is a map with
-  #    `get/put/delete/path` callbacks (used in tests).
-  #
-  # 2. **ETS mode** -- the global `BloomRegistry` ETS tables are used.
-  #    The shard index is derived from the key via `Router.shard_for/1`
-  #    and the data_dir from application config.
-  @spec resolve_registry(map()) ::
-          {:ets, non_neg_integer(), binary()}
-          | {:callback, map()}
-  defp resolve_registry(%{bloom_registry: registry}) when is_map(registry) do
-    {:callback, registry}
-  end
-
-  defp resolve_registry(_store) do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    {:ets, nil, data_dir}
-  end
-
-  # Resolves the registry for a specific key (fills in shard index for ETS mode).
-  @spec resolve_registry_for_key(binary(), map()) ::
-          {:ets, non_neg_integer(), binary()}
-          | {:callback, map()}
-  defp resolve_registry_for_key(_key, %{bloom_registry: registry}) when is_map(registry) do
-    {:callback, registry}
-  end
-
-  defp resolve_registry_for_key(key, _store) do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    index = Router.shard_for(key)
-    {:ets, index, data_dir}
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private: bloom resource access
-  # ---------------------------------------------------------------------------
-
-  # Returns {resource, metadata} or nil.
-  @spec get_bloom(binary(), map()) :: {reference(), map()} | nil
-  defp get_bloom(key, store) do
-    case resolve_registry_for_key(key, store) do
-      {:ets, index, data_dir} ->
-        case BloomRegistry.open_or_lookup(index, key, data_dir) do
-          {:ok, resource, meta} -> {resource, meta}
-          :not_found -> nil
-        end
-
-      {:callback, registry} ->
-        case registry.get.(key) do
-          nil -> nil
-          {resource, meta} -> {resource, meta}
-        end
-    end
-  end
-
-  # Returns true if a bloom key exists (either in cache or on disk).
-  @spec bloom_exists?(binary(), map()) :: boolean()
-  defp bloom_exists?(key, store) do
-    get_bloom(key, store) != nil
-  end
-
-  # Returns {resource, metadata}, creating a new filter with defaults if missing.
-  @spec ensure_bloom(binary(), map()) :: {reference(), map()}
-  defp ensure_bloom(key, store) do
-    case get_bloom(key, store) do
-      nil ->
-        {:ok, resource, meta} =
-          create_bloom_internal(key, @default_capacity, @default_error_rate, store)
-
-        {resource, meta}
-
-      existing ->
-        existing
-    end
-  end
-
-  # Creates a new bloom filter and registers it.
-  @spec create_bloom(binary(), pos_integer(), float(), map()) :: :ok | {:error, binary()}
-  defp create_bloom(key, capacity, error_rate, store) do
-    case create_bloom_internal(key, capacity, error_rate, store) do
-      {:ok, _resource, _meta} -> :ok
-      {:error, _} = err -> err
-    end
-  end
-
-  @spec create_bloom_internal(binary(), pos_integer(), float(), map()) ::
-          {:ok, reference(), map()} | {:error, binary()}
-  defp create_bloom_internal(key, capacity, error_rate, store) do
+  defp compute_params(capacity, error_rate) do
     num_bits = optimal_num_bits(capacity, error_rate)
     num_hashes = optimal_num_hashes(num_bits, capacity)
-    meta = %{capacity: capacity, error_rate: error_rate}
+    {num_bits, num_hashes}
+  end
 
-    case resolve_registry_for_key(key, store) do
-      {:ets, index, data_dir} ->
-        path = BloomRegistry.bloom_path(data_dir, index, key)
+  defp default_auto_create_params do
+    {num_bits, num_hashes} = compute_params(@default_capacity, @default_error_rate)
+    %{num_bits: num_bits, num_hashes: num_hashes,
+      capacity: @default_capacity, error_rate: @default_error_rate}
+  end
 
-        case NIF.bloom_create(path, num_bits, num_hashes) do
-          {:ok, resource} ->
-            BloomRegistry.register(index, key, resource, meta)
-            BloomRegistry.save_meta(path, meta)
-            {:ok, resource, meta}
+  defp prob_path(store, key, ext) do
+    safe = Base.url_encode64(key, padding: false)
+    prob_dir = resolve_prob_dir(store, key)
+    Path.join(prob_dir, "#{safe}.#{ext}")
+  end
 
-          {:error, reason} ->
-            {:error, "ERR bloom create failed: #{reason}"}
-        end
+  defp resolve_prob_dir(%{prob_dir: prob_dir_fn}, _key) when is_function(prob_dir_fn), do: prob_dir_fn.()
+  defp resolve_prob_dir(%{prob_dir_for_key: f}, key) when is_function(f), do: f.(key)
+  defp resolve_prob_dir(%{bloom_registry: %{dir: dir}}, _key), do: dir
+  defp resolve_prob_dir(_store, key) do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    idx = Ferricstore.Store.Router.shard_for(key)
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+    Path.join(shard_path, "prob")
+  end
 
-      {:callback, registry} ->
-        path = registry.path.(key)
+  defp bloom_file_exists?(key, store) do
+    case Map.get(store, :exists?) do
+      nil ->
+        path = prob_path(store, key, "bloom")
+        File.exists?(path)
 
-        case NIF.bloom_create(path, num_bits, num_hashes) do
-          {:ok, resource} ->
-            registry.put.(key, resource, meta)
-            {:ok, resource, meta}
+      exists_fn ->
+        exists_fn.(key)
+    end
+  end
 
-          {:error, reason} ->
-            {:error, "ERR bloom create failed: #{reason}"}
-        end
+  defp normalize_add_result({:ok, result}), do: result
+  defp normalize_add_result({:error, reason}), do: {:error, "ERR bloom add failed: #{inspect(reason)}"}
+  defp normalize_add_result(:ok), do: :ok
+  defp normalize_add_result(other), do: other
+
+  # Routes a prob write command through Raft (production) or directly via
+  # NIF (test mode when store lacks prob_write).
+  defp do_prob_write(store, command) do
+    case Map.get(store, :prob_write) do
+      nil -> apply_prob_locally(store, command)
+      write_fn -> write_fn.(command)
+    end
+  end
+
+  # Direct NIF application for test stores without Raft.
+  defp apply_prob_locally(store, {:bloom_create, _key, num_bits, num_hashes, _meta}) do
+    path = prob_path(store, _key, "bloom")
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
+    NIF.bloom_file_create(path, num_bits, num_hashes)
+  end
+
+  defp apply_prob_locally(store, {:bloom_add, key, element, auto_params}) do
+    path = prob_path(store, key, "bloom")
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
+    unless File.exists?(path) do
+      if auto_params do
+        %{num_bits: nb, num_hashes: nh} = auto_params
+        NIF.bloom_file_create(path, nb, nh)
+      end
+    end
+    NIF.bloom_file_add(path, element)
+  end
+
+  defp apply_prob_locally(store, {:bloom_madd, key, elements, auto_params}) do
+    path = prob_path(store, key, "bloom")
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
+    unless File.exists?(path) do
+      if auto_params do
+        %{num_bits: nb, num_hashes: nh} = auto_params
+        NIF.bloom_file_create(path, nb, nh)
+      end
+    end
+    NIF.bloom_file_madd(path, elements)
+  end
+
+  defp recover_bloom_meta(key, store, num_bits, num_hashes) do
+    # Try to read metadata from Bitcask (stored during BF.RESERVE)
+    meta =
+      case Map.get(store, :get) do
+        nil -> nil
+        get_fn ->
+          case get_fn.(key) do
+            nil -> nil
+            value when is_binary(value) ->
+              try do
+                case :erlang.binary_to_term(value) do
+                  {:bloom_meta, %{capacity: c, error_rate: e}} -> {c, e}
+                  _ -> nil
+                end
+              rescue
+                _ -> nil
+              end
+            _ -> nil
+          end
+      end
+
+    case meta do
+      {capacity, error_rate} -> {capacity, error_rate}
+      nil ->
+        # Derive from num_bits/num_hashes (inverse formula)
+        capacity =
+          if num_hashes > 0 do
+            max(1, round(num_bits * :math.log(2) / num_hashes))
+          else
+            @default_capacity
+          end
+
+        error_rate =
+          if capacity > 0 do
+            :math.exp(-num_bits * :math.pow(:math.log(2), 2) / capacity)
+          else
+            @default_error_rate
+          end
+
+        {capacity, error_rate}
     end
   end
 
@@ -395,8 +367,4 @@ defmodule Ferricstore.Commands.Bloom do
   @spec validate_error_rate(float()) :: :ok | {:error, binary()}
   defp validate_error_rate(rate) when rate > 0.0 and rate < 1.0, do: :ok
   defp validate_error_rate(_), do: {:error, "ERR (0 < error rate range < 1)"}
-
-  # Wraps NIF results — converts raw {:error, reason} to RESP error messages.
-  defp nif_result({:error, reason}, op), do: {:error, "ERR #{op} failed: #{inspect(reason)}"}
-  defp nif_result(result, _op), do: result
 end

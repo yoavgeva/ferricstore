@@ -42,7 +42,7 @@ defmodule Ferricstore.Store.Shard do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.{BloomRegistry, LFU, PrefixIndex, Router, ValueCodec}
+  alias Ferricstore.Store.{LFU, PrefixIndex, Router, ValueCodec}
 
   require Logger
 
@@ -211,11 +211,6 @@ defmodule Ferricstore.Store.Shard do
 
     ets = keydir
 
-    # Create bloom registry only for non-sandbox shards
-    unless sandbox? do
-      BloomRegistry.create_table(index)
-    end
-
     # v2: recover ETS keydir from hint files or by scanning log files BEFORE
     # starting Raft. This ensures cold entries ({key, nil, ..., fid, off, vsize})
     # are in ETS when ra replays WAL entries via apply/3. Without this, replayed
@@ -251,31 +246,11 @@ defmodule Ferricstore.Store.Shard do
         Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index)
       end
 
-    # Rebuild HNSW vector indices (skip for sandbox)
+    # Migrate existing prob files: scan prob dir for files without
+    # corresponding metadata markers in the keydir. Write markers so
+    # DEL can clean up prob files and BF.INFO/CMS.INFO can recover metadata.
     unless sandbox? do
-      hnsw_get_fn = fn key ->
-        case :ets.lookup(keydir, key) do
-          [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil -> value
-          [{^key, nil, _exp, _lfu, fid, off, _vsize}] ->
-            p = file_path(path, fid)
-            case NIF.v2_pread_at(p, off) do
-              {:ok, v} -> v
-              _ -> nil
-            end
-          _ -> nil
-        end
-      end
-
-      Ferricstore.Store.HnswRegistry.rebuild_for_shard(path, index, hnsw_get_fn)
-    end
-
-    # Re-open all mmap-backed bloom filter files from disk (skip for sandbox)
-    unless sandbox? do
-      bloom_count = BloomRegistry.recover(data_dir, index)
-
-      if bloom_count > 0 do
-        Logger.debug("Shard #{index}: recovered #{bloom_count} bloom filter(s)")
-      end
+      migrate_prob_files(path, keydir, index)
     end
 
     # Publish active file metadata to ActiveFile registry (skip for sandbox --
@@ -2085,11 +2060,13 @@ defmodule Ferricstore.Store.Shard do
         end
       end,
       prob_dir: fn ->
-        Path.join([ctx.data_dir, "prob", "shard_#{ctx.index}"])
+        Path.join(ctx.shard_data_path, "prob")
       end,
-      vectors_dir: fn ->
-        Path.join([ctx.data_dir, "vectors", "shard_#{ctx.index}"])
-      end
+      prob_write: fn command ->
+        Router.prob_write(command)
+      end,
+      shard_index: ctx.index,
+      data_dir: ctx.data_dir
     }
   end
 
@@ -4256,6 +4233,142 @@ defmodule Ferricstore.Store.Shard do
       _ ->
         Process.sleep(10)
         wait_for_sandbox_leader(server_id, attempts - 1)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Prob file migration (Phase 8: backward compatibility)
+  #
+  # Scans the prob directory for existing .bloom/.cms/.cuckoo/.topk files
+  # that were created before Raft replication was added. For each file
+  # without a corresponding metadata entry in the keydir (ETS), writes a
+  # metadata marker so DEL can clean up the file and INFO commands can
+  # recover parameters.
+  #
+  # Old files used sanitized key filenames (non-alnum → _). New files use
+  # Base64 URL-safe encoding. This migration handles both conventions.
+  # ---------------------------------------------------------------------------
+
+  defp migrate_prob_files(shard_data_path, keydir, _index) do
+    prob_dir = Path.join(shard_data_path, "prob")
+
+    case File.ls(prob_dir) do
+      {:ok, files} ->
+        migrated =
+          Enum.reduce(files, 0, fn filename, count ->
+            migrate_prob_file(prob_dir, filename, keydir, count)
+          end)
+
+        if migrated > 0 do
+          Logger.info("Shard: migrated #{migrated} existing prob file(s) to Raft metadata")
+        end
+
+      {:error, :enoent} ->
+        :ok
+    end
+  end
+
+  defp migrate_prob_file(prob_dir, filename, keydir, count) do
+    path = Path.join(prob_dir, filename)
+
+    cond do
+      String.ends_with?(filename, ".bloom") ->
+        key = filename |> String.trim_trailing(".bloom")
+        migrate_if_missing(keydir, key, path, :bloom_meta, count)
+
+      String.ends_with?(filename, ".cms") ->
+        key = filename |> String.trim_trailing(".cms")
+        migrate_if_missing(keydir, key, path, :cms_meta, count)
+
+      String.ends_with?(filename, ".cuckoo") ->
+        key = filename |> String.trim_trailing(".cuckoo")
+        migrate_if_missing(keydir, key, path, :cuckoo_meta, count)
+
+      String.ends_with?(filename, ".topk") ->
+        key = filename |> String.trim_trailing(".topk")
+        migrate_if_missing(keydir, key, path, :topk_meta, count)
+
+      true ->
+        count
+    end
+  end
+
+  # Writes a metadata marker into ETS if the key doesn't already have one.
+  # The key in the filename may be Base64-encoded (new) or sanitized (old).
+  # We try to decode as Base64 first; if that fails, treat the filename
+  # stem as the literal key.
+  defp migrate_if_missing(keydir, filename_key, path, type, count) do
+    key =
+      case Base.url_decode64(filename_key, padding: false) do
+        {:ok, decoded} -> decoded
+        :error -> filename_key
+      end
+
+    case :ets.lookup(keydir, key) do
+      [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
+        # Already has an ETS entry — no migration needed
+        count
+
+      [] ->
+        # No ETS entry — write a metadata marker
+        meta = build_prob_meta(type, path, key)
+        meta_bin = :erlang.term_to_binary(meta)
+        :ets.insert(keydir, {key, meta_bin, 0, 0, 0, 0, byte_size(meta_bin)})
+        count + 1
+    end
+  rescue
+    ArgumentError -> count
+  end
+
+  defp build_prob_meta(:bloom_meta, path, _key) do
+    # Try to read bloom header for capacity/error_rate derivation
+    case Ferricstore.Bitcask.NIF.bloom_file_info(path) do
+      {:ok, {num_bits, _count, num_hashes}} ->
+        capacity =
+          if num_hashes > 0,
+            do: max(1, round(num_bits * :math.log(2) / num_hashes)),
+            else: 100
+
+        error_rate =
+          if capacity > 0,
+            do: :math.exp(-num_bits * :math.pow(:math.log(2), 2) / capacity),
+            else: 0.01
+
+        {:bloom_meta, %{path: path, num_bits: num_bits, num_hashes: num_hashes,
+                         capacity: capacity, error_rate: error_rate}}
+
+      _ ->
+        {:bloom_meta, %{path: path}}
+    end
+  end
+
+  defp build_prob_meta(:cms_meta, path, _key) do
+    case Ferricstore.Bitcask.NIF.cms_file_info(path) do
+      {:ok, {width, depth, _count}} ->
+        {:cms_meta, %{width: width, depth: depth}}
+
+      _ ->
+        {:cms_meta, %{path: path}}
+    end
+  end
+
+  defp build_prob_meta(:cuckoo_meta, path, _key) do
+    case Ferricstore.Bitcask.NIF.cuckoo_file_info(path) do
+      {:ok, {num_buckets, _bs, _fp, _ni, _nd, _ts, _mk}} ->
+        {:cuckoo_meta, %{capacity: num_buckets}}
+
+      _ ->
+        {:cuckoo_meta, %{path: path}}
+    end
+  end
+
+  defp build_prob_meta(:topk_meta, path, _key) do
+    case Ferricstore.Bitcask.NIF.topk_file_info_v2(path) do
+      {k, width, depth, decay} ->
+        {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
+
+      _ ->
+        {:topk_meta, %{path: path}}
     end
   end
 

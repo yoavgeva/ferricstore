@@ -2140,6 +2140,15 @@ defmodule FerricstoreServer.Connection do
       compound_delete_prefix: fn redis_key, prefix ->
         shard = Router.shard_name(Router.shard_for(redis_key))
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
+      end,
+      prob_write: &Router.prob_write/1,
+      # prob_dir_for_key resolves the correct shard's prob directory.
+      # Used by command handlers to compute file paths for reads.
+      prob_dir_for_key: fn key ->
+        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+        idx = Router.shard_for(key)
+        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        Path.join(shard_path, "prob")
       end
     }
   end

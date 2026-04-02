@@ -551,37 +551,6 @@ T-digests provide accurate quantile estimation with bounded memory, especially a
 :ok = FerricStore.tdigest_reset("latency")
 ```
 
-### Vector Search
-
-FerricStore-native commands for similarity search. No Redis equivalent.
-
-```elixir
-# VCREATE -- create a vector collection
-:ok = FerricStore.vcreate("embeddings", 3, :cosine)
-
-# VADD -- add vectors
-:ok = FerricStore.vadd("embeddings", "doc1", [0.1, 0.2, 0.3])
-:ok = FerricStore.vadd("embeddings", "doc2", [0.4, 0.5, 0.6])
-:ok = FerricStore.vadd("embeddings", "doc3", [0.9, 0.8, 0.7])
-
-# VSEARCH -- nearest neighbor search
-{:ok, results} = FerricStore.vsearch("embeddings", [0.1, 0.2, 0.3], 2)
-# results => [{"doc1", 0.0}, {"doc2", 0.025...}] sorted by distance
-
-# VGET -- retrieve a vector
-{:ok, [0.1, 0.2, 0.3]} = FerricStore.vget("embeddings", "doc1")
-
-# VDEL -- delete a vector
-{:ok, 1} = FerricStore.vdel("embeddings", "doc1")
-{:ok, 0} = FerricStore.vdel("embeddings", "nonexistent")
-
-# VINFO -- collection metadata
-{:ok, info} = FerricStore.vinfo("embeddings")
-
-# VCARD -- vector count
-{:ok, 2} = FerricStore.vcard("embeddings")
-```
-
 ### Geo
 
 Geo is implemented on top of Sorted Sets with geohash-encoded scores.

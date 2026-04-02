@@ -174,9 +174,11 @@ defmodule Ferricstore.Commands.TopKTest do
     end
 
     test "returns error when key holds wrong type" do
+      # With stateless NIFs, type isolation is by file extension.
+      # A string key has no .topk file, so the NIF returns enoent.
       store = MockStore.make(%{"str_key" => {"a string", 0}})
       assert {:error, msg} = TopK.handle("TOPK.ADD", ["str_key", "elem"], store)
-      assert msg =~ "WRONGTYPE"
+      assert msg =~ "does not exist"
     end
 
     test "returns error with no element arguments" do
@@ -300,7 +302,7 @@ defmodule Ferricstore.Commands.TopKTest do
     test "returns error when key holds wrong type" do
       store = MockStore.make(%{"str_key" => {"a string", 0}})
       assert {:error, msg} = TopK.handle("TOPK.QUERY", ["str_key", "a"], store)
-      assert msg =~ "WRONGTYPE"
+      assert msg =~ "does not exist"
     end
 
     test "returns error with no element arguments" do
@@ -353,7 +355,7 @@ defmodule Ferricstore.Commands.TopKTest do
     test "returns error when key holds wrong type" do
       store = MockStore.make(%{"str_key" => {"a string", 0}})
       assert {:error, msg} = TopK.handle("TOPK.LIST", ["str_key"], store)
-      assert msg =~ "WRONGTYPE"
+      assert msg =~ "does not exist"
     end
 
     test "returns error with no arguments" do
@@ -389,7 +391,7 @@ defmodule Ferricstore.Commands.TopKTest do
     test "returns error when key holds wrong type" do
       store = MockStore.make(%{"str_key" => {"a string", 0}})
       assert {:error, msg} = TopK.handle("TOPK.INFO", ["str_key"], store)
-      assert msg =~ "WRONGTYPE"
+      assert msg =~ "does not exist"
     end
 
     test "returns error with wrong number of arguments" do
@@ -565,22 +567,22 @@ defmodule Ferricstore.Commands.TopKTest do
   # ===========================================================================
 
   describe "CMS and TopK type isolation" do
-    test "CMS command on TopK key returns WRONGTYPE" do
+    test "CMS command on TopK key returns error (type isolation by file extension)" do
       alias Ferricstore.Commands.CMS
       store = MockStore.make()
       :ok = TopK.handle("TOPK.RESERVE", ["hot_keys", "10"], store)
 
-      assert {:error, msg} = CMS.handle("CMS.QUERY", ["hot_keys", "a"], store)
-      assert msg =~ "WRONGTYPE"
+      # CMS.QUERY looks for .cms file, not .topk — returns "does not exist"
+      assert {:error, _msg} = CMS.handle("CMS.QUERY", ["hot_keys", "a"], store)
     end
 
-    test "TopK command on CMS key returns WRONGTYPE" do
+    test "TopK command on CMS key returns error (type isolation by file extension)" do
       alias Ferricstore.Commands.CMS
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
 
-      assert {:error, msg} = TopK.handle("TOPK.ADD", ["mysketch", "a"], store)
-      assert msg =~ "WRONGTYPE"
+      # TOPK.ADD looks for .topk file, not .cms — returns "does not exist"
+      assert {:error, _msg} = TopK.handle("TOPK.ADD", ["mysketch", "a"], store)
     end
   end
 

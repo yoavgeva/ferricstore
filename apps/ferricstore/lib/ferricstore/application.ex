@@ -126,9 +126,6 @@ defmodule Ferricstore.Application do
     Ferricstore.ClientTracking.init_tables()
     # Initialize stream metadata ETS tables (owned by this long-lived process)
     Ferricstore.Commands.Stream.init_tables()
-    # Initialize HNSW vector index registry (used by VCREATE/VADD/VSEARCH)
-    Ferricstore.Store.HnswRegistry.create_table()
-
     # Load the patched ra_log_wal with async fdatasync BEFORE starting
     # the ra system, so the patched module is in place when the WAL starts.
     install_patched_wal()

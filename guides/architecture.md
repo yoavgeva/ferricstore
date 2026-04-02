@@ -58,10 +58,10 @@ FerricStore is built around three core design principles: (1) all mutable state 
 │  │  └─────────────────────────────────────────────────────────┘   │        │
 │  │                                                                 │        │
 │  │  ┌─────────────────────────────────────────────────────────┐   │        │
-│  │  │  Tier 3: mmap files (probabilistic + vector)             │   │        │
-│  │  │  Bloom (.bloom), Cuckoo (.cuck), CMS (.cms)              │   │        │
-│  │  │  TopK (.topk), TDigest (.tdig), HNSW (.v + .hnsw)       │   │        │
-│  │  │  OS page cache manages RAM, zero-copy NIF reads          │   │        │
+│  │  │  Tier 3: pread/pwrite files (probabilistic)               │   │        │
+│  │  │  Bloom (.bloom), Cuckoo (.cuckoo), CMS (.cms)            │   │        │
+│  │  │  TopK (.topk), TDigest (.tdig)                           │   │        │
+│  │  │  OS page cache manages RAM, stateless NIF reads           │   │        │
 │  │  └─────────────────────────────────────────────────────────┘   │        │
 │  └─────────────────────────────────────────────────────────────────┘        │
 │                                                                            │
@@ -133,7 +133,7 @@ Before the supervision tree starts, `Application.start/2` performs critical init
 1. `DataDir.ensure_layout!(data_dir, shard_count)` -- creates the on-disk directory structure
 2. `LFU.init_config_cache()` -- caches `lfu_decay_time` and `lfu_log_factor` in `persistent_term` (~5ns reads)
 3. `persistent_term` initialization -- `hot_cache_max_value_size`, `keydir_full`, `reject_writes`, `shard_count`, `promotion_threshold`
-4. `Waiters.init()`, `ClientTracking.init_tables()`, `Stream.init_tables()`, `HnswRegistry.create_table()` -- ETS tables for blocking commands, client tracking, streams, and vector indices
+4. `Waiters.init()`, `ClientTracking.init_tables()`, `Stream.init_tables()` -- ETS tables for blocking commands, client tracking, and streams
 5. `install_patched_wal()` -- loads the patched `ra_log_wal` module with async fdatasync (pre-compiled `.beam` in release mode, runtime-compiled in dev)
 6. `Raft.Cluster.start_system(data_dir)` -- starts the ra system (WAL directory under `data_dir/ra`)
 7. Supervision tree starts: Stats -> SlowLog -> AuditLog -> Config -> NamespaceConfig -> Acl -> HLC -> Batchers -> BitcaskWriters -> ShardSupervisor -> AsyncApplyWorkers -> Merge.Supervisor -> PubSub -> FetchOrCompute -> MemoryGuard
@@ -498,9 +498,8 @@ On shard startup, `Shard.init/1` rebuilds the in-memory keydir:
    - If no hint files: full scan of all log files via `NIF.v2_scan_file/2`. For each record, insert or delete from ETS. Last-writer-wins (higher file_id + higher offset wins).
    - Entries recovered from hints/logs are inserted as cold: `{key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size}`.
 5. **Recover promoted collections**: Scans ETS for `PM:` marker keys, re-opens dedicated Bitcask directories, scans their logs to recover entries.
-6. **Rebuild HNSW indices**: Reads persisted vectors from disk and rebuilds in-memory HNSW graphs.
-7. **Recover bloom filters**: Re-opens mmap-backed bloom filter files.
-8. **Start Raft server**: `Raft.Cluster.start_shard_server/5` starts the ra server for this shard. On supervisor restart after a shard crash, the existing Raft server is stopped and restarted with the same UID, preserving all committed WAL data (previous versions used `force_delete_server` which destroyed the WAL).
+6. **Migrate prob files**: Scans prob directory for existing `.bloom`/`.cms`/`.cuckoo`/`.topk` files, writes metadata markers to ETS for any files without corresponding keydir entries.
+7. **Start Raft server**: `Raft.Cluster.start_shard_server/5` starts the ra server for this shard. On supervisor restart after a shard crash, the existing Raft server is stopped and restarted with the same UID, preserving all committed WAL data (previous versions used `force_delete_server` which destroyed the WAL).
 9. **Schedule flush timer and expiry sweep**.
 
 ## Rust NIF Design
@@ -549,44 +548,28 @@ Correlation IDs (monotonically increasing integers from `System.unique_integer/1
 
 Header size: 26 bytes. CRC32 covers everything after the checksum field. Tombstone records have `value_size = u32::MAX` (0xFFFFFFFF) and no value bytes. A `value_size` of 0 indicates a valid empty string value (`SET key ""`). All integers are little-endian. The I/O backend is selected at startup: `io_uring` on Linux kernel >= 5.1, `BufWriter<File>` otherwise.
 
-### mmap-Backed Structures (NIF Resources)
+### Stateless pread/pwrite Structures
 
-Probabilistic and vector structures use memory-mapped files managed by the OS page cache. Each structure type has create/open/close NIFs that return a NIF resource (reference-counted, BEAM GC'd):
+Probabilistic structures use stateless file-based NIFs. Each NIF opens the file, reads/writes specific bytes via pread/pwrite, and closes on return. No mmap, no ResourceArc, no Mutex. Memory stays in kernel page cache (managed by OS).
 
 | Structure | File Extension | NIFs |
 |-----------|---------------|------|
-| Bloom Filter | `.bloom` | `bloom_create(path, num_bits, num_hashes)`, `bloom_open(path)`, `bloom_add`, `bloom_exists`, `bloom_madd`, `bloom_mexists`, `bloom_card`, `bloom_info`, `bloom_delete` |
-| Cuckoo Filter | `.cuck` | `cuckoo_create_file(path, capacity, bucket_size)`, `cuckoo_open_file(path)`, `cuckoo_add`, `cuckoo_addnx`, `cuckoo_del`, `cuckoo_exists`, `cuckoo_mexists`, `cuckoo_count`, `cuckoo_info` |
-| Count-Min Sketch | `.cms` | `cms_create_file(path, width, depth)`, `cms_open_file(path)`, `cms_incrby`, `cms_query`, `cms_merge`, `cms_info` |
-| TopK | `.topk` | `topk_create_file(path, k, width, depth, decay)`, `topk_open_file(path)`, `topk_file_add`, `topk_file_list`, `topk_file_info` |
-| TDigest | `.tdig` | `tdigest_create_file(path, compression)`, `tdigest_open_file(path)`, `tdigest_file_add`, `tdigest_file_quantile`, `tdigest_file_cdf`, `tdigest_file_min`, `tdigest_file_max` |
-| HNSW Vector | `.v` + `.hnsw` | `hnsw_create_file(vec_path, hnsw_path, dims, m, ef, metric, max_capacity)`, `hnsw_open_file`, `hnsw_file_add`, `hnsw_file_search`, `hnsw_file_delete` |
+| Bloom Filter | `.bloom` | `bloom_file_create`, `bloom_file_add`, `bloom_file_madd`, `bloom_file_exists`, `bloom_file_mexists`, `bloom_file_card`, `bloom_file_info` |
+| Cuckoo Filter | `.cuckoo` | `cuckoo_file_create`, `cuckoo_file_add`, `cuckoo_file_addnx`, `cuckoo_file_del`, `cuckoo_file_exists`, `cuckoo_file_count`, `cuckoo_file_info` |
+| Count-Min Sketch | `.cms` | `cms_file_create`, `cms_file_incrby`, `cms_file_query`, `cms_file_info`, `cms_file_merge` |
+| TopK | `.topk` | `topk_file_create_v2`, `topk_file_add_v2`, `topk_file_incrby_v2`, `topk_file_query_v2`, `topk_file_list_v2`, `topk_file_count_v2`, `topk_file_info_v2` |
+| TDigest | `.tdig` | (in-memory ResourceArc — pending migration to stateless) |
 
-These structures never go through ETS because they are too large for ETS copy semantics, use random-access patterns (not key-lookup), and are best served by OS page cache (zero-copy, no serialization).
-
-### In-Memory NIF Resources
-
-Some structures also have in-memory (non-mmap) variants for smaller datasets or serialization:
-
-```
-hnsw_new(dims, m, ef_construction, metric) -> resource
-topk_create(k, width, depth, decay) -> resource
-cms_create(width, depth) -> resource
-cuckoo_create(capacity, bucket_size, max_kicks, expansion) -> resource
-tdigest_create(compression) -> resource
-```
-
-These resources can be serialized to/from bytes (e.g., `topk_to_bytes`/`topk_from_bytes`, `cms_to_bytes`/`cms_from_bytes`) for Bitcask persistence.
+Write commands route through Raft for replication. Read commands use stateless pread NIFs directly on the local file. Files live at `shard_data_path/prob/BASE64_KEY.ext`.
 
 ### The "Should This Be in Rust?" Test
 
-1. Is it CPU-intensive? (hash, distance, crypto, HNSW graph traversal) -- **Rust**
-2. Is it a syscall wrapper? (pread, fsync, mmap) -- **Rust**
-3. Is it pointer math on mmap? (bloom bits, CMS counters, cuckoo buckets) -- **Rust**
-4. Does it manage mmap-backed data structures? (TopK, TDigest, HNSW) -- **Rust NIF resource**
-5. Does it have application state? (keydir, routing, scheduling) -- **Elixir**
-6. Does it make decisions? (eviction, batching, consensus) -- **Elixir**
-7. Does it need debugging in production? -- **Elixir**
+1. Is it CPU-intensive? (hash, fingerprint, CMS counters) -- **Rust**
+2. Is it a syscall wrapper? (pread, pwrite, fsync) -- **Rust**
+3. Is it file I/O on binary layouts? (bloom bits, CMS counters, cuckoo buckets) -- **Rust stateless NIF**
+4. Does it have application state? (keydir, routing, scheduling) -- **Elixir**
+5. Does it make decisions? (eviction, batching, consensus) -- **Elixir**
+6. Does it need debugging in production? -- **Elixir**
 
 ### NIF Scheduling
 
@@ -659,20 +642,19 @@ Bitcask is an append-only log-structured storage engine. When values are evicted
 - Hint files for fast startup recovery
 - File rotation at 256 MB
 
-### Tier 3: mmap (Probabilistic and Vector)
+### Tier 3: Stateless pread/pwrite (Probabilistic)
 
-Probabilistic data structures and vector indexes use memory-mapped files managed by the OS page cache:
+Probabilistic data structures use stateless file-based NIFs with pread/pwrite. Each NIF opens the file, operates, and closes on return. Data stays in OS page cache:
 
 | Structure | File Extension | Access Pattern |
 |-----------|---------------|----------------|
 | Bloom Filter | `.bloom` | Random bit set/check |
-| Cuckoo Filter | `.cuck` | Bucket array, fingerprint ops |
+| Cuckoo Filter | `.cuckoo` | Bucket array, fingerprint ops |
 | Count-Min Sketch | `.cms` | Counter matrix, hash-indexed increment |
 | TopK | `.topk` | CMS + min-heap |
 | TDigest | `.tdig` | Sorted centroid array |
-| HNSW Vector Index | `.v` + `.hnsw` | Flat f32 array + graph |
 
-These structures never go through ETS because they are too large for ETS copy semantics, use random-access patterns, and are best served by the OS page cache (zero-copy, no serialization).
+Write commands replicate through Raft. Read commands bypass Raft and use stateless pread NIFs on local files. Zero process memory — the OS page cache handles caching.
 
 ## Telemetry Events
 
