@@ -144,7 +144,12 @@ fn cuckoo_file_alternate_bucket(bucket: usize, fp: &[u8], num_buckets: u32) -> u
 }
 
 /// Compute the byte offset in the file for a given bucket and slot.
-fn cuckoo_file_slot_offset(bucket_idx: usize, slot_idx: usize, bucket_size: u8, fingerprint_size: u8) -> u64 {
+fn cuckoo_file_slot_offset(
+    bucket_idx: usize,
+    slot_idx: usize,
+    bucket_size: u8,
+    fingerprint_size: u8,
+) -> u64 {
     HEADER_SIZE as u64
         + ((bucket_idx * (bucket_size as usize) + slot_idx) * (fingerprint_size as usize)) as u64
 }
@@ -235,7 +240,12 @@ fn encode_file_open_error(env: Env, err: FileOpenError) -> Term {
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_file_create(env: Env, path: String, capacity: u32, bucket_size: u8) -> NifResult<Term> {
+pub fn cuckoo_file_create(
+    env: Env,
+    path: String,
+    capacity: u32,
+    bucket_size: u8,
+) -> NifResult<Term> {
     if capacity == 0 {
         return Ok((atoms::error(), "capacity must be > 0").encode(env));
     }
@@ -252,16 +262,14 @@ pub fn cuckoo_file_create(env: Env, path: String, capacity: u32, bucket_size: u8
     let p = Path::new(&path);
     if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| {
-                rustler::Error::Term(Box::new(format!("mkdir: {e}")))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| rustler::Error::Term(Box::new(format!("mkdir: {e}"))))?;
         }
     }
 
     // Write header + zeroed buckets.
-    let mut file = File::create(p).map_err(|e| {
-        rustler::Error::Term(Box::new(format!("create: {e}")))
-    })?;
+    let mut file =
+        File::create(p).map_err(|e| rustler::Error::Term(Box::new(format!("create: {e}"))))?;
     let mut header = [0u8; HEADER_SIZE];
     header[0..2].copy_from_slice(&MAGIC);
     header[2] = VERSION;
@@ -276,12 +284,10 @@ pub fn cuckoo_file_create(env: Env, path: String, capacity: u32, bucket_size: u8
     buf.extend_from_slice(&header);
     buf.resize(file_size, 0);
 
-    file.write_all(&buf).map_err(|e| {
-        rustler::Error::Term(Box::new(format!("write: {e}")))
-    })?;
-    file.sync_all().map_err(|e| {
-        rustler::Error::Term(Box::new(format!("fsync: {e}")))
-    })?;
+    file.write_all(&buf)
+        .map_err(|e| rustler::Error::Term(Box::new(format!("write: {e}"))))?;
+    file.sync_all()
+        .map_err(|e| rustler::Error::Term(Box::new(format!("fsync: {e}"))))?;
 
     Ok((atoms::ok(), atoms::ok()).encode(env))
 }
@@ -290,7 +296,11 @@ pub fn cuckoo_file_create(env: Env, path: String, capacity: u32, bucket_size: u8
 /// Opens the file, reads header, inserts fingerprint, updates counters, closes.
 /// Returns `{:ok, 1}` or `{:error, "filter is full"}`.
 #[rustler::nif(schedule = "Normal")]
-#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unnecessary_wraps,
+    clippy::too_many_lines
+)]
 pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> NifResult<Term<'a>> {
     let file = match cuckoo_file_open_rw(&path) {
         Ok(f) => f,
@@ -313,12 +323,25 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 
     // Try primary bucket.
     for slot in 0..hdr.bucket_size {
-        let s = match cuckoo_file_read_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+        let s = match cuckoo_file_read_slot(
+            &file,
+            b1,
+            slot as usize,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+        ) {
             Ok(s) => s,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
         if s.iter().all(|&b| b == 0) {
-            if let Err(e) = cuckoo_file_write_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &fp) {
+            if let Err(e) = cuckoo_file_write_slot(
+                &file,
+                b1,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+                &fp,
+            ) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
@@ -331,12 +354,25 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 
     // Try alternate bucket.
     for slot in 0..hdr.bucket_size {
-        let s = match cuckoo_file_read_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+        let s = match cuckoo_file_read_slot(
+            &file,
+            b2,
+            slot as usize,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+        ) {
             Ok(s) => s,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
         if s.iter().all(|&b| b == 0) {
-            if let Err(e) = cuckoo_file_write_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &fp) {
+            if let Err(e) = cuckoo_file_write_slot(
+                &file,
+                b2,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+                &fp,
+            ) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
@@ -354,13 +390,26 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
         let slot_idx = (kicks as usize) % (hdr.bucket_size as usize);
 
         // Read evicted fingerprint.
-        let evicted = match cuckoo_file_read_slot(&file, cur_bucket, slot_idx, hdr.bucket_size, hdr.fingerprint_size) {
+        let evicted = match cuckoo_file_read_slot(
+            &file,
+            cur_bucket,
+            slot_idx,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+        ) {
             Ok(s) => s,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
 
         // Place our fingerprint in that slot.
-        if let Err(e) = cuckoo_file_write_slot(&file, cur_bucket, slot_idx, hdr.bucket_size, hdr.fingerprint_size, &cur_fp) {
+        if let Err(e) = cuckoo_file_write_slot(
+            &file,
+            cur_bucket,
+            slot_idx,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+            &cur_fp,
+        ) {
             return Ok((atoms::error(), e).encode(env));
         }
 
@@ -369,12 +418,25 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 
         // Try to place evicted fingerprint in its alternate bucket.
         for slot in 0..hdr.bucket_size {
-            let s = match cuckoo_file_read_slot(&file, alt, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+            let s = match cuckoo_file_read_slot(
+                &file,
+                alt,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            ) {
                 Ok(s) => s,
                 Err(e) => return Ok((atoms::error(), e).encode(env)),
             };
             if s.iter().all(|&b| b == 0) {
-                if let Err(e) = cuckoo_file_write_slot(&file, alt, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &evicted) {
+                if let Err(e) = cuckoo_file_write_slot(
+                    &file,
+                    alt,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                    &evicted,
+                ) {
                     return Ok((atoms::error(), e).encode(env));
                 }
                 if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
@@ -397,8 +459,16 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 /// Add an element only if it does not already exist.
 /// Returns `{:ok, 0}` (already present) or `{:ok, 1}` (added), or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
-#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> NifResult<Term<'a>> {
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unnecessary_wraps,
+    clippy::too_many_lines
+)]
+pub fn cuckoo_file_addnx<'a>(
+    env: Env<'a>,
+    path: String,
+    element: Binary<'a>,
+) -> NifResult<Term<'a>> {
     // Check existence first using the same file.
     let file = match cuckoo_file_open_rw(&path) {
         Ok(f) => f,
@@ -422,7 +492,13 @@ pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
     // Check if exists in either bucket.
     for bucket in &[b1, b2] {
         for slot in 0..hdr.bucket_size {
-            let s = match cuckoo_file_read_slot(&file, *bucket, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+            let s = match cuckoo_file_read_slot(
+                &file,
+                *bucket,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            ) {
                 Ok(s) => s,
                 Err(e) => return Ok((atoms::error(), e).encode(env)),
             };
@@ -435,12 +511,25 @@ pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
 
     // Not found, try to add. Try primary bucket.
     for slot in 0..hdr.bucket_size {
-        let s = match cuckoo_file_read_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+        let s = match cuckoo_file_read_slot(
+            &file,
+            b1,
+            slot as usize,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+        ) {
             Ok(s) => s,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
         if s.iter().all(|&b| b == 0) {
-            if let Err(e) = cuckoo_file_write_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &fp) {
+            if let Err(e) = cuckoo_file_write_slot(
+                &file,
+                b1,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+                &fp,
+            ) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
@@ -453,12 +542,25 @@ pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
 
     // Try alternate bucket.
     for slot in 0..hdr.bucket_size {
-        let s = match cuckoo_file_read_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+        let s = match cuckoo_file_read_slot(
+            &file,
+            b2,
+            slot as usize,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+        ) {
             Ok(s) => s,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
         if s.iter().all(|&b| b == 0) {
-            if let Err(e) = cuckoo_file_write_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &fp) {
+            if let Err(e) = cuckoo_file_write_slot(
+                &file,
+                b2,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+                &fp,
+            ) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
@@ -475,24 +577,50 @@ pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
     for kicks in 0..(hdr.max_kicks as u32) {
         let slot_idx = (kicks as usize) % (hdr.bucket_size as usize);
 
-        let evicted = match cuckoo_file_read_slot(&file, cur_bucket, slot_idx, hdr.bucket_size, hdr.fingerprint_size) {
+        let evicted = match cuckoo_file_read_slot(
+            &file,
+            cur_bucket,
+            slot_idx,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+        ) {
             Ok(s) => s,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
 
-        if let Err(e) = cuckoo_file_write_slot(&file, cur_bucket, slot_idx, hdr.bucket_size, hdr.fingerprint_size, &cur_fp) {
+        if let Err(e) = cuckoo_file_write_slot(
+            &file,
+            cur_bucket,
+            slot_idx,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+            &cur_fp,
+        ) {
             return Ok((atoms::error(), e).encode(env));
         }
 
         let alt = cuckoo_file_alternate_bucket(cur_bucket, &evicted, hdr.num_buckets);
 
         for slot in 0..hdr.bucket_size {
-            let s = match cuckoo_file_read_slot(&file, alt, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+            let s = match cuckoo_file_read_slot(
+                &file,
+                alt,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            ) {
                 Ok(s) => s,
                 Err(e) => return Ok((atoms::error(), e).encode(env)),
             };
             if s.iter().all(|&b| b == 0) {
-                if let Err(e) = cuckoo_file_write_slot(&file, alt, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &evicted) {
+                if let Err(e) = cuckoo_file_write_slot(
+                    &file,
+                    alt,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                    &evicted,
+                ) {
                     return Ok((atoms::error(), e).encode(env));
                 }
                 if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
@@ -538,12 +666,25 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 
     // Try primary bucket first.
     for slot in 0..hdr.bucket_size {
-        let s = match cuckoo_file_read_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+        let s = match cuckoo_file_read_slot(
+            &file,
+            b1,
+            slot as usize,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+        ) {
             Ok(s) => s,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
         if s == fp {
-            if let Err(e) = cuckoo_file_write_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &empty) {
+            if let Err(e) = cuckoo_file_write_slot(
+                &file,
+                b1,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+                &empty,
+            ) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items.wrapping_sub(1)) {
@@ -559,12 +700,25 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 
     // Try alternate bucket.
     for slot in 0..hdr.bucket_size {
-        let s = match cuckoo_file_read_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+        let s = match cuckoo_file_read_slot(
+            &file,
+            b2,
+            slot as usize,
+            hdr.bucket_size,
+            hdr.fingerprint_size,
+        ) {
             Ok(s) => s,
             Err(e) => return Ok((atoms::error(), e).encode(env)),
         };
         if s == fp {
-            if let Err(e) = cuckoo_file_write_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &empty) {
+            if let Err(e) = cuckoo_file_write_slot(
+                &file,
+                b2,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+                &empty,
+            ) {
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items.wrapping_sub(1)) {
@@ -586,7 +740,11 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
 /// Returns `{:ok, 0}` or `{:ok, 1}`, or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_file_exists<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> NifResult<Term<'a>> {
+pub fn cuckoo_file_exists<'a>(
+    env: Env<'a>,
+    path: String,
+    element: Binary<'a>,
+) -> NifResult<Term<'a>> {
     let file = match cuckoo_file_open_read(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -608,7 +766,13 @@ pub fn cuckoo_file_exists<'a>(env: Env<'a>, path: String, element: Binary<'a>) -
 
     for bucket in &[b1, b2] {
         for slot in 0..hdr.bucket_size {
-            let s = match cuckoo_file_read_slot(&file, *bucket, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+            let s = match cuckoo_file_read_slot(
+                &file,
+                *bucket,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            ) {
                 Ok(s) => s,
                 Err(e) => return Ok((atoms::error(), e).encode(env)),
             };
@@ -627,7 +791,11 @@ pub fn cuckoo_file_exists<'a>(env: Env<'a>, path: String, element: Binary<'a>) -
 /// Returns `{:ok, count}` or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn cuckoo_file_count<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> NifResult<Term<'a>> {
+pub fn cuckoo_file_count<'a>(
+    env: Env<'a>,
+    path: String,
+    element: Binary<'a>,
+) -> NifResult<Term<'a>> {
     let file = match cuckoo_file_open_read(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -650,7 +818,13 @@ pub fn cuckoo_file_count<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
     let mut total = 0u64;
     for bucket in &[b1, b2] {
         for slot in 0..hdr.bucket_size {
-            let s = match cuckoo_file_read_slot(&file, *bucket, slot as usize, hdr.bucket_size, hdr.fingerprint_size) {
+            let s = match cuckoo_file_read_slot(
+                &file,
+                *bucket,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            ) {
                 Ok(s) => s,
                 Err(e) => return Ok((atoms::error(), e).encode(env)),
             };
@@ -718,7 +892,8 @@ mod tests {
         let bucket_size: u8 = 4;
         let fingerprint_size: u8 = FILE_DEFAULT_FINGERPRINT_SIZE as u8;
         let max_kicks = FILE_DEFAULT_MAX_KICKS;
-        let bucket_bytes = (capacity as usize) * (bucket_size as usize) * (fingerprint_size as usize);
+        let bucket_bytes =
+            (capacity as usize) * (bucket_size as usize) * (fingerprint_size as usize);
         let file_size = HEADER_SIZE + bucket_bytes;
 
         let mut file = File::create(&path).unwrap();
@@ -756,7 +931,8 @@ mod tests {
         let capacity: u32 = 64;
         let bucket_size: u8 = 4;
         let fingerprint_size: u8 = 1;
-        let bucket_bytes = (capacity as usize) * (bucket_size as usize) * (fingerprint_size as usize);
+        let bucket_bytes =
+            (capacity as usize) * (bucket_size as usize) * (fingerprint_size as usize);
         let file_size = HEADER_SIZE + bucket_bytes;
 
         let mut file = File::create(&path).unwrap();
@@ -810,7 +986,10 @@ mod tests {
             let (fp, b1) = cuckoo_file_fingerprint_and_bucket(elem.as_bytes(), 1, 1024);
             let b2 = cuckoo_file_alternate_bucket(b1, &fp, 1024);
             let b1_again = cuckoo_file_alternate_bucket(b2, &fp, 1024);
-            assert_eq!(b1, b1_again, "alternate_bucket must be an involution for elem {i}");
+            assert_eq!(
+                b1, b1_again,
+                "alternate_bucket must be an involution for elem {i}"
+            );
         }
     }
 }

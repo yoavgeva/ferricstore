@@ -104,7 +104,12 @@ fn encode_file_error(env: Env, fe: FileError) -> Term {
 /// Returns `{:ok, :ok}` or `{:error, reason}`.
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
-pub fn bloom_file_create(env: Env, path: String, num_bits: u64, num_hashes: u32) -> NifResult<Term> {
+pub fn bloom_file_create(
+    env: Env,
+    path: String,
+    num_bits: u64,
+    num_hashes: u32,
+) -> NifResult<Term> {
     if num_bits == 0 {
         return Ok((atoms::error(), "num_bits must be > 0").encode(env));
     }
@@ -399,7 +404,6 @@ pub fn bloom_file_info(env: Env, path: String) -> NifResult<Term> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     #[test]
     fn file_create_and_read_header() {
