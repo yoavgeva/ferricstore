@@ -414,7 +414,16 @@ defmodule Ferricstore.MemoryGuard do
         {kd_acc + kd_bytes, Map.put(shards_acc, i, %{bytes: kd_bytes, ratio: ratio})}
       end)
 
-    total_bytes = keydir_bytes
+    # Rust NIF heap allocations (Vec, String, etc.) tracked by the global
+    # AtomicUsize counter in tracking_alloc.rs. Returns -1 when the tracking
+    # allocator is not installed (production cdylib), 0+ when active.
+    nif_allocated_bytes =
+      case Ferricstore.Bitcask.NIF.rust_allocated_bytes() do
+        n when is_integer(n) and n >= 0 -> n
+        _ -> 0
+      end
+
+    total_bytes = keydir_bytes + nif_allocated_bytes
     ratio = if state.max_memory_bytes > 0, do: total_bytes / state.max_memory_bytes, else: 0.0
     pressure_level = classify_pressure(ratio)
 
@@ -422,7 +431,7 @@ defmodule Ferricstore.MemoryGuard do
     keydir_pressure_level = classify_pressure(keydir_ratio)
 
     # RSS-based pressure: the real physical memory footprint including ETS,
-    # mmap'd files, NIF allocations, BEAM heaps, and page cache residency.
+    # NIF allocations, BEAM heaps, and page cache residency.
     # Only used in standalone mode where we own the entire BEAM process.
     # In embedded mode, RSS includes the host app's memory — not meaningful
     # for our pressure decisions.
@@ -453,7 +462,8 @@ defmodule Ferricstore.MemoryGuard do
       rss_bytes: rss_bytes,
       rss_ratio: rss_ratio,
       rss_pressure_level: rss_pressure_level,
-      memory_limit: state.memory_limit
+      memory_limit: state.memory_limit,
+      nif_allocated_bytes: nif_allocated_bytes
     }
   end
 
