@@ -59,6 +59,10 @@ defmodule Ferricstore.Store.Shard do
   # Configurable via :max_active_file_size application env.
   @default_max_active_file_size 256 * 1024 * 1024
 
+  # How often (ms) to re-evaluate fragmentation on idle shards.
+  # Catches shards that accumulated dead data then went quiet.
+  @default_frag_check_interval_ms 60_000
+
   # Record header size for dead byte accounting (same as @bitcask_header_size).
   @record_header_size 26
 
@@ -295,6 +299,7 @@ defmodule Ferricstore.Store.Shard do
 
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
+    unless sandbox?, do: schedule_frag_check()
     max_file_size = :persistent_term.get(:ferricstore_max_active_file_size, @default_max_active_file_size)
 
     {:ok, %__MODULE__{ets: keydir, keydir: keydir,
@@ -2739,6 +2744,14 @@ defmodule Ferricstore.Store.Shard do
     {:reply, :ok, state}
   end
 
+  # Periodic fragmentation re-evaluation for idle shards.
+  # Catches shards that accumulated dead data then stopped receiving writes.
+  def handle_info(:frag_check, state) do
+    state = maybe_notify_fragmentation(state)
+    schedule_frag_check()
+    {:noreply, state}
+  end
+
   # Active expiry sweep: scan ETS for expired keys and delete them.
   # When the sweep finds nothing to expire and there are no pending writes
   # or in-flight flushes, hibernate the GenServer to trigger a full GC
@@ -3717,6 +3730,11 @@ defmodule Ferricstore.Store.Shard do
   defp schedule_expiry_sweep do
     interval = Application.get_env(:ferricstore, :expiry_sweep_interval_ms, @default_sweep_interval_ms)
     Process.send_after(self(), :expiry_sweep, interval)
+  end
+
+  defp schedule_frag_check do
+    interval = Application.get_env(:ferricstore, :frag_check_interval_ms, @default_frag_check_interval_ms)
+    Process.send_after(self(), :frag_check, interval)
   end
 
   # --- Native command helpers ---
