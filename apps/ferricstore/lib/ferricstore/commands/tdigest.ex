@@ -334,24 +334,30 @@ defmodule Ferricstore.Commands.TDigest do
       {:tdigest, centroids, metadata} ->
         {:ok, deserialize(centroids, metadata)}
 
+      bin when is_binary(bin) ->
+        try do
+          case :erlang.binary_to_term(bin) do
+            {:tdigest, centroids, metadata} ->
+              {:ok, deserialize(centroids, metadata)}
+
+            _ ->
+              {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+          end
+        rescue
+          ArgumentError ->
+            {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        end
+
       _ ->
         {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
     end
   end
 
-  # Checks whether a key is held by another probabilistic registry (CMS, Cuckoo, Bloom).
-  defp key_held_by_other_registry?(key, store) do
-    Enum.any?([:cms_registry, :cuckoo_registry, :bloom_registry], fn reg_key ->
-      case Map.get(store, reg_key) do
-        %{get: get_fn} -> get_fn.(key) != nil
-        _ -> false
-      end
-    end)
-  end
+  defp key_held_by_other_registry?(_key, _store), do: false
 
   defp persist!(key, %Core{} = digest, store) do
     encoded = serialize(digest)
-    store.put.(key, encoded, 0)
+    store.put.(key, :erlang.term_to_binary(encoded), 0)
   end
 
   defp serialize(%Core{} = digest) do

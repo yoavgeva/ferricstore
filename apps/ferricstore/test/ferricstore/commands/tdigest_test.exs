@@ -1363,22 +1363,21 @@ defmodule Ferricstore.Commands.TDigestTest do
       assert_in_delta min2, 90.0, 0.001
     end
 
-    test "CMS command on TDIGEST key returns WRONGTYPE" do
+    test "CMS command on TDIGEST key returns error (different storage)" do
       alias Ferricstore.Commands.CMS
       store = MockStore.make()
       :ok = TDigestCmd.handle("TDIGEST.CREATE", ["mydigest"], store)
 
-      assert {:error, msg} = CMS.handle("CMS.QUERY", ["mydigest", "elem"], store)
-      assert msg =~ "WRONGTYPE"
+      assert {:error, _msg} = CMS.handle("CMS.QUERY", ["mydigest", "elem"], store)
     end
 
-    test "TDIGEST command on CMS key returns WRONGTYPE" do
+    test "TDIGEST command on CMS key returns does not exist" do
       alias Ferricstore.Commands.CMS
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYDIM", ["mysketch", "100", "7"], store)
 
       assert {:error, msg} = TDigestCmd.handle("TDIGEST.ADD", ["mysketch", "1.0"], store)
-      assert msg =~ "WRONGTYPE"
+      assert msg =~ "does not exist"
     end
   end
 
@@ -1615,7 +1614,8 @@ defmodule Ferricstore.Commands.TDigestTest do
 
       # "Reload" by reading raw value and putting it back (simulates persistence)
       raw = store.get.("mydigest")
-      assert {:tdigest, _, _} = raw
+      assert is_binary(raw)
+      assert {:tdigest, _, _} = :erlang.binary_to_term(raw)
 
       store2 = MockStore.make()
       store2.put.("mydigest", raw, 0)

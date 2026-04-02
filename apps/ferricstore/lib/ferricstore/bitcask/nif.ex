@@ -3,38 +3,6 @@ defmodule Ferricstore.Bitcask.NIF do
 
   use Rustler, otp_app: :ferricstore, crate: "ferricstore_bitcask", skip_compilation?: true
 
-  # -- TDigest NIFs (in-memory) --
-  def tdigest_create(_compression), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_add(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_quantile(_resource, _quantiles), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_cdf(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_trimmed_mean(_resource, _lo, _hi), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_min(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_max(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_info(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_rank(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_revrank(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_byrank(_resource, _ranks), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_byrevrank(_resource, _ranks), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_merge(_resources, _compression), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_reset(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_serialize(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_deserialize(_data), do: :erlang.nif_error(:nif_not_loaded)
-
-  # -- TDigest mmap file-backed NIFs --
-  def tdigest_create_file(_path, _compression), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_open_file(_path), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_close(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_add(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_quantile(_resource, _quantiles), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_cdf(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_trimmed_mean(_resource, _lo, _hi), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_min(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_max(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_info(_resource), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_rank(_resource, _values), do: :erlang.nif_error(:nif_not_loaded)
-  def tdigest_file_reset(_resource), do: :erlang.nif_error(:nif_not_loaded)
-
   # -- Tracking allocator --
   def rust_allocated_bytes, do: :erlang.nif_error(:nif_not_loaded)
 

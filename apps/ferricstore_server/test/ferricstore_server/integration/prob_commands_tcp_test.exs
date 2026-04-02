@@ -368,6 +368,120 @@ defmodule FerricstoreServer.Integration.ProbCommandsTcpTest do
   end
 
   # -------------------------------------------------------------------
+  # TDigest
+  # -------------------------------------------------------------------
+
+  describe "TDigest over TCP" do
+    test "TDIGEST.CREATE + TDIGEST.ADD + TDIGEST.QUANTILE + TDIGEST.INFO", ctx do
+      sock = connect(ctx)
+
+      assert {:ok, "OK"} = redis(sock, ["TDIGEST.CREATE", "td1", "COMPRESSION", "100"])
+
+      # ADD values
+      assert {:ok, "OK"} = redis(sock, ["TDIGEST.ADD", "td1", "1", "2", "3", "4", "5"])
+
+      # QUANTILE — median should be ~3
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.QUANTILE", "td1", "0.5"]))
+      {:ok, q_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(q_raw, "-")
+
+      # INFO
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.INFO", "td1"]))
+      {:ok, info_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(info_raw, "-")
+      assert String.contains?(info_raw, "Compression")
+
+      :gen_tcp.close(sock)
+    end
+
+    test "TDIGEST.CREATE with default compression", ctx do
+      sock = connect(ctx)
+      assert {:ok, "OK"} = redis(sock, ["TDIGEST.CREATE", "td_def"])
+      :gen_tcp.close(sock)
+    end
+
+    test "TDIGEST.MIN + TDIGEST.MAX", ctx do
+      sock = connect(ctx)
+      redis(sock, ["TDIGEST.CREATE", "td_mm"])
+      redis(sock, ["TDIGEST.ADD", "td_mm", "10", "20", "30"])
+
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.MIN", "td_mm"]))
+      {:ok, min_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(min_raw, "-")
+
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.MAX", "td_mm"]))
+      {:ok, max_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(max_raw, "-")
+
+      :gen_tcp.close(sock)
+    end
+
+    test "TDIGEST.CDF + TDIGEST.RANK + TDIGEST.TRIMMED_MEAN", ctx do
+      sock = connect(ctx)
+      redis(sock, ["TDIGEST.CREATE", "td_cdf"])
+      redis(sock, ["TDIGEST.ADD", "td_cdf", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
+
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.CDF", "td_cdf", "5"]))
+      {:ok, cdf_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(cdf_raw, "-")
+
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.RANK", "td_cdf", "5"]))
+      {:ok, rank_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(rank_raw, "-")
+
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.TRIMMED_MEAN", "td_cdf", "0.1", "0.9"]))
+      {:ok, tm_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(tm_raw, "-")
+
+      :gen_tcp.close(sock)
+    end
+
+    test "TDIGEST.RESET clears data", ctx do
+      sock = connect(ctx)
+      redis(sock, ["TDIGEST.CREATE", "td_reset"])
+      redis(sock, ["TDIGEST.ADD", "td_reset", "1", "2", "3"])
+      assert {:ok, "OK"} = redis(sock, ["TDIGEST.RESET", "td_reset"])
+      :gen_tcp.close(sock)
+    end
+
+    test "TDIGEST.MERGE combines digests", ctx do
+      sock = connect(ctx)
+      redis(sock, ["TDIGEST.CREATE", "td_src1"])
+      redis(sock, ["TDIGEST.CREATE", "td_src2"])
+      redis(sock, ["TDIGEST.ADD", "td_src1", "1", "2", "3"])
+      redis(sock, ["TDIGEST.ADD", "td_src2", "4", "5", "6"])
+
+      assert {:ok, "OK"} = redis(sock, ["TDIGEST.MERGE", "td_dst", "2", "td_src1", "td_src2"])
+
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.INFO", "td_dst"]))
+      {:ok, info_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(info_raw, "-")
+
+      :gen_tcp.close(sock)
+    end
+
+    test "TDIGEST.BYRANK + TDIGEST.BYREVRANK + TDIGEST.REVRANK", ctx do
+      sock = connect(ctx)
+      redis(sock, ["TDIGEST.CREATE", "td_rank"])
+      redis(sock, ["TDIGEST.ADD", "td_rank", "10", "20", "30", "40", "50"])
+
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.BYRANK", "td_rank", "0", "2", "4"]))
+      {:ok, br_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(br_raw, "-")
+
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.BYREVRANK", "td_rank", "0", "2"]))
+      {:ok, brr_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(brr_raw, "-")
+
+      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.REVRANK", "td_rank", "30"]))
+      {:ok, rr_raw} = :gen_tcp.recv(sock, 0, 5000)
+      refute String.starts_with?(rr_raw, "-")
+
+      :gen_tcp.close(sock)
+    end
+  end
+
+  # -------------------------------------------------------------------
   # DEL + FLUSHDB
   # -------------------------------------------------------------------
 

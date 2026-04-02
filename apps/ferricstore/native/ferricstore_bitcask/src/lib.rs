@@ -6,7 +6,7 @@
 // - doc_markdown: minor style preference, not a correctness issue.
 // - missing_errors_doc / missing_panics_doc: NIF wrapper docs don't benefit from # Errors sections.
 // - must_use_candidate: most public methods are called via NIF wrappers where must_use is irrelevant.
-// - cast_possible_wrap: u64→i64 casts are intentional in tdigest/store code.
+// - cast_possible_wrap: u64→i64 casts are intentional in store code.
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_lossless)]
