@@ -423,11 +423,18 @@ defmodule Ferricstore.MemoryGuard do
 
     # RSS-based pressure: the real physical memory footprint including ETS,
     # mmap'd files, NIF allocations, BEAM heaps, and page cache residency.
-    # This catches memory pressure that ETS-only tracking misses.
-    rss_bytes = process_rss_bytes() || 0
-    memory_limit = state.memory_limit
-    rss_ratio = if memory_limit > 0, do: rss_bytes / memory_limit, else: 0.0
-    rss_pressure_level = classify_pressure(rss_ratio)
+    # Only used in standalone mode where we own the entire BEAM process.
+    # In embedded mode, RSS includes the host app's memory — not meaningful
+    # for our pressure decisions.
+    {rss_bytes, rss_ratio, rss_pressure_level} =
+      if Ferricstore.Mode.standalone?() do
+        rss = process_rss_bytes() || 0
+        limit = state.memory_limit
+        r = if limit > 0, do: rss / limit, else: 0.0
+        {rss, r, classify_pressure(r)}
+      else
+        {0, 0.0, :ok}
+      end
 
     # Overall pressure is the worse of keydir-based and RSS-based.
     overall_pressure = worse_pressure(pressure_level, rss_pressure_level)
@@ -446,7 +453,7 @@ defmodule Ferricstore.MemoryGuard do
       rss_bytes: rss_bytes,
       rss_ratio: rss_ratio,
       rss_pressure_level: rss_pressure_level,
-      memory_limit: memory_limit
+      memory_limit: state.memory_limit
     }
   end
 
