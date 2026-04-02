@@ -108,7 +108,10 @@ pub fn open_random_read(path: &std::path::Path) -> std::io::Result<std::fs::File
 
 /// Open a file for read+write with FADV_RANDOM hint.
 pub fn open_random_rw(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     fadvise_random(&file);
     Ok(file)
 }
@@ -273,8 +276,10 @@ fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
                 Ok(Some(record)) => {
                     // Hint kernel to evict the pages — value is promoted to ETS,
                     // the page cache copy is never needed again.
-                    let record_size = (log::HEADER_SIZE + record.key.len()
-                        + record.value.as_ref().map_or(0, Vec::len)) as i64;
+                    let record_size = (log::HEADER_SIZE
+                        + record.key.len()
+                        + record.value.as_ref().map_or(0, Vec::len))
+                        as i64;
                     fadvise_dontneed(&file, offset as i64, record_size);
 
                     match record.value {
@@ -283,15 +288,13 @@ fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
                             let binary = resource.make_binary(env, |vb| &vb.data);
                             Ok((atoms::ok(), binary).encode(env))
                         }
-                        None => {
-                            Ok((atoms::ok(), atoms::nil()).encode(env))
-                        }
+                        None => Ok((atoms::ok(), atoms::nil()).encode(env)),
                     }
-                },
+                }
                 Ok(None) => Ok((atoms::error(), "offset past EOF").encode(env)),
                 Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
             }
-        },
+        }
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
 }
@@ -383,9 +386,14 @@ fn v2_pread_batch<'a>(env: Env<'a>, path: String, locations: Vec<u64>) -> NifRes
             for &(orig_idx, offset) in &sorted {
                 let term = match log::pread_record_from_file(&file, offset) {
                     Ok(Some(record)) => {
-                        fadvise_dontneed(&file, offset as i64,
-                            (log::HEADER_SIZE + record.key.len()
-                             + record.value.as_ref().map_or(0, Vec::len)) as i64);
+                        fadvise_dontneed(
+                            &file,
+                            offset as i64,
+                            (log::HEADER_SIZE
+                                + record.key.len()
+                                + record.value.as_ref().map_or(0, Vec::len))
+                                as i64,
+                        );
                         match record.value {
                             Some(value) => {
                                 let resource = ResourceArc::new(ValueBuffer { data: value });
@@ -393,7 +401,7 @@ fn v2_pread_batch<'a>(env: Env<'a>, path: String, locations: Vec<u64>) -> NifRes
                             }
                             None => nil,
                         }
-                    },
+                    }
                     _ => nil,
                 };
                 slot_results[orig_idx] = Some(term);
@@ -589,20 +597,26 @@ fn v2_pread_at_async(
     offset: u64,
 ) -> NifResult<Term<'_>> {
     async_io::runtime().spawn(async move {
-        let p = std::path::Path::new(&path);
-        // C-2/C-6 fix: use File::open + pread instead of LogReader::open
-        let result = std::fs::File::open(p)
-            .map_err(|e| log::LogError(e.to_string()))
-            .and_then(|file| {
-                fadvise_random(&file);
-                let record = log::pread_record_from_file(&file, offset);
-                if let Ok(Some(ref r)) = record {
-                    let size = (log::HEADER_SIZE + r.key.len()
-                        + r.value.as_ref().map_or(0, Vec::len)) as i64;
-                    fadvise_dontneed(&file, offset as i64, size);
-                }
-                record
-            });
+        // spawn_blocking: IO runs on Tokio's blocking thread pool (up to 512 threads),
+        // keeping async worker threads free for coordination.
+        let result = tokio::task::spawn_blocking(move || {
+            let p = std::path::Path::new(&path);
+            std::fs::File::open(p)
+                .map_err(|e| log::LogError(e.to_string()))
+                .and_then(|file| {
+                    fadvise_random(&file);
+                    let record = log::pread_record_from_file(&file, offset);
+                    if let Ok(Some(ref r)) = record {
+                        let size =
+                            (log::HEADER_SIZE + r.key.len() + r.value.as_ref().map_or(0, Vec::len))
+                                as i64;
+                        fadvise_dontneed(&file, offset as i64, size);
+                    }
+                    record
+                })
+        })
+        .await
+        .unwrap_or_else(|e| Err(log::LogError(format!("spawn_blocking failed: {e}"))));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -661,25 +675,26 @@ fn v2_pread_batch_async(
     locations: Vec<(String, u64)>,
 ) -> NifResult<Term<'_>> {
     async_io::runtime().spawn(async move {
-        // Spawn each pread as a separate Tokio task for concurrency.
+        // Spawn each pread as a blocking task for concurrency.
         let mut handles = Vec::with_capacity(locations.len());
         for (path, offset) in locations {
-            // C-2/C-6 fix: use File::open + pread instead of LogReader::open
-            handles.push(tokio::spawn(async move {
+            handles.push(tokio::task::spawn_blocking(move || {
                 let p = std::path::Path::new(&path);
                 match std::fs::File::open(p) {
                     Ok(file) => {
                         fadvise_random(&file);
                         match log::pread_record_from_file(&file, offset) {
                             Ok(Some(record)) => {
-                                let size = (log::HEADER_SIZE + record.key.len()
-                                    + record.value.as_ref().map_or(0, Vec::len)) as i64;
+                                let size = (log::HEADER_SIZE
+                                    + record.key.len()
+                                    + record.value.as_ref().map_or(0, Vec::len))
+                                    as i64;
                                 fadvise_dontneed(&file, offset as i64, size);
                                 record.value
                             }
                             _ => None,
                         }
-                    },
+                    }
                     Err(_) => None,
                 }
             }));
@@ -734,13 +749,15 @@ fn v2_fsync_async(
     path: String,
 ) -> NifResult<Term<'_>> {
     async_io::runtime().spawn(async move {
-        let p = std::path::Path::new(&path);
-        // C-7 fix: use sync_data (fdatasync) instead of sync_all (fsync)
-        // L-REMAIN-1 fix: open with write permission so sync_data actually flushes
-        let result = std::fs::OpenOptions::new()
-            .write(true)
-            .open(p)
-            .and_then(|f| f.sync_data());
+        let result = tokio::task::spawn_blocking(move || {
+            let p = std::path::Path::new(&path);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .and_then(|f| f.sync_data())
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(format!("spawn_blocking: {e}"))));
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -841,15 +858,14 @@ fn v2_append_batch_async<'a>(
 
     let owned_path = path;
 
-    // Step 2: Spawn IO to Tokio — BEAM scheduler returns immediately.
+    // Step 2: Spawn IO to Tokio blocking thread pool — BEAM scheduler returns immediately.
     async_io::runtime().spawn(async move {
-        let p = std::path::Path::new(&owned_path);
-        let file_id = parse_file_id(p);
+        let result = tokio::task::spawn_blocking(move || {
+            let p = std::path::Path::new(&owned_path);
+            let file_id = parse_file_id(p);
 
-        let result: std::result::Result<Vec<(u64, usize)>, String> =
             match log::LogWriter::open(p, file_id) {
                 Ok(mut writer) => {
-                    // Write each encoded record and collect offsets.
                     let mut offsets = Vec::with_capacity(encoded.len());
                     let mut write_err: Option<String> = None;
                     for buf in &encoded {
@@ -879,7 +895,10 @@ fn v2_append_batch_async<'a>(
                     }
                 }
                 Err(e) => Err(e.to_string()),
-            };
+            }
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
 
         // Step 3: Send result to the BEAM caller.
         let mut msg_env = rustler::OwnedEnv::new();
