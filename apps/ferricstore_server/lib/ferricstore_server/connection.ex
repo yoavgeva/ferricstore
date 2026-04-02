@@ -38,19 +38,21 @@ defmodule FerricstoreServer.Connection do
   Ranch requires the protocol module to export `start_link/3` and the started
   process to call `:ranch.handshake/1` before reading from the socket.
 
-  ## BEAM scheduler notes (active: :once mode)
+  ## BEAM scheduler notes (active: N mode)
 
-  The socket operates in `active: :once` mode (spec section 2C.2): the kernel
+  The socket operates in `active: N` mode (default N=100): the kernel
   delivers exactly one `{:tcp, socket, data}` message to the process, then
   automatically switches the socket to passive. The process re-arms via
-  `transport.setopts(socket, active: :once)` after handling each data message.
+  delivers N messages then sends `{:tcp_passive, socket}`, at which point
+  we re-arm with `transport.setopts(socket, active: N)`.
 
-  This is superior to the older `active: false` / blocking `recv` approach:
+  This is superior to both `active: false` (blocking recv) and `active: true`
+  (unbounded mailbox flooding):
   - The process can handle OTHER messages (waiter notifications, pub/sub pushes,
     client tracking invalidations) between TCP reads.
   - The BEAM scheduler can schedule other processes while waiting for TCP data.
   - Sliding window responses can be sent incrementally.
-  - No risk of mailbox flooding (unlike `active: true`) since only one message
+  - No risk of mailbox flooding (unlike `active: true`) since at most N messages
     is delivered at a time.
   """
 
@@ -95,7 +97,7 @@ defmodule FerricstoreServer.Connection do
     tracking: nil,
     read_mode: :consistent,
     acl_cache: nil,
-    active_mode: true
+    active_mode: 100
   ]
 
   @type multi_state :: :none | :queuing
@@ -198,7 +200,12 @@ defmodule FerricstoreServer.Connection do
       transport.send(socket, error_msg)
       transport.close(socket)
     else
-      active_mode = Application.get_env(:ferricstore, :socket_active_mode, true)
+      # active: N delivers N TCP messages before the socket goes passive,
+      # then sends {:tcp_passive, socket}. We re-arm in the receive loop.
+      # N=100 balances throughput (batch of 100 messages without setopts
+      # overhead) with back-pressure (mailbox can't grow beyond ~100 messages).
+      # active: true has no back-pressure — mailbox can flood under load.
+      active_mode = Application.get_env(:ferricstore, :socket_active_mode, 100)
       :ok = transport.setopts(socket, active: active_mode)
 
       Stats.incr_connections()
@@ -251,12 +258,13 @@ defmodule FerricstoreServer.Connection do
   end
 
   # ---------------------------------------------------------------------------
-  # Receive loop (active: :once, event-driven)
+  # Receive loop (active: N, event-driven)
   # ---------------------------------------------------------------------------
 
-  # Normal receive loop — active: :once is rearmed AFTER processing data,
-  # not before entering receive. This saves one setopts syscall when the
-  # process wakes up from non-TCP messages (tracking, ACL invalidation).
+  # Normal receive loop. In active:N mode, the kernel delivers N messages
+  # then sends {:tcp_passive, socket}. We re-arm on {:tcp_passive}.
+  # In active: :once mode, we re-arm after each data message.
+  # In active: true mode, no re-arming needed.
   #
   # Pubsub mode uses a separate loop (pubsub_loop) to avoid checking
   # a mode flag on every iteration of the hot path.
