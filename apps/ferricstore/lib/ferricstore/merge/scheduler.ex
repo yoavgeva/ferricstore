@@ -60,6 +60,10 @@ defmodule Ferricstore.Merge.Scheduler do
   @default_mode :hot
   @default_merge_window {2, 4}
   @default_min_free_space_ratio 0.1
+  @default_fragmentation_threshold 0.5
+  @default_dead_bytes_threshold 134_217_728
+  @default_merge_cooldown_ms 60_000
+  @default_small_file_threshold 10_485_760
 
   @type merge_mode :: :hot | :bulk | :age
 
@@ -68,7 +72,11 @@ defmodule Ferricstore.Merge.Scheduler do
           min_files_for_merge: pos_integer(),
           max_files_per_merge: pos_integer(),
           merge_window: {non_neg_integer(), non_neg_integer()},
-          min_free_space_ratio: float()
+          min_free_space_ratio: float(),
+          fragmentation_threshold: float(),
+          dead_bytes_threshold: non_neg_integer(),
+          merge_cooldown_ms: non_neg_integer(),
+          small_file_threshold: non_neg_integer()
         }
 
   defstruct [
@@ -78,11 +86,14 @@ defmodule Ferricstore.Merge.Scheduler do
     :semaphore,
     merging: false,
     last_merge_at: nil,
+    last_merge_completed_at: nil,
     merge_count: 0,
     total_bytes_reclaimed: 0,
     # Tracks the current file count from the last rotation notification.
     # Initialized to 0; updated by :file_rotated casts from the Shard.
-    file_count: 0
+    file_count: 0,
+    # File IDs flagged by the shard as having high fragmentation.
+    fragmentation_candidates: []
   ]
 
   # -------------------------------------------------------------------
@@ -124,6 +135,25 @@ defmodule Ferricstore.Merge.Scheduler do
 
     try do
       GenServer.cast(name, {:file_rotated, file_count})
+    catch
+      :exit, _ -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
+  Called by the Shard when per-file fragmentation exceeds thresholds.
+
+  The `candidate_file_ids` are file IDs that have dead/total ratio above
+  `fragmentation_threshold` AND dead bytes above `dead_bytes_threshold`.
+  """
+  @spec notify_fragmentation(non_neg_integer(), [non_neg_integer()], non_neg_integer()) :: :ok
+  def notify_fragmentation(shard_index, candidate_file_ids, file_count) do
+    name = scheduler_name(shard_index)
+
+    try do
+      GenServer.cast(name, {:fragmentation, candidate_file_ids, file_count})
     catch
       :exit, _ -> :ok
     end
@@ -190,9 +220,11 @@ defmodule Ferricstore.Merge.Scheduler do
       mode: state.config.mode,
       merging: state.merging,
       last_merge_at: state.last_merge_at,
+      last_merge_completed_at: state.last_merge_completed_at,
       merge_count: state.merge_count,
       total_bytes_reclaimed: state.total_bytes_reclaimed,
       file_count: state.file_count,
+      fragmentation_candidates: state.fragmentation_candidates,
       config: state.config
     }
 
@@ -207,6 +239,12 @@ defmodule Ferricstore.Merge.Scheduler do
   @impl true
   def handle_cast({:file_rotated, file_count}, state) do
     state = %{state | file_count: file_count}
+    new_state = maybe_merge(state)
+    {:noreply, new_state}
+  end
+
+  def handle_cast({:fragmentation, candidate_file_ids, file_count}, state) do
+    state = %{state | fragmentation_candidates: candidate_file_ids, file_count: file_count}
     new_state = maybe_merge(state)
     {:noreply, new_state}
   end
@@ -231,8 +269,16 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   defp should_merge?(state) do
-    state.file_count >= state.config.min_files_for_merge and
-      mode_allows_merge?(state.config)
+    cooldown_ok =
+      state.last_merge_completed_at == nil or
+        System.system_time(:millisecond) - state.last_merge_completed_at >=
+          state.config.merge_cooldown_ms
+
+    has_trigger =
+      state.file_count >= state.config.min_files_for_merge or
+        state.fragmentation_candidates != []
+
+    cooldown_ok and has_trigger and mode_allows_merge?(state.config)
   end
 
   defp mode_allows_merge?(%{mode: :hot}), do: true
@@ -298,12 +344,16 @@ defmodule Ferricstore.Merge.Scheduler do
         Manifest.delete(state.data_dir)
         Semaphore.release(state.shard_index, state.semaphore)
 
+        now_ms = System.system_time(:millisecond)
+
         %{
           state
           | merging: false,
-            last_merge_at: System.system_time(:millisecond),
+            last_merge_at: now_ms,
+            last_merge_completed_at: now_ms,
             merge_count: state.merge_count + 1,
-            total_bytes_reclaimed: state.total_bytes_reclaimed + reclaimed
+            total_bytes_reclaimed: state.total_bytes_reclaimed + reclaimed,
+            fragmentation_candidates: []
         }
 
       {:error, reason} ->
@@ -313,32 +363,66 @@ defmodule Ferricstore.Merge.Scheduler do
 
         Manifest.delete(state.data_dir)
         Semaphore.release(state.shard_index, state.semaphore)
-        %{state | merging: false}
+        %{state | merging: false, fragmentation_candidates: []}
     end
   end
 
   defp select_files_for_merge(state, shard_name) do
     with {:ok, file_sizes} <- safe_call(shard_name, :file_sizes),
-         {:ok, mergeable} <- pick_mergeable_files(file_sizes, state.config) do
+         {:ok, mergeable} <- pick_mergeable_files(file_sizes, state.config, state.fragmentation_candidates) do
       {:ok, mergeable}
     else
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp pick_mergeable_files([], _config), do: {:error, :no_files}
+  defp pick_mergeable_files([], _config, _frag_candidates), do: {:error, :no_files}
 
-  defp pick_mergeable_files(file_sizes, config) do
+  defp pick_mergeable_files(file_sizes, config, frag_candidates) do
     {active_fid, _} = Enum.max_by(file_sizes, fn {fid, _size} -> fid end)
 
-    mergeable =
-      file_sizes
-      |> Enum.reject(fn {fid, _size} -> fid == active_fid end)
-      |> Enum.sort_by(fn {_fid, size} -> size end, :desc)
-      |> Enum.take(config.max_files_per_merge)
+    non_active = Enum.reject(file_sizes, fn {fid, _size} -> fid == active_fid end)
+
+    # Priority 1: files flagged by fragmentation
+    frag_set = MapSet.new(frag_candidates)
+
+    frag_files =
+      non_active
+      |> Enum.filter(fn {fid, _size} -> MapSet.member?(frag_set, fid) end)
       |> Enum.map(fn {fid, _size} -> fid end)
 
-    if Enum.count(mergeable) >= config.min_files_for_merge do
+    # Priority 2: small files (below small_file_threshold) — always merge candidates
+    small_files =
+      non_active
+      |> Enum.filter(fn {fid, size} ->
+        not MapSet.member?(frag_set, fid) and size < config.small_file_threshold
+      end)
+      |> Enum.map(fn {fid, _size} -> fid end)
+
+    # Priority 3: largest non-active files (existing logic)
+    remaining_fids = MapSet.new(frag_files ++ small_files)
+
+    by_size =
+      non_active
+      |> Enum.reject(fn {fid, _size} -> MapSet.member?(remaining_fids, fid) end)
+      |> Enum.sort_by(fn {_fid, size} -> size end, :desc)
+      |> Enum.map(fn {fid, _size} -> fid end)
+
+    # Combine, dedup, cap at max_files_per_merge
+    mergeable =
+      (frag_files ++ small_files ++ by_size)
+      |> Enum.uniq()
+      |> Enum.take(config.max_files_per_merge)
+
+    min_required =
+      if frag_candidates != [] do
+        # Fragmentation-triggered: merge even a single file
+        1
+      else
+        config.min_files_for_merge
+      end
+
+    if length(mergeable) >= min_required do
       {:ok, mergeable}
     else
       {:error, :not_enough_files}
@@ -408,6 +492,30 @@ defmodule Ferricstore.Merge.Scheduler do
           overrides,
           :min_free_space_ratio,
           app_config(:min_free_space_ratio, @default_min_free_space_ratio)
+        ),
+      fragmentation_threshold:
+        Map.get(
+          overrides,
+          :fragmentation_threshold,
+          app_config(:fragmentation_threshold, @default_fragmentation_threshold)
+        ),
+      dead_bytes_threshold:
+        Map.get(
+          overrides,
+          :dead_bytes_threshold,
+          app_config(:dead_bytes_threshold, @default_dead_bytes_threshold)
+        ),
+      merge_cooldown_ms:
+        Map.get(
+          overrides,
+          :merge_cooldown_ms,
+          app_config(:merge_cooldown_ms, @default_merge_cooldown_ms)
+        ),
+      small_file_threshold:
+        Map.get(
+          overrides,
+          :small_file_threshold,
+          app_config(:small_file_threshold, @default_small_file_threshold)
         )
     }
   end

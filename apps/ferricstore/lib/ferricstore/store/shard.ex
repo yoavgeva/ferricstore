@@ -59,9 +59,17 @@ defmodule Ferricstore.Store.Shard do
   # Configurable via :max_active_file_size application env.
   @default_max_active_file_size 256 * 1024 * 1024
 
-  # Write count threshold before compacting a promoted dedicated file.
-  # After this many writes/deletes, dead entries are purged.
-  @dedicated_compaction_threshold 1000
+  # Record header size for dead byte accounting (same as @bitcask_header_size).
+  @record_header_size 26
+
+  # Default fragmentation thresholds for per-file dead bytes tracking.
+  @default_fragmentation_threshold 0.5
+  @default_dead_bytes_threshold 134_217_728
+
+  # Promoted (dedicated) compaction thresholds.
+  @promoted_frag_threshold 0.5
+  @promoted_dead_bytes_min 1_048_576
+  @promoted_compaction_cooldown_ms 30_000
 
   # Maximum pending entries before triggering a synchronous flush.
   # Bounds worst-case shard process heap growth during write bursts.
@@ -86,6 +94,10 @@ defmodule Ferricstore.Store.Shard do
     sweep_at_ceiling_count: 0,
     sweep_struggling: false,
     promoted_instances: %{},
+    # Per-file dead bytes tracking: %{file_id => {total_bytes, dead_bytes}}
+    file_stats: %{},
+    # Merge config overrides for fragmentation thresholds
+    merge_config: %{},
     # Map from correlation_id => {from, key} for in-flight Tokio async reads.
     # Correlation IDs fix the LIFO ordering bug from the old list-based approach.
     pending_reads: %{},
@@ -268,6 +280,19 @@ defmodule Ferricstore.Store.Shard do
       Ferricstore.Store.ActiveFile.publish(index, active_file_id, active_file_path, path)
     end
 
+    # Compute per-file dead bytes stats from disk sizes + ETS live data.
+    file_stats = compute_file_stats(path, keydir)
+
+    # Read merge config for fragmentation thresholds
+    merge_config_overrides = Keyword.get(opts, :merge_config, %{})
+
+    merge_config = %{
+      fragmentation_threshold:
+        Map.get(merge_config_overrides, :fragmentation_threshold, @default_fragmentation_threshold),
+      dead_bytes_threshold:
+        Map.get(merge_config_overrides, :dead_bytes_threshold, @default_dead_bytes_threshold)
+    }
+
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
     max_file_size = :persistent_term.get(:ferricstore_max_active_file_size, @default_max_active_file_size)
@@ -280,6 +305,8 @@ defmodule Ferricstore.Store.Shard do
                        active_file_size: active_file_size,
                        pending: [], flush_in_flight: nil,
                        promoted_instances: promoted,
+                       file_stats: file_stats,
+                       merge_config: merge_config,
                        raft?: raft?,
                        sandbox?: sandbox?,
                        sandbox_ra_system: sandbox_ra_system,
@@ -655,6 +682,7 @@ defmodule Ferricstore.Store.Shard do
         # Promoted -- write to dedicated Bitcask first (get fid+offset), then ETS with location
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
           {:ok, {fid, offset, record_size}} ->
+            state = track_promoted_dead_bytes(state, redis_key, compound_key, record_size)
             ets_insert_with_location(state, compound_key, value, expire_at_ms, fid, offset, record_size)
             {:reply, :ok, bump_promoted_writes(state, redis_key)}
           {:error, reason} ->
@@ -688,6 +716,7 @@ defmodule Ferricstore.Store.Shard do
         # Promoted -- write to dedicated Bitcask first (get fid+offset), then ETS with location
         case promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
           {:ok, {fid, offset, record_size}} ->
+            state = track_promoted_dead_bytes(state, redis_key, compound_key, record_size)
             ets_insert_with_location(state, compound_key, value, expire_at_ms, fid, offset, record_size)
             {:reply, :ok, bump_promoted_writes(state, redis_key)}
           {:error, reason} ->
@@ -722,6 +751,8 @@ defmodule Ferricstore.Store.Shard do
 
       dedicated_path ->
         # Promoted -- delete from dedicated Bitcask via v2
+        state = track_promoted_delete_bytes(state, redis_key, compound_key)
+
         case promoted_tombstone(dedicated_path, compound_key) do
           {:ok, _} ->
             ets_delete_key(state, compound_key)
@@ -741,6 +772,7 @@ defmodule Ferricstore.Store.Shard do
         # Not promoted -- synchronous delete from shared Bitcask
         state = await_in_flight(state)
         state = flush_pending_sync(state)
+        state = track_delete_dead_bytes(state, compound_key)
 
         case NIF.v2_append_tombstone(state.active_file_path, compound_key) do
           {:ok, _} ->
@@ -761,6 +793,8 @@ defmodule Ferricstore.Store.Shard do
 
       dedicated_path ->
         # Promoted -- delete from dedicated Bitcask via v2
+        state = track_promoted_delete_bytes(state, redis_key, compound_key)
+
         case promoted_tombstone(dedicated_path, compound_key) do
           {:ok, _} ->
             ets_delete_key(state, compound_key)
@@ -1348,6 +1382,7 @@ defmodule Ferricstore.Store.Shard do
       # Synchronous delete for durability
       state = await_in_flight(state)
       state = flush_pending_sync(state)
+      state = track_delete_dead_bytes(state, key)
 
       case NIF.v2_append_tombstone(state.active_file_path, key) do
         {:ok, _} ->
@@ -1506,6 +1541,7 @@ defmodule Ferricstore.Store.Shard do
       # 4. Remove the deleted key from pending to prevent resurrection.
       state = await_in_flight(state)
       state = flush_pending_sync(state)
+      state = track_delete_dead_bytes(state, key)
 
       case NIF.v2_append_tombstone(state.active_file_path, key) do
         {:ok, _} ->
@@ -2189,6 +2225,7 @@ defmodule Ferricstore.Store.Shard do
       {{:hit, ^owner, _exp}, state} ->
         state = await_in_flight(state)
         state = flush_pending_sync(state)
+        state = track_delete_dead_bytes(state, key)
 
         case NIF.v2_append_tombstone(state.active_file_path, key) do
           {:ok, _} ->
@@ -2590,7 +2627,22 @@ defmodule Ferricstore.Store.Shard do
         end
       end)
 
-    {:reply, {:ok, {total_written, total_dropped, total_reclaimed}}, state}
+    # Reset file_stats for compacted files: dead bytes are now gone,
+    # total bytes reflect the new compacted file size.
+    new_file_stats =
+      Enum.reduce(file_ids, state.file_stats, fn fid, fs ->
+        case File.stat(file_path(sp, fid)) do
+          {:ok, %{size: new_size}} ->
+            Map.put(fs, fid, {new_size, 0})
+
+          _ ->
+            # File was deleted entirely (all dead)
+            Map.delete(fs, fid)
+        end
+      end)
+
+    {:reply, {:ok, {total_written, total_dropped, total_reclaimed}},
+     %{state | file_stats: new_file_stats}}
   end
 
   def handle_call(:available_disk_space, _from, state) do
@@ -2644,6 +2696,7 @@ defmodule Ferricstore.Store.Shard do
     else
       state = await_in_flight(state)
       state = flush_pending_sync(state)
+      state = track_delete_dead_bytes(state, key)
 
       case NIF.v2_append_tombstone(state.active_file_path, key) do
         {:ok, _} ->
@@ -2874,9 +2927,12 @@ defmodule Ferricstore.Store.Shard do
 
     case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
       {:ok, locations} ->
-        update_ets_locations(state, batch, locations)
-        %{state | pending: [], pending_count: 0, fsync_needed: true,
-          active_file_size: state.active_file_size + total_written(locations)}
+        written = total_written(locations)
+        state = update_ets_locations(state, batch, locations)
+        state = track_flush_bytes(state, written)
+        state = %{state | pending: [], pending_count: 0, fsync_needed: true,
+          active_file_size: state.active_file_size + written}
+        maybe_notify_fragmentation(state)
 
       {:error, reason} ->
         Logger.error("Shard #{state.index}: flush_pending (nosync) failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
@@ -2907,9 +2963,12 @@ defmodule Ferricstore.Store.Shard do
 
     case NIF.v2_append_batch(state.active_file_path, batch) do
       {:ok, locations} ->
-        update_ets_locations(state, batch, locations)
-        %{state | pending: [], pending_count: 0, fsync_needed: false,
-          active_file_size: state.active_file_size + total_written(locations)}
+        written = total_written(locations)
+        state = update_ets_locations(state, batch, locations)
+        state = track_flush_bytes(state, written)
+        state = %{state | pending: [], pending_count: 0, fsync_needed: false,
+          active_file_size: state.active_file_size + written}
+        maybe_notify_fragmentation(state)
 
       {:error, reason} ->
         Logger.error("Shard #{state.index}: flush_pending_sync failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
@@ -2941,29 +3000,141 @@ defmodule Ferricstore.Store.Shard do
   defp update_ets_locations(state, batch, locations) do
     fid = state.active_file_id
 
-    Enum.zip(batch, locations)
-    |> Enum.each(fn {{key, value, _exp}, {offset, _record_size}} ->
-      # Use update_element for the disk-location fields only.
-      # This preserves the LFU counter (position 4) and is a single
-      # ETS operation — no lookup+insert round-trip needed.
-      # Positions: {1=key, 2=value, 3=exp, 4=lfu, 5=fid, 6=offset, 7=vsize}
-      #
-      # vsize is computed from the original batch value (not the ETS value)
-      # because large values are stored as nil in ETS due to
-      # hot_cache_max_value_size, which would incorrectly produce vsize=0.
-      case :ets.lookup(state.keydir, key) do
-        [{^key, _ets_value, _exp, _lfu, _old_fid, _old_off, _old_vsize}] ->
-          vsize = byte_size(value)
-          :ets.update_element(state.keydir, key, [
-            {5, fid}, {6, offset}, {7, vsize}
-          ])
-        [] -> :ok
-      end
-    end)
+    new_file_stats =
+      Enum.zip(batch, locations)
+      |> Enum.reduce(state.file_stats, fn {{key, value, _exp}, {offset, _record_size}}, fs ->
+        # Use update_element for the disk-location fields only.
+        # This preserves the LFU counter (position 4) and is a single
+        # ETS operation — no lookup+insert round-trip needed.
+        # Positions: {1=key, 2=value, 3=exp, 4=lfu, 5=fid, 6=offset, 7=vsize}
+        #
+        # vsize is computed from the original batch value (not the ETS value)
+        # because large values are stored as nil in ETS due to
+        # hot_cache_max_value_size, which would incorrectly produce vsize=0.
+        case :ets.lookup(state.keydir, key) do
+          [{^key, _ets_value, _exp, _lfu, old_fid, _old_off, old_vsize}] ->
+            vsize = byte_size(value)
+            :ets.update_element(state.keydir, key, [
+              {5, fid}, {6, offset}, {7, vsize}
+            ])
+
+            # Track dead bytes: if the old entry was on disk (not :pending/0),
+            # the overwritten data is now dead in the old file.
+            if old_fid != 0 and old_vsize > 0 do
+              dead_increment = old_vsize + @record_header_size + byte_size(key)
+              {old_total, old_dead} = Map.get(fs, old_fid, {0, 0})
+              Map.put(fs, old_fid, {old_total, old_dead + dead_increment})
+            else
+              fs
+            end
+
+          [] ->
+            fs
+        end
+      end)
+
+    %{state | file_stats: new_file_stats}
   end
 
   defp total_written(locations) do
     Enum.reduce(locations, 0, fn {_offset, size}, acc -> acc + size end)
+  end
+
+  # Increment total_bytes for the active file after a flush.
+  defp track_flush_bytes(state, written_bytes) do
+    fid = state.active_file_id
+    {total, dead} = Map.get(state.file_stats, fid, {0, 0})
+    %{state | file_stats: Map.put(state.file_stats, fid, {total + written_bytes, dead})}
+  end
+
+  # Track dead bytes when a key is deleted via tombstone (direct path only).
+  # Reads the old ETS entry to determine which file contains the now-dead record.
+  defp track_delete_dead_bytes(state, key) do
+    case :ets.lookup(state.keydir, key) do
+      [{^key, _v, _exp, _lfu, old_fid, _off, old_vsize}] when old_fid != 0 and old_vsize > 0 ->
+        dead_increment = old_vsize + @record_header_size + byte_size(key)
+        {old_total, old_dead} = Map.get(state.file_stats, old_fid, {0, 0})
+        %{state | file_stats: Map.put(state.file_stats, old_fid, {old_total, old_dead + dead_increment})}
+
+      _ ->
+        state
+    end
+  end
+
+  # Check if any non-active file exceeds fragmentation thresholds and notify
+  # the merge scheduler. Cheap: iterates a small map (typically <20 files).
+  defp maybe_notify_fragmentation(%{sandbox?: true} = state), do: state
+
+  defp maybe_notify_fragmentation(state) do
+    frag_threshold = state.merge_config.fragmentation_threshold
+    dead_bytes_min = state.merge_config.dead_bytes_threshold
+
+    candidates =
+      state.file_stats
+      |> Enum.filter(fn {fid, {total, dead}} ->
+        fid != state.active_file_id and
+          total > 0 and
+          dead / total >= frag_threshold and
+          dead >= dead_bytes_min
+      end)
+      |> Enum.map(fn {fid, _} -> fid end)
+
+    if candidates != [] do
+      file_count = map_size(state.file_stats)
+      Ferricstore.Merge.Scheduler.notify_fragmentation(state.index, candidates, file_count)
+    end
+
+    state
+  end
+
+  # Compute per-file dead bytes stats from disk file sizes + ETS live data.
+  # Called once during init after recover_keydir. O(file_count + key_count).
+  defp compute_file_stats(shard_path, keydir) do
+    case File.ls(shard_path) do
+      {:ok, files} ->
+        # 1. Get total bytes per file from disk
+        file_totals =
+          files
+          |> Enum.filter(&String.ends_with?(&1, ".log"))
+          |> Enum.reject(&String.starts_with?(&1, "compact_"))
+          |> Enum.reduce(%{}, fn name, acc ->
+            fid = name |> String.trim_trailing(".log") |> String.to_integer()
+            full_path = Path.join(shard_path, name)
+
+            size =
+              case File.stat(full_path) do
+                {:ok, %{size: s}} -> s
+                _ -> 0
+              end
+
+            Map.put(acc, fid, size)
+          end)
+
+        # 2. Sum live bytes per file from ETS (record_header + key + value per entry)
+        live_per_file =
+          :ets.foldl(
+            fn {key, _value, _exp, _lfu, fid, _off, vsize}, acc ->
+              if fid != 0 and is_integer(fid) do
+                record_bytes = @record_header_size + byte_size(key) + vsize
+                Map.update(acc, fid, record_bytes, &(&1 + record_bytes))
+              else
+                acc
+              end
+            end,
+            %{},
+            keydir
+          )
+
+        # 3. dead_bytes = total_bytes - live_bytes per file
+        Map.new(file_totals, fn {fid, total} ->
+          live = Map.get(live_per_file, fid, 0)
+          dead = max(total - live, 0)
+          {fid, {total, dead}}
+        end)
+
+      _ ->
+        %{}
+    end
   end
 
   defp maybe_rotate_file(state) do
@@ -2975,13 +3146,17 @@ defmodule Ferricstore.Store.Shard do
       File.touch!(new_path)
       Ferricstore.Store.ActiveFile.publish(state.index, new_id, new_path, sp)
 
+      # Initialize file_stats for the new file
+      new_file_stats = Map.put(state.file_stats, new_id, {0, 0})
+
       # Notify the merge scheduler that a rotation happened.
       # file_count = new_id + 1 (files are 0-indexed: 0, 1, ..., new_id)
       unless state.sandbox? do
         Ferricstore.Merge.Scheduler.notify_rotation(state.index, new_id + 1)
       end
 
-      %{state | active_file_id: new_id, active_file_path: new_path, active_file_size: 0}
+      %{state | active_file_id: new_id, active_file_path: new_path, active_file_size: 0,
+        file_stats: new_file_stats}
     else
       state
     end
@@ -3656,17 +3831,98 @@ defmodule Ferricstore.Store.Shard do
   # compaction when the threshold is reached.
   defp bump_promoted_writes(state, redis_key) do
     case Map.get(state.promoted_instances, redis_key) do
-      %{path: path, writes: writes} ->
-        new_writes = writes + 1
+      %{path: path, total_bytes: total, dead_bytes: dead, last_compacted_at: last} = info ->
+        frag = if total > 0, do: dead / total, else: 0.0
 
-        if new_writes >= @dedicated_compaction_threshold do
+        cooldown_ok =
+          last == nil or
+            System.system_time(:millisecond) - last >= @promoted_compaction_cooldown_ms
+
+        if frag >= @promoted_frag_threshold and dead >= @promoted_dead_bytes_min and cooldown_ok do
           state = compact_dedicated(state, redis_key, path)
-          new_promoted = Map.put(state.promoted_instances, redis_key, %{path: path, writes: 0})
+          # After compaction, recompute total_bytes from the new file on disk
+          new_total = promoted_dir_size(path)
+          new_info = %{info | dead_bytes: 0, total_bytes: new_total,
+                       last_compacted_at: System.system_time(:millisecond)}
+          new_promoted = Map.put(state.promoted_instances, redis_key, new_info)
           %{state | promoted_instances: new_promoted}
         else
-          new_promoted = Map.put(state.promoted_instances, redis_key, %{path: path, writes: new_writes})
-          %{state | promoted_instances: new_promoted}
+          %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, info)}
         end
+
+      # Legacy format without byte tracking — upgrade in place
+      %{path: path, writes: _writes} = info ->
+        new_info = Map.merge(info, %{total_bytes: promoted_dir_size(path),
+                                     dead_bytes: 0, last_compacted_at: nil})
+        new_promoted = Map.put(state.promoted_instances, redis_key, new_info)
+        %{state | promoted_instances: new_promoted}
+
+      _ ->
+        state
+    end
+  end
+
+  # Returns total size of all .log files in a promoted directory.
+  defp promoted_dir_size(dir_path) do
+    case File.ls(dir_path) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.ends_with?(&1, ".log"))
+        |> Enum.reduce(0, fn name, acc ->
+          case File.stat(Path.join(dir_path, name)) do
+            {:ok, %{size: s}} -> acc + s
+            _ -> acc
+          end
+        end)
+
+      _ ->
+        0
+    end
+  end
+
+  # Tracks dead bytes for a promoted collection on overwrite (put).
+  # Reads old ETS entry to determine the previous record size, then
+  # increments dead_bytes and total_bytes on the promoted instance.
+  defp track_promoted_dead_bytes(state, redis_key, compound_key, new_record_size) do
+    case Map.get(state.promoted_instances, redis_key) do
+      %{total_bytes: total, dead_bytes: dead} = info ->
+        old_record_size =
+          case :ets.lookup(state.keydir, compound_key) do
+            [{^compound_key, _v, _exp, _lfu, _fid, _off, old_vsize}] when old_vsize > 0 ->
+              @record_header_size + byte_size(compound_key) + old_vsize
+
+            _ ->
+              0
+          end
+
+        new_info = %{info |
+          dead_bytes: dead + old_record_size,
+          total_bytes: total + new_record_size
+        }
+
+        %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, new_info)}
+
+      _ ->
+        state
+    end
+  end
+
+  # Tracks dead bytes for a promoted collection on delete (tombstone).
+  # The entire old record becomes dead.
+  defp track_promoted_delete_bytes(state, redis_key, compound_key) do
+    case Map.get(state.promoted_instances, redis_key) do
+      %{dead_bytes: dead} = info ->
+        old_record_size =
+          case :ets.lookup(state.keydir, compound_key) do
+            [{^compound_key, _v, _exp, _lfu, _fid, _off, old_vsize}] when old_vsize > 0 ->
+              @record_header_size + byte_size(compound_key) + old_vsize
+
+            _ ->
+              0
+          end
+
+        new_info = %{info | dead_bytes: dead + old_record_size}
+        %{state | promoted_instances: Map.put(state.promoted_instances, redis_key, new_info)}
 
       _ ->
         state
@@ -3825,7 +4081,10 @@ defmodule Ferricstore.Store.Shard do
                    state.index
                  ) do
               {:ok, dedicated_store} ->
-                new_promoted = Map.put(state.promoted_instances, redis_key, %{path: dedicated_store, writes: 0})
+                new_promoted = Map.put(state.promoted_instances, redis_key, %{
+                  path: dedicated_store, writes: 0,
+                  total_bytes: 0, dead_bytes: 0, last_compacted_at: nil
+                })
                 %{state | promoted_instances: new_promoted}
 
               {:error, _reason} ->

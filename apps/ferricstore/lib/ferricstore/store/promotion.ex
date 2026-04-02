@@ -245,7 +245,35 @@ defmodule Ferricstore.Store.Promotion do
               :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), fid, offset, 0})
           end)
 
-          Map.put(acc, redis_key, %{path: dedicated_path, writes: 0})
+          # Compute byte stats for fragmentation-based compaction
+          total_bytes = dir_total_size(dedicated_path)
+
+          live_bytes =
+            Enum.reduce(final_state, 0, fn {key, entry}, acc ->
+              case entry do
+                :tombstone ->
+                  acc
+
+                {:live, _fid, _path, _off, _vs, _exp} ->
+                  case :ets.lookup(keydir, key) do
+                    [{^key, _v, _exp, _lfu, _f, _o, vsize}] when vsize > 0 ->
+                      acc + 26 + byte_size(key) + vsize
+
+                    _ ->
+                      acc
+                  end
+              end
+            end)
+
+          dead_bytes = max(total_bytes - live_bytes, 0)
+
+          Map.put(acc, redis_key, %{
+            path: dedicated_path,
+            writes: 0,
+            total_bytes: total_bytes,
+            dead_bytes: dead_bytes,
+            last_compacted_at: nil
+          })
 
         {:error, reason} ->
           Logger.error(
@@ -313,6 +341,25 @@ defmodule Ferricstore.Store.Promotion do
     case list_log_files(path) do
       [] -> Path.join(path, "00000.log")
       files -> files |> List.last() |> elem(1)
+    end
+  end
+
+  # Returns total size of all .log files in a directory.
+  defp dir_total_size(dir) do
+    case File.ls(dir) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.ends_with?(&1, ".log"))
+        |> Enum.reject(&String.starts_with?(&1, "compact_"))
+        |> Enum.reduce(0, fn name, acc ->
+          case File.stat(Path.join(dir, name)) do
+            {:ok, %{size: s}} -> acc + s
+            _ -> acc
+          end
+        end)
+
+      _ ->
+        0
     end
   end
 
