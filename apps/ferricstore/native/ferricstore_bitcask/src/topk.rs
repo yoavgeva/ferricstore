@@ -9,7 +9,7 @@ use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use rustler::{Binary, Encoder, Env, NifResult, OwnedBinary, Term};
+use rustler::{Binary, Encoder, Env, LocalPid, NifResult, OwnedBinary, Term};
 
 // ---------------------------------------------------------------------------
 // Constants (shared file format with the old mmap implementation)
@@ -44,6 +44,7 @@ mod atoms {
         error,
         nil,
         enoent,
+        tokio_complete,
     }
 }
 
@@ -666,6 +667,230 @@ pub fn topk_file_info_v2(env: Env, path: String) -> NifResult<Term> {
 }
 
 // ---------------------------------------------------------------------------
+// Async variants of read NIFs — Tokio spawn_blocking, never block BEAM
+// ---------------------------------------------------------------------------
+
+/// Async topk query: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn topk_file_query_v2_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    elements: Vec<Binary<'a>>,
+) -> NifResult<Term<'a>> {
+    let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let p = std::path::Path::new(&path);
+            let file = crate::open_random_read(p).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (k, width, depth, _decay, heap_len) =
+                v2_read_header(&file).map_err(|e| e.clone())?;
+            let heap_entries =
+                v2_read_heap(&file, width, depth, heap_len, k).map_err(|e| e.clone())?;
+            let fingerprints: std::collections::HashSet<String> =
+                heap_entries.iter().map(|e| e.element.clone()).collect();
+            let results: Vec<i32> = elements_owned
+                .iter()
+                .map(|elem| {
+                    let elem_str = String::from_utf8_lossy(elem);
+                    i32::from(fingerprints.contains(elem_str.as_ref()))
+                })
+                .collect();
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(results)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(vals) => (atoms::tokio_complete(), correlation_id, atoms::ok(), vals).encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async topk list: spawns on Tokio, sends result to `caller_pid`.
+/// Returns element names as a list of byte vectors (encoded as binaries).
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn topk_file_list_v2_async(
+    env: Env<'_>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+) -> NifResult<Term<'_>> {
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let p = std::path::Path::new(&path);
+            let file = crate::open_random_read(p).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (k, width, depth, _decay, heap_len) =
+                v2_read_header(&file).map_err(|e| e.clone())?;
+            let mut heap_entries =
+                v2_read_heap(&file, width, depth, heap_len, k).map_err(|e| e.clone())?;
+            heap_entries.sort_by(|a, b| {
+                b.count
+                    .cmp(&a.count)
+                    .then_with(|| a.element.cmp(&b.element))
+            });
+            let items: Vec<Vec<u8>> = heap_entries
+                .iter()
+                .map(|e| e.element.as_bytes().to_vec())
+                .collect();
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(items)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(items) => {
+                let terms: Vec<rustler::Term<'_>> = items
+                    .iter()
+                    .map(|item| match OwnedBinary::new(item.len()) {
+                        Some(mut ob) => {
+                            ob.as_mut_slice().copy_from_slice(item);
+                            rustler::Binary::from_owned(ob, env).encode(env)
+                        }
+                        None => atoms::error().encode(env),
+                    })
+                    .collect();
+                (atoms::tokio_complete(), correlation_id, atoms::ok(), terms).encode(env)
+            }
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async topk count: spawns on Tokio, sends CMS estimates to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn topk_file_count_v2_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    elements: Vec<Binary<'a>>,
+) -> NifResult<Term<'a>> {
+    let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let p = std::path::Path::new(&path);
+            let file = crate::open_random_read(p).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (_k, width, depth, _decay, _heap_len) =
+                v2_read_header(&file).map_err(|e| e.clone())?;
+            let counters = v2_read_cms(&file, width, depth).map_err(|e| e.clone())?;
+            let results: Vec<i64> = elements_owned
+                .iter()
+                .map(|elem| v2_cms_estimate(&counters, width, depth, elem))
+                .collect();
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(results)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(counts) => {
+                (atoms::tokio_complete(), correlation_id, atoms::ok(), counts).encode(env)
+            }
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async topk info: spawns on Tokio, sends metadata to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn topk_file_info_v2_async(
+    env: Env<'_>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+) -> NifResult<Term<'_>> {
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let p = std::path::Path::new(&path);
+            let file = crate::open_random_read(p).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (k, width, depth, decay, _heap_len) =
+                v2_read_header(&file).map_err(|e| e.clone())?;
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok((k, width, depth, decay))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok((k, width, depth, decay)) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::ok(),
+                (k, width, depth, decay),
+            )
+                .encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+// ---------------------------------------------------------------------------
 // Rust-only unit tests
 // ---------------------------------------------------------------------------
 
@@ -746,7 +971,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad_magic.topk");
         let mut data = [0u8; TOPK_HEADER_SIZE + 64];
-        data[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+        data[0..8].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
         std::fs::write(&path, data).unwrap();
         let file = File::open(&path).unwrap();
         let result = v2_read_header(&file);
@@ -797,9 +1022,18 @@ mod tests {
         let mut fingerprints: HashSet<String> = HashSet::new();
 
         // Add 3 elements (heap has room, no eviction)
-        assert_eq!(v2_heap_add(&mut entries, &mut fingerprints, k, "a", 10), None);
-        assert_eq!(v2_heap_add(&mut entries, &mut fingerprints, k, "b", 20), None);
-        assert_eq!(v2_heap_add(&mut entries, &mut fingerprints, k, "c", 30), None);
+        assert_eq!(
+            v2_heap_add(&mut entries, &mut fingerprints, k, "a", 10),
+            None
+        );
+        assert_eq!(
+            v2_heap_add(&mut entries, &mut fingerprints, k, "b", 20),
+            None
+        );
+        assert_eq!(
+            v2_heap_add(&mut entries, &mut fingerprints, k, "c", 30),
+            None
+        );
         assert_eq!(entries.len(), 3);
 
         // Add a 4th element with higher count => evicts "a" (count=10, the min)
@@ -854,9 +1088,18 @@ mod tests {
 
         // Write some heap entries
         let entries = vec![
-            V2HeapEntry { element: "alpha".to_string(), count: 100 },
-            V2HeapEntry { element: "beta".to_string(), count: 50 },
-            V2HeapEntry { element: "gamma".to_string(), count: 25 },
+            V2HeapEntry {
+                element: "alpha".to_string(),
+                count: 100,
+            },
+            V2HeapEntry {
+                element: "beta".to_string(),
+                count: 50,
+            },
+            V2HeapEntry {
+                element: "gamma".to_string(),
+                count: 25,
+            },
         ];
         v2_write_heap(&file, width, depth, &entries).unwrap();
 
@@ -920,7 +1163,10 @@ mod tests {
         let file = crate::open_random_rw(std::path::Path::new(&path_str)).unwrap();
         let (_, width, depth, _, _) = v2_read_header(&file).unwrap();
 
-        let entries = vec![V2HeapEntry { element: long_element.clone(), count: 10 }];
+        let entries = vec![V2HeapEntry {
+            element: long_element.clone(),
+            count: 10,
+        }];
         v2_write_heap(&file, width, depth, &entries).unwrap();
 
         let read_entries = v2_read_heap(&file, width, depth, 1, 3).unwrap();

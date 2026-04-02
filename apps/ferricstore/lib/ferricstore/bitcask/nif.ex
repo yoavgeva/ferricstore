@@ -34,12 +34,22 @@ defmodule Ferricstore.Bitcask.NIF do
   def bloom_file_card(_path), do: :erlang.nif_error(:nif_not_loaded)
   def bloom_file_info(_path), do: :erlang.nif_error(:nif_not_loaded)
 
+  # -- Async Bloom read NIFs (Tokio spawn_blocking) --
+  def bloom_file_exists_async(_caller_pid, _correlation_id, _path, _element), do: :erlang.nif_error(:nif_not_loaded)
+  def bloom_file_mexists_async(_caller_pid, _correlation_id, _path, _elements), do: :erlang.nif_error(:nif_not_loaded)
+  def bloom_file_card_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
+  def bloom_file_info_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
+
   # -- Stateless pread/pwrite CMS NIFs --
   def cms_file_create(_path, _width, _depth), do: :erlang.nif_error(:nif_not_loaded)
   def cms_file_incrby(_path, _items), do: :erlang.nif_error(:nif_not_loaded)
   def cms_file_query(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
   def cms_file_info(_path), do: :erlang.nif_error(:nif_not_loaded)
   def cms_file_merge(_dst_path, _src_paths, _weights), do: :erlang.nif_error(:nif_not_loaded)
+
+  # -- Async CMS read NIFs (Tokio spawn_blocking) --
+  def cms_file_query_async(_caller_pid, _correlation_id, _path, _elements), do: :erlang.nif_error(:nif_not_loaded)
+  def cms_file_info_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- Stateless pread/pwrite Cuckoo NIFs --
   def cuckoo_file_create(_path, _capacity, _bucket_size), do: :erlang.nif_error(:nif_not_loaded)
@@ -50,6 +60,11 @@ defmodule Ferricstore.Bitcask.NIF do
   def cuckoo_file_count(_path, _element), do: :erlang.nif_error(:nif_not_loaded)
   def cuckoo_file_info(_path), do: :erlang.nif_error(:nif_not_loaded)
 
+  # -- Async Cuckoo read NIFs (Tokio spawn_blocking) --
+  def cuckoo_file_exists_async(_caller_pid, _correlation_id, _path, _element), do: :erlang.nif_error(:nif_not_loaded)
+  def cuckoo_file_count_async(_caller_pid, _correlation_id, _path, _element), do: :erlang.nif_error(:nif_not_loaded)
+  def cuckoo_file_info_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
+
   # -- Stateless pread/pwrite TopK v2 NIFs --
   def topk_file_create_v2(_path, _k, _width, _depth, _decay), do: :erlang.nif_error(:nif_not_loaded)
   def topk_file_add_v2(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
@@ -58,4 +73,10 @@ defmodule Ferricstore.Bitcask.NIF do
   def topk_file_list_v2(_path), do: :erlang.nif_error(:nif_not_loaded)
   def topk_file_count_v2(_path, _elements), do: :erlang.nif_error(:nif_not_loaded)
   def topk_file_info_v2(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  # -- Async TopK v2 read NIFs (Tokio spawn_blocking) --
+  def topk_file_query_v2_async(_caller_pid, _correlation_id, _path, _elements), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_list_v2_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_count_v2_async(_caller_pid, _correlation_id, _path, _elements), do: :erlang.nif_error(:nif_not_loaded)
+  def topk_file_info_v2_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
 end

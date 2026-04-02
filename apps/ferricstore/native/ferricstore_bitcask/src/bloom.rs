@@ -26,7 +26,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use rustler::schedule::consume_timeslice;
-use rustler::{Binary, Encoder, Env, NifResult, Term};
+use rustler::{Binary, Encoder, Env, LocalPid, NifResult, Term};
 
 /// How often (in items) to call `consume_timeslice` and let the BEAM
 /// decide whether we should yield. 64 matches the interval used in lib.rs.
@@ -44,6 +44,7 @@ mod atoms {
         ok,
         error,
         enoent,
+        tokio_complete,
     }
 }
 
@@ -398,6 +399,215 @@ pub fn bloom_file_info(env: Env, path: String) -> NifResult<Term> {
 }
 
 // ---------------------------------------------------------------------------
+// Async variants of read NIFs — Tokio spawn_blocking, never block BEAM
+// ---------------------------------------------------------------------------
+
+/// Async bloom exists: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn bloom_file_exists_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    element: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    let element_owned = element.as_slice().to_vec();
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (num_bits, num_hashes, _count) =
+                file_read_header(&file).map_err(|e| e.clone())?;
+            let positions = file_hash_positions(&element_owned, num_bits, num_hashes);
+            for pos in positions {
+                let byte_index = pos / 8;
+                let bit_offset = (pos % 8) as u8;
+                let file_offset = HEADER_SIZE as u64 + byte_index;
+                let mut buf = [0u8; 1];
+                file.read_at(&mut buf, file_offset)
+                    .map_err(|e| e.to_string())?;
+                if (buf[0] & (1u8 << bit_offset)) == 0 {
+                    crate::fadvise_dontneed(&file, 0, 0);
+                    return Ok(0u32);
+                }
+            }
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(1u32)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(val) => (atoms::tokio_complete(), correlation_id, atoms::ok(), val).encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async bloom mexists: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn bloom_file_mexists_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    elements: Vec<Binary<'a>>,
+) -> NifResult<Term<'a>> {
+    let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (num_bits, num_hashes, _count) =
+                file_read_header(&file).map_err(|e| e.clone())?;
+            let mut results: Vec<u32> = Vec::with_capacity(elements_owned.len());
+            for element in &elements_owned {
+                let positions = file_hash_positions(element, num_bits, num_hashes);
+                let mut found = true;
+                for pos in positions {
+                    let byte_index = pos / 8;
+                    let bit_offset = (pos % 8) as u8;
+                    let file_offset = HEADER_SIZE as u64 + byte_index;
+                    let mut buf = [0u8; 1];
+                    file.read_at(&mut buf, file_offset)
+                        .map_err(|e| e.to_string())?;
+                    if (buf[0] & (1u8 << bit_offset)) == 0 {
+                        found = false;
+                        break;
+                    }
+                }
+                results.push(u32::from(found));
+            }
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(results)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(vals) => (atoms::tokio_complete(), correlation_id, atoms::ok(), vals).encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async bloom card: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn bloom_file_card_async(
+    env: Env<'_>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+) -> NifResult<Term<'_>> {
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (_num_bits, _num_hashes, count) =
+                file_read_header(&file).map_err(|e| e.clone())?;
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(count)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(count) => (atoms::tokio_complete(), correlation_id, atoms::ok(), count).encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async bloom info: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn bloom_file_info_async(
+    env: Env<'_>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+) -> NifResult<Term<'_>> {
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (num_bits, num_hashes, count) =
+                file_read_header(&file).map_err(|e| e.clone())?;
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok((num_bits, count, num_hashes as u64))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok((num_bits, count, num_hashes)) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::ok(),
+                (num_bits, count, num_hashes),
+            )
+                .encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+// ---------------------------------------------------------------------------
 // Rust unit tests (stateless file-based functions only)
 // ---------------------------------------------------------------------------
 
@@ -482,7 +692,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: create a valid bloom file and return the path string.
-    fn create_bloom_file(dir: &std::path::Path, name: &str, num_bits: u64, num_hashes: u32) -> String {
+    fn create_bloom_file(
+        dir: &std::path::Path,
+        name: &str,
+        num_bits: u64,
+        num_hashes: u32,
+    ) -> String {
         let path = dir.join(name);
         let byte_count = num_bits.div_ceil(8) as usize;
         let mut file = File::create(&path).unwrap();
@@ -533,7 +748,7 @@ mod tests {
         let path = dir.path().join("wrong_magic.bloom");
         let mut data = [0u8; HEADER_SIZE + 8];
         // Write a different magic number
-        data[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+        data[0..8].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
         std::fs::write(&path, data).unwrap();
         let file = File::open(&path).unwrap();
         let result = file_read_header(&file);
@@ -563,7 +778,7 @@ mod tests {
         assert_eq!(positions[0], 0);
 
         // Write the bit
-        let file_offset = HEADER_SIZE as u64 + 0;
+        let file_offset = HEADER_SIZE as u64;
         let mut buf = [0u8; 1];
         file.read_at(&mut buf, file_offset).unwrap();
         assert_eq!(buf[0], 0);
@@ -641,7 +856,10 @@ mod tests {
                 break;
             }
         }
-        assert!(!found_all, "with only 1 element in 10000 bits, false positive should be extremely rare");
+        assert!(
+            !found_all,
+            "with only 1 element in 10000 bits, false positive should be extremely rare"
+        );
     }
 
     #[test]

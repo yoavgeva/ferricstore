@@ -60,14 +60,18 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.INCRBY", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'cms.incrby' command"}
 
-  # CMS.QUERY — local stateless pread
+  # CMS.QUERY — local stateless pread (async)
   def handle("CMS.QUERY", [key | elements], store) when elements != [] do
     path = prob_path(store, key, "cms")
+    corr_id = System.unique_integer([:positive, :monotonic])
+    :ok = NIF.cms_file_query_async(self(), corr_id, path, elements)
 
-    case NIF.cms_file_query(path, elements) do
-      {:ok, counts} -> counts
-      {:error, :enoent} -> {:error, "ERR CMS: key does not exist"}
-      {:error, reason} -> {:error, "ERR CMS query failed: #{inspect(reason)}"}
+    receive do
+      {:tokio_complete, ^corr_id, :ok, counts} -> counts
+      {:tokio_complete, ^corr_id, :error, "enoent"} -> {:error, "ERR CMS: key does not exist"}
+      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR CMS query failed: #{reason}"}
+    after
+      5000 -> {:error, "ERR timeout"}
     end
   end
 
@@ -107,19 +111,23 @@ defmodule Ferricstore.Commands.CMS do
   def handle("CMS.MERGE", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'cms.merge' command"}
 
-  # CMS.INFO — local stateless pread
+  # CMS.INFO — local stateless pread (async)
   def handle("CMS.INFO", [key], store) do
     path = prob_path(store, key, "cms")
+    corr_id = System.unique_integer([:positive, :monotonic])
+    :ok = NIF.cms_file_info_async(self(), corr_id, path)
 
-    case NIF.cms_file_info(path) do
-      {:ok, {width, depth, count}} ->
+    receive do
+      {:tokio_complete, ^corr_id, :ok, {width, depth, count}} ->
         ["width", width, "depth", depth, "count", count]
 
-      {:error, :enoent} ->
+      {:tokio_complete, ^corr_id, :error, "enoent"} ->
         {:error, "ERR CMS: key does not exist"}
 
-      {:error, reason} ->
-        {:error, "ERR CMS info failed: #{inspect(reason)}"}
+      {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, "ERR CMS info failed: #{reason}"}
+    after
+      5000 -> {:error, "ERR timeout"}
     end
   end
 

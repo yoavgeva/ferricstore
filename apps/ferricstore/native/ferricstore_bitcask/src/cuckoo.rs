@@ -19,7 +19,7 @@ use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use rustler::{Binary, Encoder, Env, NifResult, Term};
+use rustler::{Binary, Encoder, Env, LocalPid, NifResult, Term};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -41,6 +41,7 @@ mod atoms {
         ok,
         error,
         enoent,
+        tokio_complete,
     }
 }
 
@@ -874,6 +875,187 @@ pub fn cuckoo_file_info(env: Env, path: String) -> NifResult<Term> {
 }
 
 // ---------------------------------------------------------------------------
+// Async variants of read NIFs — Tokio spawn_blocking, never block BEAM
+// ---------------------------------------------------------------------------
+
+/// Async cuckoo exists: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cuckoo_file_exists_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    element: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    let element_owned = element.as_slice().to_vec();
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let hdr = cuckoo_read_header(&file).map_err(|e| e.clone())?;
+            let (fp, b1) = cuckoo_file_fingerprint_and_bucket(
+                &element_owned,
+                hdr.fingerprint_size as usize,
+                hdr.num_buckets,
+            );
+            let b2 = cuckoo_file_alternate_bucket(b1, &fp, hdr.num_buckets);
+            for bucket in &[b1, b2] {
+                for slot in 0..hdr.bucket_size {
+                    let s = cuckoo_file_read_slot(
+                        &file,
+                        *bucket,
+                        slot as usize,
+                        hdr.bucket_size,
+                        hdr.fingerprint_size,
+                    )
+                    .map_err(|e| e.clone())?;
+                    if s == fp {
+                        crate::fadvise_dontneed(&file, 0, 0);
+                        return Ok(1u64);
+                    }
+                }
+            }
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(0u64)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(val) => (atoms::tokio_complete(), correlation_id, atoms::ok(), val).encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async cuckoo count: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cuckoo_file_count_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    element: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    let element_owned = element.as_slice().to_vec();
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let hdr = cuckoo_read_header(&file).map_err(|e| e.clone())?;
+            let (fp, b1) = cuckoo_file_fingerprint_and_bucket(
+                &element_owned,
+                hdr.fingerprint_size as usize,
+                hdr.num_buckets,
+            );
+            let b2 = cuckoo_file_alternate_bucket(b1, &fp, hdr.num_buckets);
+            let mut total = 0u64;
+            for bucket in &[b1, b2] {
+                for slot in 0..hdr.bucket_size {
+                    let s = cuckoo_file_read_slot(
+                        &file,
+                        *bucket,
+                        slot as usize,
+                        hdr.bucket_size,
+                        hdr.fingerprint_size,
+                    )
+                    .map_err(|e| e.clone())?;
+                    if s == fp {
+                        total += 1;
+                    }
+                }
+            }
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(total)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(count) => (atoms::tokio_complete(), correlation_id, atoms::ok(), count).encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async cuckoo info: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cuckoo_file_info_async(
+    env: Env<'_>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+) -> NifResult<Term<'_>> {
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let hdr = cuckoo_read_header(&file).map_err(|e| e.clone())?;
+            let total_slots = (hdr.num_buckets as u64) * (hdr.bucket_size as u64);
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok((
+                hdr.num_buckets as u64,
+                hdr.bucket_size as u64,
+                hdr.fingerprint_size as u64,
+                hdr.num_items,
+                hdr.num_deletes,
+                total_slots,
+                hdr.max_kicks as u64,
+            ))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(info) => (atoms::tokio_complete(), correlation_id, atoms::ok(), info).encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1032,7 +1214,10 @@ mod tests {
     fn empty_element_fingerprint() {
         // Zero-length element should produce a valid non-zero fingerprint.
         let (fp, bucket) = cuckoo_file_fingerprint_and_bucket(b"", 1, 1024);
-        assert!(!fp.iter().all(|&b| b == 0), "fingerprint should never be all zeros");
+        assert!(
+            !fp.iter().all(|&b| b == 0),
+            "fingerprint should never be all zeros"
+        );
         assert!(bucket < 1024);
     }
 
@@ -1083,7 +1268,10 @@ mod tests {
         let result = cuckoo_read_header(&file);
         assert!(result.is_err());
         match result {
-            Err(msg) => assert!(msg.contains("version"), "expected version error, got: {msg}"),
+            Err(msg) => assert!(
+                msg.contains("version"),
+                "expected version error, got: {msg}"
+            ),
             Ok(_) => panic!("expected error"),
         }
     }
@@ -1133,7 +1321,8 @@ mod tests {
         assert_eq!(fp, fp2);
         assert_eq!(b1, b1_2);
 
-        let read_fp = cuckoo_file_read_slot(&file, b1, 0, hdr.bucket_size, hdr.fingerprint_size).unwrap();
+        let read_fp =
+            cuckoo_file_read_slot(&file, b1, 0, hdr.bucket_size, hdr.fingerprint_size).unwrap();
         assert_eq!(read_fp, fp);
     }
 
@@ -1156,7 +1345,8 @@ mod tests {
 
         // Delete it
         let empty = vec![0u8; hdr.fingerprint_size as usize];
-        cuckoo_file_write_slot(&file, b1, 0, hdr.bucket_size, hdr.fingerprint_size, &empty).unwrap();
+        cuckoo_file_write_slot(&file, b1, 0, hdr.bucket_size, hdr.fingerprint_size, &empty)
+            .unwrap();
         cuckoo_file_write_num_items(&file, 0).unwrap();
         cuckoo_file_write_num_deletes(&file, 1).unwrap();
 
@@ -1166,7 +1356,8 @@ mod tests {
         assert_eq!(hdr2.num_deletes, 1);
 
         // Verify slot is empty
-        let read_fp = cuckoo_file_read_slot(&file, b1, 0, hdr.bucket_size, hdr.fingerprint_size).unwrap();
+        let read_fp =
+            cuckoo_file_read_slot(&file, b1, 0, hdr.bucket_size, hdr.fingerprint_size).unwrap();
         assert!(read_fp.iter().all(|&b| b == 0));
     }
 
@@ -1204,7 +1395,10 @@ mod tests {
 
         // Should differ from element without nulls
         let (fp2, bucket2) = cuckoo_file_fingerprint_and_bucket(b"testwithnulls", 1, 1024);
-        assert!(fp != fp2 || bucket != bucket2, "null bytes should affect hash");
+        assert!(
+            fp != fp2 || bucket != bucket2,
+            "null bytes should affect hash"
+        );
     }
 
     #[test]

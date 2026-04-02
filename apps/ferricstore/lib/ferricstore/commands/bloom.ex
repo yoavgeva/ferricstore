@@ -93,11 +93,15 @@ defmodule Ferricstore.Commands.Bloom do
 
   def handle("BF.EXISTS", [key, element], store) do
     path = prob_path(store, key, "bloom")
+    corr_id = System.unique_integer([:positive, :monotonic])
+    :ok = NIF.bloom_file_exists_async(self(), corr_id, path, element)
 
-    case NIF.bloom_file_exists(path, element) do
-      {:ok, result} -> result
-      {:error, :enoent} -> 0
-      {:error, reason} -> {:error, "ERR bloom exists failed: #{inspect(reason)}"}
+    receive do
+      {:tokio_complete, ^corr_id, :ok, result} -> result
+      {:tokio_complete, ^corr_id, :error, "enoent"} -> 0
+      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR bloom exists failed: #{reason}"}
+    after
+      5000 -> {:error, "ERR timeout"}
     end
   end
 
@@ -111,11 +115,15 @@ defmodule Ferricstore.Commands.Bloom do
 
   def handle("BF.MEXISTS", [key | elements], store) when elements != [] do
     path = prob_path(store, key, "bloom")
+    corr_id = System.unique_integer([:positive, :monotonic])
+    :ok = NIF.bloom_file_mexists_async(self(), corr_id, path, elements)
 
-    case NIF.bloom_file_mexists(path, elements) do
-      {:ok, results} -> results
-      {:error, :enoent} -> List.duplicate(0, length(elements))
-      {:error, reason} -> {:error, "ERR bloom mexists failed: #{inspect(reason)}"}
+    receive do
+      {:tokio_complete, ^corr_id, :ok, results} -> results
+      {:tokio_complete, ^corr_id, :error, "enoent"} -> List.duplicate(0, length(elements))
+      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR bloom mexists failed: #{reason}"}
+    after
+      5000 -> {:error, "ERR timeout"}
     end
   end
 
@@ -129,11 +137,15 @@ defmodule Ferricstore.Commands.Bloom do
 
   def handle("BF.CARD", [key], store) do
     path = prob_path(store, key, "bloom")
+    corr_id = System.unique_integer([:positive, :monotonic])
+    :ok = NIF.bloom_file_card_async(self(), corr_id, path)
 
-    case NIF.bloom_file_card(path) do
-      {:ok, count} -> count
-      {:error, :enoent} -> 0
-      {:error, reason} -> {:error, "ERR bloom card failed: #{inspect(reason)}"}
+    receive do
+      {:tokio_complete, ^corr_id, :ok, count} -> count
+      {:tokio_complete, ^corr_id, :error, "enoent"} -> 0
+      {:tokio_complete, ^corr_id, :error, reason} -> {:error, "ERR bloom card failed: #{reason}"}
+    after
+      5000 -> {:error, "ERR timeout"}
     end
   end
 
@@ -147,9 +159,11 @@ defmodule Ferricstore.Commands.Bloom do
 
   def handle("BF.INFO", [key], store) do
     path = prob_path(store, key, "bloom")
+    corr_id = System.unique_integer([:positive, :monotonic])
+    :ok = NIF.bloom_file_info_async(self(), corr_id, path)
 
-    case NIF.bloom_file_info(path) do
-      {:ok, {num_bits, count, num_hashes}} ->
+    receive do
+      {:tokio_complete, ^corr_id, :ok, {num_bits, count, num_hashes}} ->
         # Try to get capacity/error_rate from stored metadata
         {capacity, error_rate} = recover_bloom_meta(key, store, num_bits, num_hashes)
 
@@ -164,11 +178,13 @@ defmodule Ferricstore.Commands.Bloom do
           "Number of bits", num_bits
         ]
 
-      {:error, :enoent} ->
+      {:tokio_complete, ^corr_id, :error, "enoent"} ->
         {:error, "ERR not found"}
 
-      {:error, reason} ->
-        {:error, "ERR bloom info failed: #{inspect(reason)}"}
+      {:tokio_complete, ^corr_id, :error, reason} ->
+        {:error, "ERR bloom info failed: #{reason}"}
+    after
+      5000 -> {:error, "ERR timeout"}
     end
   end
 

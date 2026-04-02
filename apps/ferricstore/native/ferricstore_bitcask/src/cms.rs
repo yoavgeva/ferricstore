@@ -18,7 +18,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use rustler::schedule::consume_timeslice;
-use rustler::{Encoder, Env, NifResult, Term};
+use rustler::{Encoder, Env, LocalPid, NifResult, Term};
 
 /// How often (in items) to call `consume_timeslice` and let the BEAM
 /// decide whether we should yield. 64 matches the interval used in lib.rs.
@@ -38,6 +38,7 @@ mod atoms {
         ok,
         error,
         enoent,
+        tokio_complete,
     }
 }
 
@@ -425,6 +426,113 @@ pub fn cms_file_merge(
 }
 
 // ---------------------------------------------------------------------------
+// Async variants of read NIFs — Tokio spawn_blocking, never block BEAM
+// ---------------------------------------------------------------------------
+
+/// Async CMS query: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cms_file_query_async<'a>(
+    env: Env<'a>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+    elements: Vec<rustler::Binary<'a>>,
+) -> NifResult<Term<'a>> {
+    let elements_owned: Vec<Vec<u8>> = elements.iter().map(|e| e.as_slice().to_vec()).collect();
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (width, depth, _count) = cms_file_read_header(&file).map_err(|e| e.clone())?;
+            let mut counts: Vec<i64> = Vec::with_capacity(elements_owned.len());
+            let mut buf = [0u8; 8];
+            for element in &elements_owned {
+                let indices = hash_indices_standalone(element, width, depth);
+                let mut min_val = i64::MAX;
+                for (row, &col) in indices.iter().enumerate() {
+                    let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
+                    file.read_at(&mut buf, offset).map_err(|e| e.to_string())?;
+                    let val = i64::from_le_bytes(buf);
+                    min_val = min_val.min(val);
+                }
+                counts.push(min_val);
+            }
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok(counts)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok(counts) => {
+                (atoms::tokio_complete(), correlation_id, atoms::ok(), counts).encode(env)
+            }
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+/// Async CMS info: spawns on Tokio, sends result to `caller_pid`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cms_file_info_async(
+    env: Env<'_>,
+    caller_pid: LocalPid,
+    correlation_id: u64,
+    path: String,
+) -> NifResult<Term<'_>> {
+    crate::async_io::runtime().spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let file = crate::open_random_read(std::path::Path::new(&path)).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    "enoent".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            let (width, depth, count) = cms_file_read_header(&file).map_err(|e| e.clone())?;
+            crate::fadvise_dontneed(&file, 0, 0);
+            Ok((width, depth, count))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking: {e}")));
+
+        let mut msg_env = rustler::OwnedEnv::new();
+        let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
+            Ok((width, depth, count)) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::ok(),
+                (width, depth, count),
+            )
+                .encode(env),
+            Err(reason) => (
+                atoms::tokio_complete(),
+                correlation_id,
+                atoms::error(),
+                reason,
+            )
+                .encode(env),
+        });
+    });
+    Ok(atoms::ok().encode(env))
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -591,7 +699,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad_magic.cms");
         let mut data = [0u8; MMAP_HEADER_SIZE + 64];
-        data[0..8].copy_from_slice(&0xBAADF00Du64.to_le_bytes());
+        data[0..8].copy_from_slice(&0xBAAD_F00D_u64.to_le_bytes());
         data[8..16].copy_from_slice(&10u64.to_le_bytes());
         data[16..24].copy_from_slice(&5u64.to_le_bytes());
         std::fs::write(&path, data).unwrap();
