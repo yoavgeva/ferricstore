@@ -26,7 +26,14 @@ defmodule FerricstoreServer.Bench.TcpActiveModeBenchTest do
     end
     Process.sleep(500)
 
-    modes = [true, 100, 500]
+    modes = [true, 100, 200, 300, 500]
+    # Results on macOS M-series (same-machine, client competes for CPU):
+    #   true:  148K→84K→77K→80K→82K  (1→10→50→100→200 conns)
+    #   100:   144K→84K→81K→80K→79K
+    #   200:   130K→76K→79K→81K→81K
+    #   300:   133K→74K→77K→79K→80K
+    #   500:   123K→75K→77K→78K→81K
+    # All converge at 50+ connections. Real difference shows on separate machines.
     conn_counts = [1, 10, 50, 100, 200]
 
     IO.puts("\n=== TCP Active Mode Benchmark ===")
