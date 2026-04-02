@@ -259,6 +259,14 @@ defmodule Ferricstore.Store.Router do
   # users choosing async accept eventual consistency.
 
   defp async_write(idx, {:put, key, value, expire_at_ms}) do
+    if Ferricstore.Store.DiskPressure.under_pressure?(idx) do
+      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
+    else
+      async_write_put(idx, key, value, expire_at_ms)
+    end
+  end
+
+  defp async_write_put(idx, key, value, expire_at_ms) do
     keydir = keydir_name(idx)
     value_for_ets = case value do
       v when is_integer(v) -> Integer.to_string(v)
@@ -296,16 +304,20 @@ defmodule Ferricstore.Store.Router do
   end
 
   defp async_write(idx, {:delete, key}) do
-    keydir = keydir_name(idx)
-    :ets.delete(keydir, key)
-    PrefixIndex.untrack(PrefixIndex.table_name(idx), key, idx)
+    if Ferricstore.Store.DiskPressure.under_pressure?(idx) do
+      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
+    else
+      keydir = keydir_name(idx)
+      :ets.delete(keydir, key)
+      PrefixIndex.untrack(PrefixIndex.table_name(idx), key, idx)
 
-    {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
-    Ferricstore.Store.BitcaskWriter.delete(idx, file_path, key)
+      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+      Ferricstore.Store.BitcaskWriter.delete(idx, file_path, key)
 
-    WriteVersion.increment(idx)
-    async_submit_to_raft(idx, {:delete, key})
-    :ok
+      WriteVersion.increment(idx)
+      async_submit_to_raft(idx, {:delete, key})
+      :ok
+    end
   end
 
   defp async_write(idx, {:incr, key, delta}) do

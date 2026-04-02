@@ -82,6 +82,9 @@ defmodule Ferricstore.Application do
     # and the Shard-bypass quorum write path in Router).
     Ferricstore.Store.WriteVersion.init(shard_count)
 
+    # Initialize per-shard disk pressure flags (reject async writes on ENOSPC).
+    Ferricstore.Store.DiskPressure.init(shard_count)
+
     # Initialize the active file registry (ETS + atomics generation counter).
     # Replaces persistent_term for active file metadata to avoid global GC
     # on file rotation — critical for embedded mode with many host processes.

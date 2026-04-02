@@ -1216,6 +1216,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
         case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
           {:ok, locations} ->
+            Ferricstore.Store.DiskPressure.clear(state.shard_index)
+
             Enum.zip(batch, locations)
             |> Enum.each(fn {{key, _val, _exp}, {offset, value_size}} ->
               # Update ETS: replace :pending with real file_id and offset.
@@ -1233,6 +1235,7 @@ defmodule Ferricstore.Raft.StateMachine do
             end)
 
           {:error, reason} ->
+            Ferricstore.Store.DiskPressure.set(state.shard_index)
             require Logger
             Logger.error("StateMachine flush_pending_writes failed: #{inspect(reason)}")
         end

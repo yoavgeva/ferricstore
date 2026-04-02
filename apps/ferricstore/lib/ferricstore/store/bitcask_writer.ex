@@ -313,6 +313,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
         end)
 
       {:error, reason} ->
+        Ferricstore.Store.DiskPressure.set(shard_index)
         Logger.error(
           "BitcaskWriter shard_#{shard_index}: flush failed for #{path}: #{inspect(reason)} — #{length(batch)} entries lost"
         )
@@ -324,6 +325,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
       case NIF.v2_append_tombstone(path, key) do
         {:ok, _} -> :ok
         {:error, reason} ->
+          Ferricstore.Store.DiskPressure.set(shard_index)
           Logger.error(
             "BitcaskWriter shard_#{shard_index}: tombstone failed for #{path} key=#{inspect(key)}: #{inspect(reason)}"
           )

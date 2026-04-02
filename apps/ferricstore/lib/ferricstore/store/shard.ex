@@ -2746,7 +2746,12 @@ defmodule Ferricstore.Store.Shard do
 
   # Periodic fragmentation re-evaluation for idle shards.
   # Catches shards that accumulated dead data then stopped receiving writes.
+  # Also clears disk pressure flag periodically so writes can probe recovery.
   def handle_info(:frag_check, state) do
+    if Ferricstore.Store.DiskPressure.under_pressure?(state.index) do
+      Ferricstore.Store.DiskPressure.clear(state.index)
+    end
+
     state = maybe_notify_fragmentation(state)
     schedule_frag_check()
     {:noreply, state}
@@ -2940,6 +2945,7 @@ defmodule Ferricstore.Store.Shard do
 
     case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
       {:ok, locations} ->
+        Ferricstore.Store.DiskPressure.clear(state.index)
         written = total_written(locations)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
@@ -2948,6 +2954,7 @@ defmodule Ferricstore.Store.Shard do
         maybe_notify_fragmentation(state)
 
       {:error, reason} ->
+        Ferricstore.Store.DiskPressure.set(state.index)
         Logger.error("Shard #{state.index}: flush_pending (nosync) failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
         state
     end
@@ -2976,6 +2983,7 @@ defmodule Ferricstore.Store.Shard do
 
     case NIF.v2_append_batch(state.active_file_path, batch) do
       {:ok, locations} ->
+        Ferricstore.Store.DiskPressure.clear(state.index)
         written = total_written(locations)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
@@ -2984,6 +2992,7 @@ defmodule Ferricstore.Store.Shard do
         maybe_notify_fragmentation(state)
 
       {:error, reason} ->
+        Ferricstore.Store.DiskPressure.set(state.index)
         Logger.error("Shard #{state.index}: flush_pending_sync failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
         state
     end
