@@ -84,6 +84,59 @@ fn load(env: Env, _info: Term) -> bool {
 // These are the building blocks for the Elixir-owned ETS keydir architecture.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// fadvise helpers — page cache hints for random-access pread patterns.
+//
+// FADV_RANDOM: disables kernel readahead on the fd. Without this, each pread
+// triggers ~128KB of readahead on pages that will never be used (bloom bits,
+// CMS counters, Bitcask cold reads are all hash-indexed random access).
+//
+// FADV_DONTNEED: hints the kernel to evict the pages we just read. For
+// Bitcask cold reads, the value is promoted to ETS — the page cache copy
+// is never needed again. For prob reads, parallel stateless access means
+// no single reader benefits from caching. Saves page cache for hot data.
+//
+// On non-Linux (macOS), posix_fadvise is not available — these are no-ops.
+// ---------------------------------------------------------------------------
+
+/// Open a file for reading with FADV_RANDOM hint (disable readahead).
+pub fn open_random_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    fadvise_random(&file);
+    Ok(file)
+}
+
+/// Open a file for read+write with FADV_RANDOM hint.
+pub fn open_random_rw(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    fadvise_random(&file);
+    Ok(file)
+}
+
+/// Hint the kernel that this fd will be accessed randomly (disable readahead).
+#[cfg(target_os = "linux")]
+pub fn fadvise_random(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn fadvise_random(_file: &std::fs::File) {}
+
+/// Hint the kernel to evict pages at [offset, offset+len] from page cache.
+#[cfg(target_os = "linux")]
+pub fn fadvise_dontneed(file: &std::fs::File, offset: i64, len: i64) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn fadvise_dontneed(_file: &std::fs::File, _offset: i64, _len: i64) {}
+
 /// Parse the numeric file_id from a log file path.
 ///
 /// L-NEW-1 fix: `"00000000000000000000".trim_start_matches('0')` produces `""`
@@ -214,21 +267,30 @@ fn v2_pread_at(env: Env<'_>, path: String, offset: u64) -> NifResult<Term<'_>> {
     // File::open + pread = 2 syscalls (open + pread).
     // Future optimization: cache fds per shard in a global fd pool.
     match std::fs::File::open(p) {
-        Ok(file) => match log::pread_record_from_file(&file, offset) {
-            Ok(Some(record)) => match record.value {
-                Some(value) => {
-                    // Zero-copy: wrap the value in a ResourceArc
-                    let resource = ResourceArc::new(ValueBuffer { data: value });
-                    let binary = resource.make_binary(env, |vb| &vb.data);
-                    Ok((atoms::ok(), binary).encode(env))
-                }
-                None => {
-                    // Tombstone at this offset
-                    Ok((atoms::ok(), atoms::nil()).encode(env))
-                }
-            },
-            Ok(None) => Ok((atoms::error(), "offset past EOF").encode(env)),
-            Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+        Ok(file) => {
+            fadvise_random(&file);
+            match log::pread_record_from_file(&file, offset) {
+                Ok(Some(record)) => {
+                    // Hint kernel to evict the pages — value is promoted to ETS,
+                    // the page cache copy is never needed again.
+                    let record_size = (log::HEADER_SIZE + record.key.len()
+                        + record.value.as_ref().map_or(0, Vec::len)) as i64;
+                    fadvise_dontneed(&file, offset as i64, record_size);
+
+                    match record.value {
+                        Some(value) => {
+                            let resource = ResourceArc::new(ValueBuffer { data: value });
+                            let binary = resource.make_binary(env, |vb| &vb.data);
+                            Ok((atoms::ok(), binary).encode(env))
+                        }
+                        None => {
+                            Ok((atoms::ok(), atoms::nil()).encode(env))
+                        }
+                    }
+                },
+                Ok(None) => Ok((atoms::error(), "offset past EOF").encode(env)),
+                Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+            }
         },
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
@@ -306,6 +368,7 @@ fn v2_pread_batch<'a>(env: Env<'a>, path: String, locations: Vec<u64>) -> NifRes
     // C-2/C-6 fix: open file once, use pread for each offset
     match std::fs::File::open(p) {
         Ok(file) => {
+            fadvise_random(&file);
             let n = locations.len();
 
             // Build (original_index, offset) pairs and sort by offset for
@@ -319,12 +382,17 @@ fn v2_pread_batch<'a>(env: Env<'a>, path: String, locations: Vec<u64>) -> NifRes
 
             for &(orig_idx, offset) in &sorted {
                 let term = match log::pread_record_from_file(&file, offset) {
-                    Ok(Some(record)) => match record.value {
-                        Some(value) => {
-                            let resource = ResourceArc::new(ValueBuffer { data: value });
-                            resource.make_binary(env, |vb| &vb.data).encode(env)
+                    Ok(Some(record)) => {
+                        fadvise_dontneed(&file, offset as i64,
+                            (log::HEADER_SIZE + record.key.len()
+                             + record.value.as_ref().map_or(0, Vec::len)) as i64);
+                        match record.value {
+                            Some(value) => {
+                                let resource = ResourceArc::new(ValueBuffer { data: value });
+                                resource.make_binary(env, |vb| &vb.data).encode(env)
+                            }
+                            None => nil,
                         }
-                        None => nil,
                     },
                     _ => nil,
                 };
@@ -525,7 +593,16 @@ fn v2_pread_at_async(
         // C-2/C-6 fix: use File::open + pread instead of LogReader::open
         let result = std::fs::File::open(p)
             .map_err(|e| log::LogError(e.to_string()))
-            .and_then(|file| log::pread_record_from_file(&file, offset));
+            .and_then(|file| {
+                fadvise_random(&file);
+                let record = log::pread_record_from_file(&file, offset);
+                if let Ok(Some(ref r)) = record {
+                    let size = (log::HEADER_SIZE + r.key.len()
+                        + r.value.as_ref().map_or(0, Vec::len)) as i64;
+                    fadvise_dontneed(&file, offset as i64, size);
+                }
+                record
+            });
 
         let mut msg_env = rustler::OwnedEnv::new();
         let _ = msg_env.send_and_clear(&caller_pid, |env| match result {
@@ -591,9 +668,17 @@ fn v2_pread_batch_async(
             handles.push(tokio::spawn(async move {
                 let p = std::path::Path::new(&path);
                 match std::fs::File::open(p) {
-                    Ok(file) => match log::pread_record_from_file(&file, offset) {
-                        Ok(Some(record)) => record.value,
-                        _ => None,
+                    Ok(file) => {
+                        fadvise_random(&file);
+                        match log::pread_record_from_file(&file, offset) {
+                            Ok(Some(record)) => {
+                                let size = (log::HEADER_SIZE + record.key.len()
+                                    + record.value.as_ref().map_or(0, Vec::len)) as i64;
+                                fadvise_dontneed(&file, offset as i64, size);
+                                record.value
+                            }
+                            _ => None,
+                        }
                     },
                     Err(_) => None,
                 }

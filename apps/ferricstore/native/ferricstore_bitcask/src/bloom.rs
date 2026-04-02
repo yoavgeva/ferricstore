@@ -20,7 +20,7 @@
 //!
 //! where h1 and h2 are derived from xxh3 with two different seeds.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -158,7 +158,7 @@ pub fn bloom_file_create(env: Env, path: String, num_bits: u64, num_hashes: u32)
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> NifResult<Term<'a>> {
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+    let file = match crate::open_random_rw(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -195,6 +195,7 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
             .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite count: {e}"))))?;
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), u32::from(any_new)).encode(env))
 }
 
@@ -208,7 +209,7 @@ pub fn bloom_file_madd<'a>(
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+    let file = match crate::open_random_rw(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -256,6 +257,7 @@ pub fn bloom_file_madd<'a>(
     file.write_at(&count.to_le_bytes(), 24)
         .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite count: {e}"))))?;
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), results).encode(env))
 }
 
@@ -269,7 +271,7 @@ pub fn bloom_file_exists<'a>(
     path: String,
     element: Binary<'a>,
 ) -> NifResult<Term<'a>> {
-    let file = match File::open(&path) {
+    let file = match crate::open_random_read(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -291,10 +293,12 @@ pub fn bloom_file_exists<'a>(
             .map_err(|e| rustler::Error::Term(Box::new(format!("pread bit: {e}"))))?;
 
         if (buf[0] & (1u8 << bit_offset)) == 0 {
+            crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 0u32).encode(env));
         }
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), 1u32).encode(env))
 }
 
@@ -308,7 +312,7 @@ pub fn bloom_file_mexists<'a>(
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let file = match File::open(&path) {
+    let file = match crate::open_random_read(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -346,6 +350,7 @@ pub fn bloom_file_mexists<'a>(
         }
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), results).encode(env))
 }
 
@@ -354,7 +359,7 @@ pub fn bloom_file_mexists<'a>(
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_card(env: Env, path: String) -> NifResult<Term> {
-    let file = match File::open(&path) {
+    let file = match crate::open_random_read(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -364,6 +369,7 @@ pub fn bloom_file_card(env: Env, path: String) -> NifResult<Term> {
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), count).encode(env))
 }
 
@@ -372,7 +378,7 @@ pub fn bloom_file_card(env: Env, path: String) -> NifResult<Term> {
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn bloom_file_info(env: Env, path: String) -> NifResult<Term> {
-    let file = match File::open(&path) {
+    let file = match crate::open_random_read(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(encode_file_error(env, map_io_error(&e))),
     };
@@ -382,6 +388,7 @@ pub fn bloom_file_info(env: Env, path: String) -> NifResult<Term> {
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), (num_bits, count, num_hashes as u64)).encode(env))
 }
 

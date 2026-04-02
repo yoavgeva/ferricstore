@@ -4,7 +4,7 @@
 //! No mmap, no ResourceArc — fully stateless NIF functions.
 
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -367,9 +367,7 @@ pub fn topk_file_add_v2<'a>(
     path: String,
     elements: Vec<Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let p = Path::new(&path);
-
-    let file = match OpenOptions::new().read(true).write(true).open(p) {
+    let file = match crate::open_random_rw(Path::new(&path)) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -431,6 +429,7 @@ pub fn topk_file_add_v2<'a>(
     // No fsync on hot path — kernel writeback flushes to disk within ~30s.
     // Raft WAL replay reconstructs the file on crash recovery.
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok(results.encode(env))
 }
 
@@ -444,9 +443,7 @@ pub fn topk_file_incrby_v2<'a>(
     path: String,
     pairs: Vec<(Binary<'a>, i64)>,
 ) -> NifResult<Term<'a>> {
-    let p = Path::new(&path);
-
-    let file = match OpenOptions::new().read(true).write(true).open(p) {
+    let file = match crate::open_random_rw(Path::new(&path)) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -507,6 +504,7 @@ pub fn topk_file_incrby_v2<'a>(
     }
     // No fsync on hot path — same rationale as topk_file_add_v2.
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok(results.encode(env))
 }
 
@@ -521,7 +519,7 @@ pub fn topk_file_query_v2<'a>(
 ) -> NifResult<Term<'a>> {
     let p = Path::new(&path);
 
-    let file = match File::open(p) {
+    let file = match crate::open_random_read(p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -552,6 +550,7 @@ pub fn topk_file_query_v2<'a>(
         })
         .collect();
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok(results.encode(env))
 }
 
@@ -562,7 +561,7 @@ pub fn topk_file_query_v2<'a>(
 pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     let p = Path::new(&path);
 
-    let file = match File::open(p) {
+    let file = match crate::open_random_read(p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -597,6 +596,7 @@ pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
         }
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok(result_terms.encode(env))
 }
 
@@ -611,7 +611,7 @@ pub fn topk_file_count_v2<'a>(
 ) -> NifResult<Term<'a>> {
     let p = Path::new(&path);
 
-    let file = match File::open(p) {
+    let file = match crate::open_random_read(p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -634,6 +634,7 @@ pub fn topk_file_count_v2<'a>(
         .map(|elem_bin| v2_cms_estimate(&counters, width, depth, elem_bin.as_slice()))
         .collect();
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok(results.encode(env))
 }
 
@@ -643,7 +644,7 @@ pub fn topk_file_count_v2<'a>(
 pub fn topk_file_info_v2(env: Env, path: String) -> NifResult<Term> {
     let p = Path::new(&path);
 
-    let file = match File::open(p) {
+    let file = match crate::open_random_read(p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((atoms::error(), atoms::enoent()).encode(env));
@@ -656,6 +657,7 @@ pub fn topk_file_info_v2(env: Env, path: String) -> NifResult<Term> {
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((k, width, depth, decay).encode(env))
 }
 

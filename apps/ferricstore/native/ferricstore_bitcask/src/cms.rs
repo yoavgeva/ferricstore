@@ -11,7 +11,7 @@
 //!
 //! Header size: 32 bytes. Magic: `CMS_FIL1` (0x434D535F46494C31).
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -200,7 +200,7 @@ pub fn cms_file_incrby<'a>(
     path: String,
     items: Vec<(rustler::Binary<'a>, i64)>,
 ) -> NifResult<Term<'a>> {
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+    let file = match crate::open_random_rw(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(map_io_error(&e).encode(env)),
     };
@@ -247,6 +247,7 @@ pub fn cms_file_incrby<'a>(
     file.write_at(&total_count.to_le_bytes(), 24)
         .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), counts).encode(env))
 }
 
@@ -262,7 +263,7 @@ pub fn cms_file_query<'a>(
     path: String,
     elements: Vec<rustler::Binary<'a>>,
 ) -> NifResult<Term<'a>> {
-    let file = match File::open(&path) {
+    let file = match crate::open_random_read(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(map_io_error(&e).encode(env)),
     };
@@ -295,6 +296,7 @@ pub fn cms_file_query<'a>(
         }
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), counts).encode(env))
 }
 
@@ -302,7 +304,7 @@ pub fn cms_file_query<'a>(
 #[rustler::nif(schedule = "Normal")]
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 pub fn cms_file_info(env: Env, path: String) -> NifResult<Term> {
-    let file = match File::open(&path) {
+    let file = match crate::open_random_read(Path::new(&path)) {
         Ok(f) => f,
         Err(e) => return Ok(map_io_error(&e).encode(env)),
     };
@@ -312,6 +314,7 @@ pub fn cms_file_info(env: Env, path: String) -> NifResult<Term> {
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), (width, depth, count)).encode(env))
 }
 
@@ -334,7 +337,7 @@ pub fn cms_file_merge(
     }
 
     // Open destination read+write
-    let dst_file = match OpenOptions::new().read(true).write(true).open(&dst_path) {
+    let dst_file = match crate::open_random_rw(Path::new(&dst_path)) {
         Ok(f) => f,
         Err(e) => return Ok(map_io_error(&e).encode(env)),
     };
@@ -347,7 +350,7 @@ pub fn cms_file_merge(
     // Open each source read-only and validate dimensions
     let mut src_files: Vec<(File, u64)> = Vec::with_capacity(src_paths.len());
     for src_path in &src_paths {
-        let src_file = match File::open(src_path) {
+        let src_file = match crate::open_random_read(Path::new(src_path)) {
             Ok(f) => f,
             Err(e) => return Ok(map_io_error(&e).encode(env)),
         };
@@ -408,6 +411,11 @@ pub fn cms_file_merge(
     dst_file
         .write_at(&dst_count.to_le_bytes(), 24)
         .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+
+    crate::fadvise_dontneed(&dst_file, 0, 0);
+    for (src_file, _) in &src_files {
+        crate::fadvise_dontneed(src_file, 0, 0);
+    }
 
     Ok(atoms::ok().encode(env))
 }

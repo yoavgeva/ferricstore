@@ -14,7 +14,7 @@
 //!
 //! Total header size: 27 bytes.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -202,31 +202,24 @@ enum FileOpenError {
 
 /// Open a cuckoo file for reading only.
 fn cuckoo_file_open_read(path: &str) -> Result<File, FileOpenError> {
-    OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                FileOpenError::NotFound
-            } else {
-                FileOpenError::Other(format!("open: {e}"))
-            }
-        })
+    crate::open_random_read(Path::new(path)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FileOpenError::NotFound
+        } else {
+            FileOpenError::Other(format!("open: {e}"))
+        }
+    })
 }
 
 /// Open a cuckoo file for reading and writing.
 fn cuckoo_file_open_rw(path: &str) -> Result<File, FileOpenError> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                FileOpenError::NotFound
-            } else {
-                FileOpenError::Other(format!("open: {e}"))
-            }
-        })
+    crate::open_random_rw(Path::new(path)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            FileOpenError::NotFound
+        } else {
+            FileOpenError::Other(format!("open: {e}"))
+        }
+    })
 }
 
 /// Encode a FileOpenError as an Erlang error term.
@@ -331,6 +324,7 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
                 return Ok((atoms::error(), e).encode(env));
             }
+            crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 1u64).encode(env));
         }
     }
@@ -348,6 +342,7 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
                 return Ok((atoms::error(), e).encode(env));
             }
+            crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 1u64).encode(env));
         }
     }
@@ -385,6 +380,7 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
                 if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
                     return Ok((atoms::error(), e).encode(env));
                 }
+                crate::fadvise_dontneed(&file, 0, 0);
                 return Ok((atoms::ok(), 1u64).encode(env));
             }
         }
@@ -394,6 +390,7 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
         cur_bucket = alt;
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::error(), "filter is full").encode(env))
 }
 
@@ -430,6 +427,7 @@ pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
                 Err(e) => return Ok((atoms::error(), e).encode(env)),
             };
             if s == fp {
+                crate::fadvise_dontneed(&file, 0, 0);
                 return Ok((atoms::ok(), 0u64).encode(env));
             }
         }
@@ -448,6 +446,7 @@ pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
                 return Ok((atoms::error(), e).encode(env));
             }
+            crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 1u64).encode(env));
         }
     }
@@ -465,6 +464,7 @@ pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
                 return Ok((atoms::error(), e).encode(env));
             }
+            crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 1u64).encode(env));
         }
     }
@@ -498,6 +498,7 @@ pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
                 if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
                     return Ok((atoms::error(), e).encode(env));
                 }
+                crate::fadvise_dontneed(&file, 0, 0);
                 return Ok((atoms::ok(), 1u64).encode(env));
             }
         }
@@ -506,6 +507,7 @@ pub fn cuckoo_file_addnx<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
         cur_bucket = alt;
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::error(), "filter is full").encode(env))
 }
 
@@ -550,6 +552,7 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             if let Err(e) = cuckoo_file_write_num_deletes(&file, hdr.num_deletes + 1) {
                 return Ok((atoms::error(), e).encode(env));
             }
+            crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 1u64).encode(env));
         }
     }
@@ -570,10 +573,12 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             if let Err(e) = cuckoo_file_write_num_deletes(&file, hdr.num_deletes + 1) {
                 return Ok((atoms::error(), e).encode(env));
             }
+            crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 1u64).encode(env));
         }
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), 0u64).encode(env))
 }
 
@@ -608,11 +613,13 @@ pub fn cuckoo_file_exists<'a>(env: Env<'a>, path: String, element: Binary<'a>) -
                 Err(e) => return Ok((atoms::error(), e).encode(env)),
             };
             if s == fp {
+                crate::fadvise_dontneed(&file, 0, 0);
                 return Ok((atoms::ok(), 1u64).encode(env));
             }
         }
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), 0u64).encode(env))
 }
 
@@ -653,6 +660,7 @@ pub fn cuckoo_file_count<'a>(env: Env<'a>, path: String, element: Binary<'a>) ->
         }
     }
 
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), total).encode(env))
 }
 
@@ -687,6 +695,7 @@ pub fn cuckoo_file_info(env: Env, path: String) -> NifResult<Term> {
             hdr.max_kicks as u64,
         ),
     );
+    crate::fadvise_dontneed(&file, 0, 0);
     Ok(info.encode(env))
 }
 
