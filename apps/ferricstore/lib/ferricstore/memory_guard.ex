@@ -72,6 +72,9 @@ defmodule Ferricstore.MemoryGuard do
     :keydir_max_ram,
     :hot_cache_max_ram,
     :hot_cache_min_ram,
+    # Effective memory limit: cgroup limit or host RAM.
+    # Used for RSS-based pressure detection.
+    :memory_limit,
     last_pressure_level: :ok,
     last_hot_cache_budget: nil,
     keydir_pressure_level: :ok
@@ -192,6 +195,8 @@ defmodule Ferricstore.MemoryGuard do
 
     initial_budget = hot_cache_budget(max_memory_bytes, :ok)
 
+    memory_limit = detect_memory_limit()
+
     state = %__MODULE__{
       interval_ms: interval_ms,
       max_memory_bytes: max_memory_bytes,
@@ -200,6 +205,7 @@ defmodule Ferricstore.MemoryGuard do
       keydir_max_ram: keydir_max_ram,
       hot_cache_max_ram: max_memory_bytes - keydir_max_ram,
       hot_cache_min_ram: hot_cache_min_ram,
+      memory_limit: memory_limit,
       last_pressure_level: :ok,
       last_hot_cache_budget: initial_budget,
       keydir_pressure_level: :ok
@@ -263,8 +269,10 @@ defmodule Ferricstore.MemoryGuard do
 
     :telemetry.execute(
       [:ferricstore, :memory, :check],
-      %{total_bytes: stats.total_bytes},
-      %{pressure_level: stats.pressure_level, ratio: stats.ratio, max_bytes: stats.max_bytes}
+      %{total_bytes: stats.total_bytes, rss_bytes: stats.rss_bytes},
+      %{pressure_level: stats.pressure_level, ratio: stats.ratio, max_bytes: stats.max_bytes,
+        rss_ratio: stats.rss_ratio, rss_pressure_level: stats.rss_pressure_level,
+        memory_limit: stats.memory_limit}
     )
 
     emit_spec_pressure_level(stats, level)
@@ -413,9 +421,20 @@ defmodule Ferricstore.MemoryGuard do
     keydir_ratio = if state.keydir_max_ram > 0, do: keydir_bytes / state.keydir_max_ram, else: 0.0
     keydir_pressure_level = classify_pressure(keydir_ratio)
 
+    # RSS-based pressure: the real physical memory footprint including ETS,
+    # mmap'd files, NIF allocations, BEAM heaps, and page cache residency.
+    # This catches memory pressure that ETS-only tracking misses.
+    rss_bytes = process_rss_bytes() || 0
+    memory_limit = state.memory_limit
+    rss_ratio = if memory_limit > 0, do: rss_bytes / memory_limit, else: 0.0
+    rss_pressure_level = classify_pressure(rss_ratio)
+
+    # Overall pressure is the worse of keydir-based and RSS-based.
+    overall_pressure = worse_pressure(pressure_level, rss_pressure_level)
+
     %{
       total_bytes: total_bytes, max_bytes: state.max_memory_bytes,
-      ratio: ratio, pressure_level: pressure_level,
+      ratio: ratio, pressure_level: overall_pressure,
       shards: shard_stats, eviction_policy: state.eviction_policy,
       keydir_bytes: keydir_bytes,
       hot_cache_bytes: 0,
@@ -423,8 +442,18 @@ defmodule Ferricstore.MemoryGuard do
       hot_cache_max_ram: state.hot_cache_max_ram,
       hot_cache_min_ram: state.hot_cache_min_ram,
       keydir_pressure_level: keydir_pressure_level,
-      keydir_ratio: keydir_ratio
+      keydir_ratio: keydir_ratio,
+      rss_bytes: rss_bytes,
+      rss_ratio: rss_ratio,
+      rss_pressure_level: rss_pressure_level,
+      memory_limit: memory_limit
     }
+  end
+
+  @pressure_order %{ok: 0, warning: 1, pressure: 2, reject: 3}
+
+  defp worse_pressure(a, b) do
+    if Map.get(@pressure_order, a, 0) >= Map.get(@pressure_order, b, 0), do: a, else: b
   end
 
   defp safe_ets_memory(table_name) do
@@ -504,14 +533,89 @@ defmodule Ferricstore.MemoryGuard do
   defp default_max_memory, do: Application.get_env(:ferricstore, :max_memory_bytes, default_system_memory())
 
   defp default_system_memory do
+    limit = detect_memory_limit()
+    # Use 75% of the detected limit as the default budget.
+    trunc(limit * 0.75)
+  end
+
+  # Detects the effective memory limit: cgroup v2 → cgroup v1 → host RAM.
+  # In Kubernetes, the cgroup limit reflects the pod's memory limit,
+  # which is the correct ceiling (not the host's total RAM).
+  @doc false
+  def detect_memory_limit do
+    cgroup_v2_limit()
+    || cgroup_v1_limit()
+    || host_total_memory()
+    || 1_073_741_824
+  end
+
+  defp cgroup_v2_limit do
+    case File.read("/sys/fs/cgroup/memory.max") do
+      {:ok, "max\n"} -> nil
+      {:ok, data} ->
+        case Integer.parse(String.trim(data)) do
+          {bytes, _} when bytes > 0 -> bytes
+          _ -> nil
+        end
+      _ -> nil
+    end
+  end
+
+  defp cgroup_v1_limit do
+    case File.read("/sys/fs/cgroup/memory/memory.limit_in_bytes") do
+      {:ok, data} ->
+        case Integer.parse(String.trim(data)) do
+          # Very large values (>= 2^62) mean "no limit"
+          {bytes, _} when bytes > 0 and bytes < 4_611_686_018_427_387_904 -> bytes
+          _ -> nil
+        end
+      _ -> nil
+    end
+  end
+
+  defp host_total_memory do
     try do
       data = apply(:memsup, :get_system_memory_data, [])
       case data do
-        list when is_list(list) -> trunc(Keyword.get(list, :total_memory, 1_073_741_824) * 0.75)
-        _ -> 1_073_741_824
+        list when is_list(list) -> Keyword.get(list, :total_memory)
+        _ -> nil
       end
-    rescue _ -> 1_073_741_824
-    catch _, _ -> 1_073_741_824
+    rescue _ -> nil
+    catch _, _ -> nil
+    end
+  end
+
+  # Returns the current process RSS (Resident Set Size) in bytes.
+  # This is the actual physical memory used by the BEAM process,
+  # including ETS, NIF allocations, mmap'd file pages, and BEAM heaps.
+  # Falls back to :erlang.memory(:total) which only covers BEAM-managed memory.
+  @doc false
+  def process_rss_bytes do
+    read_proc_self_rss()
+    || erlang_total_memory()
+  end
+
+  # Linux: parse VmRSS from /proc/self/status (in kB)
+  defp read_proc_self_rss do
+    case File.read("/proc/self/status") do
+      {:ok, content} ->
+        case Regex.run(~r/VmRSS:\s+(\d+)\s+kB/, content) do
+          [_, kb_str] ->
+            case Integer.parse(kb_str) do
+              {kb, _} -> kb * 1024
+              _ -> nil
+            end
+          _ -> nil
+        end
+      _ -> nil
+    end
+  end
+
+  defp erlang_total_memory do
+    try do
+      :erlang.memory(:total)
+    rescue _ -> nil
+    catch _, _ -> nil
     end
   end
 
