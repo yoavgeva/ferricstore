@@ -122,10 +122,7 @@ fn v2_read_cms(file: &File, width: usize, depth: usize) -> Result<Vec<i64>, Stri
 }
 
 /// Helper: write all CMS counters back to the file.
-fn v2_write_cms(
-    file: &File,
-    counters: &[i64],
-) -> Result<(), String> {
+fn v2_write_cms(file: &File, counters: &[i64]) -> Result<(), String> {
     let byte_len = counters.len() * 8;
     let mut buf = vec![0u8; byte_len];
     for (i, &val) in counters.iter().enumerate() {
@@ -163,11 +160,9 @@ fn v2_read_heap(
     for i in 0..read_count {
         let base = i * HEAP_ENTRY_SIZE;
         let count = i64::from_le_bytes(buf[base..base + 8].try_into().unwrap());
-        let elem_len =
-            u32::from_le_bytes(buf[base + 8..base + 12].try_into().unwrap()) as usize;
+        let elem_len = u32::from_le_bytes(buf[base + 8..base + 12].try_into().unwrap()) as usize;
         let clamped = elem_len.min(MAX_ELEMENT_LEN);
-        let element =
-            String::from_utf8_lossy(&buf[base + 12..base + 12 + clamped]).to_string();
+        let element = String::from_utf8_lossy(&buf[base + 12..base + 12 + clamped]).to_string();
         entries.push(V2HeapEntry { element, count });
     }
     Ok(entries)
@@ -390,17 +385,21 @@ pub fn topk_file_add_v2<'a>(
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
-    let mut fingerprints: HashSet<String> = heap_entries
-        .iter()
-        .map(|e| e.element.clone())
-        .collect();
+    let mut fingerprints: HashSet<String> =
+        heap_entries.iter().map(|e| e.element.clone()).collect();
 
     let mut results: Vec<Term<'a>> = Vec::with_capacity(elements.len());
     for elem_bin in &elements {
         let elem_bytes = elem_bin.as_slice();
         let elem_str = String::from_utf8_lossy(elem_bytes);
         let estimated = v2_cms_increment(&mut counters, width, depth, elem_bytes, 1);
-        match v2_heap_add(&mut heap_entries, &mut fingerprints, k, &elem_str, estimated) {
+        match v2_heap_add(
+            &mut heap_entries,
+            &mut fingerprints,
+            k,
+            &elem_str,
+            estimated,
+        ) {
             Some(evicted) => {
                 let evicted_bytes = evicted.as_bytes();
                 match OwnedBinary::new(evicted_bytes.len()) {
@@ -466,17 +465,21 @@ pub fn topk_file_incrby_v2<'a>(
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
-    let mut fingerprints: HashSet<String> = heap_entries
-        .iter()
-        .map(|e| e.element.clone())
-        .collect();
+    let mut fingerprints: HashSet<String> =
+        heap_entries.iter().map(|e| e.element.clone()).collect();
 
     let mut results: Vec<Term<'a>> = Vec::with_capacity(pairs.len());
     for (elem_bin, count) in &pairs {
         let elem_bytes = elem_bin.as_slice();
         let elem_str = String::from_utf8_lossy(elem_bytes);
         let estimated = v2_cms_increment(&mut counters, width, depth, elem_bytes, *count);
-        match v2_heap_add(&mut heap_entries, &mut fingerprints, k, &elem_str, estimated) {
+        match v2_heap_add(
+            &mut heap_entries,
+            &mut fingerprints,
+            k,
+            &elem_str,
+            estimated,
+        ) {
             Some(evicted) => {
                 let evicted_bytes = evicted.as_bytes();
                 match OwnedBinary::new(evicted_bytes.len()) {
@@ -537,10 +540,7 @@ pub fn topk_file_query_v2<'a>(
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
 
-    let fingerprints: HashSet<String> = heap_entries
-        .iter()
-        .map(|e| e.element.clone())
-        .collect();
+    let fingerprints: HashSet<String> = heap_entries.iter().map(|e| e.element.clone()).collect();
 
     let results: Vec<i32> = elements
         .iter()
@@ -580,7 +580,11 @@ pub fn topk_file_list_v2(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
     };
 
     // Sort by count descending, then element ascending for ties
-    heap_entries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.element.cmp(&b.element)));
+    heap_entries.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.element.cmp(&b.element))
+    });
 
     let mut result_terms: Vec<Term<'_>> = Vec::with_capacity(heap_entries.len());
     for entry in &heap_entries {
@@ -677,5 +681,252 @@ mod tests {
 
         let h3 = fnv1a(b"world", 0x811c_9dc5);
         assert_ne!(h1, h3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge case tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a valid TopK file and return the path string.
+    fn create_topk_file(
+        dir: &std::path::Path,
+        name: &str,
+        k: u32,
+        width: u32,
+        depth: u32,
+        decay: f64,
+    ) -> String {
+        let path = dir.join(name);
+        let file_size = TOPK_HEADER_SIZE
+            + (width as usize * depth as usize * 8)
+            + (k as usize * HEAP_ENTRY_SIZE);
+
+        let mut file = File::create(&path).unwrap();
+        let mut header = [0u8; TOPK_HEADER_SIZE];
+        header[0..8].copy_from_slice(&TOPK_MAGIC.to_le_bytes());
+        header[8..12].copy_from_slice(&k.to_le_bytes());
+        header[12..16].copy_from_slice(&width.to_le_bytes());
+        header[16..20].copy_from_slice(&depth.to_le_bytes());
+        header[20..28].copy_from_slice(&decay.to_le_bytes());
+        // heap_len=0, reserved=0 (already zeroed)
+
+        file.write_all(&header).unwrap();
+        let zeros = vec![0u8; file_size - TOPK_HEADER_SIZE];
+        file.write_all(&zeros).unwrap();
+        file.sync_all().unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn empty_element_fnv1a() {
+        let h = fnv1a(b"", 0x811c_9dc5);
+        // Should be the offset basis XOR'd with nothing = offset basis
+        assert_eq!(h, 0x811c_9dc5);
+    }
+
+    #[test]
+    fn large_element_fnv1a() {
+        let big = vec![0xAAu8; 1_000_000];
+        let h = fnv1a(&big, 0x811c_9dc5);
+        // Just verify it doesn't panic and returns a non-zero value.
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn truncated_header_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.topk");
+        std::fs::write(&path, [0u8; 32]).unwrap();
+        let file = File::open(&path).unwrap();
+        assert!(v2_read_header(&file).is_err());
+    }
+
+    #[test]
+    fn wrong_magic_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_magic.topk");
+        let mut data = [0u8; TOPK_HEADER_SIZE + 64];
+        data[0..8].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+        std::fs::write(&path, data).unwrap();
+        let file = File::open(&path).unwrap();
+        let result = v2_read_header(&file);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("magic"));
+    }
+
+    #[test]
+    fn valid_header_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = create_topk_file(dir.path(), "header.topk", 5, 8, 7, 0.9);
+        let file = File::open(&path_str).unwrap();
+        let (k, width, depth, decay, heap_len) = v2_read_header(&file).unwrap();
+        assert_eq!(k, 5);
+        assert_eq!(width, 8);
+        assert_eq!(depth, 7);
+        assert!((decay - 0.9).abs() < 1e-10);
+        assert_eq!(heap_len, 0);
+    }
+
+    #[test]
+    fn cms_increment_and_estimate() {
+        let width = 10;
+        let depth = 3;
+        let mut counters = vec![0i64; width * depth];
+
+        // Increment "apple" by 5
+        let est = v2_cms_increment(&mut counters, width, depth, b"apple", 5);
+        assert_eq!(est, 5);
+
+        // Increment "apple" by 3 more
+        let est2 = v2_cms_increment(&mut counters, width, depth, b"apple", 3);
+        assert_eq!(est2, 8);
+
+        // Estimate should match
+        let est3 = v2_cms_estimate(&counters, width, depth, b"apple");
+        assert_eq!(est3, 8);
+
+        // Unseen element should be 0
+        let est4 = v2_cms_estimate(&counters, width, depth, b"banana");
+        assert_eq!(est4, 0);
+    }
+
+    #[test]
+    fn heap_add_and_eviction() {
+        let k = 3;
+        let mut entries: Vec<V2HeapEntry> = Vec::new();
+        let mut fingerprints: HashSet<String> = HashSet::new();
+
+        // Add 3 elements (heap has room, no eviction)
+        assert_eq!(v2_heap_add(&mut entries, &mut fingerprints, k, "a", 10), None);
+        assert_eq!(v2_heap_add(&mut entries, &mut fingerprints, k, "b", 20), None);
+        assert_eq!(v2_heap_add(&mut entries, &mut fingerprints, k, "c", 30), None);
+        assert_eq!(entries.len(), 3);
+
+        // Add a 4th element with higher count => evicts "a" (count=10, the min)
+        let evicted = v2_heap_add(&mut entries, &mut fingerprints, k, "d", 40);
+        assert_eq!(evicted, Some("a".to_string()));
+        assert_eq!(entries.len(), 3);
+        assert!(!fingerprints.contains("a"));
+        assert!(fingerprints.contains("d"));
+    }
+
+    #[test]
+    fn heap_add_no_eviction_when_new_is_too_small() {
+        let k = 2;
+        let mut entries: Vec<V2HeapEntry> = Vec::new();
+        let mut fingerprints: HashSet<String> = HashSet::new();
+
+        v2_heap_add(&mut entries, &mut fingerprints, k, "a", 100);
+        v2_heap_add(&mut entries, &mut fingerprints, k, "b", 200);
+
+        // New element with count=50 is less than min(100), no eviction
+        let evicted = v2_heap_add(&mut entries, &mut fingerprints, k, "c", 50);
+        assert_eq!(evicted, None);
+        assert_eq!(entries.len(), 2);
+        assert!(!fingerprints.contains("c"));
+    }
+
+    #[test]
+    fn heap_add_update_existing() {
+        let k = 3;
+        let mut entries: Vec<V2HeapEntry> = Vec::new();
+        let mut fingerprints: HashSet<String> = HashSet::new();
+
+        v2_heap_add(&mut entries, &mut fingerprints, k, "a", 10);
+        v2_heap_add(&mut entries, &mut fingerprints, k, "b", 20);
+
+        // Update "a" with new count
+        let evicted = v2_heap_add(&mut entries, &mut fingerprints, k, "a", 50);
+        assert_eq!(evicted, None); // no eviction, just update
+        assert_eq!(entries.len(), 2);
+
+        // Find "a" and verify count was updated
+        let a_entry = entries.iter().find(|e| e.element == "a").unwrap();
+        assert_eq!(a_entry.count, 50);
+    }
+
+    #[test]
+    fn heap_read_write_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = create_topk_file(dir.path(), "heap_rw.topk", 5, 8, 3, 0.9);
+        let file = crate::open_random_rw(std::path::Path::new(&path_str)).unwrap();
+        let (_, width, depth, _, _) = v2_read_header(&file).unwrap();
+
+        // Write some heap entries
+        let entries = vec![
+            V2HeapEntry { element: "alpha".to_string(), count: 100 },
+            V2HeapEntry { element: "beta".to_string(), count: 50 },
+            V2HeapEntry { element: "gamma".to_string(), count: 25 },
+        ];
+        v2_write_heap(&file, width, depth, &entries).unwrap();
+
+        // Read them back
+        let read_entries = v2_read_heap(&file, width, depth, 3, 5).unwrap();
+        assert_eq!(read_entries.len(), 3);
+        assert_eq!(read_entries[0].element, "alpha");
+        assert_eq!(read_entries[0].count, 100);
+        assert_eq!(read_entries[1].element, "beta");
+        assert_eq!(read_entries[1].count, 50);
+        assert_eq!(read_entries[2].element, "gamma");
+        assert_eq!(read_entries[2].count, 25);
+    }
+
+    #[test]
+    fn empty_heap_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = create_topk_file(dir.path(), "empty_heap.topk", 5, 8, 3, 0.9);
+        let file = crate::open_random_read(std::path::Path::new(&path_str)).unwrap();
+        let (k, width, depth, _, heap_len) = v2_read_header(&file).unwrap();
+        assert_eq!(heap_len, 0);
+
+        let entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn cms_write_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = create_topk_file(dir.path(), "cms_rw.topk", 3, 10, 5, 0.9);
+        let file = crate::open_random_rw(std::path::Path::new(&path_str)).unwrap();
+        let (_, width, depth, _, _) = v2_read_header(&file).unwrap();
+
+        let mut counters = vec![0i64; width * depth];
+        v2_cms_increment(&mut counters, width, depth, b"test", 42);
+
+        v2_write_cms(&file, &counters).unwrap();
+
+        let read_counters = v2_read_cms(&file, width, depth).unwrap();
+        assert_eq!(counters, read_counters);
+
+        let est = v2_cms_estimate(&read_counters, width, depth, b"test");
+        assert_eq!(est, 42);
+    }
+
+    #[test]
+    fn nonexistent_file_returns_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.topk");
+        let result = crate::open_random_read(&path);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn element_max_length_clamp() {
+        // Elements longer than MAX_ELEMENT_LEN (252) should be clamped
+        let long_element = "x".repeat(300);
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = create_topk_file(dir.path(), "long.topk", 3, 8, 3, 0.9);
+        let file = crate::open_random_rw(std::path::Path::new(&path_str)).unwrap();
+        let (_, width, depth, _, _) = v2_read_header(&file).unwrap();
+
+        let entries = vec![V2HeapEntry { element: long_element.clone(), count: 10 }];
+        v2_write_heap(&file, width, depth, &entries).unwrap();
+
+        let read_entries = v2_read_heap(&file, width, depth, 1, 3).unwrap();
+        assert_eq!(read_entries.len(), 1);
+        // Should be clamped to MAX_ELEMENT_LEN
+        assert_eq!(read_entries[0].element.len(), MAX_ELEMENT_LEN);
+        assert_eq!(read_entries[0].count, 10);
     }
 }
