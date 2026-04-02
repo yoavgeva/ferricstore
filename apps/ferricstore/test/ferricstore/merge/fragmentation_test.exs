@@ -358,6 +358,98 @@ defmodule Ferricstore.Merge.FragmentationTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Semaphore busy: retry
+  # ---------------------------------------------------------------------------
+
+  describe "semaphore busy retry" do
+    test "scheduler retries merge after semaphore busy" do
+      # Hold the real semaphore so our test scheduler gets :busy
+      real_sem = Ferricstore.Merge.Semaphore
+      :ok = Ferricstore.Merge.Semaphore.acquire(99, real_sem)
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: Application.get_env(:ferricstore, :data_dir, "data"),
+          merge_config: %{
+            mode: :hot,
+            min_files_for_merge: 2,
+            merge_cooldown_ms: 0,
+            merge_retry_interval_ms: 50
+          },
+          semaphore: real_sem,
+          name: :"test_retry_scheduler"
+        )
+
+      # Trigger merge — should get :busy and schedule a retry
+      GenServer.cast(pid, {:file_rotated, 10})
+      Process.sleep(20)
+
+      # Verify retry is pending
+      state = :sys.get_state(pid)
+      assert state.retry_ref != nil
+      assert state.merging == false
+
+      # Release the semaphore — the retry should fire and attempt merge
+      Ferricstore.Merge.Semaphore.release(99, real_sem)
+      Process.sleep(100)
+
+      # After retry, retry_ref should be cleared
+      state = :sys.get_state(pid)
+      assert state.retry_ref == nil
+
+      GenServer.stop(pid)
+    end
+
+    test "multiple busy responses don't stack retries" do
+      real_sem = Ferricstore.Merge.Semaphore
+      :ok = Ferricstore.Merge.Semaphore.acquire(99, real_sem)
+
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: Application.get_env(:ferricstore, :data_dir, "data"),
+          merge_config: %{
+            mode: :hot,
+            min_files_for_merge: 2,
+            merge_cooldown_ms: 0,
+            merge_retry_interval_ms: 200
+          },
+          semaphore: real_sem,
+          name: :"test_no_stack_scheduler"
+        )
+
+      # Send multiple rotations while semaphore held
+      for i <- 1..5 do
+        GenServer.cast(pid, {:file_rotated, 10 + i})
+      end
+
+      Process.sleep(20)
+
+      # Should have exactly one retry pending, not five
+      state = :sys.get_state(pid)
+      assert state.retry_ref != nil
+
+      Ferricstore.Merge.Semaphore.release(99, real_sem)
+      GenServer.stop(pid)
+    end
+
+    test "retry config defaults to 5 seconds" do
+      {:ok, pid} =
+        Scheduler.start_link(
+          shard_index: 0,
+          data_dir: Application.get_env(:ferricstore, :data_dir, "data"),
+          name: :"test_retry_default_scheduler"
+        )
+
+      status = GenServer.call(pid, :status)
+      assert status.config.merge_retry_interval_ms == 5_000
+
+      GenServer.stop(pid)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Status observability
   # ---------------------------------------------------------------------------
 

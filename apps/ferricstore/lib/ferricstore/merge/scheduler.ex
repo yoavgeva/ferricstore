@@ -64,6 +64,7 @@ defmodule Ferricstore.Merge.Scheduler do
   @default_dead_bytes_threshold 134_217_728
   @default_merge_cooldown_ms 60_000
   @default_small_file_threshold 10_485_760
+  @default_merge_retry_interval_ms 5_000
 
   @type merge_mode :: :hot | :bulk | :age
 
@@ -76,7 +77,8 @@ defmodule Ferricstore.Merge.Scheduler do
           fragmentation_threshold: float(),
           dead_bytes_threshold: non_neg_integer(),
           merge_cooldown_ms: non_neg_integer(),
-          small_file_threshold: non_neg_integer()
+          small_file_threshold: non_neg_integer(),
+          merge_retry_interval_ms: non_neg_integer()
         }
 
   defstruct [
@@ -93,7 +95,9 @@ defmodule Ferricstore.Merge.Scheduler do
     # Initialized to 0; updated by :file_rotated casts from the Shard.
     file_count: 0,
     # File IDs flagged by the shard as having high fragmentation.
-    fragmentation_candidates: []
+    fragmentation_candidates: [],
+    # Timer ref for retry after semaphore busy. Prevents stacking retries.
+    retry_ref: nil
   ]
 
   # -------------------------------------------------------------------
@@ -250,6 +254,12 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   @impl true
+  def handle_info(:retry_merge, state) do
+    state = %{state | retry_ref: nil}
+    new_state = maybe_merge(state)
+    {:noreply, new_state}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
@@ -310,16 +320,34 @@ defmodule Ferricstore.Merge.Scheduler do
   defp attempt_merge(state) do
     case Semaphore.acquire(state.shard_index, state.semaphore) do
       :ok ->
+        state = cancel_retry(state)
         state = %{state | merging: true}
         do_merge(state)
 
       {:busy, _holder} ->
         Logger.debug(
-          "Shard #{state.shard_index}: merge semaphore busy, deferring"
+          "Shard #{state.shard_index}: merge semaphore busy, scheduling retry"
         )
 
-        state
+        schedule_retry(state)
     end
+  end
+
+  # Schedule a retry timer if one isn't already pending.
+  defp schedule_retry(%{retry_ref: ref} = state) when ref != nil, do: state
+
+  defp schedule_retry(state) do
+    interval = state.config.merge_retry_interval_ms
+    ref = Process.send_after(self(), :retry_merge, interval)
+    %{state | retry_ref: ref}
+  end
+
+  # Cancel any pending retry timer.
+  defp cancel_retry(%{retry_ref: nil} = state), do: state
+
+  defp cancel_retry(%{retry_ref: ref} = state) do
+    Process.cancel_timer(ref)
+    %{state | retry_ref: nil}
   end
 
   defp do_merge(state) do
@@ -516,6 +544,12 @@ defmodule Ferricstore.Merge.Scheduler do
           overrides,
           :small_file_threshold,
           app_config(:small_file_threshold, @default_small_file_threshold)
+        ),
+      merge_retry_interval_ms:
+        Map.get(
+          overrides,
+          :merge_retry_interval_ms,
+          app_config(:merge_retry_interval_ms, @default_merge_retry_interval_ms)
         )
     }
   end
