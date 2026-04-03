@@ -1,27 +1,53 @@
 defmodule FerricStore do
   @moduledoc """
-  Direct Elixir API for FerricStore in embedded mode.
+  Module-based cache instances for FerricStore.
 
-  When FerricStore runs embedded inside a host Elixir application, this module
-  provides direct function calls that bypass TCP, RESP3 parsing, and ACL checks.
-  These are thin wrappers around the same shard routing and group-commit pipeline
-  that standalone mode uses, at ETS lookup latency (~1-5us for hot reads).
+  Each module that calls `use FerricStore` gets its own fully isolated
+  cache instance with its own shards, ETS tables, Raft system, and config.
 
   ## Usage
 
-      FerricStore.set("user:42:name", "alice", ttl: :timer.hours(1))
-      {:ok, "alice"} = FerricStore.get("user:42:name")
-      :ok = FerricStore.del("user:42:name")
+      defmodule MyApp.Cache do
+        use FerricStore,
+          data_dir: "/data/cache",
+          shard_count: 4,
+          max_memory: "1GB"
+      end
 
-  ## Named caches
+      # In your supervision tree:
+      children = [MyApp.Cache]
 
-  Pass the `:cache` option to direct operations to a named cache instance:
+      # Then use it:
+      MyApp.Cache.set("key", "value")
+      {:ok, "value"} = MyApp.Cache.get("key")
 
-      FerricStore.set("session:abc", data, cache: :sessions)
-      FerricStore.get("session:abc", cache: :sessions)
+  ## Multiple instances
 
-  When `:cache` is not specified, the default cache is used.
+      defmodule MyApp.Sessions do
+        use FerricStore,
+          data_dir: "/data/sessions",
+          shard_count: 2
+      end
+
+      MyApp.Cache.set("page:home", html)
+      MyApp.Sessions.set("sess:abc", session_data)
+
+  ## Options
+
+    * `:data_dir` — base directory for Bitcask data files (required)
+    * `:shard_count` — number of shards (default: 4)
+    * `:max_memory_bytes` — maximum memory budget (default: 1GB)
+    * `:keydir_max_ram` — maximum ETS keydir memory (default: 256MB)
+    * `:eviction_policy` — `:volatile_lfu` | `:allkeys_lfu` | `:noeviction` (default: `:volatile_lfu`)
+    * `:hot_cache_max_value_size` — max value size for ETS caching (default: 65536)
+    * `:read_sample_rate` — LFU sampling rate (default: 100)
   """
+
+  defmacro __using__(opts) do
+    quote do
+      use FerricStore.Macro, unquote(opts)
+    end
+  end
 
   alias Ferricstore.Store.Router
 
