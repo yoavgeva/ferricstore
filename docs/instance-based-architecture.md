@@ -325,24 +325,26 @@ end
 
 No flush_all_keys, no sandbox, no shared state. Tests can run `async: true`.
 
-## Migration Path
+## Implementation
 
-### Phase 1: Internal refactor (non-breaking)
-- Add `ctx` parameter to all Router/Shard/StateMachine internal functions
-- Build instance context from current global state
-- Current `FerricStore` module becomes a thin wrapper that uses a default instance
-- All tests pass unchanged
+This is a new library — there is no existing user base to migrate. We implement
+the instance-based architecture directly. No backward compatibility, no
+deprecation phases, no global singleton fallback.
 
-### Phase 2: Add `use FerricStore` macro
-- Implement `FerricStore.Instance` start/stop
-- Implement `__using__` macro that generates API functions
-- Current `FerricStore` module uses default instance internally
-- Users can define custom instances
+The `FerricStore` module exists ONLY as the `use` macro provider. There are no
+global `FerricStore.set/2` or `FerricStore.get/1` functions. Users must define
+a module with `use FerricStore` to get an API.
 
-### Phase 3: Deprecate global API
-- Mark `FerricStore.set/2` etc. as deprecated
-- Guide users to `use FerricStore` pattern
-- Remove global persistent_term usage
+The application module does NOT start any instances automatically. Each instance
+is started by the user's supervision tree:
+
+```elixir
+# In the user's application.ex:
+children = [
+  MyApp.Cache,     # starts the FerricStore instance
+  MyApp.Sessions,  # starts another independent instance
+]
+```
 
 ## Performance Comparison
 
@@ -357,28 +359,31 @@ No flush_all_keys, no sandbox, no shared state. Tests can run `async: true`.
 **Estimated 30-40ns faster per operation** from eliminating persistent_term lookups.
 At 100K ops/sec that's 3-4ms saved per second. At 1M ops/sec that's 30-40ms.
 
-## Files to Modify
+## Files
 
-| File | Changes |
+All files are rewritten to use the instance context. No global persistent_term,
+no globally named processes, no singleton assumptions.
+
+| File | Role |
 |---|---|
-| `ferricstore.ex` | Add `__using__` macro, wrap 208 functions with default instance |
-| `ferricstore/instance.ex` | NEW — Instance struct, start_link, init |
-| `ferricstore/instance/supervisor.ex` | NEW — Per-instance supervision tree |
-| `ferricstore/impl.ex` | NEW — All 208 functions taking ctx as first arg |
-| `store/router.ex` | Add ctx as first arg to all functions |
-| `store/shard.ex` | Receive ctx at init, use for all operations |
-| `store/disk_pressure.ex` | Take atomics ref instead of global |
-| `store/write_version.ex` | Take counters ref instead of global |
+| `ferricstore.ex` | `use` macro only — generates 208 API functions per module |
+| `ferricstore/instance.ex` | Instance struct + start_link + init |
+| `ferricstore/instance/supervisor.ex` | Per-instance supervision tree |
+| `ferricstore/impl.ex` | All 208 functions taking `ctx` as first arg |
+| `store/router.ex` | All routing functions take `ctx` — zero persistent_term |
+| `store/shard.ex` | Receives `ctx` at init, all operations use ctx refs |
+| `store/disk_pressure.ex` | Takes atomics ref from ctx |
+| `store/write_version.ex` | Takes counters ref from ctx |
 | `store/active_file.ex` | Instance-scoped |
-| `store/lfu.ex` | Read config from ctx instead of persistent_term |
+| `store/lfu.ex` | Reads config from ctx |
 | `raft/cluster.ex` | Instance-scoped ra system name |
-| `raft/state_machine.ex` | Receive ctx refs via machine_config |
+| `raft/state_machine.ex` | Receives ctx refs via machine_config |
 | `raft/batcher.ex` | Instance-scoped naming |
 | `raft/async_apply_worker.ex` | Instance-scoped naming |
-| `commands/dispatcher.ex` | Pass ctx through store map |
+| `commands/dispatcher.ex` | Passes ctx through store map |
 | `commands/*.ex` | No changes (use store map callbacks) |
 | `memory_guard.ex` | Per-instance GenServer |
 | `stats.ex` | Per-instance counters |
-| `application.ex` | Start default instance from config |
+| `application.ex` | Minimal — just HLC + shared Tokio runtime |
 | `config.ex` | Per-instance config ETS |
-| Connection (server) | Receive instance ctx, build store map with it |
+| Connection (server) | Receives instance ctx from listener config |
