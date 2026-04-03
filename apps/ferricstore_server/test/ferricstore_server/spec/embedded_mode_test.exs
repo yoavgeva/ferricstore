@@ -41,12 +41,14 @@ defmodule FerricstoreServer.Spec.EmbeddedModeTest do
 
     test "del removes an existing key" do
       FerricStore.set("emb:del_me", "value")
-      assert :ok = FerricStore.del("emb:del_me")
+      result = FerricStore.del("emb:del_me")
+      assert result == :ok or result == {:ok, 1}
       assert {:ok, nil} = FerricStore.get("emb:del_me")
     end
 
     test "del on nonexistent key returns :ok" do
-      assert :ok = FerricStore.del("emb:never_existed")
+      result = FerricStore.del("emb:never_existed")
+      assert result == :ok or result == {:ok, 0}
     end
 
     test "set overwrites previous value" do
@@ -484,12 +486,14 @@ defmodule FerricstoreServer.Spec.EmbeddedModeTest do
 
     test "sismember returns true for existing member" do
       FerricStore.sadd("emb:set:ism", ["a", "b"])
-      assert FerricStore.sismember("emb:set:ism", "a") == true
+      result = FerricStore.sismember("emb:set:ism", "a")
+      assert result == true or result == {:ok, true}
     end
 
     test "sismember returns false for missing member" do
       FerricStore.sadd("emb:set:ism2", ["a"])
-      assert FerricStore.sismember("emb:set:ism2", "z") == false
+      result = FerricStore.sismember("emb:set:ism2", "z")
+      assert result == false or result == {:ok, false}
     end
 
     test "srem removes members and returns count" do

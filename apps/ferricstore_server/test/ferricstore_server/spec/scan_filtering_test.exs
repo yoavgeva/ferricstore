@@ -320,19 +320,10 @@ defmodule FerricstoreServer.Spec.ScanFilteringTest do
       end
 
       test_pid = self()
-      _parent_ns = FerricStore.Sandbox.current_namespace()
 
       # Start a writer that modifies keys concurrently
       writer =
         spawn(fn ->
-          # Wait for sandbox namespace propagation
-          receive do
-            {:ferricstore_sandbox_allow, ns} ->
-              Process.put(:ferricstore_sandbox, ns)
-          after
-            5_000 -> :timeout
-          end
-
           for round <- 1..100 do
             idx = rem(round, 20) + 1
             FerricStore.set("cw_key_#{idx}", "updated_round_#{round}")
@@ -340,9 +331,6 @@ defmodule FerricstoreServer.Spec.ScanFilteringTest do
 
           send(test_pid, :writer_done)
         end)
-
-      # Propagate sandbox to writer
-      FerricStore.Sandbox.allow(writer)
 
       # Concurrently perform SCAN iterations
       for _scan_round <- 1..20 do
