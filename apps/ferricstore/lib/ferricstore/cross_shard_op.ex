@@ -333,7 +333,8 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec build_store_for_shard(non_neg_integer()) :: map()
   def build_store_for_shard(shard_idx) do
-    shard = Router.shard_name(shard_idx)
+    ctx = FerricStore.Instance.get(:default)
+    shard = Router.shard_name(ctx, shard_idx)
 
     %{
       shard_idx: shard_idx,
@@ -430,8 +431,9 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec build_routing_store(map()) :: map()
   def build_routing_store(per_shard_stores) do
+    ctx = FerricStore.Instance.get(:default)
     route = fn key ->
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(ctx, key)
       Map.get(per_shard_stores, idx) || Map.get(per_shard_stores, hd(Map.keys(per_shard_stores)))
     end
 
@@ -460,8 +462,9 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec build_locked_routing_store(map(), reference()) :: map()
   def build_locked_routing_store(per_shard_stores, owner_ref) do
+    ctx = FerricStore.Instance.get(:default)
     route = fn key ->
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(ctx, key)
       Map.get(per_shard_stores, idx) || Map.get(per_shard_stores, hd(Map.keys(per_shard_stores)))
     end
 
@@ -479,7 +482,7 @@ defmodule Ferricstore.CrossShardOp do
 
       # Writes: use locked variants through Raft with owner_ref
       put: fn key, value, expire_at_ms ->
-        shard_idx = Router.shard_for(key)
+        shard_idx = Router.shard_for(ctx, key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
         case :ra.process_command(shard_id, {:locked_put, key, value, expire_at_ms, owner_ref}) do
@@ -488,7 +491,7 @@ defmodule Ferricstore.CrossShardOp do
         end
       end,
       delete: fn key ->
-        shard_idx = Router.shard_for(key)
+        shard_idx = Router.shard_for(ctx, key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
         case :ra.process_command(shard_id, {:locked_delete, key, owner_ref}) do
@@ -497,7 +500,7 @@ defmodule Ferricstore.CrossShardOp do
         end
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard_idx = Router.shard_for(redis_key)
+        shard_idx = Router.shard_for(ctx, redis_key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
         case :ra.process_command(shard_id, {:locked_put, compound_key, value, expire_at_ms, owner_ref}) do
@@ -506,7 +509,7 @@ defmodule Ferricstore.CrossShardOp do
         end
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard_idx = Router.shard_for(redis_key)
+        shard_idx = Router.shard_for(ctx, redis_key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
         case :ra.process_command(shard_id, {:locked_delete, compound_key, owner_ref}) do
@@ -515,7 +518,7 @@ defmodule Ferricstore.CrossShardOp do
         end
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard_idx = Router.shard_for(redis_key)
+        shard_idx = Router.shard_for(ctx, redis_key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
         case :ra.process_command(shard_id, {:locked_delete_prefix, prefix, owner_ref}) do
@@ -532,8 +535,9 @@ defmodule Ferricstore.CrossShardOp do
   @doc false
   @spec compute_value_hashes([key_with_role()], map()) :: map()
   def compute_value_hashes(keys_with_roles, per_shard_stores) do
+    ctx = FerricStore.Instance.get(:default)
     Map.new(keys_with_roles, fn {key, _role} ->
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(ctx, key)
       store = Map.get(per_shard_stores, idx)
 
       value =
@@ -553,9 +557,10 @@ defmodule Ferricstore.CrossShardOp do
 
   # Groups keys by shard index, preserving roles.
   defp group_keys_by_shard(keys_with_roles) do
+    ctx = FerricStore.Instance.get(:default)
     Enum.group_by(
       keys_with_roles,
-      fn {key, _role} -> Router.shard_for(key) end,
+      fn {key, _role} -> Router.shard_for(ctx, key) end,
       fn {key, role} -> {key, role} end
     )
   end
@@ -563,10 +568,11 @@ defmodule Ferricstore.CrossShardOp do
   # Builds a map of shard_index => [keys_to_lock]. Only :write and :read_write
   # roles need locking.
   defp build_lock_map(keys_with_roles) do
+    ctx = FerricStore.Instance.get(:default)
     keys_with_roles
     |> Enum.filter(fn {_key, role} -> role in [:write, :read_write] end)
     |> Enum.group_by(
-      fn {key, _role} -> Router.shard_for(key) end,
+      fn {key, _role} -> Router.shard_for(ctx, key) end,
       fn {key, _role} -> key end
     )
   end

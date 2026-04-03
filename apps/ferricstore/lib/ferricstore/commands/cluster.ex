@@ -83,7 +83,8 @@ defmodule Ferricstore.Commands.Cluster do
   end
 
   def handle("CLUSTER.KEYSLOT", [key], _store) do
-    Router.slot_for(key)
+    ctx = FerricStore.Instance.get(:default)
+    Router.slot_for(ctx, key)
   end
 
   def handle("CLUSTER.KEYSLOT", _args, _store) do
@@ -170,7 +171,8 @@ defmodule Ferricstore.Commands.Cluster do
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
     Enum.map(0..(shard_count - 1), fn index ->
       keydir = :"keydir_#{index}"
-      name = Router.shard_name(index)
+      ctx = FerricStore.Instance.get(:default)
+      name = Router.shard_name(ctx, index)
 
       info =
         try do

@@ -335,7 +335,7 @@ defmodule Ferricstore.Raft.PatchedWalTest do
       # Delete odd, overwrite even
       for i <- 1..50 do
         if rem(i, 2) == 1 do
-          :ok = FerricStore.del("#{prefix}:#{i}")
+          {:ok, 1} = FerricStore.del("#{prefix}:#{i}")
         else
           :ok = FerricStore.set("#{prefix}:#{i}", "updated")
         end

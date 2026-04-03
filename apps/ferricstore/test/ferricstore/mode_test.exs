@@ -27,9 +27,9 @@ defmodule Ferricstore.ModeTest do
   # ---------------------------------------------------------------------------
 
   describe "current/0" do
-    test "returns :standalone when :mode is not configured" do
+    test "returns :embedded when :mode is not configured (default)" do
       Application.delete_env(:ferricstore, :mode)
-      assert Mode.current() == :standalone
+      assert Mode.current() == :embedded
     end
 
     test "returns :standalone when explicitly set" do
@@ -53,9 +53,9 @@ defmodule Ferricstore.ModeTest do
       assert Mode.standalone?() == true
     end
 
-    test "returns true when mode is not configured (default)" do
+    test "returns false when mode is not configured (default is :embedded)" do
       Application.delete_env(:ferricstore, :mode)
-      assert Mode.standalone?() == true
+      assert Mode.standalone?() == false
     end
 
     test "returns false when mode is :embedded" do
@@ -79,9 +79,9 @@ defmodule Ferricstore.ModeTest do
       assert Mode.embedded?() == false
     end
 
-    test "returns false when mode is not configured (default)" do
+    test "returns true when mode is not configured (default is :embedded)" do
       Application.delete_env(:ferricstore, :mode)
-      assert Mode.embedded?() == false
+      assert Mode.embedded?() == true
     end
   end
 

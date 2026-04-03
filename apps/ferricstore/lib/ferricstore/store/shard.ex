@@ -88,6 +88,10 @@ defmodule Ferricstore.Store.Shard do
     # Cached result of DataDir.shard_data_path(data_dir, index).
     # Computed once during init; avoids string concat on every cold read/flush.
     :shard_data_path,
+    # FerricStore.Instance context — holds all per-instance refs (shard_names,
+    # slot_map, keydir_refs, atomics, config) needed to route operations without
+    # global state. Passed to Router.* calls instead of persistent_term lookups.
+    :instance_ctx,
     :active_file_id,
     :active_file_path,
     :active_file_size,
@@ -134,7 +138,8 @@ defmodule Ferricstore.Store.Shard do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     index = Keyword.fetch!(opts, :index)
-    name = Router.shard_name(index)
+    ctx = Keyword.get(opts, :instance_ctx)
+    name = if ctx, do: Router.shard_name(ctx, index), else: :"Ferricstore.Store.Shard.#{index}"
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
@@ -148,6 +153,7 @@ defmodule Ferricstore.Store.Shard do
     index = Keyword.fetch!(opts, :index)
     data_dir = Keyword.fetch!(opts, :data_dir)
     flush_ms = Keyword.get(opts, :flush_interval_ms, @flush_interval_ms)
+    ctx = Keyword.get(opts, :instance_ctx)
 
     path = Ferricstore.DataDir.shard_data_path(data_dir, index)
     File.mkdir_p!(path)
@@ -226,6 +232,7 @@ defmodule Ferricstore.Store.Shard do
     {:ok, %__MODULE__{ets: keydir, keydir: keydir,
                        prefix_keys: prefix_keys, index: index, data_dir: data_dir,
                        shard_data_path: path,
+                       instance_ctx: ctx,
                        active_file_id: active_file_id,
                        active_file_path: active_file_path,
                        active_file_size: active_file_size,
@@ -1563,6 +1570,7 @@ defmodule Ferricstore.Store.Shard do
   # uses a direct write path, falling through to normal Router for other shards.
   defp build_local_store(state) do
     my_idx = state.index
+    instance_ctx = state.instance_ctx
     # Build a minimal context with only the fields closures need, to avoid
     # capturing the entire state struct (which includes pending list,
     # promoted_instances, etc. that hold stale references).
@@ -1577,7 +1585,7 @@ defmodule Ferricstore.Store.Shard do
     # Direct put: write to ETS immediately, queue for async Bitcask flush.
     # This mirrors the non-raft {:put, ...} handler logic.
     local_put = fn key, value, expire_at_ms ->
-      is_local = Router.shard_for(key) == my_idx
+      is_local = Router.shard_for(instance_ctx, key) == my_idx
 
       if is_local do
         ets_insert(ctx, key, value, expire_at_ms)
@@ -1590,12 +1598,12 @@ defmodule Ferricstore.Store.Shard do
         send(self(), {:tx_pending_write, key, value, expire_at_ms})
         :ok
       else
-        Router.put(key, value, expire_at_ms)
+        Router.put(instance_ctx, key, value, expire_at_ms)
       end
     end
 
     local_delete = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         ets_delete_key(state, key)
         # Track deletion so subsequent reads within this tx see the key as gone
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
@@ -1603,12 +1611,12 @@ defmodule Ferricstore.Store.Shard do
         send(self(), {:tx_pending_delete, key})
         :ok
       else
-        Router.delete(key)
+        Router.delete(instance_ctx, key)
       end
     end
 
     local_get = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         # Check if key was deleted within this transaction
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
@@ -1630,12 +1638,12 @@ defmodule Ferricstore.Store.Shard do
           end
         end
       else
-        Router.get(key)
+        Router.get(instance_ctx, key)
       end
     end
 
     local_get_meta = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
         if MapSet.member?(deleted, key) do
@@ -1655,12 +1663,12 @@ defmodule Ferricstore.Store.Shard do
           end
         end
       else
-        Router.get_meta(key)
+        Router.get_meta(instance_ctx, key)
       end
     end
 
     local_exists = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         deleted = Process.get(:tx_deleted_keys, MapSet.new())
 
         if MapSet.member?(deleted, key) do
@@ -1678,12 +1686,12 @@ defmodule Ferricstore.Store.Shard do
           end
         end
       else
-        Router.exists?(key)
+        Router.exists?(instance_ctx, key)
       end
     end
 
     local_incr = fn key, delta ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         current =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> value
@@ -1715,12 +1723,12 @@ defmodule Ferricstore.Store.Shard do
             end
         end
       else
-        Router.incr(key, delta)
+        Router.incr(instance_ctx, key, delta)
       end
     end
 
     local_incr_float = fn key, delta ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         current =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> value
@@ -1753,12 +1761,12 @@ defmodule Ferricstore.Store.Shard do
             end
         end
       else
-        Router.incr_float(key, delta)
+        Router.incr_float(instance_ctx, key, delta)
       end
     end
 
     local_append = fn key, suffix ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         current =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> to_disk_binary(value)
@@ -1776,12 +1784,12 @@ defmodule Ferricstore.Store.Shard do
         send(self(), {:tx_pending_write, key, new_val, 0})
         {:ok, byte_size(new_val)}
       else
-        Router.append(key, suffix)
+        Router.append(instance_ctx, key, suffix)
       end
     end
 
     local_getset = fn key, new_value ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         old =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> value
@@ -1798,12 +1806,12 @@ defmodule Ferricstore.Store.Shard do
         send(self(), {:tx_pending_write, key, new_value, 0})
         old
       else
-        Router.getset(key, new_value)
+        Router.getset(instance_ctx, key, new_value)
       end
     end
 
     local_getdel = fn key ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         old =
           case ets_lookup_warm(ctx, key) do
             {:hit, value, _exp} -> value
@@ -1823,12 +1831,12 @@ defmodule Ferricstore.Store.Shard do
 
         old
       else
-        Router.getdel(key)
+        Router.getdel(instance_ctx, key)
       end
     end
 
     local_getex = fn key, expire_at_ms ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         value =
           case ets_lookup_warm(ctx, key) do
             {:hit, v, _exp} -> v
@@ -1848,12 +1856,12 @@ defmodule Ferricstore.Store.Shard do
 
         value
       else
-        Router.getex(key, expire_at_ms)
+        Router.getex(instance_ctx, key, expire_at_ms)
       end
     end
 
     local_setrange = fn key, offset, value ->
-      if Router.shard_for(key) == my_idx do
+      if Router.shard_for(instance_ctx, key) == my_idx do
         old =
           case ets_lookup_warm(ctx, key) do
             {:hit, v, _exp} -> to_disk_binary(v)
@@ -1871,7 +1879,7 @@ defmodule Ferricstore.Store.Shard do
         send(self(), {:tx_pending_write, key, new_val, 0})
         {:ok, byte_size(new_val)}
       else
-        Router.setrange(key, offset, value)
+        Router.setrange(instance_ctx, key, offset, value)
       end
     end
 
@@ -1881,12 +1889,12 @@ defmodule Ferricstore.Store.Shard do
       put: local_put,
       delete: local_delete,
       exists?: local_exists,
-      keys: &Router.keys/0,
+      keys: fn -> Router.keys(instance_ctx) end,
       flush: fn ->
-        Enum.each(Router.keys(), &Router.delete/1)
+        Enum.each(Router.keys(instance_ctx), fn k -> Router.delete(instance_ctx, k) end)
         :ok
       end,
-      dbsize: &Router.dbsize/0,
+      dbsize: fn -> Router.dbsize(instance_ctx) end,
       incr: local_incr,
       incr_float: local_incr_float,
       append: local_append,
@@ -1894,14 +1902,14 @@ defmodule Ferricstore.Store.Shard do
       getdel: local_getdel,
       getex: local_getex,
       setrange: local_setrange,
-      cas: &Router.cas/4,
-      lock: &Router.lock/3,
-      unlock: &Router.unlock/2,
-      extend: &Router.extend/3,
-      ratelimit_add: &Router.ratelimit_add/4,
-      list_op: &Router.list_op/2,
+      cas: fn key, expected, new_value, ttl_ms -> Router.cas(instance_ctx, key, expected, new_value, ttl_ms) end,
+      lock: fn key, owner, ttl_ms -> Router.lock(instance_ctx, key, owner, ttl_ms) end,
+      unlock: fn key, owner -> Router.unlock(instance_ctx, key, owner) end,
+      extend: fn key, owner, ttl_ms -> Router.extend(instance_ctx, key, owner, ttl_ms) end,
+      ratelimit_add: fn key, window_ms, max, count -> Router.ratelimit_add(instance_ctx, key, window_ms, max, count) end,
+      list_op: fn key, operation -> Router.list_op(instance_ctx, key, operation) end,
       compound_get: fn redis_key, compound_key ->
-        if Router.shard_for(redis_key) == my_idx do
+        if Router.shard_for(instance_ctx, redis_key) == my_idx do
           # Local: read compound key directly from ETS
           case ets_lookup_warm(ctx, compound_key) do
             {:hit, value, _exp} -> value
@@ -1916,12 +1924,12 @@ defmodule Ferricstore.Store.Shard do
               end
           end
         else
-          shard = Router.resolve_shard(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(instance_ctx, Router.shard_for(instance_ctx, redis_key))
           GenServer.call(shard, {:compound_get, redis_key, compound_key})
         end
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        if Router.shard_for(redis_key) == my_idx do
+        if Router.shard_for(instance_ctx, redis_key) == my_idx do
           case ets_lookup_warm(ctx, compound_key) do
             {:hit, value, exp} -> {value, exp}
             :expired -> nil
@@ -1935,52 +1943,52 @@ defmodule Ferricstore.Store.Shard do
               end
           end
         else
-          shard = Router.resolve_shard(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(instance_ctx, Router.shard_for(instance_ctx, redis_key))
           GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
         end
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        if Router.shard_for(redis_key) == my_idx do
+        if Router.shard_for(instance_ctx, redis_key) == my_idx do
           ets_insert(ctx, compound_key, value, expire_at_ms)
           send(self(), {:tx_pending_write, compound_key, value, expire_at_ms})
           :ok
         else
-          shard = Router.resolve_shard(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(instance_ctx, Router.shard_for(instance_ctx, redis_key))
           GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
         end
       end,
       compound_delete: fn redis_key, compound_key ->
-        if Router.shard_for(redis_key) == my_idx do
+        if Router.shard_for(instance_ctx, redis_key) == my_idx do
           ets_delete_key(ctx, compound_key)
           send(self(), {:tx_pending_delete, compound_key})
           :ok
         else
-          shard = Router.resolve_shard(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(instance_ctx, Router.shard_for(instance_ctx, redis_key))
           GenServer.call(shard, {:compound_delete, redis_key, compound_key})
         end
       end,
       compound_scan: fn redis_key, prefix ->
-        if Router.shard_for(redis_key) == my_idx do
+        if Router.shard_for(instance_ctx, redis_key) == my_idx do
           # Uses :ets.select match spec instead of :ets.foldl full-table scan
           # Pass shard_data_path to enable cold-read for recovered keys
           results = prefix_scan_entries(ctx.keydir, prefix, ctx.shard_data_path)
           Enum.sort_by(results, fn {field, _} -> field end)
         else
-          shard = Router.resolve_shard(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(instance_ctx, Router.shard_for(instance_ctx, redis_key))
           GenServer.call(shard, {:compound_scan, redis_key, prefix})
         end
       end,
       compound_count: fn redis_key, prefix ->
-        if Router.shard_for(redis_key) == my_idx do
+        if Router.shard_for(instance_ctx, redis_key) == my_idx do
           # Uses :ets.select match spec instead of :ets.foldl full-table scan
           prefix_count_entries(ctx.keydir, prefix)
         else
-          shard = Router.resolve_shard(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(instance_ctx, Router.shard_for(instance_ctx, redis_key))
           GenServer.call(shard, {:compound_count, redis_key, prefix})
         end
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        if Router.shard_for(redis_key) == my_idx do
+        if Router.shard_for(instance_ctx, redis_key) == my_idx do
           # Uses :ets.select match spec instead of :ets.foldl full-table scan
           keys_to_delete = prefix_collect_keys(ctx.keydir, prefix)
 
@@ -1991,7 +1999,7 @@ defmodule Ferricstore.Store.Shard do
 
           :ok
         else
-          shard = Router.resolve_shard(Router.shard_for(redis_key))
+          shard = Router.resolve_shard(instance_ctx, Router.shard_for(instance_ctx, redis_key))
           GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
         end
       end,
@@ -1999,7 +2007,7 @@ defmodule Ferricstore.Store.Shard do
         Path.join(ctx.shard_data_path, "prob")
       end,
       prob_write: fn command ->
-        Router.prob_write(command)
+        Router.prob_write(instance_ctx, command)
       end,
       shard_index: ctx.index,
       data_dir: ctx.data_dir

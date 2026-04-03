@@ -41,7 +41,8 @@ defmodule Mix.Tasks.Ferricstore.Info do
 
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
     uptime = Ferricstore.Stats.uptime_seconds()
-    keys = Ferricstore.Store.Router.keys()
+    ctx = FerricStore.Instance.get(:default)
+    keys = Ferricstore.Store.Router.keys(ctx)
     total_keys = length(keys)
     memory = :erlang.memory(:total)
 
@@ -57,7 +58,7 @@ defmodule Mix.Tasks.Ferricstore.Info do
     Mix.shell().info("--- Shard Status ---")
 
     Enum.each(0..(shard_count - 1), fn i ->
-      shard_name = Ferricstore.Store.Router.shard_name(i)
+      shard_name = Ferricstore.Store.Router.shard_name(ctx, i)
       pid = Process.whereis(shard_name)
       alive? = is_pid(pid) and Process.alive?(pid)
       status = if alive?, do: "ok", else: "down"

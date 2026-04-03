@@ -177,18 +177,17 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       assert val1 == val2
     end
 
-    test "LFU.initial uses persistent_term cache" do
+    test "LFU.initial uses persistent_term atomics cache" do
       packed = LFU.initial()
       {minute, counter} = LFU.unpack(packed)
       assert counter == LFU.initial_counter()
       assert minute == LFU.now_minutes()
 
-      # Verify cache exists in persistent_term
-      cache = :persistent_term.get(:ferricstore_lfu_initial_cache, nil)
-      assert cache != nil
-      {cached_min, cached_packed} = cache
-      assert cached_min == minute
-      assert cached_packed == packed
+      # Verify cache exists via atomics ref in persistent_term
+      ref = :persistent_term.get(:ferricstore_lfu_initial_ref, nil)
+      assert ref != nil
+      assert :atomics.get(ref, 1) == minute
+      assert :atomics.get(ref, 2) == packed
     end
 
     test "LFU.initial produces valid packed values for ETS insert" do

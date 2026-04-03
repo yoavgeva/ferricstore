@@ -219,9 +219,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       Router.put(k0, "original_k0", 0)
       Router.put(k1, "original_k1", 0)
 
-      # Capture version of watched key
-      version_k0 = Router.get_version(k0)
-      watched = %{k0 => version_k0}
+      # watches_clean? uses phash2(Router.get(key)) to detect changes
+      watched = %{k0 => :erlang.phash2(Router.get(k0))}
 
       # Simulate another client modifying the watched key
       Router.put(k0, "modified_by_other", 0)
@@ -245,8 +244,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
     test "WATCH key, no modification, cross-shard EXEC succeeds", %{k0: k0, k1: k1} do
       Router.put(k0, "original_k0", 0)
 
-      version_k0 = Router.get_version(k0)
-      watched = %{k0 => version_k0}
+      # watches_clean? uses phash2(Router.get(key)) to detect changes
+      watched = %{k0 => :erlang.phash2(Router.get(k0))}
 
       # Cross-shard transaction with unmodified watched key
       queue = [

@@ -111,7 +111,6 @@ defmodule Ferricstore.Application do
     # a uniform 1024-slot -> shard mapping and stores it in persistent_term.
     # Also sets :ferricstore_shard_count.
     Ferricstore.Store.SlotMap.init(shard_count)
-    Ferricstore.Store.Router.init_shard_names(shard_count)
     :persistent_term.put(:ferricstore_promotion_threshold,
       Application.get_env(:ferricstore, :promotion_threshold, 100))
     :persistent_term.put(:ferricstore_read_sample_rate,
@@ -291,7 +290,7 @@ defmodule Ferricstore.Application do
     # (terminate/1 on each shard will also do this, but doing it here
     # while the system is still healthy is more reliable)
     for i <- 0..(shard_count - 1) do
-      name = Ferricstore.Store.Router.shard_name(i)
+      name = :"Ferricstore.Store.Shard.#{i}"
       try do
         GenServer.call(name, :flush, 5_000)
       catch

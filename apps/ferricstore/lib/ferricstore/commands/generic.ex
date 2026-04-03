@@ -290,8 +290,9 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_object("FREQ", [key], store) do
     if store.exists?.(key) do
-      idx = Ferricstore.Store.Router.shard_for(key)
-      keydir = :"keydir_#{idx}"
+      ctx = FerricStore.Instance.get(:default)
+      idx = Ferricstore.Store.Router.shard_for(ctx, key)
+      keydir = Ferricstore.Store.Router.resolve_keydir(ctx, idx)
 
       case :ets.lookup(keydir, key) do
         [{^key, _val, _exp, packed_lfu, _fid, _off, _vsize}] ->
@@ -307,8 +308,9 @@ defmodule Ferricstore.Commands.Generic do
 
   defp do_object("IDLETIME", [key], store) do
     if store.exists?.(key) do
-      idx = Ferricstore.Store.Router.shard_for(key)
-      keydir = :"keydir_#{idx}"
+      ctx = FerricStore.Instance.get(:default)
+      idx = Ferricstore.Store.Router.shard_for(ctx, key)
+      keydir = Ferricstore.Store.Router.resolve_keydir(ctx, idx)
 
       case :ets.lookup(keydir, key) do
         [{^key, _val, _exp, packed_lfu, _fid, _off, _vsize}] ->

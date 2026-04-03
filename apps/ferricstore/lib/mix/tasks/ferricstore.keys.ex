@@ -47,7 +47,8 @@ defmodule Mix.Tasks.Ferricstore.Keys do
     ensure_started()
 
     pattern = List.first(args)
-    all_keys = Ferricstore.Store.Router.keys()
+    ctx = FerricStore.Instance.get(:default)
+    all_keys = Ferricstore.Store.Router.keys(ctx)
 
     matched =
       if pattern do

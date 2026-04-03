@@ -947,7 +947,7 @@ defmodule Ferricstore.EmbeddedExtendedTest do
       assert {:ok, member} = FerricStore.spop("sp:key")
       assert member in ["a", "b", "c"]
       # Verify it was removed
-      assert FerricStore.sismember("sp:key", member) == false
+      assert FerricStore.sismember("sp:key", member) == {:ok, false}
     end
 
     test "pops multiple random members" do

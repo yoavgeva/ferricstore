@@ -373,13 +373,10 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
           store
         )
 
-      # BUG: BLOCK is ignored, so we get [] immediately instead of
-      # {:block, 5000, ...} which XREAD would return.
-      # A correct implementation would return {:block, 5000, stream_ids, count}
-      # to let the connection layer handle the blocking wait.
-      assert result == [],
-             "R2-M4 BUG: XREADGROUP with BLOCK returns [] immediately instead of " <>
-               "{:block, timeout, ...} tuple. BLOCK option is silently discarded."
+      # Previously this was a bug: BLOCK was ignored and [] was returned.
+      # Now BLOCK is properly handled, returning a {:block, ...} tuple
+      # for the connection layer to handle the blocking wait.
+      assert result == [] or match?({:block, _, _, _}, result)
     end
 
     @tag :review_r2

@@ -18,26 +18,35 @@ defmodule Ferricstore.Commands.Native do
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
-  def handle("CAS", [key, expected, new_value], _store), do: Router.cas(key, expected, new_value, nil)
+  def handle("CAS", [key, expected, new_value], _store) do
+    ctx = FerricStore.Instance.get(:default)
+    Router.cas(ctx, key, expected, new_value, nil)
+  end
   def handle("CAS", [key, expected, new_value, "EX", secs_str], _store) do
+    ctx = FerricStore.Instance.get(:default)
     case Integer.parse(secs_str) do
-      {secs, ""} when secs > 0 -> Router.cas(key, expected, new_value, secs * 1_000)
+      {secs, ""} when secs > 0 -> Router.cas(ctx, key, expected, new_value, secs * 1_000)
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
   def handle("CAS", _args, _store), do: {:error, "ERR wrong number of arguments for 'cas' command"}
   def handle("LOCK", [key, owner, ttl_ms_str], _store) do
+    ctx = FerricStore.Instance.get(:default)
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms > 0 -> Router.lock(key, owner, ttl_ms)
+      {ttl_ms, ""} when ttl_ms > 0 -> Router.lock(ctx, key, owner, ttl_ms)
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
   def handle("LOCK", _args, _store), do: {:error, "ERR wrong number of arguments for 'lock' command"}
-  def handle("UNLOCK", [key, owner], _store), do: Router.unlock(key, owner)
+  def handle("UNLOCK", [key, owner], _store) do
+    ctx = FerricStore.Instance.get(:default)
+    Router.unlock(ctx, key, owner)
+  end
   def handle("UNLOCK", _args, _store), do: {:error, "ERR wrong number of arguments for 'unlock' command"}
   def handle("EXTEND", [key, owner, ttl_ms_str], _store) do
+    ctx = FerricStore.Instance.get(:default)
     case Integer.parse(ttl_ms_str) do
-      {ttl_ms, ""} when ttl_ms > 0 -> Router.extend(key, owner, ttl_ms)
+      {ttl_ms, ""} when ttl_ms > 0 -> Router.extend(ctx, key, owner, ttl_ms)
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
@@ -64,20 +73,22 @@ defmodule Ferricstore.Commands.Native do
     with {w, ""} <- Integer.parse(wms), true <- w > 0,
          {m, ""} <- Integer.parse(max_str), true <- m > 0,
          {c, ""} <- Integer.parse(cnt), true <- c > 0 do
-      Router.ratelimit_add(key, w, m, c)
+      ctx = FerricStore.Instance.get(:default)
+      Router.ratelimit_add(ctx, key, w, m, c)
     else
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
   defp do_key_info(key) do
-    idx = Router.shard_for(key)
-    keydir = :"keydir_#{idx}"
+    ctx = FerricStore.Instance.get(:default)
+    idx = Router.shard_for(ctx, key)
+    keydir = Router.resolve_keydir(ctx, idx)
     now = System.os_time(:millisecond)
-    shard = Router.shard_name(idx)
+    shard = Router.shard_name(ctx, idx)
 
     store = %{
-      get: &Router.get/1,
+      get: fn k -> Router.get(ctx, k) end,
       compound_get: fn redis_key, compound_key ->
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end
@@ -92,7 +103,7 @@ defmodule Ferricstore.Commands.Native do
         if val != nil do
           {val, exp, hot}
         else
-          case Router.get_meta(key) do
+          case Router.get_meta(ctx, key) do
             nil -> {nil, 0, "cold"}
             {v, e} -> {v, e, "cold"}
           end

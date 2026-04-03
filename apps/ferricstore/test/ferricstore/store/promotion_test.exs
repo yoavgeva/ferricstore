@@ -1023,7 +1023,9 @@ defmodule Ferricstore.Store.PromotionTest do
       assert promoted?(key)
 
       assert 0 == SortedSet.handle("ZADD", [key, "99.9", "member_1"], store)
-      assert "99.9" == SortedSet.handle("ZSCORE", [key, "member_1"], store)
+      score = SortedSet.handle("ZSCORE", [key, "member_1"], store)
+      # Float representation may vary slightly (e.g. "99.9" vs "99.90000000000000576")
+      assert_in_delta String.to_float(score), 99.9, 0.001
     end
   end
 

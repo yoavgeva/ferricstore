@@ -117,6 +117,7 @@ defmodule Ferricstore.Raft.StateMachine do
       ets: config.ets,
       data_dir: Map.get(config, :data_dir, Path.dirname(config.shard_data_path)),
       prefix_keys: Map.get(config, :prefix_keys, PrefixIndex.table_name(config.shard_index)),
+      instance_ctx: Map.get(config, :instance_ctx),
       applied_count: 0,
       release_cursor_interval: interval,
       # Cross-shard operation locks and intents — persisted in Raft state
@@ -850,6 +851,8 @@ defmodule Ferricstore.Raft.StateMachine do
   # For the anchor shard (matching state.shard_index), uses state directly.
   # For remote shards, reads active file info from persistent_term.
   defp build_cross_shard_store(shard_idx, anchor_state) do
+    instance_ctx = anchor_state.instance_ctx
+
     ctx =
       if shard_idx == anchor_state.shard_index do
         %{
@@ -864,9 +867,23 @@ defmodule Ferricstore.Raft.StateMachine do
         {file_id, file_path, shard_data_path} =
           Ferricstore.Store.ActiveFile.get(shard_idx)
 
+        keydir =
+          if instance_ctx do
+            elem(instance_ctx.keydir_refs, shard_idx)
+          else
+            :"keydir_#{shard_idx}"
+          end
+
+        prefix_keys =
+          if instance_ctx do
+            elem(instance_ctx.prefix_table_refs, shard_idx)
+          else
+            PrefixIndex.table_name(shard_idx)
+          end
+
         %{
-          keydir: :"keydir_#{shard_idx}",
-          prefix_keys: PrefixIndex.table_name(shard_idx),
+          keydir: keydir,
+          prefix_keys: prefix_keys,
           index: shard_idx,
           shard_data_path: shard_data_path,
           active_file_path: file_path,
@@ -1019,7 +1036,12 @@ defmodule Ferricstore.Raft.StateMachine do
       {:ok, byte_size(new_val)}
     end
 
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    data_dir =
+      if instance_ctx do
+        instance_ctx.data_dir
+      else
+        Application.get_env(:ferricstore, :data_dir, "data")
+      end
 
     %{
       get: local_get,
@@ -1027,12 +1049,12 @@ defmodule Ferricstore.Raft.StateMachine do
       put: local_put,
       delete: local_delete,
       exists?: local_exists,
-      keys: &Router.keys/0,
+      keys: fn -> Router.keys(instance_ctx) end,
       flush: fn ->
-        Enum.each(Router.keys(), &Router.delete/1)
+        Enum.each(Router.keys(instance_ctx), fn k -> Router.delete(instance_ctx, k) end)
         :ok
       end,
-      dbsize: &Router.dbsize/0,
+      dbsize: fn -> Router.dbsize(instance_ctx) end,
       incr: local_incr,
       incr_float: local_incr_float,
       append: local_append,
@@ -1040,12 +1062,12 @@ defmodule Ferricstore.Raft.StateMachine do
       getdel: local_getdel,
       getex: local_getex,
       setrange: local_setrange,
-      cas: &Router.cas/4,
-      lock: &Router.lock/3,
-      unlock: &Router.unlock/2,
-      extend: &Router.extend/3,
-      ratelimit_add: &Router.ratelimit_add/4,
-      list_op: &Router.list_op/2,
+      cas: fn key, expected, new_value, ttl_ms -> Router.cas(instance_ctx, key, expected, new_value, ttl_ms) end,
+      lock: fn key, owner, ttl_ms -> Router.lock(instance_ctx, key, owner, ttl_ms) end,
+      unlock: fn key, owner -> Router.unlock(instance_ctx, key, owner) end,
+      extend: fn key, owner, ttl_ms -> Router.extend(instance_ctx, key, owner, ttl_ms) end,
+      ratelimit_add: fn key, window_ms, max, count -> Router.ratelimit_add(instance_ctx, key, window_ms, max, count) end,
+      list_op: fn key, op -> Router.list_op(instance_ctx, key, op) end,
       compound_get: fn _redis_key, compound_key ->
         cross_shard_ets_read(ctx, compound_key)
       end,
@@ -1073,7 +1095,7 @@ defmodule Ferricstore.Raft.StateMachine do
       prob_write: fn command ->
         # Within cross-shard tx, prob writes are applied directly
         # (the state machine is already applying through Raft)
-        apply_prob_locally(ctx, command)
+        apply_prob_locally(instance_ctx, command)
       end,
       shard_index: ctx.index,
       data_dir: data_dir
@@ -2236,10 +2258,10 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Applies a prob command locally (used in cross-shard tx context where
   # the state machine is already running inside Raft apply).
-  defp apply_prob_locally(_ctx, command) do
+  defp apply_prob_locally(instance_ctx, command) do
     # In cross-shard tx, prob commands go through Router.prob_write
     # which routes to the correct shard's Raft group.
-    Router.prob_write(command)
+    Router.prob_write(instance_ctx, command)
   end
 
   # Auto-creates a cuckoo filter file if it doesn't exist.

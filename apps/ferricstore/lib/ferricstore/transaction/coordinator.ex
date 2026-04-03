@@ -44,7 +44,8 @@ defmodule Ferricstore.Transaction.Coordinator do
   # ---------------------------------------------------------------------------
 
   defp execute_single_shard(queue, shard_idx, sandbox_namespace) do
-    shard = Router.resolve_shard(shard_idx)
+    ctx = FerricStore.Instance.get(:default)
+    shard = Router.resolve_shard(ctx, shard_idx)
 
     try do
       GenServer.call(shard, {:tx_execute, queue, sandbox_namespace}, 10_000)
@@ -104,7 +105,8 @@ defmodule Ferricstore.Transaction.Coordinator do
     shard_results =
       Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds_with_indices}, acc ->
         queue = Enum.map(cmds_with_indices, fn {_orig_idx, cmd, args} -> {cmd, args} end)
-        shard = Router.resolve_shard(shard_idx)
+        ctx = FerricStore.Instance.get(:default)
+        shard = Router.resolve_shard(ctx, shard_idx)
 
         results =
           try do
@@ -245,7 +247,8 @@ defmodule Ferricstore.Transaction.Coordinator do
         ns -> ns <> key
       end
 
-    Router.shard_for(full_key)
+    ctx = FerricStore.Instance.get(:default)
+    Router.shard_for(ctx, full_key)
   end
 
   @spec extract_key([binary()]) :: binary()
@@ -259,9 +262,10 @@ defmodule Ferricstore.Transaction.Coordinator do
   defp watches_clean?(watched) when map_size(watched) == 0, do: true
 
   defp watches_clean?(watched) do
+    ctx = FerricStore.Instance.get(:default)
     Enum.all?(watched, fn {key, saved_hash} ->
       try do
-        :erlang.phash2(Router.get(key)) == saved_hash
+        :erlang.phash2(Router.get(ctx, key)) == saved_hash
       catch
         :exit, _ -> false
       end

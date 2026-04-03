@@ -340,7 +340,7 @@ defmodule Ferricstore.Commands.ServerInfoTest do
   describe "INFO server (extended fields)" do
     test "has redis_mode" do
       result = Server.handle("INFO", ["server"], MockStore.make())
-      assert result =~ "redis_mode:standalone"
+      assert result =~ "redis_mode:embedded"
     end
 
     test "has os field" do

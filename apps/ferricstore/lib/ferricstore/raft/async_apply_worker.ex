@@ -483,7 +483,8 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   # GenServer.call instead of :sys.get_state (which copies the entire state).
   @spec get_active_file(non_neg_integer()) :: {non_neg_integer(), binary()}
   defp get_active_file(shard_index) do
-    shard_name = Ferricstore.Store.Router.shard_name(shard_index)
+    ctx = FerricStore.Instance.get(:default)
+    shard_name = Ferricstore.Store.Router.shard_name(ctx, shard_index)
     GenServer.call(shard_name, :get_active_file)
   end
 

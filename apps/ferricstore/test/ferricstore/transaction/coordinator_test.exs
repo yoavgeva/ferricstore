@@ -198,8 +198,8 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     test "aborts when a watched key was modified before EXEC", %{same1: s1} do
       Router.put(s1, "original", 0)
 
-      version = Router.get_version(s1)
-      watched = %{s1 => version}
+      # watches_clean? uses phash2(Router.get(key)) to detect changes
+      watched = %{s1 => :erlang.phash2(Router.get(s1))}
 
       # Simulate another client modifying the key
       Router.put(s1, "modified_by_other", 0)
@@ -215,8 +215,8 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     test "proceeds when watched keys are unmodified", %{same1: s1} do
       Router.put(s1, "original", 0)
 
-      version = Router.get_version(s1)
-      watched = %{s1 => version}
+      # watches_clean? uses phash2(Router.get(key)) to detect changes
+      watched = %{s1 => :erlang.phash2(Router.get(s1))}
 
       queue = [{"SET", [s1, "updated"]}]
 
@@ -229,8 +229,8 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     test "cross-shard WATCH succeeds when watches pass", %{k0: k0, k1: k1} do
       Router.put(k0, "orig_k0", 0)
 
-      version_k0 = Router.get_version(k0)
-      watched = %{k0 => version_k0}
+      # watches_clean? uses phash2(Router.get(key)) to detect changes
+      watched = %{k0 => :erlang.phash2(Router.get(k0))}
 
       queue = [
         {"SET", [k0, "new_k0"]},
@@ -247,8 +247,8 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
     test "cross-shard WATCH conflict returns nil", %{k0: k0, k1: k1} do
       Router.put(k0, "orig_k0", 0)
 
-      version_k0 = Router.get_version(k0)
-      watched = %{k0 => version_k0}
+      # watches_clean? uses phash2(Router.get(key)) to detect changes
+      watched = %{k0 => :erlang.phash2(Router.get(k0))}
 
       # Modify watched key
       Router.put(k0, "changed", 0)

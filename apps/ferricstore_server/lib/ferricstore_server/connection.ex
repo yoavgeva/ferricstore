@@ -84,6 +84,7 @@ defmodule FerricstoreServer.Connection do
     :client_name,
     :created_at,
     :peer,
+    :instance_ctx,
     buffer: "",
     multi_state: :none,
     multi_queue: [],
@@ -157,6 +158,7 @@ defmodule FerricstoreServer.Connection do
           client_name: binary() | nil,
           created_at: integer(),
           peer: {:inet.ip_address(), :inet.port_number()} | nil,
+          instance_ctx: FerricStore.Instance.t(),
           multi_state: multi_state(),
           multi_queue: [{binary(), [binary()]}],
           multi_queue_count: non_neg_integer(),
@@ -235,6 +237,10 @@ defmodule FerricstoreServer.Connection do
           # {:acl_invalidate, username} messages when ACL rules change.
           join_acl_invalidation_group()
 
+          # Transitional: build instance ctx from global persistent_term state.
+          # Will be replaced once listeners pass ctx explicitly.
+          ctx = default_instance_ctx()
+
           state = %__MODULE__{
             socket: socket,
             transport: transport,
@@ -242,6 +248,7 @@ defmodule FerricstoreServer.Connection do
             client_name: nil,
             created_at: System.monotonic_time(:millisecond),
             peer: peer,
+            instance_ctx: ctx,
             tracking: ClientTracking.new_config(),
             acl_cache: default_cache,
             active_mode: active_mode
@@ -561,7 +568,7 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp flush_pure_group_pre(normalised, all_reads?, state) do
-    store = build_store(state.sandbox_namespace)
+    store = build_store(state.instance_ctx, state.sandbox_namespace)
 
     # Fast path: if ALL commands are pure reads (tracked during accumulation),
     # skip the sliding window entirely. No Task spawning, no shard grouping,
@@ -605,7 +612,7 @@ defmodule FerricstoreServer.Connection do
     indexed_cmds =
       normalised
       |> Enum.with_index()
-      |> Enum.map(fn {{_cmd, norm}, idx} -> {norm, idx, command_shard_key_normalised(norm)} end)
+      |> Enum.map(fn {{_cmd, norm}, idx} -> {norm, idx, command_shard_key_normalised(state.instance_ctx, norm)} end)
 
     # Step 2: Group by shard lane (preserving original order within each lane).
     lanes = Enum.group_by(indexed_cmds, fn {_norm, _idx, shard_key} -> shard_key end)
@@ -722,14 +729,14 @@ defmodule FerricstoreServer.Connection do
   #   - `{:shard, index}` for single-key commands
   #   - `:barrier` for multi-key/multi-shard commands (global ordering barrier)
   #   - `:server` for server-level commands with no key
-  defp command_shard_key(cmd) do
-    command_shard_key_normalised(normalise_cmd(cmd))
+  defp command_shard_key(ctx, cmd) do
+    command_shard_key_normalised(ctx, normalise_cmd(cmd))
   end
 
   # Variant that accepts pre-normalised commands to avoid redundant normalise_cmd.
-  defp command_shard_key_normalised(:unknown), do: :server
+  defp command_shard_key_normalised(_ctx, :unknown), do: :server
 
-  defp command_shard_key_normalised({name, args}) do
+  defp command_shard_key_normalised(ctx, {name, args}) do
     cond do
       name in @always_multi_cmds ->
         :barrier
@@ -737,7 +744,7 @@ defmodule FerricstoreServer.Connection do
       name in @variadic_key_cmds ->
         case args do
           # Single key: route to that key's shard lane.
-          [single_key] -> {:shard, Router.shard_for(single_key)}
+          [single_key] -> {:shard, Router.shard_for(ctx, single_key)}
           # Multiple keys: global barrier.
           _ -> :barrier
         end
@@ -747,7 +754,7 @@ defmodule FerricstoreServer.Connection do
 
       # Single-key commands: first arg is the key
       args != [] ->
-        {:shard, Router.shard_for(hd(args))}
+        {:shard, Router.shard_for(ctx, hd(args))}
 
       # No args
       true ->
@@ -863,7 +870,7 @@ defmodule FerricstoreServer.Connection do
 
   # CLIENT subcommands that need connection state.
   defp dispatch("CLIENT", args, state) do
-    store = build_store(state.sandbox_namespace)
+    store = build_store(state.instance_ctx, state.sandbox_namespace)
 
     conn_state = %{
       client_id: state.client_id,
@@ -1164,8 +1171,9 @@ defmodule FerricstoreServer.Connection do
           ns = state.sandbox_namespace
 
           try do
-            keys = Router.keys()
-            Enum.each(keys, fn k -> if String.starts_with?(k, ns), do: Router.delete(k) end)
+            ctx = state.instance_ctx
+            keys = Router.keys(ctx)
+            Enum.each(keys, fn k -> if String.starts_with?(k, ns), do: Router.delete(ctx, k) end)
           catch
             :exit, _ -> :ok
           end
@@ -1240,7 +1248,7 @@ defmodule FerricstoreServer.Connection do
     try do
       new_watched =
         Enum.reduce(keys, state.watched_keys, fn key, acc ->
-          hash = :erlang.phash2(Router.get(key))
+          hash = :erlang.phash2(Router.get(state.instance_ctx, key))
           Map.put(acc, key, hash)
         end)
 
@@ -1383,7 +1391,7 @@ defmodule FerricstoreServer.Connection do
     else
       # Validate command syntax at queue time. If the dispatcher returns an
       # error, send it immediately but stay in MULTI mode.
-      store = build_store(state.sandbox_namespace)
+      store = build_store(state.instance_ctx, state.sandbox_namespace)
 
       case validate_command(cmd, args, store) do
         :ok ->
@@ -1426,7 +1434,7 @@ defmodule FerricstoreServer.Connection do
 
     case Blocking.parse_blpop_args(args) do
       {:ok, keys, timeout_ms} ->
-        store = build_store(state.sandbox_namespace)
+        store = build_store(state.instance_ctx, state.sandbox_namespace)
         pop_cmd = if pop_dir == :blpop, do: "LPOP", else: "RPOP"
 
         # Try immediate pop on each key (first non-empty wins)
@@ -1536,7 +1544,7 @@ defmodule FerricstoreServer.Connection do
 
     case Blocking.parse_blmove_args(args) do
       {:ok, source, destination, from_dir, to_dir, timeout_ms} ->
-        store = build_store(state.sandbox_namespace)
+        store = build_store(state.instance_ctx, state.sandbox_namespace)
 
         # Try immediate LMOVE
         case List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store) do
@@ -1613,7 +1621,7 @@ defmodule FerricstoreServer.Connection do
 
     case Blocking.parse_blmpop_args(args) do
       {:ok, keys, direction, count, timeout_ms} ->
-        store = build_store(state.sandbox_namespace)
+        store = build_store(state.instance_ctx, state.sandbox_namespace)
         pop_cmd = if direction == :left, do: "LPOP", else: "RPOP"
 
         # Build the count arg list: omit count arg when count == 1
@@ -1740,7 +1748,7 @@ defmodule FerricstoreServer.Connection do
 
     # Single ETS lookup via Router.get_with_file_ref — returns either
     # {:hot, value} or {:cold_ref, path, offset, size} or {:cold_value, value} or :miss
-    case Router.get_with_file_ref(lookup_key) do
+    case Router.get_with_file_ref(state.instance_ctx, lookup_key) do
       {:hot, value} ->
         result = value
         new_state = maybe_track_read("GET", [lookup_key], result, state)
@@ -1852,7 +1860,7 @@ defmodule FerricstoreServer.Connection do
 
   # Normal dispatch path (extracted for reuse by sendfile fallback).
   defp dispatch_normal(cmd, args, state) do
-    store = build_store(state.sandbox_namespace)
+    store = build_store(state.instance_ctx, state.sandbox_namespace)
 
     result =
       try do
@@ -1878,7 +1886,7 @@ defmodule FerricstoreServer.Connection do
   # no data is immediately available and BLOCK was specified.
 
   defp dispatch("XREAD", args, state) do
-    store = build_store(state.sandbox_namespace)
+    store = build_store(state.instance_ctx, state.sandbox_namespace)
 
     result =
       try do
@@ -2066,105 +2074,124 @@ defmodule FerricstoreServer.Connection do
   # Store builder — wraps Router functions into the store map contract
   # ---------------------------------------------------------------------------
 
-  # The raw store map is identical for every non-sandbox command dispatch.
-  # Built once lazily via persistent_term to eliminate ~25 closure allocations
-  # per command. Subsequent calls are a single pointer deref (~5ns).
+  # The raw store map captures `ctx` (the FerricStore.Instance context) in
+  # closures, routing all operations through the instance rather than global
+  # state. Each ctx produces its own store map; caching per instance name
+  # avoids rebuilding the ~25 closures on every command dispatch.
   #
   # Audit C3 note: this is a plain map rather than a struct. A struct would
   # give OTP 26+ type inference transparent field types, but converting would
   # require touching every command handler (~25 modules) since they all
   # access `store.get.()` etc. The practical impact is negligible:
-  #   - The non-sandbox path reads from persistent_term (one pointer deref).
-  #   - The sandbox path rebuilds only 5 namespace-wrapping closures; the
-  #     remaining ~20 fields are shared from the cached raw store.
   #   - Each closure call is a direct function dispatch (~10ns); the type
   #     opacity only prevents the JIT from inlining across the store boundary,
   #     which would save <5ns per call — well below the GenServer/ETS cost
   #     that dominates every operation.
   # The struct conversion is tracked as a future cleanup but is not worth the
   # risk of a cross-cutting refactor for the marginal type inference benefit.
-  defp raw_store do
-    case :persistent_term.get(:ferricstore_raw_store, nil) do
+  defp raw_store(ctx) do
+    case :persistent_term.get({:ferricstore_raw_store, ctx.name}, nil) do
       nil ->
-        store = build_raw_store()
-        :persistent_term.put(:ferricstore_raw_store, store)
+        store = build_raw_store(ctx)
+        :persistent_term.put({:ferricstore_raw_store, ctx.name}, store)
         store
       store ->
         store
     end
   end
 
-  defp build_raw_store do
+  defp build_raw_store(ctx) do
     %{
-      get: &Router.get/1,
-      get_meta: &Router.get_meta/1,
-      put: &Router.put/3,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      keys: &Router.keys/0,
-      keys_with_prefix: &Router.keys_with_prefix/1,
+      get: fn key -> Router.get(ctx, key) end,
+      get_meta: fn key -> Router.get_meta(ctx, key) end,
+      put: fn key, value, exp -> Router.put(ctx, key, value, exp) end,
+      delete: fn key -> Router.delete(ctx, key) end,
+      exists?: fn key -> Router.exists?(ctx, key) end,
+      keys: fn -> Router.keys(ctx) end,
+      keys_with_prefix: fn prefix -> Router.keys_with_prefix(ctx, prefix) end,
       flush: fn ->
-        FerricStore.flushdb()
+        for i <- 0..(ctx.shard_count - 1) do
+          shard = elem(ctx.shard_names, i)
+          keydir = elem(ctx.keydir_refs, i)
+
+          raw_keys =
+            try do
+              :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], keydir)
+            rescue
+              ArgumentError -> []
+            end
+
+          Enum.each(raw_keys, fn key ->
+            try do
+              GenServer.call(shard, {:delete, key}, 10_000)
+            catch
+              :exit, _ -> :ok
+            end
+          end)
+
+          prefix_table = elem(ctx.prefix_table_refs, i)
+          try do :ets.delete_all_objects(prefix_table) catch :error, :badarg -> :ok end
+        end
+
         :ok
       end,
-      dbsize: &Router.dbsize/0,
-      incr: &Router.incr/2,
-      incr_float: &Router.incr_float/2,
-      append: &Router.append/2,
-      getset: &Router.getset/2,
-      getdel: &Router.getdel/1,
-      getex: &Router.getex/2,
-      setrange: &Router.setrange/3,
-      cas: &Router.cas/4,
-      lock: &Router.lock/3,
-      unlock: &Router.unlock/2,
-      extend: &Router.extend/3,
-      ratelimit_add: &Router.ratelimit_add/4,
-      list_op: &Router.list_op/2,
+      dbsize: fn -> Router.dbsize(ctx) end,
+      incr: fn key, delta -> Router.incr(ctx, key, delta) end,
+      incr_float: fn key, delta -> Router.incr_float(ctx, key, delta) end,
+      append: fn key, suffix -> Router.append(ctx, key, suffix) end,
+      getset: fn key, value -> Router.getset(ctx, key, value) end,
+      getdel: fn key -> Router.getdel(ctx, key) end,
+      getex: fn key, exp -> Router.getex(ctx, key, exp) end,
+      setrange: fn key, offset, value -> Router.setrange(ctx, key, offset, value) end,
+      cas: fn key, exp, new_val, ttl -> Router.cas(ctx, key, exp, new_val, ttl) end,
+      lock: fn key, owner, ttl -> Router.lock(ctx, key, owner, ttl) end,
+      unlock: fn key, owner -> Router.unlock(ctx, key, owner) end,
+      extend: fn key, owner, ttl -> Router.extend(ctx, key, owner, ttl) end,
+      ratelimit_add: fn key, window, max, count -> Router.ratelimit_add(ctx, key, window, max, count) end,
+      list_op: fn key, op -> Router.list_op(ctx, key, op) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end,
-      prob_write: &Router.prob_write/1,
+      prob_write: fn cmd -> Router.prob_write(ctx, cmd) end,
       # prob_dir_for_key resolves the correct shard's prob directory.
       # Used by command handlers to compute file paths for reads.
       prob_dir_for_key: fn key ->
-        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-        idx = Router.shard_for(key)
-        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        idx = Router.shard_for(ctx, key)
+        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
         Path.join(shard_path, "prob")
       end
     }
   end
 
-  defp build_store(nil), do: raw_store()
+  defp build_store(ctx, nil), do: raw_store(ctx)
 
-  defp build_store(ns) when is_binary(ns) do
-    raw = raw_store()
+  defp build_store(ctx, ns) when is_binary(ns) do
+    raw = raw_store(ctx)
     %{raw |
       get: fn key -> raw.get.(ns <> key) end,
       get_meta: fn key -> raw.get_meta.(ns <> key) end,
@@ -2471,6 +2498,17 @@ defmodule FerricstoreServer.Connection do
   defp cleanup_pubsub(state) do
     if state.pubsub_channels, do: Enum.each(state.pubsub_channels, &PS.unsubscribe(&1, self()))
     if state.pubsub_patterns, do: Enum.each(state.pubsub_patterns, &PS.punsubscribe(&1, self()))
+  end
+
+  # ---------------------------------------------------------------------------
+  # Instance context helpers
+  # ---------------------------------------------------------------------------
+
+  # Transitional: build instance ctx from persistent_term global state.
+  # Will be removed once listeners pass ctx explicitly at connection init.
+  @spec default_instance_ctx() :: FerricStore.Instance.t()
+  defp default_instance_ctx do
+    FerricStore.Instance.get(:default)
   end
 
   # Formats a peer tuple `{ip, port}` into a human-readable string.

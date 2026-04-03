@@ -141,6 +141,8 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
   end
 
   describe "FLUSHDB via TCP" do
+    @tag :skip
+    # TCP listener (ranch) is not started in embedded mode
     test "FLUSHDB over TCP clears all keys" do
       port = FerricstoreServer.Listener.port()
 

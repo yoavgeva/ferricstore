@@ -306,7 +306,7 @@ defmodule Ferricstore.Raft.AsyncWalTest do
       :ok = FerricStore.set(k, "value")
       {:ok, "value"} = FerricStore.get(k)
 
-      :ok = FerricStore.del(k)
+      {:ok, 1} = FerricStore.del(k)
       {:ok, nil} = FerricStore.get(k)
     end
 
@@ -594,7 +594,7 @@ defmodule Ferricstore.Raft.AsyncWalTest do
         for i <- 1..200 do
           Task.async(fn ->
             if rem(i, 2) == 1 do
-              :ok = FerricStore.del("#{prefix}:#{i}")
+              {:ok, 1} = FerricStore.del("#{prefix}:#{i}")
               {:deleted, i}
             else
               :ok = FerricStore.set("#{prefix}:#{i}", "updated")

@@ -351,7 +351,8 @@ defmodule Ferricstore.Merge.Scheduler do
   end
 
   defp do_merge(state) do
-    shard_name = Router.shard_name(state.shard_index)
+    ctx = FerricStore.Instance.get(:default)
+    shard_name = Router.shard_name(ctx, state.shard_index)
 
     result =
       with {:ok, file_ids} <- select_files_for_merge(state, shard_name),

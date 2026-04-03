@@ -133,7 +133,8 @@ defmodule Ferricstore.FetchOrCompute do
   @impl true
   def handle_call({:fetch_or_compute, key, _ttl_ms, hint, caller_pid}, from, state) do
     # Check the store first.
-    case Router.get(key) do
+    ctx = FerricStore.Instance.get(:default)
+    case Router.get(ctx, key) do
       nil ->
         # Cache miss -- check for existing compute lock.
         case :ets.lookup(@table, key) do
@@ -172,7 +173,8 @@ defmodule Ferricstore.FetchOrCompute do
         0
       end
 
-    Router.put(key, value, expire_at_ms)
+    ctx = FerricStore.Instance.get(:default)
+    Router.put(ctx, key, value, expire_at_ms)
 
     # Wake all waiters.
     case :ets.lookup(@table, key) do

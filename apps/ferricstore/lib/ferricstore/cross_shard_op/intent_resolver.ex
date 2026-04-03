@@ -118,7 +118,8 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
     |> Map.values()
     |> Enum.uniq()
     |> Enum.each(fn key ->
-      shard_idx = Router.shard_for(key)
+      ctx = FerricStore.Instance.get(:default)
+      shard_idx = Router.shard_for(ctx, key)
       shard_id = Cluster.shard_server_id(shard_idx)
       :ra.process_command(shard_id, {:unlock_keys, [key], owner_ref})
     end)
@@ -127,6 +128,7 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
   # Reads the current value of a key through the Router.
   # Returns nil if the key doesn't exist.
   defp read_current_value(key) do
-    Router.get(key)
+    ctx = FerricStore.Instance.get(:default)
+    Router.get(ctx, key)
   end
 end

@@ -131,9 +131,9 @@ defmodule Ferricstore.ReviewR4Test do
       assert Map.has_key?(config, :min_files_for_merge)
       assert is_integer(config.min_files_for_merge)
 
-      # Verify there is no dead_ratio or fragmentation config key
+      # fragmentation_threshold was added as a config option (no longer absent),
+      # but the actual trigger still uses file count as the primary condition.
       refute Map.has_key?(config, :dead_ratio_threshold)
-      refute Map.has_key?(config, :fragmentation_threshold)
       refute Map.has_key?(config, :min_dead_ratio)
     end
   end

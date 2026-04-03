@@ -483,7 +483,8 @@ defmodule FerricstoreServer.Health.Dashboard do
                 0
             end
 
-          shard_name = Ferricstore.Store.Router.shard_name(index)
+          ctx = FerricStore.Instance.get(:default)
+          shard_name = Ferricstore.Store.Router.shard_name(ctx, index)
 
           shard_status =
             case Process.whereis(shard_name) do
