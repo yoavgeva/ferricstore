@@ -34,7 +34,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
   describe "router key distribution" do
     test "keys are distributed across multiple shards" do
       shard_assignments =
-        Enum.group_by(0..99, fn i -> Router.shard_for("key_#{i}") end)
+        Enum.group_by(0..99, fn i -> Router.shard_for(FerricStore.Instance.get(:default), "key_#{i}") end)
 
       shard_count = map_size(shard_assignments)
 
@@ -46,7 +46,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
     test "shard_for is deterministic across calls" do
       results =
         for _ <- 1..1_000 do
-          Router.shard_for("same_key")
+          Router.shard_for(FerricStore.Instance.get(:default), "same_key")
         end
 
       assert Enum.uniq(results) |> length() == 1,
@@ -55,7 +55,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
 
     test "shard_for distributes 1000 keys across all 4 shards" do
       shard_assignments =
-        Enum.group_by(0..999, fn i -> Router.shard_for("key_#{i}") end)
+        Enum.group_by(0..999, fn i -> Router.shard_for(FerricStore.Instance.get(:default), "key_#{i}") end)
 
       for shard_idx <- 0..3 do
         assert Map.has_key?(shard_assignments, shard_idx),
@@ -89,14 +89,14 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
       ]
 
       for key <- special_keys do
-        shard = Router.shard_for(key)
+        shard = Router.shard_for(FerricStore.Instance.get(:default), key)
         assert shard in 0..3, "shard_for(#{inspect(key)}) returned #{inspect(shard)}"
       end
     end
 
     test "slot_for distributes keys across many slots" do
       slot_assignments =
-        Enum.group_by(0..999, fn i -> Router.slot_for("key_#{i}") end)
+        Enum.group_by(0..999, fn i -> Router.slot_for(FerricStore.Instance.get(:default), "key_#{i}") end)
 
       assert map_size(slot_assignments) > 100,
              "Expected 1000 keys to cover many slots, " <>
@@ -112,9 +112,9 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
     test "put and get through router succeeds" do
       key = "router_conc_test_#{:rand.uniform(999_999)}"
       :ok = Router.put(key, "hello")
-      assert "hello" == Router.get(key)
+      assert "hello" == Router.get(FerricStore.Instance.get(:default), key)
       # Clean up
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
 
     test "100 concurrent puts through router all succeed" do
@@ -135,12 +135,12 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
 
       # Verify all keys are readable
       for {key, i} <- Enum.with_index(keys) do
-        assert "val_#{i}" == Router.get(key),
+        assert "val_#{i}" == Router.get(FerricStore.Instance.get(:default), key),
                "Key #{key} not found after concurrent put"
       end
 
       # Clean up
-      for key <- keys, do: Router.delete(key)
+      for key <- keys, do: Router.delete(FerricStore.Instance.get(:default), key)
     end
 
     test "concurrent puts and deletes through router do not crash" do
@@ -161,7 +161,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
       deleter_tasks =
         Enum.map(0..9, fn i ->
           Task.async(fn ->
-            Router.delete("#{base}_#{i}")
+            Router.delete(FerricStore.Instance.get(:default), "#{base}_#{i}")
           end)
         end)
 
@@ -170,13 +170,13 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
 
       # Shard processes are all still alive
       for i <- 0..3 do
-        name = Router.shard_name(i)
+        name = Router.shard_name(FerricStore.Instance.get(:default), i)
         assert Process.alive?(Process.whereis(name)),
                "Shard #{i} (#{name}) died during concurrent operations"
       end
 
       # Clean up surviving keys
-      for i <- 0..19, do: Router.delete("#{base}_#{i}")
+      for i <- 0..19, do: Router.delete(FerricStore.Instance.get(:default), "#{base}_#{i}")
     end
 
     test "dbsize reflects concurrent operations" do
@@ -192,17 +192,17 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
       Enum.map(tasks, &Task.await(&1, 30_000))
 
       # dbsize should include all 50 keys (plus any other keys from other tests)
-      size = Router.dbsize()
+      size = Router.dbsize(FerricStore.Instance.get(:default))
       assert size >= 50, "Expected dbsize >= 50, got #{size}"
 
       # Exists? should work correctly
       for i <- 0..49 do
-        assert Router.exists?("#{base}_#{i}"),
+        assert Router.exists?(FerricStore.Instance.get(:default), "#{base}_#{i}"),
                "Key #{base}_#{i} not found via exists? after concurrent put"
       end
 
       # Clean up
-      for i <- 0..49, do: Router.delete("#{base}_#{i}")
+      for i <- 0..49, do: Router.delete(FerricStore.Instance.get(:default), "#{base}_#{i}")
     end
 
     test "MGET-style concurrent reads through router" do
@@ -217,7 +217,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
       tasks =
         Enum.map(0..19, fn i ->
           Task.async(fn ->
-            {i, Router.get("#{base}_#{i}")}
+            {i, Router.get(FerricStore.Instance.get(:default), "#{base}_#{i}")}
           end)
         end)
 
@@ -229,7 +229,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
       end
 
       # Clean up
-      for i <- 0..19, do: Router.delete("#{base}_#{i}")
+      for i <- 0..19, do: Router.delete(FerricStore.Instance.get(:default), "#{base}_#{i}")
     end
   end
 end

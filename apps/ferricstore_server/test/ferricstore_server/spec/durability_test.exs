@@ -53,13 +53,13 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
   # Returns the PID of the shard GenServer that owns `key`.
   defp shard_pid_for(key) do
-    name = Router.shard_name(Router.shard_for(key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     Process.whereis(name)
   end
 
   # Writes a key through the Raft batcher (the canonical write path).
   defp batcher_put(key, value, expire_at_ms \\ 0) do
-    shard = Router.shard_for(key)
+    shard = Router.shard_for(FerricStore.Instance.get(:default), key)
     Batcher.write(shard, {:put, key, value, expire_at_ms})
   end
 
@@ -81,7 +81,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       assert :ok == batcher_put(k, "durable_value")
 
       # Verify the value is present
-      assert "durable_value" == Router.get(k)
+      assert "durable_value" == Router.get(FerricStore.Instance.get(:default), k)
 
       # Flush all pending writes to Bitcask before killing the shard
       pid = shard_pid_for(k)
@@ -100,7 +100,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       new_pid = shard_pid_for(k)
       assert is_pid(new_pid)
       assert new_pid != pid, "Expected a new process after restart"
-      ShardHelpers.eventually(fn -> "durable_value" == Router.get(k) end,
+      ShardHelpers.eventually(fn -> "durable_value" == Router.get(FerricStore.Instance.get(:default), k) end,
         "data should survive shard restart")
     end
 
@@ -110,7 +110,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       # Write through batcher and immediately read -- must return the written value
       assert :ok == batcher_put(k, "linearizable")
-      assert "linearizable" == Router.get(k)
+      assert "linearizable" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     @tag :durability
@@ -119,7 +119,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       for i <- 1..10 do
         assert :ok == batcher_put(k, "val_#{i}")
-        assert "val_#{i}" == Router.get(k),
+        assert "val_#{i}" == Router.get(FerricStore.Instance.get(:default), k),
                "Expected val_#{i} after sequential overwrite #{i}"
       end
     end
@@ -144,7 +144,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
              "Expected all concurrent writes to succeed, got: #{inspect(Enum.reject(results, &(&1 == :ok)))}"
 
       # Final GET should return exactly one of the written values
-      final = Router.get(k)
+      final = Router.get(FerricStore.Instance.get(:default), k)
       assert is_binary(final), "Expected a binary value, got: #{inspect(final)}"
       assert String.starts_with?(final, "writer_"), "Expected value from one of the writers, got: #{inspect(final)}"
 
@@ -258,7 +258,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       NamespaceConfig.set("fast", "durability", "async")
 
       k = pkey("fast", "da001")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       # Measure async write latency
       {async_us, result} =
@@ -270,7 +270,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       # Also measure a quorum write for comparison
       k_quorum = ukey("da001_quorum")
-      shard_q = Router.shard_for(k_quorum)
+      shard_q = Router.shard_for(FerricStore.Instance.get(:default), k_quorum)
 
       {quorum_us, result_q} =
         :timer.tc(fn ->
@@ -291,14 +291,14 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       NamespaceConfig.set("fast", "durability", "async")
 
       k = pkey("fast", "da002")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "readable_val", 0})
 
       # Give the async worker time to process the batch
       Process.sleep(100)
 
-      assert "readable_val" == Router.get(k)
+      assert "readable_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     @tag :durability
@@ -308,7 +308,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       keys =
         for i <- 1..20 do
           k = pkey("fast", "da002_multi_#{i}")
-          shard = Router.shard_for(k)
+          shard = Router.shard_for(FerricStore.Instance.get(:default), k)
           assert :ok == Batcher.write(shard, {:put, k, "val_#{i}", 0})
           {k, i}
         end
@@ -317,7 +317,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       Process.sleep(200)
 
       for {k, i} <- keys do
-        assert "val_#{i}" == Router.get(k),
+        assert "val_#{i}" == Router.get(FerricStore.Instance.get(:default), k),
                "Expected key #{k} to be readable after async write"
       end
     end
@@ -332,17 +332,17 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       k_session = pkey("session", "da003")
       k_sensor = pkey("sensor", "da003")
 
-      shard_session = Router.shard_for(k_session)
-      shard_sensor = Router.shard_for(k_sensor)
+      shard_session = Router.shard_for(FerricStore.Instance.get(:default), k_session)
+      shard_sensor = Router.shard_for(FerricStore.Instance.get(:default), k_sensor)
 
       # Quorum write -- synchronous, immediately consistent
       assert :ok == Batcher.write(shard_session, {:put, k_session, "session_val", 0})
-      assert "session_val" == Router.get(k_session)
+      assert "session_val" == Router.get(FerricStore.Instance.get(:default), k_session)
 
       # Async write -- fire-and-forget, eventually consistent
       assert :ok == Batcher.write(shard_sensor, {:put, k_sensor, "sensor_val", 0})
       Process.sleep(100)
-      assert "sensor_val" == Router.get(k_sensor)
+      assert "sensor_val" == Router.get(FerricStore.Instance.get(:default), k_sensor)
 
       # Verify the durability modes are actually different
       assert :quorum == NamespaceConfig.durability_for("session")
@@ -354,13 +354,13 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
           [
             Task.async(fn ->
               k = pkey("session", "indep_#{i}")
-              s = Router.shard_for(k)
+              s = Router.shard_for(FerricStore.Instance.get(:default), k)
               Batcher.write(s, {:put, k, "s_#{i}", 0})
               k
             end),
             Task.async(fn ->
               k = pkey("sensor", "indep_#{i}")
-              s = Router.shard_for(k)
+              s = Router.shard_for(FerricStore.Instance.get(:default), k)
               Batcher.write(s, {:put, k, "n_#{i}", 0})
               k
             end)
@@ -376,11 +376,11 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       sensor_keys = Enum.drop(results, 1) |> Enum.take_every(2)
 
       for {k, i} <- Enum.with_index(session_keys, 1) do
-        assert "s_#{i}" == Router.get(k), "Session key #{k} not readable"
+        assert "s_#{i}" == Router.get(FerricStore.Instance.get(:default), k), "Session key #{k} not readable"
       end
 
       for {k, i} <- Enum.with_index(sensor_keys, 1) do
-        assert "n_#{i}" == Router.get(k), "Sensor key #{k} not readable"
+        assert "n_#{i}" == Router.get(FerricStore.Instance.get(:default), k), "Sensor key #{k} not readable"
       end
     end
 
@@ -394,7 +394,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       # Write and immediately read -- quorum provides linearizable read-after-write
       assert :ok == batcher_put(k, "default_quorum")
-      assert "default_quorum" == Router.get(k)
+      assert "default_quorum" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     @tag :durability
@@ -404,9 +404,9 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       assert :quorum == NamespaceConfig.durability_for("unconfigured")
 
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
       assert :ok == Batcher.write(shard, {:put, k, "default_quorum_ns", 0})
-      assert "default_quorum_ns" == Router.get(k)
+      assert "default_quorum_ns" == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -428,7 +428,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
         Enum.reduce_while(1..10_000, [], fn i, acc ->
           k = "batch:gc001_#{i}"
 
-          if Router.shard_for(k) == shard_idx and length(acc) < 10 do
+          if Router.shard_for(FerricStore.Instance.get(:default), k) == shard_idx and length(acc) < 10 do
             {:cont, [k | acc]}
           else
             if length(acc) >= 10, do: {:halt, acc}, else: {:cont, acc}
@@ -452,7 +452,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       # All keys should be readable -- this proves the batch was applied atomically
       for k <- keys do
-        assert "batched" == Router.get(k), "Key #{k} should be readable after batched write"
+        assert "batched" == Router.get(FerricStore.Instance.get(:default), k), "Key #{k} should be readable after batched write"
       end
     end
 
@@ -465,8 +465,8 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       k_fast = pkey("fast_ns", "gc002")
       k_slow = pkey("slow_ns", "gc002")
 
-      shard_fast = Router.shard_for(k_fast)
-      shard_slow = Router.shard_for(k_slow)
+      shard_fast = Router.shard_for(FerricStore.Instance.get(:default), k_fast)
+      shard_slow = Router.shard_for(FerricStore.Instance.get(:default), k_slow)
 
       # Write to both namespaces concurrently
       # The fast namespace should not wait for the slow namespace's window
@@ -497,11 +497,11 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       assert slow_result == :ok
 
       # Verify both values are readable
-      assert "fast_val" == Router.get(k_fast)
+      assert "fast_val" == Router.get(FerricStore.Instance.get(:default), k_fast)
 
       # Slow namespace needs time for its window to expire
       Process.sleep(150)
-      assert "slow_val" == Router.get(k_slow)
+      assert "slow_val" == Router.get(FerricStore.Instance.get(:default), k_slow)
 
       # The fast namespace write should complete well before the slow window
       # (this is a soft assertion -- timing-dependent but generous enough for CI)
@@ -518,8 +518,8 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       k_a = pkey("flush_a", "gc003")
       k_b = pkey("flush_b", "gc003")
 
-      shard_a = Router.shard_for(k_a)
-      shard_b = Router.shard_for(k_b)
+      shard_a = Router.shard_for(FerricStore.Instance.get(:default), k_a)
+      shard_b = Router.shard_for(FerricStore.Instance.get(:default), k_b)
 
       # Write to both namespaces -- with 5s window, they will sit in the buffer.
       # We use Task.async to avoid blocking the test process since the batcher
@@ -545,8 +545,8 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       assert :ok == Task.await(task_b, 10_000)
 
       # Both values should be readable
-      assert "flush_val_a" == Router.get(k_a)
-      assert "flush_val_b" == Router.get(k_b)
+      assert "flush_val_a" == Router.get(FerricStore.Instance.get(:default), k_a)
+      assert "flush_val_b" == Router.get(FerricStore.Instance.get(:default), k_b)
     end
 
     @tag :durability
@@ -575,15 +575,15 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       assert :ok == batcher_put(k_quorum, "quorum_survives")
 
       # Write through async path
-      shard_async = Router.shard_for(k_async)
+      shard_async = Router.shard_for(FerricStore.Instance.get(:default), k_async)
       assert :ok == Batcher.write(shard_async, {:put, k_async, "async_data", 0})
 
       # Give async worker time to process
       Process.sleep(100)
 
       # Verify both are readable before the crash
-      assert "quorum_survives" == Router.get(k_quorum)
-      assert "async_data" == Router.get(k_async)
+      assert "quorum_survives" == Router.get(FerricStore.Instance.get(:default), k_quorum)
+      assert "async_data" == Router.get(FerricStore.Instance.get(:default), k_async)
 
       # Flush all shards to disk before killing (for fair comparison)
       ShardHelpers.flush_all_shards()
@@ -598,7 +598,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       ShardHelpers.wait_shards_alive()
 
       # Quorum write should survive
-      ShardHelpers.eventually(fn -> "quorum_survives" == Router.get(k_quorum) end,
+      ShardHelpers.eventually(fn -> "quorum_survives" == Router.get(FerricStore.Instance.get(:default), k_quorum) end,
         "quorum write should survive shard restart")
     end
 
@@ -618,7 +618,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       async_keys =
         for i <- 1..20 do
           k = pkey("mixed", "overlap_a_#{i}")
-          shard = Router.shard_for(k)
+          shard = Router.shard_for(FerricStore.Instance.get(:default), k)
           Batcher.write(shard, {:put, k, "a_#{i}", 0})
           k
         end
@@ -627,11 +627,11 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       # All keys should be readable
       for {k, i} <- Enum.with_index(quorum_keys, 1) do
-        assert "q_#{i}" == Router.get(k)
+        assert "q_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
       end
 
       for {k, i} <- Enum.with_index(async_keys, 1) do
-        assert "a_#{i}" == Router.get(k)
+        assert "a_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
   end
@@ -670,7 +670,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
   end
 
   defp kill_shard_and_wait(key) do
-    name = Router.shard_name(Router.shard_for(key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     pid = Process.whereis(name)
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)
@@ -696,7 +696,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       # Verify before crash
       for {k, i} <- Enum.with_index(keys, 1) do
-        assert Router.get(k) == "val_#{i}"
+        assert Router.get(FerricStore.Instance.get(:default), k) == "val_#{i}"
       end
 
       # Kill shard owning first key
@@ -704,12 +704,12 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       # All keys must still be readable
       for {k, i} <- Enum.with_index(keys, 1) do
-        ShardHelpers.eventually(fn -> Router.get(k) == "val_#{i}" end,
+        ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "val_#{i}" end,
           "key #{k} lost after crash")
       end
 
       # dbsize must be at least 10 (could be more from other shards' residual keys)
-      ShardHelpers.eventually(fn -> Router.dbsize() >= 10 end,
+      ShardHelpers.eventually(fn -> Router.dbsize(FerricStore.Instance.get(:default)) >= 10 end,
         "dbsize should be at least 10 after crash recovery")
     end
   end
@@ -723,13 +723,13 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       flush_all_batchers()
       ShardHelpers.flush_all_shards()
 
-      assert Router.get(k) == "ttl_val"
+      assert Router.get(FerricStore.Instance.get(:default), k) == "ttl_val"
       {:ok, ttl_before} = FerricStore.pttl(k)
       assert is_integer(ttl_before) and ttl_before > 0, "TTL should be positive before crash"
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn -> Router.get(k) == "ttl_val" end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "ttl_val" end,
         "value lost after crash")
       ShardHelpers.eventually(fn ->
         case FerricStore.pttl(k) do
@@ -751,11 +751,11 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       flush_all_batchers()
       ShardHelpers.flush_all_shards()
 
-      assert Router.get(k) == nil, "expired key should not be readable"
+      assert Router.get(FerricStore.Instance.get(:default), k) == nil, "expired key should not be readable"
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn -> Router.get(k) == nil end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == nil end,
         "expired key must stay expired after crash")
     end
   end
@@ -817,16 +817,16 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       flush_all_batchers()
       ShardHelpers.flush_all_shards()
 
-      assert Router.get(k) == "temporary"
+      assert Router.get(FerricStore.Instance.get(:default), k) == "temporary"
 
-      Router.delete(k)
+      Router.delete(FerricStore.Instance.get(:default), k)
       ShardHelpers.flush_all_shards()
 
-      assert Router.get(k) == nil, "key should be deleted"
+      assert Router.get(FerricStore.Instance.get(:default), k) == nil, "key should be deleted"
 
       kill_shard_and_wait(k)
 
-      ShardHelpers.eventually(fn -> Router.get(k) == nil end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == nil end,
         "tombstone must survive crash")
     end
 
@@ -863,7 +863,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       # First crash
       kill_shard_and_wait(k1)
-      ShardHelpers.eventually(fn -> Router.get(k1) == "round1" end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k1) == "round1" end,
         "round 1 data lost")
 
       # Write more after first recovery
@@ -872,15 +872,15 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       flush_all_batchers()
       ShardHelpers.flush_all_shards()
 
-      ShardHelpers.eventually(fn -> Router.get(k2) == "round2" end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k2) == "round2" end,
         "round 2 data should be readable")
 
       # Second crash
       kill_shard_and_wait(k1)
 
-      ShardHelpers.eventually(fn -> Router.get(k1) == "round1" end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k1) == "round1" end,
         "round 1 data lost after second crash")
-      ShardHelpers.eventually(fn -> Router.get(k2) == "round2" end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k2) == "round2" end,
         "round 2 data lost after second crash")
 
       # Write after second recovery
@@ -888,7 +888,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       batcher_put(k3, "round3")
       flush_all_batchers()
       ShardHelpers.flush_all_shards()
-      ShardHelpers.eventually(fn -> Router.get(k3) == "round3" end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k3) == "round3" end,
         "write after double crash failed")
     end
   end

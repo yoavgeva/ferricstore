@@ -64,31 +64,31 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       flush: fn -> :ok end,
       dbsize: &Router.dbsize/0,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }
@@ -105,7 +105,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
   end
 
   defp dedicated_dir(key) do
-    shard_idx = Router.shard_for(key)
+    shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     Promotion.dedicated_path(data_dir, shard_idx, :hash, key)
   end
@@ -137,7 +137,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
 
       Hash.handle("HSET", [key, "new_field", "new_value"], store)
 
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       keydir = :"keydir_#{shard_idx}"
       compound_key = "H:#{key}\0new_field"
 
@@ -256,7 +256,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
 
       assert "value_1" == Hash.handle("HGET", [key, "field_1"], store)
 
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       ShardHelpers.flush_all_shards()
       ShardHelpers.kill_shard_safely(shard_idx)
 
@@ -277,7 +277,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       File.touch!(new_file)
       NIF.v2_append_record(new_file, "H:#{key}\0crash_field", "crash_value", 0)
 
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       ShardHelpers.flush_all_shards()
       ShardHelpers.kill_shard_safely(shard_idx)
 
@@ -304,7 +304,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       File.touch!(new_file)
       NIF.v2_append_record(new_file, "H:#{key}\0field_1", "overwritten", 0)
 
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       ShardHelpers.flush_all_shards()
       ShardHelpers.kill_shard_safely(shard_idx)
 
@@ -324,7 +324,7 @@ defmodule Ferricstore.Store.DedicatedCompactionTest do
       File.touch!(new_file)
       NIF.v2_append_tombstone(new_file, "H:#{key}\0field_1")
 
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       ShardHelpers.flush_all_shards()
       ShardHelpers.kill_shard_safely(shard_idx)
 

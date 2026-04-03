@@ -35,10 +35,10 @@ defmodule Ferricstore.Raft.IntegrationTest do
 
   defp ukey(base), do: "raft_int_#{base}_#{:rand.uniform(9_999_999)}"
 
-  defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
+  defp keydir_for(key), do: :"keydir_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
   defp shard_pid_for(key) do
-    name = Router.shard_name(Router.shard_for(key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     Process.whereis(name)
   end
 
@@ -50,21 +50,21 @@ defmodule Ferricstore.Raft.IntegrationTest do
     test "SET through Router writes via Raft and is readable" do
       k = ukey("set_via_raft")
 
-      Router.put(k, "raft_value", 0)
-      assert "raft_value" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "raft_value", 0)
+      assert "raft_value" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "SET writes to both ETS and Bitcask" do
       k = ukey("dual_write")
 
-      Router.put(k, "dual_val", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "dual_val", 0)
 
       # ETS should have the value
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
       assert [{^k, "dual_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
 
       # Flush pending writes to Bitcask before checking NIF directly
-      shard_name = Router.shard_name(Router.shard_for(k))
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), k))
       GenServer.call(shard_name, :flush)
 
       # Flush background BitcaskWriter so deferred writes are on disk
@@ -82,11 +82,11 @@ defmodule Ferricstore.Raft.IntegrationTest do
     test "DEL removes from ETS and Bitcask" do
       k = ukey("del_both")
 
-      Router.put(k, "to_delete", 0)
-      assert "to_delete" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "to_delete", 0)
+      assert "to_delete" == Router.get(FerricStore.Instance.get(:default), k)
 
-      Router.delete(k)
-      assert nil == Router.get(k)
+      Router.delete(FerricStore.Instance.get(:default), k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
 
       # ETS should be empty
       assert [] == :ets.lookup(keydir_for(k), k)
@@ -95,20 +95,20 @@ defmodule Ferricstore.Raft.IntegrationTest do
     test "multiple writes to same key return latest value" do
       k = ukey("overwrite")
 
-      Router.put(k, "v1", 0)
-      Router.put(k, "v2", 0)
-      Router.put(k, "v3", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "v1", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "v2", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "v3", 0)
 
-      assert "v3" == Router.get(k)
+      assert "v3" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "writes with TTL are respected" do
       k = ukey("ttl_write")
       future = System.os_time(:millisecond) + 60_000
 
-      Router.put(k, "ttl_val", future)
+      Router.put(FerricStore.Instance.get(:default), k, "ttl_val", future)
 
-      {value, expire_at_ms} = Router.get_meta(k)
+      {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "ttl_val"
       assert expire_at_ms == future
     end
@@ -129,13 +129,13 @@ defmodule Ferricstore.Raft.IntegrationTest do
 
       # Write all keys
       for k <- keys do
-        Router.put(k, "shard_val_#{k}", 0)
+        Router.put(FerricStore.Instance.get(:default), k, "shard_val_#{k}", 0)
       end
 
       # All keys should be readable
       for k <- keys do
-        assert "shard_val_#{k}" == Router.get(k),
-               "Key #{k} (shard #{Router.shard_for(k)}) should be readable"
+        assert "shard_val_#{k}" == Router.get(FerricStore.Instance.get(:default), k),
+               "Key #{k} (shard #{Router.shard_for(FerricStore.Instance.get(:default), k)}) should be readable"
       end
     end
 
@@ -144,10 +144,10 @@ defmodule Ferricstore.Raft.IntegrationTest do
       keys = for i <- 1..10, do: "#{prefix}_#{i}"
 
       for k <- keys do
-        Router.put(k, "v", 0)
+        Router.put(FerricStore.Instance.get(:default), k, "v", 0)
       end
 
-      all_keys = Router.keys()
+      all_keys = Router.keys(FerricStore.Instance.get(:default))
 
       for k <- keys do
         assert k in all_keys, "Key #{k} should be in keys()"
@@ -166,7 +166,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
       tasks =
         Enum.map(keys, fn k ->
           Task.async(fn ->
-            Router.put(k, "concurrent_val", 0)
+            Router.put(FerricStore.Instance.get(:default), k, "concurrent_val", 0)
           end)
         end)
 
@@ -175,7 +175,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
 
       # All keys should be readable
       for k <- keys do
-        assert "concurrent_val" == Router.get(k)
+        assert "concurrent_val" == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
 
@@ -183,14 +183,14 @@ defmodule Ferricstore.Raft.IntegrationTest do
       k = ukey("interleave")
 
       # Write, read, write, read -- each read should see the latest write
-      Router.put(k, "v1", 0)
-      assert "v1" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "v1", 0)
+      assert "v1" == Router.get(FerricStore.Instance.get(:default), k)
 
-      Router.put(k, "v2", 0)
-      assert "v2" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "v2", 0)
+      assert "v2" == Router.get(FerricStore.Instance.get(:default), k)
 
-      Router.put(k, "v3", 0)
-      assert "v3" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "v3", 0)
+      assert "v3" == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -234,15 +234,15 @@ defmodule Ferricstore.Raft.IntegrationTest do
     @tag :capture_log
     test "data survives shard crash and restart" do
       k = ukey("durable")
-      Router.put(k, "survives_crash", 0)
-      assert "survives_crash" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "survives_crash", 0)
+      assert "survives_crash" == Router.get(FerricStore.Instance.get(:default), k)
 
       # Flush to ensure data is durable
       pid = shard_pid_for(k)
       :ok = GenServer.call(pid, :flush)
 
-      shard_index = Router.shard_for(k)
-      shard_name = Router.shard_name(shard_index)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_index)
 
       # Kill the shard (simulates crash)
       ref = Process.monitor(pid)
@@ -257,7 +257,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
       assert new_pid != pid
 
       # Data should be recoverable from Bitcask
-      ShardHelpers.eventually(fn -> "survives_crash" == Router.get(k) end,
+      ShardHelpers.eventually(fn -> "survives_crash" == Router.get(FerricStore.Instance.get(:default), k) end,
         "data should survive shard crash and be recovered from Bitcask")
     end
   end

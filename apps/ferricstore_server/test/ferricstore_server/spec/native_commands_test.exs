@@ -92,7 +92,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
 
       # After expiry a new owner can acquire the lock
       assert :ok = Native.handle("LOCK", [key, "owner_b", "5000"], dummy_store())
-      assert "owner_b" == Router.get(key)
+      assert "owner_b" == Router.get(FerricStore.Instance.get(:default), key)
 
       # Cleanup
       Native.handle("UNLOCK", [key, "owner_b"], dummy_store())
@@ -111,12 +111,12 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       assert msg =~ "not the lock owner"
 
       # Lock is still held by owner_a
-      assert "owner_a" == Router.get(key)
+      assert "owner_a" == Router.get(FerricStore.Instance.get(:default), key)
       assert {:error, _} = Native.handle("LOCK", [key, "owner_c", "5000"], dummy_store())
 
       # Correct owner can unlock
       assert 1 == Native.handle("UNLOCK", [key, "owner_a"], dummy_store())
-      assert nil == Router.get(key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -126,13 +126,13 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
 
       # Acquire lock with 500ms TTL
       assert :ok = Native.handle("LOCK", [key, "owner1", "500"], dummy_store())
-      {_val, original_exp} = Router.get_meta(key)
+      {_val, original_exp} = Router.get_meta(FerricStore.Instance.get(:default), key)
 
       # Wait briefly, then extend with a much longer TTL
       Process.sleep(50)
       assert 1 == Native.handle("EXTEND", [key, "owner1", "60000"], dummy_store())
 
-      {_val, new_exp} = Router.get_meta(key)
+      {_val, new_exp} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert new_exp > original_exp,
              "EXTEND must push the expiry forward: #{new_exp} > #{original_exp}"
 
@@ -158,7 +158,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       end
 
       # After heartbeats the lock is still held
-      assert "worker" == Router.get(key)
+      assert "worker" == Router.get(FerricStore.Instance.get(:default), key)
       assert {:error, _} = Native.handle("LOCK", [key, "impostor", "100"], dummy_store())
 
       # Cleanup
@@ -171,19 +171,19 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       key = ukey("lock_idempotent")
 
       assert :ok = Native.handle("LOCK", [key, "owner1", "1000"], dummy_store())
-      {_val, exp1} = Router.get_meta(key)
+      {_val, exp1} = Router.get_meta(FerricStore.Instance.get(:default), key)
 
       Process.sleep(50)
 
       # Same owner re-locks with a longer TTL -- should succeed and refresh TTL
       assert :ok = Native.handle("LOCK", [key, "owner1", "60000"], dummy_store())
-      {_val, exp2} = Router.get_meta(key)
+      {_val, exp2} = Router.get_meta(FerricStore.Instance.get(:default), key)
 
       assert exp2 > exp1,
              "re-lock by same owner should refresh TTL: #{exp2} > #{exp1}"
 
       # Value should still be owner1
-      assert "owner1" == Router.get(key)
+      assert "owner1" == Router.get(FerricStore.Instance.get(:default), key)
 
       # Cleanup
       Native.handle("UNLOCK", [key, "owner1"], dummy_store())
@@ -341,7 +341,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
   describe "Section 15 -- warm cache returns value, no compute" do
     test "FETCH_OR_COMPUTE on existing key returns hit, no COMPUTE issued" do
       key = ukey("foc_warm_cache")
-      Router.put(key, "cached_value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "cached_value", 0)
 
       # 20 concurrent callers -- all should get cached value, none get COMPUTE
       tasks =
@@ -357,7 +357,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
              "all callers should receive cache hit, no COMPUTE expected"
 
       # Cleanup
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -396,7 +396,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
              "all callers should receive the computed value"
 
       # Cleanup
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
 
     test "50 concurrent FETCH_OR_COMPUTE on same missing key, exactly 1 COMPUTE" do
@@ -428,7 +428,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
              "all 50 callers should receive the computed value"
 
       # Cleanup
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -545,7 +545,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       end
 
       # Cleanup
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -597,13 +597,13 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
 
     test "FETCH_OR_COMPUTE command returns ['hit', value] on cache hit" do
       key = ukey("foc_cmd_hit")
-      Router.put(key, "already_cached", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "already_cached", 0)
 
       result = Native.handle("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
       assert ["hit", "already_cached"] = result
 
       # Cleanup
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
 
     test "FETCH_OR_COMPUTE_RESULT stores value and subsequent fetch is hit" do
@@ -616,7 +616,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       assert ["hit", "val"] = result
 
       # Cleanup
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
   end
 end

@@ -47,10 +47,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       :ok = NamespaceConfig.set(prefix, "window_ms", "100")
 
       # Write a key to populate the batcher's ns_cache for this prefix.
-      Router.put(key, "seed", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "seed", 0)
 
       # Inspect the batcher state to verify the ns_cache contains our prefix.
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       batcher_name = Batcher.batcher_name(shard_idx)
       state_before = :sys.get_state(batcher_name)
 
@@ -120,7 +120,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       # Set a long initial window so the slot stays open.
       :ok = NamespaceConfig.set(prefix, "window_ms", "5000")
 
-      shard_idx = Router.shard_for(key1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key1)
 
       # Queue a write — this starts a 5000ms timer on the slot.
       task1 =
@@ -152,7 +152,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       # Verify the key was written (the flush forced it through).
       ShardHelpers.eventually(
-        fn -> Router.get(key1) == "v1" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key1) == "v1" end,
         "key1 should be written after flush",
         50,
         50
@@ -186,7 +186,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       assert results == [:ok, "written_without_acl"],
         "multi/exec should execute all commands (no ACL enforcement in embedded mode)"
 
-      assert Router.get(key) == "written_without_acl"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "written_without_acl"
     end
 
     @tag timeout: 30_000
@@ -216,11 +216,11 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       # capability — transactions always execute (never return nil).
       key = "r2m10:nowatch_#{System.unique_integer([:positive])}"
 
-      Router.put(key, "original", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # Even though we modify the key before executing the transaction,
       # it succeeds because Tx doesn't support WATCH.
-      Router.put(key, "modified_externally", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "modified_externally", 0)
 
       {:ok, results} =
         FerricStore.multi(fn tx ->
@@ -243,10 +243,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
     test "EXEC succeeds when watched key is unchanged" do
       key = "r2m11:unchanged_#{System.unique_integer([:positive])}"
 
-      Router.put(key, "original", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # Capture the value hash (simulates WATCH).
-      hash = :erlang.phash2(Router.get(key))
+      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
       watched = %{key => hash}
 
       # No modification to key — EXEC should succeed.
@@ -255,28 +255,28 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       assert is_list(result), "EXEC should return a list of results when WATCH passes"
       assert result == [:ok]
-      assert Router.get(key) == "updated_by_tx"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "updated_by_tx"
     end
 
     @tag timeout: 30_000
     test "EXEC fails (returns nil) when watched key is modified" do
       key = "r2m11:modified_#{System.unique_integer([:positive])}"
 
-      Router.put(key, "original", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # WATCH the key (snapshot value hash).
-      hash = :erlang.phash2(Router.get(key))
+      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
       watched = %{key => hash}
 
       # Another client modifies the key between WATCH and EXEC.
-      Router.put(key, "changed_by_other", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "changed_by_other", 0)
 
       # EXEC should detect the value hash mismatch and abort.
       queue = [{"SET", [key, "should_not_apply"]}]
       result = Coordinator.execute(queue, watched, nil)
 
       assert result == nil, "EXEC should return nil when a watched key was modified"
-      assert Router.get(key) == "changed_by_other",
+      assert Router.get(FerricStore.Instance.get(:default), key) == "changed_by_other",
         "original modification should persist — tx was aborted"
     end
 
@@ -284,13 +284,13 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
     test "WATCH detects key deletion" do
       key = "r2m11:deleted_#{System.unique_integer([:positive])}"
 
-      Router.put(key, "exists", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "exists", 0)
 
-      hash = :erlang.phash2(Router.get(key))
+      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
       watched = %{key => hash}
 
       # Delete the key — value changes from "exists" to nil, hash changes.
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
 
       queue = [{"SET", [key, "should_not_apply"]}]
       result = Coordinator.execute(queue, watched, nil)
@@ -303,15 +303,15 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       key_a = "r2m11:multi_a_#{System.unique_integer([:positive])}"
       key_b = "r2m11:multi_b_#{System.unique_integer([:positive])}"
 
-      Router.put(key_a, "a_orig", 0)
-      Router.put(key_b, "b_orig", 0)
+      Router.put(FerricStore.Instance.get(:default), key_a, "a_orig", 0)
+      Router.put(FerricStore.Instance.get(:default), key_b, "b_orig", 0)
 
-      hash_a = :erlang.phash2(Router.get(key_a))
-      hash_b = :erlang.phash2(Router.get(key_b))
+      hash_a = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
+      hash_b = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_b))
       watched = %{key_a => hash_a, key_b => hash_b}
 
       # Modify only key_b.
-      Router.put(key_b, "b_changed", 0)
+      Router.put(FerricStore.Instance.get(:default), key_b, "b_changed", 0)
 
       queue = [
         {"SET", [key_a, "a_new"]},
@@ -321,8 +321,8 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       result = Coordinator.execute(queue, watched, nil)
 
       assert result == nil, "EXEC should abort if ANY watched key was modified"
-      assert Router.get(key_a) == "a_orig", "key_a should be unchanged"
-      assert Router.get(key_b) == "b_changed", "key_b should retain the external modification"
+      assert Router.get(FerricStore.Instance.get(:default), key_a) == "a_orig", "key_a should be unchanged"
+      assert Router.get(FerricStore.Instance.get(:default), key_b) == "b_changed", "key_b should retain the external modification"
     end
 
     @tag timeout: 30_000
@@ -333,16 +333,16 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       {key_a, key_b} = ShardHelpers.keys_on_same_shard()
 
       # Sanity check: both keys must route to the same shard.
-      assert Router.shard_for(key_a) == Router.shard_for(key_b),
+      assert Router.shard_for(FerricStore.Instance.get(:default), key_a) == Router.shard_for(FerricStore.Instance.get(:default), key_b),
         "test infrastructure: keys should be on the same shard"
 
-      Router.put(key_a, "watched_val", 0)
+      Router.put(FerricStore.Instance.get(:default), key_a, "watched_val", 0)
 
-      hash_a = :erlang.phash2(Router.get(key_a))
+      hash_a = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
       watched = %{key_a => hash_a}
 
       # Write to key_b which is on the SAME shard — does NOT affect key_a's value.
-      Router.put(key_b, "unrelated_write", 0)
+      Router.put(FerricStore.Instance.get(:default), key_b, "unrelated_write", 0)
 
       queue = [{"GET", [key_a]}]
       result = Coordinator.execute(queue, watched, nil)
@@ -357,11 +357,11 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
     test "WATCH value hash changes when value changes" do
       key = "r2m11:hash_#{System.unique_integer([:positive])}"
 
-      Router.put(key, "v1", 0)
-      h1 = :erlang.phash2(Router.get(key))
+      Router.put(FerricStore.Instance.get(:default), key, "v1", 0)
+      h1 = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
 
-      Router.put(key, "v2", 0)
-      h2 = :erlang.phash2(Router.get(key))
+      Router.put(FerricStore.Instance.get(:default), key, "v2", 0)
+      h2 = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
 
       # Hash should differ because the value changed.
       assert h1 != h2, "value hash should change when value changes (h1=#{h1}, h2=#{h2})"
@@ -371,7 +371,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
     test "concurrent WATCH/EXEC — only one succeeds under contention" do
       key = "r2m11:race_#{System.unique_integer([:positive])}"
 
-      Router.put(key, "0", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "0", 0)
 
       # Ten tasks all WATCH the same key (snapshot same value hash "0")
       # and try to SET it to different values. The first to execute changes
@@ -380,7 +380,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
         1..10
         |> Enum.map(fn i ->
           Task.async(fn ->
-            hash = :erlang.phash2(Router.get(key))
+            hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
             watched = %{key => hash}
             queue = [{"SET", [key, Integer.to_string(i)]}]
             Coordinator.execute(queue, watched, nil)
@@ -408,10 +408,10 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       key = "h13:nx_skip_#{System.unique_integer([:positive])}"
 
       # Create the key so SET NX will be a no-op.
-      Router.put(key, "original", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # WATCH: snapshot value hash.
-      hash = :erlang.phash2(Router.get(key))
+      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
       watched = %{key => hash}
 
       # SET NX is a no-op (key exists), value unchanged.
@@ -432,50 +432,50 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
     test "actual value change aborts WATCH" do
       key = "h13:changed_#{System.unique_integer([:positive])}"
 
-      Router.put(key, "original", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
-      hash = :erlang.phash2(Router.get(key))
+      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
       watched = %{key => hash}
 
       # Another client changes the value.
-      Router.put(key, "new_value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "new_value", 0)
 
       queue = [{"SET", [key, "should_not_apply"]}]
       result = Coordinator.execute(queue, watched, nil)
 
       assert result == nil, "EXEC should abort when value actually changed"
-      assert Router.get(key) == "new_value"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "new_value"
     end
 
     @tag timeout: 30_000
     test "DEL aborts WATCH" do
       key = "h13:del_#{System.unique_integer([:positive])}"
 
-      Router.put(key, "exists", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "exists", 0)
 
-      hash = :erlang.phash2(Router.get(key))
+      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
       watched = %{key => hash}
 
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
 
       queue = [{"SET", [key, "should_not_apply"]}]
       result = Coordinator.execute(queue, watched, nil)
 
       assert result == nil, "EXEC should abort when watched key is deleted"
-      assert Router.get(key) == nil
+      assert Router.get(FerricStore.Instance.get(:default), key) == nil
     end
 
     @tag timeout: 30_000
     test "idempotent write does not abort WATCH" do
       key = "h13:idempotent_#{System.unique_integer([:positive])}"
 
-      Router.put(key, "hello", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "hello", 0)
 
-      hash = :erlang.phash2(Router.get(key))
+      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
       watched = %{key => hash}
 
       # Write the same value — phash2 should match.
-      Router.put(key, "hello", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "hello", 0)
 
       queue = [{"GET", [key]}]
       result = Coordinator.execute(queue, watched, nil)
@@ -489,16 +489,16 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
     test "write to different key on same shard does not abort WATCH" do
       {key_a, key_b} = ShardHelpers.keys_on_same_shard()
 
-      assert Router.shard_for(key_a) == Router.shard_for(key_b),
+      assert Router.shard_for(FerricStore.Instance.get(:default), key_a) == Router.shard_for(FerricStore.Instance.get(:default), key_b),
         "test infrastructure: keys should be on the same shard"
 
-      Router.put(key_a, "watched", 0)
+      Router.put(FerricStore.Instance.get(:default), key_a, "watched", 0)
 
-      hash_a = :erlang.phash2(Router.get(key_a))
+      hash_a = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
       watched = %{key_a => hash_a}
 
       # Write to key_b on the same shard — key_a's value is unchanged.
-      Router.put(key_b, "unrelated", 0)
+      Router.put(FerricStore.Instance.get(:default), key_b, "unrelated", 0)
 
       queue = [{"GET", [key_a]}]
       result = Coordinator.execute(queue, watched, nil)
@@ -517,7 +517,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
       watched = %{key => hash}
 
       # Another client creates the key.
-      Router.put(key, "created", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "created", 0)
 
       queue = [{"GET", [key]}]
       result = Coordinator.execute(queue, watched, nil)
@@ -539,7 +539,7 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
       assert is_list(result), "EXEC should succeed when non-existent key stays absent"
       assert result == [:ok]
-      assert Router.get(key) == "created_by_tx"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "created_by_tx"
     end
   end
 

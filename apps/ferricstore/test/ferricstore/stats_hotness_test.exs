@@ -241,9 +241,9 @@ defmodule Ferricstore.Stats.HotnessTest do
     setup do
       # Clean up any keys we write
       on_exit(fn ->
-        Router.delete("hottest:alpha")
-        Router.delete("hottest:beta")
-        Router.delete("coldkey")
+        Router.delete(FerricStore.Instance.get(:default), "hottest:alpha")
+        Router.delete(FerricStore.Instance.get(:default), "hottest:beta")
+        Router.delete(FerricStore.Instance.get(:default), "coldkey")
       end)
 
       :ok
@@ -252,9 +252,9 @@ defmodule Ferricstore.Stats.HotnessTest do
     test "first read of a key after put is hot (ETS hit)" do
       Stats.reset_hotness()
 
-      Router.put("hottest:alpha", "value", 0)
+      Router.put(FerricStore.Instance.get(:default), "hottest:alpha", "value", 0)
       # Key is now in ETS from the put. Reading should be a hot read.
-      _val = Router.get("hottest:alpha")
+      _val = Router.get(FerricStore.Instance.get(:default), "hottest:alpha")
 
       assert Stats.total_hot_reads() >= 1
 
@@ -268,10 +268,10 @@ defmodule Ferricstore.Stats.HotnessTest do
     test "repeated reads of same key are all hot" do
       Stats.reset_hotness()
 
-      Router.put("hottest:beta", "value", 0)
+      Router.put(FerricStore.Instance.get(:default), "hottest:beta", "value", 0)
 
       for _ <- 1..5 do
-        Router.get("hottest:beta")
+        Router.get(FerricStore.Instance.get(:default), "hottest:beta")
       end
 
       entries = Stats.hotness_top(10)

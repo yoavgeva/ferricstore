@@ -24,7 +24,7 @@ defmodule Ferricstore.Bench.ReadProfileTest do
       t1 = :erlang.monotonic_time(:nanosecond)
 
       # Step 2: shard_for (hash + extract_hash_tag)
-      idx = Ferricstore.Store.Router.shard_for(resolved)
+      idx = Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), resolved)
       t2 = :erlang.monotonic_time(:nanosecond)
 
       # Step 3: ETS lookup

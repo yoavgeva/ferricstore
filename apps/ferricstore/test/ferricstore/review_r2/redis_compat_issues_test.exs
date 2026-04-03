@@ -289,7 +289,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       key = unique_key("wv")
 
       # Write the key
-      Router.put(key, "original", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # Snapshot version after the write
       version_before = Router.get_version(key)
@@ -314,7 +314,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       # Don't create the key -- it should be absent
 
       # Capture version of the shard this key maps to
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       version_before = Ferricstore.Store.WriteVersion.get(shard_idx)
 
       # SET XX should fail (key absent) and NOT modify anything
@@ -333,10 +333,10 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       key = unique_key("wv_watch")
 
       # Create the key
-      Router.put(key, "original", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # WATCH: capture value hash
-      hash = :erlang.phash2(Router.get(key))
+      hash = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key))
       watched = %{key => hash}
 
       # Within MULTI, queue SET NX (will fail since key exists)
@@ -350,7 +350,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
              "R2-H13: EXEC should succeed with [nil] (NX skip), got: #{inspect(result)}"
 
       # Key should still be original
-      assert Router.get(key) == "original"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "original"
     end
 
     test "cross-shard failed NX should not poison WATCH for other clients" do
@@ -362,10 +362,10 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       [key_a, key_b] = ShardHelpers.keys_on_different_shards(2)
 
       # Create key_a so SET NX will fail on it
-      Router.put(key_a, "original", 0)
+      Router.put(FerricStore.Instance.get(:default), key_a, "original", 0)
 
       # Client A: WATCH key_a (snapshot value hash)
-      hash_a = :erlang.phash2(Router.get(key_a))
+      hash_a = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
 
       # Client B: cross-shard MULTI with SET NX on key_a (fails) + SET key_b
       client_b_queue = [
@@ -377,7 +377,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       # Client A: value hash should be unchanged since key_a was not modified.
       # With value-hash WATCH, the cross-shard WriteVersion.increment is
       # irrelevant -- we compare phash2(value) not shard versions.
-      hash_a_after = :erlang.phash2(Router.get(key_a))
+      hash_a_after = :erlang.phash2(Router.get(FerricStore.Instance.get(:default), key_a))
 
       assert hash_a == hash_a_after,
              "R2-H13: value hash should be unchanged after NX skip"
@@ -390,7 +390,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       assert result == [:ok],
              "R2-H13: Client A's EXEC should succeed, got: #{inspect(result)}"
 
-      assert Router.get(key_a) == "updated_by_a"
+      assert Router.get(FerricStore.Instance.get(:default), key_a) == "updated_by_a"
     end
   end
 
@@ -416,31 +416,31 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       getex: &Router.getex/2,
       setrange: &Router.setrange/3,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }

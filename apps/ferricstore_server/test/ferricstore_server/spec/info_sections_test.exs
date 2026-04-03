@@ -39,7 +39,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       exists?: &Router.exists?/1,
       keys: &Router.keys/0,
       flush: fn ->
-        Enum.each(Router.keys(), &Router.delete/1)
+        Enum.each(Router.keys(FerricStore.Instance.get(:default)), &Router.delete/1)
         :ok
       end,
       dbsize: &Router.dbsize/0,
@@ -210,7 +210,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
 
       # Write enough data to create at least one data file
       key = "bitcask_info_test_#{System.unique_integer([:positive])}"
-      Router.put(key, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       fields = parse_info(Server.handle("INFO", ["bitcask"], store))
 
@@ -226,7 +226,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       assert total_files >= 1, "at least one data file should exist after a write"
 
       # Cleanup
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -280,7 +280,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       {before_count, ""} = Integer.parse(Map.fetch!(before_fields, "raft_commands_committed"))
 
       key = "ferricstore_info_test_#{System.unique_integer([:positive])}"
-      Router.put(key, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       # Allow the Raft commit to propagate
       Process.sleep(50)
@@ -292,7 +292,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
              "raft_commands_committed should not decrease after a write"
 
       # Cleanup
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -312,11 +312,11 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
         "plain_#{System.unique_integer([:positive])}"
       ]
 
-      Enum.each(keys, fn key -> Router.put(key, "val", 0) end)
+      Enum.each(keys, fn key -> Router.put(FerricStore.Instance.get(:default), key, "val", 0) end)
 
       on_exit(fn ->
         ShardHelpers.wait_shards_alive()
-        Enum.each(keys, fn key -> Router.delete(key) end)
+        Enum.each(keys, fn key -> Router.delete(FerricStore.Instance.get(:default), key) end)
       end)
 
       %{keys: keys}

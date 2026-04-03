@@ -39,7 +39,7 @@ defmodule FerricstoreServer.Bench.TcpDetailedProfileTest do
     key = "#{prefix}:500"
     dispatch_times = for _ <- 1..10_000 do
       t0 = :erlang.monotonic_time(:nanosecond)
-      _val = Ferricstore.Store.Router.get(key)
+      _val = Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), key)
       t1 = :erlang.monotonic_time(:nanosecond)
       t1 - t0
     end

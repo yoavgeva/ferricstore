@@ -190,12 +190,12 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       keys =
         Stream.iterate(0, &(&1 + 1))
         |> Stream.map(fn i -> "expiry_struggle_#{uid}_#{i}" end)
-        |> Stream.filter(fn k -> Router.shard_for(k) == 0 end)
+        |> Stream.filter(fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) == 0 end)
         |> Enum.take(20)
 
-      Enum.each(keys, fn k -> Router.put(k, "val", past) end)
+      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "val", past) end)
 
-      shard_name = Router.shard_name(0)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), 0)
 
       # Run 3+ sweeps. The first 3 should all hit ceiling (2 keys removed per sweep,
       # but 20 expired keys remain). After 3 ceiling hits, :struggling fires.
@@ -235,7 +235,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       # Use shard 1 to avoid state left over from the struggling test on shard 0.
       # First, reset sweep state by triggering a below-ceiling sweep (no expired keys).
-      shard_name = Router.shard_name(1)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), 1)
       GenServer.call(shard_name, :expiry_sweep)
 
       # Drain any stale recovered events produced by the reset sweep above
@@ -250,10 +250,10 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       keys =
         Stream.iterate(0, &(&1 + 1))
         |> Stream.map(fn i -> "expiry_recover_#{uid}_#{i}" end)
-        |> Stream.filter(fn k -> Router.shard_for(k) == 1 end)
+        |> Stream.filter(fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) == 1 end)
         |> Enum.take(10)
 
-      Enum.each(keys, fn k -> Router.put(k, "val", past) end)
+      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "val", past) end)
 
       # Run 3 sweeps to enter struggling state (each removes 2 at ceiling).
       for _ <- 1..3 do
@@ -523,16 +523,16 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
     test "hot read is recorded when key is in ETS cache" do
       key = "hotcold_hot_#{System.unique_integer([:positive])}"
-      Router.put(key, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       # First GET warms the cache (may be cold if not yet in ETS).
-      _val = Router.get(key)
+      _val = Router.get(FerricStore.Instance.get(:default), key)
 
       # Reset counters after warm-up.
       Ferricstore.Stats.reset_hotness()
 
       # Second GET should be hot (ETS hit).
-      assert Router.get(key) == "value"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "value"
 
       hot = Ferricstore.Stats.total_hot_reads()
       assert hot >= 1
@@ -540,11 +540,11 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
     test "cold read is recorded when key is not in ETS cache" do
       key = "hotcold_cold_#{System.unique_integer([:positive])}"
-      Router.put(key, "cold_value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "cold_value", 0)
 
       # Flush to disk so Bitcask has the data.
-      shard_idx = Router.shard_for(key)
-      shard_name = Router.shard_name(shard_idx)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
       :ok = GenServer.call(shard_name, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
 
@@ -556,15 +556,15 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       Ferricstore.Stats.reset_hotness()
 
-      assert Router.get(key) == "cold_value"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "cold_value"
 
       cold = Ferricstore.Stats.total_cold_reads()
       assert cold >= 1
     end
 
     test "INFO stats section includes hot/cold read fields" do
-      Router.put("hotcold_info_test", "val", 0)
-      _val = Router.get("hotcold_info_test")
+      Router.put(FerricStore.Instance.get(:default), "hotcold_info_test", "val", 0)
+      _val = Router.get(FerricStore.Instance.get(:default), "hotcold_info_test")
 
       store = %{
         dbsize: fn -> 1 end

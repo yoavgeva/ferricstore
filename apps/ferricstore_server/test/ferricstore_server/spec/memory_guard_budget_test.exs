@@ -143,7 +143,7 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
 
       # Use a unique key that definitely doesn't exist
       unique_key = "keydir_full_test_#{System.unique_integer([:positive])}"
-      result = Router.put(unique_key, "value", 0)
+      result = Router.put(FerricStore.Instance.get(:default), unique_key, "value", 0)
 
       assert {:error, msg} = result
       assert msg =~ "KEYDIR_FULL"
@@ -157,7 +157,7 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       Process.sleep(50)
 
       key = "existing_key_update_test_#{System.unique_integer([:positive])}"
-      assert :ok = Router.put(key, "original_value", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "original_value", 0)
 
       # Now shrink the keydir budget to trigger KEYDIR_FULL
       MemoryGuard.reconfigure(%{keydir_max_ram: 1})
@@ -167,7 +167,7 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       assert MemoryGuard.keydir_full?() == true
 
       # Update to existing key should succeed
-      assert :ok = Router.put(key, "updated_value", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "updated_value", 0)
     end
 
     test "KEYDIR_FULL error message format" do
@@ -176,7 +176,7 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       Process.sleep(50)
 
       unique_key = "keydir_full_format_#{System.unique_integer([:positive])}"
-      {:error, msg} = Router.put(unique_key, "value", 0)
+      {:error, msg} = Router.put(FerricStore.Instance.get(:default), unique_key, "value", 0)
 
       # Exact error message per spec
       assert msg == "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"
@@ -289,8 +289,8 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       # Hot cache shrink may or may not fire depending on hot_cache contents.
       # If there are items in hot_cache, it should trigger.
       # Write some data to hot_cache first.
-      Router.put("shrink_test_key_1", String.duplicate("x", 1000), 0)
-      Router.put("shrink_test_key_2", String.duplicate("y", 1000), 0)
+      Router.put(FerricStore.Instance.get(:default), "shrink_test_key_1", String.duplicate("x", 1000), 0)
+      Router.put(FerricStore.Instance.get(:default), "shrink_test_key_2", String.duplicate("y", 1000), 0)
 
       MemoryGuard.force_check()
 
@@ -446,7 +446,7 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       results =
         Enum.reduce_while(1..10_000, [], fn i, acc ->
           key = "stress_keydir_#{i}"
-          result = Router.put(key, "v", 0)
+          result = Router.put(FerricStore.Instance.get(:default), key, "v", 0)
 
           case result do
             {:error, msg} ->
@@ -483,7 +483,7 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       Process.sleep(50)
 
       unique_key = "recovery_test_#{System.unique_integer([:positive])}"
-      assert {:error, _} = Router.put(unique_key, "value", 0)
+      assert {:error, _} = Router.put(FerricStore.Instance.get(:default), unique_key, "value", 0)
 
       # Restore generous budget
       MemoryGuard.reconfigure(%{keydir_max_ram: 1_073_741_824})
@@ -491,7 +491,7 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       Process.sleep(50)
 
       # New writes should succeed
-      assert :ok = Router.put(unique_key, "value", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), unique_key, "value", 0)
     end
   end
 end

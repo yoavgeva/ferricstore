@@ -54,10 +54,10 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
 
       # Write a key through the async path
       key = "asynctest:diverge_1"
-      assert :ok = Router.put(key, "local_value", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "local_value", 0)
 
       # Verify it's readable locally (ETS + Bitcask have it)
-      assert Router.get(key) == "local_value"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "local_value"
 
       # Now verify the Raft state machine has it too — query via quorum read.
       # First, drain async workers to ensure the Raft submission had time to process.
@@ -69,7 +69,7 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       Process.sleep(100)
 
       # The key should be in both ETS and Raft under normal conditions
-      assert Router.get(key) == "local_value"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "local_value"
     end
 
     test "async write path uses fire-and-forget ra.pipeline_command without correlation" do
@@ -96,7 +96,7 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       )
 
       key = "asynctest:fire_forget_check"
-      assert :ok = Router.put(key, "value", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       # Drain to ensure async processing completes
       shard_count = Application.get_env(:ferricstore, :shard_count, 4)
@@ -107,7 +107,7 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       :telemetry.detach(handler_id)
 
       # Verify the write went through
-      assert Router.get(key) == "value"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "value"
     end
 
     test "multiple rapid async writes all succeed locally regardless of Raft health" do
@@ -117,14 +117,14 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       keys =
         for i <- 1..100 do
           key = "asynctest:rapid_#{i}"
-          assert :ok = Router.put(key, "v#{i}", 0)
+          assert :ok = Router.put(FerricStore.Instance.get(:default), key, "v#{i}", 0)
           {key, "v#{i}"}
         end
 
       # All should be readable locally
       missing =
         Enum.filter(keys, fn {key, expected} ->
-          Router.get(key) != expected
+          Router.get(FerricStore.Instance.get(:default), key) != expected
         end)
 
       assert missing == [],
@@ -137,7 +137,7 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       # Time the write — async should be fast because it doesn't wait for Raft
       {time_us, result} =
         :timer.tc(fn ->
-          Router.put("asynctest:latency_check", "fast", 0)
+          Router.put(FerricStore.Instance.get(:default), "asynctest:latency_check", "fast", 0)
         end)
 
       assert result == :ok
@@ -158,8 +158,8 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
 
       # Write a key — even if ra has temporary issues, local write succeeds
       key = "asynctest:swallow_test"
-      assert :ok = Router.put(key, "survived", 0)
-      assert Router.get(key) == "survived"
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "survived", 0)
+      assert Router.get(FerricStore.Instance.get(:default), key) == "survived"
     end
   end
 
@@ -168,10 +168,10 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       assert :ok = NamespaceConfig.set("asynctest", "durability", "async")
 
       key = "asynctest:lag_demo"
-      assert :ok = Router.put(key, "immediate", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "immediate", 0)
 
       # Immediately readable (ETS has it)
-      assert Router.get(key) == "immediate"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "immediate"
 
       # The Raft log MIGHT not have it yet (pipeline_command is async).
       # In single-node mode this is usually fine because the local ra server
@@ -190,7 +190,7 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       tasks =
         for i <- 1..50 do
           Task.async(fn ->
-            Router.put("asynctest:concurrent_key", "writer_#{i}", 0)
+            Router.put(FerricStore.Instance.get(:default), "asynctest:concurrent_key", "writer_#{i}", 0)
           end)
         end
 
@@ -200,7 +200,7 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       assert Enum.all?(results, &(&1 == :ok))
 
       # The key should have SOME value (whichever writer was last)
-      value = Router.get("asynctest:concurrent_key")
+      value = Router.get(FerricStore.Instance.get(:default), "asynctest:concurrent_key")
       assert value != nil
       assert String.starts_with?(value, "writer_")
     end
@@ -212,7 +212,7 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       # Quorum write — blocks until Raft applies
       {quorum_us, :ok} =
         :timer.tc(fn ->
-          Router.put("quorum_timing_key", "quorum_val", 0)
+          Router.put(FerricStore.Instance.get(:default), "quorum_timing_key", "quorum_val", 0)
         end)
 
       # Switch to async
@@ -221,12 +221,12 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       # Async write — returns immediately
       {async_us, :ok} =
         :timer.tc(fn ->
-          Router.put("asynctest:timing_key", "async_val", 0)
+          Router.put(FerricStore.Instance.get(:default), "asynctest:timing_key", "async_val", 0)
         end)
 
       # Both should succeed
-      assert Router.get("quorum_timing_key") == "quorum_val"
-      assert Router.get("asynctest:timing_key") == "async_val"
+      assert Router.get(FerricStore.Instance.get(:default), "quorum_timing_key") == "quorum_val"
+      assert Router.get(FerricStore.Instance.get(:default), "asynctest:timing_key") == "async_val"
 
       # Log the timings for visibility (async should typically be faster)
       IO.puts("  quorum write: #{quorum_us}us, async write: #{async_us}us")

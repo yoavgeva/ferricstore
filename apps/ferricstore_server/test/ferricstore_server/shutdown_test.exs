@@ -61,7 +61,7 @@ defmodule FerricstoreServer.ShutdownTest do
   describe "shard not alive after stop" do
     @tag :capture_log
     test "killing a shard makes it temporarily unregistered" do
-      name = Router.shard_name(0)
+      name = Router.shard_name(FerricStore.Instance.get(:default), 0)
       old_pid = Process.whereis(name)
       assert is_pid(old_pid) and Process.alive?(old_pid)
 
@@ -79,7 +79,7 @@ defmodule FerricstoreServer.ShutdownTest do
 
     @tag :capture_log
     test "stopped shard is restarted by supervisor with a new PID" do
-      name = Router.shard_name(1)
+      name = Router.shard_name(FerricStore.Instance.get(:default), 1)
       old_pid = Process.whereis(name)
       ref = Process.monitor(old_pid)
       Process.exit(old_pid, :kill)
@@ -104,11 +104,11 @@ defmodule FerricstoreServer.ShutdownTest do
       key = "shutdown_flush_test_#{:rand.uniform(9_999_999)}"
       value = "must_be_on_disk"
 
-      Router.put(key, value, 0)
+      Router.put(FerricStore.Instance.get(:default), key, value, 0)
 
       # Explicitly flush to ensure pending async writes hit disk.
-      shard_idx = Router.shard_for(key)
-      shard_name = Router.shard_name(shard_idx)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
       :ok = GenServer.call(shard_name, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
 
@@ -132,7 +132,7 @@ defmodule FerricstoreServer.ShutdownTest do
         for i <- 1..20 do
           k = "#{prefix}_#{i}"
           v = "value_#{i}"
-          Router.put(k, v, 0)
+          Router.put(FerricStore.Instance.get(:default), k, v, 0)
           {k, v}
         end
 
@@ -141,7 +141,7 @@ defmodule FerricstoreServer.ShutdownTest do
 
       # Verify each key is recoverable by scanning the v2 data files directly.
       for {k, v} <- keys_and_values do
-        shard_idx = Router.shard_for(k)
+        shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k)
         shard_dir = DataDir.shard_data_path(data_dir, shard_idx)
 
         # Scan all log files in the shard directory to find the key
@@ -182,10 +182,10 @@ defmodule FerricstoreServer.ShutdownTest do
         key =
           Enum.find_value(1..100_000, fn n ->
             k = "shard_data_probe_#{i}_#{n}"
-            if Router.shard_for(k) == i, do: k
+            if Router.shard_for(FerricStore.Instance.get(:default), k) == i, do: k
           end)
 
-        Router.put(key, "shard_#{i}_data", 0)
+        Router.put(FerricStore.Instance.get(:default), key, "shard_#{i}_data", 0)
       end
 
       ShardHelpers.flush_all_shards()

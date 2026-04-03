@@ -211,18 +211,18 @@ defmodule Ferricstore.ObjectHashtagTest do
 
   describe "Router.shard_for/1 with hash tags" do
     test "{user:42}:session and {user:42}:profile go to same shard" do
-      shard1 = Router.shard_for("{user:42}:session")
-      shard2 = Router.shard_for("{user:42}:profile")
+      shard1 = Router.shard_for(FerricStore.Instance.get(:default), "{user:42}:session")
+      shard2 = Router.shard_for(FerricStore.Instance.get(:default), "{user:42}:profile")
       assert shard1 == shard2
     end
 
     test "{a}:x and {a}:y go to same shard" do
-      assert Router.shard_for("{a}:x") == Router.shard_for("{a}:y")
+      assert Router.shard_for(FerricStore.Instance.get(:default), "{a}:x") == Router.shard_for(FerricStore.Instance.get(:default), "{a}:y")
     end
 
     test "{a}:x and {b}:x likely go to different slots" do
-      slot_a = Router.slot_for("{a}:x")
-      slot_b = Router.slot_for("{b}:x")
+      slot_a = Router.slot_for(FerricStore.Instance.get(:default), "{a}:x")
+      slot_b = Router.slot_for(FerricStore.Instance.get(:default), "{b}:x")
       # Extremely unlikely to collide with 1024 slots
       assert slot_a != slot_b
     end
@@ -230,14 +230,14 @@ defmodule Ferricstore.ObjectHashtagTest do
     test "no tag key hashes on full key" do
       import Bitwise
       expected_slot = :erlang.phash2("plain") |> band(0x3FF)
-      assert Router.slot_for("plain") == expected_slot
+      assert Router.slot_for(FerricStore.Instance.get(:default), "plain") == expected_slot
     end
 
     test "empty tag {} hashes on full key" do
       import Bitwise
       key = "{}empty"
       expected_slot = :erlang.phash2(key) |> band(0x3FF)
-      assert Router.slot_for(key) == expected_slot
+      assert Router.slot_for(FerricStore.Instance.get(:default), key) == expected_slot
     end
 
     test "hash tag with slot_for matches extract_hash_tag" do
@@ -245,7 +245,7 @@ defmodule Ferricstore.ObjectHashtagTest do
       key = "{user:42}:data"
       tag = Router.extract_hash_tag(key)
       # slot_for should hash on the tag, same as hashing the tag directly
-      assert Router.slot_for(key) == (:erlang.phash2(tag) |> band(0x3FF))
+      assert Router.slot_for(FerricStore.Instance.get(:default), key) == (:erlang.phash2(tag) |> band(0x3FF))
     end
   end
 end

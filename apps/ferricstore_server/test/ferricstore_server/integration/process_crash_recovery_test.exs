@@ -68,7 +68,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     ShardHelpers.kill_shard_safely(idx)
     ShardHelpers.wait_shards_alive(30_000)
 
-    ShardHelpers.eventually(fn -> Router.get(k) == "before_crash" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "before_crash" end,
       "data should survive shard crash")
 
     k2 = ukey("after_shard")
@@ -77,7 +77,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
       Router.put(k2, "new_write") == :ok
     end, "write should succeed after shard crash")
 
-    ShardHelpers.eventually(fn -> Router.get(k2) == "new_write" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k2) == "new_write" end,
       "new writes should work after shard crash")
   end
 
@@ -95,7 +95,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     ShardHelpers.wait_shards_alive(30_000)
 
     for {k, i} <- Enum.with_index(keys) do
-      ShardHelpers.eventually(fn -> Router.get(k) == "shard_#{i}" end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "shard_#{i}" end,
         "shard #{i} data should be unaffected by shard 0 crash")
     end
   end
@@ -111,13 +111,13 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
     kill_and_wait(Ferricstore.Raft.Batcher.batcher_name(0))
 
-    ShardHelpers.eventually(fn -> Router.get(k) == "durable" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "durable" end,
       "data should survive batcher crash")
 
     k2 = ukey("batcher_post")
     Router.put(k2, "after")
     ShardHelpers.flush_all_shards()
-    ShardHelpers.eventually(fn -> Router.get(k2) == "after" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k2) == "after" end,
       "writes should work after batcher crash")
   end
 
@@ -128,13 +128,13 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
     kill_and_wait(Ferricstore.Store.BitcaskWriter.writer_name(0))
 
-    ShardHelpers.eventually(fn -> Router.get(k) == "durable" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "durable" end,
       "data should survive BitcaskWriter crash")
 
     k2 = ukey("writer_post")
     Router.put(k2, "after")
     ShardHelpers.flush_all_shards()
-    ShardHelpers.eventually(fn -> Router.get(k2) == "after" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k2) == "after" end,
       "writes should work after BitcaskWriter crash")
   end
 
@@ -145,7 +145,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
 
     kill_and_wait(Ferricstore.Raft.AsyncApplyWorker.worker_name(0))
 
-    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "safe" end,
       "data should survive AsyncApplyWorker crash")
   end
 
@@ -157,7 +157,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     k = ukey("stats")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.Stats)
-    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "safe" end,
       "data should survive Stats crash")
   end
 
@@ -165,7 +165,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     k = ukey("slowlog")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.SlowLog)
-    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "safe" end,
       "data should survive SlowLog crash")
   end
 
@@ -173,7 +173,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     k = ukey("pubsub")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.PubSub)
-    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "safe" end,
       "data should survive PubSub crash")
   end
 
@@ -181,7 +181,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     k = ukey("config")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.Config)
-    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "safe" end,
       "data should survive Config crash")
   end
 
@@ -189,7 +189,7 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
     k = ukey("memguard")
     Router.put(k, "safe")
     kill_and_wait(Ferricstore.MemoryGuard)
-    ShardHelpers.eventually(fn -> Router.get(k) == "safe" end,
+    ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "safe" end,
       "data should survive MemoryGuard crash")
   end
 end

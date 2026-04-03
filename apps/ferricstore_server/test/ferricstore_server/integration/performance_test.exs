@@ -403,7 +403,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       # Use Router directly to avoid TCP pipeline complexity.
       # The point of this test is memory stability, not TCP throughput.
 
-      baseline = Router.dbsize()
+      baseline = Router.dbsize(FerricStore.Instance.get(:default))
 
       # Write 10,000 keys directly through the Router
       for i <- 1..10_000 do
@@ -411,16 +411,16 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       end
 
       # Verify DBSIZE reflects the new keys
-      after_write = Router.dbsize()
+      after_write = Router.dbsize(FerricStore.Instance.get(:default))
       assert after_write >= baseline + 10_000
 
       # Delete all 10,000 keys
       for i <- 1..10_000 do
-        Router.delete("mem_#{i}")
+        Router.delete(FerricStore.Instance.get(:default), "mem_#{i}")
       end
 
       # Verify DBSIZE is back to baseline
-      after_delete = Router.dbsize()
+      after_delete = Router.dbsize(FerricStore.Instance.get(:default))
       assert after_delete == baseline
     end
   end
@@ -486,20 +486,20 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       Router.put(key, "hot_value")
 
       # First get warms the ETS cache
-      assert Router.get(key) == "hot_value"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "hot_value"
 
       # Time 1000 gets -- all should be ETS cache hits
       {elapsed_us, _} =
         :timer.tc(fn ->
           for _ <- 1..1_000 do
-            Router.get(key)
+            Router.get(FerricStore.Instance.get(:default), key)
           end
         end)
 
       avg_us = elapsed_us / 1_000
 
       # Clean up
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
 
       assert avg_us < 100,
         "Average Router.get from ETS cache was #{Float.round(avg_us, 2)}us, expected < 100us"
@@ -518,7 +518,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       # Count how many keys map to each shard
       shard_counts =
         keys
-        |> Enum.group_by(fn key -> Router.shard_for(key) end)
+        |> Enum.group_by(fn key -> Router.shard_for(FerricStore.Instance.get(:default), key) end)
         |> Enum.map(fn {shard, shard_keys} -> {shard, length(shard_keys)} end)
         |> Map.new()
 

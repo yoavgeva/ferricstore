@@ -165,17 +165,17 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
   describe "WRONGTYPE prefix for type mismatches (spec 4.6)" do
     test "LPUSH on a string key returns WRONGTYPE" do
       k = ukey("wrongtype_str")
-      Router.put(k, "string_value", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "string_value", 0)
 
       # Wait until key is visible in ETS (Raft commit may take time on slow CI)
-      eventually(fn -> Router.get(k) != nil end)
+      eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) != nil end)
 
       live_store = build_live_store()
       result = Dispatcher.dispatch("LPUSH", [k, "elem"], live_store)
 
       assert {:error, "WRONGTYPE" <> _} = result
 
-      Router.delete(k)
+      Router.delete(FerricStore.Instance.get(:default), k)
     end
 
     test "HSET on a list key returns WRONGTYPE", %{port: port} do
@@ -452,7 +452,7 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
       exists?: &Router.exists?/1,
       keys: &Router.keys/0,
       flush: fn ->
-        Enum.each(Router.keys(), &Router.delete/1)
+        Enum.each(Router.keys(FerricStore.Instance.get(:default)), &Router.delete/1)
         :ok
       end,
       dbsize: &Router.dbsize/0,
@@ -470,31 +470,31 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
       ratelimit_add: &Router.ratelimit_add/4,
       list_op: &Router.list_op/2,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:get, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:get_meta, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:put, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:delete, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:scan_prefix, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:count_prefix, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:delete_prefix, prefix})
       end
     }

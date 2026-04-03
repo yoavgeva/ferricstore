@@ -298,41 +298,41 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   describe "StateMachine nosync + BitcaskWriter" do
     test "SET then GET returns correct value" do
       key = ukey("sm")
-      assert :ok = Router.put(key, "hello", 0)
-      assert "hello" == Router.get(key)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "hello", 0)
+      assert "hello" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "SET overwrites previous value" do
       key = ukey("sm")
-      Router.put(key, "first", 0)
-      Router.put(key, "second", 0)
-      assert "second" == Router.get(key)
+      Router.put(FerricStore.Instance.get(:default), key, "first", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "second", 0)
+      assert "second" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "DEL removes key" do
       key = ukey("sm")
-      Router.put(key, "val", 0)
-      Router.delete(key)
-      assert nil == Router.get(key)
+      Router.put(FerricStore.Instance.get(:default), key, "val", 0)
+      Router.delete(FerricStore.Instance.get(:default), key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "SET with TTL — key expires correctly" do
       key = ukey("sm")
       expire_at = System.os_time(:millisecond) + 100
-      Router.put(key, "ephemeral", expire_at)
+      Router.put(FerricStore.Instance.get(:default), key, "ephemeral", expire_at)
 
-      assert "ephemeral" == Router.get(key)
+      assert "ephemeral" == Router.get(FerricStore.Instance.get(:default), key)
       Process.sleep(150)
-      assert nil == Router.get(key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "after BitcaskWriter flush, data is readable from cold path" do
       key = ukey("sm")
-      Router.put(key, "persistent", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "persistent", 0)
       BitcaskWriter.flush_all()
 
       # Verify ETS has a non-pending file_id after flush
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       keydir = :"keydir_#{idx}"
 
       case :ets.lookup(keydir, key) do
@@ -347,10 +347,10 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     test "SET large value (> 64KB) uses synchronous path" do
       key = ukey("sm")
       large_value = String.duplicate("x", 70_000)
-      assert :ok = Router.put(key, large_value, 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, large_value, 0)
 
       # Large values go through the synchronous NIF path and store nil in ETS
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       keydir = :"keydir_#{idx}"
 
       [{^key, ets_val, _exp, _lfu, fid, _off, vsize}] = :ets.lookup(keydir, key)
@@ -361,22 +361,22 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       assert vsize == byte_size(large_value)
 
       # GET should still return the full value (cold read from disk)
-      assert large_value == Router.get(key)
+      assert large_value == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "SET small value goes through background writer with :pending marker" do
       key = ukey("sm")
       small_value = "tiny"
 
-      Router.put(key, small_value, 0)
+      Router.put(FerricStore.Instance.get(:default), key, small_value, 0)
 
       # The value should be readable immediately (hot from ETS)
-      assert small_value == Router.get(key)
+      assert small_value == Router.get(FerricStore.Instance.get(:default), key)
 
       # After flush, file_id should be updated from :pending to a real id
       BitcaskWriter.flush_all()
 
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       keydir = :"keydir_#{idx}"
       [{^key, _val, _exp, _lfu, fid, _off, _vsize}] = :ets.lookup(keydir, key)
       assert fid != :pending
@@ -384,28 +384,28 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
     test "SET empty string value" do
       key = ukey("sm")
-      Router.put(key, "", 0)
-      assert "" == Router.get(key)
+      Router.put(FerricStore.Instance.get(:default), key, "", 0)
+      assert "" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "SET binary value with null bytes" do
       key = ukey("sm")
       value = <<0, 1, 2, 0, 255, 0>>
-      Router.put(key, value, 0)
-      assert value == Router.get(key)
+      Router.put(FerricStore.Instance.get(:default), key, value, 0)
+      assert value == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "SET very long key (10KB)" do
       key = String.duplicate("k", 10_000) <> ":#{:rand.uniform(999_999)}"
-      Router.put(key, "val", 0)
-      assert "val" == Router.get(key)
+      Router.put(FerricStore.Instance.get(:default), key, "val", 0)
+      assert "val" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "SET then immediate GET (read-your-own-writes)" do
       key = ukey("sm")
-      Router.put(key, "ryow", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "ryow", 0)
       # No flush — read should come from ETS hot cache
-      assert "ryow" == Router.get(key)
+      assert "ryow" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "SET from process A, GET from process B" do
@@ -413,13 +413,13 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
       task =
         Task.async(fn ->
-          Router.put(key, "cross_process", 0)
+          Router.put(FerricStore.Instance.get(:default), key, "cross_process", 0)
         end)
 
       Task.await(task)
 
       # Read from this process
-      assert "cross_process" == Router.get(key)
+      assert "cross_process" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "50 concurrent SETs to different keys all succeed" do
@@ -431,7 +431,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
       tasks =
         Enum.map(keys, fn {k, v} ->
-          Task.async(fn -> Router.put(k, v, 0) end)
+          Task.async(fn -> Router.put(FerricStore.Instance.get(:default), k, v, 0) end)
         end)
 
       results = Enum.map(tasks, &Task.await(&1, 10_000))
@@ -440,7 +440,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       BitcaskWriter.flush_all()
 
       for {k, v} <- keys do
-        assert v == Router.get(k)
+        assert v == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
 
@@ -449,29 +449,29 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
       tasks =
         for i <- 1..50 do
-          Task.async(fn -> Router.put(key, "val_#{i}", 0) end)
+          Task.async(fn -> Router.put(FerricStore.Instance.get(:default), key, "val_#{i}", 0) end)
         end
 
       Enum.each(tasks, &Task.await(&1, 10_000))
 
       # Should have some value, not nil
-      value = Router.get(key)
+      value = Router.get(FerricStore.Instance.get(:default), key)
       assert value != nil
       assert String.starts_with?(value, "val_")
     end
 
     test "INCR 50 times concurrently — final value is 50" do
       key = ukey("incr")
-      Router.put(key, "0", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "0", 0)
 
       tasks =
         for _ <- 1..50 do
-          Task.async(fn -> Router.incr(key, 1) end)
+          Task.async(fn -> Router.incr(FerricStore.Instance.get(:default), key, 1) end)
         end
 
       Enum.each(tasks, &Task.await(&1, 10_000))
 
-      assert {:ok, final} = Router.incr(key, 0)
+      assert {:ok, final} = Router.incr(FerricStore.Instance.get(:default), key, 0)
       assert final == 50
     end
   end
@@ -490,14 +490,14 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       keys =
         for i <- 1..100 do
           k = ukey("rapid#{i}")
-          Router.put(k, "v#{i}", 0)
+          Router.put(FerricStore.Instance.get(:default), k, "v#{i}", 0)
           k
         end
 
       BitcaskWriter.flush_all()
 
       for k <- keys do
-        idx = Router.shard_for(k)
+        idx = Router.shard_for(FerricStore.Instance.get(:default), k)
         keydir = :"keydir_#{idx}"
 
         case :ets.lookup(keydir, k) do
@@ -527,13 +527,13 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     test "DELETE on key with pending background write flushes first" do
       # This tests the flush_pending_for_key path in StateMachine
       key = ukey("delpend")
-      Router.put(key, "val", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "val", 0)
       # Immediately delete — the StateMachine should flush the pending write
       # before writing the tombstone
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
       BitcaskWriter.flush_all()
 
-      assert nil == Router.get(key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -548,83 +548,83 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
     test "SET through bypass" do
       key = ukey("qw")
-      assert :ok = Router.put(key, "bypass_val", 0)
-      assert "bypass_val" == Router.get(key)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "bypass_val", 0)
+      assert "bypass_val" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "DEL through bypass" do
       key = ukey("qw")
-      Router.put(key, "to_delete", 0)
-      assert :ok = Router.delete(key)
-      assert nil == Router.get(key)
+      Router.put(FerricStore.Instance.get(:default), key, "to_delete", 0)
+      assert :ok = Router.delete(FerricStore.Instance.get(:default), key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "INCR through bypass" do
       key = ukey("qw")
-      Router.put(key, "10", 0)
-      assert {:ok, 11} = Router.incr(key, 1)
+      Router.put(FerricStore.Instance.get(:default), key, "10", 0)
+      assert {:ok, 11} = Router.incr(FerricStore.Instance.get(:default), key, 1)
     end
 
     test "INCRBY through bypass" do
       key = ukey("qw")
-      Router.put(key, "100", 0)
-      assert {:ok, 150} = Router.incr(key, 50)
+      Router.put(FerricStore.Instance.get(:default), key, "100", 0)
+      assert {:ok, 150} = Router.incr(FerricStore.Instance.get(:default), key, 50)
     end
 
     test "INCRBYFLOAT through bypass" do
       key = ukey("qw")
-      Router.put(key, "10.5", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "10.5", 0)
       assert {:ok, result} = Router.incr_float(key, 1.5)
       assert_in_delta result, 12.0, 0.001
     end
 
     test "APPEND through bypass" do
       key = ukey("qw")
-      Router.put(key, "hello", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "hello", 0)
       assert {:ok, 10} = Router.append(key, "world")
-      assert "helloworld" == Router.get(key)
+      assert "helloworld" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "GETSET through bypass" do
       key = ukey("qw")
-      Router.put(key, "old", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
       assert "old" == Router.getset(key, "new")
-      assert "new" == Router.get(key)
+      assert "new" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "GETDEL through bypass" do
       key = ukey("qw")
-      Router.put(key, "gone", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "gone", 0)
       assert "gone" == Router.getdel(key)
-      assert nil == Router.get(key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "GETEX through bypass" do
       key = ukey("qw")
       expire_at = System.os_time(:millisecond) + 60_000
-      Router.put(key, "getex_val", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "getex_val", 0)
       assert "getex_val" == Router.getex(key, expire_at)
     end
 
     test "SETRANGE through bypass" do
       key = ukey("qw")
-      Router.put(key, "Hello World", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "Hello World", 0)
       assert {:ok, 11} = Router.setrange(key, 6, "Redis")
-      assert "Hello Redis" == Router.get(key)
+      assert "Hello Redis" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS through bypass" do
       key = ukey("qw")
-      Router.put(key, "original", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "original", 0)
       assert 1 == Router.cas(key, "original", "updated", nil)
-      assert "updated" == Router.get(key)
+      assert "updated" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS fails when expected value does not match" do
       key = ukey("qw")
-      Router.put(key, "actual", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "actual", 0)
       assert 0 == Router.cas(key, "wrong", "updated", nil)
-      assert "actual" == Router.get(key)
+      assert "actual" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS on non-existent key returns nil" do
@@ -654,8 +654,8 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
     test "read-your-own-writes after quorum SET" do
       key = ukey("ryow")
-      Router.put(key, "immediate", 0)
-      assert "immediate" == Router.get(key)
+      Router.put(FerricStore.Instance.get(:default), key, "immediate", 0)
+      assert "immediate" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "rapid SET+GET interleaving from same process" do
@@ -663,8 +663,8 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
       for i <- 1..100 do
         val = "v#{i}"
-        Router.put(key, val, 0)
-        assert val == Router.get(key)
+        Router.put(FerricStore.Instance.get(:default), key, val, 0)
+        assert val == Router.get(FerricStore.Instance.get(:default), key)
       end
     end
 
@@ -677,7 +677,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
       tasks =
         Enum.map(keys, fn {k, v} ->
-          Task.async(fn -> {Router.put(k, v, 0), k, v} end)
+          Task.async(fn -> {Router.put(FerricStore.Instance.get(:default), k, v, 0), k, v} end)
         end)
 
       results = Enum.map(tasks, &Task.await(&1, 15_000))
@@ -689,7 +689,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       BitcaskWriter.flush_all()
 
       for {_result, k, v} <- results do
-        assert v == Router.get(k)
+        assert v == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
   end
@@ -706,10 +706,10 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
     test "SET returns :ok — write is durable after return" do
       key = ukey("wal")
-      assert :ok = Router.put(key, "durable", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "durable", 0)
       # The write returned :ok, which means ra committed it (WAL + quorum).
       # The patched WAL still guarantees fdatasync before notifying writers.
-      assert "durable" == Router.get(key)
+      assert "durable" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "concurrent SETs all return :ok — all durable" do
@@ -717,7 +717,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
         for i <- 1..50 do
           Task.async(fn ->
             k = ukey("wal#{i}")
-            {Router.put(k, "v#{i}", 0), k, "v#{i}"}
+            {Router.put(FerricStore.Instance.get(:default), k, "v#{i}", 0), k, "v#{i}"}
           end)
         end
 
@@ -728,7 +728,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       end
 
       for {_result, k, v} <- results do
-        assert v == Router.get(k)
+        assert v == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
 
@@ -741,7 +741,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
       tasks =
         Enum.map(keys, fn {k, v} ->
-          Task.async(fn -> Router.put(k, v, 0) end)
+          Task.async(fn -> Router.put(FerricStore.Instance.get(:default), k, v, 0) end)
         end)
 
       Enum.each(tasks, &Task.await(&1, 15_000))
@@ -749,7 +749,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
       missing =
         Enum.filter(keys, fn {k, v} ->
-          Router.get(k) != v
+          Router.get(FerricStore.Instance.get(:default), k) != v
         end)
 
       assert missing == [], "Missing keys after concurrent writes: #{inspect(missing)}"
@@ -825,13 +825,13 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
     test "10000 reads of same key — counter is reasonable (not 0, not 255)" do
       key = ukey("lfu_freq")
-      Router.put(key, "val", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "val", 0)
 
       for _ <- 1..10_000 do
-        Router.get(key)
+        Router.get(FerricStore.Instance.get(:default), key)
       end
 
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       keydir = :"keydir_#{idx}"
 
       case :ets.lookup(keydir, key) do
@@ -893,10 +893,10 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
     test "write through Router increments version" do
       key = ukey("wv")
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       before = WriteVersion.get(idx)
 
-      Router.put(key, "val", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "val", 0)
 
       after_val = WriteVersion.get(idx)
       assert after_val > before
@@ -905,13 +905,13 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     test "different shards have independent counters" do
       # Find two keys that map to different shards
       {k0, k1} = find_keys_on_different_shards()
-      idx0 = Router.shard_for(k0)
-      idx1 = Router.shard_for(k1)
+      idx0 = Router.shard_for(FerricStore.Instance.get(:default), k0)
+      idx1 = Router.shard_for(FerricStore.Instance.get(:default), k1)
 
       v0_before = WriteVersion.get(idx0)
       v1_before = WriteVersion.get(idx1)
 
-      Router.put(k0, "val", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "val", 0)
 
       v0_after = WriteVersion.get(idx0)
       v1_after = WriteVersion.get(idx1)
@@ -927,7 +927,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
   describe "hash tags" do
     test "{user:42}:session and {user:42}:profile hash to same shard" do
-      assert Router.shard_for("{user:42}:session") == Router.shard_for("{user:42}:profile")
+      assert Router.shard_for(FerricStore.Instance.get(:default), "{user:42}:session") == Router.shard_for(FerricStore.Instance.get(:default), "{user:42}:profile")
     end
 
     test "no tag hashes on full key" do
@@ -949,8 +949,8 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     end
 
     test "{a}:x and {b}:x may route to different shards" do
-      shard_a = Router.shard_for("{a}:x")
-      shard_b = Router.shard_for("{b}:x")
+      shard_a = Router.shard_for(FerricStore.Instance.get(:default), "{a}:x")
+      shard_b = Router.shard_for(FerricStore.Instance.get(:default), "{b}:x")
       # They hash on different tags, so they *may* differ
       # We can't guarantee they differ with only 4 shards, but we can verify
       # they hash on the tag, not the full key
@@ -973,12 +973,12 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       k1 = "{ht42}:session_#{:rand.uniform(999_999)}"
       k2 = "{ht42}:profile_#{:rand.uniform(999_999)}"
 
-      Router.put(k1, "sess", 0)
-      Router.put(k2, "prof", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "sess", 0)
+      Router.put(FerricStore.Instance.get(:default), k2, "prof", 0)
 
-      assert Router.shard_for(k1) == Router.shard_for(k2)
-      assert "sess" == Router.get(k1)
-      assert "prof" == Router.get(k2)
+      assert Router.shard_for(FerricStore.Instance.get(:default), k1) == Router.shard_for(FerricStore.Instance.get(:default), k2)
+      assert "sess" == Router.get(FerricStore.Instance.get(:default), k1)
+      assert "prof" == Router.get(FerricStore.Instance.get(:default), k2)
     end
   end
 
@@ -1138,15 +1138,15 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   describe "Router value size limits" do
     test "key too large (> 65535 bytes) rejected" do
       big_key = String.duplicate("k", 65_536)
-      assert {:error, _} = Router.put(big_key, "val", 0)
+      assert {:error, _} = Router.put(FerricStore.Instance.get(:default), big_key, "val", 0)
     end
 
     test "key at exactly 65535 bytes accepted" do
       key_at_limit = String.duplicate("k", 65_535)
       # This should succeed (at limit, not over)
-      result = Router.put(key_at_limit, "val", 0)
+      result = Router.put(FerricStore.Instance.get(:default), key_at_limit, "val", 0)
       assert result == :ok
-      Router.delete(key_at_limit)
+      Router.delete(FerricStore.Instance.get(:default), key_at_limit)
     end
 
     test "value too large (>= 512MB) rejected" do
@@ -1230,7 +1230,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   describe "exists_fast? ETS-direct check" do
     test "returns true for existing key" do
       key = ukey("ef")
-      Router.put(key, "val", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "val", 0)
       assert Router.exists_fast?(key) == true
     end
 
@@ -1241,7 +1241,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     test "returns false for expired key" do
       key = ukey("ef_exp")
       expire_at = System.os_time(:millisecond) + 50
-      Router.put(key, "ephemeral", expire_at)
+      Router.put(FerricStore.Instance.get(:default), key, "ephemeral", expire_at)
 
       assert Router.exists_fast?(key) == true
       Process.sleep(100)
@@ -1254,7 +1254,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       threshold = :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536)
       large_value = String.duplicate("c", threshold + 1)
 
-      Router.put(key, large_value, 0)
+      Router.put(FerricStore.Instance.get(:default), key, large_value, 0)
       BitcaskWriter.flush_all()
 
       # Cold key should still be "exists" (nil value but valid keydir entry)
@@ -1270,9 +1270,9 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     # Generate keys until we find two that map to different shards
     Enum.reduce_while(1..1000, nil, fn i, _acc ->
       k = "diff:#{i}"
-      idx = Router.shard_for(k)
+      idx = Router.shard_for(FerricStore.Instance.get(:default), k)
 
-      if idx != Router.shard_for("diff:1") do
+      if idx != Router.shard_for(FerricStore.Instance.get(:default), "diff:1") do
         {:halt, {"diff:1", k}}
       else
         {:cont, nil}

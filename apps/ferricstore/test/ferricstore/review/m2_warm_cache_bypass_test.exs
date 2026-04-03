@@ -40,7 +40,7 @@ defmodule Ferricstore.Review.M2WarmCacheBypassTest do
     # 2. Flush to disk.
     ShardHelpers.flush_all_shards()
 
-    idx = Router.shard_for(key)
+    idx = Router.shard_for(FerricStore.Instance.get(:default), key)
     keydir = :"keydir_#{idx}"
 
     [{^key, nil, _exp, _lfu, file_id, _offset, vsize}] = :ets.lookup(keydir, key)
@@ -62,7 +62,7 @@ defmodule Ferricstore.Review.M2WarmCacheBypassTest do
     :ets.update_element(keydir, key, {2, nil})
 
     # 4. Read via Router.get — cold read triggers warm_ets_after_cold_read.
-    assert Router.get(key) == large_value
+    assert Router.get(FerricStore.Instance.get(:default), key) == large_value
 
     # 5. ETS value MUST still be nil. If it holds the full binary, the size
     #    limit was bypassed (the bug).

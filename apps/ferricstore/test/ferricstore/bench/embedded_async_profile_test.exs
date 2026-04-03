@@ -22,7 +22,7 @@ defmodule Ferricstore.Bench.EmbeddedAsyncProfileTest do
 
     # 2. Router.put on async namespace
     {router_us, _} = :timer.tc(fn ->
-      for i <- 1..@iterations, do: Router.put("aprof:rtr:#{i}", value, 0)
+      for i <- 1..@iterations, do: Router.put(FerricStore.Instance.get(:default), "aprof:rtr:#{i}", value, 0)
     end)
 
     # 3. quorum_bypass? check timing
@@ -39,8 +39,8 @@ defmodule Ferricstore.Bench.EmbeddedAsyncProfileTest do
 
     # 4. GenServer.call to shard (what async path does)
     key = "aprof:gs_test"
-    idx = Router.shard_for(key)
-    shard_name = Router.shard_name(idx)
+    idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+    shard_name = Router.shard_name(FerricStore.Instance.get(:default), idx)
     {gs_us, _} = :timer.tc(fn ->
       for i <- 1..@iterations do
         GenServer.call(shard_name, {:put, "aprof:gs:#{i}", value, 0})

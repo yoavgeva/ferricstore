@@ -71,8 +71,8 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
       k1 = ukey("health_a")
       k2 = ukey("health_b")
 
-      Router.put(k1, "v1", 0)
-      Router.put(k2, "v2", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "v1", 0)
+      Router.put(FerricStore.Instance.get(:default), k2, "v2", 0)
 
       store = MockStore.make()
       result = Dispatcher.dispatch("CLUSTER.HEALTH", [], store)
@@ -95,8 +95,8 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
       assert total_keys >= 2
 
       # Cleanup
-      Router.delete(k1)
-      Router.delete(k2)
+      Router.delete(FerricStore.Instance.get(:default), k1)
+      Router.delete(FerricStore.Instance.get(:default), k2)
     end
 
     test "memory_bytes is non-negative for all shards" do
@@ -160,7 +160,7 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
       keys = for i <- 1..5, do: ukey("stats_#{i}")
 
       Enum.each(keys, fn k ->
-        Router.put(k, "v", 0)
+        Router.put(FerricStore.Instance.get(:default), k, "v", 0)
       end)
 
       store = MockStore.make()
@@ -229,7 +229,7 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
 
       # Add keys
       new_keys = for i <- 1..3, do: ukey("incr_stats_#{i}")
-      Enum.each(new_keys, fn k -> Router.put(k, "v", 0) end)
+      Enum.each(new_keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "v", 0) end)
 
       result_after = Dispatcher.dispatch("CLUSTER.STATS", [], store)
       lines_after = String.split(result_after, "\r\n")

@@ -38,7 +38,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
   describe "lock expiry" do
     test "locks expire after TTL and keys become writable" do
       {k1, _k2} = cross_shard_keys()
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Cluster.shard_server_id(shard_idx)
 
       # Lock with 200ms TTL
@@ -61,7 +61,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
 
     test "expired lock allows regular writes" do
       {k1, _k2} = cross_shard_keys()
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Cluster.shard_server_id(shard_idx)
 
       # Lock with 200ms TTL
@@ -73,8 +73,8 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       Process.sleep(300)
 
       # Regular write should succeed
-      assert :ok = Router.put(k1, "after_expiry", 0)
-      assert "after_expiry" == Router.get(k1)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), k1, "after_expiry", 0)
+      assert "after_expiry" == Router.get(FerricStore.Instance.get(:default), k1)
     end
   end
 
@@ -87,7 +87,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       {src, dst} = cross_shard_keys()
 
       # Create source set
-      shard = Router.shard_name(Router.shard_for(src))
+      shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
       GenServer.call(shard, {:tx_execute, [{"SADD", [src, "a", "b"]}], nil}, 10_000)
 
       # Two sequential SMOVE (concurrent is hard to guarantee without races)
@@ -102,7 +102,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       [src_members] = GenServer.call(shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
       assert src_members == [] or src_members == nil
 
-      dst_shard = Router.shard_name(Router.shard_for(dst))
+      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
       [dst_members] = GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
       assert "a" in dst_members
       assert "b" in dst_members
@@ -162,7 +162,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       dst = "quorumns:dst_#{:rand.uniform(9_999_999)}"
 
       # Ensure cross-shard
-      if Router.shard_for(src) == Router.shard_for(dst) do
+      if Router.shard_for(FerricStore.Instance.get(:default), src) == Router.shard_for(FerricStore.Instance.get(:default), dst) do
         # Skip if they happen to route to same shard
         :ok
       else
@@ -170,7 +170,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
         NamespaceConfig.set("quorumns", "durability", "quorum")
 
         # Set up source
-        shard = Router.shard_name(Router.shard_for(src))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
         GenServer.call(shard, {:tx_execute, [{"SADD", [src, "member"]}], nil}, 10_000)
 
         result = Set.handle("SMOVE", [src, dst, "member"], %{})
@@ -183,13 +183,13 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       src = "quorumns:src2_#{:rand.uniform(9_999_999)}"
       dst = "asyncns:dst2_#{:rand.uniform(9_999_999)}"
 
-      if Router.shard_for(src) == Router.shard_for(dst) do
+      if Router.shard_for(FerricStore.Instance.get(:default), src) == Router.shard_for(FerricStore.Instance.get(:default), dst) do
         :ok
       else
         NamespaceConfig.set("asyncns", "durability", "async")
         NamespaceConfig.set("quorumns", "durability", "quorum")
 
-        shard = Router.shard_name(Router.shard_for(src))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
         GenServer.call(shard, {:tx_execute, [{"SADD", [src, "member"]}], nil}, 10_000)
 
         result = Set.handle("SMOVE", [src, dst, "member"], %{})
@@ -206,11 +206,11 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
   describe "compound key lock mapping" do
     test "reads on locked keys still work" do
       {k1, _k2} = cross_shard_keys()
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Cluster.shard_server_id(shard_idx)
 
       # Write data first
-      Router.put(k1, "readable", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "readable", 0)
 
       # Lock the key
       owner_ref = make_ref()
@@ -218,8 +218,8 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       {:ok, :ok, _} = :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Read should still work
-      assert "readable" == Router.get(k1)
-      assert Router.exists?(k1)
+      assert "readable" == Router.get(FerricStore.Instance.get(:default), k1)
+      assert Router.exists?(FerricStore.Instance.get(:default), k1)
 
       # Cleanup
       :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
@@ -227,7 +227,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
 
     test "writes on locked keys are rejected" do
       {k1, _k2} = cross_shard_keys()
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Cluster.shard_server_id(shard_idx)
 
       # Lock the key
@@ -236,7 +236,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       {:ok, :ok, _} = :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, expire_at})
 
       # Write should be rejected
-      result = Router.put(k1, "blocked", 0)
+      result = Router.put(FerricStore.Instance.get(:default), k1, "blocked", 0)
       assert result == {:error, :key_locked},
              "Expected write to locked key to be rejected, got: #{inspect(result)}"
 

@@ -134,7 +134,7 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
     # 3. Router.get (shard_for + ETS lookup + LFU touch)
     {router_us, _} = :timer.tc(fn ->
       for _ <- 1..10_000 do
-        Ferricstore.Store.Router.get(key)
+        Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), key)
       end
     end)
 

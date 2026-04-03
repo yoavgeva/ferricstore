@@ -66,16 +66,16 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
       MemoryGuard.set_skip_promotion(false)
 
       # Write a key, then evict its value to make it cold
-      Router.put("promo_test", "hello", 0)
+      Router.put(FerricStore.Instance.get(:default), "promo_test", "hello", 0)
       Process.sleep(50)
 
       # Evict to cold
-      idx = Router.shard_for("promo_test")
+      idx = Router.shard_for(FerricStore.Instance.get(:default), "promo_test")
       keydir = :"keydir_#{idx}"
       :ets.update_element(keydir, "promo_test", {2, nil})
 
       # Read should promote back to hot
-      value = Router.get("promo_test")
+      value = Router.get(FerricStore.Instance.get(:default), "promo_test")
       assert value == "hello"
 
       # Check ETS — value should be re-cached (hot)
@@ -88,15 +88,15 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
     test "cold read stays cold when skip_promotion is on" do
       MemoryGuard.set_skip_promotion(true)
 
-      Router.put("nopromo_test", "world", 0)
+      Router.put(FerricStore.Instance.get(:default), "nopromo_test", "world", 0)
       Process.sleep(50)
 
-      idx = Router.shard_for("nopromo_test")
+      idx = Router.shard_for(FerricStore.Instance.get(:default), "nopromo_test")
       keydir = :"keydir_#{idx}"
       :ets.update_element(keydir, "nopromo_test", {2, nil})
 
       # Read should return value but NOT promote
-      value = Router.get("nopromo_test")
+      value = Router.get(FerricStore.Instance.get(:default), "nopromo_test")
       assert value == "world"
 
       # Check ETS — value should still be nil (cold)
@@ -134,13 +134,13 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
     test "eviction reduces hot entries when triggered" do
       # Fill a shard with hot entries
       for i <- 1..100 do
-        Router.put("evict_test_#{i}", String.duplicate("x", 100), 0)
+        Router.put(FerricStore.Instance.get(:default), "evict_test_#{i}", String.duplicate("x", 100), 0)
       end
 
       Process.sleep(100)
 
       # Count hot entries before eviction
-      idx = Router.shard_for("evict_test_1")
+      idx = Router.shard_for(FerricStore.Instance.get(:default), "evict_test_1")
       keydir = :"keydir_#{idx}"
 
       hot_before =
@@ -159,10 +159,10 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
     end
 
     test "eviction sets value to nil, keeps key and disk location" do
-      Router.put("evict_keep", "keep_this", 0)
+      Router.put(FerricStore.Instance.get(:default), "evict_keep", "keep_this", 0)
       Process.sleep(100)
 
-      idx = Router.shard_for("evict_keep")
+      idx = Router.shard_for(FerricStore.Instance.get(:default), "evict_keep")
       keydir = :"keydir_#{idx}"
 
       # Get the entry before eviction
@@ -180,7 +180,7 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
       assert new_vsize == vsize
 
       # Reading the key should still work (cold read from disk)
-      assert Router.get("evict_keep") == "keep_this"
+      assert Router.get(FerricStore.Instance.get(:default), "evict_keep") == "keep_this"
     end
   end
 
@@ -243,10 +243,10 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
   describe "ETS select match spec filtering" do
     test "eviction skips cold entries (value=nil)" do
       # Write and evict a key to make it cold
-      Router.put("cold_skip", "val", 0)
+      Router.put(FerricStore.Instance.get(:default), "cold_skip", "val", 0)
       Process.sleep(50)
 
-      idx = Router.shard_for("cold_skip")
+      idx = Router.shard_for(FerricStore.Instance.get(:default), "cold_skip")
       keydir = :"keydir_#{idx}"
       :ets.update_element(keydir, "cold_skip", {2, nil})
 
@@ -272,10 +272,10 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
     end
 
     test "eviction finds hot entries" do
-      Router.put("hot_find", "val", 0)
+      Router.put(FerricStore.Instance.get(:default), "hot_find", "val", 0)
       Process.sleep(50)
 
-      idx = Router.shard_for("hot_find")
+      idx = Router.shard_for(FerricStore.Instance.get(:default), "hot_find")
       keydir = :"keydir_#{idx}"
 
       ms = [

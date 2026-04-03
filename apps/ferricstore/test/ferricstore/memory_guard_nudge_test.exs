@@ -153,7 +153,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       end
 
       # This put should be rejected AND trigger a nudge
-      result = Router.put("nudge_test_new_key", "value", 0)
+      result = Router.put(FerricStore.Instance.get(:default), "nudge_test_new_key", "value", 0)
       assert {:error, msg} = result
       assert msg =~ "KEYDIR_FULL"
 
@@ -165,7 +165,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
 
     test "existing key update does NOT nudge (no rejection)" do
       # Write key before pressure
-      assert :ok = Router.put("pre_existing", "old", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "pre_existing", "old", 0)
 
       test_pid = self()
       handler_id = "nudge-no-fire-#{System.unique_integer([:positive])}"
@@ -187,7 +187,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       )
 
       # Update existing key — should succeed, no nudge
-      assert :ok = Router.put("pre_existing", "new", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "pre_existing", "new", 0)
 
       # Should NOT receive a nudge-triggered check within a short window.
       # (The periodic timer fires every 100ms, so we only wait 50ms to
@@ -201,7 +201,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       # Write some keys with TTL that are evictable under volatile_lru
       for i <- 1..10 do
         expire = System.os_time(:millisecond) + 60_000
-        Router.put("evictable_#{i}", "v", expire)
+        Router.put(FerricStore.Instance.get(:default), "evictable_#{i}", "v", expire)
       end
 
       # Switch to reject with eviction enabled (volatile_lru, not noeviction).
@@ -213,7 +213,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       MemoryGuard.set_reject_writes(false)
 
       # New key rejected via keydir_full check
-      result = Router.put("blocked_key", "v", 0)
+      result = Router.put(FerricStore.Instance.get(:default), "blocked_key", "v", 0)
       assert {:error, msg} = result
       assert msg =~ "KEYDIR_FULL"
 
@@ -226,7 +226,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       assert MemoryGuard.keydir_full?() == false
 
       # Now the write should succeed
-      assert :ok = Router.put("blocked_key", "v", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "blocked_key", "v", 0)
     end
   end
 
@@ -331,7 +331,7 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       tasks =
         for i <- 1..500 do
           Task.async(fn ->
-            Router.put("storm_key_#{i}", "v", 0)
+            Router.put(FerricStore.Instance.get(:default), "storm_key_#{i}", "v", 0)
           end)
         end
 

@@ -26,7 +26,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
   describe "FETCH_OR_COMPUTE on existing key" do
     test "returns hit with the cached value" do
       key = ukey("existing")
-      Router.put(key, "cached_value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "cached_value", 0)
 
       result = Native.handle("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
       assert ["hit", "cached_value"] = result
@@ -34,7 +34,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
 
     test "returns hit with hint when key exists and hint is given" do
       key = ukey("existing_hint")
-      Router.put(key, "val", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "val", 0)
 
       result = Native.handle("FETCH_OR_COMPUTE", [key, "5000", "my_hint"], dummy_store())
       assert ["hit", "val"] = result
@@ -82,7 +82,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       assert :ok = Native.handle("FETCH_OR_COMPUTE_RESULT", [key, "computed_value", "10000"], dummy_store())
 
       # Value should now be in the store.
-      assert "computed_value" == Router.get(key)
+      assert "computed_value" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "stores value with TTL" do
@@ -91,8 +91,8 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       ["compute", _] = Native.handle("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
       assert :ok = Native.handle("FETCH_OR_COMPUTE_RESULT", [key, "ttl_val", "5000"], dummy_store())
 
-      assert "ttl_val" == Router.get(key)
-      {_val, expire_at_ms} = Router.get_meta(key)
+      assert "ttl_val" == Router.get(FerricStore.Instance.get(:default), key)
+      {_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert expire_at_ms > System.os_time(:millisecond)
       assert expire_at_ms <= System.os_time(:millisecond) + 6_000
     end
@@ -146,7 +146,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       assert {:ok, "stampede_val"} = result2
 
       # Verify the value is in the store.
-      assert "stampede_val" == Router.get(key)
+      assert "stampede_val" == Router.get(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -258,7 +258,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
 
     test "FETCH_OR_COMPUTE is routed through dispatcher" do
       key = ukey("disp_foc")
-      Router.put(key, "cached", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "cached", 0)
 
       result = Dispatcher.dispatch("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
       assert ["hit", "cached"] = result
@@ -266,7 +266,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
 
     test "FETCH_OR_COMPUTE is case-insensitive" do
       key = ukey("disp_foc_ci")
-      Router.put(key, "val", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "val", 0)
 
       result = Dispatcher.dispatch("fetch_or_compute", [key, "5000"], dummy_store())
       assert ["hit", "val"] = result
@@ -277,7 +277,7 @@ defmodule Ferricstore.Commands.FetchOrComputeTest do
       # First become the computer.
       ["compute", _] = Dispatcher.dispatch("FETCH_OR_COMPUTE", [key, "5000"], dummy_store())
       assert :ok = Dispatcher.dispatch("FETCH_OR_COMPUTE_RESULT", [key, "v", "5000"], dummy_store())
-      assert "v" == Router.get(key)
+      assert "v" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "FETCH_OR_COMPUTE_ERROR is routed through dispatcher" do

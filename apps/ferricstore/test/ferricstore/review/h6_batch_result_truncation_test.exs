@@ -61,7 +61,7 @@ defmodule Ferricstore.Review.H6BatchResultTruncationTest do
 
       # Verify data actually landed.
       for k <- shard_keys do
-        assert Router.get(k) == "v"
+        assert Router.get(FerricStore.Instance.get(:default), k) == "v"
       end
     end
 
@@ -82,7 +82,7 @@ defmodule Ferricstore.Review.H6BatchResultTruncationTest do
 
       # Group by shard, pick the largest group.
       by_shard =
-        Enum.group_by(shard_keys_and_cmds, fn {k, _cmd} -> Router.shard_for(k) end)
+        Enum.group_by(shard_keys_and_cmds, fn {k, _cmd} -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
 
       {shard_idx, group} = Enum.max_by(by_shard, fn {_, g} -> length(g) end)
 

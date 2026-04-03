@@ -45,9 +45,9 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
     end
 
     test "cross-shard key pairs are on different shards", %{k0: k0, k1: k1, k2: k2, k3: k3} do
-      assert Router.shard_for(k0) != Router.shard_for(k1)
-      assert Router.shard_for(k0) != Router.shard_for(k2)
-      assert Router.shard_for(k0) != Router.shard_for(k3)
+      assert Router.shard_for(FerricStore.Instance.get(:default), k0) != Router.shard_for(FerricStore.Instance.get(:default), k1)
+      assert Router.shard_for(FerricStore.Instance.get(:default), k0) != Router.shard_for(FerricStore.Instance.get(:default), k2)
+      assert Router.shard_for(FerricStore.Instance.get(:default), k0) != Router.shard_for(FerricStore.Instance.get(:default), k3)
     end
   end
 
@@ -62,8 +62,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [:ok, :ok]
-      assert Router.get(k0) == "val_k0"
-      assert Router.get(k1) == "val_k1"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "val_k0"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "val_k1"
     end
 
     test "SET keys across all 4 shards — all written", %{k0: k0, k1: k1, k2: k2, k3: k3} do
@@ -77,10 +77,10 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [:ok, :ok, :ok, :ok]
-      assert Router.get(k0) == "s0"
-      assert Router.get(k1) == "s1"
-      assert Router.get(k2) == "s2"
-      assert Router.get(k3) == "s3"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "s0"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "s1"
+      assert Router.get(FerricStore.Instance.get(:default), k2) == "s2"
+      assert Router.get(FerricStore.Instance.get(:default), k3) == "s3"
     end
 
     test "mixed GET and SET across shards — results in correct order", %{
@@ -89,8 +89,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       k2: k2,
       k3: k3
     } do
-      Router.put(k0, "existing_k0", 0)
-      Router.put(k2, "existing_k2", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "existing_k0", 0)
+      Router.put(FerricStore.Instance.get(:default), k2, "existing_k2", 0)
 
       queue = [
         {"GET", [k0]},
@@ -102,27 +102,27 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == ["existing_k0", :ok, "existing_k2", :ok]
-      assert Router.get(k1) == "new_k1"
-      assert Router.get(k3) == "new_k3"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "new_k1"
+      assert Router.get(FerricStore.Instance.get(:default), k3) == "new_k3"
     end
 
     test "INCR on keys across different shards — both incremented", %{k0: k0, k1: k1} do
-      Router.put(k0, "10", 0)
-      Router.put(k1, "20", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "10", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "20", 0)
 
       queue = [{"INCR", [k0]}, {"INCR", [k1]}]
 
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [{:ok, 11}, {:ok, 21}]
-      assert Router.get(k0) == "11"
-      assert Router.get(k1) == "21"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "11"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "21"
     end
 
     test "DEL across shards — all deleted", %{k0: k0, k1: k1, k2: k2} do
-      Router.put(k0, "v0", 0)
-      Router.put(k1, "v1", 0)
-      Router.put(k2, "v2", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "v0", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "v1", 0)
+      Router.put(FerricStore.Instance.get(:default), k2, "v2", 0)
 
       queue = [
         {"DEL", [k0]},
@@ -133,9 +133,9 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [1, 1, 1]
-      assert Router.get(k0) == nil
-      assert Router.get(k1) == nil
-      assert Router.get(k2) == nil
+      assert Router.get(FerricStore.Instance.get(:default), k0) == nil
+      assert Router.get(FerricStore.Instance.get(:default), k1) == nil
+      assert Router.get(FerricStore.Instance.get(:default), k2) == nil
     end
 
     test "GET before SET within same transaction across shards (read-before-write ordering)", %{
@@ -152,8 +152,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       result = Coordinator.execute(queue, %{}, nil)
 
       assert result == [nil, :ok, nil, :ok]
-      assert Router.get(k0) == "created"
-      assert Router.get(k1) == "also_created"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "created"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "also_created"
     end
   end
 
@@ -181,10 +181,10 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       assert result == [:ok, :ok, :ok, :ok]
 
       # All values must be readable immediately after execute returns
-      assert Router.get(k0) == "atomic_k0"
-      assert Router.get(k1) == "atomic_k1"
-      assert Router.get(k2) == "atomic_k2"
-      assert Router.get(k3) == "atomic_k3"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "atomic_k0"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "atomic_k1"
+      assert Router.get(FerricStore.Instance.get(:default), k2) == "atomic_k2"
+      assert Router.get(FerricStore.Instance.get(:default), k3) == "atomic_k3"
     end
 
     test "concurrent readers eventually see all-new values after execute returns", %{
@@ -192,8 +192,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       k1: k1
     } do
       # Pre-set values on two different shards
-      Router.put(k0, "old_k0", 0)
-      Router.put(k1, "old_k1", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "old_k0", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "old_k1", 0)
 
       # Execute cross-shard transaction
       queue = [{"SET", [k0, "new_k0"]}, {"SET", [k1, "new_k1"]}]
@@ -202,8 +202,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       assert result == [:ok, :ok]
 
       # After execute returns, ALL writes must be visible (durability guarantee)
-      assert Router.get(k0) == "new_k0"
-      assert Router.get(k1) == "new_k1"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "new_k0"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "new_k1"
     end
   end
 
@@ -216,14 +216,14 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       k0: k0,
       k1: k1
     } do
-      Router.put(k0, "original_k0", 0)
-      Router.put(k1, "original_k1", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "original_k0", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "original_k1", 0)
 
-      # watches_clean? uses phash2(Router.get(key)) to detect changes
-      watched = %{k0 => :erlang.phash2(Router.get(k0))}
+      # watches_clean? uses phash2(Router.get(FerricStore.Instance.get(:default), key)) to detect changes
+      watched = %{k0 => :erlang.phash2(Router.get(FerricStore.Instance.get(:default), k0))}
 
       # Simulate another client modifying the watched key
-      Router.put(k0, "modified_by_other", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "modified_by_other", 0)
 
       # Cross-shard transaction
       queue = [
@@ -237,15 +237,15 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       assert result == nil
 
       # Neither shard should have been written to
-      assert Router.get(k0) == "modified_by_other"
-      assert Router.get(k1) == "original_k1"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "modified_by_other"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "original_k1"
     end
 
     test "WATCH key, no modification, cross-shard EXEC succeeds", %{k0: k0, k1: k1} do
-      Router.put(k0, "original_k0", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "original_k0", 0)
 
-      # watches_clean? uses phash2(Router.get(key)) to detect changes
-      watched = %{k0 => :erlang.phash2(Router.get(k0))}
+      # watches_clean? uses phash2(Router.get(FerricStore.Instance.get(:default), key)) to detect changes
+      watched = %{k0 => :erlang.phash2(Router.get(FerricStore.Instance.get(:default), k0))}
 
       # Cross-shard transaction with unmodified watched key
       queue = [
@@ -256,8 +256,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       result = Coordinator.execute(queue, watched, nil)
 
       assert result == [:ok, :ok]
-      assert Router.get(k0) == "new_k0"
-      assert Router.get(k1) == "new_k1"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "new_k0"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "new_k1"
     end
   end
 
@@ -274,7 +274,7 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
     test "cross-shard tx with command error (INCR on non-integer) — error in results, other commands still execute",
          %{k0: k0, k1: k1} do
       # Set a non-integer value
-      Router.put(k0, "not_a_number", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "not_a_number", 0)
 
       # Cross-shard tx: INCR non-integer, SET on different shard
       queue = [
@@ -296,7 +296,7 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       assert Enum.at(result, 1) == :ok
 
       # SET should have been applied despite INCR error
-      assert Router.get(k1) == "val_k1"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "val_k1"
     end
 
     test "large cross-shard transaction (many commands across shards)", %{
@@ -324,10 +324,10 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       assert Enum.all?(result, &(&1 == :ok))
 
       # Verify a sample from each shard is written
-      assert Router.get("{#{k0}}:sub_0") != nil
-      assert Router.get("{#{k1}}:sub_0") != nil
-      assert Router.get("{#{k2}}:sub_0") != nil
-      assert Router.get("{#{k3}}:sub_0") != nil
+      assert Router.get(FerricStore.Instance.get(:default), "{#{k0}}:sub_0") != nil
+      assert Router.get(FerricStore.Instance.get(:default), "{#{k1}}:sub_0") != nil
+      assert Router.get(FerricStore.Instance.get(:default), "{#{k2}}:sub_0") != nil
+      assert Router.get(FerricStore.Instance.get(:default), "{#{k3}}:sub_0") != nil
     end
 
     test "cross-shard tx with PING (keyless command) mixed with keyed commands", %{
@@ -352,8 +352,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       assert Enum.at(result, 2) == :ok
       assert Enum.at(result, 3) == {:simple, "PONG"}
 
-      assert Router.get(k0) == "val_k0"
-      assert Router.get(k1) == "val_k1"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "val_k0"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "val_k1"
     end
 
     test "sandbox namespace with cross-shard keys" do
@@ -362,7 +362,7 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       # Find two keys that route to different shards under this namespace
       {ns_key_a, ns_key_b} = ShardHelpers.cross_shard_keys_for_namespace(ns)
 
-      assert Router.shard_for(ns <> ns_key_a) != Router.shard_for(ns <> ns_key_b)
+      assert Router.shard_for(FerricStore.Instance.get(:default), ns <> ns_key_a) != Router.shard_for(FerricStore.Instance.get(:default), ns <> ns_key_b)
 
       queue = [
         {"SET", [ns_key_a, "ns_val_a"]},
@@ -374,8 +374,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       assert result == [:ok, :ok]
 
       # The actual stored keys include the namespace prefix
-      assert Router.get(ns <> ns_key_a) == "ns_val_a"
-      assert Router.get(ns <> ns_key_b) == "ns_val_b"
+      assert Router.get(FerricStore.Instance.get(:default), ns <> ns_key_a) == "ns_val_a"
+      assert Router.get(FerricStore.Instance.get(:default), ns <> ns_key_b) == "ns_val_b"
     end
   end
 
@@ -387,8 +387,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
     test "two concurrent cross-shard transactions on overlapping keys — both complete, consistent state",
          %{k0: k0, k1: k1} do
       # Pre-set values
-      Router.put(k0, "0", 0)
-      Router.put(k1, "0", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "0", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "0", 0)
 
       # Two concurrent transactions both INCR the same keys across shards
       task1 =
@@ -409,8 +409,8 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
       assert is_list(result2)
 
       # Final values should reflect both increments
-      assert Router.get(k0) == "2"
-      assert Router.get(k1) == "2"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "2"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "2"
     end
   end
 end

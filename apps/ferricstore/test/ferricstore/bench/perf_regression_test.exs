@@ -157,25 +157,25 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
 
     # Warm up
     for _ <- 1..1000 do
-      Ferricstore.Store.Router.shard_for(key)
-      Ferricstore.Store.Router.shard_name(0)
+      Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
+      Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
     end
 
     # Measure shard_for (phash2 + slot map lookup)
     {time_shard_for, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Store.Router.shard_for(key)
+      for _ <- 1..n, do: Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
     end)
 
     # Measure shard_name (atom interpolation)
     {time_shard_name, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Store.Router.shard_name(0)
+      for _ <- 1..n, do: Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
     end)
 
     # Measure the combined routing path
     {time_combined, _} = :timer.tc(fn ->
       for _ <- 1..n do
-        idx = Ferricstore.Store.Router.shard_for(key)
-        Ferricstore.Store.Router.shard_name(idx)
+        idx = Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
+        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), idx)
       end
     end)
 
@@ -346,17 +346,17 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
 
     # Warm up
     for _ <- 1..1000 do
-      Ferricstore.Store.Router.shard_name(0)
+      Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
       elem(shard_names, 0)
     end
 
     # Measure current implementation (string interpolation -> atom)
     {time_interp, _} = :timer.tc(fn ->
       for _ <- 1..n do
-        Ferricstore.Store.Router.shard_name(0)
-        Ferricstore.Store.Router.shard_name(1)
-        Ferricstore.Store.Router.shard_name(2)
-        Ferricstore.Store.Router.shard_name(3)
+        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
+        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 1)
+        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 2)
+        Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 3)
       end
     end)
 

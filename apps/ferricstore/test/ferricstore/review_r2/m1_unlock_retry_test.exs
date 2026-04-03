@@ -28,7 +28,7 @@ defmodule Ferricstore.ReviewR2.M1UnlockRetryTest do
       # Unlock via CrossShardOp (which uses parallel_unlock internally)
       # We call it through a cross-shard RENAME that acquires and releases locks
       [key_other] = ShardHelpers.keys_on_different_shards(2) |> Enum.reject(fn k ->
-        Ferricstore.Store.Router.shard_for(k) == 0
+        Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), k) == 0
       end) |> Enum.take(1)
 
       # Just directly unlock via Raft to test the mechanism
@@ -45,13 +45,13 @@ defmodule Ferricstore.ReviewR2.M1UnlockRetryTest do
 
     test "cross-shard operation unlocks all shards after completion" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
-      shard_0 = Ferricstore.Store.Router.shard_for(k1)
-      shard_1 = Ferricstore.Store.Router.shard_for(k2)
+      shard_0 = Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), k1)
+      shard_1 = Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), k2)
       shard_id_0 = Cluster.shard_server_id(shard_0)
       shard_id_1 = Cluster.shard_server_id(shard_1)
 
       # Write source key
-      Ferricstore.Store.Router.put(k1, "value", 0)
+      Ferricstore.Store.Router.put(FerricStore.Instance.get(:default), k1, "value", 0)
 
       # Do a cross-shard RENAME (locks both shards, executes, unlocks)
       Ferricstore.Commands.Generic.handle("RENAME", [k1, k2], %{})

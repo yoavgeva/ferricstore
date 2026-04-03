@@ -30,7 +30,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
   end
 
-  defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
+  defp keydir_for(key), do: :"keydir_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
   defp keydir_lookup(key) do
     :ets.lookup(keydir_for(key), key)
@@ -185,7 +185,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
       {_ldt_before, counter_before} = LFU.unpack(packed_before)
 
       # Read many times to probabilistically increment counter
-      for _ <- 1..500, do: Router.get("lfu_touch_test")
+      for _ <- 1..500, do: Router.get(FerricStore.Instance.get(:default), "lfu_touch_test")
 
       packed_after = get_packed_lfu("lfu_touch_test")
       {_ldt_after, counter_after} = LFU.unpack(packed_after)
@@ -203,7 +203,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
       :ets.update_element(keydir, "lfu_cap_test", {4, LFU.pack(LFU.now_minutes(), 255)})
 
       # Read many times
-      for _ <- 1..200, do: Router.get("lfu_cap_test")
+      for _ <- 1..200, do: Router.get(FerricStore.Instance.get(:default), "lfu_cap_test")
 
       packed = get_packed_lfu("lfu_cap_test")
       {_ldt, counter} = LFU.unpack(packed)
@@ -226,7 +226,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
       :ets.update_element(keydir, "lfu_decay_access", {4, LFU.pack(old_ldt, 50)})
 
       # Read the key -- this triggers lfu_touch which decays first
-      Router.get("lfu_decay_access")
+      Router.get(FerricStore.Instance.get(:default), "lfu_decay_access")
 
       packed = get_packed_lfu("lfu_decay_access")
       {ldt, counter} = LFU.unpack(packed)
@@ -259,7 +259,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
       :ets.update_element(keydir, "lfu_decay_zero", {4, LFU.pack(old_ldt, 10)})
 
       # Read the key
-      Router.get("lfu_decay_zero")
+      Router.get(FerricStore.Instance.get(:default), "lfu_decay_zero")
 
       packed = get_packed_lfu("lfu_decay_zero")
       {_ldt, counter} = LFU.unpack(packed)
@@ -279,7 +279,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
       :ets.update_element(keydir, "lfu_hot_key", {4, LFU.pack(LFU.now_minutes(), 50)})
 
       # Read many times (within same minute, so no significant decay)
-      for _ <- 1..500, do: Router.get("lfu_hot_key")
+      for _ <- 1..500, do: Router.get(FerricStore.Instance.get(:default), "lfu_hot_key")
 
       packed = get_packed_lfu("lfu_hot_key")
       {_ldt, counter} = LFU.unpack(packed)
@@ -304,7 +304,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
         :ets.update_element(keydir, "lfu_no_decay", {4, LFU.pack(old_ldt, 200)})
 
         # Read the key
-        Router.get("lfu_no_decay")
+        Router.get(FerricStore.Instance.get(:default), "lfu_no_decay")
 
         packed = get_packed_lfu("lfu_no_decay")
         {_ldt, counter} = LFU.unpack(packed)
@@ -487,7 +487,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
       :ets.update_element(keydir, "rewarm_lfu", {2, nil})
 
       # Re-warm by reading
-      Router.get("rewarm_lfu")
+      Router.get(FerricStore.Instance.get(:default), "rewarm_lfu")
       drain_all()
 
       packed = get_packed_lfu("rewarm_lfu")

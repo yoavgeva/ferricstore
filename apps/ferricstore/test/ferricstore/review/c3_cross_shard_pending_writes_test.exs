@@ -27,8 +27,8 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
     on_exit(fn -> ShardHelpers.wait_shards_alive() end)
 
     [k0, k1] = ShardHelpers.keys_on_different_shards(2)
-    shard0 = Router.shard_for(k0)
-    shard1 = Router.shard_for(k1)
+    shard0 = Router.shard_for(FerricStore.Instance.get(:default), k0)
+    shard1 = Router.shard_for(FerricStore.Instance.get(:default), k1)
 
     %{k0: k0, k1: k1, shard0: shard0, shard1: shard1}
   end
@@ -81,8 +81,8 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
       assert result == [:ok, :ok]
 
       # Values must be readable through the normal path
-      assert Router.get(k0) == "val_shard0"
-      assert Router.get(k1) == "val_shard1"
+      assert Router.get(FerricStore.Instance.get(:default), k0) == "val_shard0"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "val_shard1"
 
       # Flush all pending async writes to disk so we can scan Bitcask files
       ShardHelpers.flush_all_shards()
@@ -111,8 +111,8 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
     test "INCR across shards lands in correct Bitcask files",
          %{k0: k0, k1: k1, shard0: shard0, shard1: shard1} do
       # Pre-set values so INCR has something to increment
-      Router.put(k0, "10", 0)
-      Router.put(k1, "20", 0)
+      Router.put(FerricStore.Instance.get(:default), k0, "10", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "20", 0)
       ShardHelpers.flush_all_shards()
 
       # Cross-shard INCR
@@ -164,8 +164,8 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
 
       ShardHelpers.flush_all_shards()
 
-      shard0 = Router.shard_for(k0)
-      shard1 = Router.shard_for(k1)
+      shard0 = Router.shard_for(FerricStore.Instance.get(:default), k0)
+      shard1 = Router.shard_for(FerricStore.Instance.get(:default), k1)
       disk_keys_shard0 = keys_on_disk(shard0)
       disk_keys_shard1 = keys_on_disk(shard1)
 

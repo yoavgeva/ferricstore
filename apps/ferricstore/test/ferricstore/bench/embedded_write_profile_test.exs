@@ -20,7 +20,7 @@ defmodule Ferricstore.Bench.EmbeddedWriteProfileTest do
 
     # 2. Router.put (skip sandbox_key + opts parsing)
     {router_us, _} = :timer.tc(fn ->
-      for i <- 1..@iterations, do: Router.put("#{prefix}:rtr:#{i}", value, 0)
+      for i <- 1..@iterations, do: Router.put(FerricStore.Instance.get(:default), "#{prefix}:rtr:#{i}", value, 0)
     end)
 
     # 3. sandbox_key
@@ -30,7 +30,7 @@ defmodule Ferricstore.Bench.EmbeddedWriteProfileTest do
 
     # 4. shard_for
     {hash_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations, do: Router.shard_for("somekey")
+      for _ <- 1..@iterations, do: Router.shard_for(FerricStore.Instance.get(:default), "somekey")
     end)
 
     # 5. Direct ETS insert (no Raft, no Bitcask, just ETS)
@@ -114,7 +114,7 @@ defmodule Ferricstore.Bench.EmbeddedWriteProfileTest do
         fn w, i -> FerricStore.set("#{prefix}:#{w}:#{i}", value) end
       end},
       {"Router.put (quorum)", fn prefix ->
-        fn w, i -> Ferricstore.Store.Router.put("#{prefix}:#{w}:#{i}", value, 0) end
+        fn w, i -> Ferricstore.Store.Router.put(FerricStore.Instance.get(:default), "#{prefix}:#{w}:#{i}", value, 0) end
       end},
       {"Direct ETS insert", fn prefix ->
         keydir = :"keydir_0"

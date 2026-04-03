@@ -34,25 +34,25 @@ defmodule Ferricstore.Commands.NativeTest do
 
     test "CAS with matching expected value returns 1 and sets new value" do
       key = ukey("cas_match")
-      Router.put(key, "old", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
       assert 1 == Native.handle("CAS", [key, "old", "new"], dummy_store())
-      assert "new" == Router.get(key)
+      assert "new" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS with non-matching expected returns 0 and does not change value" do
       key = ukey("cas_mismatch")
-      Router.put(key, "current", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "current", 0)
       assert 0 == Native.handle("CAS", [key, "wrong", "new"], dummy_store())
-      assert "current" == Router.get(key)
+      assert "current" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS with EX sets TTL" do
       key = ukey("cas_ex")
-      Router.put(key, "old", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
       assert 1 == Native.handle("CAS", [key, "old", "new", "EX", "60"], dummy_store())
-      assert "new" == Router.get(key)
+      assert "new" == Router.get(FerricStore.Instance.get(:default), key)
       # The key should have a TTL now
-      {_val, expire_at_ms} = Router.get_meta(key)
+      {_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert expire_at_ms > System.os_time(:millisecond)
       assert expire_at_ms <= System.os_time(:millisecond) + 61_000
     end
@@ -60,10 +60,10 @@ defmodule Ferricstore.Commands.NativeTest do
     test "CAS without EX preserves existing TTL" do
       key = ukey("cas_keep_ttl")
       future = System.os_time(:millisecond) + 120_000
-      Router.put(key, "old", future)
+      Router.put(FerricStore.Instance.get(:default), key, "old", future)
       assert 1 == Native.handle("CAS", [key, "old", "new"], dummy_store())
-      assert "new" == Router.get(key)
-      {_val, expire_at_ms} = Router.get_meta(key)
+      assert "new" == Router.get(FerricStore.Instance.get(:default), key)
+      {_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert expire_at_ms == future
     end
 
@@ -78,20 +78,20 @@ defmodule Ferricstore.Commands.NativeTest do
 
     test "CAS with EX 0 returns error (TTL must be positive)" do
       key = ukey("cas_ex_zero")
-      Router.put(key, "old", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
       assert {:error, _} = Native.handle("CAS", [key, "old", "new", "EX", "0"], dummy_store())
     end
 
     test "CAS with EX non-integer returns error" do
       key = ukey("cas_ex_bad")
-      Router.put(key, "old", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
       assert {:error, _} = Native.handle("CAS", [key, "old", "new", "EX", "abc"], dummy_store())
     end
 
     test "CAS on expired key returns nil" do
       key = ukey("cas_expired")
       past = System.os_time(:millisecond) - 1_000
-      Router.put(key, "old", past)
+      Router.put(FerricStore.Instance.get(:default), key, "old", past)
       # Give ETS time to recognize expiry
       assert nil == Native.handle("CAS", [key, "old", "new"], dummy_store())
     end
@@ -105,14 +105,14 @@ defmodule Ferricstore.Commands.NativeTest do
     test "LOCK on non-existent key acquires lock" do
       key = ukey("lock_new")
       assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
-      assert "owner1" == Router.get(key)
+      assert "owner1" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "LOCK with same owner returns OK (idempotent)" do
       key = ukey("lock_idem")
       assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
       assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
-      assert "owner1" == Router.get(key)
+      assert "owner1" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "LOCK with different owner returns DISTLOCK error" do
@@ -127,16 +127,16 @@ defmodule Ferricstore.Commands.NativeTest do
       key = ukey("lock_expired")
       # Set a lock with a very short TTL
       past = System.os_time(:millisecond) - 1_000
-      Router.put(key, "old_owner", past)
+      Router.put(FerricStore.Instance.get(:default), key, "old_owner", past)
       # Wait for it to expire
       assert :ok = Native.handle("LOCK", [key, "new_owner", "5000"], dummy_store())
-      assert "new_owner" == Router.get(key)
+      assert "new_owner" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "LOCK sets TTL on the key" do
       key = ukey("lock_ttl")
       assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
-      {_val, expire_at_ms} = Router.get_meta(key)
+      {_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert expire_at_ms > System.os_time(:millisecond)
       assert expire_at_ms <= System.os_time(:millisecond) + 6_000
     end
@@ -164,7 +164,7 @@ defmodule Ferricstore.Commands.NativeTest do
       key = ukey("unlock_match")
       assert :ok = Native.handle("LOCK", [key, "owner1", "5000"], dummy_store())
       assert 1 == Native.handle("UNLOCK", [key, "owner1"], dummy_store())
-      assert nil == Router.get(key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "UNLOCK with wrong owner returns error" do
@@ -188,7 +188,7 @@ defmodule Ferricstore.Commands.NativeTest do
     test "UNLOCK after expiry returns 1 (already unlocked)" do
       key = ukey("unlock_after_exp")
       past = System.os_time(:millisecond) - 1_000
-      Router.put(key, "owner1", past)
+      Router.put(FerricStore.Instance.get(:default), key, "owner1", past)
       assert 1 == Native.handle("UNLOCK", [key, "owner1"], dummy_store())
     end
   end
@@ -201,10 +201,10 @@ defmodule Ferricstore.Commands.NativeTest do
     test "EXTEND with matching owner extends TTL" do
       key = ukey("extend_match")
       assert :ok = Native.handle("LOCK", [key, "owner1", "1000"], dummy_store())
-      {_val, old_exp} = Router.get_meta(key)
+      {_val, old_exp} = Router.get_meta(FerricStore.Instance.get(:default), key)
 
       assert 1 == Native.handle("EXTEND", [key, "owner1", "60000"], dummy_store())
-      {_val, new_exp} = Router.get_meta(key)
+      {_val, new_exp} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert new_exp > old_exp
     end
 
@@ -226,7 +226,7 @@ defmodule Ferricstore.Commands.NativeTest do
     test "EXTEND on expired key returns error" do
       key = ukey("extend_expired")
       past = System.os_time(:millisecond) - 1_000
-      Router.put(key, "owner1", past)
+      Router.put(FerricStore.Instance.get(:default), key, "owner1", past)
       assert {:error, msg} = Native.handle("EXTEND", [key, "owner1", "5000"], dummy_store())
       assert msg =~ "DISTLOCK"
     end
@@ -368,14 +368,14 @@ defmodule Ferricstore.Commands.NativeTest do
 
     test "CAS is routed through dispatcher" do
       key = ukey("disp_cas")
-      Router.put(key, "old", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
       assert 1 == Dispatcher.dispatch("CAS", [key, "old", "new"], dummy_store())
-      assert "new" == Router.get(key)
+      assert "new" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS is case-insensitive" do
       key = ukey("disp_cas_ci")
-      Router.put(key, "old", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "old", 0)
       assert 1 == Dispatcher.dispatch("cas", [key, "old", "new"], dummy_store())
     end
 
@@ -391,7 +391,7 @@ defmodule Ferricstore.Commands.NativeTest do
 
     test "EXTEND is routed through dispatcher" do
       key = ukey("disp_extend")
-      Router.put(key, "owner1", System.os_time(:millisecond) + 5_000)
+      Router.put(FerricStore.Instance.get(:default), key, "owner1", System.os_time(:millisecond) + 5_000)
       assert 1 == Dispatcher.dispatch("EXTEND", [key, "owner1", "10000"], dummy_store())
     end
 

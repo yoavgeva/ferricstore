@@ -29,7 +29,7 @@ defmodule FerricstoreServer.StartupTest do
   describe "all shards alive after startup" do
     test "all 4 shard GenServers are registered and alive" do
       for i <- 0..3 do
-        name = Router.shard_name(i)
+        name = Router.shard_name(FerricStore.Instance.get(:default), i)
         pid = Process.whereis(name)
         assert is_pid(pid), "Shard #{i} should be registered as #{name}"
         assert Process.alive?(pid), "Shard #{i} should be alive"
@@ -62,11 +62,11 @@ defmodule FerricstoreServer.StartupTest do
       # this verifies that the shard initialized its Bitcask store
       # correctly and can read persisted data.
       key = "startup_keydir_test_#{:rand.uniform(9_999_999)}"
-      Router.put(key, "persisted_value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "persisted_value", 0)
 
       # Flush to ensure data is on disk (shard pending + background writer).
-      shard_idx = Router.shard_for(key)
-      shard_name = Router.shard_name(shard_idx)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
       :ok = GenServer.call(shard_name, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
 
@@ -77,7 +77,7 @@ defmodule FerricstoreServer.StartupTest do
       :ets.insert(keydir, {key, nil, exp, lfu, fid, off, vsize})
 
       # The get must warm from Bitcask -- keydir must be valid.
-      assert "persisted_value" == Router.get(key)
+      assert "persisted_value" == Router.get(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -277,7 +277,7 @@ defmodule FerricstoreServer.StartupTest do
       # Write a 600KB value (exceeds default 512KB threshold).
       large_value = :binary.copy(<<0>>, 600 * 1024)
       key = "large_value_test_#{:rand.uniform(9_999_999)}"
-      Router.put(key, large_value, 0)
+      Router.put(FerricStore.Instance.get(:default), key, large_value, 0)
 
       {count, largest_key, largest_size} =
         Ferricstore.Application.scan_large_values(4, 512 * 1024)
@@ -290,7 +290,7 @@ defmodule FerricstoreServer.StartupTest do
 
     test "scan_large_values returns {0, nil, 0} when no large values exist" do
       # All keys were flushed in setup; write only small values.
-      Router.put("small_#{:rand.uniform(9_999_999)}", "tiny", 0)
+      Router.put(FerricStore.Instance.get(:default), "small_#{:rand.uniform(9_999_999)}", "tiny", 0)
 
       assert {0, nil, 0} = Ferricstore.Application.scan_large_values(4, 512 * 1024)
     end
@@ -299,8 +299,8 @@ defmodule FerricstoreServer.StartupTest do
       key_medium = "medium_val_#{:rand.uniform(9_999_999)}"
       key_biggest = "biggest_val_#{:rand.uniform(9_999_999)}"
 
-      Router.put(key_medium, :binary.copy(<<1>>, 600 * 1024), 0)
-      Router.put(key_biggest, :binary.copy(<<2>>, 800 * 1024), 0)
+      Router.put(FerricStore.Instance.get(:default), key_medium, :binary.copy(<<1>>, 600 * 1024), 0)
+      Router.put(FerricStore.Instance.get(:default), key_biggest, :binary.copy(<<2>>, 800 * 1024), 0)
 
       {count, largest_key, largest_size} =
         Ferricstore.Application.scan_large_values(4, 512 * 1024)
@@ -312,7 +312,7 @@ defmodule FerricstoreServer.StartupTest do
 
     test "scan_large_values respects a custom threshold" do
       key = "custom_threshold_#{:rand.uniform(9_999_999)}"
-      Router.put(key, :binary.copy(<<0>>, 100), 0)
+      Router.put(FerricStore.Instance.get(:default), key, :binary.copy(<<0>>, 100), 0)
 
       # Threshold of 50 bytes -- the 100-byte value should be flagged.
       {count, largest_key, _largest_size} =
@@ -325,7 +325,7 @@ defmodule FerricstoreServer.StartupTest do
     test "check_large_values logs warning when large values exist" do
       large_value = :binary.copy(<<0>>, 600 * 1024)
       key = "log_warn_test_#{:rand.uniform(9_999_999)}"
-      Router.put(key, large_value, 0)
+      Router.put(FerricStore.Instance.get(:default), key, large_value, 0)
 
       log =
         capture_log(fn ->
@@ -353,7 +353,7 @@ defmodule FerricstoreServer.StartupTest do
     test "check_large_values emits telemetry when large values exist" do
       large_value = :binary.copy(<<0>>, 700 * 1024)
       key = "telemetry_test_#{:rand.uniform(9_999_999)}"
-      Router.put(key, large_value, 0)
+      Router.put(FerricStore.Instance.get(:default), key, large_value, 0)
 
       test_pid = self()
       ref = make_ref()
@@ -395,7 +395,7 @@ defmodule FerricstoreServer.StartupTest do
 
     test "no warning or telemetry when all values are below threshold" do
       # Only small values exist (setup flushed everything).
-      Router.put("small_check_#{:rand.uniform(9_999_999)}", "ok", 0)
+      Router.put(FerricStore.Instance.get(:default), "small_check_#{:rand.uniform(9_999_999)}", "ok", 0)
 
       test_pid = self()
       ref = make_ref()

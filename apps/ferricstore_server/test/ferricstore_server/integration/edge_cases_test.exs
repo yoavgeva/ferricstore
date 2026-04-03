@@ -24,7 +24,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
 
     Enum.each(0..(shard_count - 1), fn i ->
-      name = Router.shard_name(i)
+      name = Router.shard_name(FerricStore.Instance.get(:default), i)
 
       Enum.find_value(1..50, fn _ ->
         pid = Process.whereis(name)
@@ -111,43 +111,43 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   describe "value size boundaries" do
     test "empty value (0 bytes) round-trips correctly" do
       k = ukey("empty")
-      assert :ok == Router.put(k, "", 0)
-      assert "" == Router.get(k)
+      assert :ok == Router.put(FerricStore.Instance.get(:default), k, "", 0)
+      assert "" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "1-byte value round-trips correctly" do
       k = ukey("one_byte")
-      assert :ok == Router.put(k, "x", 0)
-      assert "x" == Router.get(k)
+      assert :ok == Router.put(FerricStore.Instance.get(:default), k, "x", 0)
+      assert "x" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "value at exactly 1 MB round-trips correctly" do
       k = ukey("1mb")
       v = :binary.copy("A", 1_048_576)
-      assert :ok == Router.put(k, v, 0)
-      assert v == Router.get(k)
+      assert :ok == Router.put(FerricStore.Instance.get(:default), k, v, 0)
+      assert v == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "value at exactly 10 MB round-trips correctly" do
       k = ukey("10mb")
       v = :binary.copy("B", 10_000_000)
-      assert :ok == Router.put(k, v, 0)
-      assert v == Router.get(k)
+      assert :ok == Router.put(FerricStore.Instance.get(:default), k, v, 0)
+      assert v == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "value at 32 MB round-trips correctly" do
       k = ukey("32mb")
       v = :binary.copy("C", 32_000_000)
-      assert :ok == Router.put(k, v, 0)
-      assert v == Router.get(k)
+      assert :ok == Router.put(FerricStore.Instance.get(:default), k, v, 0)
+      assert v == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "value content is byte-exact after round-trip at 10 MB" do
       k = ukey("byte_exact_10mb")
       # Use a non-repeating pattern to catch offset/truncation bugs
       v = for i <- 0..9_999_999, into: <<>>, do: <<rem(i, 251)>>
-      assert :ok == Router.put(k, v, 0)
-      result = Router.get(k)
+      assert :ok == Router.put(FerricStore.Instance.get(:default), k, v, 0)
+      result = Router.get(FerricStore.Instance.get(:default), k)
       assert byte_size(result) == 10_000_000
       assert result == v
     end
@@ -156,18 +156,18 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       k = ukey("overwrite_large")
       big = :binary.copy("Z", 1_000_000)
       small = "tiny"
-      Router.put(k, big, 0)
-      assert big == Router.get(k)
-      Router.put(k, small, 0)
-      assert small == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, big, 0)
+      assert big == Router.get(FerricStore.Instance.get(:default), k)
+      Router.put(FerricStore.Instance.get(:default), k, small, 0)
+      assert small == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "overwrite small value with large value, GET returns new value" do
       k = ukey("overwrite_small")
-      Router.put(k, "tiny", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "tiny", 0)
       big = :binary.copy("Q", 500_000)
-      Router.put(k, big, 0)
-      assert big == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, big, 0)
+      assert big == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     # The Rust NIF guard caps values at 512 MiB. Anything larger is rejected
@@ -185,81 +185,81 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   describe "TTL edge cases" do
     test "expire_at_ms = 0 means no expiry (key lives forever)" do
       k = ukey("no_expiry")
-      Router.put(k, "permanent", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "permanent", 0)
       Process.sleep(50)
-      assert "permanent" == Router.get(k)
+      assert "permanent" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "key expires before read returns nil" do
       k = ukey("past_expiry")
       past = System.os_time(:millisecond) - 1
-      Router.put(k, "ghost", past)
-      assert nil == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "ghost", past)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "key expiring in 1ms: readable immediately, nil after sleep" do
       k = ukey("1ms_ttl")
       expire_at = System.os_time(:millisecond) + 1
-      Router.put(k, "ephemeral", expire_at)
+      Router.put(FerricStore.Instance.get(:default), k, "ephemeral", expire_at)
       # May or may not be readable immediately depending on scheduling
-      _ = Router.get(k)
+      _ = Router.get(FerricStore.Instance.get(:default), k)
       Process.sleep(10)
-      assert nil == Router.get(k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "key expiring in 50ms is readable before expiry, nil after" do
       k = ukey("50ms_ttl")
       expire_at = System.os_time(:millisecond) + 50
-      Router.put(k, "brief", expire_at)
-      assert "brief" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "brief", expire_at)
+      assert "brief" == Router.get(FerricStore.Instance.get(:default), k)
       Process.sleep(100)
-      assert nil == Router.get(k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
-    test "expired key is not included in Router.keys()" do
+    test "expired key is not included in Router.keys(FerricStore.Instance.get(:default))" do
       k = ukey("expired_keys")
       past = System.os_time(:millisecond) - 1
-      Router.put(k, "ghost", past)
-      refute k in Router.keys()
+      Router.put(FerricStore.Instance.get(:default), k, "ghost", past)
+      refute k in Router.keys(FerricStore.Instance.get(:default))
     end
 
-    test "expired key is not counted in Router.dbsize()" do
+    test "expired key is not counted in Router.dbsize(FerricStore.Instance.get(:default))" do
       k = ukey("expired_dbsize")
       past = System.os_time(:millisecond) - 1
-      baseline = Router.dbsize()
-      Router.put(k, "ghost", past)
+      baseline = Router.dbsize(FerricStore.Instance.get(:default))
+      Router.put(FerricStore.Instance.get(:default), k, "ghost", past)
       # dbsize may transiently include the key before the lazy eviction fires,
       # but after a GET (which triggers eviction) it must be excluded
-      Router.get(k)
-      assert Router.dbsize() <= baseline
+      Router.get(FerricStore.Instance.get(:default), k)
+      assert Router.dbsize(FerricStore.Instance.get(:default)) <= baseline
     end
 
     test "PUT then overwrite with no-expiry removes the TTL" do
       k = ukey("clear_ttl")
       expire_at = System.os_time(:millisecond) + 50
-      Router.put(k, "expiring", expire_at)
-      assert "expiring" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "expiring", expire_at)
+      assert "expiring" == Router.get(FerricStore.Instance.get(:default), k)
       # Overwrite with no expiry
-      Router.put(k, "permanent", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "permanent", 0)
       Process.sleep(100)
-      assert "permanent" == Router.get(k)
+      assert "permanent" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "PUT then overwrite with earlier TTL takes effect" do
       k = ukey("earlier_ttl")
       far_future = System.os_time(:millisecond) + 60_000
-      Router.put(k, "far", far_future)
+      Router.put(FerricStore.Instance.get(:default), k, "far", far_future)
       past = System.os_time(:millisecond) - 1
-      Router.put(k, "past", past)
-      assert nil == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "past", past)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "expire_at_ms at u64 max does not crash" do
       k = ukey("max_ttl")
       # u64::MAX — far future, should behave as no expiry in practice
       max_u64 = 18_446_744_073_709_551_615
-      Router.put(k, "max_future", max_u64)
-      assert "max_future" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "max_future", max_u64)
+      assert "max_future" == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -270,29 +270,29 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   describe "duplicate keys and update semantics" do
     test "multiple PUTs to same key: GET returns last value" do
       k = ukey("overwrite")
-      for i <- 1..10, do: Router.put(k, "val_#{i}", 0)
-      assert "val_10" == Router.get(k)
+      for i <- 1..10, do: Router.put(FerricStore.Instance.get(:default), k, "val_#{i}", 0)
+      assert "val_10" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "PUT then DELETE then PUT: GET returns new value" do
       k = ukey("del_then_put")
-      Router.put(k, "first", 0)
-      Router.delete(k)
-      assert nil == Router.get(k)
-      Router.put(k, "second", 0)
-      assert "second" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "first", 0)
+      Router.delete(FerricStore.Instance.get(:default), k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
+      Router.put(FerricStore.Instance.get(:default), k, "second", 0)
+      assert "second" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "DELETE of non-existent key returns :ok without error" do
       k = ukey("del_nonexist")
-      assert :ok == Router.delete(k)
+      assert :ok == Router.delete(FerricStore.Instance.get(:default), k)
     end
 
     test "DELETE then DELETE same key: both return :ok" do
       k = ukey("double_del")
-      Router.put(k, "v", 0)
-      assert :ok == Router.delete(k)
-      assert :ok == Router.delete(k)
+      Router.put(FerricStore.Instance.get(:default), k, "v", 0)
+      assert :ok == Router.delete(FerricStore.Instance.get(:default), k)
+      assert :ok == Router.delete(FerricStore.Instance.get(:default), k)
     end
 
     test "MSET with duplicate keys in same call: last value wins" do
@@ -497,13 +497,13 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
 
       results =
         keys
-        |> Enum.map(fn {k, v} -> Task.async(fn -> Router.put(k, v, 0) end) end)
+        |> Enum.map(fn {k, v} -> Task.async(fn -> Router.put(FerricStore.Instance.get(:default), k, v, 0) end) end)
         |> Task.await_many(15_000)
 
       assert Enum.all?(results, &(&1 == :ok))
 
       for {k, v} <- keys do
-        assert v == Router.get(k)
+        assert v == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
 
@@ -512,12 +512,12 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
 
       results =
         1..50
-        |> Enum.map(fn i -> Task.async(fn -> Router.put(k, "val_#{i}", 0) end) end)
+        |> Enum.map(fn i -> Task.async(fn -> Router.put(FerricStore.Instance.get(:default), k, "val_#{i}", 0) end) end)
         |> Task.await_many(15_000)
 
       assert Enum.all?(results, &(&1 == :ok))
 
-      value = Router.get(k)
+      value = Router.get(FerricStore.Instance.get(:default), k)
       assert is_binary(value)
       assert String.starts_with?(value, "val_")
     end
@@ -527,16 +527,16 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       n = 30
 
       # Pre-seed
-      for i <- 1..n, do: Router.put("#{base_key}_#{i}", "seed_#{i}", 0)
+      for i <- 1..n, do: Router.put(FerricStore.Instance.get(:default), "#{base_key}_#{i}", "seed_#{i}", 0)
 
       write_tasks =
         Enum.map(1..n, fn i ->
-          Task.async(fn -> Router.put("#{base_key}_#{i}", "updated_#{i}", 0) end)
+          Task.async(fn -> Router.put(FerricStore.Instance.get(:default), "#{base_key}_#{i}", "updated_#{i}", 0) end)
         end)
 
       read_tasks =
         Enum.map(1..n, fn i ->
-          Task.async(fn -> Router.get("#{base_key}_#{i}") end)
+          Task.async(fn -> Router.get(FerricStore.Instance.get(:default), "#{base_key}_#{i}") end)
         end)
 
       write_results = Task.await_many(write_tasks, 15_000)
@@ -553,21 +553,21 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
 
     test "concurrent DEL and PUT on same key: store remains consistent" do
       k = ukey("del_put_race")
-      Router.put(k, "initial", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "initial", 0)
 
       tasks =
         Enum.map(1..20, fn i ->
           Task.async(fn ->
             if rem(i, 2) == 0,
-              do: Router.put(k, "v#{i}", 0),
-              else: Router.delete(k)
+              do: Router.put(FerricStore.Instance.get(:default), k, "v#{i}", 0),
+              else: Router.delete(FerricStore.Instance.get(:default), k)
           end)
         end)
 
       Task.await_many(tasks, 15_000)
 
       # After the race, value must be either nil or a valid string — never a crash
-      result = Router.get(k)
+      result = Router.get(FerricStore.Instance.get(:default), k)
       assert is_nil(result) or is_binary(result)
     end
   end

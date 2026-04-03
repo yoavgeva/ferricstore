@@ -89,7 +89,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
   end
 
   defp kill_and_wait_restart(index) do
-    name = Router.shard_name(index)
+    name = Router.shard_name(FerricStore.Instance.get(:default), index)
     old_pid = Process.whereis(name)
     ref = Process.monitor(old_pid)
     Process.exit(old_pid, :kill)
@@ -166,12 +166,12 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       key = ukey("crash_recover")
       value = "important_data"
 
-      Router.put(key, value, 0)
-      assert value == Router.get(key)
+      Router.put(FerricStore.Instance.get(:default), key, value, 0)
+      assert value == Router.get(FerricStore.Instance.get(:default), key)
 
       # Flush to disk before crashing.
-      shard_idx = Router.shard_for(key)
-      shard_name = Router.shard_name(shard_idx)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
       :ok = GenServer.call(shard_name, :flush)
 
       # Kill the shard that owns this key.
@@ -186,7 +186,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       ShardHelpers.wait_shards_alive()
 
       # Data should be recovered from Bitcask.
-      ShardHelpers.eventually(fn -> value == Router.get(key) end,
+      ShardHelpers.eventually(fn -> value == Router.get(FerricStore.Instance.get(:default), key) end,
         "Data should survive shard crash and be recovered from Bitcask")
     end
 
@@ -195,7 +195,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       keys =
         for i <- 1..20 do
           k = ukey("multi_crash_#{i}")
-          Router.put(k, "val_#{i}", 0)
+          Router.put(FerricStore.Instance.get(:default), k, "val_#{i}", 0)
           k
         end
 
@@ -207,7 +207,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # All 20 keys should still be readable.
       for {k, i} <- Enum.with_index(keys, 1) do
-        ShardHelpers.eventually(fn -> "val_#{i}" == Router.get(k) end,
+        ShardHelpers.eventually(fn -> "val_#{i}" == Router.get(FerricStore.Instance.get(:default), k) end,
           "Key #{k} should survive shard 0 crash")
       end
     end
@@ -224,18 +224,18 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       key =
         Enum.find_value(1..100_000, fn n ->
           k = "nlc_ets_probe_#{n}"
-          if Router.shard_for(k) == 2, do: k
+          if Router.shard_for(FerricStore.Instance.get(:default), k) == 2, do: k
         end)
 
-      Router.put(key, "ets_test", 0)
-      assert "ets_test" == Router.get(key)
+      Router.put(FerricStore.Instance.get(:default), key, "ets_test", 0)
+      assert "ets_test" == Router.get(FerricStore.Instance.get(:default), key)
 
       # Verify ETS has the entry in single-table format.
       ets_name = :keydir_2
       assert [{^key, "ets_test", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets_name, key)
 
       # Flush and crash shard 2.
-      :ok = GenServer.call(Router.shard_name(2), :flush)
+      :ok = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), 2), :flush)
       {_old, _new} = kill_and_wait_restart(2)
       ShardHelpers.wait_shards_alive()
 
@@ -245,7 +245,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # The old cached entry is gone (ETS was recreated), but the data
       # is recoverable from Bitcask on the first GET.
-      ShardHelpers.eventually(fn -> "ets_test" == Router.get(key) end,
+      ShardHelpers.eventually(fn -> "ets_test" == Router.get(FerricStore.Instance.get(:default), key) end,
         "Data should be recoverable from Bitcask after restart")
 
       # Now it should be back in ETS.
@@ -289,8 +289,8 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       assert recv_response(sock) == {:simple, "OK"}
 
       # Flush the shard that owns this key.
-      shard_idx = Router.shard_for(key)
-      :ok = GenServer.call(Router.shard_name(shard_idx), :flush)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      :ok = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), shard_idx), :flush)
 
       # Kill that shard.
       {_old, _new} = kill_and_wait_restart(shard_idx)
@@ -367,7 +367,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
     test "startup state is consistent, operations work, health checks pass" do
       # 1. Verify startup state.
       for i <- 0..3 do
-        name = Router.shard_name(i)
+        name = Router.shard_name(FerricStore.Instance.get(:default), i)
         pid = Process.whereis(name)
         assert is_pid(pid) and Process.alive?(pid)
 

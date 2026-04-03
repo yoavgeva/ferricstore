@@ -33,7 +33,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
     @tag :shard_kill
     test "lock on a key disappears after shard kill -- another owner can lock immediately" do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Cluster.shard_server_id(shard_idx)
 
       # Use the discovered key that routes to this shard
@@ -75,7 +75,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
     @tag :shard_kill
     test "intent record disappears after shard kill" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
-      coordinator_shard_idx = min(Router.shard_for(k1), Router.shard_for(k2))
+      coordinator_shard_idx = min(Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2))
       shard_id = Cluster.shard_server_id(coordinator_shard_idx)
 
       owner_ref = make_ref()
@@ -124,7 +124,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
   describe "R2-C3: lock expiry during slow execute" do
     test "lock expires while execution is still in progress -- TTL window exists" do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Cluster.shard_server_id(shard_idx)
 
       owner_ref = make_ref()
@@ -168,13 +168,13 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
   describe "R2-H1: intent write failure not detected (regression guard)" do
     test "cross-shard RENAME succeeds under normal conditions" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
-      Router.put(k1, "r2h1_value", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "r2h1_value", 0)
 
       result = Ferricstore.Commands.Generic.handle("RENAME", [k1, k2], %{})
       assert result == :ok
 
-      assert Router.get(k1) == nil
-      assert Router.get(k2) == "r2h1_value"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == nil
+      assert Router.get(FerricStore.Instance.get(:default), k2) == "r2h1_value"
     end
 
     test "write_intent return value is ignored in source code" do
@@ -188,7 +188,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       #
       # Verify the function exists and can be called (regression guard).
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
-      coordinator_shard_idx = min(Router.shard_for(k1), Router.shard_for(k2))
+      coordinator_shard_idx = min(Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2))
       shard_id = Cluster.shard_server_id(coordinator_shard_idx)
 
       owner_ref = make_ref()
@@ -225,7 +225,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
     test "locks are released when execute_fn raises an exception" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(k1, "r2h2_value", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "r2h2_value", 0)
 
       # Execute a cross-shard op that raises during execution
       assert_raise RuntimeError, "boom", fn ->
@@ -237,8 +237,8 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       end
 
       # After the exception, locks should be released (the try/rescue handles this)
-      shard1_id = Cluster.shard_server_id(Router.shard_for(k1))
-      shard2_id = Cluster.shard_server_id(Router.shard_for(k2))
+      shard1_id = Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k1))
+      shard2_id = Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k2))
 
       new_ref = make_ref()
       expire = System.os_time(:millisecond) + 30_000
@@ -274,7 +274,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       # If write_intent raises (e.g., Raft timeout), the rescue is NOT entered
       # and locks leak. This test just confirms the happy path works.
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
-      Router.put(k1, "h2_guard", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "h2_guard", 0)
 
       result = Ferricstore.Commands.Generic.handle("RENAME", [k1, k2], %{})
       assert result == :ok
@@ -292,9 +292,9 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
   describe "R2-H3: intent resolver does not clean up locks" do
     test "stale intent is cleaned up but lock on same key persists" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Cluster.shard_server_id(shard_idx)
-      coordinator_shard_idx = min(Router.shard_for(k1), Router.shard_for(k2))
+      coordinator_shard_idx = min(Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2))
       coordinator_id = Cluster.shard_server_id(coordinator_shard_idx)
 
       owner_ref = make_ref()
@@ -357,7 +357,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
   describe "R2-H4: expired locks not cleaned -- memory leak" do
     test "100 expired locks accumulate in process dictionary" do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Cluster.shard_server_id(shard_idx)
 
       now = System.os_time(:millisecond)
@@ -429,7 +429,7 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
     test "parallel_unlock completes without error under normal conditions" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(k1, "r2m1_value", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "r2m1_value", 0)
 
       # Execute a normal cross-shard operation. The unlock phase runs inside
       # CrossShardOp.execute and its results are discarded. If it failed silently,
@@ -438,8 +438,8 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       assert result == :ok
 
       # Verify keys are not still locked: we can lock them ourselves
-      shard1_id = Cluster.shard_server_id(Router.shard_for(k1))
-      shard2_id = Cluster.shard_server_id(Router.shard_for(k2))
+      shard1_id = Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k1))
+      shard2_id = Cluster.shard_server_id(Router.shard_for(FerricStore.Instance.get(:default), k2))
 
       ref = make_ref()
       expire = System.os_time(:millisecond) + 30_000
@@ -469,13 +469,13 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
       #
       # Regression guard: verify the function works in the happy path.
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
-      Router.put(k1, "m1_verify", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "m1_verify", 0)
 
       result = Ferricstore.Commands.Generic.handle("COPY", [k1, k2], %{})
       assert result == 1
 
-      assert Router.get(k1) == "m1_verify"
-      assert Router.get(k2) == "m1_verify"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "m1_verify"
+      assert Router.get(FerricStore.Instance.get(:default), k2) == "m1_verify"
     end
   end
 end

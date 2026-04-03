@@ -56,7 +56,7 @@ defmodule Mix.Tasks.FerricstoreTest do
     end
 
     test "reflects actual key count after writes" do
-      baseline = length(Router.keys())
+      baseline = length(Router.keys(FerricStore.Instance.get(:default)))
       Router.put("info_test_key1", "v1")
       Router.put("info_test_key2", "v2")
 

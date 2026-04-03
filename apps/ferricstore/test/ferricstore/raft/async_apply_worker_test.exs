@@ -56,11 +56,11 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
   describe "apply_batch/2 processes batches correctly" do
     test "single put command is applied to shard" do
       k = ukey("single_put")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k, "async_val", 0}])
       AsyncApplyWorker.drain(shard_index)
-      assert "async_val" == Router.get(k)
+      assert "async_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "multiple put commands in a batch" do
@@ -82,23 +82,23 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
       AsyncApplyWorker.drain(shard_idx)
 
       for k <- shard_keys do
-        assert "batch_val" == Router.get(k)
+        assert "batch_val" == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
 
     test "delete command in batch" do
       k = ukey("batch_delete")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       # First write the key
-      Router.put(k, "to_delete", 0)
-      assert "to_delete" == Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "to_delete", 0)
+      assert "to_delete" == Router.get(FerricStore.Instance.get(:default), k)
 
       # Delete via async worker
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:delete, k}])
       AsyncApplyWorker.drain(shard_index)
 
-      assert nil == Router.get(k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "mixed put and delete commands in batch" do
@@ -106,13 +106,13 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
       k2 = ukey("mix_del")
 
       # Find two keys that hash to the same shard
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
 
       # Pre-create k2
-      Router.put(k2, "before_delete", 0)
+      Router.put(FerricStore.Instance.get(:default), k2, "before_delete", 0)
 
       # If they're on different shards, just test k1
-      if Router.shard_for(k2) == shard_idx do
+      if Router.shard_for(FerricStore.Instance.get(:default), k2) == shard_idx do
         :ok =
           AsyncApplyWorker.apply_batch(shard_idx, [
             {:put, k1, "new_val", 0},
@@ -120,8 +120,8 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
           ])
 
         AsyncApplyWorker.drain(shard_idx)
-        assert "new_val" == Router.get(k1)
-        assert nil == Router.get(k2)
+        assert "new_val" == Router.get(FerricStore.Instance.get(:default), k1)
+        assert nil == Router.get(FerricStore.Instance.get(:default), k2)
       else
         :ok =
           AsyncApplyWorker.apply_batch(shard_idx, [
@@ -129,19 +129,19 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
           ])
 
         AsyncApplyWorker.drain(shard_idx)
-        assert "new_val" == Router.get(k1)
+        assert "new_val" == Router.get(FerricStore.Instance.get(:default), k1)
       end
     end
 
     test "put with expiry" do
       k = ukey("expiry")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
       future = System.os_time(:millisecond) + 60_000
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k, "ttl_val", future}])
       AsyncApplyWorker.drain(shard_index)
 
-      {value, expire_at_ms} = Router.get_meta(k)
+      {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "ttl_val"
       assert expire_at_ms == future
     end
@@ -154,14 +154,14 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
   describe "async writes are eventually visible" do
     test "write is visible after short delay" do
       k = ukey("eventually_visible")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k, "visible", 0}])
 
       # Poll until visible or timeout
       result =
         Enum.reduce_while(1..100, nil, fn _i, _acc ->
-          case Router.get(k) do
+          case Router.get(FerricStore.Instance.get(:default), k) do
             nil ->
               Process.sleep(5)
               {:cont, nil}
@@ -195,7 +195,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
       for shard_idx <- 0..3, do: AsyncApplyWorker.drain(shard_idx)
 
       for k <- keys do
-        assert "val_#{k}" == Router.get(k),
+        assert "val_#{k}" == Router.get(FerricStore.Instance.get(:default), k),
                "Expected key #{k} to be visible after async write"
       end
     end
@@ -208,7 +208,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
   describe "apply_batch/2 is non-blocking" do
     test "returns :ok immediately without waiting for disk write" do
       k = ukey("fast_return")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       # Time the call -- it should return nearly instantly since it just
       # casts to the GenServer
@@ -224,7 +224,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
 
       # Wait for it to actually be written
       AsyncApplyWorker.drain(shard_index)
-      assert "fast" == Router.get(k)
+      assert "fast" == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -240,7 +240,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
 
     test "worker survives after processing batch" do
       k = ukey("survive")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k, "survived", 0}])
       AsyncApplyWorker.drain(shard_index)
@@ -253,13 +253,13 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
       k2 =
         Enum.find(1..10_000, fn i ->
           candidate = "async_survive2_#{i}"
-          Router.shard_for(candidate) == shard_index
+          Router.shard_for(FerricStore.Instance.get(:default), candidate) == shard_index
         end)
         |> then(fn i -> "async_survive2_#{i}" end)
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k2, "still_works", 0}])
       AsyncApplyWorker.drain(shard_index)
-      assert "still_works" == Router.get(k2)
+      assert "still_works" == Router.get(FerricStore.Instance.get(:default), k2)
     end
   end
 
@@ -274,7 +274,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
           Task.async(fn ->
             k = "async_conc_#{i}_#{:rand.uniform(9_999_999)}"
             # Route to the correct shard for this key
-            actual_shard = Router.shard_for(k)
+            actual_shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
             AsyncApplyWorker.apply_batch(actual_shard, [{:put, k, "conc_#{i}", 0}])
             {k, actual_shard}
@@ -287,7 +287,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
       for shard_idx <- 0..3, do: AsyncApplyWorker.drain(shard_idx)
 
       for {k, _shard} <- key_shard_pairs do
-        assert Router.get(k) != nil,
+        assert Router.get(FerricStore.Instance.get(:default), k) != nil,
                "Expected key #{k} to exist after concurrent async write"
       end
     end
@@ -301,7 +301,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
             k =
               Enum.find(1..10_000, fn i ->
                 candidate = "async_indep_shard#{shard_idx}_#{i}"
-                Router.shard_for(candidate) == shard_idx
+                Router.shard_for(FerricStore.Instance.get(:default), candidate) == shard_idx
               end)
               |> then(fn i -> "async_indep_shard#{shard_idx}_#{i}" end)
 
@@ -317,7 +317,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
       for shard_idx <- 0..3, do: AsyncApplyWorker.drain(shard_idx)
 
       for {k, shard_idx} <- results do
-        assert "shard_val_#{shard_idx}" == Router.get(k),
+        assert "shard_val_#{shard_idx}" == Router.get(FerricStore.Instance.get(:default), k),
                "Expected key #{k} on shard #{shard_idx} to be readable"
       end
     end
@@ -335,7 +335,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
         ])
 
       k = ukey("telemetry_batch")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = AsyncApplyWorker.apply_batch(shard_index, [{:put, k, "telem_val", 0}])
 
@@ -356,7 +356,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
 
       k1 = ukey("telem_multi_1")
       k2 = ukey("telem_multi_2")
-      shard_index = Router.shard_for(k1)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k1)
 
       commands = [
         {:put, k1, "v1", 0},

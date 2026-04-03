@@ -62,7 +62,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
     end
 
     test "INCRBYFLOAT uses shared format_float (no dead then)" do
-      Router.put("incr_float_test", "10.5", 0)
+      Router.put(FerricStore.Instance.get(:default), "incr_float_test", "10.5", 0)
       Process.sleep(50)
       assert {:ok, result} = Router.incr_float("incr_float_test", 1.5)
       assert_in_delta result, 12.0, 0.001
@@ -78,20 +78,20 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
     test "SETRANGE works correctly through transaction path" do
       # The fix replaced charlist-based SETRANGE with binary_part-based.
       # Verify correct behavior through the store.
-      Router.put("setrange_test", "Hello World", 0)
+      Router.put(FerricStore.Instance.get(:default), "setrange_test", "Hello World", 0)
       Process.sleep(50)
       assert {:ok, 11} = Router.setrange("setrange_test", 6, "Redis")
       Process.sleep(50)
-      assert Router.get("setrange_test") == "Hello Redis"
+      assert Router.get(FerricStore.Instance.get(:default), "setrange_test") == "Hello Redis"
     end
 
     test "SETRANGE with padding works correctly" do
-      Router.put("setrange_pad", "Hi", 0)
+      Router.put(FerricStore.Instance.get(:default), "setrange_pad", "Hi", 0)
       Process.sleep(50)
       # Offset beyond current string length should zero-pad
       assert {:ok, _len} = Router.setrange("setrange_pad", 5, "X")
       Process.sleep(50)
-      result = Router.get("setrange_pad")
+      result = Router.get(FerricStore.Instance.get(:default), "setrange_pad")
       assert binary_part(result, 0, 2) == "Hi"
       # Bytes 2..4 should be zero-padded
       assert binary_part(result, 2, 3) == <<0, 0, 0>>
@@ -101,7 +101,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
     test "SETRANGE on empty key works" do
       assert {:ok, 5} = Router.setrange("setrange_empty", 0, "Hello")
       Process.sleep(50)
-      assert Router.get("setrange_empty") == "Hello"
+      assert Router.get(FerricStore.Instance.get(:default), "setrange_empty") == "Hello"
     end
   end
 
@@ -114,12 +114,12 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # The fix changed `multi_queue ++ [{cmd, args}]` to
       # `[{cmd, args} | multi_queue]` with Enum.reverse at EXEC time.
       # Commands must still execute in order.
-      Router.put("multi_order", "0", 0)
+      Router.put(FerricStore.Instance.get(:default), "multi_order", "0", 0)
       Process.sleep(50)
 
       # INCR three times: result should be 3, not some other value
-      shard_idx = Router.shard_for("multi_order")
-      shard = Router.shard_name(shard_idx)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "multi_order")
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
 
       # Execute through the shard's transaction path
       commands = [
@@ -148,7 +148,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # After an expiry sweep with no expired keys, pending=[], flush_in_flight=nil,
       # the shard should return {:noreply, state, :hibernate}.
       # We can verify by checking the process info after a sweep.
-      shard = Router.shard_name(0)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), 0)
       pid = Process.whereis(shard)
       assert is_pid(pid)
 
@@ -324,9 +324,9 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
 
     test "non-pubsub operations work with nil pubsub fields" do
       # Regular GET/PUT should work fine with nil pubsub fields
-      Router.put("nil_pubsub_test", "value", 0)
+      Router.put(FerricStore.Instance.get(:default), "nil_pubsub_test", "value", 0)
       Process.sleep(50)
-      assert Router.get("nil_pubsub_test") == "value"
+      assert Router.get(FerricStore.Instance.get(:default), "nil_pubsub_test") == "value"
     end
   end
 

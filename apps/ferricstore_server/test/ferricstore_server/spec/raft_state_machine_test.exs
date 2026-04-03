@@ -47,7 +47,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
   defp key_on_shard(prefix, shard_idx) do
     suffix =
       Enum.find(1..10_000, fn i ->
-        Router.shard_for("#{prefix}:s6_#{i}") == shard_idx
+        Router.shard_for(FerricStore.Instance.get(:default), "#{prefix}:s6_#{i}") == shard_idx
       end)
 
     "#{prefix}:s6_#{suffix}"
@@ -65,7 +65,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
   describe "AP-002: apply() updates ETS hot cache" do
     test "SET via Batcher populates keydir ETS table" do
       key = pkey("ap002", "hot_cache")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       :ok = Batcher.write(shard_index, {:put, key, "cached_value", 0})
 
@@ -77,7 +77,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
     test "SET with expiry populates keydir with correct expire_at_ms" do
       key = pkey("ap002", "hot_cache_ttl")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
       future = System.os_time(:millisecond) + 60_000
 
       :ok = Batcher.write(shard_index, {:put, key, "ttl_value", future})
@@ -88,7 +88,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
     test "overwrite updates ETS to new value" do
       key = pkey("ap002", "overwrite")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       :ok = Batcher.write(shard_index, {:put, key, "old_value", 0})
       :ok = Batcher.write(shard_index, {:put, key, "new_value", 0})
@@ -99,17 +99,17 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
     test "GET reads from ETS without GenServer call (hot path)" do
       key = pkey("ap002", "hot_read")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       :ok = Batcher.write(shard_index, {:put, key, "hot_read_val", 0})
 
       # Router.get reads directly from ETS for hot keys
-      assert "hot_read_val" == Router.get(key)
+      assert "hot_read_val" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "delete removes key from keydir ETS" do
       key = pkey("ap002", "delete_cache")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       :ok = Batcher.write(shard_index, {:put, key, "to_delete", 0})
       :ok = Batcher.write(shard_index, {:delete, key})
@@ -213,7 +213,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
   describe "AP-006: TTL apply consistency" do
     test "SET with EX stores correct expire_at_ms, PEXPIRETIME matches" do
       key = pkey("ap006", "ttl_consist")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       ttl_seconds = 10
       now_ms = System.os_time(:millisecond)
@@ -222,14 +222,14 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       :ok = Batcher.write(shard_index, {:put, key, "ttl_val", expire_at_ms})
 
       # Verify via Router.get_meta
-      {value, stored_expire} = Router.get_meta(key)
+      {value, stored_expire} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert value == "ttl_val"
       assert stored_expire == expire_at_ms
     end
 
     test "SET with EX, EXPIRETIME returns correct Unix timestamp in seconds" do
       key = pkey("ap006", "expiretime_sec")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       ttl_seconds = 30
       now_ms = System.os_time(:millisecond)
@@ -240,7 +240,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       # EXPIRETIME returns seconds (div expire_at_ms by 1000)
       expected_seconds = div(expire_at_ms, 1_000)
 
-      {_val, stored_expire} = Router.get_meta(key)
+      {_val, stored_expire} = Router.get_meta(FerricStore.Instance.get(:default), key)
       actual_seconds = div(stored_expire, 1_000)
 
       assert actual_seconds == expected_seconds
@@ -248,18 +248,18 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
     test "SET without TTL, PEXPIRETIME returns expire_at_ms = 0 (no expiry)" do
       key = pkey("ap006", "no_ttl")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       :ok = Batcher.write(shard_index, {:put, key, "persistent", 0})
 
-      {value, stored_expire} = Router.get_meta(key)
+      {value, stored_expire} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert value == "persistent"
       assert stored_expire == 0
     end
 
     test "TTL is consistent between keydir ETS and get_meta" do
       key = pkey("ap006", "ets_vs_meta")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       expire_at_ms = System.os_time(:millisecond) + 60_000
 
@@ -270,7 +270,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       [{^key, _value, ets_expire, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, key)
 
       # Check via get_meta
-      {_value, meta_expire} = Router.get_meta(key)
+      {_value, meta_expire} = Router.get_meta(FerricStore.Instance.get(:default), key)
 
       assert ets_expire == expire_at_ms
       assert meta_expire == expire_at_ms
@@ -278,17 +278,17 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
     test "overwriting with new TTL updates expire_at_ms atomically" do
       key = pkey("ap006", "ttl_overwrite")
-      shard_index = Router.shard_for(key)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       expire1 = System.os_time(:millisecond) + 10_000
       expire2 = System.os_time(:millisecond) + 60_000
 
       :ok = Batcher.write(shard_index, {:put, key, "v1", expire1})
-      {_, stored1} = Router.get_meta(key)
+      {_, stored1} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert stored1 == expire1
 
       :ok = Batcher.write(shard_index, {:put, key, "v2", expire2})
-      {val, stored2} = Router.get_meta(key)
+      {val, stored2} = Router.get_meta(FerricStore.Instance.get(:default), key)
       assert val == "v2"
       assert stored2 == expire2
     end
@@ -341,7 +341,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
       # Verify all keys are readable
       for key <- keys do
-        assert Router.get(key) != nil, "Key #{key} should be readable after write"
+        assert Router.get(FerricStore.Instance.get(:default), key) != nil, "Key #{key} should be readable after write"
       end
     end
 
@@ -360,7 +360,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       assert latency < 500,
         "Expected single write latency < 500ms with 1ms window, got #{latency}ms"
 
-      assert "latency_check" == Router.get(key)
+      assert "latency_check" == Router.get(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -418,7 +418,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
       # All keys readable
       for key <- keys do
-        assert Router.get(key) != nil
+        assert Router.get(FerricStore.Instance.get(:default), key) != nil
       end
     end
 
@@ -530,8 +530,8 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
         "Expected session (1ms window) to complete quickly, took #{Float.round(session_latency_ms, 1)}ms"
 
       # Verify both values are readable
-      assert "fast" == Router.get(session_key)
-      assert "slow" == Router.get(sensor_key)
+      assert "fast" == Router.get(FerricStore.Instance.get(:default), session_key)
+      assert "slow" == Router.get(FerricStore.Instance.get(:default), sensor_key)
     end
 
     test "multiple namespace writes on same shard are independent" do
@@ -581,10 +581,10 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
       # All values readable
       for key <- fast_keys do
-        assert "fast_val" == Router.get(key)
+        assert "fast_val" == Router.get(FerricStore.Instance.get(:default), key)
       end
 
-      assert "slow_val" == Router.get(slow_key)
+      assert "slow_val" == Router.get(FerricStore.Instance.get(:default), slow_key)
     end
   end
 

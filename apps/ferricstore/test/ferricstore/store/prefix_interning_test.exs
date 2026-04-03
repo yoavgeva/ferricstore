@@ -366,8 +366,8 @@ defmodule Ferricstore.Store.PrefixInterningTest do
       ShardHelpers.flush_all_shards()
 
       # Kill and wait for shard restart
-      idx = Router.shard_for(key)
-      shard_pid = Process.whereis(Router.shard_name(idx))
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      shard_pid = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
       Process.exit(shard_pid, :kill)
       ShardHelpers.wait_shards_alive()
 

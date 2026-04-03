@@ -714,13 +714,13 @@ defmodule Ferricstore.Raft.PatchedWalTest do
         for _ <- 1..20 do
           Task.async(fn ->
             for _ <- 1..50 do
-              Router.incr(k, 1)
+              Router.incr(FerricStore.Instance.get(:default), k, 1)
             end
           end)
         end
 
       Task.await_many(tasks, 30_000)
-      assert Router.get(k) == "1000"
+      assert Router.get(FerricStore.Instance.get(:default), k) == "1000"
     end
 
     test "large value survives WAL async sync" do

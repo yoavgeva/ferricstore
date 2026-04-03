@@ -26,19 +26,19 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
 
     # Pre-populate 1000 keys via Router.put (goes through Raft)
     for i <- 1..1000 do
-      Router.put("#{prefix}:#{i}", String.duplicate("v", 100), 0)
+      Router.put(FerricStore.Instance.get(:default), "#{prefix}:#{i}", String.duplicate("v", 100), 0)
     end
     Process.sleep(200)
 
     key = "#{prefix}:500"
-    idx = Router.shard_for(key)
+    idx = Router.shard_for(FerricStore.Instance.get(:default), key)
     keydir = Router.resolve_keydir(idx)
 
     IO.puts("\n=== Read Path Per-Layer Cost (#{@iterations} iters, production sample_rate=100) ===\n")
 
     # 1. Full Router.get
     {router_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations, do: Router.get(key)
+      for _ <- 1..@iterations, do: Router.get(FerricStore.Instance.get(:default), key)
     end)
 
     # 2. Direct ETS lookup only
@@ -53,7 +53,7 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
 
     # 3. shard_for
     {hash_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations, do: Router.shard_for(key)
+      for _ <- 1..@iterations, do: Router.shard_for(FerricStore.Instance.get(:default), key)
     end)
 
     # 4. Stats.incr_keyspace_hits
@@ -134,7 +134,7 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
     prefix = "rppt_thr_#{System.unique_integer([:positive])}"
 
     for i <- 1..10_000 do
-      Router.put("#{prefix}:#{i}", String.duplicate("v", 100), 0)
+      Router.put(FerricStore.Instance.get(:default), "#{prefix}:#{i}", String.duplicate("v", 100), 0)
     end
     Process.sleep(300)
 
@@ -146,7 +146,7 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
         l = fn l ->
           if :atomics.get(stop, 1) == 1, do: throw(:stop)
           key = "#{prefix}:#{:rand.uniform(10_000)}"
-          Router.get(key)
+          Router.get(FerricStore.Instance.get(:default), key)
           :counters.add(counter, 1, 1)
           l.(l)
         end

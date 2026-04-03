@@ -180,11 +180,11 @@ defmodule FerricstoreServer.Spec.EdgeCasesTest do
       value = "router_null_key"
 
       Router.put(key, value)
-      assert Router.get(key) == value
-      assert Router.exists?(key) == true
+      assert Router.get(FerricStore.Instance.get(:default), key) == value
+      assert Router.exists?(FerricStore.Instance.get(:default), key) == true
 
-      Router.delete(key)
-      assert Router.get(key) == nil
+      Router.delete(FerricStore.Instance.get(:default), key)
+      assert Router.get(FerricStore.Instance.get(:default), key) == nil
     end
 
     test "all-null-byte key and all-null-byte value round-trip" do

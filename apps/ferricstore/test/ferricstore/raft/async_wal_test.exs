@@ -332,7 +332,7 @@ defmodule Ferricstore.Raft.AsyncWalTest do
       keys_by_shard =
         Enum.reduce(1..10_000, %{}, fn i, acc ->
           key = "#{prefix}:#{i}"
-          shard = Router.shard_for(key)
+          shard = Router.shard_for(FerricStore.Instance.get(:default), key)
 
           if map_size(Map.get(acc, shard, %{})) < 10 do
             Map.update(acc, shard, %{key => true}, &Map.put(&1, key, true))
@@ -402,14 +402,14 @@ defmodule Ferricstore.Raft.AsyncWalTest do
         for _ <- 1..50 do
           Task.async(fn ->
             for _ <- 1..100 do
-              Router.incr(k, 1)
+              Router.incr(FerricStore.Instance.get(:default), k, 1)
             end
           end)
         end
 
       Task.await_many(tasks, 30_000)
 
-      assert Router.get(k) == "5000"
+      assert Router.get(FerricStore.Instance.get(:default), k) == "5000"
     end
 
     test "CAS is linearizable through async WAL" do
@@ -443,14 +443,14 @@ defmodule Ferricstore.Raft.AsyncWalTest do
       writer =
         Task.async(fn ->
           for _ <- 1..total do
-            Router.incr(k, 1)
+            Router.incr(FerricStore.Instance.get(:default), k, 1)
           end
         end)
 
       reader =
         Task.async(fn ->
           for _ <- 1..200 do
-            val = Router.get(k)
+            val = Router.get(FerricStore.Instance.get(:default), k)
 
             if val != nil do
               n = if is_integer(val), do: val, else: String.to_integer(val)
@@ -464,7 +464,7 @@ defmodule Ferricstore.Raft.AsyncWalTest do
       Task.await(writer, 30_000)
       Task.await(reader, 30_000)
 
-      assert Router.get(k) == Integer.to_string(total)
+      assert Router.get(FerricStore.Instance.get(:default), k) == Integer.to_string(total)
     end
 
     test "CAS retry loop converges" do

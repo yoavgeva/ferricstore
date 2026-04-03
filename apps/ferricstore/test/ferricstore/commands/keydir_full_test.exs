@@ -78,31 +78,31 @@ defmodule Ferricstore.Commands.KeydirFullTest do
   describe "KEYDIR_FULL rejection (spec 2.4)" do
     test "new key is rejected when pressure is at reject level with noeviction" do
       # Write one key before enabling reject mode.
-      assert :ok = Router.put("seed_key", "value", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "seed_key", "value", 0)
 
       # Switch MemoryGuard to reject+noeviction mode.
       force_reject_mode()
       assert MemoryGuard.reject_writes?() == true
 
       # Try writing a NEW key -- should be rejected.
-      result = Router.put("brand_new_key", "value", 0)
+      result = Router.put(FerricStore.Instance.get(:default), "brand_new_key", "value", 0)
       assert {:error, msg} = result
       assert msg =~ "KEYDIR_FULL"
     end
 
     test "update to existing key succeeds even under reject pressure" do
       # Write a key before pressure kicks in.
-      assert :ok = Router.put("existing_key", "old_value", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "existing_key", "old_value", 0)
 
       # Switch to reject mode.
       force_reject_mode()
       assert MemoryGuard.reject_writes?() == true
 
       # Update the EXISTING key -- should succeed despite pressure.
-      assert :ok = Router.put("existing_key", "new_value", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "existing_key", "new_value", 0)
 
       # Verify the update took effect.
-      assert Router.get("existing_key") == "new_value"
+      assert Router.get(FerricStore.Instance.get(:default), "existing_key") == "new_value"
     end
 
     test "new key succeeds when pressure is below reject threshold" do
@@ -110,8 +110,8 @@ defmodule Ferricstore.Commands.KeydirFullTest do
       assert MemoryGuard.reject_writes?() == false
 
       # New key should succeed.
-      assert :ok = Router.put("allowed_key", "value", 0)
-      assert Router.get("allowed_key") == "value"
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "allowed_key", "value", 0)
+      assert Router.get(FerricStore.Instance.get(:default), "allowed_key") == "value"
     end
 
     test "new key succeeds when eviction policy is not :noeviction" do
@@ -122,16 +122,16 @@ defmodule Ferricstore.Commands.KeydirFullTest do
       assert MemoryGuard.reject_writes?() == false
 
       # New key should succeed.
-      assert :ok = Router.put("new_volatile_key", "value", 0)
-      assert Router.get("new_volatile_key") == "value"
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "new_volatile_key", "value", 0)
+      assert Router.get(FerricStore.Instance.get(:default), "new_volatile_key") == "value"
     end
 
     test "KEYDIR_FULL error message is correct" do
-      assert :ok = Router.put("seed_msg", "v", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "seed_msg", "v", 0)
       force_reject_mode()
       assert MemoryGuard.reject_writes?() == true
 
-      result = Router.put("fail_key", "v", 0)
+      result = Router.put(FerricStore.Instance.get(:default), "fail_key", "v", 0)
 
       assert {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"} = result
     end
@@ -140,7 +140,7 @@ defmodule Ferricstore.Commands.KeydirFullTest do
       force_reject_mode()
 
       for i <- 1..5 do
-        result = Router.put("new_key_#{i}", "v", 0)
+        result = Router.put(FerricStore.Instance.get(:default), "new_key_#{i}", "v", 0)
         assert {:error, msg} = result
         assert msg =~ "KEYDIR_FULL"
       end
@@ -148,13 +148,13 @@ defmodule Ferricstore.Commands.KeydirFullTest do
 
     test "existing key with TTL update succeeds under pressure" do
       # Write key with no expiry.
-      assert :ok = Router.put("ttl_key", "value", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "ttl_key", "value", 0)
 
       force_reject_mode()
 
       # Update with new TTL -- should succeed (it's an existing key).
       expire_at = System.os_time(:millisecond) + 60_000
-      assert :ok = Router.put("ttl_key", "value", expire_at)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "ttl_key", "value", expire_at)
     end
   end
 end

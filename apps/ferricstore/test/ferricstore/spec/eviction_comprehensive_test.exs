@@ -60,7 +60,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..20 do
-        Router.put("vol_eligible_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_eligible_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(50)
@@ -77,7 +77,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
     test "2: keys WITHOUT TTL are never evicted under volatile_lru" do
       for i <- 1..30 do
-        Router.put("vol_perm_#{i}", String.duplicate("x", 100), 0)
+        Router.put(FerricStore.Instance.get(:default), "vol_perm_#{i}", String.duplicate("x", 100), 0)
       end
 
       Process.sleep(50)
@@ -98,19 +98,19 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Insert "old" keys first -- these have an older last_access_ms
       for i <- 1..20 do
-        Router.put("vol_old_#{i}", "old_val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_old_#{i}", "old_val_#{i}", future)
       end
 
       Process.sleep(50)
 
       # Insert "new" keys -- these have a more recent last_access_ms
       for i <- 1..5 do
-        Router.put("vol_new_#{i}", "new_val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_new_#{i}", "new_val_#{i}", future)
       end
 
       # Also re-access the new keys to ensure they are freshly touched
       for i <- 1..5 do
-        Router.get("vol_new_#{i}")
+        Router.get(FerricStore.Instance.get(:default), "vol_new_#{i}")
       end
 
       Process.sleep(10)
@@ -132,13 +132,13 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
     test "4: accessing a key updates its last_access_ms" do
       future = System.os_time(:millisecond) + 60_000
-      Router.put("vol_access_ts", "hello", future)
+      Router.put(FerricStore.Instance.get(:default), "vol_access_ts", "hello", future)
       Process.sleep(30)
 
-      hot_cache = :"hot_cache_#{Router.shard_for("vol_access_ts")}"
+      hot_cache = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), "vol_access_ts")}"
 
       # Read the key once via Router.get to ensure it is upgraded to 3-tuple
-      assert Router.get("vol_access_ts") == "hello"
+      assert Router.get(FerricStore.Instance.get(:default), "vol_access_ts") == "hello"
       Process.sleep(10)
 
       # Get initial access time -- entry is always a 3-tuple.
@@ -149,7 +149,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       Process.sleep(10)
 
       # Read the key again to update access time
-      assert Router.get("vol_access_ts") == "hello"
+      assert Router.get(FerricStore.Instance.get(:default), "vol_access_ts") == "hello"
 
       [{_, _, access_after}] = :ets.lookup(hot_cache, "vol_access_ts")
 
@@ -161,14 +161,14 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..40 do
-        Router.put("vol_multi_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_multi_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(50)
 
       # Touch keys 1-10 to keep them hot
       for i <- 1..10 do
-        Router.get("vol_multi_#{i}")
+        Router.get(FerricStore.Instance.get(:default), "vol_multi_#{i}")
       end
 
       Process.sleep(10)
@@ -186,7 +186,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       hot_surviving =
         Enum.count(1..10, fn i ->
           key = "vol_multi_#{i}"
-          hc = :"hot_cache_#{Router.shard_for(key)}"
+          hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
           :ets.lookup(hc, key) != []
         end)
 
@@ -198,7 +198,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..20 do
-        Router.put("vol_cold_read_#{i}", "data_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_cold_read_#{i}", "data_#{i}", future)
       end
 
       Process.sleep(50)
@@ -207,7 +207,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       assert Stats.evicted_keys() > 0
 
       for i <- 1..20 do
-        value = Router.get("vol_cold_read_#{i}")
+        value = Router.get(FerricStore.Instance.get(:default), "vol_cold_read_#{i}")
         assert value == "data_#{i}",
                "vol_cold_read_#{i}: expected data_#{i}, got #{inspect(value)}"
       end
@@ -217,7 +217,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..20 do
-        Router.put("vol_rewarm_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_rewarm_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(50)
@@ -228,13 +228,13 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       assert evicted_i != nil, "Expected at least one key evicted from hot_cache"
 
       key = "vol_rewarm_#{evicted_i}"
-      hc = :"hot_cache_#{Router.shard_for(key)}"
+      hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
       # Confirm it is evicted
       assert :ets.lookup(hc, key) == []
 
       # Read it -- should trigger cold read + warm back
-      assert Router.get(key) == "val_#{evicted_i}"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "val_#{evicted_i}"
 
       # Now it should be back in hot_cache
       assert :ets.lookup(hc, key) != [],
@@ -247,7 +247,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       # Insert keys that are already expired (expire_at_ms in the past)
       for i <- 1..10 do
         # Write directly to ETS to simulate an expired-but-not-yet-reaped key
-        shard_idx = Router.shard_for("vol_expired_#{i}")
+        shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "vol_expired_#{i}")
         :ets.insert(:"keydir_#{shard_idx}", {"vol_expired_#{i}", now - 1000})
         :ets.insert(:"hot_cache_#{shard_idx}", {"vol_expired_#{i}", "old_val", now - 5000})
       end
@@ -256,7 +256,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = now + 60_000
 
       for i <- 1..10 do
-        Router.put("vol_live_#{i}", "live_val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_live_#{i}", "live_val_#{i}", future)
       end
 
       Process.sleep(50)
@@ -267,7 +267,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Live keys should be the ones evicted (they are the only eligible candidates)
       for i <- 1..10 do
-        assert Router.get("vol_live_#{i}") == "live_val_#{i}",
+        assert Router.get(FerricStore.Instance.get(:default), "vol_live_#{i}") == "live_val_#{i}",
                "Live key vol_live_#{i} should still be readable"
       end
     end
@@ -276,14 +276,14 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..100 do
-        Router.put("vol_100_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_100_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(50)
 
       # Access top 20 keys heavily
       for _ <- 1..5, i <- 1..20 do
-        Router.get("vol_100_#{i}")
+        Router.get(FerricStore.Instance.get(:default), "vol_100_#{i}")
       end
 
       Process.sleep(10)
@@ -297,7 +297,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       hot_keys_surviving =
         Enum.count(1..20, fn i ->
           key = "vol_100_#{i}"
-          hc = :"hot_cache_#{Router.shard_for(key)}"
+          hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
           :ets.lookup(hc, key) != []
         end)
 
@@ -306,7 +306,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # All keys still readable
       for i <- 1..100 do
-        assert Router.get("vol_100_#{i}") == "val_#{i}"
+        assert Router.get(FerricStore.Instance.get(:default), "vol_100_#{i}") == "val_#{i}"
       end
     end
 
@@ -315,14 +315,14 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..1000 do
-        Router.put("vol_1k_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_1k_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(100)
 
       # Access top 100 keys recently
       for i <- 1..100 do
-        Router.get("vol_1k_#{i}")
+        Router.get(FerricStore.Instance.get(:default), "vol_1k_#{i}")
       end
 
       Process.sleep(10)
@@ -336,7 +336,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       top_surviving =
         Enum.count(1..100, fn i ->
           key = "vol_1k_#{i}"
-          hc = :"hot_cache_#{Router.shard_for(key)}"
+          hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
           :ets.lookup(hc, key) != []
         end)
 
@@ -346,7 +346,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # ALL 1000 keys must still be readable (data integrity)
       for i <- 1..1000 do
-        assert Router.get("vol_1k_#{i}") == "val_#{i}",
+        assert Router.get(FerricStore.Instance.get(:default), "vol_1k_#{i}") == "val_#{i}",
                "vol_1k_#{i}: data loss detected"
       end
     end
@@ -355,22 +355,22 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       # Insert old key and let it age
-      Router.put("vol_ts_old", "old_value", future)
+      Router.put(FerricStore.Instance.get(:default), "vol_ts_old", "old_value", future)
       Process.sleep(50)
 
       # Insert many filler keys (to give eviction candidates)
       for i <- 1..30 do
-        Router.put("vol_ts_filler_#{i}", "filler_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_ts_filler_#{i}", "filler_#{i}", future)
       end
 
       Process.sleep(10)
 
       # Access the old key now to make it recent
-      Router.get("vol_ts_old")
+      Router.get(FerricStore.Instance.get(:default), "vol_ts_old")
 
       # Now insert a fresh key
-      Router.put("vol_ts_fresh", "fresh_value", future)
-      Router.get("vol_ts_fresh")
+      Router.put(FerricStore.Instance.get(:default), "vol_ts_fresh", "fresh_value", future)
+      Router.get(FerricStore.Instance.get(:default), "vol_ts_fresh")
 
       Process.sleep(10)
 
@@ -379,15 +379,15 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       # The recently-accessed key should be more likely to survive
       # We can't guarantee deterministic behavior with approximate LRU,
       # but both the old (recently re-accessed) and fresh key should be readable
-      assert Router.get("vol_ts_old") == "old_value"
-      assert Router.get("vol_ts_fresh") == "fresh_value"
+      assert Router.get(FerricStore.Instance.get(:default), "vol_ts_old") == "old_value"
+      assert Router.get(FerricStore.Instance.get(:default), "vol_ts_fresh") == "fresh_value"
     end
 
     test "12: concurrent reads during eviction don't crash" do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..50 do
-        Router.put("vol_conc_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "vol_conc_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(50)
@@ -400,7 +400,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
           Task.async(fn ->
             for _ <- 1..20 do
               key = "vol_conc_#{i}"
-              _result = Router.get(key)
+              _result = Router.get(FerricStore.Instance.get(:default), key)
               # Just verify the read completes without crashing
             end
 
@@ -424,7 +424,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
   describe "allkeys_lru" do
     test "1: keys without TTL ARE eligible (unlike volatile_lru)" do
       for i <- 1..20 do
-        Router.put("ak_no_ttl_#{i}", String.duplicate("x", 100), 0)
+        Router.put(FerricStore.Instance.get(:default), "ak_no_ttl_#{i}", String.duplicate("x", 100), 0)
       end
 
       Process.sleep(50)
@@ -441,14 +441,14 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
     test "2: recently accessed key survives over old key" do
       for i <- 1..30 do
-        Router.put("ak_lru_#{i}", "val_#{i}", 0)
+        Router.put(FerricStore.Instance.get(:default), "ak_lru_#{i}", "val_#{i}", 0)
       end
 
       Process.sleep(50)
 
       # Access only keys 1-5 recently
       for i <- 1..5 do
-        Router.get("ak_lru_#{i}")
+        Router.get(FerricStore.Instance.get(:default), "ak_lru_#{i}")
       end
 
       Process.sleep(10)
@@ -458,7 +458,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       hot_surviving =
         Enum.count(1..5, fn i ->
           key = "ak_lru_#{i}"
-          hc = :"hot_cache_#{Router.shard_for(key)}"
+          hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
           :ets.lookup(hc, key) != []
         end)
 
@@ -470,11 +470,11 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..15 do
-        Router.put("ak_mix_ttl_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "ak_mix_ttl_#{i}", "val_#{i}", future)
       end
 
       for i <- 1..15 do
-        Router.put("ak_mix_notl_#{i}", "val_#{i}", 0)
+        Router.put(FerricStore.Instance.get(:default), "ak_mix_notl_#{i}", "val_#{i}", 0)
       end
 
       Process.sleep(50)
@@ -494,14 +494,14 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
     test "4: 500 keys, access top 50, trigger eviction, all 50 survive" do
       for i <- 1..500 do
-        Router.put("ak_500_#{i}", "val_#{i}", 0)
+        Router.put(FerricStore.Instance.get(:default), "ak_500_#{i}", "val_#{i}", 0)
       end
 
       Process.sleep(100)
 
       # Touch top 50
       for _ <- 1..3, i <- 1..50 do
-        Router.get("ak_500_#{i}")
+        Router.get(FerricStore.Instance.get(:default), "ak_500_#{i}")
       end
 
       Process.sleep(10)
@@ -514,7 +514,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       top_surviving =
         Enum.count(1..50, fn i ->
           key = "ak_500_#{i}"
-          hc = :"hot_cache_#{Router.shard_for(key)}"
+          hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
           :ets.lookup(hc, key) != []
         end)
 
@@ -525,33 +525,33 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
     test "5: DBSIZE correct after eviction (evicted keys still exist in keydir)" do
       for i <- 1..20 do
-        Router.put("ak_dbsize_#{i}", "val_#{i}", 0)
+        Router.put(FerricStore.Instance.get(:default), "ak_dbsize_#{i}", "val_#{i}", 0)
       end
 
       Process.sleep(50)
 
-      dbsize_before = Router.dbsize()
+      dbsize_before = Router.dbsize(FerricStore.Instance.get(:default))
       assert dbsize_before >= 20
 
       trigger_eviction(:allkeys_lru)
 
       # Eviction removes from hot_cache only, not keydir.
       # DBSIZE reads from keydir, so it should be unchanged.
-      dbsize_after = Router.dbsize()
+      dbsize_after = Router.dbsize(FerricStore.Instance.get(:default))
       assert dbsize_after == dbsize_before,
              "DBSIZE should not change after hot_cache eviction: before=#{dbsize_before}, after=#{dbsize_after}"
     end
 
     test "6: KEYS returns evicted keys (still in keydir)" do
       for i <- 1..10 do
-        Router.put("ak_keys_#{i}", "val_#{i}", 0)
+        Router.put(FerricStore.Instance.get(:default), "ak_keys_#{i}", "val_#{i}", 0)
       end
 
       Process.sleep(50)
 
       trigger_eviction(:allkeys_lru)
 
-      all_keys = Router.keys()
+      all_keys = Router.keys(FerricStore.Instance.get(:default))
       ak_keys = Enum.filter(all_keys, &String.starts_with?(&1, "ak_keys_"))
 
       assert length(ak_keys) == 10,
@@ -560,7 +560,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
     test "7: evicted keys are still discoverable (keydir entry intact)" do
       for i <- 1..20 do
-        Router.put("ak_exists_#{i}", "val_#{i}", 0)
+        Router.put(FerricStore.Instance.get(:default), "ak_exists_#{i}", "val_#{i}", 0)
       end
 
       Process.sleep(50)
@@ -570,7 +570,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       # Verify keydir entries survive eviction -- eviction only touches hot_cache
       for i <- 1..20 do
         key = "ak_exists_#{i}"
-        shard_idx = Router.shard_for(key)
+        shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
         keydir = :"keydir_#{shard_idx}"
 
         assert :ets.lookup(keydir, key) != [],
@@ -580,7 +580,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       # Values are still readable via Router.get (which handles 2-tuple and 3-tuple
       # hot_cache entries gracefully and falls through to cold read)
       for i <- 1..20 do
-        assert Router.get("ak_exists_#{i}") == "val_#{i}",
+        assert Router.get(FerricStore.Instance.get(:default), "ak_exists_#{i}") == "val_#{i}",
                "Evicted key ak_exists_#{i} should be readable via Router.get"
       end
     end
@@ -589,7 +589,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..20 do
-        Router.put("ak_ttl_check_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "ak_ttl_check_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(50)
@@ -599,7 +599,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       # Verify keydir still has the correct expire_at_ms for evicted keys
       for i <- 1..20 do
         key = "ak_ttl_check_#{i}"
-        shard_idx = Router.shard_for(key)
+        shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
         keydir = :"keydir_#{shard_idx}"
 
         case :ets.lookup(keydir, key) do
@@ -623,11 +623,11 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       now = System.os_time(:millisecond)
 
       for i <- 1..5 do
-        Router.put("vttl_short_#{i}", "val_#{i}", now + 5_000)
+        Router.put(FerricStore.Instance.get(:default), "vttl_short_#{i}", "val_#{i}", now + 5_000)
       end
 
       for i <- 1..5 do
-        Router.put("vttl_long_#{i}", "val_#{i}", now + 600_000)
+        Router.put(FerricStore.Instance.get(:default), "vttl_long_#{i}", "val_#{i}", now + 600_000)
       end
 
       Process.sleep(50)
@@ -643,7 +643,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
     test "2: key with no TTL never evicted" do
       for i <- 1..20 do
-        Router.put("vttl_perm_#{i}", String.duplicate("y", 100), 0)
+        Router.put(FerricStore.Instance.get(:default), "vttl_perm_#{i}", String.duplicate("y", 100), 0)
       end
 
       Process.sleep(50)
@@ -660,12 +660,12 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
     test "3: key with 1s TTL evicted before key with 1h TTL" do
       now = System.os_time(:millisecond)
 
-      Router.put("vttl_1s", "short", now + 1_000)
-      Router.put("vttl_1h", "long", now + 3_600_000)
+      Router.put(FerricStore.Instance.get(:default), "vttl_1s", "short", now + 1_000)
+      Router.put(FerricStore.Instance.get(:default), "vttl_1h", "long", now + 3_600_000)
 
       # Insert filler keys with medium TTL to give the sampler options
       for i <- 1..20 do
-        Router.put("vttl_filler_#{i}", "filler", now + 30_000)
+        Router.put(FerricStore.Instance.get(:default), "vttl_filler_#{i}", "filler", now + 30_000)
       end
 
       Process.sleep(50)
@@ -674,15 +674,15 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # The 1h key should be more likely to survive than the 1s key
       # Both should still be readable regardless
-      assert Router.get("vttl_1s") == "short"
-      assert Router.get("vttl_1h") == "long"
+      assert Router.get(FerricStore.Instance.get(:default), "vttl_1s") == "short"
+      assert Router.get(FerricStore.Instance.get(:default), "vttl_1h") == "long"
     end
 
     test "4: after eviction, key still readable via cold path" do
       now = System.os_time(:millisecond)
 
       for i <- 1..20 do
-        Router.put("vttl_cold_#{i}", "val_#{i}", now + 30_000)
+        Router.put(FerricStore.Instance.get(:default), "vttl_cold_#{i}", "val_#{i}", now + 30_000)
       end
 
       Process.sleep(50)
@@ -692,7 +692,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       assert Stats.evicted_keys() > 0
 
       for i <- 1..20 do
-        assert Router.get("vttl_cold_#{i}") == "val_#{i}",
+        assert Router.get(FerricStore.Instance.get(:default), "vttl_cold_#{i}") == "val_#{i}",
                "vttl_cold_#{i} should be readable via cold path"
       end
     end
@@ -702,11 +702,11 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Keys 1-50: short TTL (5s), keys 51-100: long TTL (5min)
       for i <- 1..50 do
-        Router.put("vttl_100_#{i}", "val_#{i}", now + 5_000)
+        Router.put(FerricStore.Instance.get(:default), "vttl_100_#{i}", "val_#{i}", now + 5_000)
       end
 
       for i <- 51..100 do
-        Router.put("vttl_100_#{i}", "val_#{i}", now + 300_000)
+        Router.put(FerricStore.Instance.get(:default), "vttl_100_#{i}", "val_#{i}", now + 300_000)
       end
 
       Process.sleep(50)
@@ -729,14 +729,14 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Insert expired keys directly into ETS
       for i <- 1..10 do
-        shard_idx = Router.shard_for("vttl_expired_#{i}")
+        shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "vttl_expired_#{i}")
         :ets.insert(:"keydir_#{shard_idx}", {"vttl_expired_#{i}", now - 5000})
         :ets.insert(:"hot_cache_#{shard_idx}", {"vttl_expired_#{i}", "dead", now - 10_000})
       end
 
       # Insert live keys with short TTL
       for i <- 1..10 do
-        Router.put("vttl_live_#{i}", "live_#{i}", now + 10_000)
+        Router.put(FerricStore.Instance.get(:default), "vttl_live_#{i}", "live_#{i}", now + 10_000)
       end
 
       Process.sleep(50)
@@ -745,7 +745,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Live keys should all still be readable
       for i <- 1..10 do
-        assert Router.get("vttl_live_#{i}") == "live_#{i}"
+        assert Router.get(FerricStore.Instance.get(:default), "vttl_live_#{i}") == "live_#{i}"
       end
     end
 
@@ -755,12 +755,12 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       durations = [1_000, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000]
 
       for {dur, i} <- Enum.with_index(durations, 1) do
-        Router.put("vttl_order_#{i}", "val_#{i}", now + dur)
+        Router.put(FerricStore.Instance.get(:default), "vttl_order_#{i}", "val_#{i}", now + dur)
       end
 
       # Add filler keys
       for i <- 1..20 do
-        Router.put("vttl_order_fill_#{i}", "filler", now + 5_000)
+        Router.put(FerricStore.Instance.get(:default), "vttl_order_fill_#{i}", "filler", now + 5_000)
       end
 
       Process.sleep(50)
@@ -769,10 +769,10 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Keys with longer TTL should be more likely to survive
       # The last key (600s TTL) should survive better than the first (1s TTL)
-      assert Router.get("vttl_order_8") == "val_8",
+      assert Router.get(FerricStore.Instance.get(:default), "vttl_order_8") == "val_8",
              "Key with longest TTL should be readable"
 
-      assert Router.get("vttl_order_1") == "val_1",
+      assert Router.get(FerricStore.Instance.get(:default), "vttl_order_1") == "val_1",
              "Key with shortest TTL should still be readable (cold path)"
     end
 
@@ -780,14 +780,14 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       now = System.os_time(:millisecond)
 
       # Create a key with short TTL
-      Router.put("vttl_updated", "value", now + 5_000)
+      Router.put(FerricStore.Instance.get(:default), "vttl_updated", "value", now + 5_000)
 
       # Update its TTL to a very long one by re-writing with new expire
-      Router.put("vttl_updated", "value", now + 600_000)
+      Router.put(FerricStore.Instance.get(:default), "vttl_updated", "value", now + 600_000)
 
       # Create filler keys with medium TTL
       for i <- 1..20 do
-        Router.put("vttl_upd_filler_#{i}", "filler", now + 10_000)
+        Router.put(FerricStore.Instance.get(:default), "vttl_upd_filler_#{i}", "filler", now + 10_000)
       end
 
       Process.sleep(50)
@@ -795,8 +795,8 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       trigger_eviction(:volatile_ttl)
 
       # The updated key with long TTL should be more likely to survive
-      hc = :"hot_cache_#{Router.shard_for("vttl_updated")}"
-      keydir = :"keydir_#{Router.shard_for("vttl_updated")}"
+      hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), "vttl_updated")}"
+      keydir = :"keydir_#{Router.shard_for(FerricStore.Instance.get(:default), "vttl_updated")}"
 
       # Verify keydir has the new expiry
       [{_, _value, exp, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "vttl_updated")
@@ -804,7 +804,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
              "Keydir should have updated TTL, got #{exp}"
 
       # Key should be readable regardless
-      assert Router.get("vttl_updated") == "value"
+      assert Router.get(FerricStore.Instance.get(:default), "vttl_updated") == "value"
     end
   end
 
@@ -815,7 +815,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
   describe "noeviction" do
     test "1: no keys evicted under any pressure" do
       for i <- 1..20 do
-        Router.put("noev_#{i}", "val_#{i}", 0)
+        Router.put(FerricStore.Instance.get(:default), "noev_#{i}", "val_#{i}", 0)
       end
 
       Process.sleep(50)
@@ -845,23 +845,23 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
     end
 
     test "3: updates to existing keys still work under noeviction pressure" do
-      Router.put("noev_update", "original", 0)
+      Router.put(FerricStore.Instance.get(:default), "noev_update", "original", 0)
       Process.sleep(20)
 
       # Even under memory pressure with noeviction, updates to existing keys
       # should work (the Shard checks for existing keys before rejecting)
-      assert Router.get("noev_update") == "original"
+      assert Router.get(FerricStore.Instance.get(:default), "noev_update") == "original"
 
       # Update the value
-      Router.put("noev_update", "updated", 0)
+      Router.put(FerricStore.Instance.get(:default), "noev_update", "updated", 0)
       Process.sleep(20)
 
-      assert Router.get("noev_update") == "updated"
+      assert Router.get(FerricStore.Instance.get(:default), "noev_update") == "updated"
     end
 
     test "4: read operations work normally under noeviction pressure" do
       for i <- 1..10 do
-        Router.put("noev_read_#{i}", "val_#{i}", 0)
+        Router.put(FerricStore.Instance.get(:default), "noev_read_#{i}", "val_#{i}", 0)
       end
 
       Process.sleep(50)
@@ -876,14 +876,14 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # All reads should still work
       for i <- 1..10 do
-        assert Router.get("noev_read_#{i}") == "val_#{i}",
+        assert Router.get(FerricStore.Instance.get(:default), "noev_read_#{i}") == "val_#{i}",
                "Read for noev_read_#{i} should work under noeviction pressure"
       end
     end
 
     test "5: after switching from noeviction to allkeys_lru, eviction starts" do
       for i <- 1..30 do
-        Router.put("noev_switch_#{i}", String.duplicate("x", 100), 0)
+        Router.put(FerricStore.Instance.get(:default), "noev_switch_#{i}", String.duplicate("x", 100), 0)
       end
 
       Process.sleep(50)
@@ -925,7 +925,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       original_values = for i <- 1..30, into: %{}, do: {"dp_rt_#{i}", "original_data_#{i}_#{:crypto.strong_rand_bytes(8) |> Base.encode16()}"}
 
       for {key, value} <- original_values do
-        Router.put(key, value, future)
+        Router.put(FerricStore.Instance.get(:default), key, value, future)
       end
 
       Process.sleep(50)
@@ -933,7 +933,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       trigger_eviction(:volatile_lru)
 
       for {key, expected} <- original_values do
-        actual = Router.get(key)
+        actual = Router.get(FerricStore.Instance.get(:default), key)
         assert actual == expected,
                "Cold read roundtrip failed for #{key}: expected #{inspect(expected)}, got #{inspect(actual)}"
       end
@@ -947,7 +947,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..5 do
-        Router.put("dp_hash_field_#{i}", "value_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "dp_hash_field_#{i}", "value_#{i}", future)
       end
 
       Process.sleep(50)
@@ -955,7 +955,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       trigger_eviction(:volatile_lru)
 
       for i <- 1..5 do
-        value = Router.get("dp_hash_field_#{i}")
+        value = Router.get(FerricStore.Instance.get(:default), "dp_hash_field_#{i}")
         assert value == "value_#{i}",
                "Hash field #{i} should be readable after eviction, got #{inspect(value)}"
       end
@@ -967,7 +967,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..5 do
-        Router.put("dp_list_elem_#{i}", "elem_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "dp_list_elem_#{i}", "elem_#{i}", future)
       end
 
       Process.sleep(50)
@@ -975,7 +975,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       trigger_eviction(:volatile_lru)
 
       for i <- 1..5 do
-        value = Router.get("dp_list_elem_#{i}")
+        value = Router.get(FerricStore.Instance.get(:default), "dp_list_elem_#{i}")
         assert value == "elem_#{i}",
                "List element #{i} should be readable after eviction, got #{inspect(value)}"
       end
@@ -987,7 +987,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..5 do
-        Router.put("dp_set_member_#{i}", "1", future)
+        Router.put(FerricStore.Instance.get(:default), "dp_set_member_#{i}", "1", future)
       end
 
       Process.sleep(50)
@@ -995,7 +995,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       trigger_eviction(:volatile_lru)
 
       for i <- 1..5 do
-        value = Router.get("dp_set_member_#{i}")
+        value = Router.get(FerricStore.Instance.get(:default), "dp_set_member_#{i}")
         assert value == "1",
                "Set member #{i} should be readable after eviction, got #{inspect(value)}"
       end
@@ -1005,7 +1005,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..1000 do
-        Router.put("dp_1k_#{i}", "data_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "dp_1k_#{i}", "data_#{i}", future)
       end
 
       Process.sleep(100)
@@ -1019,7 +1019,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # EVERY key must be readable
       for i <- 1..1000 do
-        actual = Router.get("dp_1k_#{i}")
+        actual = Router.get(FerricStore.Instance.get(:default), "dp_1k_#{i}")
         assert actual == "data_#{i}",
                "DATA LOSS at dp_1k_#{i}: expected data_#{i}, got #{inspect(actual)}"
       end
@@ -1029,7 +1029,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..30 do
-        Router.put("dp_cycle_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "dp_cycle_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(50)
@@ -1039,7 +1039,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Read all keys (re-warms them)
       for i <- 1..30 do
-        assert Router.get("dp_cycle_#{i}") == "val_#{i}"
+        assert Router.get(FerricStore.Instance.get(:default), "dp_cycle_#{i}") == "val_#{i}"
       end
 
       Process.sleep(20)
@@ -1049,7 +1049,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Read all keys again
       for i <- 1..30 do
-        assert Router.get("dp_cycle_#{i}") == "val_#{i}",
+        assert Router.get(FerricStore.Instance.get(:default), "dp_cycle_#{i}") == "val_#{i}",
                "Data lost after evict-read-evict cycle for dp_cycle_#{i}"
       end
     end
@@ -1058,7 +1058,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..50 do
-        Router.put("dp_multi_#{i}", "data_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "dp_multi_#{i}", "data_#{i}", future)
       end
 
       Process.sleep(50)
@@ -1068,7 +1068,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
         trigger_eviction(:volatile_lru)
 
         for i <- 1..50 do
-          actual = Router.get("dp_multi_#{i}")
+          actual = Router.get(FerricStore.Instance.get(:default), "dp_multi_#{i}")
           assert actual == "data_#{i}",
                  "Cycle #{cycle}: data loss for dp_multi_#{i}, got #{inspect(actual)}"
         end
@@ -1081,7 +1081,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..30 do
-        Router.put("dp_cw_#{i}", "original_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "dp_cw_#{i}", "original_#{i}", future)
       end
 
       Process.sleep(50)
@@ -1090,7 +1090,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       writer_tasks =
         for i <- 31..60 do
           Task.async(fn ->
-            Router.put("dp_cw_#{i}", "new_val_#{i}", future)
+            Router.put(FerricStore.Instance.get(:default), "dp_cw_#{i}", "new_val_#{i}", future)
             :ok
           end)
         end
@@ -1104,14 +1104,14 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # All original keys readable
       for i <- 1..30 do
-        actual = Router.get("dp_cw_#{i}")
+        actual = Router.get(FerricStore.Instance.get(:default), "dp_cw_#{i}")
         assert actual == "original_#{i}",
                "Corruption detected for dp_cw_#{i}: got #{inspect(actual)}"
       end
 
       # All newly written keys readable
       for i <- 31..60 do
-        actual = Router.get("dp_cw_#{i}")
+        actual = Router.get(FerricStore.Instance.get(:default), "dp_cw_#{i}")
         assert actual == "new_val_#{i}",
                "New key dp_cw_#{i} not readable: got #{inspect(actual)}"
       end
@@ -1121,7 +1121,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 60_000
 
       for i <- 1..20 do
-        Router.put("dp_restart_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "dp_restart_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(50)
@@ -1135,7 +1135,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # All keys should be readable (via cold path from Bitcask)
       for i <- 1..20 do
-        actual = Router.get("dp_restart_#{i}")
+        actual = Router.get(FerricStore.Instance.get(:default), "dp_restart_#{i}")
         assert actual == "val_#{i}",
                "After eviction + flush, dp_restart_#{i} should be readable, got #{inspect(actual)}"
       end
@@ -1154,7 +1154,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       ]
 
       for {val, i} <- Enum.with_index(binary_values, 1) do
-        Router.put("dp_binary_#{i}", val, future)
+        Router.put(FerricStore.Instance.get(:default), "dp_binary_#{i}", val, future)
       end
 
       Process.sleep(50)
@@ -1162,7 +1162,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       trigger_eviction(:volatile_lru)
 
       for {expected, i} <- Enum.with_index(binary_values, 1) do
-        actual = Router.get("dp_binary_#{i}")
+        actual = Router.get(FerricStore.Instance.get(:default), "dp_binary_#{i}")
         assert actual == expected,
                "Binary value #{i} corrupted after eviction: expected #{inspect(expected)}, got #{inspect(actual)}"
       end
@@ -1179,7 +1179,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 300_000
 
       for i <- 1..10_000 do
-        Router.put("stress_10k_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "stress_10k_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(200)
@@ -1194,7 +1194,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       failures =
         Enum.reduce(1..10_000, [], fn i, acc ->
           key = "stress_10k_#{i}"
-          actual = Router.get(key)
+          actual = Router.get(FerricStore.Instance.get(:default), key)
 
           if actual == "val_#{i}" do
             acc
@@ -1212,19 +1212,19 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 120_000
 
       for i <- 1..1000 do
-        Router.put("stress_access_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "stress_access_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(100)
 
       # Cold keys accessed once
       for i <- 101..1000 do
-        Router.get("stress_access_#{i}")
+        Router.get(FerricStore.Instance.get(:default), "stress_access_#{i}")
       end
 
       # Hot keys accessed many times
       for _ <- 1..100, i <- 1..100 do
-        Router.get("stress_access_#{i}")
+        Router.get(FerricStore.Instance.get(:default), "stress_access_#{i}")
       end
 
       Process.sleep(10)
@@ -1236,7 +1236,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       hot_surviving =
         Enum.count(1..100, fn i ->
           key = "stress_access_#{i}"
-          hc = :"hot_cache_#{Router.shard_for(key)}"
+          hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
           :ets.lookup(hc, key) != []
         end)
 
@@ -1248,7 +1248,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
     @tag timeout: 120_000
     test "3: 50 concurrent readers + eviction running: no crashes" do
       for i <- 1..200 do
-        Router.put("stress_conc_#{i}", "val_#{i}", 0)
+        Router.put(FerricStore.Instance.get(:default), "stress_conc_#{i}", "val_#{i}", 0)
       end
 
       Process.sleep(100)
@@ -1263,7 +1263,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
             for _ <- 1..100 do
               i = :rand.uniform(200)
               key = "stress_conc_#{i}"
-              _result = Router.get(key)
+              _result = Router.get(FerricStore.Instance.get(:default), key)
               # Just verify no crash
             end
 
@@ -1282,7 +1282,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # After eviction settles, verify all keys are still readable
       for i <- 1..200 do
-        assert Router.get("stress_conc_#{i}") == "val_#{i}",
+        assert Router.get(FerricStore.Instance.get(:default), "stress_conc_#{i}") == "val_#{i}",
                "Key stress_conc_#{i} should be readable after eviction settles"
       end
     end
@@ -1293,7 +1293,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Insert 5000 keys to give plenty of eviction candidates
       for i <- 1..5000 do
-        Router.put("stress_tp_#{i}", String.duplicate("x", 100), future)
+        Router.put(FerricStore.Instance.get(:default), "stress_tp_#{i}", String.duplicate("x", 100), future)
       end
 
       Process.sleep(200)
@@ -1331,7 +1331,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 120_000
 
       for i <- 1..2000 do
-        Router.put("stress_mem_#{i}", String.duplicate("x", 500), future)
+        Router.put(FerricStore.Instance.get(:default), "stress_mem_#{i}", String.duplicate("x", 500), future)
       end
 
       Process.sleep(100)
@@ -1356,7 +1356,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # Write old keys
       for i <- 1..500 do
-        Router.put("stress_ew_old_#{i}", "old_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "stress_ew_old_#{i}", "old_#{i}", future)
       end
 
       Process.sleep(100)
@@ -1367,7 +1367,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
           Task.async(fn ->
             for i <- 1..50 do
               key = "stress_ew_new_#{batch}_#{i}"
-              Router.put(key, "new_#{batch}_#{i}", future)
+              Router.put(FerricStore.Instance.get(:default), key, "new_#{batch}_#{i}", future)
             end
 
             :ok
@@ -1384,13 +1384,13 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # All keys should be readable
       for i <- 1..500 do
-        actual = Router.get("stress_ew_old_#{i}")
+        actual = Router.get(FerricStore.Instance.get(:default), "stress_ew_old_#{i}")
         assert actual == "old_#{i}", "Old key #{i} lost: got #{inspect(actual)}"
       end
 
       for batch <- 1..10, i <- 1..50 do
         key = "stress_ew_new_#{batch}_#{i}"
-        actual = Router.get(key)
+        actual = Router.get(FerricStore.Instance.get(:default), key)
         assert actual == "new_#{batch}_#{i}", "New key #{key} lost: got #{inspect(actual)}"
       end
     end
@@ -1400,7 +1400,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       future = System.os_time(:millisecond) + 120_000
 
       for i <- 1..200 do
-        Router.put("stress_stable_#{i}", "val_#{i}", future)
+        Router.put(FerricStore.Instance.get(:default), "stress_stable_#{i}", "val_#{i}", future)
       end
 
       Process.sleep(100)
@@ -1413,7 +1413,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
           # Re-read some keys to re-warm (simulating real workload)
           for i <- 1..10 do
-            Router.get("stress_stable_#{:rand.uniform(200)}")
+            Router.get(FerricStore.Instance.get(:default), "stress_stable_#{:rand.uniform(200)}")
           end
 
           mem = total_hot_cache_memory()
@@ -1434,7 +1434,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
 
       # All keys still readable
       for i <- 1..200 do
-        actual = Router.get("stress_stable_#{i}")
+        actual = Router.get(FerricStore.Instance.get(:default), "stress_stable_#{i}")
         assert actual == "val_#{i}",
                "Key stress_stable_#{i} lost after 100 eviction cycles: got #{inspect(actual)}"
       end
@@ -1504,7 +1504,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
   defp count_hot_cache_entries_range(prefix, range) do
     Enum.count(range, fn i ->
       key = "#{prefix}#{i}"
-      hc = :"hot_cache_#{Router.shard_for(key)}"
+      hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
       try do
         :ets.lookup(hc, key) != []
@@ -1542,7 +1542,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
   defp find_evicted_key(prefix, range) do
     Enum.find(range, fn i ->
       key = "#{prefix}#{i}"
-      hc = :"hot_cache_#{Router.shard_for(key)}"
+      hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
       try do
         :ets.lookup(hc, key) == []

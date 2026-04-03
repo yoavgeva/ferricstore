@@ -35,10 +35,10 @@ defmodule Ferricstore.CrossShardOpTest do
       {src, dst} = ShardHelpers.keys_on_same_shard()
 
       # Confirm both keys route to the same shard
-      assert Router.shard_for(src) == Router.shard_for(dst)
+      assert Router.shard_for(FerricStore.Instance.get(:default), src) == Router.shard_for(FerricStore.Instance.get(:default), dst)
 
       # Create source set with members via tx_execute (writes to ETS directly)
-      shard = Router.shard_name(Router.shard_for(src))
+      shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
       [sadd_result] =
         GenServer.call(shard, {:tx_execute, [{"SADD", [src, "a", "b", "c"]}], nil}, 10_000)
 
@@ -77,10 +77,10 @@ defmodule Ferricstore.CrossShardOpTest do
       [src, dst] = ShardHelpers.keys_on_different_shards(2)
 
       # Confirm different shards
-      assert Router.shard_for(src) != Router.shard_for(dst)
+      assert Router.shard_for(FerricStore.Instance.get(:default), src) != Router.shard_for(FerricStore.Instance.get(:default), dst)
 
       # Create source set via its shard
-      src_shard = Router.shard_name(Router.shard_for(src))
+      src_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
       GenServer.call(src_shard, {:tx_execute, [{"SADD", [src, "x", "y"]}], nil}, 10_000)
 
       # Call SMOVE directly -- the handler calls CrossShardOp.execute internally
@@ -92,7 +92,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [src_members] =
         GenServer.call(src_shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
 
-      dst_shard = Router.shard_name(Router.shard_for(dst))
+      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
 
       [dst_members] =
         GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
@@ -133,10 +133,10 @@ defmodule Ferricstore.CrossShardOpTest do
     test "renames key atomically across shards" do
       [old_key, new_key] = ShardHelpers.keys_on_different_shards(2)
 
-      assert Router.shard_for(old_key) != Router.shard_for(new_key)
+      assert Router.shard_for(FerricStore.Instance.get(:default), old_key) != Router.shard_for(FerricStore.Instance.get(:default), new_key)
 
       # Create the old key with a value
-      Router.put(old_key, "rename_value", 0)
+      Router.put(FerricStore.Instance.get(:default), old_key, "rename_value", 0)
 
       # Call RENAME directly -- the handler calls CrossShardOp.execute internally
       result = Generic.handle("RENAME", [old_key, new_key], %{})
@@ -144,8 +144,8 @@ defmodule Ferricstore.CrossShardOpTest do
       assert result == :ok
 
       # Old key gone, new key has value
-      assert Router.get(old_key) == nil
-      assert Router.get(new_key) == "rename_value"
+      assert Router.get(FerricStore.Instance.get(:default), old_key) == nil
+      assert Router.get(FerricStore.Instance.get(:default), new_key) == "rename_value"
     end
   end
 
@@ -157,10 +157,10 @@ defmodule Ferricstore.CrossShardOpTest do
     test "copies key value across shards" do
       [src, dst] = ShardHelpers.keys_on_different_shards(2)
 
-      assert Router.shard_for(src) != Router.shard_for(dst)
+      assert Router.shard_for(FerricStore.Instance.get(:default), src) != Router.shard_for(FerricStore.Instance.get(:default), dst)
 
       # Create source key
-      Router.put(src, "copy_value", 0)
+      Router.put(FerricStore.Instance.get(:default), src, "copy_value", 0)
 
       # Call COPY directly -- the handler calls CrossShardOp.execute internally
       result = Generic.handle("COPY", [src, dst], %{})
@@ -168,8 +168,8 @@ defmodule Ferricstore.CrossShardOpTest do
       assert result == 1
 
       # Both keys exist
-      assert Router.get(src) == "copy_value"
-      assert Router.get(dst) == "copy_value"
+      assert Router.get(FerricStore.Instance.get(:default), src) == "copy_value"
+      assert Router.get(FerricStore.Instance.get(:default), dst) == "copy_value"
     end
   end
 
@@ -182,8 +182,8 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2, k3, k4] = ShardHelpers.keys_on_different_shards(4)
 
       # Set up source keys
-      Router.put(k1, "v1", 0)
-      Router.put(k3, "v3", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "v1", 0)
+      Router.put(FerricStore.Instance.get(:default), k3, "v3", 0)
 
       # Run two independent cross-shard RENAMEs concurrently
       # Each command handler calls CrossShardOp.execute internally
@@ -203,10 +203,10 @@ defmodule Ferricstore.CrossShardOpTest do
       assert result1 == :ok
       assert result2 == :ok
 
-      assert Router.get(k1) == nil
-      assert Router.get(k2) == "v1"
-      assert Router.get(k3) == nil
-      assert Router.get(k4) == "v3"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == nil
+      assert Router.get(FerricStore.Instance.get(:default), k2) == "v1"
+      assert Router.get(FerricStore.Instance.get(:default), k3) == nil
+      assert Router.get(FerricStore.Instance.get(:default), k4) == "v3"
     end
   end
 
@@ -218,12 +218,12 @@ defmodule Ferricstore.CrossShardOpTest do
     test "locks expire after TTL allowing subsequent operations" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(k1, "val", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "val", 0)
 
       # Acquire locks with a very short TTL (200ms for testing)
       owner_ref = make_ref()
-      shard1_idx = Router.shard_for(k1)
-      shard2_idx = Router.shard_for(k2)
+      shard1_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
+      shard2_idx = Router.shard_for(FerricStore.Instance.get(:default), k2)
 
       now = System.os_time(:millisecond)
 
@@ -260,8 +260,8 @@ defmodule Ferricstore.CrossShardOpTest do
     test "overlapping cross-shard operations don't deadlock (ordered locking)" do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(k1, "v1", 0)
-      Router.put(k2, "v2", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "v1", 0)
+      Router.put(FerricStore.Instance.get(:default), k2, "v2", 0)
 
       # Two tasks try to RENAME the SAME pair of keys in opposite directions.
       # CrossShardOp normalizes lock acquisition order by shard index.
@@ -297,7 +297,7 @@ defmodule Ferricstore.CrossShardOpTest do
 
       # Write an intent directly to simulate a coordinator crash mid-operation
       owner_ref = make_ref()
-      coordinator_shard_idx = min(Router.shard_for(k1), Router.shard_for(k2))
+      coordinator_shard_idx = min(Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2))
       shard_id = Ferricstore.Raft.Cluster.shard_server_id(coordinator_shard_idx)
 
       intent_map = %{
@@ -358,16 +358,16 @@ defmodule Ferricstore.CrossShardOpTest do
     test "same-shard keys call execute_fn directly without locking" do
       {k1, k2} = ShardHelpers.keys_on_same_shard()
 
-      assert Router.shard_for(k1) == Router.shard_for(k2)
+      assert Router.shard_for(FerricStore.Instance.get(:default), k1) == Router.shard_for(FerricStore.Instance.get(:default), k2)
 
-      Router.put(k1, "val1", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "val1", 0)
 
       # Call RENAME directly -- handler calls CrossShardOp internally (same-shard fast path)
       result = Generic.handle("RENAME", [k1, k2], %{})
 
       assert result == :ok
-      assert Router.get(k1) == nil
-      assert Router.get(k2) == "val1"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == nil
+      assert Router.get(FerricStore.Instance.get(:default), k2) == "val1"
     end
   end
 
@@ -381,23 +381,23 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set a value first
-      Router.put(k1, "before_lock", 0)
-      assert Router.get(k1) == "before_lock"
+      Router.put(FerricStore.Instance.get(:default), k1, "before_lock", 0)
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "before_lock"
 
       # Lock the key with a long TTL
       owner_ref = make_ref()
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Ferricstore.Raft.Cluster.shard_server_id(shard_idx)
       now = System.os_time(:millisecond)
 
       {:ok, :ok, _} = :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
 
       # Try a regular put -- should be rejected
-      result = Router.put(k1, "during_lock", 0)
+      result = Router.put(FerricStore.Instance.get(:default), k1, "during_lock", 0)
       assert result == {:error, :key_locked}
 
       # Value should be unchanged
-      assert Router.get(k1) == "before_lock"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "before_lock"
 
       # Clean up
       :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
@@ -406,21 +406,21 @@ defmodule Ferricstore.CrossShardOpTest do
     test "Router.delete on a locked key returns {:error, :key_locked}" do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(k1, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "value", 0)
 
       owner_ref = make_ref()
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Ferricstore.Raft.Cluster.shard_server_id(shard_idx)
       now = System.os_time(:millisecond)
 
       {:ok, :ok, _} = :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
 
       # Delete should be rejected
-      result = Router.delete(k1)
+      result = Router.delete(FerricStore.Instance.get(:default), k1)
       assert result == {:error, :key_locked}
 
       # Value should still exist
-      assert Router.get(k1) == "value"
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "value"
 
       # Clean up
       :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
@@ -429,18 +429,18 @@ defmodule Ferricstore.CrossShardOpTest do
     test "reads on locked keys still work" do
       [k1, _k2] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(k1, "readable", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "readable", 0)
 
       owner_ref = make_ref()
-      shard_idx = Router.shard_for(k1)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k1)
       shard_id = Ferricstore.Raft.Cluster.shard_server_id(shard_idx)
       now = System.os_time(:millisecond)
 
       {:ok, :ok, _} = :ra.process_command(shard_id, {:lock_keys, [k1], owner_ref, now + 30_000})
 
       # Reads should still work -- locks only block writes
-      assert Router.get(k1) == "readable"
-      assert Router.exists?(k1) == true
+      assert Router.get(FerricStore.Instance.get(:default), k1) == "readable"
+      assert Router.exists?(FerricStore.Instance.get(:default), k1) == true
 
       # Clean up
       :ra.process_command(shard_id, {:unlock_keys, [k1], owner_ref})
@@ -451,10 +451,10 @@ defmodule Ferricstore.CrossShardOpTest do
   describe "command handlers use CrossShardOp internally" do
     test "SMOVE across shards works when called directly" do
       [src, dst] = ShardHelpers.keys_on_different_shards(2)
-      assert Router.shard_for(src) != Router.shard_for(dst)
+      assert Router.shard_for(FerricStore.Instance.get(:default), src) != Router.shard_for(FerricStore.Instance.get(:default), dst)
 
       # Create source set
-      src_shard = Router.shard_name(Router.shard_for(src))
+      src_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
       GenServer.call(src_shard, {:tx_execute, [{"SADD", [src, "member1"]}], nil}, 10_000)
 
       # Call SMOVE directly -- handler uses CrossShardOp internally
@@ -465,7 +465,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [src_members] =
         GenServer.call(src_shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
 
-      dst_shard = Router.shard_name(Router.shard_for(dst))
+      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
       [dst_members] =
         GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
 
@@ -476,37 +476,37 @@ defmodule Ferricstore.CrossShardOpTest do
     test "RENAME across shards works when called directly" do
       [old_key, new_key] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(old_key, "rename_test", 0)
+      Router.put(FerricStore.Instance.get(:default), old_key, "rename_test", 0)
 
       result = Generic.handle("RENAME", [old_key, new_key], %{})
       assert result == :ok
 
-      assert Router.get(old_key) == nil
-      assert Router.get(new_key) == "rename_test"
+      assert Router.get(FerricStore.Instance.get(:default), old_key) == nil
+      assert Router.get(FerricStore.Instance.get(:default), new_key) == "rename_test"
     end
 
     test "COPY across shards works when called directly" do
       [src, dst] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(src, "copy_test", 0)
+      Router.put(FerricStore.Instance.get(:default), src, "copy_test", 0)
 
       result = Generic.handle("COPY", [src, dst], %{})
       assert result == 1
 
-      assert Router.get(src) == "copy_test"
-      assert Router.get(dst) == "copy_test"
+      assert Router.get(FerricStore.Instance.get(:default), src) == "copy_test"
+      assert Router.get(FerricStore.Instance.get(:default), dst) == "copy_test"
     end
 
     test "RENAMENX across shards works when called directly" do
       [old_key, new_key] = ShardHelpers.keys_on_different_shards(2)
 
-      Router.put(old_key, "renamenx_test", 0)
+      Router.put(FerricStore.Instance.get(:default), old_key, "renamenx_test", 0)
 
       result = Generic.handle("RENAMENX", [old_key, new_key], %{})
       assert result == 1
 
-      assert Router.get(old_key) == nil
-      assert Router.get(new_key) == "renamenx_test"
+      assert Router.get(FerricStore.Instance.get(:default), old_key) == nil
+      assert Router.get(FerricStore.Instance.get(:default), new_key) == "renamenx_test"
     end
   end
 
@@ -516,7 +516,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set up keys with known values
-      Router.put(k1, "hash_test_value", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "hash_test_value", 0)
 
       # Rename will write an intent with value hashes
       result = Generic.handle("RENAME", [k1, k2], %{})
@@ -525,7 +525,7 @@ defmodule Ferricstore.CrossShardOpTest do
       # The intent is cleaned up after success, so we can't inspect it directly.
       # Instead, test that compute_value_hashes works correctly.
       per_shard_stores =
-        Map.new([Router.shard_for(k1), Router.shard_for(k2)], fn idx ->
+        Map.new([Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2)], fn idx ->
           {idx, CrossShardOp.build_store_for_shard(idx)}
         end)
 
@@ -538,11 +538,11 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set up k1 with a value
-      Router.put(k1, "intent_hash_test", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "intent_hash_test", 0)
 
       # Write a stale intent with matching value hash
       owner_ref = make_ref()
-      coordinator_shard_idx = min(Router.shard_for(k1), Router.shard_for(k2))
+      coordinator_shard_idx = min(Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2))
       shard_id = Ferricstore.Raft.Cluster.shard_server_id(coordinator_shard_idx)
 
       intent_map = %{
@@ -566,11 +566,11 @@ defmodule Ferricstore.CrossShardOpTest do
       [k1, k2] = ShardHelpers.keys_on_different_shards(2)
 
       # Set up k1 with a value
-      Router.put(k1, "current_value", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "current_value", 0)
 
       # Write a stale intent with a DIFFERENT value hash (simulating data changed)
       owner_ref = make_ref()
-      coordinator_shard_idx = min(Router.shard_for(k1), Router.shard_for(k2))
+      coordinator_shard_idx = min(Router.shard_for(FerricStore.Instance.get(:default), k1), Router.shard_for(FerricStore.Instance.get(:default), k2))
       shard_id = Ferricstore.Raft.Cluster.shard_server_id(coordinator_shard_idx)
 
       intent_map = %{

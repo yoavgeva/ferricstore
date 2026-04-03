@@ -268,7 +268,7 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
       # 512 MiB exactly hits the >= guard in Router.put
       oversized = :binary.copy("x", 512 * 1024 * 1024)
 
-      result = Router.put("err012_key", oversized, 0)
+      result = Router.put(FerricStore.Instance.get(:default), "err012_key", oversized, 0)
       assert {:error, msg} = result
       assert msg =~ "value too large"
     end
@@ -280,10 +280,10 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
       assert Ferricstore.Store.Router.max_value_size() == 512 * 1024 * 1024
 
       small = :binary.copy("y", 1_000_000)
-      result = Router.put("err012_under", small, 0)
+      result = Router.put(FerricStore.Instance.get(:default), "err012_under", small, 0)
       assert result == :ok
 
-      Router.delete("err012_under")
+      Router.delete(FerricStore.Instance.get(:default), "err012_under")
     end
   end
 

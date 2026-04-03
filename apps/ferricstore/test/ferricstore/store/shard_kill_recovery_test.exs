@@ -44,7 +44,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
   defp ukey_for_shard(shard_idx) do
     Enum.find_value(0..200_000, fn i ->
       candidate = "skr_shard#{shard_idx}_#{System.unique_integer([:positive])}_#{i}"
-      if Router.shard_for(candidate) == shard_idx, do: candidate
+      if Router.shard_for(FerricStore.Instance.get(:default), candidate) == shard_idx, do: candidate
     end)
   end
 
@@ -71,14 +71,14 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.wait_shards_alive(30_000)
 
       eventually(
-        fn -> Router.get(key) == "string_value" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key) == "string_value" end,
         "string key should survive shard kill"
       )
     end
 
     test "2. kill shard, hash data survives" do
       key = ukey("hash")
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       FerricStore.hset(key, %{"field1" => "val1", "field2" => "val2"})
       ShardHelpers.flush_all_shards()
@@ -94,7 +94,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
 
     test "3. kill shard, list data survives" do
       key = ukey("list")
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       {:ok, _} = FerricStore.rpush(key, ["a", "b", "c"])
       ShardHelpers.flush_all_shards()
@@ -110,7 +110,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
 
     test "4. kill shard, set data survives" do
       key = ukey("set")
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
 
       {:ok, _} = FerricStore.sadd(key, ["x", "y", "z"])
       ShardHelpers.flush_all_shards()
@@ -132,7 +132,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.wait_shards_alive(30_000)
 
       eventually(
-        fn -> Router.get(key) == "survive_twice" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key) == "survive_twice" end,
         "data should survive first kill"
       )
 
@@ -140,7 +140,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.wait_shards_alive(30_000)
 
       eventually(
-        fn -> Router.get(key) == "survive_twice" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key) == "survive_twice" end,
         "data should survive second kill"
       )
     end
@@ -162,7 +162,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
 
       for {k, i} <- keys do
         eventually(
-          fn -> Router.get(k) == "shard_#{i}_data" end,
+          fn -> Router.get(FerricStore.Instance.get(:default), k) == "shard_#{i}_data" end,
           "shard #{i} data should survive sequential kill"
         )
       end
@@ -176,7 +176,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.wait_shards_alive(30_000)
 
       eventually(
-        fn -> Router.get(key_old) == "old_data" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key_old) == "old_data" end,
         "old data should survive first kill"
       )
 
@@ -188,12 +188,12 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.wait_shards_alive(30_000)
 
       eventually(
-        fn -> Router.get(key_old) == "old_data" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key_old) == "old_data" end,
         "old data should survive second kill"
       )
 
       eventually(
-        fn -> Router.get(key_new) == "new_data" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key_new) == "new_data" end,
         "new data should survive second kill"
       )
     end
@@ -216,7 +216,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       # replay during init should recover it). The critical requirement
       # is that the shard recovers without crashing.
       eventually(fn ->
-        result = Router.get(key)
+        result = Router.get(FerricStore.Instance.get(:default), key)
         result == "maybe_lost" or result == nil
       end, "shard should recover after kill without flush")
     end
@@ -259,7 +259,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
 
       # The base value written before kill should survive
       eventually(
-        fn -> Router.get(key) == "base_value" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key) == "base_value" end,
         "base value should survive despite concurrent kill"
       )
     end
@@ -299,7 +299,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
 
       # Shard should still serve reads even with BitcaskWriter dead
       eventually(
-        fn -> Router.get(key) == "readable_after_writer_kill" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key) == "readable_after_writer_kill" end,
         "shard should serve reads after BitcaskWriter kill"
       )
     end
@@ -330,7 +330,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
 
       # Data written before kill should survive
       eventually(
-        fn -> Router.get(key) == "before_batcher_kill" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key) == "before_batcher_kill" end,
         "data should survive Batcher kill"
       )
     end
@@ -354,12 +354,12 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       ShardHelpers.wait_shards_alive(30_000)
 
       eventually(
-        fn -> Router.get(key0) == "shard0_rapid" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key0) == "shard0_rapid" end,
         "shard 0 data should survive rapid kill"
       )
 
       eventually(
-        fn -> Router.get(key1) == "shard1_rapid" end,
+        fn -> Router.get(FerricStore.Instance.get(:default), key1) == "shard1_rapid" end,
         "shard 1 data should survive rapid kill"
       )
     end
@@ -373,7 +373,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
         ShardHelpers.wait_shards_alive(30_000)
 
         eventually(
-          fn -> Router.get(key) == "loop_survivor" end,
+          fn -> Router.get(FerricStore.Instance.get(:default), key) == "loop_survivor" end,
           "data should survive kill round #{round}"
         )
       end

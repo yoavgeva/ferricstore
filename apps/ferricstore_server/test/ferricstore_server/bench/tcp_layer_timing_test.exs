@@ -30,7 +30,7 @@ defmodule FerricstoreServer.Bench.TcpLayerTimingTest do
 
     # 3. Router.get (shard_for + ETS lookup)
     {router_us, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Store.Router.get(key)
+      for _ <- 1..n, do: Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), key)
     end)
 
     # 4. RESP3 encode

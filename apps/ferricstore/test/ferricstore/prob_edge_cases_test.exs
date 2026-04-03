@@ -566,10 +566,10 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       MemoryGuard.set_skip_promotion(true)
 
       # Writes should still work
-      Router.put("skip_promo_write", "value", 0)
+      Router.put(FerricStore.Instance.get(:default), "skip_promo_write", "value", 0)
       Process.sleep(50)
 
-      assert Router.get("skip_promo_write") == "value"
+      assert Router.get(FerricStore.Instance.get(:default), "skip_promo_write") == "value"
     end
 
     test "NIF allocator returns non-negative value" do
@@ -687,14 +687,14 @@ defmodule Ferricstore.ProbEdgeCasesTest do
 
   describe "state machine prob edge cases via Router" do
     test "DEL on a regular (non-prob) key does not crash" do
-      Router.put("regular_key", "value", 0)
+      Router.put(FerricStore.Instance.get(:default), "regular_key", "value", 0)
       Process.sleep(50)
-      assert Router.get("regular_key") == "value"
+      assert Router.get(FerricStore.Instance.get(:default), "regular_key") == "value"
 
       # Delete should work fine without touching prob files
-      Router.delete("regular_key")
+      Router.delete(FerricStore.Instance.get(:default), "regular_key")
       Process.sleep(50)
-      assert Router.get("regular_key") == nil
+      assert Router.get(FerricStore.Instance.get(:default), "regular_key") == nil
     end
 
     test "prob_path handles keys with special characters via base64" do
@@ -975,7 +975,7 @@ defmodule Ferricstore.ProbEdgeCasesTest do
 
   describe "prob file cleanup" do
     test "DEL on a bloom key via Router deletes the prob file" do
-      Router.put("bloom_router_test", "placeholder", 0)
+      Router.put(FerricStore.Instance.get(:default), "bloom_router_test", "placeholder", 0)
       Process.sleep(50)
 
       # Create a bloom filter via the command handler

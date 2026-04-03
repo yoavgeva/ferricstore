@@ -35,8 +35,8 @@ defmodule Ferricstore.Commands.ClusterTest do
 
     test "reflects keys stored in shards" do
       # Write some keys to the live store
-      Router.put("cluster_health_key_a", "v1", 0)
-      Router.put("cluster_health_key_b", "v2", 0)
+      Router.put(FerricStore.Instance.get(:default), "cluster_health_key_a", "v1", 0)
+      Router.put(FerricStore.Instance.get(:default), "cluster_health_key_b", "v2", 0)
 
       store = MockStore.make()
       result = Dispatcher.dispatch("CLUSTER.HEALTH", [], store)
@@ -47,8 +47,8 @@ defmodule Ferricstore.Commands.ClusterTest do
       assert result =~ "memory_bytes:"
 
       # Clean up
-      Router.delete("cluster_health_key_a")
-      Router.delete("cluster_health_key_b")
+      Router.delete(FerricStore.Instance.get(:default), "cluster_health_key_a")
+      Router.delete(FerricStore.Instance.get(:default), "cluster_health_key_b")
     end
 
     test "returns error with extra arguments" do
@@ -86,9 +86,9 @@ defmodule Ferricstore.Commands.ClusterTest do
 
     test "total_keys is sum of per-shard keys" do
       # Write known keys
-      Router.put("cluster_stats_a", "v1", 0)
-      Router.put("cluster_stats_b", "v2", 0)
-      Router.put("cluster_stats_c", "v3", 0)
+      Router.put(FerricStore.Instance.get(:default), "cluster_stats_a", "v1", 0)
+      Router.put(FerricStore.Instance.get(:default), "cluster_stats_b", "v2", 0)
+      Router.put(FerricStore.Instance.get(:default), "cluster_stats_c", "v3", 0)
 
       store = MockStore.make()
       result = Dispatcher.dispatch("CLUSTER.STATS", [], store)
@@ -104,9 +104,9 @@ defmodule Ferricstore.Commands.ClusterTest do
       assert total >= 3
 
       # Clean up
-      Router.delete("cluster_stats_a")
-      Router.delete("cluster_stats_b")
-      Router.delete("cluster_stats_c")
+      Router.delete(FerricStore.Instance.get(:default), "cluster_stats_a")
+      Router.delete(FerricStore.Instance.get(:default), "cluster_stats_b")
+      Router.delete(FerricStore.Instance.get(:default), "cluster_stats_c")
     end
 
     test "returns error with extra arguments" do

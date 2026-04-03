@@ -88,17 +88,17 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       k2 = pkey("beta", "ind2")
       k3 = rootkey("ind3")
 
-      shard1 = Router.shard_for(k1)
-      shard2 = Router.shard_for(k2)
-      shard3 = Router.shard_for(k3)
+      shard1 = Router.shard_for(FerricStore.Instance.get(:default), k1)
+      shard2 = Router.shard_for(FerricStore.Instance.get(:default), k2)
+      shard3 = Router.shard_for(FerricStore.Instance.get(:default), k3)
 
       assert :ok == Batcher.write(shard1, {:put, k1, "val_alpha", 0})
       assert :ok == Batcher.write(shard2, {:put, k2, "val_beta", 0})
       assert :ok == Batcher.write(shard3, {:put, k3, "val_root", 0})
 
-      assert "val_alpha" == Router.get(k1)
-      assert "val_beta" == Router.get(k2)
-      assert "val_root" == Router.get(k3)
+      assert "val_alpha" == Router.get(FerricStore.Instance.get(:default), k1)
+      assert "val_beta" == Router.get(FerricStore.Instance.get(:default), k2)
+      assert "val_root" == Router.get(FerricStore.Instance.get(:default), k3)
     end
 
     test "commands with same prefix are batched together" do
@@ -127,7 +127,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert Enum.all?(results, &(&1 == :ok))
 
       for k <- shard_keys do
-        assert "batched_ns" == Router.get(k)
+        assert "batched_ns" == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
 
@@ -139,14 +139,14 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       alpha_key =
         Enum.find(1..1000, fn i ->
           k = "alpha:indep_#{i}"
-          Router.shard_for(k) == shard_idx
+          Router.shard_for(FerricStore.Instance.get(:default), k) == shard_idx
         end)
         |> then(fn i -> "alpha:indep_#{i}" end)
 
       beta_key =
         Enum.find(1..1000, fn i ->
           k = "beta:indep_#{i}"
-          Router.shard_for(k) == shard_idx
+          Router.shard_for(FerricStore.Instance.get(:default), k) == shard_idx
         end)
         |> then(fn i -> "beta:indep_#{i}" end)
 
@@ -158,8 +158,8 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert :ok == Batcher.write(shard_idx, {:put, alpha_key, "alpha_val", 0})
       assert :ok == Batcher.write(shard_idx, {:put, beta_key, "beta_val", 0})
 
-      assert "alpha_val" == Router.get(alpha_key)
-      assert "beta_val" == Router.get(beta_key)
+      assert "alpha_val" == Router.get(FerricStore.Instance.get(:default), alpha_key)
+      assert "beta_val" == Router.get(FerricStore.Instance.get(:default), beta_key)
     end
   end
 
@@ -180,14 +180,14 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       k_fast = pkey("fast", "wtest")
       k_slow = pkey("slow", "wtest")
 
-      shard_fast = Router.shard_for(k_fast)
-      shard_slow = Router.shard_for(k_slow)
+      shard_fast = Router.shard_for(FerricStore.Instance.get(:default), k_fast)
+      shard_slow = Router.shard_for(FerricStore.Instance.get(:default), k_slow)
 
       assert :ok == Batcher.write(shard_fast, {:put, k_fast, "fast_val", 0})
       assert :ok == Batcher.write(shard_slow, {:put, k_slow, "slow_val", 0})
 
-      assert "fast_val" == Router.get(k_fast)
-      assert "slow_val" == Router.get(k_slow)
+      assert "fast_val" == Router.get(FerricStore.Instance.get(:default), k_fast)
+      assert "slow_val" == Router.get(FerricStore.Instance.get(:default), k_slow)
     end
 
     test "uses default window for unconfigured prefix" do
@@ -195,18 +195,18 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert 1 == NamespaceConfig.window_for("unconfigured_prefix")
 
       k = pkey("unconfigured_prefix", "default_test")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "default_win", 0})
-      assert "default_win" == Router.get(k)
+      assert "default_win" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "root namespace uses default window" do
       k = rootkey("rootwin")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "root_val", 0})
-      assert "root_val" == Router.get(k)
+      assert "root_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -224,24 +224,24 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       NamespaceConfig.set("ephemeral", "durability", "async")
 
       k = pkey("ephemeral", "async_test")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       # Async durability bypasses Raft consensus and writes via
       # AsyncApplyWorker. The write returns immediately; the data
       # becomes visible after the worker processes the batch.
       assert :ok == Batcher.write(shard, {:put, k, "async_val", 0})
       Process.sleep(100)
-      assert "async_val" == Router.get(k)
+      assert "async_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "quorum durability commands complete successfully" do
       NamespaceConfig.set("durable", "durability", "quorum")
 
       k = pkey("durable", "quorum_test")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "quorum_val", 0})
-      assert "quorum_val" == Router.get(k)
+      assert "quorum_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -254,8 +254,8 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       k1 = pkey("ns_flush_a", "f1")
       k2 = pkey("ns_flush_b", "f2")
 
-      shard1 = Router.shard_for(k1)
-      shard2 = Router.shard_for(k2)
+      shard1 = Router.shard_for(FerricStore.Instance.get(:default), k1)
+      shard2 = Router.shard_for(FerricStore.Instance.get(:default), k2)
 
       :ok = Batcher.write(shard1, {:put, k1, "fv1", 0})
       :ok = Batcher.write(shard2, {:put, k2, "fv2", 0})
@@ -265,8 +265,8 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
         :ok = Batcher.flush(i)
       end
 
-      assert "fv1" == Router.get(k1)
-      assert "fv2" == Router.get(k2)
+      assert "fv1" == Router.get(FerricStore.Instance.get(:default), k1)
+      assert "fv2" == Router.get(FerricStore.Instance.get(:default), k2)
     end
 
     test "flush returns :ok when no slots have pending writes" do
@@ -366,22 +366,22 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
   describe "edge cases" do
     test "write with delete command routes to correct namespace" do
       k = pkey("delns", "edge_del")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = Batcher.write(shard, {:put, k, "to_delete", 0})
-      assert "to_delete" == Router.get(k)
+      assert "to_delete" == Router.get(FerricStore.Instance.get(:default), k)
 
       :ok = Batcher.write(shard, {:delete, k})
-      assert nil == Router.get(k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "write with append command routes to correct namespace" do
       k = pkey("appns", "edge_app")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = Batcher.write(shard, {:put, k, "hello", 0})
       {:ok, 10} = Batcher.write(shard, {:append, k, "world"})
-      assert "helloworld" == Router.get(k)
+      assert "helloworld" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "concurrent writes across multiple namespaces on same shard" do
@@ -393,7 +393,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
           key =
             Enum.find(1..5000, fn i ->
               k = "#{prefix}:conc_#{i}"
-              Router.shard_for(k) == shard_idx
+              Router.shard_for(FerricStore.Instance.get(:default), k) == shard_idx
             end)
             |> then(fn i -> "#{prefix}:conc_#{i}" end)
 
@@ -412,14 +412,14 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert Enum.all?(results, &(&1 == :ok))
 
       for {_prefix, key} <- keys_by_prefix do
-        assert "concurrent_val" == Router.get(key)
+        assert "concurrent_val" == Router.get(FerricStore.Instance.get(:default), key)
       end
     end
 
     test "namespace config change is picked up on next write" do
       # Start with default config
       k1 = pkey("dynamic", "cfg1")
-      shard = Router.shard_for(k1)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k1)
       :ok = Batcher.write(shard, {:put, k1, "before", 0})
 
       # Change the config
@@ -427,11 +427,11 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       # Next write should use the new window
       k2 = pkey("dynamic", "cfg2")
-      shard2 = Router.shard_for(k2)
+      shard2 = Router.shard_for(FerricStore.Instance.get(:default), k2)
       :ok = Batcher.write(shard2, {:put, k2, "after", 0})
 
-      assert "before" == Router.get(k1)
-      assert "after" == Router.get(k2)
+      assert "before" == Router.get(FerricStore.Instance.get(:default), k1)
+      assert "after" == Router.get(FerricStore.Instance.get(:default), k2)
     end
   end
 
@@ -449,11 +449,11 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       Process.sleep(10)
 
       k1 = pkey("cached_ns", "cache_hit_1")
-      shard = Router.shard_for(k1)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k1)
 
       # First write: triggers ETS lookup for "cached_ns", populates ns_cache
       assert :ok == Batcher.write(shard, {:put, k1, "v1", 0})
-      assert "v1" == Router.get(k1)
+      assert "v1" == Router.get(FerricStore.Instance.get(:default), k1)
 
       # Inspect batcher state to verify cache is populated
       batcher_pid = Process.whereis(Batcher.batcher_name(shard))
@@ -463,12 +463,12 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       # Second write with same prefix: should use cached config (no ETS needed)
       k2 = pkey("cached_ns", "cache_hit_2")
-      shard2 = Router.shard_for(k2)
+      shard2 = Router.shard_for(FerricStore.Instance.get(:default), k2)
 
       # Only test on the same shard to verify in-process cache
       if shard2 == shard do
         assert :ok == Batcher.write(shard2, {:put, k2, "v2", 0})
-        assert "v2" == Router.get(k2)
+        assert "v2" == Router.get(FerricStore.Instance.get(:default), k2)
 
         # Cache should still have the entry
         state2 = :sys.get_state(batcher_pid)
@@ -484,7 +484,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       Process.sleep(10)
 
       k1 = pkey("inval_ns", "inval_1")
-      shard = Router.shard_for(k1)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k1)
       assert :ok == Batcher.write(shard, {:put, k1, "before_inval", 0})
 
       batcher_pid = Process.whereis(Batcher.batcher_name(shard))
@@ -504,11 +504,11 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       # Next write should re-read from ETS and cache the new value
       k2 = pkey("inval_ns", "inval_2")
-      shard2 = Router.shard_for(k2)
+      shard2 = Router.shard_for(FerricStore.Instance.get(:default), k2)
 
       if shard2 == shard do
         assert :ok == Batcher.write(shard2, {:put, k2, "after_inval", 0})
-        assert "after_inval" == Router.get(k2)
+        assert "after_inval" == Router.get(FerricStore.Instance.get(:default), k2)
 
         state_new = :sys.get_state(batcher_pid)
         assert {20, :quorum} == Map.get(state_new.ns_cache, "inval_ns")
@@ -520,7 +520,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       Process.sleep(10)
 
       k = pkey("reset_ns", "reset_1")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
       assert :ok == Batcher.write(shard, {:put, k, "reset_val", 0})
 
       batcher_pid = Process.whereis(Batcher.batcher_name(shard))
@@ -545,13 +545,13 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       k_a =
         Enum.find(1..5000, fn i ->
-          Router.shard_for("resetall_a:ra_#{i}") == shard
+          Router.shard_for(FerricStore.Instance.get(:default), "resetall_a:ra_#{i}") == shard
         end)
         |> then(fn i -> "resetall_a:ra_#{i}" end)
 
       k_b =
         Enum.find(1..5000, fn i ->
-          Router.shard_for("resetall_b:ra_#{i}") == shard
+          Router.shard_for(FerricStore.Instance.get(:default), "resetall_b:ra_#{i}") == shard
         end)
         |> then(fn i -> "resetall_b:ra_#{i}" end)
 
@@ -583,13 +583,13 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       k_x =
         Enum.find(1..5000, fn i ->
-          Router.shard_for("indep_x:ic_#{i}") == shard
+          Router.shard_for(FerricStore.Instance.get(:default), "indep_x:ic_#{i}") == shard
         end)
         |> then(fn i -> "indep_x:ic_#{i}" end)
 
       k_y =
         Enum.find(1..5000, fn i ->
-          Router.shard_for("indep_y:ic_#{i}") == shard
+          Router.shard_for(FerricStore.Instance.get(:default), "indep_y:ic_#{i}") == shard
         end)
         |> then(fn i -> "indep_y:ic_#{i}" end)
 
@@ -605,8 +605,8 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert {8, :async} == Map.get(state.ns_cache, "indep_y")
 
       # Verify they don't interfere with each other
-      assert "vx" == Router.get(k_x)
-      assert "vy" == Router.get(k_y)
+      assert "vx" == Router.get(FerricStore.Instance.get(:default), k_x)
+      assert "vy" == Router.get(FerricStore.Instance.get(:default), k_y)
     end
   end
 
@@ -616,10 +616,10 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       Process.sleep(10)
 
       k = rootkey("rootcache")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "rootval", 0})
-      assert "rootval" == Router.get(k)
+      assert "rootval" == Router.get(FerricStore.Instance.get(:default), k)
 
       batcher_pid = Process.whereis(Batcher.batcher_name(shard))
       state = :sys.get_state(batcher_pid)
@@ -644,7 +644,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
         Enum.reduce_while(1..50_000, [], fn i, acc ->
           k = "stress:perf_#{i}"
 
-          if Router.shard_for(k) == shard do
+          if Router.shard_for(FerricStore.Instance.get(:default), k) == shard do
             acc = [k | acc]
             if length(acc) >= count, do: {:halt, acc}, else: {:cont, acc}
           else
@@ -683,7 +683,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       sample = Enum.take_random(keys, 10)
 
       for k <- sample do
-        assert "stress_val" == Router.get(k)
+        assert "stress_val" == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
   end

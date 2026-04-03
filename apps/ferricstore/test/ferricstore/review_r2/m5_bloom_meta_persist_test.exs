@@ -23,7 +23,7 @@ defmodule Ferricstore.ReviewR2.M5BloomMetaPersistTest do
   # Build a real store for a specific key (routes to correct shard).
   defp real_store_for_key(key) do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    shard_idx = Ferricstore.Store.Router.shard_for(key)
+    shard_idx = Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
     shard_path = Ferricstore.DataDir.shard_data_path(data_dir, shard_idx)
 
     %{

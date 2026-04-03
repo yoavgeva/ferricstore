@@ -28,7 +28,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
   describe "FLUSHDB clears ETS completely" do
     test "string keys removed from ETS" do
-      for i <- 1..100, do: Router.put("flush_str:#{i}", "val", 0)
+      for i <- 1..100, do: Router.put(FerricStore.Instance.get(:default), "flush_str:#{i}", "val", 0)
       assert ets_total_keys() >= 100
 
       FerricStore.flushall()
@@ -37,7 +37,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
     end
 
     test "prefix index cleared" do
-      for i <- 1..50, do: Router.put("myprefix:#{i}", "val", 0)
+      for i <- 1..50, do: Router.put(FerricStore.Instance.get(:default), "myprefix:#{i}", "val", 0)
       assert prefix_index_total() > 0
 
       FerricStore.flushall()
@@ -90,7 +90,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
     end
 
     test "mixed types all removed" do
-      Router.put("str_key", "val", 0)
+      Router.put(FerricStore.Instance.get(:default), "str_key", "val", 0)
       FerricStore.hset("hash_key", %{"f" => "v"})
       FerricStore.sadd("set_key", ["m"])
       FerricStore.zadd("zset_key", [{1.0, "m"}])
@@ -106,13 +106,13 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
 
   describe "FLUSHDB keys don't resurrect" do
     test "GET after flush returns nil" do
-      Router.put("resurrect:k1", "val", 0)
-      Router.put("resurrect:k2", "val", 0)
+      Router.put(FerricStore.Instance.get(:default), "resurrect:k1", "val", 0)
+      Router.put(FerricStore.Instance.get(:default), "resurrect:k2", "val", 0)
 
       FerricStore.flushall()
 
-      assert Router.get("resurrect:k1") == nil
-      assert Router.get("resurrect:k2") == nil
+      assert Router.get(FerricStore.Instance.get(:default), "resurrect:k1") == nil
+      assert Router.get(FerricStore.Instance.get(:default), "resurrect:k2") == nil
     end
 
     test "HGET after flush returns nil" do
@@ -124,19 +124,19 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
     end
 
     test "DBSIZE after flush is 0" do
-      for i <- 1..50, do: Router.put("dbsize:#{i}", "v", 0)
+      for i <- 1..50, do: Router.put(FerricStore.Instance.get(:default), "dbsize:#{i}", "v", 0)
 
       FerricStore.flushall()
 
-      assert Router.dbsize() == 0
+      assert Router.dbsize(FerricStore.Instance.get(:default)) == 0
     end
 
     test "KEYS after flush returns empty" do
-      for i <- 1..20, do: Router.put("keys_test:#{i}", "v", 0)
+      for i <- 1..20, do: Router.put(FerricStore.Instance.get(:default), "keys_test:#{i}", "v", 0)
 
       FerricStore.flushall()
 
-      assert Router.keys() == []
+      assert Router.keys(FerricStore.Instance.get(:default)) == []
     end
   end
 
@@ -146,7 +146,7 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
     test "FLUSHDB over TCP clears all keys" do
       port = FerricstoreServer.Listener.port()
 
-      for i <- 1..50, do: Router.put("tcp_flush:#{i}", "val", 0)
+      for i <- 1..50, do: Router.put(FerricStore.Instance.get(:default), "tcp_flush:#{i}", "val", 0)
       FerricStore.hset("tcp_flush:hash", %{"f" => "v"})
 
       assert ets_total_keys() > 50
@@ -161,13 +161,13 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
       :gen_tcp.close(sock)
 
       assert ets_total_keys() == 0
-      assert Router.dbsize() == 0
+      assert Router.dbsize(FerricStore.Instance.get(:default)) == 0
     end
   end
 
   describe "double flush is idempotent" do
     test "flush twice doesn't crash" do
-      Router.put("double:k", "v", 0)
+      Router.put(FerricStore.Instance.get(:default), "double:k", "v", 0)
 
       FerricStore.flushall()
       FerricStore.flushall()

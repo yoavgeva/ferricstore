@@ -28,7 +28,7 @@ defmodule Ferricstore.ExpirySweepTest do
   # into the GenServer rather than sending an async message. This guarantees
   # the sweep has completed before the caller continues.
   defp trigger_sweep(shard_index) do
-    name = Router.shard_name(shard_index)
+    name = Router.shard_name(FerricStore.Instance.get(:default), shard_index)
     GenServer.call(name, :expiry_sweep)
   end
 
@@ -45,11 +45,11 @@ defmodule Ferricstore.ExpirySweepTest do
     test "expired keys are removed after sweep runs" do
       key = ukey("expired")
       past = System.os_time(:millisecond) - 1_000
-      Router.put(key, "value", past)
+      Router.put(FerricStore.Instance.get(:default), key, "value", past)
 
       # Key is in ETS but expired — lazy expiry would catch it on read,
       # but we want the sweep to catch it proactively.
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       trigger_sweep(shard_idx)
 
       # After sweep, the key should be gone from ETS.
@@ -59,35 +59,35 @@ defmodule Ferricstore.ExpirySweepTest do
 
     test "keys without TTL are not affected by sweep" do
       key = ukey("no_ttl")
-      Router.put(key, "persistent_value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "persistent_value", 0)
 
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       trigger_sweep(shard_idx)
 
       # Key should still be present.
-      assert Router.get(key) == "persistent_value"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "persistent_value"
     end
 
     test "keys with future TTL are not affected by sweep" do
       key = ukey("future_ttl")
       future = System.os_time(:millisecond) + 60_000
-      Router.put(key, "alive_value", future)
+      Router.put(FerricStore.Instance.get(:default), key, "alive_value", future)
 
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       trigger_sweep(shard_idx)
 
-      assert Router.get(key) == "alive_value"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "alive_value"
     end
 
     test "expired keys are not returned by GET after sweep" do
       key = ukey("get_after_sweep")
       past = System.os_time(:millisecond) - 500
-      Router.put(key, "gone", past)
+      Router.put(FerricStore.Instance.get(:default), key, "gone", past)
 
-      shard_idx = Router.shard_for(key)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       trigger_sweep(shard_idx)
 
-      assert Router.get(key) == nil
+      assert Router.get(FerricStore.Instance.get(:default), key) == nil
     end
 
     test "sweep respects max_keys_per_sweep limit" do
@@ -112,10 +112,10 @@ defmodule Ferricstore.ExpirySweepTest do
       keys =
         Stream.iterate(0, &(&1 + 1))
         |> Stream.map(fn i -> "sweep_limit_#{uid}_#{i}" end)
-        |> Stream.filter(fn k -> Router.shard_for(k) == 0 end)
+        |> Stream.filter(fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) == 0 end)
         |> Enum.take(5)
 
-      Enum.each(keys, fn k -> Router.put(k, "expired_val", past) end)
+      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "expired_val", past) end)
 
       # First manual sweep should remove at most 2.
       # Note: the auto sweep timer may have already run, so we only assert
@@ -149,10 +149,10 @@ defmodule Ferricstore.ExpirySweepTest do
       keys =
         Stream.iterate(0, &(&1 + 1))
         |> Stream.map(fn i -> "multi_sweep_#{uid}_#{i}" end)
-        |> Stream.filter(fn k -> Router.shard_for(k) == 0 end)
+        |> Stream.filter(fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) == 0 end)
         |> Enum.take(5)
 
-      Enum.each(keys, fn k -> Router.put(k, "expired_val", past) end)
+      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "expired_val", past) end)
 
       # Run enough sweep cycles (ceiling of 5/2 = 3, plus 1 extra for safety).
       Enum.each(1..4, fn _ -> trigger_sweep(0) end)
@@ -168,15 +168,15 @@ defmodule Ferricstore.ExpirySweepTest do
       keys = for i <- 1..8, do: ukey("dbsize_#{i}")
 
       # First flush the store to have a clean baseline.
-      baseline = Router.dbsize()
+      baseline = Router.dbsize(FerricStore.Instance.get(:default))
 
-      Enum.each(keys, fn k -> Router.put(k, "val", past) end)
+      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "val", past) end)
 
       # Before sweep, dbsize should not count expired keys (lazy expiry on
       # read in keys()). But let's verify the sweep still cleans up ETS.
       trigger_all_sweeps()
 
-      after_sweep = Router.dbsize()
+      after_sweep = Router.dbsize(FerricStore.Instance.get(:default))
       # Use <= instead of == because concurrent tests may add keys between
       # baseline and after_sweep. The important invariant is that the sweep
       # did not increase the count (expired keys were removed).

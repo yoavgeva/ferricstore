@@ -48,12 +48,12 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
     test "CAS with TTL -- swapped value has correct expiry" do
       k = ukey("cas_ttl_edge")
 
-      :ok = Router.put(k, "original", 0)
+      :ok = Router.put(FerricStore.Instance.get(:default), k, "original", 0)
       before_swap = System.os_time(:millisecond)
 
       assert 1 = Router.cas(k, "original", "swapped", 5_000)
 
-      {value, expire_at_ms} = Router.get_meta(k)
+      {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       after_swap = System.os_time(:millisecond)
 
       assert value == "swapped"
@@ -67,19 +67,19 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       past = System.os_time(:millisecond) - 1_000
 
       # Set a key with an already-expired TTL
-      :ok = Router.put(k, "expired_val", past)
+      :ok = Router.put(FerricStore.Instance.get(:default), k, "expired_val", past)
 
       # CAS should treat the expired key as missing and return nil
       assert nil == Router.cas(k, "expired_val", "new_val", nil)
 
       # The key should still not be readable
-      assert nil == Router.get(k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "CAS concurrent: two CAS on same key -- only one succeeds" do
       k = ukey("cas_concurrent")
 
-      :ok = Router.put(k, "initial", 0)
+      :ok = Router.put(FerricStore.Instance.get(:default), k, "initial", 0)
 
       # Launch two concurrent CAS operations that both expect "initial"
       tasks =
@@ -96,7 +96,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
              "Expected exactly one CAS to succeed and one to fail, got: #{inspect(results)}"
 
       # The value should be one of the winners
-      final = Router.get(k)
+      final = Router.get(FerricStore.Instance.get(:default), k)
       assert String.starts_with?(final, "winner_")
     end
 
@@ -105,16 +105,16 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       k_missing = ukey("cas_nil")
 
       # Set a key to empty string
-      :ok = Router.put(k_empty, "", 0)
+      :ok = Router.put(FerricStore.Instance.get(:default), k_empty, "", 0)
 
       # CAS with empty string expected on a key that has empty string -- should match
       assert 1 = Router.cas(k_empty, "", "replaced", nil)
-      assert "replaced" == Router.get(k_empty)
+      assert "replaced" == Router.get(FerricStore.Instance.get(:default), k_empty)
 
       # CAS with empty string expected on a missing key -- should return nil (not 0)
       # because the key does not exist at all, which is different from having ""
       assert nil == Router.cas(k_missing, "", "new_val", nil)
-      assert nil == Router.get(k_missing)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k_missing)
     end
   end
 
@@ -128,11 +128,11 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       past = System.os_time(:millisecond) - 1_000
 
       # Set a key with an already-expired TTL to simulate an expired lock
-      :ok = Router.put(k, "old_owner", past)
+      :ok = Router.put(FerricStore.Instance.get(:default), k, "old_owner", past)
 
       # LOCK should treat the expired key as free and acquire
       assert :ok = Router.lock(k, "new_owner", 30_000)
-      assert "new_owner" == Router.get(k)
+      assert "new_owner" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "LOCK same owner re-acquires -- updates TTL" do
@@ -140,14 +140,14 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
 
       # Acquire with a short TTL
       assert :ok = Router.lock(k, "owner_a", 5_000)
-      {_, expire_first} = Router.get_meta(k)
+      {_, expire_first} = Router.get_meta(FerricStore.Instance.get(:default), k)
 
       # Small delay so the second lock gets a clearly different TTL
       Process.sleep(10)
 
       # Re-acquire with a much longer TTL
       assert :ok = Router.lock(k, "owner_a", 60_000)
-      {value, expire_second} = Router.get_meta(k)
+      {value, expire_second} = Router.get_meta(FerricStore.Instance.get(:default), k)
 
       assert value == "owner_a"
       # The TTL should have been extended significantly
@@ -164,7 +164,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
                Router.lock(k, "bob", 30_000)
 
       # Lock should still be held by alice
-      assert "alice" == Router.get(k)
+      assert "alice" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "UNLOCK wrong owner -- error, lock retained" do
@@ -176,11 +176,11 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
                Router.unlock(k, "bob")
 
       # Alice's lock should still be there
-      assert "alice" == Router.get(k)
+      assert "alice" == Router.get(FerricStore.Instance.get(:default), k)
 
       # Alice can still unlock
       assert 1 = Router.unlock(k, "alice")
-      assert nil == Router.get(k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "EXTEND on unlocked key -- error" do
@@ -302,7 +302,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       tasks =
         for _i <- 1..10 do
           Task.async(fn ->
-            Router.incr(k, 1)
+            Router.incr(FerricStore.Instance.get(:default), k, 1)
           end)
         end
 
@@ -316,7 +316,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
              "All INCR calls should succeed, got: #{inspect(results)}"
 
       # The final value should be exactly 10
-      assert "10" == Router.get(k)
+      assert "10" == Router.get(FerricStore.Instance.get(:default), k)
 
       # The individual results should be some permutation of 1..10
       values = Enum.map(results, fn {:ok, n} -> n end)
@@ -327,7 +327,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
     test "5 concurrent CAS on same key -- exactly 1 succeeds" do
       k = ukey("conc_cas")
 
-      :ok = Router.put(k, "starting_value", 0)
+      :ok = Router.put(FerricStore.Instance.get(:default), k, "starting_value", 0)
 
       tasks =
         for i <- 1..5 do
@@ -349,7 +349,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
              "Expected exactly 4 CAS failures, got #{failures}. Results: #{inspect(results)}"
 
       # The final value should be the winner
-      final = Router.get(k)
+      final = Router.get(FerricStore.Instance.get(:default), k)
       assert String.starts_with?(final, "cas_winner_")
     end
 
@@ -381,7 +381,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
              "Expected exactly 4 lock rejections, got #{errors}. Results: #{inspect(results)}"
 
       # The lock should be held by exactly one owner
-      owner = Router.get(k)
+      owner = Router.get(FerricStore.Instance.get(:default), k)
       assert String.starts_with?(owner, "owner_")
     end
 
@@ -392,7 +392,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
       tasks =
         for i <- 1..10 do
           Task.async(fn ->
-            Router.list_op(k, {:lpush, ["elem_#{i}"]})
+            Router.list_op(FerricStore.Instance.get(:default), k, {:lpush, ["elem_#{i}"]})
           end)
         end
 
@@ -410,7 +410,7 @@ defmodule Ferricstore.Raft.NativeEdgeCasesTest do
              "Each LPUSH should see a unique list length, got: #{inspect(Enum.sort(results))}"
 
       # All 10 elements should be present in the list
-      elements = Router.list_op(k, {:lrange, 0, -1})
+      elements = Router.list_op(FerricStore.Instance.get(:default), k, {:lrange, 0, -1})
       assert length(elements) == 10
 
       expected = for i <- 1..10, do: "elem_#{i}"

@@ -78,7 +78,7 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
         # Source not accessible — verify via behavioral test instead.
         # The run_compaction handler is reachable via GenServer.call on a shard.
         # We confirm the handler exists and accepts the expected message format.
-        shard = Ferricstore.Store.Router.shard_name(0)
+        shard = Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
         assert is_atom(shard)
 
         # Calling run_compaction with empty file_ids should return success

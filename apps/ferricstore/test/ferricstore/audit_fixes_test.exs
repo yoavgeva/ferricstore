@@ -630,7 +630,7 @@ defmodule Ferricstore.AuditFixesTest do
         })
 
       # The mock_store helper already filters internal keys in the keys fn,
-      # matching what Router.keys() returns after the single-pass fix.
+      # matching what Router.keys(FerricStore.Instance.get(:default)) returns after the single-pass fix.
       # Verify the Server.handle("KEYS", ...) path filters correctly.
       result = Server.handle("KEYS", ["*"], store) |> Enum.sort()
       assert result == ["also_visible", "visible"]

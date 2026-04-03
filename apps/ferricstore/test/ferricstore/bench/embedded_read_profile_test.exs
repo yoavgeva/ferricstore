@@ -19,7 +19,7 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
 
     # Pre-populate 1000 keys
     for i <- 1..1000 do
-      Router.put("#{prefix}:#{i}", String.duplicate("v", 100), 0)
+      Router.put(FerricStore.Instance.get(:default), "#{prefix}:#{i}", String.duplicate("v", 100), 0)
     end
     Process.sleep(200)
 
@@ -34,11 +34,11 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
 
     # 2. Router.get (skip sandbox_key + {:ok, _} wrap)
     {router_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations, do: Router.get(key)
+      for _ <- 1..@iterations, do: Router.get(FerricStore.Instance.get(:default), key)
     end)
 
     # 3. Direct ETS lookup (skip Router dispatch, shard_for, stats)
-    idx = Router.shard_for(key)
+    idx = Router.shard_for(FerricStore.Instance.get(:default), key)
     keydir = :"keydir_#{idx}"
     {ets_us, _} = :timer.tc(fn ->
       for _ <- 1..@iterations do
@@ -51,7 +51,7 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
 
     # 4. Just shard_for (hash computation)
     {hash_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations, do: Router.shard_for(key)
+      for _ <- 1..@iterations, do: Router.shard_for(FerricStore.Instance.get(:default), key)
     end)
 
     # 5. sandbox_key overhead (should be ~0 in non-sandbox)
@@ -109,7 +109,7 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
     prefix = "emb_thr_#{System.unique_integer([:positive])}"
 
     for i <- 1..10_000 do
-      Ferricstore.Store.Router.put("#{prefix}:#{i}", String.duplicate("v", 100), 0)
+      Ferricstore.Store.Router.put(FerricStore.Instance.get(:default), "#{prefix}:#{i}", String.duplicate("v", 100), 0)
     end
     Process.sleep(300)
 
@@ -151,12 +151,12 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
     prefix = "emb_cmp_#{System.unique_integer([:positive])}"
 
     for i <- 1..1000 do
-      Ferricstore.Store.Router.put("#{prefix}:#{i}", String.duplicate("v", 100), 0)
+      Ferricstore.Store.Router.put(FerricStore.Instance.get(:default), "#{prefix}:#{i}", String.duplicate("v", 100), 0)
     end
     Process.sleep(200)
 
     key = "#{prefix}:500"
-    idx = Ferricstore.Store.Router.shard_for(key)
+    idx = Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), key)
     keydir = :"keydir_#{idx}"
 
     IO.puts("\n=== Embedded GET Comparison (50 concurrent readers, 3s) ===\n")
@@ -165,7 +165,7 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
 
     for {label, fun} <- [
       {"FerricStore.get", fn -> FerricStore.get(key) end},
-      {"Router.get", fn -> Ferricstore.Store.Router.get(key) end},
+      {"Router.get", fn -> Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), key) end},
       {"Direct ETS", fn ->
         case :ets.lookup(keydir, key) do
           [{^key, v, _, _, _, _, _}] when v != nil -> v

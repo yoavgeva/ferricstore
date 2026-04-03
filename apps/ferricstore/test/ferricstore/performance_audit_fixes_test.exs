@@ -28,14 +28,14 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
     test "LFU.touch works correctly after persistent_term caching" do
       # Put a key and verify touch updates the LFU counter
-      Router.put("lfu_test_key", "value", 0)
+      Router.put(FerricStore.Instance.get(:default), "lfu_test_key", "value", 0)
       Process.sleep(50)
 
-      idx = Router.shard_for("lfu_test_key")
+      idx = Router.shard_for(FerricStore.Instance.get(:default), "lfu_test_key")
       keydir = :"keydir_#{idx}"
 
       # Read to trigger LFU touch
-      assert Router.get("lfu_test_key") == "value"
+      assert Router.get(FerricStore.Instance.get(:default), "lfu_test_key") == "value"
 
       # Verify the key's LFU value was updated in ETS
       [{_, _, _, lfu, _, _, _}] = :ets.lookup(keydir, "lfu_test_key")
@@ -83,8 +83,8 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
     test "PUT works when keydir is not full" do
       Ferricstore.MemoryGuard.force_check()
-      assert :ok = Router.put("memory_test", "value", 0)
-      assert Router.get("memory_test") == "value"
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "memory_test", "value", 0)
+      assert Router.get(FerricStore.Instance.get(:default), "memory_test") == "value"
     end
   end
 
@@ -94,7 +94,7 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
   describe "C3: Router.exists_fast? ETS bypass" do
     test "exists_fast? returns true for present key" do
-      Router.put("exists_fast_test", "value", 0)
+      Router.put(FerricStore.Instance.get(:default), "exists_fast_test", "value", 0)
       Process.sleep(50)
       assert Router.exists_fast?("exists_fast_test") == true
     end
@@ -105,7 +105,7 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
     test "exists_fast? returns false for expired key" do
       # Set a key with an expiry in the past
-      Router.put("expired_fast_test", "value", 1)
+      Router.put(FerricStore.Instance.get(:default), "expired_fast_test", "value", 1)
       Process.sleep(50)
       # Expired key should return false
       assert Router.exists_fast?("expired_fast_test") == false
@@ -114,10 +114,10 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     test "check_keydir_full uses exists_fast? instead of GenServer" do
       # This is an indirect test - if keydir is full, it should be able
       # to check existence via ETS without GenServer.call
-      Router.put("keydir_full_test", "value", 0)
+      Router.put(FerricStore.Instance.get(:default), "keydir_full_test", "value", 0)
       Process.sleep(50)
       # Put should succeed (updates existing key even when full)
-      assert :ok = Router.put("keydir_full_test", "updated", 0)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), "keydir_full_test", "updated", 0)
     end
   end
 
@@ -131,24 +131,24 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
       for i <- 0..(shard_count - 1) do
         expected = :"Ferricstore.Store.Shard.#{i}"
-        assert Router.shard_name(i) == expected
+        assert Router.shard_name(FerricStore.Instance.get(:default), i) == expected
       end
     end
 
     test "shard_name is fast (no string interpolation overhead)" do
       # Just verify functional correctness - the perf improvement is structural
-      assert Router.shard_name(0) == :"Ferricstore.Store.Shard.0"
-      assert Router.shard_name(1) == :"Ferricstore.Store.Shard.1"
-      assert Router.shard_name(2) == :"Ferricstore.Store.Shard.2"
-      assert Router.shard_name(3) == :"Ferricstore.Store.Shard.3"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 0) == :"Ferricstore.Store.Shard.0"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 1) == :"Ferricstore.Store.Shard.1"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 2) == :"Ferricstore.Store.Shard.2"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 3) == :"Ferricstore.Store.Shard.3"
     end
 
     test "routing works correctly with pre-computed names" do
-      Router.put("route_test_1", "v1", 0)
-      Router.put("route_test_2", "v2", 0)
+      Router.put(FerricStore.Instance.get(:default), "route_test_1", "v1", 0)
+      Router.put(FerricStore.Instance.get(:default), "route_test_2", "v2", 0)
       Process.sleep(50)
-      assert Router.get("route_test_1") == "v1"
-      assert Router.get("route_test_2") == "v2"
+      assert Router.get(FerricStore.Instance.get(:default), "route_test_1") == "v1"
+      assert Router.get(FerricStore.Instance.get(:default), "route_test_2") == "v2"
     end
   end
 
@@ -159,19 +159,19 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
   describe "C5: build_store cached as module attribute" do
     test "all store operations work with cached store" do
       # Test core operations through the command pipeline
-      Router.put("store_cache_test", "hello", 0)
+      Router.put(FerricStore.Instance.get(:default), "store_cache_test", "hello", 0)
       Process.sleep(50)
-      assert Router.get("store_cache_test") == "hello"
-      assert Router.exists?("store_cache_test") == true
-      Router.delete("store_cache_test")
+      assert Router.get(FerricStore.Instance.get(:default), "store_cache_test") == "hello"
+      assert Router.exists?(FerricStore.Instance.get(:default), "store_cache_test") == true
+      Router.delete(FerricStore.Instance.get(:default), "store_cache_test")
       Process.sleep(50)
-      assert Router.get("store_cache_test") == nil
+      assert Router.get(FerricStore.Instance.get(:default), "store_cache_test") == nil
     end
 
     test "incr works with cached store" do
-      Router.put("incr_cache_test", "10", 0)
+      Router.put(FerricStore.Instance.get(:default), "incr_cache_test", "10", 0)
       Process.sleep(50)
-      assert {:ok, 15} = Router.incr("incr_cache_test", 5)
+      assert {:ok, 15} = Router.incr(FerricStore.Instance.get(:default), "incr_cache_test", 5)
     end
   end
 
@@ -182,8 +182,8 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
   describe "M-C1: Prefix-based lookups use prefix_keys index" do
     test "compound_scan uses prefix index instead of foldl" do
       # Create a hash with some fields
-      shard_idx = Router.shard_for("myhash")
-      shard = Router.shard_name(shard_idx)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "myhash")
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
 
       # Use compound_put to create hash fields
       prefix = "H:myhash\0"
@@ -200,8 +200,8 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     end
 
     test "compound_count uses prefix index instead of foldl" do
-      shard_idx = Router.shard_for("counthash")
-      shard = Router.shard_name(shard_idx)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "counthash")
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
 
       prefix = "H:counthash\0"
       GenServer.call(shard, {:compound_put, "counthash", prefix <> "a", "1", 0})
@@ -213,8 +213,8 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     end
 
     test "compound_delete_prefix works with prefix index" do
-      shard_idx = Router.shard_for("delhash")
-      shard = Router.shard_name(shard_idx)
+      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "delhash")
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
 
       prefix = "H:delhash\0"
       GenServer.call(shard, {:compound_put, "delhash", prefix <> "x", "1", 0})
@@ -237,9 +237,9 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     test "buffer handles empty + data correctly" do
       # This is structural - the optimization is in handle_data
       # Verify through a successful TCP pipeline that the buffer works
-      Router.put("buffer_test", "hello", 0)
+      Router.put(FerricStore.Instance.get(:default), "buffer_test", "hello", 0)
       Process.sleep(50)
-      assert Router.get("buffer_test") == "hello"
+      assert Router.get(FerricStore.Instance.get(:default), "buffer_test") == "hello"
     end
   end
 end

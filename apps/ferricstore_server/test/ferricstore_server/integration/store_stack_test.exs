@@ -44,11 +44,11 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
   defp ukey(base), do: "#{base}_#{:rand.uniform(9_999_999)}"
 
   # Returns the keydir ETS table name for the shard that owns `key`.
-  defp keydir_for(key), do: :"keydir_#{Router.shard_for(key)}"
+  defp keydir_for(key), do: :"keydir_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
   # Returns the PID of the shard GenServer that owns `key`.
   defp shard_pid_for(key) do
-    name = Router.shard_name(Router.shard_for(key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     Process.whereis(name)
   end
 
@@ -128,11 +128,11 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
 
       # Verify every key is retrievable through shard GenServer calls
       for i <- 0..3 do
-        shard_keys = GenServer.call(Router.shard_name(i), :keys)
+        shard_keys = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), i), :keys)
         matching = Enum.filter(keys, fn k -> k in shard_keys end)
 
         for k <- matching do
-          assert Router.shard_for(k) == i
+          assert Router.shard_for(FerricStore.Instance.get(:default), k) == i
         end
       end
     end
@@ -182,7 +182,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       k = ukey("pttl_precision")
 
       future = System.os_time(:millisecond) + 5_000
-      Router.put(k, "v", future)
+      Router.put(FerricStore.Instance.get(:default), k, "v", future)
 
       pttl = Expiry.handle("PTTL", [k], store)
       assert pttl >= 1 and pttl <= 5_000
@@ -283,7 +283,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       assert size >= 5
 
       # All our keys should be in the store
-      all_keys = Router.keys()
+      all_keys = Router.keys(FerricStore.Instance.get(:default))
       for k <- keys, do: assert(k in all_keys)
     end
   end
@@ -295,10 +295,10 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
   describe "ETS cache integration" do
     test "ETS cache is warm after GET" do
       k = ukey("ets_warm")
-      Router.put(k, "cached_val", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "cached_val", 0)
 
       # GET warms the ETS cache
-      assert "cached_val" == Router.get(k)
+      assert "cached_val" == Router.get(FerricStore.Instance.get(:default), k)
 
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
       assert [{^k, "cached_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
@@ -306,13 +306,13 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
 
     test "ETS cache is cleared after DEL" do
       k = ukey("ets_del")
-      Router.put(k, "val", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "val", 0)
       # Warm the cache
-      Router.get(k)
+      Router.get(FerricStore.Instance.get(:default), k)
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
       assert [{^k, _, _, _, _, _, _}] = :ets.lookup(keydir_for(k), k)
 
-      Router.delete(k)
+      Router.delete(FerricStore.Instance.get(:default), k)
       assert [] == :ets.lookup(keydir_for(k), k)
     end
 
@@ -320,7 +320,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       k = ukey("ets_expiry")
       future = System.os_time(:millisecond) + 60_000
 
-      Router.put(k, "v", future)
+      Router.put(FerricStore.Instance.get(:default), k, "v", future)
       # PUT writes to ETS directly, single-table format
       assert [{^k, "v", ^future, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
     end
@@ -329,12 +329,12 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       k = ukey("ets_evict")
       past = System.os_time(:millisecond) - 500
 
-      Router.put(k, "v", past)
+      Router.put(FerricStore.Instance.get(:default), k, "v", past)
       # Confirm ETS has the entry (put always writes), single-table format
       assert [{^k, "v", ^past, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
 
       # GET detects expiry, evicts from ETS, returns nil
-      assert nil == Router.get(k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
       assert [] == :ets.lookup(keydir_for(k), k)
     end
   end
@@ -349,10 +349,10 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       keys_by_shard = find_keys_for_all_shards("fan_out")
 
       for {_shard_idx, k} <- keys_by_shard do
-        Router.put(k, "present", 0)
+        Router.put(FerricStore.Instance.get(:default), k, "present", 0)
       end
 
-      all_keys = Router.keys()
+      all_keys = Router.keys(FerricStore.Instance.get(:default))
 
       for {_shard_idx, k} <- keys_by_shard do
         assert k in all_keys, "Expected #{k} in keys(), but it was missing"
@@ -363,22 +363,22 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       keys_by_shard = find_keys_for_all_shards("dbsize_sum")
 
       for {_shard_idx, k} <- keys_by_shard do
-        Router.put(k, "v", 0)
+        Router.put(FerricStore.Instance.get(:default), k, "v", 0)
       end
 
-      assert Router.dbsize() >= 4
+      assert Router.dbsize(FerricStore.Instance.get(:default)) >= 4
     end
 
     test "keys from different shards all retrievable" do
       keys =
         for i <- 1..20 do
           k = ukey("multi_shard_#{i}")
-          Router.put(k, "val_#{i}", 0)
+          Router.put(FerricStore.Instance.get(:default), k, "val_#{i}", 0)
           k
         end
 
       for k <- keys do
-        assert Router.get(k) != nil, "Key #{k} should be retrievable"
+        assert Router.get(FerricStore.Instance.get(:default), k) != nil, "Key #{k} should be retrievable"
       end
     end
   end
@@ -390,10 +390,10 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
   describe "data durability through shard restart" do
     test "data survives shard GenServer crash and restart" do
       k = ukey("durability")
-      Router.put(k, "persistent_value", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "persistent_value", 0)
 
       # Confirm value is there
-      assert "persistent_value" == Router.get(k)
+      assert "persistent_value" == Router.get(FerricStore.Instance.get(:default), k)
 
       # Flush pending writes to Bitcask before killing so data survives the crash.
       pid = shard_pid_for(k)
@@ -416,14 +416,14 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       assert new_pid != pid, "Expected a new process after restart"
 
       # Data persisted in Bitcask should survive the restart
-      ShardHelpers.eventually(fn -> "persistent_value" == Router.get(k) end,
+      ShardHelpers.eventually(fn -> "persistent_value" == Router.get(FerricStore.Instance.get(:default), k) end,
         "Data should survive shard restart")
     end
 
     test "ETS cache is rebuilt on warm after shard restart" do
       k = ukey("ets_rebuild")
-      Router.put(k, "rebuild_val", 0)
-      Router.get(k)
+      Router.put(FerricStore.Instance.get(:default), k, "rebuild_val", 0)
+      Router.get(FerricStore.Instance.get(:default), k)
 
       # Confirm ETS has the value
       assert [{^k, "rebuild_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
@@ -439,7 +439,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       ShardHelpers.wait_shards_alive()
 
       # New ETS table is empty (fresh shard), but GET should warm it from Bitcask
-      ShardHelpers.eventually(fn -> "rebuild_val" == Router.get(k) end,
+      ShardHelpers.eventually(fn -> "rebuild_val" == Router.get(FerricStore.Instance.get(:default), k) end,
         "Value should be recovered from Bitcask after shard restart")
       assert [{^k, "rebuild_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
     end
@@ -447,11 +447,11 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
     test "multiple keys survive shard crash" do
       # Generate keys that all hash to the same shard
       base = ukey("multi_dur")
-      target_shard = Router.shard_for(base)
+      target_shard = Router.shard_for(FerricStore.Instance.get(:default), base)
       same_shard_keys = find_n_keys_for_shard(target_shard, 5, "multi_dur")
 
       for k <- same_shard_keys do
-        Router.put(k, "val_#{k}", 0)
+        Router.put(FerricStore.Instance.get(:default), k, "val_#{k}", 0)
       end
 
       # Flush all pending async writes to disk before killing the shard.
@@ -471,7 +471,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
 
       # All keys should survive
       for k <- same_shard_keys do
-        ShardHelpers.eventually(fn -> "val_#{k}" == Router.get(k) end,
+        ShardHelpers.eventually(fn -> "val_#{k}" == Router.get(FerricStore.Instance.get(:default), k) end,
           "Key #{k} should survive shard restart")
       end
     end
@@ -489,7 +489,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
         {:halt, acc}
       else
         k = "#{prefix}_shard_probe_#{i}"
-        shard = Router.shard_for(k)
+        shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
         if Map.has_key?(acc, shard) do
           {:cont, acc}
@@ -509,7 +509,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
       else
         k = "#{prefix}_probe_#{i}_#{:rand.uniform(999_999)}"
 
-        if Router.shard_for(k) == shard_idx do
+        if Router.shard_for(FerricStore.Instance.get(:default), k) == shard_idx do
           {:cont, [k | acc]}
         else
           {:cont, acc}

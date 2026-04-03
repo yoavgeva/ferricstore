@@ -152,12 +152,12 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       Router.put(key, "warm_value")
 
       # Warm the ETS hot cache
-      for _ <- 1..100, do: Router.get(key)
+      for _ <- 1..100, do: Router.get(FerricStore.Instance.get(:default), key)
 
       {elapsed_us, _} =
         measure_us(fn ->
           for _ <- 1..1_000 do
-            assert Router.get(key) == "warm_value"
+            assert Router.get(FerricStore.Instance.get(:default), key) == "warm_value"
           end
         end)
 
@@ -169,7 +169,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
         "Average Router.get on warm key was #{Float.round(avg_us, 1)}us, expected < 1000us"
 
       # Clean up
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -345,16 +345,16 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       Router.put(key, "test_value")
 
       # First get to warm the hot cache
-      Router.get(key)
+      Router.get(FerricStore.Instance.get(:default), key)
 
       # Measure warm reads (ETS path)
       {warm_us, _} =
         measure_us(fn ->
-          for _ <- 1..1_000, do: Router.get(key)
+          for _ <- 1..1_000, do: Router.get(FerricStore.Instance.get(:default), key)
         end)
 
       # Delete from keydir to force cold path (but leave in Bitcask)
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       keydir = :"keydir_#{idx}"
 
       # Record cold path time by doing repeated GenServer calls
@@ -373,7 +373,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
 
       {cold_us, _} =
         measure_us(fn ->
-          for k <- cold_keys, do: Router.get(k)
+          for k <- cold_keys, do: Router.get(FerricStore.Instance.get(:default), k)
         end)
 
       warm_avg = warm_us / 1_000
@@ -386,7 +386,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
         "Warm avg=#{Float.round(warm_avg, 1)}us should be faster than cold avg=#{Float.round(cold_avg, 1)}us"
 
       # Clean up
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
       Enum.each(cold_keys, &Router.delete/1)
     end
   end

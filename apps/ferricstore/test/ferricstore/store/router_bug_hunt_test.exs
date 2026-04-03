@@ -53,7 +53,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
     Enum.reduce_while(1..100_000, nil, fn i, _acc ->
       k = "rbh_#{prefix}_#{i}_#{:rand.uniform(999_999)}"
 
-      if Router.shard_for(k) == shard_idx do
+      if Router.shard_for(FerricStore.Instance.get(:default), k) == shard_idx do
         {:halt, k}
       else
         {:cont, nil}
@@ -63,7 +63,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
   # Kills a shard by index, waits for supervisor to restart it, returns {old_pid, new_pid}.
   defp kill_and_wait_restart(index) do
-    name = Router.shard_name(index)
+    name = Router.shard_name(FerricStore.Instance.get(:default), index)
     old_pid = Process.whereis(name)
     ref = Process.monitor(old_pid)
     Process.exit(old_pid, :kill)
@@ -97,10 +97,10 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
   describe "put/get routes to correct shard" do
     test "put with a key mapping to shard 0, then get returns the value" do
       key = key_for_shard(0, "shard0")
-      assert Router.shard_for(key) == 0, "Precondition: key must hash to shard 0"
+      assert Router.shard_for(FerricStore.Instance.get(:default), key) == 0, "Precondition: key must hash to shard 0"
 
       assert :ok = Router.put(key, "hello_shard0")
-      assert "hello_shard0" == Router.get(key)
+      assert "hello_shard0" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "put to each shard index independently, get returns correct values" do
@@ -113,15 +113,15 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
         end
 
       for {k, v, idx} <- kvs do
-        assert Router.get(k) == v,
+        assert Router.get(FerricStore.Instance.get(:default), k) == v,
                "Key #{k} (shard #{idx}) should return #{v}"
       end
     end
 
     test "shard routing is deterministic -- same key always same shard" do
       key = ukey("deterministic")
-      shard1 = Router.shard_for(key)
-      shard2 = Router.shard_for(key)
+      shard1 = Router.shard_for(FerricStore.Instance.get(:default), key)
+      shard2 = Router.shard_for(FerricStore.Instance.get(:default), key)
       assert shard1 == shard2
     end
   end
@@ -144,7 +144,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       ShardHelpers.wait_shards_alive()
 
       # After restart, Bitcask replays the log and the value should be recoverable.
-      ShardHelpers.eventually(fn -> value == Router.get(key) end,
+      ShardHelpers.eventually(fn -> value == Router.get(FerricStore.Instance.get(:default), key) end,
         "Value should survive shard crash and restart (recovered from Bitcask)")
     end
 
@@ -162,7 +162,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       ShardHelpers.wait_shards_alive()
 
       for {k, v} <- keys do
-        ShardHelpers.eventually(fn -> Router.get(k) == v end,
+        ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == v end,
           "Key #{k} should survive crash recovery")
       end
     end
@@ -174,21 +174,21 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
   describe "get on non-existent key" do
     test "returns nil for a key that was never set" do
-      assert nil == Router.get("rbh_nonexistent_key_that_does_not_exist")
+      assert nil == Router.get(FerricStore.Instance.get(:default), "rbh_nonexistent_key_that_does_not_exist")
     end
 
     test "returns nil for a random unique key" do
-      assert nil == Router.get(ukey("never_set"))
+      assert nil == Router.get(FerricStore.Instance.get(:default), ukey("never_set"))
     end
 
     test "returns nil and does not crash the shard process" do
       key = ukey("safe_miss")
-      idx = Router.shard_for(key)
-      pid_before = Process.whereis(Router.shard_name(idx))
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
 
-      assert nil == Router.get(key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
 
-      pid_after = Process.whereis(Router.shard_name(idx))
+      pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
       assert pid_before == pid_after, "Shard should not have crashed on get-miss"
     end
   end
@@ -199,26 +199,26 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
   describe "delete on non-existent key" do
     test "returns :ok for key that was never set" do
-      assert :ok = Router.delete("rbh_delete_nonexistent_key")
+      assert :ok = Router.delete(FerricStore.Instance.get(:default), "rbh_delete_nonexistent_key")
     end
 
     test "returns :ok and does not crash the shard process" do
       key = ukey("safe_delete")
-      idx = Router.shard_for(key)
-      pid_before = Process.whereis(Router.shard_name(idx))
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
 
-      assert :ok = Router.delete(key)
+      assert :ok = Router.delete(FerricStore.Instance.get(:default), key)
 
-      pid_after = Process.whereis(Router.shard_name(idx))
+      pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
       assert pid_before == pid_after, "Shard should not have crashed on delete-miss"
     end
 
     test "double delete is idempotent" do
       key = ukey("double_del")
       Router.put(key, "v")
-      assert :ok = Router.delete(key)
-      assert :ok = Router.delete(key)
-      assert nil == Router.get(key)
+      assert :ok = Router.delete(FerricStore.Instance.get(:default), key)
+      assert :ok = Router.delete(FerricStore.Instance.get(:default), key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -239,17 +239,17 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
           k
         end
 
-      returned_keys = Router.keys()
+      returned_keys = Router.keys(FerricStore.Instance.get(:default))
       key_set = MapSet.new(returned_keys)
 
       # All inserted keys must be present.
       for k <- keys do
         assert MapSet.member?(key_set, k),
-               "Key #{k} should be in Router.keys() result"
+               "Key #{k} should be in Router.keys(FerricStore.Instance.get(:default)) result"
       end
 
       # No internal/metadata keys should leak through KEYS command.
-      # Note: Router.keys() returns raw keys including compound keys;
+      # Note: Router.keys(FerricStore.Instance.get(:default)) returns raw keys including compound keys;
       # the KEYS command in server.ex filters them via CompoundKey.internal_key?/1.
       # Here we verify the filtering logic is correct by checking that
       # the KEYS command (via Dispatcher) does not expose internal keys.
@@ -281,7 +281,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
   describe "dbsize accuracy after put/delete cycles" do
     test "dbsize reflects net key count after puts and deletes" do
-      base = Router.dbsize()
+      base = Router.dbsize(FerricStore.Instance.get(:default))
 
       keys =
         for i <- 1..20 do
@@ -290,22 +290,22 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
           k
         end
 
-      assert Router.dbsize() == base + 20
+      assert Router.dbsize(FerricStore.Instance.get(:default)) == base + 20
 
       # Delete half the keys.
       {to_delete, to_keep} = Enum.split(keys, 10)
       Enum.each(to_delete, &Router.delete/1)
 
-      assert Router.dbsize() == base + 10
+      assert Router.dbsize(FerricStore.Instance.get(:default)) == base + 10
 
       # Verify the kept keys still exist.
       for k <- to_keep do
-        assert Router.get(k) != nil
+        assert Router.get(FerricStore.Instance.get(:default), k) != nil
       end
     end
 
     test "dbsize decreases by exactly the number of keys deleted" do
-      base = Router.dbsize()
+      base = Router.dbsize(FerricStore.Instance.get(:default))
 
       keys =
         for i <- 1..5 do
@@ -314,10 +314,10 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
           k
         end
 
-      assert Router.dbsize() == base + 5
+      assert Router.dbsize(FerricStore.Instance.get(:default)) == base + 5
 
       Enum.each(keys, &Router.delete/1)
-      assert Router.dbsize() == base
+      assert Router.dbsize(FerricStore.Instance.get(:default)) == base
     end
   end
 
@@ -330,12 +330,12 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = ukey("expired_exists")
       expire_at = System.os_time(:millisecond) + 150
 
-      Router.put(key, "ephemeral", expire_at)
-      assert Router.exists?(key) == true
+      Router.put(FerricStore.Instance.get(:default), key, "ephemeral", expire_at)
+      assert Router.exists?(FerricStore.Instance.get(:default), key) == true
 
       Process.sleep(200)
 
-      assert Router.exists?(key) == false,
+      assert Router.exists?(FerricStore.Instance.get(:default), key) == false,
              "exists? should return false for expired key"
     end
 
@@ -343,19 +343,19 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = ukey("past_expire")
       past = System.os_time(:millisecond) - 100
 
-      Router.put(key, "already_dead", past)
-      assert Router.exists?(key) == false
+      Router.put(FerricStore.Instance.get(:default), key, "already_dead", past)
+      assert Router.exists?(FerricStore.Instance.get(:default), key) == false
     end
 
     test "get also returns nil for expired key" do
       key = ukey("expired_get")
       expire_at = System.os_time(:millisecond) + 150
 
-      Router.put(key, "temp", expire_at)
+      Router.put(FerricStore.Instance.get(:default), key, "temp", expire_at)
       Process.sleep(200)
 
-      assert nil == Router.get(key)
-      assert false == Router.exists?(key)
+      assert nil == Router.get(FerricStore.Instance.get(:default), key)
+      assert false == Router.exists?(FerricStore.Instance.get(:default), key)
     end
   end
 
@@ -380,7 +380,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       Router.put(key, "val")
 
       v1 = Router.get_version(key)
-      Router.delete(key)
+      Router.delete(FerricStore.Instance.get(:default), key)
       v2 = Router.get_version(key)
 
       assert v2 > v1,
@@ -392,7 +392,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       Router.put(key, "val")
 
       v1 = Router.get_version(key)
-      _val = Router.get(key)
+      _val = Router.get(FerricStore.Instance.get(:default), key)
       v2 = Router.get_version(key)
 
       assert v2 == v1,
@@ -440,7 +440,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
       # Every key/value pair should be readable.
       for {key, value} <- results do
-        actual = Router.get(key)
+        actual = Router.get(FerricStore.Instance.get(:default), key)
 
         assert actual == value,
                "Key #{key}: expected #{inspect(value)}, got #{inspect(actual)}"
@@ -461,7 +461,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       Task.await_many(tasks, 10_000)
 
       # The key should have one of the 20 values, not nil or a crash.
-      result = Router.get(key)
+      result = Router.get(FerricStore.Instance.get(:default), key)
       assert result != nil, "Key should not be nil after concurrent writes"
       assert String.starts_with?(result, "writer_"), "Value should be one of the writer values"
     end
@@ -470,7 +470,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = ukey("conc_rw")
       Router.put(key, "initial")
 
-      pids_before = for i <- 0..3, do: {i, Process.whereis(Router.shard_name(i))}
+      pids_before = for i <- 0..3, do: {i, Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), i))}
 
       tasks =
         for i <- 1..20 do
@@ -478,7 +478,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
             if rem(i, 2) == 0 do
               Router.put(key, "v_#{i}")
             else
-              Router.get(key)
+              Router.get(FerricStore.Instance.get(:default), key)
             end
           end)
         end
@@ -487,7 +487,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
       # All shards should still be alive with the same PIDs.
       for {i, old_pid} <- pids_before do
-        current_pid = Process.whereis(Router.shard_name(i))
+        current_pid = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), i))
 
         assert current_pid == old_pid,
                "Shard #{i} should not have crashed during concurrent read/write"
@@ -504,7 +504,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = ukey("incr_str")
       Router.put(key, "not_a_number")
 
-      assert {:error, msg} = Router.incr(key, 1)
+      assert {:error, msg} = Router.incr(FerricStore.Instance.get(:default), key, 1)
       assert msg =~ "not an integer"
     end
 
@@ -512,7 +512,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = ukey("incr_float_str")
       Router.put(key, "3.14")
 
-      assert {:error, msg} = Router.incr(key, 1)
+      assert {:error, msg} = Router.incr(FerricStore.Instance.get(:default), key, 1)
       assert msg =~ "not an integer"
     end
 
@@ -520,19 +520,19 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = ukey("incr_empty")
       Router.put(key, "")
 
-      assert {:error, msg} = Router.incr(key, 1)
+      assert {:error, msg} = Router.incr(FerricStore.Instance.get(:default), key, 1)
       assert msg =~ "not an integer"
     end
 
     test "does not crash the shard on non-integer incr" do
       key = ukey("incr_safe")
-      idx = Router.shard_for(key)
-      pid_before = Process.whereis(Router.shard_name(idx))
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
+      pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
 
       Router.put(key, "hello")
-      {:error, _} = Router.incr(key, 1)
+      {:error, _} = Router.incr(FerricStore.Instance.get(:default), key, 1)
 
-      pid_after = Process.whereis(Router.shard_name(idx))
+      pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
 
       assert pid_before == pid_after,
              "Shard should not crash on incr of non-integer value"
@@ -540,17 +540,17 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
     test "incr on non-existent key initializes to delta" do
       key = ukey("incr_new")
-      assert {:ok, 5} = Router.incr(key, 5)
-      assert "5" == Router.get(key)
+      assert {:ok, 5} = Router.incr(FerricStore.Instance.get(:default), key, 5)
+      assert "5" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "value is unchanged after failed incr" do
       key = ukey("incr_unchanged")
       Router.put(key, "abc")
 
-      {:error, _} = Router.incr(key, 1)
+      {:error, _} = Router.incr(FerricStore.Instance.get(:default), key, 1)
 
-      assert "abc" == Router.get(key),
+      assert "abc" == Router.get(FerricStore.Instance.get(:default), key),
              "Value should be unchanged after failed incr"
     end
   end
@@ -581,7 +581,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
     test "value well under 512MB is accepted and readable" do
       key = ukey("small_val")
       assert :ok = Router.put(key, "small_value")
-      assert "small_value" == Router.get(key)
+      assert "small_value" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "key at 64KB limit is rejected" do
@@ -614,7 +614,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
              "Router.put with empty key succeeds (guard is at command layer only)"
 
       # The value should be retrievable with empty key.
-      assert "empty_key_value" == Router.get("")
+      assert "empty_key_value" == Router.get(FerricStore.Instance.get(:default), "")
     end
   end
 

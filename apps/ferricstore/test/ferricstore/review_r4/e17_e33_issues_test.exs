@@ -472,7 +472,7 @@ defmodule Ferricstore.ReviewR4.E17E33IssuesTest do
     test "embedded incr_by does not check int64 overflow" do
       # The embedded FerricStore.incr_by at line 442-456 does:
       #   new_val = int_val + amount
-      #   Router.put(resolved_key, Integer.to_string(new_val), 0)
+      #   Router.put(FerricStore.Instance.get(:default), resolved_key, Integer.to_string(new_val), 0)
       # No range check. If int_val is at max_int64 and amount is 1,
       # the result exceeds the Redis int64 range.
       # This is a compatibility issue with Redis clients that expect

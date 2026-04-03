@@ -57,7 +57,7 @@ defmodule Ferricstore.Raft.BatcherTest do
   describe "single writes through batcher" do
     test "write put command succeeds" do
       k = ukey("single_put")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       result = Batcher.write(shard_index, {:put, k, "val", 0})
       assert result == :ok
@@ -65,7 +65,7 @@ defmodule Ferricstore.Raft.BatcherTest do
 
     test "write delete command succeeds" do
       k = ukey("single_del")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       # First put, then delete
       :ok = Batcher.write(shard_index, {:put, k, "to_delete", 0})
@@ -75,21 +75,21 @@ defmodule Ferricstore.Raft.BatcherTest do
 
     test "data written through batcher is readable from Router" do
       k = ukey("readable")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = Batcher.write(shard_index, {:put, k, "batcher_val", 0})
-      assert "batcher_val" == Router.get(k)
+      assert "batcher_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "delete through batcher removes key from Router" do
       k = ukey("del_readable")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = Batcher.write(shard_index, {:put, k, "temp", 0})
-      assert "temp" == Router.get(k)
+      assert "temp" == Router.get(FerricStore.Instance.get(:default), k)
 
       :ok = Batcher.write(shard_index, {:delete, k})
-      assert nil == Router.get(k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -123,7 +123,7 @@ defmodule Ferricstore.Raft.BatcherTest do
 
       # All keys should be readable
       for k <- shard_keys do
-        assert "batched" == Router.get(k)
+        assert "batched" == Router.get(FerricStore.Instance.get(:default), k)
       end
     end
   end
@@ -139,12 +139,12 @@ defmodule Ferricstore.Raft.BatcherTest do
 
     test "flush after writes ensures all data is committed" do
       k = ukey("flush_verify")
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = Batcher.write(shard_index, {:put, k, "flushed", 0})
       :ok = Batcher.flush(shard_index)
 
-      assert "flushed" == Router.get(k)
+      assert "flushed" == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -156,11 +156,11 @@ defmodule Ferricstore.Raft.BatcherTest do
     test "put with TTL stores correct expiry" do
       k = ukey("ttl_batcher")
       future = System.os_time(:millisecond) + 60_000
-      shard_index = Router.shard_for(k)
+      shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       :ok = Batcher.write(shard_index, {:put, k, "ttl_val", future})
 
-      {value, expire_at_ms} = Router.get_meta(k)
+      {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "ttl_val"
       assert expire_at_ms == future
     end

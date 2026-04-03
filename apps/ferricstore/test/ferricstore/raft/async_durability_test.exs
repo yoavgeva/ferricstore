@@ -53,11 +53,11 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       assert :async == NamespaceConfig.durability_for("async_ns")
 
       k = pkey("async_ns", "basic_write")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "async_value", 0})
       drain_async()
-      assert "async_value" == Router.get(k)
+      assert "async_value" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "multiple writes to async namespace are all visible" do
@@ -79,7 +79,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       drain_async()
 
       for k <- keys do
-        assert "val_#{k}" == Router.get(k),
+        assert "val_#{k}" == Router.get(FerricStore.Instance.get(:default), k),
                "Expected key #{k} to be readable after async write"
       end
     end
@@ -89,12 +89,12 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       future = System.os_time(:millisecond) + 60_000
 
       k = pkey("async_ttl", "with_ttl")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "ttl_val", future})
       drain_async()
 
-      {value, expire_at_ms} = Router.get_meta(k)
+      {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "ttl_val"
       assert expire_at_ms == future
     end
@@ -103,15 +103,15 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       NamespaceConfig.set("async_del", "durability", "async")
 
       k = pkey("async_del", "to_delete")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "deleteme", 0})
       drain_async()
-      assert "deleteme" == Router.get(k)
+      assert "deleteme" == Router.get(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:delete, k})
       drain_async()
-      assert nil == Router.get(k)
+      assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -124,19 +124,19 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       NamespaceConfig.set("quorum_ns", "durability", "quorum")
 
       k = pkey("quorum_ns", "raft_write")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "quorum_val", 0})
-      assert "quorum_val" == Router.get(k)
+      assert "quorum_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "default (unconfigured) namespace uses quorum" do
       k = pkey("default_ns", "default_write")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :quorum == NamespaceConfig.durability_for("default_ns")
       assert :ok == Batcher.write(shard, {:put, k, "default_val", 0})
-      assert "default_val" == Router.get(k)
+      assert "default_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -154,13 +154,13 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       # Find keys for both prefixes on shard 0
       async_key =
         Enum.find(1..5000, fn i ->
-          Router.shard_for("mix_async:coexist_#{i}") == shard_idx
+          Router.shard_for(FerricStore.Instance.get(:default), "mix_async:coexist_#{i}") == shard_idx
         end)
         |> then(fn i -> "mix_async:coexist_#{i}" end)
 
       quorum_key =
         Enum.find(1..5000, fn i ->
-          Router.shard_for("mix_quorum:coexist_#{i}") == shard_idx
+          Router.shard_for(FerricStore.Instance.get(:default), "mix_quorum:coexist_#{i}") == shard_idx
         end)
         |> then(fn i -> "mix_quorum:coexist_#{i}" end)
 
@@ -170,29 +170,29 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
 
       drain_async()
 
-      assert "async_v" == Router.get(async_key)
-      assert "quorum_v" == Router.get(quorum_key)
+      assert "async_v" == Router.get(FerricStore.Instance.get(:default), async_key)
+      assert "quorum_v" == Router.get(FerricStore.Instance.get(:default), quorum_key)
     end
 
     test "switching durability mode for a namespace is picked up" do
       NamespaceConfig.set("switch_ns", "durability", "quorum")
 
       k1 = pkey("switch_ns", "before_switch")
-      shard1 = Router.shard_for(k1)
+      shard1 = Router.shard_for(FerricStore.Instance.get(:default), k1)
       assert :ok == Batcher.write(shard1, {:put, k1, "quorum_era", 0})
-      assert "quorum_era" == Router.get(k1)
+      assert "quorum_era" == Router.get(FerricStore.Instance.get(:default), k1)
 
       # Switch to async
       NamespaceConfig.set("switch_ns", "durability", "async")
 
       k2 = pkey("switch_ns", "after_switch")
-      shard2 = Router.shard_for(k2)
+      shard2 = Router.shard_for(FerricStore.Instance.get(:default), k2)
       assert :ok == Batcher.write(shard2, {:put, k2, "async_era", 0})
       drain_async()
-      assert "async_era" == Router.get(k2)
+      assert "async_era" == Router.get(FerricStore.Instance.get(:default), k2)
 
       # Both values should still be readable
-      assert "quorum_era" == Router.get(k1)
+      assert "quorum_era" == Router.get(FerricStore.Instance.get(:default), k1)
     end
   end
 
@@ -210,7 +210,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       # Warm up
       for _ <- 1..5 do
         k = pkey("lat_async", "warmup")
-        shard = Router.shard_for(k)
+        shard = Router.shard_for(FerricStore.Instance.get(:default), k)
         Batcher.write(shard, {:put, k, "w", 0})
       end
 
@@ -218,7 +218,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
 
       for _ <- 1..5 do
         k = pkey("lat_quorum", "warmup")
-        shard = Router.shard_for(k)
+        shard = Router.shard_for(FerricStore.Instance.get(:default), k)
         Batcher.write(shard, {:put, k, "w", 0})
       end
 
@@ -226,7 +226,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       async_times =
         for i <- 1..iterations do
           k = pkey("lat_async", "lat_#{i}")
-          shard = Router.shard_for(k)
+          shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
           {us, :ok} =
             :timer.tc(fn ->
@@ -242,7 +242,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       quorum_times =
         for i <- 1..iterations do
           k = pkey("lat_quorum", "lat_#{i}")
-          shard = Router.shard_for(k)
+          shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
           {us, :ok} =
             :timer.tc(fn ->
@@ -277,7 +277,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
         for i <- 1..50 do
           Task.async(fn ->
             k = pkey("conc_async", "conc_#{i}")
-            shard = Router.shard_for(k)
+            shard = Router.shard_for(FerricStore.Instance.get(:default), k)
             :ok = Batcher.write(shard, {:put, k, "conc_val_#{i}", 0})
             k
           end)
@@ -287,7 +287,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       drain_async()
 
       for {k, i} <- Enum.with_index(keys, 1) do
-        assert "conc_val_#{i}" == Router.get(k),
+        assert "conc_val_#{i}" == Router.get(FerricStore.Instance.get(:default), k),
                "Expected key #{k} to have value conc_val_#{i}"
       end
     end
@@ -307,7 +307,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
       NamespaceConfig.set("telem_async", "durability", "async")
 
       k = pkey("telem_async", "telemetry_write")
-      shard = Router.shard_for(k)
+      shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
       assert :ok == Batcher.write(shard, {:put, k, "telem_val", 0})
 

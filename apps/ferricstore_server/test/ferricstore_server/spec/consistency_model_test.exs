@@ -60,12 +60,12 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
   # Returns two keys guaranteed to hash to the same shard index.
   defp same_shard_keys(prefix1, prefix2) do
     base_key1 = ukey(prefix1)
-    target_shard = Router.shard_for(base_key1)
+    target_shard = Router.shard_for(FerricStore.Instance.get(:default), base_key1)
 
     base_key2 =
       Enum.find(0..10_000, fn i ->
         candidate = ukey("#{prefix2}_#{i}")
-        Router.shard_for(candidate) == target_shard
+        Router.shard_for(FerricStore.Instance.get(:default), candidate) == target_shard
       end)
 
     {base_key1, ukey("#{prefix2}_#{base_key2}")}
@@ -362,17 +362,17 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
       # This tests at the Router level that any write bumps the shard version
       k = ukey("watch_ver")
 
-      Router.put(k, "initial", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "initial", 0)
       v_before = Router.get_version(k)
 
-      Router.put(k, "modified", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "modified", 0)
       v_after = Router.get_version(k)
 
       assert v_after > v_before,
              "write_version should increase after a write"
 
       # Cleanup
-      Router.delete(k)
+      Router.delete(FerricStore.Instance.get(:default), k)
     end
   end
 
@@ -385,7 +385,7 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
       k = ukey("serial_incr")
 
       # Set initial value directly via Router
-      Router.put(k, "0", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "0", 0)
 
       # Run concurrent INCRs via Router (bypasses TCP / Encoder issue)
       concurrency = 5
@@ -395,18 +395,18 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
         for _ <- 1..concurrency do
           Task.async(fn ->
             for _ <- 1..incrs_per_task do
-              Router.incr(k, 1)
+              Router.incr(FerricStore.Instance.get(:default), k, 1)
             end
           end)
         end
 
       Task.await_many(tasks, 15_000)
 
-      result = Router.get(k)
+      result = Router.get(FerricStore.Instance.get(:default), k)
       assert result == Integer.to_string(concurrency * incrs_per_task)
 
       # Cleanup
-      Router.delete(k)
+      Router.delete(FerricStore.Instance.get(:default), k)
     end
 
     test "concurrent SET and GET are consistent (no torn reads)", %{port: port} do
@@ -460,40 +460,40 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
       k1 = ukey("ver_a")
 
       v1_before = Router.get_version(k1)
-      Router.put(k1, "a", 0)
+      Router.put(FerricStore.Instance.get(:default), k1, "a", 0)
       v1_after = Router.get_version(k1)
 
       assert v1_after > v1_before
 
       # Another write to the same shard (even a different key) bumps version
-      target_shard = Router.shard_for(k1)
+      target_shard = Router.shard_for(FerricStore.Instance.get(:default), k1)
 
       # Find a key that hashes to the same shard
       same_shard_idx =
         Enum.find(0..10_000, fn i ->
           candidate = "ver_check_#{i}"
-          Router.shard_for(candidate) == target_shard
+          Router.shard_for(FerricStore.Instance.get(:default), candidate) == target_shard
         end)
 
       same_shard_key = "ver_check_#{same_shard_idx}"
       v_before = Router.get_version(same_shard_key)
-      Router.put(same_shard_key, "b", 0)
+      Router.put(FerricStore.Instance.get(:default), same_shard_key, "b", 0)
       v_after = Router.get_version(same_shard_key)
 
       assert v_after > v_before
 
       # Cleanup
-      Router.delete(k1)
-      Router.delete(same_shard_key)
+      Router.delete(FerricStore.Instance.get(:default), k1)
+      Router.delete(FerricStore.Instance.get(:default), same_shard_key)
     end
 
     test "delete also increments write_version" do
       k = ukey("ver_del")
 
-      Router.put(k, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), k, "value", 0)
       v_before = Router.get_version(k)
 
-      Router.delete(k)
+      Router.delete(FerricStore.Instance.get(:default), k)
       v_after = Router.get_version(k)
 
       assert v_after > v_before

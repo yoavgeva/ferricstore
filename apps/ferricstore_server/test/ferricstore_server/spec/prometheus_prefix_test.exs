@@ -177,7 +177,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     test "deleting a key reduces the prefix count" do
       Router.put("temp:a", "1")
       Router.put("temp:b", "2")
-      Router.delete("temp:a")
+      Router.delete(FerricStore.Instance.get(:default), "temp:a")
 
       text = Metrics.scrape()
 
@@ -187,7 +187,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     test "expired keys are not counted" do
       # Expire immediately (1ms in the past)
       past = System.os_time(:millisecond) - 1
-      Router.put("ephemeral:x", "gone", past)
+      Router.put(FerricStore.Instance.get(:default), "ephemeral:x", "gone", past)
 
       # Give lazy expiry a moment to take effect
       Process.sleep(10)
@@ -218,8 +218,8 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     end
 
     test "larger keys produce more bytes than smaller keys" do
-      Router.put("big:1", String.duplicate("x", 1000))
-      Router.put("big:2", String.duplicate("y", 1000))
+      Router.put(FerricStore.Instance.get(:default), "big:1", String.duplicate("x", 1000))
+      Router.put(FerricStore.Instance.get(:default), "big:2", String.duplicate("y", 1000))
 
       text = Metrics.scrape()
 
@@ -236,8 +236,8 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     test "hot reads are tracked per prefix after GET on cached keys" do
       # PUT populates ETS, so a subsequent GET is a hot read
       Router.put("session:abc", "val")
-      Router.get("session:abc")
-      Router.get("session:abc")
+      Router.get(FerricStore.Instance.get(:default), "session:abc")
+      Router.get(FerricStore.Instance.get(:default), "session:abc")
 
       text = Metrics.scrape()
 
@@ -262,7 +262,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     test "hot and cold reads are separate counters for the same prefix" do
       Router.put("mixed:key", "val")
       # Hot read (from ETS)
-      Router.get("mixed:key")
+      Router.get(FerricStore.Instance.get(:default), "mixed:key")
 
       # Record a cold read for the same prefix directly
       Stats.record_cold_read("mixed:other")
@@ -289,7 +289,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
 
       # Trigger some reads to create hot/cold stats
       for prefix <- prefixes, j <- 1..10 do
-        Router.get("#{prefix}:key#{j}")
+        Router.get(FerricStore.Instance.get(:default), "#{prefix}:key#{j}")
       end
 
       text = Metrics.scrape()

@@ -56,7 +56,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
   describe "type detection" do
     test "returns type=string for SET key" do
       key = ukey("ki_string")
-      Router.put(key, "hello", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "hello", 0)
 
       result = Native.handle("KEY_INFO", [key], dummy_store())
       assert is_list(result)
@@ -120,7 +120,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
   describe "TTL reporting" do
     test "returns ttl_ms=-1 for key with no TTL" do
       key = ukey("ki_no_ttl")
-      Router.put(key, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)
@@ -138,7 +138,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
     test "returns remaining TTL for key with expiry" do
       key = ukey("ki_ttl")
       future = System.os_time(:millisecond) + 60_000
-      Router.put(key, "value", future)
+      Router.put(FerricStore.Instance.get(:default), key, "value", future)
 
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)
@@ -156,9 +156,9 @@ defmodule Ferricstore.Commands.KeyInfoTest do
   describe "hot cache status" do
     test "shows hot status after GET (warmed into ETS)" do
       key = ukey("ki_hot")
-      Router.put(key, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
       # First GET warms the key into hot cache
-      _val = Router.get(key)
+      _val = Router.get(FerricStore.Instance.get(:default), key)
 
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)
@@ -168,7 +168,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
     test "shows cold status for key with evicted value" do
       key = ukey("ki_cold")
       # Put value directly -- it goes into keydir via Shard GenServer.
-      Router.put(key, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       # Flush to disk first so the cold read path has data
       ShardHelpers.flush_all_shards()
@@ -176,7 +176,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       # Evict the value from keydir to simulate a cold key (value = nil).
       # In v2, ETS IS the keydir -- deleting entirely means key is gone.
       # Cold keys have value=nil but retain disk location in the 7-tuple.
-      idx = Router.shard_for(key)
+      idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       keydir = :"keydir_#{idx}"
       [{_, _val, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, key)
       :ets.insert(keydir, {key, nil, exp, lfu, fid, off, vsize})
@@ -199,7 +199,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
     test "shows correct value_size for string key" do
       key = ukey("ki_size")
       value = "hello world"
-      Router.put(key, value, 0)
+      Router.put(FerricStore.Instance.get(:default), key, value, 0)
 
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)
@@ -217,7 +217,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
     test "shows correct value_size for large value" do
       key = ukey("ki_size_large")
       value = String.duplicate("x", 10_000)
-      Router.put(key, value, 0)
+      Router.put(FerricStore.Instance.get(:default), key, value, 0)
 
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)
@@ -232,12 +232,12 @@ defmodule Ferricstore.Commands.KeyInfoTest do
   describe "last_write_shard" do
     test "shows correct shard index" do
       key = ukey("ki_shard")
-      Router.put(key, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)
 
-      expected_shard = Router.shard_for(key)
+      expected_shard = Router.shard_for(FerricStore.Instance.get(:default), key)
       assert info["last_write_shard"] == Integer.to_string(expected_shard)
     end
   end
@@ -250,7 +250,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
     test "KEY_INFO on expired key returns type=none" do
       key = ukey("ki_expired")
       past = System.os_time(:millisecond) - 1_000
-      Router.put(key, "value", past)
+      Router.put(FerricStore.Instance.get(:default), key, "value", past)
 
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)
@@ -271,7 +271,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
 
     test "KEY_INFO returns all expected fields" do
       key = ukey("ki_fields")
-      Router.put(key, "v", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "v", 0)
 
       result = Native.handle("KEY_INFO", [key], dummy_store())
       info = parse_info(result)
@@ -291,7 +291,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
   describe "stress" do
     test "1000 KEY_INFO calls complete without error" do
       key = ukey("ki_stress")
-      Router.put(key, "stress_value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "stress_value", 0)
 
       results =
         Enum.map(1..1000, fn _i ->
@@ -317,7 +317,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
   describe "Dispatcher routing" do
     test "FERRICSTORE.KEY_INFO is routed through dispatcher" do
       key = ukey("ki_disp")
-      Router.put(key, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       result = Dispatcher.dispatch("FERRICSTORE.KEY_INFO", [key], dummy_store())
       assert is_list(result)
@@ -327,7 +327,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
 
     test "FERRICSTORE.KEY_INFO is case-insensitive" do
       key = ukey("ki_disp_ci")
-      Router.put(key, "value", 0)
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       result = Dispatcher.dispatch("ferricstore.key_info", [key], dummy_store())
       assert is_list(result)
@@ -349,7 +349,7 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       delete: &Router.delete/1,
       exists?: &Router.exists?/1,
       keys: &Router.keys/0,
-      flush: fn -> Enum.each(Router.keys(), &Router.delete/1); :ok end,
+      flush: fn -> Enum.each(Router.keys(FerricStore.Instance.get(:default)), &Router.delete/1); :ok end,
       dbsize: &Router.dbsize/0,
       incr: &Router.incr/2,
       incr_float: &Router.incr_float/2,
@@ -365,31 +365,31 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       ratelimit_add: &Router.ratelimit_add/4,
       list_op: &Router.list_op/2,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(Router.shard_for(redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }

@@ -67,10 +67,10 @@ defmodule Ferricstore.Bench.AsyncRaftHealthTest do
 
     # Verify raft can still process quorum writes
     {quorum_us, _} = :timer.tc(fn ->
-      Ferricstore.Store.Router.put("quorum_health_check", "alive", 0)
+      Ferricstore.Store.Router.put(FerricStore.Instance.get(:default), "quorum_health_check", "alive", 0)
     end)
     IO.puts("  Quorum write after blast: #{quorum_us}us")
-    IO.puts("  Quorum read: #{inspect(Ferricstore.Store.Router.get("quorum_health_check"))}")
+    IO.puts("  Quorum read: #{inspect(Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), "quorum_health_check"))}")
 
     assert alive, "Ra leader should still be alive after 100K async writes"
   end
