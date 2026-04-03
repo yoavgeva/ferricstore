@@ -99,11 +99,26 @@ defmodule FerricStore.Instance do
     # Shard process names (via Registry or atoms)
     shard_names = build_shard_names(name, shard_count)
 
-    # Shared mutable references
-    pressure_flags = :atomics.new(3, signed: false)
-    disk_pressure = :atomics.new(shard_count, signed: false)
-    write_version = :counters.new(shard_count, [:write_concurrency])
-    stats_counter = :counters.new(9, [:atomics])
+    # Shared mutable references.
+    # For the :default instance, reuse the existing global refs created by
+    # application.ex (MemoryGuard, DiskPressure, WriteVersion, Stats).
+    # For custom instances, create fresh isolated refs.
+    {pressure_flags, disk_pressure, write_version, stats_counter} =
+      if name == :default do
+        {
+          try_get_pt(:ferricstore_pressure_flags, fn -> :atomics.new(3, signed: false) end),
+          try_get_pt(:ferricstore_disk_pressure, fn -> :atomics.new(shard_count, signed: false) end),
+          try_get_pt(:ferricstore_write_version, fn -> :counters.new(shard_count, [:write_concurrency]) end),
+          try_get_pt(:ferricstore_stats_counter_ref, fn -> :counters.new(9, [:atomics]) end)
+        }
+      else
+        {
+          :atomics.new(3, signed: false),
+          :atomics.new(shard_count, signed: false),
+          :counters.new(shard_count, [:write_concurrency]),
+          :counters.new(9, [:atomics])
+        }
+      end
 
     # LFU config
     lfu_decay_time = Keyword.get(opts, :lfu_decay_time, 1)
@@ -230,6 +245,15 @@ defmodule FerricStore.Instance do
         else: :"#{name}.Shard.#{i}"
     end)
     |> List.to_tuple()
+  end
+
+  # Try to get an existing persistent_term ref, fall back to creating a new one.
+  defp try_get_pt(key, fallback_fn) do
+    try do
+      :persistent_term.get(key)
+    rescue
+      ArgumentError -> fallback_fn.()
+    end
   end
 
   defp detect_memory_limit do

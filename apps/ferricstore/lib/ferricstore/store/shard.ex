@@ -1532,7 +1532,14 @@ defmodule Ferricstore.Store.Shard do
   # with the shared atomic counter (incremented by Router for quorum bypass writes).
   # This ensures WATCH detects mutations regardless of which write path was used.
   def handle_call({:get_version, _key}, _from, state) do
-    shared = Ferricstore.Store.WriteVersion.get(state.index)
+    ctx = state.instance_ctx
+    shared =
+      if ctx do
+        size = :counters.info(ctx.write_version).size
+        if state.index < size, do: :counters.get(ctx.write_version, state.index + 1), else: 0
+      else
+        Ferricstore.Store.WriteVersion.get(state.index)
+      end
     {:reply, state.write_version + shared, state}
   end
 
