@@ -1,0 +1,255 @@
+defmodule FerricStore.Instance do
+  @moduledoc """
+  Instance context for a FerricStore instance.
+
+  Each instance owns its own shards, ETS tables, Raft system, atomics,
+  and config — fully isolated from other instances. The context struct
+  holds all references needed to route operations without any global
+  state (no persistent_term lookups).
+
+  Created by `FerricStore.Instance.Supervisor.start_link/2` and cached
+  in persistent_term per module name for ~0ns access via `__instance__/0`.
+
+  ## Fields
+
+  All fields are set once at startup and never change (except atomics/counters
+  which are mutable shared references).
+  """
+
+  @type t :: %__MODULE__{
+          name: atom(),
+          data_dir: binary(),
+          shard_count: non_neg_integer(),
+          slot_map: tuple(),
+          shard_names: tuple(),
+          keydir_refs: tuple(),
+          prefix_table_refs: tuple(),
+          ra_system: atom(),
+          pressure_flags: reference(),
+          disk_pressure: reference(),
+          write_version: reference(),
+          stats_counter: reference(),
+          lfu_decay_time: non_neg_integer(),
+          lfu_log_factor: non_neg_integer(),
+          lfu_initial_ref: reference(),
+          hot_cache_max_value_size: non_neg_integer(),
+          max_active_file_size: non_neg_integer(),
+          read_sample_rate: non_neg_integer(),
+          eviction_policy: atom(),
+          max_memory_bytes: non_neg_integer(),
+          keydir_max_ram: non_neg_integer(),
+          memory_limit: non_neg_integer(),
+          durability_mode: atom(),
+          mode: atom(),
+          hotness_table: atom() | reference(),
+          config_table: atom() | reference()
+        }
+
+  defstruct [
+    :name,
+    :data_dir,
+    :shard_count,
+    :slot_map,
+    :shard_names,
+    :keydir_refs,
+    :prefix_table_refs,
+    :ra_system,
+    :pressure_flags,
+    :disk_pressure,
+    :write_version,
+    :stats_counter,
+    :lfu_decay_time,
+    :lfu_log_factor,
+    :lfu_initial_ref,
+    :hot_cache_max_value_size,
+    :max_active_file_size,
+    :read_sample_rate,
+    :eviction_policy,
+    :max_memory_bytes,
+    :keydir_max_ram,
+    :memory_limit,
+    :durability_mode,
+    :mode,
+    :hotness_table,
+    :config_table
+  ]
+
+  @doc """
+  Builds the instance context from the given options.
+
+  This creates all the shared mutable references (atomics, counters, ETS tables)
+  and computes the immutable config values. The returned context is stored in
+  persistent_term for the module name.
+  """
+  @spec build(atom(), keyword()) :: t()
+  def build(name, opts) do
+    shard_count = Keyword.get(opts, :shard_count, 4)
+    data_dir = Keyword.get(opts, :data_dir, "data")
+    mode = Keyword.get(opts, :mode, :embedded)
+
+    # Slot map: 1024 slots → shard indices
+    slot_map = build_slot_map(shard_count)
+
+    # Per-shard ETS tables (anonymous — no global name pollution)
+    keydir_refs = build_keydir_tables(name, shard_count)
+    prefix_table_refs = build_prefix_tables(name, shard_count)
+
+    # Shard process names (via Registry or atoms)
+    shard_names = build_shard_names(name, shard_count)
+
+    # Shared mutable references
+    pressure_flags = :atomics.new(3, signed: false)
+    disk_pressure = :atomics.new(shard_count, signed: false)
+    write_version = :counters.new(shard_count, [:write_concurrency])
+    stats_counter = :counters.new(9, [:atomics])
+
+    # LFU config
+    lfu_decay_time = Keyword.get(opts, :lfu_decay_time, 1)
+    lfu_log_factor = Keyword.get(opts, :lfu_log_factor, 10)
+    lfu_initial_ref = :atomics.new(2, signed: false)
+
+    # Hotness and config ETS tables
+    hotness_table = :ets.new(:"#{name}_hotness", [:set, :public, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
+    config_table = :ets.new(:"#{name}_config", [:set, :public, {:read_concurrency, true}])
+
+    # Memory limits
+    max_memory_bytes = Keyword.get(opts, :max_memory_bytes, 1_073_741_824)
+    keydir_max_ram = Keyword.get(opts, :keydir_max_ram, 256 * 1024 * 1024)
+    memory_limit = Keyword.get(opts, :memory_limit) || detect_memory_limit()
+
+    ctx = %__MODULE__{
+      name: name,
+      data_dir: data_dir,
+      shard_count: shard_count,
+      slot_map: slot_map,
+      shard_names: shard_names,
+      keydir_refs: keydir_refs,
+      prefix_table_refs: prefix_table_refs,
+      ra_system: :"#{name}_raft",
+      pressure_flags: pressure_flags,
+      disk_pressure: disk_pressure,
+      write_version: write_version,
+      stats_counter: stats_counter,
+      lfu_decay_time: lfu_decay_time,
+      lfu_log_factor: lfu_log_factor,
+      lfu_initial_ref: lfu_initial_ref,
+      hot_cache_max_value_size: Keyword.get(opts, :hot_cache_max_value_size, 65_536),
+      max_active_file_size: Keyword.get(opts, :max_active_file_size, 256 * 1024 * 1024),
+      read_sample_rate: Keyword.get(opts, :read_sample_rate, 100),
+      eviction_policy: Keyword.get(opts, :eviction_policy, :volatile_lfu),
+      max_memory_bytes: max_memory_bytes,
+      keydir_max_ram: keydir_max_ram,
+      memory_limit: memory_limit,
+      durability_mode: :all_quorum,
+      mode: mode,
+      hotness_table: hotness_table,
+      config_table: config_table
+    }
+
+    # Cache in persistent_term for ~0ns access via __instance__/0
+    :persistent_term.put({FerricStore.Instance, name}, ctx)
+
+    ctx
+  end
+
+  @doc """
+  Retrieves the cached instance context for the given module name.
+  """
+  @spec get(atom()) :: t()
+  def get(name) do
+    :persistent_term.get({FerricStore.Instance, name})
+  end
+
+  @doc """
+  Removes the cached instance context.
+  """
+  @spec cleanup(atom()) :: :ok
+  def cleanup(name) do
+    :persistent_term.erase({FerricStore.Instance, name})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: build helpers
+  # ---------------------------------------------------------------------------
+
+  defp build_slot_map(shard_count) do
+    0..1023
+    |> Enum.map(fn slot -> rem(slot, shard_count) end)
+    |> List.to_tuple()
+  end
+
+  defp build_keydir_tables(name, shard_count) do
+    0..(shard_count - 1)
+    |> Enum.map(fn i ->
+      :ets.new(:"#{name}_keydir_#{i}", [
+        :set, :public, :named_table,
+        {:read_concurrency, true},
+        {:write_concurrency, :auto},
+        {:decentralized_counters, true}
+      ])
+    end)
+    |> List.to_tuple()
+  end
+
+  defp build_prefix_tables(name, shard_count) do
+    0..(shard_count - 1)
+    |> Enum.map(fn i ->
+      :ets.new(:"#{name}_prefix_#{i}", [
+        :set, :public, :named_table,
+        {:read_concurrency, true},
+        {:write_concurrency, :auto}
+      ])
+    end)
+    |> List.to_tuple()
+  end
+
+  defp build_shard_names(name, shard_count) do
+    0..(shard_count - 1)
+    |> Enum.map(fn i -> :"#{name}.Shard.#{i}" end)
+    |> List.to_tuple()
+  end
+
+  defp detect_memory_limit do
+    cgroup_v2_limit() || cgroup_v1_limit() || host_total_memory() || 1_073_741_824
+  end
+
+  defp cgroup_v2_limit do
+    case File.read("/sys/fs/cgroup/memory.max") do
+      {:ok, "max\n"} -> nil
+      {:ok, data} ->
+        case Integer.parse(String.trim(data)) do
+          {bytes, _} when bytes > 0 -> bytes
+          _ -> nil
+        end
+      _ -> nil
+    end
+  end
+
+  defp cgroup_v1_limit do
+    case File.read("/sys/fs/cgroup/memory/memory.limit_in_bytes") do
+      {:ok, data} ->
+        case Integer.parse(String.trim(data)) do
+          {bytes, _} when bytes > 0 and bytes < 4_611_686_018_427_387_904 -> bytes
+          _ -> nil
+        end
+      _ -> nil
+    end
+  end
+
+  defp host_total_memory do
+    try do
+      data = apply(:memsup, :get_system_memory_data, [])
+      case data do
+        list when is_list(list) -> Keyword.get(list, :total_memory)
+        _ -> nil
+      end
+    rescue
+      _ -> nil
+    catch
+      _, _ -> nil
+    end
+  end
+end
