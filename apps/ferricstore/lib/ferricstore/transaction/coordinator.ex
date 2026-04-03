@@ -59,48 +59,42 @@ defmodule Ferricstore.Transaction.Coordinator do
   # ---------------------------------------------------------------------------
 
   defp execute_cross_shard(shard_groups, index_map, total, sandbox_namespace) do
-    # In sandbox mode (or when raft is unavailable), go directly to the
-    # sequential GenServer fallback. No raft in sandbox.
-    if Router.in_sandbox?() do
-      execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
-    else
-      anchor_idx = shard_groups |> Map.keys() |> Enum.min()
+    anchor_idx = shard_groups |> Map.keys() |> Enum.min()
 
-      shard_batches =
-        Enum.map(shard_groups, fn {shard_idx, cmds_with_indices} ->
-          cmds = Enum.map(cmds_with_indices, fn {_orig_idx, cmd, args} -> {cmd, args} end)
-          {shard_idx, cmds, sandbox_namespace}
-        end)
+    shard_batches =
+      Enum.map(shard_groups, fn {shard_idx, cmds_with_indices} ->
+        cmds = Enum.map(cmds_with_indices, fn {_orig_idx, cmd, args} -> {cmd, args} end)
+        {shard_idx, cmds, sandbox_namespace}
+      end)
 
-      command = {:cross_shard_tx, shard_batches}
-      shard_id = Ferricstore.Raft.Cluster.shard_server_id(anchor_idx)
-      corr = make_ref()
+    command = {:cross_shard_tx, shard_batches}
+    shard_id = Ferricstore.Raft.Cluster.shard_server_id(anchor_idx)
+    corr = make_ref()
 
-      try do
-        case :ra.pipeline_command(shard_id, command, corr, :normal) do
-          :ok ->
-            case wait_for_ra_result(corr, shard_id, anchor_idx, command) do
-              {:ok, shard_results} ->
-                Enum.each(Map.keys(shard_groups), fn idx ->
-                  Ferricstore.Store.WriteVersion.increment(idx)
-                end)
+    try do
+      case :ra.pipeline_command(shard_id, command, corr, :normal) do
+        :ok ->
+          case wait_for_ra_result(corr, shard_id, anchor_idx, command) do
+            {:ok, shard_results} ->
+              Enum.each(Map.keys(shard_groups), fn idx ->
+                Ferricstore.Store.WriteVersion.increment(idx)
+              end)
 
-                reassemble_results(shard_results, index_map, total)
+              reassemble_results(shard_results, index_map, total)
 
-              {:error, _} = err ->
-                err
-            end
+            {:error, _} = err ->
+              err
+          end
 
-          {:error, :noproc} ->
-            execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
+        {:error, :noproc} ->
+          execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
 
-          {:error, _reason} ->
-            execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
-        end
-      catch
-        :exit, {:noproc, _} ->
+        {:error, _reason} ->
           execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
       end
+    catch
+      :exit, {:noproc, _} ->
+        execute_cross_shard_sequential(shard_groups, index_map, total, sandbox_namespace)
     end
   end
 

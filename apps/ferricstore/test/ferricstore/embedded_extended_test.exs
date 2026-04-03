@@ -11,8 +11,13 @@ defmodule Ferricstore.EmbeddedExtendedTest do
   rate limiting, fetch_or_compute, multi/tx, ping, echo, flushall, and
   probabilistic/data-structure smoke tests.
   """
-  use ExUnit.Case, async: true
-  use FerricStore.Sandbox.Case
+  use ExUnit.Case, async: false
+
+  setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
+    :ok
+  end
 
   # ===========================================================================
   # DECR / DECR_BY
@@ -1701,32 +1706,7 @@ defmodule Ferricstore.EmbeddedExtendedTest do
   end
 
   # ===========================================================================
-  # Vector smoke tests
-  # ===========================================================================
-
-  describe "Vector" do
-    test "vcreate, vadd, vsearch" do
-      assert :ok = FerricStore.vcreate("vec:col", 3, :cosine)
-      assert :ok = FerricStore.vadd("vec:col", "doc1", [1.0, 0.0, 0.0])
-      assert :ok = FerricStore.vadd("vec:col", "doc2", [0.0, 1.0, 0.0])
-      assert {:ok, results} = FerricStore.vsearch("vec:col", [1.0, 0.0, 0.0], 2)
-      assert is_list(results)
-    end
-
-    test "vdel removes a vector" do
-      FerricStore.vcreate("vec:del", 3, :cosine)
-      FerricStore.vadd("vec:del", "doc1", [1.0, 0.0, 0.0])
-      assert {:ok, 1} = FerricStore.vdel("vec:del", "doc1")
-    end
-
-    test "vcard returns count" do
-      FerricStore.vcreate("vec:card", 3, :l2)
-      FerricStore.vadd("vec:card", "d1", [1.0, 0.0, 0.0])
-      FerricStore.vadd("vec:card", "d2", [0.0, 1.0, 0.0])
-      assert {:ok, count} = FerricStore.vcard("vec:card")
-      assert count == 2
-    end
-  end
+  # Vector tests removed — HNSW/vector feature was deleted.
 
   # ===========================================================================
   # SET — EXAT option (absolute Unix timestamp in seconds)

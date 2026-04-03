@@ -17,8 +17,13 @@ defmodule FerricstoreServer.Spec.EmbeddedModeTest do
     - Set operations (sadd/smembers/scard) work in embedded mode
   """
 
-  use ExUnit.Case, async: true
-  use FerricStore.Sandbox.Case
+  use ExUnit.Case, async: false
+
+  setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
+    :ok
+  end
 
   # ---------------------------------------------------------------------------
   # get/put/delete — basic string operations without TCP

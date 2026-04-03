@@ -10,8 +10,8 @@ defmodule FerricstoreEcto.CachedRepoTest do
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(TestRepo)
-    namespace = FerricStore.Sandbox.checkout()
-    on_exit(fn -> FerricStore.Sandbox.checkin(namespace) end)
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
     :ok
   end
 
@@ -200,7 +200,7 @@ defmodule FerricstoreEcto.CachedRepoTest do
         IO.puts("\n=== DEBUG: cache not cleared after update ===")
         IO.puts("  cache_key: #{inspect(cache_key)}")
         IO.puts("  fields_after: #{inspect(fields_after)}")
-        IO.puts("  sandbox: #{inspect(Process.get(:ferricstore_sandbox))}")
+        IO.puts("  test isolation: flush_all_keys")
 
         shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
         for i <- 0..(shard_count - 1) do
@@ -430,15 +430,12 @@ defmodule FerricstoreEcto.CachedRepoTest do
       TestRepo.get(User, user.id)
 
       parent = self()
-      fs_namespace = Process.get(:ferricstore_sandbox)
 
       tasks =
         for _ <- 1..50 do
           Task.async(fn ->
             # Share the parent SQL sandbox connection
             Ecto.Adapters.SQL.Sandbox.allow(TestRepo, parent, self())
-            # Share the FerricStore sandbox namespace
-            Process.put(:ferricstore_sandbox, fs_namespace)
 
             TestRepo.get(User, user.id)
           end)

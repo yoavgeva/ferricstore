@@ -9,8 +9,13 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
   and that the value survives GC.
   """
 
-  use ExUnit.Case, async: true
-  use FerricStore.Sandbox.Case
+  use ExUnit.Case, async: false
+
+  setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
+    :ok
+  end
 
   # -------------------------------------------------------------------
   # Hot-path: ETS hit returns binary as-is (no NIF involved)

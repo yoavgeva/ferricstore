@@ -30,7 +30,7 @@ defmodule Ferricstore.Config do
     * `"hz"` -- server tick frequency (stub, always reports 10)
 
   Plus legacy parameters: `timeout`, `tcp-keepalive`, `databases`, `bind`,
-  `port`, `save`, `appendonly`, `loglevel`, `requirepass`, `sandbox_mode`.
+  `port`, `save`, `appendonly`, `loglevel`, `requirepass`.
 
   ## Telemetry
 
@@ -102,8 +102,7 @@ defmodule Ferricstore.Config do
     "save" => "",
     "appendonly" => "no",
     "loglevel" => "notice",
-    "requirepass" => "",
-    "sandbox_mode" => "disabled"
+    "requirepass" => ""
   }
 
   # -------------------------------------------------------------------

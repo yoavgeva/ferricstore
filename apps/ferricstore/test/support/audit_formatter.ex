@@ -54,9 +54,7 @@ defmodule Ferricstore.Test.AuditFormatter do
     # Sample up to 5 key prefixes to trace ownership
     key_prefixes = if ets_count > 0, do: sample_key_prefixes(shard_count, 5), else: ""
 
-    # Try to get the test's sandbox namespace from the test process
-    # (only works if the test uses FerricStore.Sandbox.Case)
-    sandbox_ns = case test.tags[:namespace] do
+    test_ns = case test.tags[:namespace] do
       ns when is_binary(ns) -> ns
       _ -> "-"
     end
@@ -72,7 +70,7 @@ defmodule Ferricstore.Test.AuditFormatter do
     module = inspect(test.module)
     line =
       "[#{timestamp()}] #{status} (#{duration_ms}ms) #{module} > #{test.name} | " <>
-        "ns=#{sandbox_ns} ets=#{ets_count} prefix=#{prefix_count} pt=#{pt_count} procs=#{proc_count} " <>
+        "ns=#{test_ns} ets=#{ets_count} prefix=#{prefix_count} pt=#{pt_count} procs=#{proc_count} " <>
         "disk_files=#{bitcask_files} disk_bytes=#{bitcask_bytes}#{leak_tag}\n"
 
     File.write!(state.log_path, line, [:append])

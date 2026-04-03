@@ -49,7 +49,6 @@ config :ferricstore, :read_sample_rate, 1
 # keyword lists, so [] gets merged with the parent config's keyword list and
 # the parent values survive. Using a non-keyword-list atom forces a full replace.
 config :libcluster, topologies: :disabled
-config :ferricstore, :sandbox_enabled, true
 
 # FerricstoreEcto test repo (SQLite3 in-memory with shared cache)
 # pool_size: 5 to allow concurrent test access; journal_mode: wal for

@@ -739,7 +739,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
   defp build_store(key) do
     # Use the FerricStore embedded API's internal store builder
     # to get a store map that can access the real shard data.
-    resolved = sandbox_key(key)
+    resolved = key
     Ferricstore.StoreBuilder.build_compound_store(resolved)
   rescue
     _ ->
@@ -752,10 +752,6 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
   end
 
   defp sandbox_key(key) do
-    case Process.get(:ferricstore_sandbox) do
-      nil -> key
-      %{prefix: prefix} -> prefix <> key
-      _ -> key
-    end
+    key
   end
 end

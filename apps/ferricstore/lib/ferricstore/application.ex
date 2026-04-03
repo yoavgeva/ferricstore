@@ -117,11 +117,6 @@ defmodule Ferricstore.Application do
     :persistent_term.put(:ferricstore_read_sample_rate,
       Application.get_env(:ferricstore, :read_sample_rate, 100))
 
-    # Initialize sandbox registry (only in test -- sandbox_enabled is set in config/test.exs)
-    if Application.get_env(:ferricstore, :sandbox_enabled, false) do
-      FerricStore.Sandbox.init_registry()
-    end
-
     # Initialize waiter registry ETS for blocking commands
     Ferricstore.Waiters.init()
     # Initialize client tracking ETS tables

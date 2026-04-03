@@ -9,8 +9,8 @@ defmodule FerricstoreEcto.QueryCacheTest do
 
   setup do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(TestRepo)
-    namespace = FerricStore.Sandbox.checkout()
-    on_exit(fn -> FerricStore.Sandbox.checkin(namespace) end)
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
     :ok
   end
 

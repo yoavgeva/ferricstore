@@ -13,13 +13,6 @@ defmodule FerricStore do
       {:ok, "alice"} = FerricStore.get("user:42:name")
       :ok = FerricStore.del("user:42:name")
 
-  ## Sandbox support
-
-  All API functions are sandbox-aware. When `FerricStore.Sandbox.checkout/1` has
-  been called in the current process, a namespace prefix is transparently prepended
-  to all keys. Production code runs with `Process.get(:ferricstore_sandbox) == nil`
-  -- zero overhead, zero behaviour change. See `FerricStore.Sandbox` for details.
-
   ## Named caches
 
   Pass the `:cache` option to direct operations to a named cache instance:
@@ -1592,9 +1585,6 @@ defmodule FerricStore do
     * `*` - matches any sequence of characters
     * `?` - matches any single character
 
-  In sandbox mode, the sandbox prefix is transparently stripped from returned
-  keys, so patterns and results always use the logical key names.
-
   ## Examples
 
       iex> FerricStore.set("user:1:name", "alice")
@@ -1616,50 +1606,16 @@ defmodule FerricStore do
   def keys(pattern \\ "*") do
     alias Ferricstore.Store.CompoundKey
 
-    namespace = Process.get(:ferricstore_sandbox)
     all_keys = Router.keys()
     match_all? = pattern == "*"
 
-    # Compound keys store the sandbox namespace INSIDE the type prefix:
-    #   "T:ns_prefix_user:42", "H:ns_prefix_user:42\0name"
-    # So we must first convert raw keys to user-visible logical keys
-    # (extracting from T: entries, rejecting H:/L:/S:/Z: etc.), then
-    # strip the sandbox namespace from the resulting logical keys.
     visible = CompoundKey.user_visible_keys(all_keys)
 
     results =
-      case namespace do
-        %FerricStore.Sandbox{} ->
-          # Struct sandbox: keys are already isolated (private shards), no prefix stripping
-          if match_all? do
-            visible
-          else
-            Enum.filter(visible, &Ferricstore.GlobMatcher.match?(&1, pattern))
-          end
-
-        ns when is_binary(ns) ->
-          prefix_len = byte_size(ns)
-
-          Enum.reduce(visible, [], fn key, acc ->
-            if String.starts_with?(key, ns) do
-              stripped = binary_part(key, prefix_len, byte_size(key) - prefix_len)
-
-              if match_all? or Ferricstore.GlobMatcher.match?(stripped, pattern) do
-                [stripped | acc]
-              else
-                acc
-              end
-            else
-              acc
-            end
-          end)
-
-        nil ->
-          if match_all? do
-            visible
-          else
-            Enum.filter(visible, &Ferricstore.GlobMatcher.match?(&1, pattern))
-          end
+      if match_all? do
+        visible
+      else
+        Enum.filter(visible, &Ferricstore.GlobMatcher.match?(&1, pattern))
       end
 
     {:ok, results}
@@ -1668,9 +1624,8 @@ defmodule FerricStore do
   @doc """
   Returns the total number of user-visible keys in the store.
 
-  In sandbox mode, only keys belonging to the current sandbox namespace
-  are counted. Internal compound keys (used by hashes, lists, sets, and
-  sorted sets) are excluded from the count.
+  Internal compound keys (used by hashes, lists, sets, and sorted sets)
+  are excluded from the count.
 
   ## Examples
 
@@ -1692,9 +1647,6 @@ defmodule FerricStore do
   @doc """
   Deletes all keys from the store.
 
-  In sandbox mode, only keys belonging to the current sandbox namespace
-  are deleted.
-
   ## Returns
 
     * `:ok`
@@ -1706,77 +1658,34 @@ defmodule FerricStore do
   """
   @spec flushdb() :: :ok
   def flushdb do
-    sandbox = Process.get(:ferricstore_sandbox)
+    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
 
-    case sandbox do
-      %FerricStore.Sandbox{} ->
-        # Struct sandbox: delete all keys via the private shards
-        sc = Router.effective_shard_count()
+    for i <- 0..(shard_count - 1) do
+      shard = Router.shard_name(i)
 
-        for i <- 0..(sc - 1) do
-          shard = Router.resolve_shard(i)
-          keydir = Router.resolve_keydir(i)
-
-          raw_keys =
-            try do
-              :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], keydir)
-            rescue
-              ArgumentError -> []
-            end
-
-          Enum.each(raw_keys, fn key ->
-            try do
-              GenServer.call(shard, {:delete, key}, 10_000)
-            catch
-              :exit, _ -> :ok
-            end
-          end)
-
-          # Clear prefix index
-          prefix_table = Router.resolve_prefix_table(i)
-          try do :ets.delete_all_objects(prefix_table) catch :error, :badarg -> :ok end
+      raw_keys =
+        try do
+          :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], :"keydir_#{i}")
+        rescue
+          ArgumentError -> []
         end
 
-        :ok
-
-      namespace when is_binary(namespace) ->
-        # Old string namespace sandbox: flush namespace keys
-        FerricStore.Sandbox.checkin(namespace)
-        # Re-set the namespace since checkin clears it
-        Process.put(:ferricstore_sandbox, namespace)
-        :ok
-
-      nil ->
-        # No sandbox: delete ALL keys
-        shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
-
-        for i <- 0..(shard_count - 1) do
-          shard = Router.shard_name(i)
-
-          raw_keys =
-            try do
-              :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], :"keydir_#{i}")
-            rescue
-              ArgumentError -> []
-            end
-
-          Enum.each(raw_keys, fn key ->
-            try do
-              GenServer.call(shard, {:delete, key}, 10_000)
-            catch
-              :exit, _ -> :ok
-            end
-          end)
-
-          try do :ets.delete_all_objects(:"prefix_keys_#{i}") catch :error, :badarg -> :ok end
-
-          # Clear probabilistic structure registries for this shard.
-          # These are local mmap handles / NIF resources not managed by Raft.
-          clear_shard_registries(i)
+      Enum.each(raw_keys, fn key ->
+        try do
+          GenServer.call(shard, {:delete, key}, 10_000)
+        catch
+          :exit, _ -> :ok
         end
+      end)
 
-        :ok
+      try do :ets.delete_all_objects(:"prefix_keys_#{i}") catch :error, :badarg -> :ok end
+
+      # Clear probabilistic structure registries for this shard.
+      # These are local mmap handles / NIF resources not managed by Raft.
+      clear_shard_registries(i)
     end
+
+    :ok
   end
 
   defp clear_shard_registries(shard_index) do
@@ -2062,7 +1971,7 @@ defmodule FerricStore do
   @doc """
   Returns a random key from the store, or `{:ok, nil}` if the store is empty.
 
-  In sandbox mode, only keys within the current sandbox are candidates.
+  Returns a random key from the store.
 
   ## Examples
 
@@ -5181,7 +5090,7 @@ defmodule FerricStore do
   def echo(message) when is_binary(message), do: {:ok, message}
 
   @doc """
-  Deletes all keys from the store. In sandbox mode, only sandbox keys are deleted.
+  Deletes all keys from the store.
 
   Alias for `flushdb/0`.
 
@@ -5226,27 +5135,12 @@ defmodule FerricStore do
   end
 
   # ---------------------------------------------------------------------------
-  # Private — sandbox key prefixing
+  # Private — key identity (pass-through)
   # ---------------------------------------------------------------------------
-
-  @sandbox_enabled Application.compile_env(:ferricstore, :sandbox_enabled, false)
 
   @doc false
   @spec sandbox_key(binary()) :: binary()
-
-  if @sandbox_enabled do
-    def sandbox_key(key) do
-      case Process.get(:ferricstore_sandbox) do
-        nil -> key
-        # New struct sandbox: no key prefixing needed -- Router routes to private shards
-        %FerricStore.Sandbox{} -> key
-        # Old string namespace sandbox: prefix the key
-        namespace when is_binary(namespace) -> namespace <> key
-      end
-    end
-  else
-    def sandbox_key(key), do: key
-  end
+  def sandbox_key(key), do: key
 
   # ---------------------------------------------------------------------------
   # Private — integer parsing for INCR
@@ -5605,17 +5499,7 @@ defmodule FerricStore.Pipe do
 
     queue = Enum.map(ordered, &to_resp_command/1)
 
-    # For the old string sandbox, pass the namespace so keys are prefixed.
-    # For the new struct sandbox, pass nil -- keys are not prefixed,
-    # and shard_for will route to the private sandbox shards.
-    sandbox_namespace =
-      case Process.get(:ferricstore_sandbox) do
-        nil -> nil
-        %FerricStore.Sandbox{} -> nil
-        ns when is_binary(ns) -> ns
-      end
-
-    raw_results = Ferricstore.Transaction.Coordinator.execute(queue, %{}, sandbox_namespace)
+    raw_results = Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
 
     ordered
     |> Enum.zip(raw_results)
@@ -5842,14 +5726,7 @@ defmodule FerricStore.Tx do
       |> Enum.reverse()
       |> Enum.map(&to_resp_command/1)
 
-    sandbox_namespace =
-      case Process.get(:ferricstore_sandbox) do
-        nil -> nil
-        %FerricStore.Sandbox{} -> nil
-        ns when is_binary(ns) -> ns
-      end
-
-    Ferricstore.Transaction.Coordinator.execute(queue, %{}, sandbox_namespace)
+    Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
   end
 
   defp to_resp_command({:set, key, value, opts}) do

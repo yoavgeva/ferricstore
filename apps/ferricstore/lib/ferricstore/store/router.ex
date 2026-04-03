@@ -21,76 +21,19 @@ defmodule Ferricstore.Store.Router do
   import Bitwise, only: [band: 2]
 
   @slot_mask 1023
-  @sandbox_enabled Application.compile_env(:ferricstore, :sandbox_enabled, false)
 
   # ---------------------------------------------------------------------------
-  # Sandbox resolution (compile-time gated -- zero overhead in production)
+  # Shard resolution helpers
   # ---------------------------------------------------------------------------
 
-  if @sandbox_enabled do
-    @doc false
-    def resolve_shard(idx) do
-      case FerricStore.Sandbox.resolve() do
-        nil -> shard_name(idx)
-        %FerricStore.Sandbox{shards: shards, shard_count: sc} -> elem(shards, rem(idx, sc))
-      end
-    end
-
-    @doc false
-    def resolve_keydir(idx) do
-      case FerricStore.Sandbox.resolve() do
-        nil -> keydir_name(idx)
-        %FerricStore.Sandbox{keydirs: keydirs, shard_count: sc} -> elem(keydirs, rem(idx, sc))
-      end
-    end
-
-    @doc false
-    def resolve_prefix_table(idx) do
-      case FerricStore.Sandbox.resolve() do
-        nil -> PrefixIndex.table_name(idx)
-        %FerricStore.Sandbox{prefix_tables: pt, shard_count: sc} -> elem(pt, rem(idx, sc))
-      end
-    end
-
-    @doc false
-    def effective_shard_count do
-      case FerricStore.Sandbox.resolve() do
-        nil -> :persistent_term.get(:ferricstore_shard_count)
-        %FerricStore.Sandbox{shard_count: sc} -> sc
-      end
-    end
-
-    @doc false
-    def sandbox_shard_for(key) do
-      case FerricStore.Sandbox.resolve() do
-        nil ->
-          slot = slot_for(key)
-          slot_map = :persistent_term.get(:ferricstore_slot_map)
-          elem(slot_map, slot)
-
-        %FerricStore.Sandbox{shard_count: sc} ->
-          rem(:erlang.phash2(key), sc)
-      end
-    end
-
-    @doc false
-    def in_sandbox? do
-      FerricStore.Sandbox.resolve() != nil
-    end
-  else
-    @doc false
-    def resolve_shard(idx), do: shard_name(idx)
-    @doc false
-    def resolve_keydir(idx), do: keydir_name(idx)
-    @doc false
-    def resolve_prefix_table(idx), do: PrefixIndex.table_name(idx)
-    @doc false
-    def effective_shard_count, do: :persistent_term.get(:ferricstore_shard_count)
-    @doc false
-    def sandbox_shard_for(key), do: shard_for(key)
-    @doc false
-    def in_sandbox?, do: false
-  end
+  @doc false
+  def resolve_shard(idx), do: shard_name(idx)
+  @doc false
+  def resolve_keydir(idx), do: keydir_name(idx)
+  @doc false
+  def resolve_prefix_table(idx), do: PrefixIndex.table_name(idx)
+  @doc false
+  def effective_shard_count, do: :persistent_term.get(:ferricstore_shard_count)
 
   # ---------------------------------------------------------------------------
   # Write-path dispatch: quorum writes bypass Shard, async writes use Shard
@@ -223,26 +166,10 @@ defmodule Ferricstore.Store.Router do
   #         Like Redis Cluster — client sees the write before replication completes.
   #         Leader crash before replication = data loss (documented trade-off).
   @spec raft_write(non_neg_integer(), binary(), tuple()) :: term()
-  if @sandbox_enabled do
-    defp raft_write(idx, key, command) do
-      if in_sandbox?() do
-        # Sandbox: route through the sandbox shard GenServer directly.
-        # The sandbox shard has its own ra system and handles writes via
-        # its raft? path (or direct path). No Batcher, no async writes.
-        GenServer.call(resolve_shard(idx), command)
-      else
-        case durability_for_key(key) do
-          :quorum -> quorum_write(idx, command)
-          :async -> async_write(idx, command)
-        end
-      end
-    end
-  else
-    defp raft_write(idx, key, command) do
-      case durability_for_key(key) do
-        :quorum -> quorum_write(idx, command)
-        :async -> async_write(idx, command)
-      end
+  defp raft_write(idx, key, command) do
+    case durability_for_key(key) do
+      :quorum -> quorum_write(idx, command)
+      :async -> async_write(idx, command)
     end
   end
 
@@ -522,24 +449,10 @@ defmodule Ferricstore.Store.Router do
   instead of the full key.
   """
   @spec shard_for(binary()) :: non_neg_integer()
-  if @sandbox_enabled do
-    def shard_for(key) do
-      case FerricStore.Sandbox.resolve() do
-        nil ->
-          slot = slot_for(key)
-          slot_map = :persistent_term.get(:ferricstore_slot_map)
-          elem(slot_map, slot)
-
-        %FerricStore.Sandbox{shard_count: sc} ->
-          rem(:erlang.phash2(key), sc)
-      end
-    end
-  else
-    def shard_for(key) do
-      slot = slot_for(key)
-      slot_map = :persistent_term.get(:ferricstore_slot_map)
-      elem(slot_map, slot)
-    end
+  def shard_for(key) do
+    slot = slot_for(key)
+    slot_map = :persistent_term.get(:ferricstore_slot_map)
+    elem(slot_map, slot)
   end
 
   @doc """

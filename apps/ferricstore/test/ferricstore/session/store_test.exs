@@ -1,32 +1,11 @@
 defmodule FerricStore.Session.StoreTest do
-  use ExUnit.Case, async: true
-  use FerricStore.Sandbox.Case
+  use ExUnit.Case, async: false
 
   alias FerricStore.Session.Store
 
-  # After each test, verify no session keys leaked outside sandbox.
-  # The sandbox checkin (from Sandbox.Case on_exit) deletes sandboxed keys.
-  # We verify by checking that no "session:" keys exist in ETS for our namespace.
-  setup context do
-    on_exit(fn ->
-      ns = context[:namespace]
-      if ns do
-        shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
-        leaked = for i <- 0..(shard_count - 1), reduce: [] do
-          acc ->
-            try do
-              :ets.foldl(fn {k, _v, _e, _l, _f, _o, _vs}, a ->
-                if is_binary(k) and String.contains?(k, ns) and String.contains?(k, "session"), do: [k | a], else: a
-              end, acc, :"keydir_#{i}")
-            rescue
-              _ -> acc
-            end
-        end
-        if leaked != [] do
-          IO.puts("LEAK: #{length(leaked)} session keys after test: #{inspect(Enum.take(leaked, 3))}")
-        end
-      end
-    end)
+  setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
     :ok
   end
 

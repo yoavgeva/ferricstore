@@ -13,8 +13,7 @@ if config_env() == :prod do
       count = System.get_env("FERRICSTORE_SHARD_COUNT", "0")
       count = String.to_integer(count)
       if count == 0, do: System.schedulers_online(), else: count
-    ),
-    sandbox_enabled: false
+    )
 
   # ---------------------------------------------------------------------------
   # Durability

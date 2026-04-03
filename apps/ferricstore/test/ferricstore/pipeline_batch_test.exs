@@ -3,8 +3,13 @@ defmodule Ferricstore.PipelineBatchTest do
   Tests that FerricStore.pipeline/1 submits commands as a single batch Raft
   entry per shard via the Coordinator, rather than executing them one at a time.
   """
-  use ExUnit.Case, async: true
-  use FerricStore.Sandbox.Case
+  use ExUnit.Case, async: false
+
+  setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
+    :ok
+  end
 
   describe "basic pipeline batching" do
     test "pipeline with 3 SETs returns [:ok, :ok, :ok]" do

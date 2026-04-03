@@ -25,8 +25,13 @@ defmodule FerricstoreServer.Spec.ScanFilteringTest do
   SC-008: DBSIZE excludes subkeys
   """
 
-  use ExUnit.Case, async: true
-  use FerricStore.Sandbox.Case
+  use ExUnit.Case, async: false
+
+  setup do
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
+    :ok
+  end
 
   alias Ferricstore.Commands.Generic
   alias Ferricstore.Store.CompoundKey
