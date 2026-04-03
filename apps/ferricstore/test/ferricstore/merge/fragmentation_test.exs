@@ -260,7 +260,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
   describe "shard file_stats" do
     test "file_stats populated with at least one file on a running shard" do
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), 0)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0)
 
       # Write some data to ensure the shard has content
       for i <- 1..5 do
@@ -275,7 +275,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
     end
 
     test "file_stats contains active file entry" do
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), 0)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0)
       state = :sys.get_state(shard_name)
 
       # Active file should be present in file_stats
@@ -283,7 +283,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
     end
 
     test "file_stats values are {total_bytes, dead_bytes} tuples" do
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), 0)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0)
       state = :sys.get_state(shard_name)
 
       Enum.each(state.file_stats, fn {fid, {total, dead}} ->
@@ -296,7 +296,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
     end
 
     test "merge_config stored in shard state" do
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), 0)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0)
       state = :sys.get_state(shard_name)
 
       assert is_map(state.merge_config)
@@ -323,7 +323,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
 
       redis_key = "prom_bytes_#{:rand.uniform(10_000_000)}"
       shard_index = Router.shard_for(FerricStore.Instance.get(:default), redis_key)
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_index)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_index)
 
       # Write enough entries to trigger promotion via compound_put
       for i <- 1..6 do

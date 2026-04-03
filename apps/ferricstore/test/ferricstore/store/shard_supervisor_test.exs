@@ -27,7 +27,7 @@ defmodule Ferricstore.Store.ShardSupervisorTest do
   end
 
   test "shards have unique registered names" do
-    names = Enum.map(0..3, fn i -> Router.shard_name(FerricStore.Instance.get(:default), i) end)
+    names = Enum.map(0..3, fn i -> Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i) end)
     assert length(Enum.uniq(names)) == 4
 
     for name <- names do
@@ -37,7 +37,7 @@ defmodule Ferricstore.Store.ShardSupervisorTest do
 
   test "each shard responds to put and get" do
     for i <- 0..3 do
-      name = Router.shard_name(FerricStore.Instance.get(:default), i)
+      name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i)
       key = "sup_test_key_#{i}_#{:rand.uniform(999_999)}"
       :ok = GenServer.call(name, {:put, key, "val_#{i}", 0})
       assert "val_#{i}" == GenServer.call(name, {:get, key})

@@ -329,7 +329,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
       # Kill the shard that owns this key
       idx = Router.shard_for(FerricStore.Instance.get(:default), "restart_key")
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), idx)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx)
       pid = Process.whereis(shard_name)
       Process.exit(pid, :kill)
       Process.sleep(200)
@@ -758,7 +758,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 36: Promotion still works with single table
     test "36. promotion still works with single table" do
       # Write enough hash fields to verify the compound key path works
-      shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), "promo_hash"))
+      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), "promo_hash"))
 
       GenServer.call(shard, {:compound_put, "promo_hash", "H:promo_hash\0field1", "val1", 0})
       drain_all()

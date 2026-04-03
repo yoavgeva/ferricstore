@@ -119,7 +119,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
 
       # INCR three times: result should be 3, not some other value
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "multi_order")
-      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
 
       # Execute through the shard's transaction path
       commands = [
@@ -148,7 +148,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # After an expiry sweep with no expired keys, pending=[], flush_in_flight=nil,
       # the shard should return {:noreply, state, :hibernate}.
       # We can verify by checking the process info after a sweep.
-      shard = Router.shard_name(FerricStore.Instance.get(:default), 0)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0)
       pid = Process.whereis(shard)
       assert is_pid(pid)
 

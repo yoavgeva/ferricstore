@@ -616,40 +616,40 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     test "CAS through bypass" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "original", 0)
-      assert 1 == Router.cas(FerricStore.Instance.get(:default), key, "original", "updated", nil)
+      assert 1 == Router.cas(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "original", "updated", nil)
       assert "updated" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS fails when expected value does not match" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "actual", 0)
-      assert 0 == Router.cas(FerricStore.Instance.get(:default), key, "wrong", "updated", nil)
+      assert 0 == Router.cas(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "wrong", "updated", nil)
       assert "actual" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS on non-existent key returns nil" do
       key = ukey("qw_nonexist")
-      assert nil == Router.cas(FerricStore.Instance.get(:default), key, "any", "new", nil)
+      assert nil == Router.cas(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "any", "new", nil)
     end
 
     test "LOCK/UNLOCK through bypass" do
       key = ukey("qw")
-      assert :ok = Router.lock(FerricStore.Instance.get(:default), key, "owner1", 5_000)
-      assert 1 = Router.unlock(FerricStore.Instance.get(:default), key, "owner1")
+      assert :ok = Router.lock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1", 5_000)
+      assert 1 = Router.unlock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1")
     end
 
     test "LOCK fails when already held" do
       key = ukey("qw")
-      Router.lock(FerricStore.Instance.get(:default), key, "owner1", 5_000)
-      assert {:error, _} = Router.lock(FerricStore.Instance.get(:default), key, "owner2", 5_000)
-      Router.unlock(FerricStore.Instance.get(:default), key, "owner1")
+      Router.lock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1", 5_000)
+      assert {:error, _} = Router.lock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner2", 5_000)
+      Router.unlock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1")
     end
 
     test "EXTEND through bypass" do
       key = ukey("qw")
-      Router.lock(FerricStore.Instance.get(:default), key, "owner1", 5_000)
-      assert 1 = Router.extend(FerricStore.Instance.get(:default), key, "owner1", 10_000)
-      Router.unlock(FerricStore.Instance.get(:default), key, "owner1")
+      Router.lock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1", 5_000)
+      assert 1 = Router.extend(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1", 10_000)
+      Router.unlock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1")
     end
 
     test "read-your-own-writes after quorum SET" do
@@ -1231,11 +1231,11 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     test "returns true for existing key" do
       key = ukey("ef")
       Router.put(FerricStore.Instance.get(:default), key, "val", 0)
-      assert Router.exists_fast?(key) == true
+      assert Router.exists_fast?(FerricStore.Instance.get(:default), key) == true
     end
 
     test "returns false for non-existent key" do
-      assert Router.exists_fast?("nonexistent_key_#{:rand.uniform(999_999)}") == false
+      assert Router.exists_fast?(FerricStore.Instance.get(:default), "nonexistent_key_#{:rand.uniform(999_999)}") == false
     end
 
     test "returns false for expired key" do
@@ -1243,9 +1243,9 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       expire_at = System.os_time(:millisecond) + 50
       Router.put(FerricStore.Instance.get(:default), key, "ephemeral", expire_at)
 
-      assert Router.exists_fast?(key) == true
+      assert Router.exists_fast?(FerricStore.Instance.get(:default), key) == true
       Process.sleep(100)
-      assert Router.exists_fast?(key) == false
+      assert Router.exists_fast?(FerricStore.Instance.get(:default), key) == false
     end
 
     test "returns true for cold key (value=nil but in keydir)" do
@@ -1258,7 +1258,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       BitcaskWriter.flush_all()
 
       # Cold key should still be "exists" (nil value but valid keydir entry)
-      assert Router.exists_fast?(key) == true
+      assert Router.exists_fast?(FerricStore.Instance.get(:default), key) == true
     end
   end
 

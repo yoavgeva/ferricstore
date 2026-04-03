@@ -76,7 +76,7 @@ defmodule FerricstoreServer.GracefulShutdownTest do
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
 
     for i <- 0..(shard_count - 1) do
-      name = Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), i)
+      name = Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i)
       pid = Process.whereis(name)
 
       if pid && Process.alive?(pid) do
@@ -91,7 +91,7 @@ defmodule FerricstoreServer.GracefulShutdownTest do
       shard_count_val = :persistent_term.get(:ferricstore_shard_count, 4)
 
       Enum.all?(0..(shard_count_val - 1), fn i ->
-        pid = Process.whereis(Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), i))
+        pid = Process.whereis(Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i))
         alive = is_pid(pid) and Process.alive?(pid)
 
         alive and try do

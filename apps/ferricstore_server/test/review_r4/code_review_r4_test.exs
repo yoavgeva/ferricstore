@@ -24,7 +24,7 @@ defmodule FerricstoreServer.ReviewR4Test do
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
 
     Enum.each(0..(shard_count - 1), fn i ->
-      name = Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), i)
+      name = Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i)
 
       Enum.find_value(1..50, fn _ ->
         pid = Process.whereis(name)

@@ -89,7 +89,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
   end
 
   defp kill_and_wait_restart(index) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), index)
+    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), index)
     old_pid = Process.whereis(name)
     ref = Process.monitor(old_pid)
     Process.exit(old_pid, :kill)
@@ -171,7 +171,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # Flush to disk before crashing.
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
       :ok = GenServer.call(shard_name, :flush)
 
       # Kill the shard that owns this key.
@@ -235,7 +235,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       assert [{^key, "ets_test", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets_name, key)
 
       # Flush and crash shard 2.
-      :ok = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), 2), :flush)
+      :ok = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 2), :flush)
       {_old, _new} = kill_and_wait_restart(2)
       ShardHelpers.wait_shards_alive()
 
@@ -290,7 +290,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
 
       # Flush the shard that owns this key.
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      :ok = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), shard_idx), :flush)
+      :ok = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx), :flush)
 
       # Kill that shard.
       {_old, _new} = kill_and_wait_restart(shard_idx)
@@ -367,7 +367,7 @@ defmodule FerricstoreServer.NodeLifecycleTest do
     test "startup state is consistent, operations work, health checks pass" do
       # 1. Verify startup state.
       for i <- 0..3 do
-        name = Router.shard_name(FerricStore.Instance.get(:default), i)
+        name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i)
         pid = Process.whereis(name)
         assert is_pid(pid) and Process.alive?(pid)
 

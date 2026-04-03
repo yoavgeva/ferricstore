@@ -53,7 +53,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
   # Returns the PID of the shard GenServer that owns `key`.
   defp shard_pid_for(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     Process.whereis(name)
   end
 
@@ -670,7 +670,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
   end
 
   defp kill_shard_and_wait(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     pid = Process.whereis(name)
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)

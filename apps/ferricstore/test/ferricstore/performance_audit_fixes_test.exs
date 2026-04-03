@@ -96,11 +96,11 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     test "exists_fast? returns true for present key" do
       Router.put(FerricStore.Instance.get(:default), "exists_fast_test", "value", 0)
       Process.sleep(50)
-      assert Router.exists_fast?("exists_fast_test") == true
+      assert Router.exists_fast?(FerricStore.Instance.get(:default), "exists_fast_test") == true
     end
 
     test "exists_fast? returns false for absent key" do
-      assert Router.exists_fast?("nonexistent_key_xyz") == false
+      assert Router.exists_fast?(FerricStore.Instance.get(:default), "nonexistent_key_xyz") == false
     end
 
     test "exists_fast? returns false for expired key" do
@@ -108,7 +108,7 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       Router.put(FerricStore.Instance.get(:default), "expired_fast_test", "value", 1)
       Process.sleep(50)
       # Expired key should return false
-      assert Router.exists_fast?("expired_fast_test") == false
+      assert Router.exists_fast?(FerricStore.Instance.get(:default), "expired_fast_test") == false
     end
 
     test "check_keydir_full uses exists_fast? instead of GenServer" do
@@ -131,16 +131,16 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
       for i <- 0..(shard_count - 1) do
         expected = :"Ferricstore.Store.Shard.#{i}"
-        assert Router.shard_name(FerricStore.Instance.get(:default), i) == expected
+        assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i) == expected
       end
     end
 
     test "shard_name is fast (no string interpolation overhead)" do
       # Just verify functional correctness - the perf improvement is structural
-      assert Router.shard_name(FerricStore.Instance.get(:default), 0) == :"Ferricstore.Store.Shard.0"
-      assert Router.shard_name(FerricStore.Instance.get(:default), 1) == :"Ferricstore.Store.Shard.1"
-      assert Router.shard_name(FerricStore.Instance.get(:default), 2) == :"Ferricstore.Store.Shard.2"
-      assert Router.shard_name(FerricStore.Instance.get(:default), 3) == :"Ferricstore.Store.Shard.3"
+      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0) == :"Ferricstore.Store.Shard.0"
+      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 1) == :"Ferricstore.Store.Shard.1"
+      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 2) == :"Ferricstore.Store.Shard.2"
+      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 3) == :"Ferricstore.Store.Shard.3"
     end
 
     test "routing works correctly with pre-computed names" do
@@ -183,7 +183,7 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     test "compound_scan uses prefix index instead of foldl" do
       # Create a hash with some fields
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "myhash")
-      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
 
       # Use compound_put to create hash fields
       prefix = "H:myhash\0"
@@ -201,7 +201,7 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
     test "compound_count uses prefix index instead of foldl" do
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "counthash")
-      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
 
       prefix = "H:counthash\0"
       GenServer.call(shard, {:compound_put, "counthash", prefix <> "a", "1", 0})
@@ -214,7 +214,7 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
     test "compound_delete_prefix works with prefix index" do
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "delhash")
-      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
 
       prefix = "H:delhash\0"
       GenServer.call(shard, {:compound_put, "delhash", prefix <> "x", "1", 0})

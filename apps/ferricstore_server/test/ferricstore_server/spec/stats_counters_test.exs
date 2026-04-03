@@ -106,7 +106,7 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
 
       # Trigger a synchronous expiry sweep on the owning shard
       idx = Router.shard_for(FerricStore.Instance.get(:default), "sweep_target")
-      shard = Router.shard_name(FerricStore.Instance.get(:default), idx)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx)
       GenServer.call(shard, :expiry_sweep)
 
       assert Stats.expired_keys() >= 1
@@ -127,7 +127,7 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
 
       # Trigger sweep on each shard
       Enum.each(0..3, fn i ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), i)
+        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i)
         GenServer.call(shard, :expiry_sweep)
       end)
 

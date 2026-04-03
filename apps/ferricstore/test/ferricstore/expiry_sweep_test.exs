@@ -28,7 +28,7 @@ defmodule Ferricstore.ExpirySweepTest do
   # into the GenServer rather than sending an async message. This guarantees
   # the sweep has completed before the caller continues.
   defp trigger_sweep(shard_index) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), shard_index)
+    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_index)
     GenServer.call(name, :expiry_sweep)
   end
 

@@ -170,7 +170,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
 
       # Shard processes are all still alive
       for i <- 0..3 do
-        name = Router.shard_name(FerricStore.Instance.get(:default), i)
+        name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i)
         assert Process.alive?(Process.whereis(name)),
                "Shard #{i} (#{name}) died during concurrent operations"
       end

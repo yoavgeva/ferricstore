@@ -195,7 +195,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "val", past) end)
 
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), 0)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0)
 
       # Run 3+ sweeps. The first 3 should all hit ceiling (2 keys removed per sweep,
       # but 20 expired keys remain). After 3 ceiling hits, :struggling fires.
@@ -235,7 +235,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       # Use shard 1 to avoid state left over from the struggling test on shard 0.
       # First, reset sweep state by triggering a below-ceiling sweep (no expired keys).
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), 1)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 1)
       GenServer.call(shard_name, :expiry_sweep)
 
       # Drain any stale recovered events produced by the reset sweep above
@@ -544,7 +544,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       # Flush to disk so Bitcask has the data.
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
       :ok = GenServer.call(shard_name, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
 
