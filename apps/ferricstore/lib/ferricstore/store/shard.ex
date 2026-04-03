@@ -167,15 +167,19 @@ defmodule Ferricstore.Store.Shard do
       File.touch!(active_file_path)
     end
 
-    # Create/clear named ETS tables
+    # Create/clear named ETS tables.
+    # Use instance-scoped names from ctx if available, else default naming.
+    keydir_name =
+      if ctx, do: elem(ctx.keydir_refs, index), else: :"keydir_#{index}"
+
     keydir =
-      case :ets.whereis(:"keydir_#{index}") do
+      case :ets.whereis(keydir_name) do
         :undefined ->
-          :ets.new(:"keydir_#{index}", [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
+          :ets.new(keydir_name, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
 
         _ref ->
-          :ets.delete_all_objects(:"keydir_#{index}")
-          :"keydir_#{index}"
+          :ets.delete_all_objects(keydir_name)
+          keydir_name
       end
 
     # Remove any leftover hot_cache table from a previous run.
@@ -184,7 +188,17 @@ defmodule Ferricstore.Store.Shard do
       _ref -> :ets.delete(:"hot_cache_#{index}")
     end
 
-    prefix_keys = PrefixIndex.create_table(index)
+    prefix_name =
+      if ctx, do: elem(ctx.prefix_table_refs, index), else: :"prefix_keys_#{index}"
+
+    prefix_keys =
+      case :ets.whereis(prefix_name) do
+        :undefined ->
+          :ets.new(prefix_name, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}])
+        _ref ->
+          :ets.delete_all_objects(prefix_name)
+          prefix_name
+      end
 
     ets = keydir
 
@@ -197,8 +211,13 @@ defmodule Ferricstore.Store.Shard do
     # Must run BEFORE recover_promoted so PM: markers are in ETS.
     recover_keydir(path, keydir, prefix_keys, index)
 
-    # Start the Raft server for this shard.
-    raft? = start_raft_if_available(index, path, active_file_id, active_file_path, ets)
+    # Start the Raft server for this shard (unless explicitly disabled).
+    raft? =
+      if Keyword.get(opts, :raft_enabled, true) do
+        start_raft_if_available(index, path, active_file_id, active_file_path, ets)
+      else
+        false
+      end
 
     # Recover promoted collection instances
     promoted = Ferricstore.Store.Promotion.recover_promoted(path, keydir, data_dir, index)
@@ -2662,6 +2681,32 @@ defmodule Ferricstore.Store.Shard do
   def handle_call(:expiry_sweep, _from, state) do
     state = do_expiry_sweep(state)
     {:reply, :ok, state}
+  end
+
+  # Catch-all for commands not handled above (prob commands, etc.).
+  # When Raft is disabled (e.g., isolated test instances), these commands
+  # arrive via GenServer.call instead of Raft apply/3. Delegate to the
+  # state machine's apply logic directly.
+  def handle_call(command, _from, state) when is_tuple(command) and not state.raft? do
+    sm_state = %{
+      shard_index: state.index,
+      shard_data_path: state.shard_data_path,
+      active_file_id: state.active_file_id,
+      active_file_path: state.active_file_path,
+      ets: state.ets,
+      data_dir: state.data_dir,
+      prefix_keys: state.prefix_keys,
+      applied_count: 0,
+      release_cursor_interval: 20_000,
+      cross_shard_locks: %{},
+      cross_shard_intents: %{},
+      instance_ctx: state.instance_ctx
+    }
+
+    case Ferricstore.Raft.StateMachine.apply(%{}, command, sm_state) do
+      {_new_state, result} -> {:reply, result, state}
+      {_new_state, result, _effects} -> {:reply, result, state}
+    end
   end
 
   # Periodic fragmentation re-evaluation for idle shards.

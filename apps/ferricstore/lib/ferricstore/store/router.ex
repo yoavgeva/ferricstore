@@ -171,10 +171,15 @@ defmodule Ferricstore.Store.Router do
   #         Like Redis Cluster — client sees the write before replication completes.
   #         Leader crash before replication = data loss (documented trade-off).
   @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
-  defp raft_write(ctx, idx, key, command) do
-    case durability_for_key(ctx, key) do
-      :quorum -> quorum_write(ctx, idx, command)
-      :async -> async_write(ctx, idx, command)
+  defp raft_write(ctx, idx, _key, command) do
+    if ctx.raft_enabled do
+      case durability_for_key(ctx, _key) do
+        :quorum -> quorum_write(ctx, idx, command)
+        :async -> async_write(ctx, idx, command)
+      end
+    else
+      # No Raft — direct GenServer.call to the shard
+      GenServer.call(elem(ctx.shard_names, idx), command)
     end
   end
 

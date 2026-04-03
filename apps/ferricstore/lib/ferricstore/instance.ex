@@ -39,6 +39,7 @@ defmodule FerricStore.Instance do
           max_memory_bytes: non_neg_integer(),
           keydir_max_ram: non_neg_integer(),
           memory_limit: non_neg_integer(),
+          raft_enabled: boolean(),
           durability_mode: atom(),
           mode: atom(),
           hotness_table: atom() | reference(),
@@ -71,7 +72,8 @@ defmodule FerricStore.Instance do
     :durability_mode,
     :mode,
     :hotness_table,
-    :config_table
+    :config_table,
+    raft_enabled: true
   ]
 
   @doc """
@@ -154,6 +156,7 @@ defmodule FerricStore.Instance do
       max_memory_bytes: max_memory_bytes,
       keydir_max_ram: keydir_max_ram,
       memory_limit: memory_limit,
+      raft_enabled: Keyword.get(opts, :raft_enabled, true),
       durability_mode: :all_quorum,
       mode: mode,
       hotness_table: hotness_table,
