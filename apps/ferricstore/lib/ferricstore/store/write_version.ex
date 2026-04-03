@@ -47,7 +47,8 @@ defmodule Ferricstore.Store.WriteVersion do
   @spec increment(non_neg_integer()) :: :ok
   def increment(shard_index) do
     ref = :persistent_term.get(@pt_key)
-    :counters.add(ref, shard_index + 1, 1)
+    size = :counters.info(ref).size
+    if shard_index < size, do: :counters.add(ref, shard_index + 1, 1)
     :ok
   end
 
@@ -57,6 +58,11 @@ defmodule Ferricstore.Store.WriteVersion do
   @spec get(non_neg_integer()) :: non_neg_integer()
   def get(shard_index) do
     ref = :persistent_term.get(@pt_key)
-    :counters.get(ref, shard_index + 1)
+    size = :counters.info(ref).size
+    if shard_index < size do
+      :counters.get(ref, shard_index + 1)
+    else
+      0
+    end
   end
 end

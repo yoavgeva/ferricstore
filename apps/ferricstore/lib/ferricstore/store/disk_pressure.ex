@@ -25,20 +25,27 @@ defmodule Ferricstore.Store.DiskPressure do
   @spec set(non_neg_integer()) :: :ok
   def set(shard_index) do
     ref = :persistent_term.get(@pt_key)
-    :atomics.put(ref, shard_index + 1, 1)
+    size = :atomics.info(ref).size
+    if shard_index < size, do: :atomics.put(ref, shard_index + 1, 1)
     :ok
   end
 
   @spec clear(non_neg_integer()) :: :ok
   def clear(shard_index) do
     ref = :persistent_term.get(@pt_key)
-    :atomics.put(ref, shard_index + 1, 0)
+    size = :atomics.info(ref).size
+    if shard_index < size, do: :atomics.put(ref, shard_index + 1, 0)
     :ok
   end
 
   @spec under_pressure?(non_neg_integer()) :: boolean()
   def under_pressure?(shard_index) do
     ref = :persistent_term.get(@pt_key)
-    :atomics.get(ref, shard_index + 1) == 1
+    size = :atomics.info(ref).size
+    if shard_index < size do
+      :atomics.get(ref, shard_index + 1) == 1
+    else
+      false
+    end
   end
 end
