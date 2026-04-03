@@ -64,7 +64,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
     test "INCRBYFLOAT uses shared format_float (no dead then)" do
       Router.put(FerricStore.Instance.get(:default), "incr_float_test", "10.5", 0)
       Process.sleep(50)
-      assert {:ok, result} = Router.incr_float("incr_float_test", 1.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "incr_float_test", 1.5)
       assert_in_delta result, 12.0, 0.001
     end
   end
@@ -80,7 +80,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # Verify correct behavior through the store.
       Router.put(FerricStore.Instance.get(:default), "setrange_test", "Hello World", 0)
       Process.sleep(50)
-      assert {:ok, 11} = Router.setrange("setrange_test", 6, "Redis")
+      assert {:ok, 11} = Router.setrange(FerricStore.Instance.get(:default), "setrange_test", 6, "Redis")
       Process.sleep(50)
       assert Router.get(FerricStore.Instance.get(:default), "setrange_test") == "Hello Redis"
     end
@@ -89,7 +89,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       Router.put(FerricStore.Instance.get(:default), "setrange_pad", "Hi", 0)
       Process.sleep(50)
       # Offset beyond current string length should zero-pad
-      assert {:ok, _len} = Router.setrange("setrange_pad", 5, "X")
+      assert {:ok, _len} = Router.setrange(FerricStore.Instance.get(:default), "setrange_pad", 5, "X")
       Process.sleep(50)
       result = Router.get(FerricStore.Instance.get(:default), "setrange_pad")
       assert binary_part(result, 0, 2) == "Hi"
@@ -99,7 +99,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
     end
 
     test "SETRANGE on empty key works" do
-      assert {:ok, 5} = Router.setrange("setrange_empty", 0, "Hello")
+      assert {:ok, 5} = Router.setrange(FerricStore.Instance.get(:default), "setrange_empty", 0, "Hello")
       Process.sleep(50)
       assert Router.get(FerricStore.Instance.get(:default), "setrange_empty") == "Hello"
     end

@@ -111,7 +111,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
   describe "router dispatch through live shards" do
     test "put and get through router succeeds" do
       key = "router_conc_test_#{:rand.uniform(999_999)}"
-      :ok = Router.put(key, "hello")
+      :ok = Router.put(FerricStore.Instance.get(:default), key, "hello")
       assert "hello" == Router.get(FerricStore.Instance.get(:default), key)
       # Clean up
       Router.delete(FerricStore.Instance.get(:default), key)
@@ -126,7 +126,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
       tasks =
         Enum.map(Enum.with_index(keys), fn {key, i} ->
           Task.async(fn ->
-            Router.put(key, "val_#{i}")
+            Router.put(FerricStore.Instance.get(:default), key, "val_#{i}")
           end)
         end)
 
@@ -148,13 +148,13 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
 
       # Seed keys
       for i <- 0..19 do
-        Router.put("#{base}_#{i}", "seed_#{i}")
+        Router.put(FerricStore.Instance.get(:default), "#{base}_#{i}", "seed_#{i}")
       end
 
       writer_tasks =
         Enum.map(0..19, fn i ->
           Task.async(fn ->
-            Router.put("#{base}_#{i}", "updated_#{i}")
+            Router.put(FerricStore.Instance.get(:default), "#{base}_#{i}", "updated_#{i}")
           end)
         end)
 
@@ -185,7 +185,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
       tasks =
         Enum.map(0..49, fn i ->
           Task.async(fn ->
-            Router.put("#{base}_#{i}", "v_#{i}")
+            Router.put(FerricStore.Instance.get(:default), "#{base}_#{i}", "v_#{i}")
           end)
         end)
 
@@ -210,7 +210,7 @@ defmodule Ferricstore.Store.RouterConcurrencyTest do
 
       # Seed 20 keys
       for i <- 0..19 do
-        Router.put("#{base}_#{i}", "val_#{i}")
+        Router.put(FerricStore.Instance.get(:default), "#{base}_#{i}", "val_#{i}")
       end
 
       # 20 concurrent readers

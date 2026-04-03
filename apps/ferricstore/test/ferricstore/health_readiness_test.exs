@@ -62,13 +62,13 @@ defmodule Ferricstore.HealthReadinessTest do
 
   describe "Health.check/0 after shard operations" do
     test "returns :ok after writing data" do
-      Ferricstore.Store.Router.put("health_test_key", "value")
+      Ferricstore.Store.Router.put(FerricStore.Instance.get(:default), "health_test_key", "value")
       result = Health.check()
       assert result.status == :ok
     end
 
     test "shards report key counts" do
-      Ferricstore.Store.Router.put("health_keys_test", "value")
+      Ferricstore.Store.Router.put(FerricStore.Instance.get(:default), "health_keys_test", "value")
       result = Health.check()
       total_keys = Enum.sum(Enum.map(result.shards, & &1.keys))
       assert total_keys > 0

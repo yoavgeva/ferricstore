@@ -126,8 +126,8 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
 
   describe "prefix_key_count after SET" do
     test "scrape contains ferricstore_prefix_key_count for a prefix after writing keys" do
-      Router.put("session:abc", "val1")
-      Router.put("session:def", "val2")
+      Router.put(FerricStore.Instance.get(:default), "session:abc", "val1")
+      Router.put(FerricStore.Instance.get(:default), "session:def", "val2")
 
       text = Metrics.scrape()
 
@@ -137,7 +137,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     end
 
     test "/metrics HTTP endpoint exposes prefix_key_count" do
-      Router.put("session:1", "v")
+      Router.put(FerricStore.Instance.get(:default), "session:1", "v")
 
       body = scrape_http()
 
@@ -146,7 +146,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     end
 
     test "keys without a colon appear under _root prefix" do
-      Router.put("plainkey", "value")
+      Router.put(FerricStore.Instance.get(:default), "plainkey", "value")
 
       text = Metrics.scrape()
 
@@ -160,12 +160,12 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
 
   describe "prefix_key_count with multiple prefixes" do
     test "reports correct counts for distinct prefixes" do
-      Router.put("user:1", "alice")
-      Router.put("user:2", "bob")
-      Router.put("user:3", "charlie")
-      Router.put("order:100", "item-a")
-      Router.put("order:200", "item-b")
-      Router.put("cache:x", "hit")
+      Router.put(FerricStore.Instance.get(:default), "user:1", "alice")
+      Router.put(FerricStore.Instance.get(:default), "user:2", "bob")
+      Router.put(FerricStore.Instance.get(:default), "user:3", "charlie")
+      Router.put(FerricStore.Instance.get(:default), "order:100", "item-a")
+      Router.put(FerricStore.Instance.get(:default), "order:200", "item-b")
+      Router.put(FerricStore.Instance.get(:default), "cache:x", "hit")
 
       text = Metrics.scrape()
 
@@ -175,8 +175,8 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     end
 
     test "deleting a key reduces the prefix count" do
-      Router.put("temp:a", "1")
-      Router.put("temp:b", "2")
+      Router.put(FerricStore.Instance.get(:default), "temp:a", "1")
+      Router.put(FerricStore.Instance.get(:default), "temp:b", "2")
       Router.delete(FerricStore.Instance.get(:default), "temp:a")
 
       text = Metrics.scrape()
@@ -206,7 +206,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
 
   describe "prefix_keydir_bytes" do
     test "is positive after writing keys" do
-      Router.put("session:abc", "value")
+      Router.put(FerricStore.Instance.get(:default), "session:abc", "value")
 
       text = Metrics.scrape()
 
@@ -235,7 +235,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
   describe "prefix_hot_reads and prefix_cold_reads" do
     test "hot reads are tracked per prefix after GET on cached keys" do
       # PUT populates ETS, so a subsequent GET is a hot read
-      Router.put("session:abc", "val")
+      Router.put(FerricStore.Instance.get(:default), "session:abc", "val")
       Router.get(FerricStore.Instance.get(:default), "session:abc")
       Router.get(FerricStore.Instance.get(:default), "session:abc")
 
@@ -260,7 +260,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     end
 
     test "hot and cold reads are separate counters for the same prefix" do
-      Router.put("mixed:key", "val")
+      Router.put(FerricStore.Instance.get(:default), "mixed:key", "val")
       # Hot read (from ETS)
       Router.get(FerricStore.Instance.get(:default), "mixed:key")
 
@@ -284,7 +284,7 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
 
       # Write 100 keys per prefix
       for prefix <- prefixes, j <- 1..100 do
-        Router.put("#{prefix}:key#{j}", "value_#{j}")
+        Router.put(FerricStore.Instance.get(:default), "#{prefix}:key#{j}", "value_#{j}")
       end
 
       # Trigger some reads to create hot/cold stats

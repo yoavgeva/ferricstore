@@ -27,7 +27,7 @@ defmodule Ferricstore.Store.ShardSupervisorTest do
   end
 
   test "shards have unique registered names" do
-    names = Enum.map(0..3, &Router.shard_name/1)
+    names = Enum.map(0..3, fn i -> Router.shard_name(FerricStore.Instance.get(:default), i) end)
     assert length(Enum.uniq(names)) == 4
 
     for name <- names do

@@ -363,10 +363,10 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
       k = ukey("watch_ver")
 
       Router.put(FerricStore.Instance.get(:default), k, "initial", 0)
-      v_before = Router.get_version(k)
+      v_before = Router.get_version(FerricStore.Instance.get(:default), k)
 
       Router.put(FerricStore.Instance.get(:default), k, "modified", 0)
-      v_after = Router.get_version(k)
+      v_after = Router.get_version(FerricStore.Instance.get(:default), k)
 
       assert v_after > v_before,
              "write_version should increase after a write"
@@ -459,9 +459,9 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
     test "write_version increments on every write to the same shard" do
       k1 = ukey("ver_a")
 
-      v1_before = Router.get_version(k1)
+      v1_before = Router.get_version(FerricStore.Instance.get(:default), k1)
       Router.put(FerricStore.Instance.get(:default), k1, "a", 0)
-      v1_after = Router.get_version(k1)
+      v1_after = Router.get_version(FerricStore.Instance.get(:default), k1)
 
       assert v1_after > v1_before
 
@@ -476,9 +476,9 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
         end)
 
       same_shard_key = "ver_check_#{same_shard_idx}"
-      v_before = Router.get_version(same_shard_key)
+      v_before = Router.get_version(FerricStore.Instance.get(:default), same_shard_key)
       Router.put(FerricStore.Instance.get(:default), same_shard_key, "b", 0)
-      v_after = Router.get_version(same_shard_key)
+      v_after = Router.get_version(FerricStore.Instance.get(:default), same_shard_key)
 
       assert v_after > v_before
 
@@ -491,10 +491,10 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
       k = ukey("ver_del")
 
       Router.put(FerricStore.Instance.get(:default), k, "value", 0)
-      v_before = Router.get_version(k)
+      v_before = Router.get_version(FerricStore.Instance.get(:default), k)
 
       Router.delete(FerricStore.Instance.get(:default), k)
-      v_after = Router.get_version(k)
+      v_after = Router.get_version(FerricStore.Instance.get(:default), k)
 
       assert v_after > v_before
     end

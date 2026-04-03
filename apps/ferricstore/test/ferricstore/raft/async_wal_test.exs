@@ -396,7 +396,7 @@ defmodule Ferricstore.Raft.AsyncWalTest do
       # Router.incr/2 is the atomic path (goes through Raft state machine as a
       # single {:incr, key, delta} command). Test that path directly.
       k = ukey("incr_atomic")
-      Router.put(k, "0")
+      Router.put(FerricStore.Instance.get(:default), k, "0")
 
       tasks =
         for _ <- 1..50 do
@@ -434,7 +434,7 @@ defmodule Ferricstore.Raft.AsyncWalTest do
 
     test "concurrent INCR and reads are consistent" do
       k = ukey("incr_read")
-      Router.put(k, "0")
+      Router.put(FerricStore.Instance.get(:default), k, "0")
 
       # Writers increment while readers read. Every read must see a valid
       # integer in the range [0, total_increments].

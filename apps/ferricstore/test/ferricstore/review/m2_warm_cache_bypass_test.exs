@@ -35,7 +35,7 @@ defmodule Ferricstore.Review.M2WarmCacheBypassTest do
     large_value = :crypto.strong_rand_bytes(@large_size)
 
     # 1. Write a large value (>65 KB).
-    :ok = Router.put(key, large_value)
+    :ok = Router.put(FerricStore.Instance.get(:default), key, large_value)
 
     # 2. Flush to disk.
     ShardHelpers.flush_all_shards()

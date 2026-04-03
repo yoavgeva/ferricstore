@@ -16,7 +16,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
   `Router.put/3` checks `byte_size(key) > @max_key_size` but does not check
   `byte_size(key) == 0`. Empty keys are rejected at the command layer
   (`Strings.handle("SET", ["", ...])`) but not at the store layer. Any code
-  that calls `Router.put("", ...)` directly bypasses this protection.
+  that calls `Router.put(FerricStore.Instance.get(:default), "", ...)` directly bypasses this protection.
   """
 
   use ExUnit.Case, async: false
@@ -99,7 +99,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = key_for_shard(0, "shard0")
       assert Router.shard_for(FerricStore.Instance.get(:default), key) == 0, "Precondition: key must hash to shard 0"
 
-      assert :ok = Router.put(key, "hello_shard0")
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "hello_shard0")
       assert "hello_shard0" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
@@ -108,7 +108,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
         for idx <- 0..3 do
           k = key_for_shard(idx, "each_shard")
           v = "val_for_shard_#{idx}"
-          assert :ok = Router.put(k, v)
+          assert :ok = Router.put(FerricStore.Instance.get(:default), k, v)
           {k, v, idx}
         end
 
@@ -135,7 +135,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = key_for_shard(0, "crash_durable")
       value = "must_survive_crash"
 
-      assert :ok = Router.put(key, value)
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, value)
 
       # Flush pending writes to Bitcask so they are durable before the crash.
       ShardHelpers.flush_all_shards()
@@ -153,7 +153,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
         for i <- 1..5 do
           k = key_for_shard(1, "multi_crash_#{i}")
           v = "durable_#{i}"
-          Router.put(k, v)
+          Router.put(FerricStore.Instance.get(:default), k, v)
           {k, v}
         end
 
@@ -215,7 +215,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
     test "double delete is idempotent" do
       key = ukey("double_del")
-      Router.put(key, "v")
+      Router.put(FerricStore.Instance.get(:default), key, "v")
       assert :ok = Router.delete(FerricStore.Instance.get(:default), key)
       assert :ok = Router.delete(FerricStore.Instance.get(:default), key)
       assert nil == Router.get(FerricStore.Instance.get(:default), key)
@@ -235,7 +235,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       keys =
         for i <- 1..n do
           k = "#{prefix}_#{i}"
-          Router.put(k, "v#{i}")
+          Router.put(FerricStore.Instance.get(:default), k, "v#{i}")
           k
         end
 
@@ -286,7 +286,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       keys =
         for i <- 1..20 do
           k = ukey("dbsize_#{i}")
-          Router.put(k, "v#{i}")
+          Router.put(FerricStore.Instance.get(:default), k, "v#{i}")
           k
         end
 
@@ -294,7 +294,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
       # Delete half the keys.
       {to_delete, to_keep} = Enum.split(keys, 10)
-      Enum.each(to_delete, &Router.delete/1)
+      Enum.each(to_delete, fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
 
       assert Router.dbsize(FerricStore.Instance.get(:default)) == base + 10
 
@@ -310,13 +310,13 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       keys =
         for i <- 1..5 do
           k = ukey("db0_#{i}")
-          Router.put(k, "v")
+          Router.put(FerricStore.Instance.get(:default), k, "v")
           k
         end
 
       assert Router.dbsize(FerricStore.Instance.get(:default)) == base + 5
 
-      Enum.each(keys, &Router.delete/1)
+      Enum.each(keys, fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
       assert Router.dbsize(FerricStore.Instance.get(:default)) == base
     end
   end
@@ -367,9 +367,9 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
     test "version increases after a put" do
       key = ukey("version_put")
 
-      v1 = Router.get_version(key)
-      Router.put(key, "val1")
-      v2 = Router.get_version(key)
+      v1 = Router.get_version(FerricStore.Instance.get(:default), key)
+      Router.put(FerricStore.Instance.get(:default), key, "val1")
+      v2 = Router.get_version(FerricStore.Instance.get(:default), key)
 
       assert v2 > v1,
              "Version should increment after put: v1=#{v1}, v2=#{v2}"
@@ -377,11 +377,11 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
     test "version increases after a delete" do
       key = ukey("version_del")
-      Router.put(key, "val")
+      Router.put(FerricStore.Instance.get(:default), key, "val")
 
-      v1 = Router.get_version(key)
+      v1 = Router.get_version(FerricStore.Instance.get(:default), key)
       Router.delete(FerricStore.Instance.get(:default), key)
-      v2 = Router.get_version(key)
+      v2 = Router.get_version(FerricStore.Instance.get(:default), key)
 
       assert v2 > v1,
              "Version should increment after delete: v1=#{v1}, v2=#{v2}"
@@ -389,11 +389,11 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
     test "version does not increment on read" do
       key = ukey("version_read")
-      Router.put(key, "val")
+      Router.put(FerricStore.Instance.get(:default), key, "val")
 
-      v1 = Router.get_version(key)
+      v1 = Router.get_version(FerricStore.Instance.get(:default), key)
       _val = Router.get(FerricStore.Instance.get(:default), key)
-      v2 = Router.get_version(key)
+      v2 = Router.get_version(FerricStore.Instance.get(:default), key)
 
       assert v2 == v1,
              "Version should NOT increment on read: v1=#{v1}, v2=#{v2}"
@@ -404,8 +404,8 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
       versions =
         for i <- 1..10 do
-          Router.put(key, "val_#{i}")
-          Router.get_version(key)
+          Router.put(FerricStore.Instance.get(:default), key, "val_#{i}")
+          Router.get_version(FerricStore.Instance.get(:default), key)
         end
 
       # Each successive version should be strictly greater than the previous.
@@ -431,7 +431,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
           Task.async(fn ->
             key = "#{prefix}_#{i}"
             value = "concurrent_val_#{i}"
-            :ok = Router.put(key, value)
+            :ok = Router.put(FerricStore.Instance.get(:default), key, value)
             {key, value}
           end)
         end
@@ -453,7 +453,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       tasks =
         for i <- 1..20 do
           Task.async(fn ->
-            Router.put(key, "writer_#{i}")
+            Router.put(FerricStore.Instance.get(:default), key, "writer_#{i}")
             i
           end)
         end
@@ -468,7 +468,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
     test "concurrent put and get do not crash shards" do
       key = ukey("conc_rw")
-      Router.put(key, "initial")
+      Router.put(FerricStore.Instance.get(:default), key, "initial")
 
       pids_before = for i <- 0..3, do: {i, Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), i))}
 
@@ -476,7 +476,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
         for i <- 1..20 do
           Task.async(fn ->
             if rem(i, 2) == 0 do
-              Router.put(key, "v_#{i}")
+              Router.put(FerricStore.Instance.get(:default), key, "v_#{i}")
             else
               Router.get(FerricStore.Instance.get(:default), key)
             end
@@ -502,7 +502,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
   describe "incr on non-integer value" do
     test "returns error tuple for string value" do
       key = ukey("incr_str")
-      Router.put(key, "not_a_number")
+      Router.put(FerricStore.Instance.get(:default), key, "not_a_number")
 
       assert {:error, msg} = Router.incr(FerricStore.Instance.get(:default), key, 1)
       assert msg =~ "not an integer"
@@ -510,7 +510,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
     test "returns error for float-like string" do
       key = ukey("incr_float_str")
-      Router.put(key, "3.14")
+      Router.put(FerricStore.Instance.get(:default), key, "3.14")
 
       assert {:error, msg} = Router.incr(FerricStore.Instance.get(:default), key, 1)
       assert msg =~ "not an integer"
@@ -518,7 +518,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
     test "returns error for empty string value" do
       key = ukey("incr_empty")
-      Router.put(key, "")
+      Router.put(FerricStore.Instance.get(:default), key, "")
 
       assert {:error, msg} = Router.incr(FerricStore.Instance.get(:default), key, 1)
       assert msg =~ "not an integer"
@@ -529,7 +529,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       idx = Router.shard_for(FerricStore.Instance.get(:default), key)
       pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
 
-      Router.put(key, "hello")
+      Router.put(FerricStore.Instance.get(:default), key, "hello")
       {:error, _} = Router.incr(FerricStore.Instance.get(:default), key, 1)
 
       pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
@@ -546,7 +546,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
     test "value is unchanged after failed incr" do
       key = ukey("incr_unchanged")
-      Router.put(key, "abc")
+      Router.put(FerricStore.Instance.get(:default), key, "abc")
 
       {:error, _} = Router.incr(FerricStore.Instance.get(:default), key, 1)
 
@@ -566,7 +566,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       # 512 * 1024 * 1024 = 536_870_912 bytes
       big_value = :binary.copy(<<0>>, 512 * 1024 * 1024)
 
-      assert {:error, msg} = Router.put(key, big_value)
+      assert {:error, msg} = Router.put(FerricStore.Instance.get(:default), key, big_value)
       assert msg =~ "value too large"
     end
 
@@ -580,19 +580,19 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
     test "value well under 512MB is accepted and readable" do
       key = ukey("small_val")
-      assert :ok = Router.put(key, "small_value")
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "small_value")
       assert "small_value" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "key at 64KB limit is rejected" do
       big_key = String.duplicate("k", 65_536)
-      assert {:error, msg} = Router.put(big_key, "v")
+      assert {:error, msg} = Router.put(FerricStore.Instance.get(:default), big_key, "v")
       assert msg =~ "key too large"
     end
 
     test "key just under 64KB limit is accepted" do
       key = String.duplicate("k", 65_535)
-      assert :ok = Router.put(key, "v")
+      assert :ok = Router.put(FerricStore.Instance.get(:default), key, "v")
     end
   end
 
@@ -608,7 +608,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       #
       # This test documents the actual behavior: Router.put("", ...) succeeds.
       # A fix would add `byte_size(key) == 0` guard to Router.put/3.
-      result = Router.put("", "empty_key_value")
+      result = Router.put(FerricStore.Instance.get(:default), "", "empty_key_value")
 
       assert result == :ok,
              "Router.put with empty key succeeds (guard is at command layer only)"

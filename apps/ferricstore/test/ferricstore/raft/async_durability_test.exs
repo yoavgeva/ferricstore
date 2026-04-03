@@ -68,7 +68,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
           pkey("async_multi", "multi_#{i}")
         end
 
-      by_shard = Enum.group_by(keys, &Router.shard_for/1)
+      by_shard = Enum.group_by(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
 
       for {shard_idx, shard_keys} <- by_shard do
         for k <- shard_keys do

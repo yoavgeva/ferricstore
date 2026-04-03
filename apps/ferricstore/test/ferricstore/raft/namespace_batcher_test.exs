@@ -111,7 +111,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
         end
 
       # Group by shard and pick one shard with multiple keys
-      by_shard = Enum.group_by(keys, &Router.shard_for/1)
+      by_shard = Enum.group_by(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
       {shard_idx, shard_keys} = Enum.max_by(by_shard, fn {_, ks} -> length(ks) end)
 
       # Send all writes concurrently -- they should be batched within the same

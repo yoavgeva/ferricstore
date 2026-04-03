@@ -57,8 +57,8 @@ defmodule Mix.Tasks.FerricstoreTest do
 
     test "reflects actual key count after writes" do
       baseline = length(Router.keys(FerricStore.Instance.get(:default)))
-      Router.put("info_test_key1", "v1")
-      Router.put("info_test_key2", "v2")
+      Router.put(FerricStore.Instance.get(:default), "info_test_key1", "v1")
+      Router.put(FerricStore.Instance.get(:default), "info_test_key2", "v2")
 
       output = capture_io(fn -> Mix.Tasks.Ferricstore.Info.run([]) end)
 
@@ -73,8 +73,8 @@ defmodule Mix.Tasks.FerricstoreTest do
 
   describe "mix ferricstore.keys" do
     test "lists all keys when no pattern given" do
-      Router.put("key_alpha", "a")
-      Router.put("key_beta", "b")
+      Router.put(FerricStore.Instance.get(:default), "key_alpha", "a")
+      Router.put(FerricStore.Instance.get(:default), "key_beta", "b")
 
       output = capture_io(fn -> Mix.Tasks.Ferricstore.Keys.run([]) end)
 
@@ -83,9 +83,9 @@ defmodule Mix.Tasks.FerricstoreTest do
     end
 
     test "lists keys matching glob pattern" do
-      Router.put("user:1", "a")
-      Router.put("user:2", "b")
-      Router.put("session:1", "c")
+      Router.put(FerricStore.Instance.get(:default), "user:1", "a")
+      Router.put(FerricStore.Instance.get(:default), "user:2", "b")
+      Router.put(FerricStore.Instance.get(:default), "session:1", "c")
 
       output = capture_io(fn -> Mix.Tasks.Ferricstore.Keys.run(["user:*"]) end)
 
@@ -105,9 +105,9 @@ defmodule Mix.Tasks.FerricstoreTest do
     end
 
     test "matches single-char wildcard with ?" do
-      Router.put("k1", "a")
-      Router.put("k2", "b")
-      Router.put("k10", "c")
+      Router.put(FerricStore.Instance.get(:default), "k1", "a")
+      Router.put(FerricStore.Instance.get(:default), "k2", "b")
+      Router.put(FerricStore.Instance.get(:default), "k10", "c")
 
       output = capture_io(fn -> Mix.Tasks.Ferricstore.Keys.run(["k?"]) end)
 

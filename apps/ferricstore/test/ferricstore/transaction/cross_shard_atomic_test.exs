@@ -40,7 +40,7 @@ defmodule Ferricstore.Transaction.CrossShardAtomicTest do
 
   describe "test infrastructure" do
     test "keys route to different shards", %{cross_keys: keys} do
-      shards = Enum.map(keys, &Router.shard_for/1) |> Enum.uniq()
+      shards = Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end) |> Enum.uniq()
       assert length(shards) == length(keys)
     end
 

@@ -549,21 +549,21 @@ defmodule Ferricstore.ReviewR2.TransactionNamespaceIssuesTest do
 
   defp build_real_store do
     %{
-      get: &Router.get/1,
-      get_meta: &Router.get_meta/1,
-      put: &Router.put/3,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      keys: &Router.keys/0,
+      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
+      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
+      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
+      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
       flush: fn -> :ok end,
-      dbsize: &Router.dbsize/0,
-      incr: &Router.incr/2,
-      incr_float: &Router.incr_float/2,
-      append: &Router.append/2,
-      getset: &Router.getset/2,
-      getdel: &Router.getdel/1,
-      getex: &Router.getex/2,
-      setrange: &Router.setrange/3
+      dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
+      incr: fn k, d -> Router.incr(FerricStore.Instance.get(:default), k, d) end,
+      incr_float: fn k, d -> Router.incr_float(FerricStore.Instance.get(:default), k, d) end,
+      append: fn k, s -> Router.append(FerricStore.Instance.get(:default), k, s) end,
+      getset: fn k, v -> Router.getset(FerricStore.Instance.get(:default), k, v) end,
+      getdel: fn k -> Router.getdel(FerricStore.Instance.get(:default), k) end,
+      getex: fn k, e -> Router.getex(FerricStore.Instance.get(:default), k, e) end,
+      setrange: fn k, o, v -> Router.setrange(FerricStore.Instance.get(:default), k, o, v) end
     }
   end
 end

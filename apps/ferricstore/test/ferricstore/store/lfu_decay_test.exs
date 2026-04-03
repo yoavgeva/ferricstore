@@ -151,7 +151,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
   describe "packed LFU in keydir" do
     test "new key starts with packed LFU (counter=5, current ldt)" do
-      Router.put("lfu_packed_new", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_packed_new", "val")
       drain_all()
 
       packed = get_packed_lfu("lfu_packed_new")
@@ -164,7 +164,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
 
     test "packed LFU is a single integer (not bare counter)" do
-      Router.put("lfu_packed_check", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_packed_check", "val")
       drain_all()
 
       packed = get_packed_lfu("lfu_packed_check")
@@ -178,7 +178,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
 
     test "reading key updates packed LFU (touch increments counter)" do
-      Router.put("lfu_touch_test", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_touch_test", "val")
       drain_all()
 
       packed_before = get_packed_lfu("lfu_touch_test")
@@ -195,7 +195,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
 
     test "counter doesn't exceed 255 even with many reads" do
-      Router.put("lfu_cap_test", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_cap_test", "val")
       drain_all()
 
       # Set counter to max via direct ETS manipulation
@@ -217,7 +217,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
   describe "time-based decay" do
     test "key with old ldt gets counter decayed on access" do
-      Router.put("lfu_decay_access", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_decay_access", "val")
       drain_all()
 
       # Simulate a key that was last touched 20 minutes ago with counter=50
@@ -250,7 +250,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
 
     test "very old key decays counter to 0" do
-      Router.put("lfu_decay_zero", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_decay_zero", "val")
       drain_all()
 
       # Simulate a key last touched 500 minutes ago with counter=10
@@ -271,7 +271,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
 
     test "frequently accessed key maintains high counter despite decay" do
-      Router.put("lfu_hot_key", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_hot_key", "val")
       drain_all()
 
       # Set a high initial counter with current ldt
@@ -295,7 +295,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
       LFU.init_config_cache()
 
       try do
-        Router.put("lfu_no_decay", "val")
+        Router.put(FerricStore.Instance.get(:default), "lfu_no_decay", "val")
         drain_all()
 
         # Simulate old ldt with high counter
@@ -364,8 +364,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
   describe "eviction uses effective (decayed) counter" do
     test "recently-accessed key has higher effective counter than stale key" do
-      Router.put("evict_recent", "val")
-      Router.put("evict_stale", "val")
+      Router.put(FerricStore.Instance.get(:default), "evict_recent", "val")
+      Router.put(FerricStore.Instance.get(:default), "evict_stale", "val")
       drain_all()
 
       # Set stale key to old ldt with high raw counter
@@ -386,8 +386,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
 
     test "key with same raw counter but older ldt has lower effective counter" do
-      Router.put("eff_old", "val")
-      Router.put("eff_new", "val")
+      Router.put(FerricStore.Instance.get(:default), "eff_old", "val")
+      Router.put(FerricStore.Instance.get(:default), "eff_new", "val")
       drain_all()
 
       # Both keys: raw counter=40
@@ -418,7 +418,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
   describe "OBJECT FREQ returns effective counter" do
     test "returns decayed counter for existing key" do
-      Router.put("freq_key", "val")
+      Router.put(FerricStore.Instance.get(:default), "freq_key", "val")
       drain_all()
 
       # Set counter to known value with current ldt
@@ -426,8 +426,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
       :ets.update_element(keydir, "freq_key", {4, LFU.pack(LFU.now_minutes(), 42)})
 
       store = %{
-        get: &Router.get/1,
-        exists?: &Router.exists?/1
+        get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+        exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end
       }
 
       result = Ferricstore.Commands.Generic.handle("OBJECT", ["FREQ", "freq_key"], store)
@@ -435,7 +435,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
 
     test "returns decayed value for old key" do
-      Router.put("freq_old_key", "val")
+      Router.put(FerricStore.Instance.get(:default), "freq_old_key", "val")
       drain_all()
 
       # Set counter to 100 with ldt 50 minutes ago
@@ -444,8 +444,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
       :ets.update_element(keydir, "freq_old_key", {4, LFU.pack(old_ldt, 100)})
 
       store = %{
-        get: &Router.get/1,
-        exists?: &Router.exists?/1
+        get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+        exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end
       }
 
       result = Ferricstore.Commands.Generic.handle("OBJECT", ["FREQ", "freq_old_key"], store)
@@ -461,8 +461,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
     test "returns error for non-existent key" do
       store = %{
-        get: &Router.get/1,
-        exists?: &Router.exists?/1
+        get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+        exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end
       }
 
       assert {:error, "ERR no such key"} ==
@@ -476,7 +476,7 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
   describe "re-warm after eviction resets LFU" do
     test "re-warmed key gets fresh LFU (counter=5, current ldt)" do
-      Router.put("rewarm_lfu", "val")
+      Router.put(FerricStore.Instance.get(:default), "rewarm_lfu", "val")
       drain_all()
 
       # Bump counter high

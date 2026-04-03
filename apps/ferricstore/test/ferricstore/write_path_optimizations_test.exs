@@ -48,21 +48,21 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   # Helper: builds a store map backed by the real Router
   defp real_store do
     %{
-      get: &Router.get/1,
-      get_meta: &Router.get_meta/1,
-      put: &Router.put/3,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      incr: &Router.incr/2,
-      incr_float: &Router.incr_float/2,
-      append: &Router.append/2,
-      getset: &Router.getset/2,
-      getdel: &Router.getdel/1,
-      getex: &Router.getex/2,
-      setrange: &Router.setrange/3,
-      keys: &Router.keys/0,
-      keys_with_prefix: &Router.keys_with_prefix/1,
-      dbsize: &Router.dbsize/0
+      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
+      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
+      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
+      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+      incr: fn k, d -> Router.incr(FerricStore.Instance.get(:default), k, d) end,
+      incr_float: fn k, d -> Router.incr_float(FerricStore.Instance.get(:default), k, d) end,
+      append: fn k, s -> Router.append(FerricStore.Instance.get(:default), k, s) end,
+      getset: fn k, v -> Router.getset(FerricStore.Instance.get(:default), k, v) end,
+      getdel: fn k -> Router.getdel(FerricStore.Instance.get(:default), k) end,
+      getex: fn k, e -> Router.getex(FerricStore.Instance.get(:default), k, e) end,
+      setrange: fn k, o, v -> Router.setrange(FerricStore.Instance.get(:default), k, o, v) end,
+      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
+      keys_with_prefix: fn p -> Router.keys_with_prefix(FerricStore.Instance.get(:default), p) end,
+      dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end
     }
   end
 
@@ -574,28 +574,28 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     test "INCRBYFLOAT through bypass" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "10.5", 0)
-      assert {:ok, result} = Router.incr_float(key, 1.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), key, 1.5)
       assert_in_delta result, 12.0, 0.001
     end
 
     test "APPEND through bypass" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "hello", 0)
-      assert {:ok, 10} = Router.append(key, "world")
+      assert {:ok, 10} = Router.append(FerricStore.Instance.get(:default), key, "world")
       assert "helloworld" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "GETSET through bypass" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "old", 0)
-      assert "old" == Router.getset(key, "new")
+      assert "old" == Router.getset(FerricStore.Instance.get(:default), key, "new")
       assert "new" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "GETDEL through bypass" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "gone", 0)
-      assert "gone" == Router.getdel(key)
+      assert "gone" == Router.getdel(FerricStore.Instance.get(:default), key)
       assert nil == Router.get(FerricStore.Instance.get(:default), key)
     end
 
@@ -603,53 +603,53 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       key = ukey("qw")
       expire_at = System.os_time(:millisecond) + 60_000
       Router.put(FerricStore.Instance.get(:default), key, "getex_val", 0)
-      assert "getex_val" == Router.getex(key, expire_at)
+      assert "getex_val" == Router.getex(FerricStore.Instance.get(:default), key, expire_at)
     end
 
     test "SETRANGE through bypass" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "Hello World", 0)
-      assert {:ok, 11} = Router.setrange(key, 6, "Redis")
+      assert {:ok, 11} = Router.setrange(FerricStore.Instance.get(:default), key, 6, "Redis")
       assert "Hello Redis" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS through bypass" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "original", 0)
-      assert 1 == Router.cas(key, "original", "updated", nil)
+      assert 1 == Router.cas(FerricStore.Instance.get(:default), key, "original", "updated", nil)
       assert "updated" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS fails when expected value does not match" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "actual", 0)
-      assert 0 == Router.cas(key, "wrong", "updated", nil)
+      assert 0 == Router.cas(FerricStore.Instance.get(:default), key, "wrong", "updated", nil)
       assert "actual" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS on non-existent key returns nil" do
       key = ukey("qw_nonexist")
-      assert nil == Router.cas(key, "any", "new", nil)
+      assert nil == Router.cas(FerricStore.Instance.get(:default), key, "any", "new", nil)
     end
 
     test "LOCK/UNLOCK through bypass" do
       key = ukey("qw")
-      assert :ok = Router.lock(key, "owner1", 5_000)
-      assert 1 = Router.unlock(key, "owner1")
+      assert :ok = Router.lock(FerricStore.Instance.get(:default), key, "owner1", 5_000)
+      assert 1 = Router.unlock(FerricStore.Instance.get(:default), key, "owner1")
     end
 
     test "LOCK fails when already held" do
       key = ukey("qw")
-      Router.lock(key, "owner1", 5_000)
-      assert {:error, _} = Router.lock(key, "owner2", 5_000)
-      Router.unlock(key, "owner1")
+      Router.lock(FerricStore.Instance.get(:default), key, "owner1", 5_000)
+      assert {:error, _} = Router.lock(FerricStore.Instance.get(:default), key, "owner2", 5_000)
+      Router.unlock(FerricStore.Instance.get(:default), key, "owner1")
     end
 
     test "EXTEND through bypass" do
       key = ukey("qw")
-      Router.lock(key, "owner1", 5_000)
-      assert 1 = Router.extend(key, "owner1", 10_000)
-      Router.unlock(key, "owner1")
+      Router.lock(FerricStore.Instance.get(:default), key, "owner1", 5_000)
+      assert 1 = Router.extend(FerricStore.Instance.get(:default), key, "owner1", 10_000)
+      Router.unlock(FerricStore.Instance.get(:default), key, "owner1")
     end
 
     test "read-your-own-writes after quorum SET" do

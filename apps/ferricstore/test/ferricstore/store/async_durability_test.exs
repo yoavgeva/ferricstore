@@ -116,12 +116,12 @@ defmodule Ferricstore.Store.AsyncDurabilityTest do
 
     test "INCR_FLOAT works" do
       Router.put(FerricStore.Instance.get(:default), "async_test:float", "10.5", 0)
-      assert {:ok, result} = Router.incr_float("async_test:float", 2.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "async_test:float", 2.5)
       assert result == 13.0
     end
 
     test "INCR_FLOAT on nonexistent key" do
-      assert {:ok, result} = Router.incr_float("async_test:float_new", 3.14)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "async_test:float_new", 3.14)
       assert result == 3.14
     end
 
@@ -134,51 +134,51 @@ defmodule Ferricstore.Store.AsyncDurabilityTest do
 
     test "APPEND works" do
       Router.put(FerricStore.Instance.get(:default), "async_test:app", "hello", 0)
-      assert {:ok, 11} = Router.append("async_test:app", " world")
+      assert {:ok, 11} = Router.append(FerricStore.Instance.get(:default), "async_test:app", " world")
       assert Router.get(FerricStore.Instance.get(:default), "async_test:app") == "hello world"
     end
 
     test "APPEND on nonexistent key creates it" do
-      assert {:ok, 3} = Router.append("async_test:app_new", "foo")
+      assert {:ok, 3} = Router.append(FerricStore.Instance.get(:default), "async_test:app_new", "foo")
       assert Router.get(FerricStore.Instance.get(:default), "async_test:app_new") == "foo"
     end
 
     test "GETSET returns old value and sets new" do
       Router.put(FerricStore.Instance.get(:default), "async_test:gs", "old", 0)
-      assert Router.getset("async_test:gs", "new") == "old"
+      assert Router.getset(FerricStore.Instance.get(:default), "async_test:gs", "new") == "old"
       assert Router.get(FerricStore.Instance.get(:default), "async_test:gs") == "new"
     end
 
     test "GETSET on nonexistent returns nil" do
-      assert Router.getset("async_test:gs_new", "val") == nil
+      assert Router.getset(FerricStore.Instance.get(:default), "async_test:gs_new", "val") == nil
       assert Router.get(FerricStore.Instance.get(:default), "async_test:gs_new") == "val"
     end
 
     test "GETDEL returns value and deletes" do
       Router.put(FerricStore.Instance.get(:default), "async_test:gd", "val", 0)
-      assert Router.getdel("async_test:gd") == "val"
+      assert Router.getdel(FerricStore.Instance.get(:default), "async_test:gd") == "val"
       assert Router.get(FerricStore.Instance.get(:default), "async_test:gd") == nil
     end
 
     test "GETDEL on nonexistent returns nil" do
-      assert Router.getdel("async_test:gd_missing") == nil
+      assert Router.getdel(FerricStore.Instance.get(:default), "async_test:gd_missing") == nil
     end
 
     test "GETEX returns value and updates expiry" do
       Router.put(FerricStore.Instance.get(:default), "async_test:gx", "val", 0)
       exp = System.os_time(:millisecond) + 60_000
-      assert Router.getex("async_test:gx", exp) == "val"
+      assert Router.getex(FerricStore.Instance.get(:default), "async_test:gx", exp) == "val"
       assert Router.get(FerricStore.Instance.get(:default), "async_test:gx") == "val"
     end
 
     test "SETRANGE overwrites part of string" do
       Router.put(FerricStore.Instance.get(:default), "async_test:sr", "Hello World", 0)
-      assert {:ok, 11} = Router.setrange("async_test:sr", 6, "Redis")
+      assert {:ok, 11} = Router.setrange(FerricStore.Instance.get(:default), "async_test:sr", 6, "Redis")
       assert Router.get(FerricStore.Instance.get(:default), "async_test:sr") == "Hello Redis"
     end
 
     test "SETRANGE on nonexistent key zero-pads" do
-      assert {:ok, 8} = Router.setrange("async_test:sr_new", 5, "abc")
+      assert {:ok, 8} = Router.setrange(FerricStore.Instance.get(:default), "async_test:sr_new", 5, "abc")
       result = Router.get(FerricStore.Instance.get(:default), "async_test:sr_new")
       assert byte_size(result) == 8
       assert binary_part(result, 5, 3) == "abc"

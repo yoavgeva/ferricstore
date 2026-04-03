@@ -105,7 +105,7 @@ defmodule Ferricstore.Raft.BatcherTest do
         end
 
       # Group keys by shard
-      by_shard = Enum.group_by(keys, &Router.shard_for/1)
+      by_shard = Enum.group_by(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
 
       # Pick a shard that has multiple keys to test batching
       {shard_idx, shard_keys} = Enum.max_by(by_shard, fn {_, ks} -> length(ks) end)

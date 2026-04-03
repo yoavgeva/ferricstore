@@ -42,13 +42,13 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
     shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
 
     %{
-      get: &Router.get/1,
-      get_meta: &Router.get_meta/1,
-      put: &Router.put/3,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      keys: &Router.keys/0,
-      list_op: &Router.list_op/2,
+      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
+      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
+      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
+      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
+      list_op: fn k, op -> Router.list_op(FerricStore.Instance.get(:default), k, op) end,
       compound_get: fn _redis_key, compound_key ->
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
@@ -80,13 +80,13 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
   # still route correctly.
   defp build_dynamic_store do
     %{
-      get: &Router.get/1,
-      get_meta: &Router.get_meta/1,
-      put: &Router.put/3,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      keys: &Router.keys/0,
-      list_op: &Router.list_op/2,
+      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
+      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
+      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
+      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
+      list_op: fn k, op -> Router.list_op(FerricStore.Instance.get(:default), k, op) end,
       compound_get: fn redis_key, compound_key ->
         shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get, redis_key, compound_key})

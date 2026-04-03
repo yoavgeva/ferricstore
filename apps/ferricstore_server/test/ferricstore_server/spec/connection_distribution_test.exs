@@ -194,7 +194,7 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
       assert total >= 5
 
       # Cleanup
-      Enum.each(keys, &Router.delete/1)
+      Enum.each(keys, fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
     end
 
     test "total_memory_bytes is non-negative" do
@@ -240,7 +240,7 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
       assert total_after >= total_before + 3
 
       # Cleanup
-      Enum.each(new_keys, &Router.delete/1)
+      Enum.each(new_keys, fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
     end
   end
 end

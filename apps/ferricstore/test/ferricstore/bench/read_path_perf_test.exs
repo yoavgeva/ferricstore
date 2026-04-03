@@ -32,7 +32,7 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
 
     key = "#{prefix}:500"
     idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-    keydir = Router.resolve_keydir(idx)
+    keydir = Router.resolve_keydir(FerricStore.Instance.get(:default), idx)
 
     IO.puts("\n=== Read Path Per-Layer Cost (#{@iterations} iters, production sample_rate=100) ===\n")
 

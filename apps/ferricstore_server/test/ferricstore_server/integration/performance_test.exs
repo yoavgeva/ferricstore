@@ -407,7 +407,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
 
       # Write 10,000 keys directly through the Router
       for i <- 1..10_000 do
-        Router.put("mem_#{i}", "val_#{i}")
+        Router.put(FerricStore.Instance.get(:default), "mem_#{i}", "val_#{i}")
       end
 
       # Verify DBSIZE reflects the new keys
@@ -483,7 +483,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
       key = "ets_hot_#{:rand.uniform(9_999_999)}"
 
       # Write via Router to populate both Bitcask and ETS
-      Router.put(key, "hot_value")
+      Router.put(FerricStore.Instance.get(:default), key, "hot_value")
 
       # First get warms the ETS cache
       assert Router.get(FerricStore.Instance.get(:default), key) == "hot_value"

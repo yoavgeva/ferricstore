@@ -218,9 +218,9 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "write version increases after SET" do
       k = ukey("version_set")
 
-      v1 = Router.get_version(k)
+      v1 = Router.get_version(FerricStore.Instance.get(:default), k)
       :ok = Router.put(FerricStore.Instance.get(:default), k, "val", 0)
-      v2 = Router.get_version(k)
+      v2 = Router.get_version(FerricStore.Instance.get(:default), k)
 
       assert v2 > v1
     end
@@ -229,10 +229,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("version_del")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "val", 0)
-      v1 = Router.get_version(k)
+      v1 = Router.get_version(FerricStore.Instance.get(:default), k)
 
       :ok = Router.delete(FerricStore.Instance.get(:default), k)
-      v2 = Router.get_version(k)
+      v2 = Router.get_version(FerricStore.Instance.get(:default), k)
 
       assert v2 > v1
     end
@@ -241,10 +241,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("version_incr")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "0", 0)
-      v1 = Router.get_version(k)
+      v1 = Router.get_version(FerricStore.Instance.get(:default), k)
 
       {:ok, _} = Router.incr(FerricStore.Instance.get(:default), k, 1)
-      v2 = Router.get_version(k)
+      v2 = Router.get_version(FerricStore.Instance.get(:default), k)
 
       assert v2 > v1
     end
@@ -377,9 +377,9 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "write version changes are visible to get_version after Raft commit" do
       k = ukey("watch_raft")
 
-      v_before = Router.get_version(k)
+      v_before = Router.get_version(FerricStore.Instance.get(:default), k)
       :ok = Router.put(FerricStore.Instance.get(:default), k, "watched_val", 0)
-      v_after = Router.get_version(k)
+      v_after = Router.get_version(FerricStore.Instance.get(:default), k)
 
       # WATCH would have recorded v_before; after the Raft-committed write,
       # get_version returns a different (higher) value, so EXEC would abort.
@@ -391,10 +391,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("watch_del")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "will_del", 0)
-      v_before = Router.get_version(k)
+      v_before = Router.get_version(FerricStore.Instance.get(:default), k)
 
       :ok = Router.delete(FerricStore.Instance.get(:default), k)
-      v_after = Router.get_version(k)
+      v_after = Router.get_version(FerricStore.Instance.get(:default), k)
 
       assert v_after > v_before
     end
@@ -403,10 +403,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("watch_incr")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "5", 0)
-      v_before = Router.get_version(k)
+      v_before = Router.get_version(FerricStore.Instance.get(:default), k)
 
       {:ok, _} = Router.incr(FerricStore.Instance.get(:default), k, 1)
-      v_after = Router.get_version(k)
+      v_after = Router.get_version(FerricStore.Instance.get(:default), k)
 
       assert v_after > v_before
     end
@@ -416,7 +416,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("watch_concurrent")
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), k)
 
-      v_before = Router.get_version(k)
+      v_before = Router.get_version(FerricStore.Instance.get(:default), k)
 
       # Write several keys to the same shard
       keys =
@@ -428,7 +428,7 @@ defmodule Ferricstore.Raft.WritePathTest do
         :ok = Router.put(FerricStore.Instance.get(:default), kk, "v", 0)
       end
 
-      v_after = Router.get_version(k)
+      v_after = Router.get_version(FerricStore.Instance.get(:default), k)
 
       # Version should have increased by at least the number of writes
       assert v_after >= v_before + length(keys)
@@ -953,7 +953,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       :ok = Router.put(FerricStore.Instance.get(:default), k, "old_val", 0)
       assert "old_val" == Router.get(FerricStore.Instance.get(:default), k)
 
-      assert 1 = Router.cas(k, "old_val", "new_val", nil)
+      assert 1 = Router.cas(FerricStore.Instance.get(:default), k, "old_val", "new_val", nil)
       assert "new_val" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
@@ -961,14 +961,14 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("cas_mismatch")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "current", 0)
-      assert 0 = Router.cas(k, "wrong_expected", "new", nil)
+      assert 0 = Router.cas(FerricStore.Instance.get(:default), k, "wrong_expected", "new", nil)
       assert "current" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "missing key returns nil" do
       k = ukey("cas_missing")
 
-      assert nil == Router.cas(k, "anything", "new", nil)
+      assert nil == Router.cas(FerricStore.Instance.get(:default), k, "anything", "new", nil)
       assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
@@ -976,7 +976,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("cas_ttl")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "v1", 0)
-      assert 1 = Router.cas(k, "v1", "v2", 60_000)
+      assert 1 = Router.cas(FerricStore.Instance.get(:default), k, "v1", "v2", 60_000)
 
       {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "v2"
@@ -989,7 +989,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       future = System.os_time(:millisecond) + 120_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "v1", future)
-      assert 1 = Router.cas(k, "v1", "v2", nil)
+      assert 1 = Router.cas(FerricStore.Instance.get(:default), k, "v1", "v2", nil)
 
       {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "v2"
@@ -1001,7 +1001,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       past = System.os_time(:millisecond) - 1_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "expired_val", past)
-      assert nil == Router.cas(k, "expired_val", "new", nil)
+      assert nil == Router.cas(FerricStore.Instance.get(:default), k, "expired_val", "new", nil)
     end
   end
 
@@ -1013,7 +1013,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "acquires lock on non-existent key" do
       k = ukey("lock_acquire")
 
-      assert :ok = Router.lock(k, "owner1", 30_000)
+      assert :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
       assert "owner1" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
@@ -1022,30 +1022,30 @@ defmodule Ferricstore.Raft.WritePathTest do
       past = System.os_time(:millisecond) - 1_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "stale_owner", past)
-      assert :ok = Router.lock(k, "new_owner", 30_000)
+      assert :ok = Router.lock(FerricStore.Instance.get(:default), k, "new_owner", 30_000)
       assert "new_owner" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "re-acquire by same owner succeeds" do
       k = ukey("lock_reacquire")
 
-      assert :ok = Router.lock(k, "owner1", 30_000)
-      assert :ok = Router.lock(k, "owner1", 60_000)
+      assert :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
+      assert :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 60_000)
       assert "owner1" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "returns error when locked by different owner" do
       k = ukey("lock_conflict")
 
-      assert :ok = Router.lock(k, "owner1", 30_000)
+      assert :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
       assert {:error, "DISTLOCK lock is held by another owner"} =
-               Router.lock(k, "owner2", 30_000)
+               Router.lock(FerricStore.Instance.get(:default), k, "owner2", 30_000)
     end
 
     test "lock sets TTL on the key" do
       k = ukey("lock_ttl")
 
-      assert :ok = Router.lock(k, "owner1", 30_000)
+      assert :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
       {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "owner1"
       assert expire_at_ms > System.os_time(:millisecond)
@@ -1061,26 +1061,26 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "releases lock when owner matches" do
       k = ukey("unlock_match")
 
-      :ok = Router.lock(k, "owner1", 30_000)
+      :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
       assert "owner1" == Router.get(FerricStore.Instance.get(:default), k)
 
-      assert 1 = Router.unlock(k, "owner1")
+      assert 1 = Router.unlock(FerricStore.Instance.get(:default), k, "owner1")
       assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "returns error when caller is not the owner" do
       k = ukey("unlock_wrong_owner")
 
-      :ok = Router.lock(k, "owner1", 30_000)
+      :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
       assert {:error, "DISTLOCK caller is not the lock owner"} =
-               Router.unlock(k, "owner2")
+               Router.unlock(FerricStore.Instance.get(:default), k, "owner2")
       # Lock should still be held
       assert "owner1" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "unlocking non-existent key returns 1" do
       k = ukey("unlock_missing")
-      assert 1 = Router.unlock(k, "anyone")
+      assert 1 = Router.unlock(FerricStore.Instance.get(:default), k, "anyone")
     end
   end
 
@@ -1092,11 +1092,11 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "extends TTL when owner matches" do
       k = ukey("extend_match")
 
-      :ok = Router.lock(k, "owner1", 10_000)
+      :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 10_000)
       {_, expire_before} = Router.get_meta(FerricStore.Instance.get(:default), k)
 
       # Extend with a longer TTL
-      assert 1 = Router.extend(k, "owner1", 60_000)
+      assert 1 = Router.extend(FerricStore.Instance.get(:default), k, "owner1", 60_000)
 
       {value, expire_after} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "owner1"
@@ -1106,16 +1106,16 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "returns error when caller is not the owner" do
       k = ukey("extend_wrong_owner")
 
-      :ok = Router.lock(k, "owner1", 30_000)
+      :ok = Router.lock(FerricStore.Instance.get(:default), k, "owner1", 30_000)
       assert {:error, "DISTLOCK caller is not the lock owner"} =
-               Router.extend(k, "owner2", 60_000)
+               Router.extend(FerricStore.Instance.get(:default), k, "owner2", 60_000)
     end
 
     test "returns error when key does not exist" do
       k = ukey("extend_missing")
 
       assert {:error, "DISTLOCK lock does not exist or has expired"} =
-               Router.extend(k, "owner1", 60_000)
+               Router.extend(FerricStore.Instance.get(:default), k, "owner1", 60_000)
     end
 
     test "returns error when lock has expired" do
@@ -1124,7 +1124,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "owner1", past)
       assert {:error, "DISTLOCK lock does not exist or has expired"} =
-               Router.extend(k, "owner1", 60_000)
+               Router.extend(FerricStore.Instance.get(:default), k, "owner1", 60_000)
     end
   end
 
@@ -1139,7 +1139,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       max_requests = 10
 
       [status, count, remaining, _ttl] =
-        Router.ratelimit_add(k, window_ms, max_requests, 1)
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
 
       assert status == "allowed"
       assert count == 1
@@ -1151,9 +1151,9 @@ defmodule Ferricstore.Raft.WritePathTest do
       window_ms = 10_000
       max_requests = 10
 
-      [_, c1, _, _] = Router.ratelimit_add(k, window_ms, max_requests, 1)
-      [_, c2, _, _] = Router.ratelimit_add(k, window_ms, max_requests, 1)
-      [_, c3, _, _] = Router.ratelimit_add(k, window_ms, max_requests, 1)
+      [_, c1, _, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
+      [_, c2, _, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
+      [_, c3, _, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
 
       assert c1 == 1
       assert c2 == 2
@@ -1166,11 +1166,11 @@ defmodule Ferricstore.Raft.WritePathTest do
       max_requests = 3
 
       # Use up the limit
-      ["allowed", _, _, _] = Router.ratelimit_add(k, window_ms, max_requests, 3)
+      ["allowed", _, _, _] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 3)
 
       # Next request should be denied
       [status, count, remaining, _ttl] =
-        Router.ratelimit_add(k, window_ms, max_requests, 1)
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
 
       assert status == "denied"
       assert count == 3
@@ -1182,7 +1182,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       window_ms = 10_000
       max_requests = 100
 
-      [_, _, _, ttl] = Router.ratelimit_add(k, window_ms, max_requests, 1)
+      [_, _, _, ttl] = Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 1)
       assert is_integer(ttl)
       assert ttl >= 0
       assert ttl <= window_ms
@@ -1194,7 +1194,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       max_requests = 10
 
       [status, count, remaining, _ttl] =
-        Router.ratelimit_add(k, window_ms, max_requests, 5)
+        Router.ratelimit_add(FerricStore.Instance.get(:default), k, window_ms, max_requests, 5)
 
       assert status == "allowed"
       assert count == 5
@@ -1210,7 +1210,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "returns correct float on non-existent key" do
       k = ukey("incrbyfloat_new")
 
-      assert {:ok, result} = Router.incr_float(k, 1.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), k, 1.5)
       assert_in_delta result, 1.5, 0.001
       {parsed, _} = Float.parse(Router.get(FerricStore.Instance.get(:default), k))
       assert_in_delta parsed, 1.5, 0.001
@@ -1220,7 +1220,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incrbyfloat_existing")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "10", 0)
-      assert {:ok, result} = Router.incr_float(k, 2.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), k, 2.5)
       assert_in_delta result, 12.5, 0.001
       {parsed, _} = Float.parse(Router.get(FerricStore.Instance.get(:default), k))
       assert_in_delta parsed, 12.5, 0.001
@@ -1230,7 +1230,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incrbyfloat_int")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "10", 0)
-      assert {:ok, result} = Router.incr_float(k, 1.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), k, 1.5)
       assert_in_delta result, 11.5, 0.001
     end
 
@@ -1238,7 +1238,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incrbyfloat_err")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "not_a_number", 0)
-      assert {:error, "ERR value is not a valid float"} = Router.incr_float(k, 1.0)
+      assert {:error, "ERR value is not a valid float"} = Router.incr_float(FerricStore.Instance.get(:default), k, 1.0)
       # Original value should be unchanged
       assert "not_a_number" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1248,7 +1248,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       future = System.os_time(:millisecond) + 60_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "5.0", future)
-      {:ok, _} = Router.incr_float(k, 1.0)
+      {:ok, _} = Router.incr_float(FerricStore.Instance.get(:default), k, 1.0)
 
       {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       {parsed, _} = Float.parse(value)
@@ -1265,7 +1265,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "returns new length on non-existent key" do
       k = ukey("append_new")
 
-      assert {:ok, 5} = Router.append(k, "hello")
+      assert {:ok, 5} = Router.append(FerricStore.Instance.get(:default), k, "hello")
       assert "hello" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
@@ -1273,16 +1273,16 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("append_existing")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "hello", 0)
-      assert {:ok, 11} = Router.append(k, " world")
+      assert {:ok, 11} = Router.append(FerricStore.Instance.get(:default), k, " world")
       assert "hello world" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "multiple appends produce correct result" do
       k = ukey("append_multi")
 
-      {:ok, 1} = Router.append(k, "a")
-      {:ok, 2} = Router.append(k, "b")
-      {:ok, 3} = Router.append(k, "c")
+      {:ok, 1} = Router.append(FerricStore.Instance.get(:default), k, "a")
+      {:ok, 2} = Router.append(FerricStore.Instance.get(:default), k, "b")
+      {:ok, 3} = Router.append(FerricStore.Instance.get(:default), k, "c")
       assert "abc" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
@@ -1291,7 +1291,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       future = System.os_time(:millisecond) + 60_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "hi", future)
-      {:ok, 8} = Router.append(k, " there")
+      {:ok, 8} = Router.append(FerricStore.Instance.get(:default), k, " there")
 
       {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "hi there"
@@ -1308,7 +1308,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("getset_basic")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "old_value", 0)
-      old = Router.getset(k, "new_value")
+      old = Router.getset(FerricStore.Instance.get(:default), k, "new_value")
       assert old == "old_value"
       assert "new_value" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1316,7 +1316,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "returns nil when key does not exist" do
       k = ukey("getset_missing")
 
-      old = Router.getset(k, "first_value")
+      old = Router.getset(FerricStore.Instance.get(:default), k, "first_value")
       assert old == nil
       assert "first_value" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1326,7 +1326,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       future = System.os_time(:millisecond) + 60_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "old", future)
-      _old = Router.getset(k, "new")
+      _old = Router.getset(FerricStore.Instance.get(:default), k, "new")
 
       {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "new"
@@ -1344,7 +1344,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("getdel_basic")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "will_vanish", 0)
-      old = Router.getdel(k)
+      old = Router.getdel(FerricStore.Instance.get(:default), k)
       assert old == "will_vanish"
       assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1352,7 +1352,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "returns nil when key does not exist" do
       k = ukey("getdel_missing")
 
-      old = Router.getdel(k)
+      old = Router.getdel(FerricStore.Instance.get(:default), k)
       assert old == nil
     end
 
@@ -1362,7 +1362,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       :ok = Router.put(FerricStore.Instance.get(:default), k, "in_ets", 0)
       assert [{^k, "in_ets", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
 
-      _old = Router.getdel(k)
+      _old = Router.getdel(FerricStore.Instance.get(:default), k)
       assert [] == :ets.lookup(keydir_for(k), k)
     end
   end
@@ -1377,7 +1377,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       future = System.os_time(:millisecond) + 120_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "my_val", 0)
-      value = Router.getex(k, future)
+      value = Router.getex(FerricStore.Instance.get(:default), k, future)
       assert value == "my_val"
 
       {stored_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
@@ -1388,7 +1388,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "returns nil when key does not exist" do
       k = ukey("getex_missing")
 
-      value = Router.getex(k, System.os_time(:millisecond) + 60_000)
+      value = Router.getex(FerricStore.Instance.get(:default), k, System.os_time(:millisecond) + 60_000)
       assert value == nil
     end
 
@@ -1398,7 +1398,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "persistent", future)
       # PERSIST = expire_at_ms of 0
-      value = Router.getex(k, 0)
+      value = Router.getex(FerricStore.Instance.get(:default), k, 0)
       assert value == "persistent"
 
       {stored_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
@@ -1416,14 +1416,14 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("setrange_basic")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "Hello World", 0)
-      assert {:ok, 11} = Router.setrange(k, 6, "Redis")
+      assert {:ok, 11} = Router.setrange(FerricStore.Instance.get(:default), k, 6, "Redis")
       assert "Hello Redis" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "pads with zero bytes for non-existent key" do
       k = ukey("setrange_new")
 
-      assert {:ok, 8} = Router.setrange(k, 5, "abc")
+      assert {:ok, 8} = Router.setrange(FerricStore.Instance.get(:default), k, 5, "abc")
       value = Router.get(FerricStore.Instance.get(:default), k)
       assert byte_size(value) == 8
       # First 5 bytes should be zero
@@ -1435,7 +1435,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("setrange_extend")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "Hi", 0)
-      assert {:ok, 7} = Router.setrange(k, 2, "There")
+      assert {:ok, 7} = Router.setrange(FerricStore.Instance.get(:default), k, 2, "There")
       assert "HiThere" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
@@ -1444,7 +1444,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       future = System.os_time(:millisecond) + 60_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "abcdef", future)
-      {:ok, _len} = Router.setrange(k, 0, "XY")
+      {:ok, _len} = Router.setrange(FerricStore.Instance.get(:default), k, 0, "XY")
 
       {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "XYcdef"
@@ -1515,7 +1515,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       # SET ... GET semantics: atomically set new value and return old.
       # In Ferricstore, GETSET provides this exact behaviour through Raft.
-      old = Router.getset(k, "new_value")
+      old = Router.getset(FerricStore.Instance.get(:default), k, "new_value")
       assert old == "old_value"
       assert "new_value" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1578,7 +1578,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incrbyfloat_int_str")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "10", 0)
-      assert {:ok, result} = Router.incr_float(k, 0.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), k, 0.5)
       assert_in_delta result, 10.5, 0.001
       {parsed, _} = Float.parse(Router.get(FerricStore.Instance.get(:default), k))
       assert_in_delta parsed, 10.5, 0.001
@@ -1588,7 +1588,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incrbyfloat_neg")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "10.5", 0)
-      assert {:ok, result} = Router.incr_float(k, -0.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), k, -0.5)
       assert_in_delta result, 10.0, 0.001
       {parsed, _} = Float.parse(Router.get(FerricStore.Instance.get(:default), k))
       assert_in_delta parsed, 10.0, 0.001
@@ -1598,7 +1598,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("incrbyfloat_nan")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "not_a_number", 0)
-      assert {:error, "ERR value is not a valid float"} = Router.incr_float(k, 1.0)
+      assert {:error, "ERR value is not a valid float"} = Router.incr_float(FerricStore.Instance.get(:default), k, 1.0)
       # Original value should be unchanged
       assert "not_a_number" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1608,7 +1608,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       future = System.os_time(:millisecond) + 120_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "5.0", future)
-      {:ok, _} = Router.incr_float(k, 2.5)
+      {:ok, _} = Router.incr_float(FerricStore.Instance.get(:default), k, 2.5)
 
       {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       {parsed, _} = Float.parse(value)
@@ -1626,7 +1626,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("append_create")
 
       # Key does not exist; APPEND should create it with the given value.
-      assert {:ok, 5} = Router.append(k, "hello")
+      assert {:ok, 5} = Router.append(FerricStore.Instance.get(:default), k, "hello")
       assert "hello" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
@@ -1635,7 +1635,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       future = System.os_time(:millisecond) + 120_000
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "base", future)
-      {:ok, 10} = Router.append(k, "_added")
+      {:ok, 10} = Router.append(FerricStore.Instance.get(:default), k, "_added")
 
       {value, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
       assert value == "base_added"
@@ -1646,7 +1646,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("append_empty")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "existing", 0)
-      {:ok, len} = Router.append(k, "")
+      {:ok, len} = Router.append(FerricStore.Instance.get(:default), k, "")
       assert len == byte_size("existing")
       assert "existing" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1660,7 +1660,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "GETSET on non-existent key returns nil, creates key" do
       k = ukey("getset_nonexistent")
 
-      old = Router.getset(k, "fresh_value")
+      old = Router.getset(FerricStore.Instance.get(:default), k, "fresh_value")
       assert old == nil
       assert "fresh_value" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1670,7 +1670,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "GETDEL on non-existent key returns nil" do
       k = ukey("getdel_nonexistent")
 
-      result = Router.getdel(k)
+      result = Router.getdel(FerricStore.Instance.get(:default), k)
       assert result == nil
       # Key should still not exist
       assert nil == Router.get(FerricStore.Instance.get(:default), k)
@@ -1689,7 +1689,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert expire_before == future
 
       # PERSIST = expire_at_ms of 0
-      value = Router.getex(k, 0)
+      value = Router.getex(FerricStore.Instance.get(:default), k, 0)
       assert value == "will_persist"
 
       {stored_val, expire_at_ms} = Router.get_meta(FerricStore.Instance.get(:default), k)
@@ -1704,7 +1704,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       :ok = Router.put(FerricStore.Instance.get(:default), k, "expired_val", past)
 
       # Key is expired; GETEX should return nil
-      result = Router.getex(k, System.os_time(:millisecond) + 60_000)
+      result = Router.getex(FerricStore.Instance.get(:default), k, System.os_time(:millisecond) + 60_000)
       assert result == nil
     end
   end
@@ -1719,7 +1719,7 @@ defmodule Ferricstore.Raft.WritePathTest do
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "Hi", 0)
       # Offset 5 is beyond "Hi" (length 2), so bytes 2..4 are zero-padded
-      assert {:ok, 8} = Router.setrange(k, 5, "abc")
+      assert {:ok, 8} = Router.setrange(FerricStore.Instance.get(:default), k, 5, "abc")
 
       value = Router.get(FerricStore.Instance.get(:default), k)
       assert byte_size(value) == 8
@@ -1731,7 +1731,7 @@ defmodule Ferricstore.Raft.WritePathTest do
       k = ukey("setrange_offset0")
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, "Hello World", 0)
-      assert {:ok, 11} = Router.setrange(k, 0, "Yo")
+      assert {:ok, 11} = Router.setrange(FerricStore.Instance.get(:default), k, 0, "Yo")
       # "Yo" replaces the first 2 bytes: "He" -> "Yo", rest unchanged
       assert "Yollo World" == Router.get(FerricStore.Instance.get(:default), k)
     end
@@ -1739,7 +1739,7 @@ defmodule Ferricstore.Raft.WritePathTest do
     test "SETRANGE on non-existent key creates zero-padded value" do
       k = ukey("setrange_nonexistent")
 
-      assert {:ok, 8} = Router.setrange(k, 5, "abc")
+      assert {:ok, 8} = Router.setrange(FerricStore.Instance.get(:default), k, 5, "abc")
       value = Router.get(FerricStore.Instance.get(:default), k)
       assert byte_size(value) == 8
       # 5 zero bytes followed by "abc"

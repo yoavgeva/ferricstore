@@ -63,7 +63,7 @@ defmodule Ferricstore.Raft.WalRecoveryTest do
       # The ra system is already running. Verify it's still healthy
       # by doing a write through Raft (which uses the WAL).
       k = "wal_fix_#{:rand.uniform(999_999)}"
-      Ferricstore.Store.Router.put(k, "after_empty_wal")
+      Ferricstore.Store.Router.put(FerricStore.Instance.get(:default), k, "after_empty_wal")
       assert Ferricstore.Store.Router.get(FerricStore.Instance.get(:default), k) == "after_empty_wal"
 
       File.rm(empty_wal)

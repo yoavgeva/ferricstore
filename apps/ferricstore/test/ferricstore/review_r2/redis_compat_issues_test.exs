@@ -292,7 +292,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       Router.put(FerricStore.Instance.get(:default), key, "original", 0)
 
       # Snapshot version after the write
-      version_before = Router.get_version(key)
+      version_before = Router.get_version(FerricStore.Instance.get(:default), key)
 
       # SET NX should fail (key exists) and NOT modify anything
       store = build_real_store()
@@ -302,7 +302,7 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       assert result == nil
 
       # Version should not have changed
-      version_after = Router.get_version(key)
+      version_after = Router.get_version(FerricStore.Instance.get(:default), key)
 
       assert version_before == version_after,
              "R2-H13: Version changed from #{version_before} to #{version_after} despite NX skip"
@@ -400,21 +400,21 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
 
   defp build_real_store do
     %{
-      get: &Router.get/1,
-      get_meta: &Router.get_meta/1,
-      put: &Router.put/3,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      keys: &Router.keys/0,
+      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
+      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
+      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
+      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
       flush: fn -> :ok end,
-      dbsize: &Router.dbsize/0,
-      incr: &Router.incr/2,
-      incr_float: &Router.incr_float/2,
-      append: &Router.append/2,
-      getset: &Router.getset/2,
-      getdel: &Router.getdel/1,
-      getex: &Router.getex/2,
-      setrange: &Router.setrange/3,
+      dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
+      incr: fn k, d -> Router.incr(FerricStore.Instance.get(:default), k, d) end,
+      incr_float: fn k, d -> Router.incr_float(FerricStore.Instance.get(:default), k, d) end,
+      append: fn k, s -> Router.append(FerricStore.Instance.get(:default), k, s) end,
+      getset: fn k, v -> Router.getset(FerricStore.Instance.get(:default), k, v) end,
+      getdel: fn k -> Router.getdel(FerricStore.Instance.get(:default), k) end,
+      getex: fn k, e -> Router.getex(FerricStore.Instance.get(:default), k, e) end,
+      setrange: fn k, o, v -> Router.setrange(FerricStore.Instance.get(:default), k, o, v) end,
       compound_get: fn redis_key, compound_key ->
         shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get, redis_key, compound_key})

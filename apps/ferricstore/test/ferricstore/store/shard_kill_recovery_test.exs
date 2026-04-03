@@ -50,7 +50,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
 
   # Write data through Raft and ensure it is fully committed to disk.
   defp write_and_flush(key, value) do
-    Router.put(key, value)
+    Router.put(FerricStore.Instance.get(:default), key, value)
     ShardHelpers.flush_all_shards()
   end
 
@@ -149,7 +149,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       keys =
         for i <- 0..3 do
           k = ukey_for_shard(i)
-          Router.put(k, "shard_#{i}_data")
+          Router.put(FerricStore.Instance.get(:default), k, "shard_#{i}_data")
           {k, i}
         end
 
@@ -206,7 +206,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
   describe "edge cases" do
     test "8. kill shard immediately after write (no flush) — no crash" do
       key = ukey_for_shard(0)
-      Router.put(key, "maybe_lost")
+      Router.put(FerricStore.Instance.get(:default), key, "maybe_lost")
       # Intentionally NO flush — data may or may not be on disk
 
       ShardHelpers.kill_shard_safely(0)
@@ -233,7 +233,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
             results =
               Enum.map(1..10, fn j ->
                 try do
-                  Router.put("#{key}_w#{i}_#{j}", "val_#{j}")
+                  Router.put(FerricStore.Instance.get(:default), "#{key}_w#{i}_#{j}", "val_#{j}")
                   :ok
                 rescue
                   _ -> :error
@@ -345,8 +345,8 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       key0 = ukey_for_shard(0)
       key1 = ukey_for_shard(1)
 
-      Router.put(key0, "shard0_rapid")
-      Router.put(key1, "shard1_rapid")
+      Router.put(FerricStore.Instance.get(:default), key0, "shard0_rapid")
+      Router.put(FerricStore.Instance.get(:default), key1, "shard1_rapid")
       ShardHelpers.flush_all_shards()
 
       ShardHelpers.kill_shard_safely(0)

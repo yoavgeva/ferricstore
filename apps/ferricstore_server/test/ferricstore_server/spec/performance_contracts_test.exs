@@ -149,7 +149,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
     @tag :bench
     test "1000 Router.get calls on a warm key complete in < 1000ms (avg < 1ms)" do
       key = ukey("warm_get")
-      Router.put(key, "warm_value")
+      Router.put(FerricStore.Instance.get(:default), key, "warm_value")
 
       # Warm the ETS hot cache
       for _ <- 1..100, do: Router.get(FerricStore.Instance.get(:default), key)
@@ -342,7 +342,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
     @tag :bench
     test "warm Router.get is faster than cold GenServer.call path" do
       key = ukey("hot_cold")
-      Router.put(key, "test_value")
+      Router.put(FerricStore.Instance.get(:default), key, "test_value")
 
       # First get to warm the hot cache
       Router.get(FerricStore.Instance.get(:default), key)
@@ -360,7 +360,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
       # Record cold path time by doing repeated GenServer calls
       # (Force cache miss by using a key pattern that bypasses ETS)
       cold_keys = for i <- 1..100, do: ukey("cold_#{i}")
-      Enum.each(cold_keys, fn k -> Router.put(k, "cold_value") end)
+      Enum.each(cold_keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "cold_value") end)
 
       # Evict cold keys from keydir to force cold reads
       Enum.each(cold_keys, fn k ->
@@ -387,7 +387,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
 
       # Clean up
       Router.delete(FerricStore.Instance.get(:default), key)
-      Enum.each(cold_keys, &Router.delete/1)
+      Enum.each(cold_keys, fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
     end
   end
 end

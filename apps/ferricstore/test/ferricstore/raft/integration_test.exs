@@ -122,7 +122,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
     test "writes to different shards are independent" do
       # Generate keys that map to different shards
       keys = for i <- 1..20, do: ukey("multi_#{i}")
-      shard_indices = Enum.map(keys, &Router.shard_for/1) |> Enum.uniq()
+      shard_indices = Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end) |> Enum.uniq()
 
       # Should have keys in multiple shards
       assert length(shard_indices) >= 2

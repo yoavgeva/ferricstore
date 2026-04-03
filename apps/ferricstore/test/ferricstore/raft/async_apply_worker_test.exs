@@ -70,7 +70,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
         end
 
       # Group by shard
-      by_shard = Enum.group_by(keys, &Router.shard_for/1)
+      by_shard = Enum.group_by(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
       {shard_idx, shard_keys} = Enum.max_by(by_shard, fn {_, ks} -> length(ks) end)
 
       commands =
@@ -184,7 +184,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorkerTest do
         end
 
       # Submit all writes grouped by shard
-      by_shard = Enum.group_by(keys, &Router.shard_for/1)
+      by_shard = Enum.group_by(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
 
       for {shard_idx, shard_keys} <- by_shard do
         commands = Enum.map(shard_keys, fn k -> {:put, k, "val_#{k}", 0} end)

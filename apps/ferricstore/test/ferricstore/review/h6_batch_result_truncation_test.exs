@@ -41,7 +41,7 @@ defmodule Ferricstore.Review.H6BatchResultTruncationTest do
       keys = for i <- 1..n, do: ukey(i)
 
       # Group by shard and pick the shard with the most keys.
-      by_shard = Enum.group_by(keys, &Router.shard_for/1)
+      by_shard = Enum.group_by(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end)
       {shard_idx, shard_keys} = Enum.max_by(by_shard, fn {_, ks} -> length(ks) end)
 
       # Fire all writes concurrently so they accumulate in the same batch.

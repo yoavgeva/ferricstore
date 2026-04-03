@@ -28,15 +28,15 @@ defmodule Ferricstore.Store.PrefixInterningTest do
   # Builds a store map backed by the real Router (application-supervised shards).
   defp real_store do
     %{
-      get: &Router.get/1,
-      get_meta: &Router.get_meta/1,
-      put: &Router.put/3,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      keys: &Router.keys/0,
-      keys_with_prefix: &Router.keys_with_prefix/1,
+      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
+      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
+      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
+      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
+      keys_with_prefix: fn p -> Router.keys_with_prefix(FerricStore.Instance.get(:default), p) end,
       flush: fn -> :ok end,
-      dbsize: &Router.dbsize/0
+      dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end
     }
   end
 
@@ -84,7 +84,7 @@ defmodule Ferricstore.Store.PrefixInterningTest do
 
       # The key should appear when querying the prefix index for "session"
       # through the Router
-      keys = Router.keys_with_prefix("session")
+      keys = Router.keys_with_prefix(FerricStore.Instance.get(:default), "session")
       assert key in keys
     end
 
@@ -94,7 +94,7 @@ defmodule Ferricstore.Store.PrefixInterningTest do
       store.put.(key, "val", 0)
 
       # No prefix extracted, so querying any prefix should not return it
-      assert ukey("nocolon") not in Router.keys_with_prefix("nocolon")
+      assert ukey("nocolon") not in Router.keys_with_prefix(FerricStore.Instance.get(:default), "nocolon")
     end
 
     test "overwriting a key does not duplicate in prefix index" do
@@ -104,7 +104,7 @@ defmodule Ferricstore.Store.PrefixInterningTest do
       store.put.(key, "v2", 0)
 
       # The key should appear exactly once
-      matches = Router.keys_with_prefix("session")
+      matches = Router.keys_with_prefix(FerricStore.Instance.get(:default), "session")
       assert Enum.count(matches, &(&1 == key)) == 1
     end
   end
@@ -118,10 +118,10 @@ defmodule Ferricstore.Store.PrefixInterningTest do
       store = real_store()
       key = "session:del_test_#{:rand.uniform(9_999_999)}"
       store.put.(key, "val", 0)
-      assert key in Router.keys_with_prefix("session")
+      assert key in Router.keys_with_prefix(FerricStore.Instance.get(:default), "session")
 
       store.delete.(key)
-      refute key in Router.keys_with_prefix("session")
+      refute key in Router.keys_with_prefix(FerricStore.Instance.get(:default), "session")
     end
 
     test "deleting a non-existent key is safe" do
@@ -342,7 +342,7 @@ defmodule Ferricstore.Store.PrefixInterningTest do
       key = ":empty_prefix_#{:rand.uniform(9_999_999)}"
       store.put.(key, "v", 0)
 
-      results = Router.keys_with_prefix("")
+      results = Router.keys_with_prefix(FerricStore.Instance.get(:default), "")
       assert key in results
     end
 
@@ -351,7 +351,7 @@ defmodule Ferricstore.Store.PrefixInterningTest do
       key = ":::"
       store.put.(key, "v", 0)
 
-      results = Router.keys_with_prefix("")
+      results = Router.keys_with_prefix(FerricStore.Instance.get(:default), "")
       assert key in results
 
       store.delete.(key)

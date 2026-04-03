@@ -179,7 +179,7 @@ defmodule FerricstoreServer.Spec.EdgeCasesTest do
       key = :binary.copy(<<0>>, 32)
       value = "router_null_key"
 
-      Router.put(key, value)
+      Router.put(FerricStore.Instance.get(:default), key, value)
       assert Router.get(FerricStore.Instance.get(:default), key) == value
       assert Router.exists?(FerricStore.Instance.get(:default), key) == true
 

@@ -29,14 +29,14 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
   # Builds a store map backed by the real Router (application-supervised shards).
   defp real_store do
     %{
-      get: &Router.get/1,
-      get_meta: &Router.get_meta/1,
-      put: &Router.put/3,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      keys: &Router.keys/0,
+      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
+      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end,
+      put: fn k, v, e -> Router.put(FerricStore.Instance.get(:default), k, v, e) end,
+      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
+      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+      keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
       flush: fn -> :ok end,
-      dbsize: &Router.dbsize/0
+      dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end
     }
   end
 
@@ -120,7 +120,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
           k
         end
 
-      shard_indices = Enum.map(keys, &Router.shard_for/1) |> Enum.uniq()
+      shard_indices = Enum.map(keys, fn k -> Router.shard_for(FerricStore.Instance.get(:default), k) end) |> Enum.uniq()
 
       # With 100 keys and 4 shards, at least 2 shards should be used
       assert length(shard_indices) >= 2,

@@ -46,7 +46,7 @@ defmodule Ferricstore.Store.TypedValuesTest do
 
   describe "INCRBYFLOAT stores string representation" do
     test "INCRBYFLOAT on nonexistent key creates string in ETS" do
-      assert {:ok, result} = Router.incr_float("typed:float_new", 3.14)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "typed:float_new", 3.14)
       assert is_float(result)
       assert_in_delta result, 3.14, 0.001
 
@@ -58,7 +58,7 @@ defmodule Ferricstore.Store.TypedValuesTest do
 
     test "INCRBYFLOAT on integer produces string" do
       Router.incr(FerricStore.Instance.get(:default), "typed:float_from_int", 10)
-      assert {:ok, result} = Router.incr_float("typed:float_from_int", 0.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "typed:float_from_int", 0.5)
       assert is_float(result)
       assert_in_delta result, 10.5, 0.001
 
@@ -68,7 +68,7 @@ defmodule Ferricstore.Store.TypedValuesTest do
 
     test "INCRBYFLOAT on string parses and stores string" do
       Router.put(FerricStore.Instance.get(:default), "typed:float_str", "10.5", 0)
-      assert {:ok, result} = Router.incr_float("typed:float_str", 2.5)
+      assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "typed:float_str", 2.5)
       assert is_float(result)
       assert_in_delta result, 13.0, 0.001
     end
@@ -99,7 +99,7 @@ defmodule Ferricstore.Store.TypedValuesTest do
     end
 
     test "GET returns string after INCRBYFLOAT" do
-      Router.incr_float("typed:get_float", 3.14)
+      Router.incr_float(FerricStore.Instance.get(:default), "typed:get_float", 3.14)
       value = Router.get(FerricStore.Instance.get(:default), "typed:get_float")
       assert is_binary(value)
       {parsed, _} = Float.parse(value)
@@ -115,7 +115,7 @@ defmodule Ferricstore.Store.TypedValuesTest do
   describe "string commands handle values" do
     test "APPEND on INCR result works" do
       Router.incr(FerricStore.Instance.get(:default), "typed:append_int", 42)
-      assert {:ok, 3} = Router.append("typed:append_int", "!")
+      assert {:ok, 3} = Router.append(FerricStore.Instance.get(:default), "typed:append_int", "!")
       value = Router.get(FerricStore.Instance.get(:default), "typed:append_int")
       assert is_binary(value)
       assert value == "42!"
@@ -144,7 +144,7 @@ defmodule Ferricstore.Store.TypedValuesTest do
       assert {:ok, 43} = Router.incr(FerricStore.Instance.get(:default), "typed:transition", 1)
       assert Router.get(FerricStore.Instance.get(:default), "typed:transition") == "43"
 
-      assert {:ok, 3} = Router.append("typed:transition", "!")
+      assert {:ok, 3} = Router.append(FerricStore.Instance.get(:default), "typed:transition", "!")
       value = Router.get(FerricStore.Instance.get(:default), "typed:transition")
       assert is_binary(value)
       assert value == "43!"
@@ -156,7 +156,7 @@ defmodule Ferricstore.Store.TypedValuesTest do
   describe "disk format is binary" do
     test "Bitcask disk format is binary after flush" do
       Router.incr(FerricStore.Instance.get(:default), "typed:disk_int", 42)
-      Router.incr_float("typed:disk_float", 3.14)
+      Router.incr_float(FerricStore.Instance.get(:default), "typed:disk_float", 3.14)
 
       Ferricstore.Store.BitcaskWriter.flush_all()
       ShardHelpers.flush_all_shards()
@@ -171,18 +171,18 @@ defmodule Ferricstore.Store.TypedValuesTest do
 
   defp build_store do
     %{
-      get: &Router.get/1,
+      get: fn k -> Router.get(FerricStore.Instance.get(:default), k) end,
       put: fn key, value, exp -> Router.put(FerricStore.Instance.get(:default), key, value, exp) end,
-      delete: &Router.delete/1,
-      exists?: &Router.exists?/1,
-      incr: &Router.incr/2,
-      incr_float: &Router.incr_float/2,
-      append: &Router.append/2,
-      getset: &Router.getset/2,
-      getdel: &Router.getdel/1,
-      getex: &Router.getex/2,
-      setrange: &Router.setrange/3,
-      get_meta: &Router.get_meta/1
+      delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
+      exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
+      incr: fn k, d -> Router.incr(FerricStore.Instance.get(:default), k, d) end,
+      incr_float: fn k, d -> Router.incr_float(FerricStore.Instance.get(:default), k, d) end,
+      append: fn k, s -> Router.append(FerricStore.Instance.get(:default), k, s) end,
+      getset: fn k, v -> Router.getset(FerricStore.Instance.get(:default), k, v) end,
+      getdel: fn k -> Router.getdel(FerricStore.Instance.get(:default), k) end,
+      getex: fn k, e -> Router.getex(FerricStore.Instance.get(:default), k, e) end,
+      setrange: fn k, o, v -> Router.setrange(FerricStore.Instance.get(:default), k, o, v) end,
+      get_meta: fn k -> Router.get_meta(FerricStore.Instance.get(:default), k) end
     }
   end
 end

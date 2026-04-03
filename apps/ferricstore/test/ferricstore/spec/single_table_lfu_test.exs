@@ -104,7 +104,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 2: GET hot key -- single ETS lookup returns value
     test "2. GET hot key returns value from single ETS lookup" do
-      Router.put("hot_key", "hot_value")
+      Router.put(FerricStore.Instance.get(:default), "hot_key", "hot_value")
       drain_all()
 
       value = Router.get(FerricStore.Instance.get(:default), "hot_key")
@@ -121,7 +121,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 3: GET cold key (value=nil) -- falls through to Bitcask
     test "3. GET cold key with nil value falls through to Bitcask" do
-      Router.put("cold_key", "cold_value")
+      Router.put(FerricStore.Instance.get(:default), "cold_key", "cold_value")
       drain_all()
 
       # Manually evict by setting value to nil in keydir
@@ -137,7 +137,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 4: SET writes value into keydir tuple
     test "4. SET writes value into keydir tuple" do
-      Router.put("set_key", "set_value")
+      Router.put(FerricStore.Instance.get(:default), "set_key", "set_value")
       drain_all()
 
       [{key, val, exp, packed_lfu, _fid, _off, _vsize}] = keydir_lookup("set_key")
@@ -150,7 +150,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 5: DEL removes entire keydir entry
     test "5. DEL removes entire keydir entry" do
-      Router.put("del_key", "del_value")
+      Router.put(FerricStore.Instance.get(:default), "del_key", "del_value")
       drain_all()
       assert [{_, _, _, _, _fid, _off, _vsize}] = keydir_lookup("del_key")
 
@@ -162,7 +162,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 6: Eviction sets value to nil (not delete)
     test "6. eviction sets value to nil, not delete" do
-      Router.put("evict_key", "evict_value")
+      Router.put(FerricStore.Instance.get(:default), "evict_key", "evict_value")
       drain_all()
 
       table = keydir_for("evict_key")
@@ -177,7 +177,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 7: Evicted key still readable via cold path (Bitcask)
     test "7. evicted key still readable via cold path from Bitcask" do
-      Router.put("evict_read", "evict_read_val")
+      Router.put(FerricStore.Instance.get(:default), "evict_read", "evict_read_val")
       drain_all()
 
       # Evict from hot cache
@@ -190,7 +190,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 8: Re-read evicted key warms value back
     test "8. re-reading evicted key warms value back into keydir" do
-      Router.put("rewarm_key", "rewarm_val")
+      Router.put(FerricStore.Instance.get(:default), "rewarm_key", "rewarm_val")
       drain_all()
 
       table = keydir_for("rewarm_key")
@@ -210,7 +210,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 9: keydir entry count unchanged after eviction
     test "9. keydir entry count unchanged after eviction (eviction is value=nil, not delete)" do
-      Router.put("count_key", "count_val")
+      Router.put(FerricStore.Instance.get(:default), "count_key", "count_val")
       drain_all()
 
       table = keydir_for("count_key")
@@ -226,7 +226,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 10: DBSIZE correct (counts all entries, not just hot)
     test "10. DBSIZE counts all entries including cold (evicted) keys" do
       keys = for i <- 1..5, do: "dbsize_key_#{i}"
-      Enum.each(keys, fn k -> Router.put(k, "v") end)
+      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "v") end)
       drain_all()
 
       assert Router.dbsize(FerricStore.Instance.get(:default)) >= 5
@@ -244,8 +244,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 11: KEYS returns all keys (hot and cold)
     test "11. KEYS returns both hot and cold keys" do
-      Router.put("keys_hot", "v")
-      Router.put("keys_cold", "v")
+      Router.put(FerricStore.Instance.get(:default), "keys_hot", "v")
+      Router.put(FerricStore.Instance.get(:default), "keys_cold", "v")
       drain_all()
 
       # Evict one key
@@ -294,7 +294,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 13: Concurrent read + eviction -- no crash
     test "13. concurrent read + eviction does not crash" do
-      Router.put("concurrent_key", "concurrent_val")
+      Router.put(FerricStore.Instance.get(:default), "concurrent_key", "concurrent_val")
       drain_all()
 
       table = keydir_for("concurrent_key")
@@ -323,7 +323,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 14: Shard restart rebuilds keydir from Bitcask (all cold initially)
     test "14. shard restart rebuilds keydir from Bitcask" do
-      Router.put("restart_key", "restart_val")
+      Router.put(FerricStore.Instance.get(:default), "restart_key", "restart_val")
       drain_all()
       Ferricstore.Test.ShardHelpers.flush_all_shards()
 
@@ -352,7 +352,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     test "15. bulk key management: warm 100, evict 50, verify counts" do
       # Create 1000 keys
       keys = for i <- 1..1000, do: "bulk_#{String.pad_leading(Integer.to_string(i), 4, "0")}"
-      Enum.each(keys, fn k -> Router.put(k, "v_#{k}") end)
+      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "v_#{k}") end)
       drain_all()
 
       # All 1000 should be hot
@@ -395,7 +395,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
   describe "LFU counter behavior" do
     # Test 16: New key starts at LFU counter = 5
     test "16. new key starts at LFU counter = 5" do
-      Router.put("lfu_new", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_new", "val")
       drain_all()
 
       assert lfu_counter("lfu_new") == 5,
@@ -404,7 +404,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 17: Reading key increments counter (probabilistically)
     test "17. reading key increments counter probabilistically" do
-      Router.put("lfu_read", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_read", "val")
       drain_all()
 
       # Read many times -- counter should increase at least once
@@ -421,8 +421,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 18: Frequently read key has higher counter than rarely read key
     test "18. frequently read key has higher counter than rarely read key" do
-      Router.put("lfu_freq", "val")
-      Router.put("lfu_rare", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_freq", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_rare", "val")
       drain_all()
 
       # Read freq key 500 times, rare key 1 time
@@ -440,8 +440,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 19: LFU eviction picks lowest counter
     test "19. LFU eviction picks entry with lowest counter" do
       # Create keys with different LFU counters
-      Router.put("lfu_high", "val")
-      Router.put("lfu_low", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_high", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_low", "val")
       drain_all()
 
       # Artificially set counters using packed format
@@ -460,7 +460,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 20: Counter capped at 255
     test "20. LFU counter capped at 255" do
-      Router.put("lfu_cap", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_cap", "val")
       drain_all()
 
       # Set counter to max using packed format
@@ -482,7 +482,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       # This test verifies that if decay is applied, counters decrease.
       # Since decay happens at read time based on elapsed minutes,
       # we test the decay function directly.
-      Router.put("lfu_decay", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_decay", "val")
       drain_all()
 
       table = keydir_for("lfu_decay")
@@ -493,8 +493,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 22: Decayed key evicted before active key
     test "22. decayed key evicted before active key" do
-      Router.put("lfu_active", "val")
-      Router.put("lfu_decayed", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_active", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_decayed", "val")
       drain_all()
 
       now_min = LFU.now_minutes()
@@ -514,7 +514,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 23: volatile_lfu only evicts keys with TTL
     test "23. volatile_lfu only evicts keys with TTL" do
       # This tests the eviction policy logic
-      Router.put("vol_no_ttl", "val")  # no TTL
+      Router.put(FerricStore.Instance.get(:default), "vol_no_ttl", "val")  # no TTL
       future = System.os_time(:millisecond) + 60_000
       Router.put(FerricStore.Instance.get(:default), "vol_with_ttl", "val", future)
       drain_all()
@@ -528,7 +528,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 24: allkeys_lfu evicts any key
     test "24. allkeys_lfu can target any key for eviction (no TTL required)" do
-      Router.put("all_key", "val")
+      Router.put(FerricStore.Instance.get(:default), "all_key", "val")
       drain_all()
 
       [{_, val, _, _, _, _, _}] = keydir_lookup("all_key")
@@ -543,7 +543,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 25: SCAN doesn't inflate LFU counters
     test "25. SCAN does not inflate LFU counters" do
-      Router.put("scan_key", "val")
+      Router.put(FerricStore.Instance.get(:default), "scan_key", "val")
       drain_all()
 
       [{_, _, _, lfu_before, _fid, _off, _vsize}] = keydir_lookup("scan_key")
@@ -560,7 +560,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 26: After 1000 reads: top-10 most read have highest counters
     test "26. after 1000 reads top-10 most read keys have highest counters" do
       keys = for i <- 1..20, do: "rank_#{String.pad_leading(Integer.to_string(i), 2, "0")}"
-      Enum.each(keys, fn k -> Router.put(k, "v") end)
+      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "v") end)
       drain_all()
 
       # Read top 10 keys 100 times each, bottom 10 only once
@@ -586,7 +586,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 27: LFU counter survives eviction+re-warm cycle (reset to 5 on re-warm)
     test "27. LFU counter resets to 5 on re-warm after eviction" do
-      Router.put("lfu_rewarm", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_rewarm", "val")
       drain_all()
 
       # Bump counter high
@@ -616,8 +616,8 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 29: Counter=0 key always evicted first
     test "29. counter=0 key is always the eviction candidate" do
-      Router.put("lfu_zero", "val")
-      Router.put("lfu_nonzero", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_zero", "val")
+      Router.put(FerricStore.Instance.get(:default), "lfu_nonzero", "val")
       drain_all()
 
       now_min = LFU.now_minutes()
@@ -637,7 +637,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 30: 100 keys, read 10 of them 100x each, evict 50: all 10 hot keys survive
     test "30. hot keys survive eviction: read 10 keys heavily, evict 50, all 10 survive" do
       keys = for i <- 1..100, do: "survive_#{String.pad_leading(Integer.to_string(i), 3, "0")}"
-      Enum.each(keys, fn k -> Router.put(k, "v_#{k}") end)
+      Enum.each(keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "v_#{k}") end)
       drain_all()
 
       # Read 10 keys 200 times each to bump their counters
@@ -688,7 +688,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
   describe "integration with existing subsystems" do
     # Test 31: Full lifecycle: SET -> GET -> evict -> cold GET -> re-warm
     test "31. full lifecycle: SET -> GET -> evict -> cold GET -> re-warm" do
-      Router.put("lifecycle", "val1")
+      Router.put(FerricStore.Instance.get(:default), "lifecycle", "val1")
       drain_all()
 
       # Hot GET
@@ -711,11 +711,11 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 32: Write-through: SET updates value in keydir
     test "32. SET updates value in keydir (write-through)" do
-      Router.put("wt_key", "v1")
+      Router.put(FerricStore.Instance.get(:default), "wt_key", "v1")
       drain_all()
       [{_, "v1", _, _, _, _, _}] = keydir_lookup("wt_key")
 
-      Router.put("wt_key", "v2")
+      Router.put(FerricStore.Instance.get(:default), "wt_key", "v2")
       drain_all()
       [{_, "v2", _, _, _, _, _}] = keydir_lookup("wt_key")
     end
@@ -746,7 +746,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 35: Hot/cold read tracking (Stats) still works
     test "35. hot/cold read tracking via Stats still works" do
-      Router.put("stats_key", "val")
+      Router.put(FerricStore.Instance.get(:default), "stats_key", "val")
       drain_all()
 
       # Hot read
@@ -769,12 +769,12 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 37: Prefix index still works
     test "37. prefix index still works with single table" do
-      Router.put("prefix:key1", "v1")
-      Router.put("prefix:key2", "v2")
-      Router.put("other:key3", "v3")
+      Router.put(FerricStore.Instance.get(:default), "prefix:key1", "v1")
+      Router.put(FerricStore.Instance.get(:default), "prefix:key2", "v2")
+      Router.put(FerricStore.Instance.get(:default), "other:key3", "v3")
       drain_all()
 
-      prefix_keys = Router.keys_with_prefix("prefix")
+      prefix_keys = Router.keys_with_prefix(FerricStore.Instance.get(:default), "prefix")
       assert "prefix:key1" in prefix_keys
       assert "prefix:key2" in prefix_keys
       refute "other:key3" in prefix_keys
@@ -782,7 +782,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 38: Raft state machine writes to single table
     test "38. Raft state machine writes use single-table format" do
-      Router.put("raft_key", "raft_val")
+      Router.put(FerricStore.Instance.get(:default), "raft_key", "raft_val")
       drain_all()
 
       # Verify the tuple has 7 elements (keydir format with disk location fields)
@@ -795,7 +795,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     test "39. async apply worker writes to single table" do
       # AsyncApplyWorker is used for async durability namespaces.
       # Test that after async batch apply, the keydir has 7-element tuples.
-      Router.put("async_key", "async_val")
+      Router.put(FerricStore.Instance.get(:default), "async_key", "async_val")
       drain_all()
 
       [{_, val, _, _, _, _, _}] = keydir_lookup("async_key")
@@ -805,7 +805,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 40: All basic command tests still pass (sanity)
     test "40. basic commands roundtrip: SET/GET/DEL/EXISTS/INCR/APPEND" do
       # SET + GET
-      Router.put("cmd_key", "cmd_val")
+      Router.put(FerricStore.Instance.get(:default), "cmd_key", "cmd_val")
       drain_all()
       assert Router.get(FerricStore.Instance.get(:default), "cmd_key") == "cmd_val"
 
@@ -824,9 +824,9 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       assert Router.get(FerricStore.Instance.get(:default), "inc_key") == "10"
 
       # APPEND
-      Router.put("app_key", "hello")
+      Router.put(FerricStore.Instance.get(:default), "app_key", "hello")
       drain_all()
-      assert {:ok, 10} = Router.append("app_key", "world")
+      assert {:ok, 10} = Router.append(FerricStore.Instance.get(:default), "app_key", "world")
       drain_all()
       assert Router.get(FerricStore.Instance.get(:default), "app_key") == "helloworld"
     end

@@ -708,7 +708,7 @@ defmodule Ferricstore.Raft.PatchedWalTest do
 
     test "INCR atomicity through patched WAL" do
       k = ukey("incr_atomic")
-      Router.put(k, "0")
+      Router.put(FerricStore.Instance.get(:default), k, "0")
 
       tasks =
         for _ <- 1..20 do
