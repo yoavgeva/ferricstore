@@ -24,11 +24,15 @@ defmodule Ferricstore.Store.ShardSupervisor do
   def init(opts) do
     data_dir = Keyword.fetch!(opts, :data_dir)
     shard_count = Keyword.get(opts, :shard_count, 4)
+    instance_ctx = Keyword.get(opts, :instance_ctx)
 
     children =
       Enum.map(0..(shard_count - 1), fn i ->
+        shard_opts = [index: i, data_dir: data_dir]
+        shard_opts = if instance_ctx, do: Keyword.put(shard_opts, :instance_ctx, instance_ctx), else: shard_opts
+
         Supervisor.child_spec(
-          {Ferricstore.Store.Shard, [index: i, data_dir: data_dir]},
+          {Ferricstore.Store.Shard, shard_opts},
           id: :"shard_#{i}"
         )
       end)

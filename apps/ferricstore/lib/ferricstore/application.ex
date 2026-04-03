@@ -129,6 +129,26 @@ defmodule Ferricstore.Application do
     # Start the ra system before shards so that Shard.init can start ra servers.
     Ferricstore.Raft.Cluster.start_system(data_dir)
 
+    # Build the default instance context. This creates the Instance struct
+    # with all refs (atomics, counters, ETS tables) and caches it in
+    # persistent_term as {:FerricStore.Instance, :default}.
+    # All code that calls FerricStore.Instance.get(:default) will find it.
+    # Note: we pass the EXISTING refs (pressure_flags, etc.) rather than
+    # creating new ones, since the global init above already created them.
+    _default_ctx = FerricStore.Instance.build(:default, [
+      data_dir: data_dir,
+      shard_count: shard_count,
+      mode: mode,
+      max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824),
+      keydir_max_ram: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024),
+      eviction_policy: Application.get_env(:ferricstore, :eviction_policy, :volatile_lfu),
+      hot_cache_max_value_size: Application.get_env(:ferricstore, :hot_cache_max_value_size, 65_536),
+      max_active_file_size: Application.get_env(:ferricstore, :max_active_file_size, 256 * 1024 * 1024),
+      read_sample_rate: Application.get_env(:ferricstore, :read_sample_rate, 100),
+      lfu_decay_time: Application.get_env(:ferricstore, :lfu_decay_time, 1),
+      lfu_log_factor: Application.get_env(:ferricstore, :lfu_log_factor, 10),
+    ])
+
     batcher_children =
       Enum.map(0..(shard_count - 1), fn i ->
         shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
@@ -180,7 +200,7 @@ defmodule Ferricstore.Application do
         batcher_children ++
         bitcask_writer_children ++
         [
-        {Ferricstore.Store.ShardSupervisor, data_dir: data_dir, shard_count: shard_count}
+        {Ferricstore.Store.ShardSupervisor, data_dir: data_dir, shard_count: shard_count, instance_ctx: _default_ctx}
       ] ++
         async_worker_children ++
         [

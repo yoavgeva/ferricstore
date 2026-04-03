@@ -108,9 +108,23 @@ defmodule FerricStore.Instance do
     lfu_log_factor = Keyword.get(opts, :lfu_log_factor, 10)
     lfu_initial_ref = :atomics.new(2, signed: false)
 
-    # Hotness and config ETS tables
-    hotness_table = :ets.new(:"#{name}_hotness", [:set, :public, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
-    config_table = :ets.new(:"#{name}_config", [:set, :public, {:read_concurrency, true}])
+    # Hotness and config ETS tables (reuse existing for :default instance)
+    hotness_name = if name == :default, do: :ferricstore_hotness, else: :"#{name}_hotness"
+    config_name = if name == :default, do: :ferricstore_config, else: :"#{name}_config"
+
+    hotness_table =
+      case :ets.whereis(hotness_name) do
+        :undefined ->
+          :ets.new(hotness_name, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}, {:decentralized_counters, true}])
+        _ref -> hotness_name
+      end
+
+    config_table =
+      case :ets.whereis(config_name) do
+        :undefined ->
+          :ets.new(config_name, [:set, :public, :named_table, {:read_concurrency, true}])
+        _ref -> config_name
+      end
 
     # Memory limits
     max_memory_bytes = Keyword.get(opts, :max_memory_bytes, 1_073_741_824)
@@ -182,14 +196,17 @@ defmodule FerricStore.Instance do
   end
 
   defp build_keydir_tables(name, shard_count) do
+    # For the :default instance, use the existing naming convention
+    # that Shard.init creates (:"keydir_0", :"keydir_1", etc.)
+    # For custom instances, use instance-scoped names.
     0..(shard_count - 1)
     |> Enum.map(fn i ->
-      :ets.new(:"#{name}_keydir_#{i}", [
-        :set, :public, :named_table,
-        {:read_concurrency, true},
-        {:write_concurrency, :auto},
-        {:decentralized_counters, true}
-      ])
+      table_name =
+        if name == :default, do: :"keydir_#{i}", else: :"#{name}_keydir_#{i}"
+
+      # Don't create the table here — Shard.init creates it.
+      # Just record the name so Router can find it.
+      table_name
     end)
     |> List.to_tuple()
   end
@@ -197,18 +214,18 @@ defmodule FerricStore.Instance do
   defp build_prefix_tables(name, shard_count) do
     0..(shard_count - 1)
     |> Enum.map(fn i ->
-      :ets.new(:"#{name}_prefix_#{i}", [
-        :set, :public, :named_table,
-        {:read_concurrency, true},
-        {:write_concurrency, :auto}
-      ])
+      if name == :default, do: :"prefix_keys_#{i}", else: :"#{name}_prefix_#{i}"
     end)
     |> List.to_tuple()
   end
 
   defp build_shard_names(name, shard_count) do
     0..(shard_count - 1)
-    |> Enum.map(fn i -> :"#{name}.Shard.#{i}" end)
+    |> Enum.map(fn i ->
+      if name == :default,
+        do: :"Ferricstore.Store.Shard.#{i}",
+        else: :"#{name}.Shard.#{i}"
+    end)
     |> List.to_tuple()
   end
 

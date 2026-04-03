@@ -86,7 +86,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # compound keys live on their parent's shard, not the shard determined
     # by hashing the compound key string.
     Enum.each(0..(shard_count - 1), fn i ->
-      shard = Router.shard_name(i)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), i)
       keys = GenServer.call(shard, :keys, 10_000)
       Enum.each(keys, fn key -> GenServer.call(shard, {:delete, key}, 30_000) end)
     end)
@@ -265,7 +265,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   def key_for_shard(shard_idx) do
     i =
       Enum.find(0..100_000, fn i ->
-        Router.shard_for("dynkey_#{i}") == shard_idx
+        Router.shard_for(FerricStore.Instance.get(:default), "dynkey_#{i}") == shard_idx
       end)
 
     "dynkey_#{i}"
@@ -291,11 +291,11 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
   @spec keys_on_same_shard() :: {binary(), binary()}
   def keys_on_same_shard do
-    shard = Router.shard_for("same_a")
+    shard = Router.shard_for(FerricStore.Instance.get(:default), "same_a")
 
     other =
       Enum.find(0..100_000, fn i ->
-        Router.shard_for("same_#{i}") == shard and "same_#{i}" != "same_a"
+        Router.shard_for(FerricStore.Instance.get(:default), "same_#{i}") == shard and "same_#{i}" != "same_a"
       end)
 
     {"same_a", "same_#{other}"}
@@ -305,16 +305,16 @@ defmodule Ferricstore.Test.ShardHelpers do
   Finds 2 keys that route to different shards under the given namespace prefix.
 
   Returns `{key_a, key_b}` (without the namespace prefix) where
-  `Router.shard_for(ns <> key_a) != Router.shard_for(ns <> key_b)`.
+  `Router.shard_for(FerricStore.Instance.get(:default), ns <> key_a) != Router.shard_for(FerricStore.Instance.get(:default), ns <> key_b)`.
   """
   @spec cross_shard_keys_for_namespace(binary()) :: {binary(), binary()}
   def cross_shard_keys_for_namespace(ns) do
     key_a = "nskey_0"
-    shard_a = Router.shard_for(ns <> key_a)
+    shard_a = Router.shard_for(FerricStore.Instance.get(:default), ns <> key_a)
 
     i =
       Enum.find(1..100_000, fn i ->
-        Router.shard_for(ns <> "nskey_#{i}") != shard_a
+        Router.shard_for(FerricStore.Instance.get(:default), ns <> "nskey_#{i}") != shard_a
       end)
 
     {key_a, "nskey_#{i}"}
@@ -378,7 +378,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   ## Example
 
       ShardHelpers.kill_shard_safely(0)
-      assert Router.get(key) == "still_here"
+      assert Router.get(FerricStore.Instance.get(:default), key) == "still_here"
   """
   @spec kill_shard_safely(non_neg_integer(), keyword()) :: :ok
   def kill_shard_safely(shard_index, opts \\ []) do
@@ -431,7 +431,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
   @spec kill_shard_for_key(binary(), keyword()) :: :ok
   def kill_shard_for_key(key, opts \\ []) do
-    kill_shard_safely(Router.shard_for(key), opts)
+    kill_shard_safely(Router.shard_for(FerricStore.Instance.get(:default), key), opts)
   end
 
   @doc """
@@ -448,7 +448,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   ## Example
 
       ShardHelpers.kill_shard_safely(0)
-      ShardHelpers.eventually(fn -> Router.get(key) == "expected" end,
+      ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), key) == "expected" end,
                               "key should survive shard restart")
   """
   @spec eventually((() -> boolean()), binary(), pos_integer(), pos_integer()) :: :ok
@@ -504,7 +504,7 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     # Kill all shards first
     for i <- 0..(shard_count - 1) do
-      name = Router.shard_name(i)
+      name = Router.shard_name(FerricStore.Instance.get(:default), i)
       pid = Process.whereis(name)
       if pid && Process.alive?(pid) do
         ref = Process.monitor(pid)
@@ -541,7 +541,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     shard_count = shard_count()
 
     for i <- 0..(shard_count - 1) do
-      name = Router.shard_name(i)
+      name = Router.shard_name(FerricStore.Instance.get(:default), i)
       pid = Process.whereis(name)
 
       if pid && Process.alive?(pid) do
