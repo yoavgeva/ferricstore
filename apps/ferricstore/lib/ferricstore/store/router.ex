@@ -5,18 +5,21 @@ defmodule Ferricstore.Store.Router do
   This is a pure module with no process state. It provides two categories of
   functions:
 
-  1. **Routing helpers** -- `shard_for/2` and `shard_name/1` map a key to its
+  1. **Routing helpers** -- `shard_for/2` and `shard_name/2` map a key to its
      owning shard index and registered process name respectively. Supports
      Redis hash tags: keys containing `{tag}` are hashed on the tag content,
      allowing related keys to co-locate on the same shard.
 
-  2. **Convenience accessors** -- `get/1`, `put/3`, `delete/1`, `exists?/1`,
-     `keys/0`, and `dbsize/0` dispatch to the correct shard GenServer
+  2. **Convenience accessors** -- `get/2`, `put/4`, `delete/2`, `exists?/2`,
+     `keys/1`, and `dbsize/1` dispatch to the correct shard GenServer
      transparently.
+
+  All public functions take a `ctx` (`FerricStore.Instance.t()`) as the first
+  argument, replacing all persistent_term lookups with instance-local state.
   """
 
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{LFU, PrefixIndex, SlotMap, WriteVersion}
+  alias Ferricstore.Store.{LFU, PrefixIndex}
 
   import Bitwise, only: [band: 2]
 
@@ -27,13 +30,13 @@ defmodule Ferricstore.Store.Router do
   # ---------------------------------------------------------------------------
 
   @doc false
-  def resolve_shard(idx), do: shard_name(idx)
+  def resolve_shard(ctx, idx), do: elem(ctx.shard_names, idx)
   @doc false
-  def resolve_keydir(idx), do: keydir_name(idx)
+  def resolve_keydir(ctx, idx), do: elem(ctx.keydir_refs, idx)
   @doc false
-  def resolve_prefix_table(idx), do: PrefixIndex.table_name(idx)
+  def resolve_prefix_table(ctx, idx), do: elem(ctx.prefix_table_refs, idx)
   @doc false
-  def effective_shard_count, do: :persistent_term.get(:ferricstore_shard_count)
+  def effective_shard_count(ctx), do: ctx.shard_count
 
   # ---------------------------------------------------------------------------
   # Write-path dispatch: quorum writes bypass Shard, async writes use Shard
@@ -56,8 +59,8 @@ defmodule Ferricstore.Store.Router do
   # so that WATCH/EXEC can detect the mutation. False positives (incrementing
   # when no state actually changed) are safe -- they only cause a spurious
   # WATCH failure, which the client retries.
-  @spec quorum_write(non_neg_integer(), tuple()) :: term()
-  defp quorum_write(idx, command) do
+  @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
+  defp quorum_write(ctx, idx, command) do
     shard_id = Ferricstore.Raft.Cluster.shard_server_id(idx)
     corr = make_ref()
 
@@ -65,24 +68,26 @@ defmodule Ferricstore.Store.Router do
       try do
         case :ra.pipeline_command(shard_id, command, corr, :normal) do
           :ok ->
-            wait_for_ra_applied(corr, shard_id, idx, command)
+            wait_for_ra_applied(ctx, corr, shard_id, idx, command)
 
           {:error, :noproc} ->
             # Ra server not alive (shard restarting). Fall back to Shard
             # GenServer which re-initialises ra during its init.
-            GenServer.call(shard_name(idx), command)
+            GenServer.call(elem(ctx.shard_names, idx), command)
 
           {:error, _reason} ->
-            GenServer.call(shard_name(idx), command)
+            GenServer.call(elem(ctx.shard_names, idx), command)
         end
       catch
         :exit, {:noproc, _} ->
-          GenServer.call(shard_name(idx), command)
+          GenServer.call(elem(ctx.shard_names, idx), command)
       end
 
     case result do
       {:error, _} -> :ok
-      _ -> Ferricstore.Store.WriteVersion.increment(idx)
+      _ ->
+        size = :counters.info(ctx.write_version).size
+        if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
     end
 
     result
@@ -94,8 +99,8 @@ defmodule Ferricstore.Store.Router do
   # our `corr`. Unrelated ra_events are silently skipped -- their results
   # belong to other concurrent calls in the same process, each of which
   # has its own selective receive waiting for its own correlation ref.
-  @spec wait_for_ra_applied(reference(), :ra.server_id(), non_neg_integer(), tuple()) :: term()
-  defp wait_for_ra_applied(corr, shard_id, idx, command) do
+  @spec wait_for_ra_applied(FerricStore.Instance.t(), reference(), :ra.server_id(), non_neg_integer(), tuple()) :: term()
+  defp wait_for_ra_applied(ctx, corr, shard_id, idx, command) do
     receive do
       {:ra_event, _leader, {:applied, applied_list}} ->
         case List.keyfind(applied_list, corr, 0) do
@@ -104,7 +109,7 @@ defmodule Ferricstore.Store.Router do
 
           nil ->
             # Our command wasn't in this batch -- keep waiting.
-            wait_for_ra_applied(corr, shard_id, idx, command)
+            wait_for_ra_applied(ctx, corr, shard_id, idx, command)
         end
 
       {:ra_event, _from, {:rejected, {:not_leader, maybe_leader, ^corr}}} ->
@@ -119,15 +124,15 @@ defmodule Ferricstore.Store.Router do
 
         case :ra.pipeline_command(leader, command, retry_corr, :normal) do
           :ok ->
-            wait_for_ra_applied(retry_corr, leader, idx, command)
+            wait_for_ra_applied(ctx, retry_corr, leader, idx, command)
 
           _err ->
-            GenServer.call(shard_name(idx), command)
+            GenServer.call(elem(ctx.shard_names, idx), command)
         end
 
       {:ra_event, _from, {:rejected, {_reason, _hint, ^corr}}} ->
         # Other rejection (e.g. cluster change). Fall back to Shard.
-        GenServer.call(shard_name(idx), command)
+        GenServer.call(elem(ctx.shard_names, idx), command)
     after
       10_000 ->
         {:error, "ERR write timeout"}
@@ -137,15 +142,15 @@ defmodule Ferricstore.Store.Router do
   # Determines the durability mode for a key by extracting its namespace
   # prefix and looking up the namespace config. Returns `:quorum` or `:async`.
   #
-  # Three-state fast path via persistent_term (~5ns):
+  # Three-state fast path via ctx.durability_mode (~0ns struct field access):
   #   :all_quorum — no async namespaces configured, return :quorum immediately
   #   :all_async  — all namespaces are async, return :async immediately
   #   :mixed      — some quorum, some async, must split key and lookup
   #
   # The flag is set by NamespaceConfig whenever durability settings change.
-  @spec durability_for_key(binary()) :: :quorum | :async
-  defp durability_for_key(key) do
-    case :persistent_term.get(:ferricstore_durability_mode, :all_quorum) do
+  @spec durability_for_key(FerricStore.Instance.t(), binary()) :: :quorum | :async
+  defp durability_for_key(ctx, key) do
+    case ctx.durability_mode do
       :all_quorum -> :quorum
       :all_async -> :async
       :mixed ->
@@ -165,11 +170,11 @@ defmodule Ferricstore.Store.Router do
   # Async:  write ETS immediately, submit to Raft non-blocking (fire-and-forget).
   #         Like Redis Cluster — client sees the write before replication completes.
   #         Leader crash before replication = data loss (documented trade-off).
-  @spec raft_write(non_neg_integer(), binary(), tuple()) :: term()
-  defp raft_write(idx, key, command) do
-    case durability_for_key(key) do
-      :quorum -> quorum_write(idx, command)
-      :async -> async_write(idx, command)
+  @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
+  defp raft_write(ctx, idx, key, command) do
+    case durability_for_key(ctx, key) do
+      :quorum -> quorum_write(ctx, idx, command)
+      :async -> async_write(ctx, idx, command)
     end
   end
 
@@ -185,25 +190,27 @@ defmodule Ferricstore.Store.Router do
   # race (last writer wins). This matches the async durability contract —
   # users choosing async accept eventual consistency.
 
-  defp async_write(idx, {:put, key, value, expire_at_ms}) do
-    if Ferricstore.Store.DiskPressure.under_pressure?(idx) do
+  defp async_write(ctx, idx, {:put, key, value, expire_at_ms}) do
+    size = :atomics.info(ctx.disk_pressure).size
+    under_pressure = if idx < size, do: :atomics.get(ctx.disk_pressure, idx + 1) == 1, else: false
+
+    if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      async_write_put(idx, key, value, expire_at_ms)
+      async_write_put(ctx, idx, key, value, expire_at_ms)
     end
   end
 
-  defp async_write_put(idx, key, value, expire_at_ms) do
-    keydir = keydir_name(idx)
+  defp async_write_put(ctx, idx, key, value, expire_at_ms) do
+    keydir = elem(ctx.keydir_refs, idx)
     value_for_ets = case value do
       v when is_integer(v) -> Integer.to_string(v)
       v when is_float(v) -> Float.to_string(v)
       v when is_binary(v) ->
-        max_hot = :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536)
-        if byte_size(v) > max_hot, do: nil, else: v
+        if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
     end
     disk_value = to_disk_binary(value)
-    PrefixIndex.track(PrefixIndex.table_name(idx), key, idx)
+    PrefixIndex.track(elem(ctx.prefix_table_refs, idx), key, idx)
     {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
 
     if value_for_ets == nil do
@@ -213,7 +220,8 @@ defmodule Ferricstore.Store.Router do
       case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, [{key, disk_value, expire_at_ms}]) do
         {:ok, [{offset, _record_size}]} ->
           :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)})
-          WriteVersion.increment(idx)
+          size = :counters.info(ctx.write_version).size
+          if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
           async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
           :ok
 
@@ -224,31 +232,36 @@ defmodule Ferricstore.Store.Router do
       # Small value: inline in ETS for instant reads, async Bitcask write.
       :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
       Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, key, disk_value, expire_at_ms)
-      WriteVersion.increment(idx)
+      size = :counters.info(ctx.write_version).size
+      if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
       async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
       :ok
     end
   end
 
-  defp async_write(idx, {:delete, key}) do
-    if Ferricstore.Store.DiskPressure.under_pressure?(idx) do
+  defp async_write(ctx, idx, {:delete, key}) do
+    size = :atomics.info(ctx.disk_pressure).size
+    under_pressure = if idx < size, do: :atomics.get(ctx.disk_pressure, idx + 1) == 1, else: false
+
+    if under_pressure do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
-      keydir = keydir_name(idx)
+      keydir = elem(ctx.keydir_refs, idx)
       :ets.delete(keydir, key)
-      PrefixIndex.untrack(PrefixIndex.table_name(idx), key, idx)
+      PrefixIndex.untrack(elem(ctx.prefix_table_refs, idx), key, idx)
 
       {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
       Ferricstore.Store.BitcaskWriter.delete(idx, file_path, key)
 
-      WriteVersion.increment(idx)
+      wv_size = :counters.info(ctx.write_version).size
+      if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
       async_submit_to_raft(idx, {:delete, key})
       :ok
     end
   end
 
-  defp async_write(idx, {:incr, key, delta}) do
-    keydir = keydir_name(idx)
+  defp async_write(ctx, idx, {:incr, key, delta}) do
+    keydir = elem(ctx.keydir_refs, idx)
     now = System.os_time(:millisecond)
 
     current =
@@ -259,19 +272,19 @@ defmodule Ferricstore.Store.Router do
 
     case current do
       nil ->
-        async_write(idx, {:put, key, delta, 0})
+        async_write(ctx, idx, {:put, key, delta, 0})
         {:ok, delta}
 
       value when is_integer(value) ->
         new_val = value + delta
-        async_write(idx, {:put, key, new_val, 0})
+        async_write(ctx, idx, {:put, key, new_val, 0})
         {:ok, new_val}
 
       value when is_binary(value) ->
         case Integer.parse(value) do
           {int_val, ""} ->
             new_val = int_val + delta
-            async_write(idx, {:put, key, new_val, 0})
+            async_write(ctx, idx, {:put, key, new_val, 0})
             {:ok, new_val}
 
           _ ->
@@ -283,8 +296,8 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp async_write(idx, {:incr_float, key, delta}) do
-    keydir = keydir_name(idx)
+  defp async_write(ctx, idx, {:incr_float, key, delta}) do
+    keydir = elem(ctx.keydir_refs, idx)
     now = System.os_time(:millisecond)
 
     current =
@@ -296,31 +309,31 @@ defmodule Ferricstore.Store.Router do
     case current do
       nil ->
         new_val = delta * 1.0
-        async_write(idx, {:put, key, new_val, 0})
+        async_write(ctx, idx, {:put, key, new_val, 0})
         {:ok, new_val}
 
       value when is_float(value) ->
         new_val = value + delta
-        async_write(idx, {:put, key, new_val, 0})
+        async_write(ctx, idx, {:put, key, new_val, 0})
         {:ok, new_val}
 
       value when is_integer(value) ->
         new_val = value * 1.0 + delta
-        async_write(idx, {:put, key, new_val, 0})
+        async_write(ctx, idx, {:put, key, new_val, 0})
         {:ok, new_val}
 
       value when is_binary(value) ->
         case Float.parse(value) do
           {float_val, _} ->
             new_val = float_val + delta
-            async_write(idx, {:put, key, new_val, 0})
+            async_write(ctx, idx, {:put, key, new_val, 0})
             {:ok, new_val}
 
           :error ->
             case Integer.parse(value) do
               {int_val, ""} ->
                 new_val = int_val * 1.0 + delta
-                async_write(idx, {:put, key, new_val, 0})
+                async_write(ctx, idx, {:put, key, new_val, 0})
                 {:ok, new_val}
 
               _ ->
@@ -330,8 +343,8 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp async_write(idx, {:append, key, suffix}) do
-    keydir = keydir_name(idx)
+  defp async_write(ctx, idx, {:append, key, suffix}) do
+    keydir = elem(ctx.keydir_refs, idx)
     now = System.os_time(:millisecond)
 
     current =
@@ -348,12 +361,12 @@ defmodule Ferricstore.Store.Router do
     end
 
     new_value = current_str <> suffix
-    async_write(idx, {:put, key, new_value, 0})
+    async_write(ctx, idx, {:put, key, new_value, 0})
     {:ok, byte_size(new_value)}
   end
 
-  defp async_write(idx, {:getset, key, new_value}) do
-    keydir = keydir_name(idx)
+  defp async_write(ctx, idx, {:getset, key, new_value}) do
+    keydir = elem(ctx.keydir_refs, idx)
     now = System.os_time(:millisecond)
 
     old =
@@ -362,12 +375,12 @@ defmodule Ferricstore.Store.Router do
         _ -> nil
       end
 
-    async_write(idx, {:put, key, new_value, 0})
+    async_write(ctx, idx, {:put, key, new_value, 0})
     old
   end
 
-  defp async_write(idx, {:getdel, key}) do
-    keydir = keydir_name(idx)
+  defp async_write(ctx, idx, {:getdel, key}) do
+    keydir = elem(ctx.keydir_refs, idx)
     now = System.os_time(:millisecond)
 
     old =
@@ -376,17 +389,17 @@ defmodule Ferricstore.Store.Router do
         _ -> nil
       end
 
-    if old, do: async_write(idx, {:delete, key})
+    if old, do: async_write(ctx, idx, {:delete, key})
     old
   end
 
-  defp async_write(idx, {:getex, key, expire_at_ms}) do
-    keydir = keydir_name(idx)
+  defp async_write(ctx, idx, {:getex, key, expire_at_ms}) do
+    keydir = elem(ctx.keydir_refs, idx)
     now = System.os_time(:millisecond)
 
     case :ets.lookup(keydir, key) do
       [{^key, value, exp, _, _, _, _}] when value != nil and (exp == 0 or exp > now) ->
-        async_write(idx, {:put, key, value, expire_at_ms})
+        async_write(ctx, idx, {:put, key, value, expire_at_ms})
         value
 
       _ ->
@@ -394,8 +407,8 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp async_write(idx, {:setrange, key, offset, value}) do
-    keydir = keydir_name(idx)
+  defp async_write(ctx, idx, {:setrange, key, offset, value}) do
+    keydir = elem(ctx.keydir_refs, idx)
     now = System.os_time(:millisecond)
 
     current =
@@ -407,14 +420,14 @@ defmodule Ferricstore.Store.Router do
 
     padded = if byte_size(current) < offset, do: current <> :binary.copy(<<0>>, offset - byte_size(current)), else: current
     new_value = binary_part(padded, 0, offset) <> value <> binary_part(padded, min(offset + byte_size(value), byte_size(padded)), max(0, byte_size(padded) - offset - byte_size(value)))
-    async_write(idx, {:put, key, new_value, 0})
+    async_write(ctx, idx, {:put, key, new_value, 0})
     {:ok, byte_size(new_value)}
   end
 
   # Commands that are complex or rarely used in async namespaces
   # fall back to quorum (CAS, LOCK, UNLOCK, EXTEND, RATELIMIT, LIST_OP).
-  defp async_write(idx, command) do
-    quorum_write(idx, command)
+  defp async_write(ctx, idx, command) do
+    quorum_write(ctx, idx, command)
   end
 
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
@@ -432,8 +445,8 @@ defmodule Ferricstore.Store.Router do
   @doc """
   Returns the slot (0-1023) for a key, respecting hash tags.
   """
-  @spec slot_for(binary()) :: non_neg_integer()
-  def slot_for(key) do
+  @spec slot_for(FerricStore.Instance.t(), binary()) :: non_neg_integer()
+  def slot_for(_ctx, key) do
     hash_input = extract_hash_tag(key) || key
     :erlang.phash2(hash_input) |> band(@slot_mask)
   end
@@ -448,11 +461,10 @@ defmodule Ferricstore.Store.Router do
   between the first `{` and the next `}`), the tag is used for hashing
   instead of the full key.
   """
-  @spec shard_for(binary()) :: non_neg_integer()
-  def shard_for(key) do
-    slot = slot_for(key)
-    slot_map = :persistent_term.get(:ferricstore_slot_map)
-    elem(slot_map, slot)
+  @spec shard_for(FerricStore.Instance.t(), binary()) :: non_neg_integer()
+  def shard_for(ctx, key) do
+    slot = slot_for(ctx, key)
+    elem(ctx.slot_map, slot)
   end
 
   @doc """
@@ -496,67 +508,20 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc """
-  Initializes the pre-computed shard name cache in persistent_term.
-
-  Must be called once during application startup (after SlotMap.init).
-  Stores a tuple of atoms so that `shard_name/1` is a single `elem/2`
-  call (~3ns) instead of string interpolation + atom creation (~120ns).
-  """
-  @spec init_shard_names(pos_integer()) :: :ok
-  def init_shard_names(shard_count) do
-    names = List.to_tuple(for i <- 0..(shard_count - 1), do: :"Ferricstore.Store.Shard.#{i}")
-    :persistent_term.put(:ferricstore_shard_names, names)
-
-    # Also cache keydir atom names to avoid string interpolation + atom
-    # creation (~120ns) on every read. Same pattern as shard_names.
-    keydirs = List.to_tuple(for i <- 0..(shard_count - 1), do: :"keydir_#{i}")
-    :persistent_term.put(:ferricstore_keydir_names, keydirs)
-
-    :ok
-  end
-
-  @doc """
   Returns the registered process name for the shard at `index`.
 
-  Uses a pre-computed tuple from persistent_term for O(1) lookup.
-  Falls back to string interpolation if the cache is not initialized
-  (e.g. during early startup or tests).
+  Uses the pre-computed tuple from the instance context for O(1) lookup.
   """
-  @spec shard_name(non_neg_integer()) :: atom()
-  def shard_name(index) do
-    case :persistent_term.get(:ferricstore_shard_names, nil) do
-      nil ->
-        :"Ferricstore.Store.Shard.#{index}"
-
-      names when index < tuple_size(names) ->
-        elem(names, index)
-
-      _names ->
-        # Index beyond the pre-computed range (e.g. test shards with ad-hoc indices).
-        :"Ferricstore.Store.Shard.#{index}"
-    end
-  end
+  @spec shard_name(FerricStore.Instance.t(), non_neg_integer()) :: atom()
+  def shard_name(ctx, index), do: elem(ctx.shard_names, index)
 
   @doc """
-  Returns the keydir ETS table name for the shard at `index`.
+  Returns the keydir ETS table ref for the shard at `index`.
 
-  Uses a pre-computed tuple from persistent_term for O(1) lookup (~5ns)
-  instead of string interpolation + atom creation (~120ns per call).
-  Falls back to string interpolation if the cache is not initialized.
+  Uses the pre-computed tuple from the instance context for O(1) lookup.
   """
-  @spec keydir_name(non_neg_integer()) :: atom()
-  def keydir_name(index) do
-    case :persistent_term.get(:ferricstore_keydir_names, nil) do
-      nil ->
-        :"keydir_#{index}"
-
-      names when index < tuple_size(names) ->
-        elem(names, index)
-
-      _names ->
-        :"keydir_#{index}"
-    end
-  end
+  @spec keydir_name(FerricStore.Instance.t(), non_neg_integer()) :: atom() | reference()
+  def keydir_name(ctx, index), do: elem(ctx.keydir_refs, index)
 
   # -------------------------------------------------------------------
   # Convenience accessors (dispatch to correct shard)
@@ -573,10 +538,10 @@ defmodule Ferricstore.Store.Router do
   Only cold keys benefit from sendfile: hot keys are already in BEAM memory
   and would need a normal `get` + `transport.send`.
   """
-  @spec get_file_ref(binary()) :: {binary(), non_neg_integer(), non_neg_integer()} | nil
-  def get_file_ref(key) do
-    idx = shard_for(key)
-    keydir = resolve_keydir(idx)
+  @spec get_file_ref(FerricStore.Instance.t(), binary()) :: {binary(), non_neg_integer(), non_neg_integer()} | nil
+  def get_file_ref(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
     now = System.os_time(:millisecond)
 
     case ets_get_full(keydir, key, now) do
@@ -586,8 +551,7 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
         # Cold key — return file ref directly, no GenServer needed.
-        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
         path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
         # Adjust offset to skip header and key bytes (sendfile needs value offset).
         value_offset = offset + 26 + byte_size(key)
@@ -595,7 +559,7 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, _file_id, _offset, _value_size} ->
         # Invalid file ref — fall back to GenServer.
-        GenServer.call(resolve_shard(idx), {:get_file_ref, key})
+        GenServer.call(resolve_shard(ctx, idx), {:get_file_ref, key})
 
       :expired ->
         Stats.incr_keyspace_misses()
@@ -619,29 +583,28 @@ defmodule Ferricstore.Store.Router do
     - `{:cold_value, value}` — value was on disk, GenServer fetched it
     - `:miss` — key doesn't exist
   """
-  @spec get_with_file_ref(binary()) :: {:hot, binary()} | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()} | {:cold_value, binary()} | :miss
-  def get_with_file_ref(key) do
-    idx = shard_for(key)
-    keydir = resolve_keydir(idx)
+  @spec get_with_file_ref(FerricStore.Instance.t(), binary()) :: {:hot, binary()} | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()} | {:cold_value, binary()} | :miss
+  def get_with_file_ref(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
     now = System.os_time(:millisecond)
 
     case ets_get_full(keydir, key, now) do
       {:hit, value, lfu} ->
-        sampled_read_bookkeeping_fast(keydir, key, lfu)
+        sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
         {:hot, value}
 
       {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
         # Value is on disk — return file ref for potential sendfile.
         # Use DataDir directly to avoid GenServer roundtrip.
-        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
         path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
         Stats.record_cold_read(key)
         {:cold_ref, path, offset, value_size}
 
       {:cold, _file_id, _offset, _value_size} ->
         # Cold entry but no valid file ref — ask GenServer
-        result = GenServer.call(resolve_shard(idx), {:get, key})
+        result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
         if result != nil do
           Stats.record_cold_read(key)
           {:cold_value, result}
@@ -661,7 +624,7 @@ defmodule Ferricstore.Store.Router do
 
       :no_table ->
         # ETS table unavailable (shard restarting). Fall back to GenServer.
-        result = GenServer.call(resolve_shard(idx), {:get, key})
+        result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
         if result != nil do
           Stats.record_cold_read(key)
           {:cold_value, result}
@@ -713,15 +676,15 @@ defmodule Ferricstore.Store.Router do
   (Bitcask fallback) in `Ferricstore.Stats` for the `FERRICSTORE.HOTNESS`
   command and the `INFO stats` hot/cold fields.
   """
-  @spec get(binary()) :: binary() | nil
-  def get(key) do
-    idx = shard_for(key)
-    keydir = resolve_keydir(idx)
+  @spec get(FerricStore.Instance.t(), binary()) :: binary() | nil
+  def get(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
     now = System.os_time(:millisecond)
 
     case ets_get_full(keydir, key, now) do
       {:hit, value, lfu} ->
-        sampled_read_bookkeeping_fast(keydir, key, lfu)
+        sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
         value
 
       {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
@@ -729,15 +692,14 @@ defmodule Ferricstore.Store.Router do
         # Read directly from Bitcask via NIF, bypassing the Shard GenServer.
         # The ETS entry has valid file_id/offset from when the write committed,
         # so pread works without flushing pending async writes.
-        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
         path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
         case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
           {:ok, value} ->
             Stats.record_cold_read(key)
             # Warm ETS: promote back to hot if value fits in cache
-            warm_ets_after_cold_read(keydir, key, value, file_id, offset)
+            warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
             value
 
           _ ->
@@ -746,7 +708,7 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, _file_id, _offset, _value_size} ->
         # Cold entry but invalid file ref (file_id=0 or value_size=0) — ask GenServer.
-        result = GenServer.call(resolve_shard(idx), {:get, key})
+        result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
 
         if result != nil do
           Stats.record_cold_read(key)
@@ -767,7 +729,7 @@ defmodule Ferricstore.Store.Router do
 
       :no_table ->
         # ETS table unavailable (shard restarting). Fall back to GenServer.
-        result = GenServer.call(resolve_shard(idx), {:get, key})
+        result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
 
         if result != nil do
           Stats.record_cold_read(key)
@@ -786,15 +748,15 @@ defmodule Ferricstore.Store.Router do
   Hot path: reads directly from ETS for cached keys. Each read is recorded
   as hot or cold in `Ferricstore.Stats`.
   """
-  @spec get_meta(binary()) :: {binary(), non_neg_integer()} | nil
-  def get_meta(key) do
-    idx = shard_for(key)
-    keydir = resolve_keydir(idx)
+  @spec get_meta(FerricStore.Instance.t(), binary()) :: {binary(), non_neg_integer()} | nil
+  def get_meta(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
     now = System.os_time(:millisecond)
 
     case ets_get_full(keydir, key, now) do
       {:hit, value, lfu} ->
-        sampled_read_bookkeeping_fast(keydir, key, lfu)
+        sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
         # Recover expire_at_ms from ETS (ets_get_full returns lfu, not exp).
         expire_at_ms =
           try do
@@ -819,14 +781,13 @@ defmodule Ferricstore.Store.Router do
             ArgumentError -> 0
           end
 
-        data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-        shard_path = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
         path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
 
         case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
           {:ok, value} ->
             Stats.record_cold_read(key)
-            warm_ets_after_cold_read(keydir, key, value, file_id, offset)
+            warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
             {value, expire_at_ms}
 
           _ ->
@@ -836,7 +797,7 @@ defmodule Ferricstore.Store.Router do
       {:cold, _file_id, _offset, _value_size} ->
         # Invalid file ref — ask GenServer.
         Stats.record_cold_read(key)
-        GenServer.call(resolve_shard(idx), {:get_meta, key})
+        GenServer.call(resolve_shard(ctx, idx), {:get_meta, key})
 
       :expired ->
         Stats.incr_keyspace_misses()
@@ -848,7 +809,7 @@ defmodule Ferricstore.Store.Router do
 
       :no_table ->
         Stats.record_cold_read(key)
-        GenServer.call(resolve_shard(idx), {:get_meta, key})
+        GenServer.call(resolve_shard(ctx, idx), {:get_meta, key})
     end
   end
 
@@ -856,14 +817,12 @@ defmodule Ferricstore.Store.Router do
   # 1 in N reads performs the ETS writes. Reduces write contention at high
   # concurrency with negligible impact on LFU accuracy (logarithmic counter)
   # and stats precision (ratio stays the same).
-  # Read at startup, cached in persistent_term for ~5ns access.
   # Default 100 = sample 1 in 100 reads. Set to 1 to disable sampling.
-  @default_read_sample_rate 100
 
   # LFU counter already available from the initial ets_get_full lookup.
   # Eliminates the second ETS lookup that sampled_read_bookkeeping does.
-  defp sampled_read_bookkeeping_fast(keydir, key, lfu) do
-    rate = :persistent_term.get(:ferricstore_read_sample_rate, @default_read_sample_rate)
+  defp sampled_read_bookkeeping_fast(ctx, keydir, key, lfu) do
+    rate = ctx.read_sample_rate
 
     if rate <= 1 or :rand.uniform(rate) == 1 do
       Stats.incr_keyspace_hits()
@@ -875,13 +834,13 @@ defmodule Ferricstore.Store.Router do
   # After a cold read, promote the value back to ETS (hot) if it fits
   # under the hot cache max value size threshold. ETS is :public with
   # write_concurrency so this is safe from any process.
-  @hot_cache_max_value_size 65_536
-  defp warm_ets_after_cold_read(keydir, key, value, _file_id, _offset) do
+  defp warm_ets_after_cold_read(ctx, keydir, key, value, _file_id, _offset) do
     # Skip promotion when under memory pressure — prevents evict/re-promote
     # thrashing where MemoryGuard evicts values and cold reads immediately
     # re-cache them. skip_promotion? is set at :pressure level (85%+).
-    if byte_size(value) <= :persistent_term.get(:ferricstore_hot_cache_max_value_size, @hot_cache_max_value_size)
-       and not Ferricstore.MemoryGuard.skip_promotion?() do
+    skip_promotion = :atomics.get(ctx.pressure_flags, 3) == 1
+
+    if byte_size(value) <= ctx.hot_cache_max_value_size and not skip_promotion do
       try do
         :ets.update_element(keydir, key, {2, value})
       rescue
@@ -894,14 +853,14 @@ defmodule Ferricstore.Store.Router do
   Stores `key` with `value`. `expire_at_ms` is an absolute Unix-epoch
   timestamp in milliseconds; pass `0` for no expiry.
   """
-  @spec put(binary(), binary(), non_neg_integer()) :: :ok | {:error, binary()}
+  @spec put(FerricStore.Instance.t(), binary(), binary(), non_neg_integer()) :: :ok | {:error, binary()}
   @max_key_size 65_535
   @max_value_size 512 * 1024 * 1024
 
   @doc "Returns the maximum allowed value size in bytes."
   def max_value_size, do: @max_value_size
 
-  def put(key, value, expire_at_ms \\ 0) do
+  def put(ctx, key, value, expire_at_ms \\ 0) do
     cond do
       byte_size(key) > @max_key_size ->
         {:error, "ERR key too large (max #{@max_key_size} bytes)"}
@@ -910,10 +869,10 @@ defmodule Ferricstore.Store.Router do
         {:error, "ERR value too large (max #{@max_value_size} bytes)"}
 
       true ->
-        case check_keydir_full(key) do
+        case check_keydir_full(ctx, key) do
           :ok ->
-            idx = shard_for(key)
-            raft_write(idx, key, {:put, key, value, expire_at_ms})
+            idx = shard_for(ctx, key)
+            raft_write(ctx, idx, key, {:put, key, value, expire_at_ms})
 
           {:error, _} = err ->
             err
@@ -922,16 +881,18 @@ defmodule Ferricstore.Store.Router do
   end
 
   # Checks if the keydir is full. If so, only allows writes to existing keys.
-  # Checks both `keydir_full?()` (ETS-level memory guard) and `reject_writes?()`
+  # Checks both `keydir_full?` (ETS-level memory guard) and `reject_writes?`
   # (noeviction policy with reject-level pressure). The Shard GenServer has its
-  # own `reject_writes?()` check in `handle_call({:put, ...})`, but when the
+  # own `reject_writes?` check in `handle_call({:put, ...})`, but when the
   # quorum bypass path is used, the Shard is skipped, so we must check here.
-  # Reads keydir_full from persistent_term (~5ns) instead of GenServer.call
-  # (~1-5us). Uses exists_fast? (ETS direct) instead of exists? (GenServer).
-  defp check_keydir_full(key) do
-    if Ferricstore.MemoryGuard.keydir_full?() or Ferricstore.MemoryGuard.reject_writes?() do
+  # Reads from ctx.pressure_flags atomics instead of persistent_term.
+  defp check_keydir_full(ctx, key) do
+    keydir_full = :atomics.get(ctx.pressure_flags, 1) == 1
+    reject_writes = :atomics.get(ctx.pressure_flags, 2) == 1
+
+    if keydir_full or reject_writes do
       # Allow updates to existing keys — use ETS direct check
-      if exists_fast?(key) do
+      if exists_fast?(ctx, key) do
         :ok
       else
         # Nudge MemoryGuard to run eviction immediately (async, non-blocking).
@@ -945,11 +906,11 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc "Deletes `key`. Returns `:ok` whether or not the key existed."
-  @spec delete(binary()) :: :ok
-  def delete(key) do
-    idx = shard_for(key)
+  @spec delete(FerricStore.Instance.t(), binary()) :: :ok
+  def delete(ctx, key) do
+    idx = shard_for(ctx, key)
 
-    raft_write(idx, key, {:delete, key})
+    raft_write(ctx, idx, key, {:delete, key})
   end
 
   @doc """
@@ -959,11 +920,11 @@ defmodule Ferricstore.Store.Router do
   with the appropriate shard index. Supports both quorum and async
   durability modes.
   """
-  @spec prob_write(tuple()) :: term()
-  def prob_write(command) do
+  @spec prob_write(FerricStore.Instance.t(), tuple()) :: term()
+  def prob_write(ctx, command) do
     key = extract_prob_key(command)
-    idx = shard_for(key)
-    raft_write(idx, key, command)
+    idx = shard_for(ctx, key)
+    raft_write(ctx, idx, key, command)
   end
 
   defp extract_prob_key({:bloom_create, key, _, _, _}), do: key
@@ -987,9 +948,9 @@ defmodule Ferricstore.Store.Router do
   A key is considered existing if it is in the keydir and not expired,
   regardless of whether its value is hot (in ETS) or cold (on disk only).
   """
-  @spec exists?(binary()) :: boolean()
-  def exists?(key) do
-    exists_fast?(key)
+  @spec exists?(FerricStore.Instance.t(), binary()) :: boolean()
+  def exists?(ctx, key) do
+    exists_fast?(ctx, key)
   end
 
   @doc """
@@ -997,14 +958,14 @@ defmodule Ferricstore.Store.Router do
 
   Returns `true` if the key exists in ETS and is not expired, `false` otherwise.
   This bypasses the GenServer entirely, saving ~1-3us per call. Used in the
-  hot write path (`check_keydir_full/1`) where we only need a boolean answer
+  hot write path (`check_keydir_full/2`) where we only need a boolean answer
   and can tolerate the fact that cold keys (value=nil but still in keydir)
   are correctly detected as existing.
   """
-  @spec exists_fast?(binary()) :: boolean()
-  def exists_fast?(key) do
-    idx = shard_for(key)
-    keydir = resolve_keydir(idx)
+  @spec exists_fast?(FerricStore.Instance.t(), binary()) :: boolean()
+  def exists_fast?(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
     now = System.os_time(:millisecond)
 
     try do
@@ -1024,9 +985,9 @@ defmodule Ferricstore.Store.Router do
   If the key does not exist, it is set to `delta`. Returns `{:ok, new_integer}`
   on success or `{:error, reason}` if the value is not a valid integer.
   """
-  @spec incr(binary(), integer()) :: {:ok, integer()} | {:error, binary()}
-  def incr(key, delta) do
-    raft_write(shard_for(key), key, {:incr, key, delta})
+  @spec incr(FerricStore.Instance.t(), binary(), integer()) :: {:ok, integer()} | {:error, binary()}
+  def incr(ctx, key, delta) do
+    raft_write(ctx, shard_for(ctx, key), key, {:incr, key, delta})
   end
 
   @doc """
@@ -1035,9 +996,9 @@ defmodule Ferricstore.Store.Router do
   If the key does not exist, it is set to `delta`. Returns `{:ok, new_float_string}`
   on success or `{:error, reason}` if the value is not a valid float.
   """
-  @spec incr_float(binary(), float()) :: {:ok, binary()} | {:error, binary()}
-  def incr_float(key, delta) do
-    raft_write(shard_for(key), key, {:incr_float, key, delta})
+  @spec incr_float(FerricStore.Instance.t(), binary(), float()) :: {:ok, binary()} | {:error, binary()}
+  def incr_float(ctx, key, delta) do
+    raft_write(ctx, shard_for(ctx, key), key, {:incr_float, key, delta})
   end
 
   @doc """
@@ -1046,9 +1007,9 @@ defmodule Ferricstore.Store.Router do
   If the key does not exist, it is created with value `suffix`.
   Returns `{:ok, new_byte_length}`.
   """
-  @spec append(binary(), binary()) :: {:ok, non_neg_integer()}
-  def append(key, suffix) do
-    raft_write(shard_for(key), key, {:append, key, suffix})
+  @spec append(FerricStore.Instance.t(), binary(), binary()) :: {:ok, non_neg_integer()}
+  def append(ctx, key, suffix) do
+    raft_write(ctx, shard_for(ctx, key), key, {:append, key, suffix})
   end
 
   @doc """
@@ -1056,9 +1017,9 @@ defmodule Ferricstore.Store.Router do
 
   Returns the old value, or `nil` if the key did not exist.
   """
-  @spec getset(binary(), binary()) :: binary() | nil
-  def getset(key, value) do
-    raft_write(shard_for(key), key, {:getset, key, value})
+  @spec getset(FerricStore.Instance.t(), binary(), binary()) :: binary() | nil
+  def getset(ctx, key, value) do
+    raft_write(ctx, shard_for(ctx, key), key, {:getset, key, value})
   end
 
   @doc """
@@ -1066,9 +1027,9 @@ defmodule Ferricstore.Store.Router do
 
   Returns the value, or `nil` if the key did not exist.
   """
-  @spec getdel(binary()) :: binary() | nil
-  def getdel(key) do
-    raft_write(shard_for(key), key, {:getdel, key})
+  @spec getdel(FerricStore.Instance.t(), binary()) :: binary() | nil
+  def getdel(ctx, key) do
+    raft_write(ctx, shard_for(ctx, key), key, {:getdel, key})
   end
 
   @doc """
@@ -1078,9 +1039,9 @@ defmodule Ferricstore.Store.Router do
   pass `0` to persist (remove expiry). Returns the value, or `nil` if
   the key did not exist.
   """
-  @spec getex(binary(), non_neg_integer()) :: binary() | nil
-  def getex(key, expire_at_ms) do
-    raft_write(shard_for(key), key, {:getex, key, expire_at_ms})
+  @spec getex(FerricStore.Instance.t(), binary(), non_neg_integer()) :: binary() | nil
+  def getex(ctx, key, expire_at_ms) do
+    raft_write(ctx, shard_for(ctx, key), key, {:getex, key, expire_at_ms})
   end
 
   @doc """
@@ -1089,17 +1050,17 @@ defmodule Ferricstore.Store.Router do
   Zero-pads if the key doesn't exist or the string is shorter than offset.
   Returns `{:ok, new_byte_length}`.
   """
-  @spec setrange(binary(), non_neg_integer(), binary()) :: {:ok, non_neg_integer()}
-  def setrange(key, offset, value) do
-    raft_write(shard_for(key), key, {:setrange, key, offset, value})
+  @spec setrange(FerricStore.Instance.t(), binary(), non_neg_integer(), binary()) :: {:ok, non_neg_integer()}
+  def setrange(ctx, key, offset, value) do
+    raft_write(ctx, shard_for(ctx, key), key, {:setrange, key, offset, value})
   end
 
   @doc "Returns all live (non-expired, non-deleted) keys across every shard."
-  @spec keys() :: [binary()]
-  def keys do
-    sc = effective_shard_count()
+  @spec keys(FerricStore.Instance.t()) :: [binary()]
+  def keys(ctx) do
+    sc = ctx.shard_count
     Enum.flat_map(0..(sc - 1), fn i ->
-      GenServer.call(resolve_shard(i), :keys)
+      GenServer.call(resolve_shard(ctx, i), :keys)
     end)
   end
 
@@ -1110,21 +1071,21 @@ defmodule Ferricstore.Store.Router do
   all keys. This is the fast path for `SCAN MATCH 'prefix:*'` and
   `KEYS 'prefix:*'`.
   """
-  @spec keys_with_prefix(binary()) :: [binary()]
-  def keys_with_prefix(prefix) when is_binary(prefix) do
-    sc = effective_shard_count()
+  @spec keys_with_prefix(FerricStore.Instance.t(), binary()) :: [binary()]
+  def keys_with_prefix(ctx, prefix) when is_binary(prefix) do
+    sc = ctx.shard_count
     Enum.flat_map(0..(sc - 1), fn i ->
-      GenServer.call(resolve_shard(i), {:keys_with_prefix, prefix})
+      GenServer.call(resolve_shard(ctx, i), {:keys_with_prefix, prefix})
     end)
   end
 
   @doc "Returns the count of all live keys across every shard."
-  @spec dbsize() :: non_neg_integer()
-  def dbsize do
-    sc = effective_shard_count()
+  @spec dbsize(FerricStore.Instance.t()) :: non_neg_integer()
+  def dbsize(ctx) do
+    sc = ctx.shard_count
     Enum.reduce(0..(sc - 1), 0, fn i, acc ->
       try do
-        acc + :ets.info(resolve_keydir(i), :size)
+        acc + :ets.info(resolve_keydir(ctx, i), :size)
       rescue
         ArgumentError -> acc
       end
@@ -1136,9 +1097,9 @@ defmodule Ferricstore.Store.Router do
 
   Used by the WATCH/EXEC transaction mechanism to detect concurrent modifications.
   """
-  @spec get_version(binary()) :: non_neg_integer()
-  def get_version(key) do
-    GenServer.call(resolve_shard(shard_for(key)), {:get_version, key})
+  @spec get_version(FerricStore.Instance.t(), binary()) :: non_neg_integer()
+  def get_version(ctx, key) do
+    GenServer.call(resolve_shard(ctx, shard_for(ctx, key)), {:get_version, key})
   end
 
   @doc """
@@ -1150,10 +1111,10 @@ defmodule Ferricstore.Store.Router do
 
   Used by sendfile zero-copy and STRLEN on cold keys.
   """
-  @spec get_keydir_file_ref(binary()) :: {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | :miss
-  def get_keydir_file_ref(key) do
-    idx = shard_for(key)
-    keydir = resolve_keydir(idx)
+  @spec get_keydir_file_ref(FerricStore.Instance.t(), binary()) :: {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | :miss
+  def get_keydir_file_ref(ctx, key) do
+    idx = shard_for(ctx, key)
+    keydir = resolve_keydir(ctx, idx)
     now = System.os_time(:millisecond)
 
     try do
@@ -1179,53 +1140,53 @@ defmodule Ferricstore.Store.Router do
   # Native command accessors
   # -------------------------------------------------------------------
 
-  @spec cas(binary(), binary(), binary(), non_neg_integer() | nil) :: 1 | 0 | nil
-  def cas(key, expected, new_value, ttl_ms) do
+  @spec cas(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer() | nil) :: 1 | 0 | nil
+  def cas(ctx, key, expected, new_value, ttl_ms) do
     expire_at_ms = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: nil
-    raft_write(shard_for(key), key, {:cas, key, expected, new_value, expire_at_ms})
+    raft_write(ctx, shard_for(ctx, key), key, {:cas, key, expected, new_value, expire_at_ms})
   end
 
-  @spec lock(binary(), binary(), pos_integer()) :: :ok | {:error, binary()}
-  def lock(key, owner, ttl_ms) do
+  @spec lock(FerricStore.Instance.t(), binary(), binary(), pos_integer()) :: :ok | {:error, binary()}
+  def lock(ctx, key, owner, ttl_ms) do
     expire_at_ms = System.os_time(:millisecond) + ttl_ms
-    raft_write(shard_for(key), key, {:lock, key, owner, expire_at_ms})
+    raft_write(ctx, shard_for(ctx, key), key, {:lock, key, owner, expire_at_ms})
   end
 
-  @spec unlock(binary(), binary()) :: 1 | {:error, binary()}
-  def unlock(key, owner) do
-    raft_write(shard_for(key), key, {:unlock, key, owner})
+  @spec unlock(FerricStore.Instance.t(), binary(), binary()) :: 1 | {:error, binary()}
+  def unlock(ctx, key, owner) do
+    raft_write(ctx, shard_for(ctx, key), key, {:unlock, key, owner})
   end
 
-  @spec extend(binary(), binary(), pos_integer()) :: 1 | {:error, binary()}
-  def extend(key, owner, ttl_ms) do
+  @spec extend(FerricStore.Instance.t(), binary(), binary(), pos_integer()) :: 1 | {:error, binary()}
+  def extend(ctx, key, owner, ttl_ms) do
     expire_at_ms = System.os_time(:millisecond) + ttl_ms
-    raft_write(shard_for(key), key, {:extend, key, owner, expire_at_ms})
+    raft_write(ctx, shard_for(ctx, key), key, {:extend, key, owner, expire_at_ms})
   end
 
-  @spec ratelimit_add(binary(), pos_integer(), pos_integer(), pos_integer()) :: [term()]
-  def ratelimit_add(key, window_ms, max, count) do
+  @spec ratelimit_add(FerricStore.Instance.t(), binary(), pos_integer(), pos_integer(), pos_integer()) :: [term()]
+  def ratelimit_add(ctx, key, window_ms, max, count) do
     now_ms = System.os_time(:millisecond)
-    raft_write(shard_for(key), key, {:ratelimit_add, key, window_ms, max, count, now_ms})
+    raft_write(ctx, shard_for(ctx, key), key, {:ratelimit_add, key, window_ms, max, count, now_ms})
   end
 
   # -------------------------------------------------------------------
   # List operations
   # -------------------------------------------------------------------
 
-  @spec list_op(binary(), term()) :: term()
-  def list_op(key, {:lmove, destination, from_dir, to_dir}) do
-    src_idx = shard_for(key)
-    dst_idx = shard_for(destination)
+  @spec list_op(FerricStore.Instance.t(), binary(), term()) :: term()
+  def list_op(ctx, key, {:lmove, destination, from_dir, to_dir}) do
+    src_idx = shard_for(ctx, key)
+    dst_idx = shard_for(ctx, destination)
 
     if src_idx == dst_idx do
-      GenServer.call(resolve_shard(src_idx), {:list_op_lmove, key, destination, from_dir, to_dir})
+      GenServer.call(resolve_shard(ctx, src_idx), {:list_op_lmove, key, destination, from_dir, to_dir})
     else
-      case GenServer.call(resolve_shard(src_idx), {:list_op, key, {:pop_for_move, from_dir}}) do
+      case GenServer.call(resolve_shard(ctx, src_idx), {:list_op, key, {:pop_for_move, from_dir}}) do
         nil -> nil
         {:error, _} = err -> err
         element ->
           push_op = if to_dir == :left, do: {:lpush, [element]}, else: {:rpush, [element]}
-          case GenServer.call(resolve_shard(dst_idx), {:list_op, destination, push_op}) do
+          case GenServer.call(resolve_shard(ctx, dst_idx), {:list_op, destination, push_op}) do
             {:error, _} = err -> err
             _length -> element
           end
@@ -1233,7 +1194,7 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  def list_op(key, operation) do
-    GenServer.call(resolve_shard(shard_for(key)), {:list_op, key, operation})
+  def list_op(ctx, key, operation) do
+    GenServer.call(resolve_shard(ctx, shard_for(ctx, key)), {:list_op, key, operation})
   end
 end
