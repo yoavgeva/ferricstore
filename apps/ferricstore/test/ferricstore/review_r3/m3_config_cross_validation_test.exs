@@ -13,6 +13,11 @@ defmodule Ferricstore.ReviewR3.M3ConfigCrossValidationTest do
     orig_min = Application.get_env(:ferricstore, :hot_cache_min_ram)
     orig_max = Application.get_env(:ferricstore, :hot_cache_max_ram)
 
+    # Reset to safe defaults before each test so leftover state from other tests
+    # (e.g. a high hot-cache-min-ram) doesn't cause cross-validation failures.
+    Ferricstore.Config.set("hot-cache-min-ram", "1048576")
+    Ferricstore.Config.set("hot-cache-max-ram", "1073741824")
+
     on_exit(fn ->
       if orig_min, do: Application.put_env(:ferricstore, :hot_cache_min_ram, orig_min)
       if orig_max, do: Application.put_env(:ferricstore, :hot_cache_max_ram, orig_max)

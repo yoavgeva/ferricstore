@@ -36,6 +36,12 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
     orig_hot_cache_min = Application.get_env(:ferricstore, :hot_cache_min_ram)
     orig_eviction = Application.get_env(:ferricstore, :eviction_policy)
 
+    # Reset min to a safe low value before each test so leftover state from
+    # other tests (e.g. a high hot-cache-min-ram) doesn't cause cross-validation
+    # failures when setting hot-cache-max-ram. Use Application.put_env directly
+    # to avoid triggering MemoryGuard reconfigure that would override :auto max.
+    Application.put_env(:ferricstore, :hot_cache_min_ram, 1_048_576)
+
     on_exit(fn ->
       # Restore original config
       if orig_keydir_max do
