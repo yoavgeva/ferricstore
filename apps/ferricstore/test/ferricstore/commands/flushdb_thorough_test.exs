@@ -20,12 +20,6 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
     end)
   end
 
-  defp prefix_index_total do
-    Enum.reduce(0..(shard_count() - 1), 0, fn i, acc ->
-      try do acc + :ets.info(:"prefix_keys_#{i}", :size) rescue _ -> acc end
-    end)
-  end
-
   describe "FLUSHDB clears ETS completely" do
     test "string keys removed from ETS" do
       for i <- 1..100, do: Router.put(FerricStore.Instance.get(:default), "flush_str:#{i}", "val", 0)
@@ -34,15 +28,6 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
       FerricStore.flushall()
 
       assert ets_total_keys() == 0
-    end
-
-    test "prefix index cleared" do
-      for i <- 1..50, do: Router.put(FerricStore.Instance.get(:default), "myprefix:#{i}", "val", 0)
-      assert prefix_index_total() > 0
-
-      FerricStore.flushall()
-
-      assert prefix_index_total() == 0
     end
 
     test "hash compound keys (H: and T:) removed from ETS" do

@@ -50,6 +50,15 @@ config :ferricstore, :read_sample_rate, 1
 # the parent values survive. Using a non-keyword-list atom forces a full replace.
 config :libcluster, topologies: :disabled
 
+# JUnit XML output for CI/CD integration (Jenkins, GitHub Actions, GitLab CI)
+config :junit_formatter,
+  report_file: "test-results.xml",
+  report_dir: Path.expand("../test-results", __DIR__),
+  automatic_create_dir?: true,
+  print_report_file: true,
+  include_filename?: true,
+  use_project_subdirectory?: true
+
 # FerricstoreEcto test repo (SQLite3 in-memory with shared cache)
 # pool_size: 5 to allow concurrent test access; journal_mode: wal for
 # concurrent reads during writes.

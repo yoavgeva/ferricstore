@@ -174,7 +174,7 @@ defmodule Ferricstore.ReviewR4Test do
     test "file IDs are monotonically increasing integers" do
       # Verify by checking that the active file for shard 0 has an
       # integer file_id (not a timestamp)
-      shard = Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0)
+      shard = Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
       {file_id, _path} = GenServer.call(shard, :get_active_file)
       assert is_integer(file_id)
       # File IDs should be small integers, not timestamps

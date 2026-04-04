@@ -402,11 +402,8 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   # individually since they don't benefit from batching.
   @spec apply_commands(non_neg_integer(), [command()]) :: :ok
   defp apply_commands(shard_index, commands) do
-    alias Ferricstore.Store.PrefixIndex
-
     {active_file_id, active_file_path} = get_active_file(shard_index)
     keydir = :"keydir_#{shard_index}"
-    prefix_table = PrefixIndex.table_name(shard_index)
 
     # Separate puts (which can be batched) from other commands
     {puts, others} = split_puts_and_others(commands)
@@ -420,7 +417,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
 
       case NIF.v2_append_batch(active_file_path, batch_entries) do
         {:ok, results} ->
-          # Update ETS (7-tuple) and prefix index for each put.
+          # Update ETS (7-tuple) for each put.
           # Values exceeding the hot_cache_max_value_size threshold are stored
           # as nil (cold) to avoid expensive binary copies on :ets.lookup.
           puts
@@ -432,12 +429,6 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
               keydir,
               {key, value_for_ets, expire_at_ms, LFU.initial(), active_file_id, offset, value_size}
             )
-
-            try do
-              PrefixIndex.track(prefix_table, key, shard_index)
-            rescue
-              ArgumentError -> :ok
-            end
           end)
 
         {:error, reason} ->
@@ -453,12 +444,6 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
         case NIF.v2_append_tombstone(active_file_path, key) do
           {:ok, _} ->
             :ets.delete(keydir, key)
-
-            try do
-              PrefixIndex.untrack(prefix_table, key, shard_index)
-            rescue
-              ArgumentError -> :ok
-            end
 
           {:error, reason} ->
             Logger.error(
@@ -484,7 +469,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   @spec get_active_file(non_neg_integer()) :: {non_neg_integer(), binary()}
   defp get_active_file(shard_index) do
     ctx = FerricStore.Instance.get(:default)
-    shard_name = Ferricstore.Store.Router.shard_name(ctx, shard_index)
+    shard_name = elem(ctx.shard_names, shard_index)
     GenServer.call(shard_name, :get_active_file)
   end
 

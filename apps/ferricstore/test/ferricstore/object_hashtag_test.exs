@@ -36,7 +36,6 @@ defmodule Ferricstore.ObjectHashtagTest do
         Map.keys(data)
         |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1)
       end,
-      keys_with_prefix: fn _prefix -> [] end,
       flush: fn -> :ok end,
       dbsize: fn -> map_size(data) end,
       compound_get: fn _rk, ck ->

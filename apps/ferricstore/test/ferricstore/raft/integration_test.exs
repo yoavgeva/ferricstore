@@ -38,7 +38,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
   defp keydir_for(key), do: :"keydir_#{Router.shard_for(FerricStore.Instance.get(:default), key)}"
 
   defp shard_pid_for(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     Process.whereis(name)
   end
 
@@ -64,7 +64,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
       assert [{^k, "dual_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir_for(k), k)
 
       # Flush pending writes to Bitcask before checking NIF directly
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), k))
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), k))
       GenServer.call(shard_name, :flush)
 
       # Flush background BitcaskWriter so deferred writes are on disk
@@ -242,7 +242,7 @@ defmodule Ferricstore.Raft.IntegrationTest do
       :ok = GenServer.call(pid, :flush)
 
       shard_index = Router.shard_for(FerricStore.Instance.get(:default), k)
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_index)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_index)
 
       # Kill the shard (simulates crash)
       ref = Process.monitor(pid)

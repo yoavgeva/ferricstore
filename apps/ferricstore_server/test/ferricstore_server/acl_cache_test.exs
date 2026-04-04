@@ -18,8 +18,8 @@ defmodule FerricstoreServer.AclCacheTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Acl
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Acl
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------

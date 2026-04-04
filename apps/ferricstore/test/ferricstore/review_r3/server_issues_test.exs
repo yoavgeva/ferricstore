@@ -310,7 +310,6 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
       exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
       keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
-      keys_with_prefix: fn p -> Router.keys_with_prefix(FerricStore.Instance.get(:default), p) end,
       flush: fn ->
         FerricStore.flushall()
       end,

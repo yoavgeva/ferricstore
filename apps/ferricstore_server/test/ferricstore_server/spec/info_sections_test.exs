@@ -39,7 +39,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
       exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
       keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
       flush: fn ->
-        Enum.each(Router.keys(FerricStore.Instance.get(:default)), &Router.delete/1)
+        Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
         :ok
       end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,

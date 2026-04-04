@@ -2,22 +2,21 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   @moduledoc """
   Comprehensive tests for write path optimizations:
 
-  1. PrefixIndex duplicate_bag optimization (track without delete_object)
-  2. StateMachine nosync Bitcask + background BitcaskWriter
-  3. Router quorum_write bypass (direct ra.pipeline_command)
-  4. Async WAL fdatasync monkey-patch
-  5. LFU touch skip when packed value unchanged
-  6. WriteVersion atomic counters
-  7. Hash tag routing
-  8. SET EXAT/PXAT/GET/KEEPTTL
-  9. Router value size limits
+  1. StateMachine nosync Bitcask + background BitcaskWriter
+  2. Router quorum_write bypass (direct ra.pipeline_command)
+  3. Async WAL fdatasync monkey-patch
+  4. LFU touch skip when packed value unchanged
+  5. WriteVersion atomic counters
+  6. Hash tag routing
+  7. SET EXAT/PXAT/GET/KEEPTTL
+  8. Router value size limits
   """
 
   use ExUnit.Case, async: false
 
   import Bitwise
 
-  alias Ferricstore.Store.{BitcaskWriter, LFU, PrefixIndex, Router, WriteVersion}
+  alias Ferricstore.Store.{BitcaskWriter, LFU, Router, WriteVersion}
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do
@@ -61,234 +60,8 @@ defmodule Ferricstore.WritePathOptimizationsTest do
       getex: fn k, e -> Router.getex(FerricStore.Instance.get(:default), k, e) end,
       setrange: fn k, o, v -> Router.setrange(FerricStore.Instance.get(:default), k, o, v) end,
       keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
-      keys_with_prefix: fn p -> Router.keys_with_prefix(FerricStore.Instance.get(:default), p) end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end
     }
-  end
-
-  # =========================================================================
-  # 1. PrefixIndex duplicate_bag optimization
-  # =========================================================================
-
-  describe "PrefixIndex duplicate_bag" do
-    test "track and lookup keys by prefix" do
-      table = PrefixIndex.create_table(9000)
-      on_exit(fn -> safe_ets_delete(table) end)
-
-      # Simulate a keydir for the filter logic
-      keydir = :ets.new(:keydir_9000_test, [:set, :public, :named_table])
-      on_exit(fn -> safe_ets_delete(keydir) end)
-
-      PrefixIndex.track(table, "user:1", 9000)
-      PrefixIndex.track(table, "user:2", 9000)
-      PrefixIndex.track(table, "user:3", 9000)
-
-      # Insert matching entries into keydir (7-tuple format, no expiry)
-      for k <- ["user:1", "user:2", "user:3"] do
-        :ets.insert(keydir, {k, "val", 0, 0, 1, 0, 3})
-      end
-
-      result = PrefixIndex.keys_for_prefix(table, keydir, "user")
-      assert length(result) == 3
-      assert "user:1" in result
-      assert "user:2" in result
-      assert "user:3" in result
-    end
-
-    test "track same key twice does not error, lookup still works" do
-      table = PrefixIndex.create_table(9001)
-      keydir = :ets.new(:keydir_9001_test, [:set, :public, :named_table])
-      on_exit(fn -> safe_ets_delete(table); safe_ets_delete(keydir) end)
-
-      PrefixIndex.track(table, "user:same", 9001)
-      PrefixIndex.track(table, "user:same", 9001)
-
-      :ets.insert(keydir, {"user:same", "val", 0, 0, 1, 0, 3})
-
-      result = PrefixIndex.keys_for_prefix(table, keydir, "user")
-      # Even with duplicates in the bag, keydir lookup deduplicates
-      # because each key appears only once in the keydir (set table).
-      # The result may have duplicates from the bag, but the keydir
-      # returns the same entry twice, so we get two identical entries.
-      # The important thing: the key IS found.
-      assert "user:same" in result
-    end
-
-    test "track 1000 keys with same prefix then lookup all" do
-      table = PrefixIndex.create_table(9002)
-      keydir = :ets.new(:keydir_9002_test, [:set, :public, :named_table])
-      on_exit(fn -> safe_ets_delete(table); safe_ets_delete(keydir) end)
-
-      for i <- 1..1000 do
-        key = "batch:#{i}"
-        PrefixIndex.track(table, key, 9002)
-        :ets.insert(keydir, {key, "v", 0, 0, 1, 0, 1})
-      end
-
-      result = PrefixIndex.keys_for_prefix(table, keydir, "batch")
-      assert length(result) == 1000
-    end
-
-    test "untrack removes key from prefix lookup" do
-      table = PrefixIndex.create_table(9003)
-      keydir = :ets.new(:keydir_9003_test, [:set, :public, :named_table])
-      on_exit(fn -> safe_ets_delete(table); safe_ets_delete(keydir) end)
-
-      PrefixIndex.track(table, "rm:a", 9003)
-      PrefixIndex.track(table, "rm:b", 9003)
-      :ets.insert(keydir, {"rm:a", "v", 0, 0, 1, 0, 1})
-      :ets.insert(keydir, {"rm:b", "v", 0, 0, 1, 0, 1})
-
-      PrefixIndex.untrack(table, "rm:a", 9003)
-
-      result = PrefixIndex.keys_for_prefix(table, keydir, "rm")
-      assert result == ["rm:b"]
-    end
-
-    test "untrack key that was tracked twice removes all instances" do
-      table = PrefixIndex.create_table(9004)
-      keydir = :ets.new(:keydir_9004_test, [:set, :public, :named_table])
-      on_exit(fn -> safe_ets_delete(table); safe_ets_delete(keydir) end)
-
-      PrefixIndex.track(table, "dup:x", 9004)
-      PrefixIndex.track(table, "dup:x", 9004)
-      :ets.insert(keydir, {"dup:x", "v", 0, 0, 1, 0, 1})
-
-      PrefixIndex.untrack(table, "dup:x", 9004)
-
-      # delete_object removes all matching {prefix, key} tuples from duplicate_bag
-      result = PrefixIndex.keys_for_prefix(table, keydir, "dup")
-      # After untrack, key should be gone from both bag entries
-      assert result == []
-    end
-
-    test "keys without colon are not indexed" do
-      table = PrefixIndex.create_table(9005)
-      on_exit(fn -> safe_ets_delete(table) end)
-
-      PrefixIndex.track(table, "nocolon", 9005)
-
-      raw = :ets.tab2list(table)
-      assert raw == []
-    end
-
-    test "empty string key is not indexed" do
-      table = PrefixIndex.create_table(9006)
-      on_exit(fn -> safe_ets_delete(table) end)
-
-      assert PrefixIndex.extract_prefix("") == nil
-      PrefixIndex.track(table, "", 9006)
-
-      raw = :ets.tab2list(table)
-      assert raw == []
-    end
-
-    test "key with leading colon has empty string prefix" do
-      assert PrefixIndex.extract_prefix(":leading") == ""
-    end
-
-    test "key with multiple colons uses first segment as prefix" do
-      assert PrefixIndex.extract_prefix("a:b:c:d") == "a"
-    end
-
-    test "duplicate entries don't cause false duplicates in KEYS via real Router" do
-      store = real_store()
-
-      # Write the same key 10 times (each write calls track)
-      key = ukey("duptest")
-
-      for _ <- 1..10 do
-        store.put.(key, "value", 0)
-      end
-
-      # Wait for any async writes
-      BitcaskWriter.flush_all()
-
-      # KEYS with prefix should return the key exactly once
-      keys = store.keys_with_prefix.("duptest")
-      occurrences = Enum.count(keys, &(&1 == key))
-      # keys_for_prefix deduplicates via keydir lookup (set table)
-      # but duplicate_bag may produce duplicates in the reduce
-      # The key MUST be present at least once
-      assert occurrences >= 1
-    end
-
-    test "expired keys filtered from keys_for_prefix" do
-      table = PrefixIndex.create_table(9007)
-      keydir = :ets.new(:keydir_9007_test, [:set, :public, :named_table])
-      on_exit(fn -> safe_ets_delete(table); safe_ets_delete(keydir) end)
-
-      PrefixIndex.track(table, "exp:alive", 9007)
-      PrefixIndex.track(table, "exp:dead", 9007)
-
-      :ets.insert(keydir, {"exp:alive", "v", 0, 0, 1, 0, 1})
-      # Expired: expire_at_ms in the past
-      :ets.insert(keydir, {"exp:dead", "v", 1, 0, 1, 0, 1})
-
-      result = PrefixIndex.keys_for_prefix(table, keydir, "exp")
-      assert result == ["exp:alive"]
-    end
-
-    test "rebuild_from_keydir produces correct index" do
-      table = PrefixIndex.create_table(9008)
-      keydir = :ets.new(:keydir_9008_test, [:set, :public, :named_table])
-      on_exit(fn -> safe_ets_delete(table); safe_ets_delete(keydir) end)
-
-      :ets.insert(keydir, {"ns:a", "v", 0, 0, 1, 0, 1})
-      :ets.insert(keydir, {"ns:b", "v", 0, 0, 1, 0, 1})
-      :ets.insert(keydir, {"nocolon", "v", 0, 0, 1, 0, 1})
-
-      PrefixIndex.rebuild_from_keydir(table, keydir)
-
-      result = PrefixIndex.keys_for_prefix(table, keydir, "ns")
-      assert length(result) == 2
-      assert "ns:a" in result
-      assert "ns:b" in result
-    end
-
-    test "rebuild after many SET+DEL cycles leaves no stale entries" do
-      store = real_store()
-
-      # Create and delete keys in a cycle
-      keys = for i <- 1..20, do: "cycle:#{i}_#{:rand.uniform(999_999)}"
-
-      for k <- keys, do: store.put.(k, "val", 0)
-      BitcaskWriter.flush_all()
-
-      for k <- keys, do: store.delete.(k)
-      BitcaskWriter.flush_all()
-
-      # All keys should be gone from prefix lookup
-      result = store.keys_with_prefix.("cycle")
-      remaining = Enum.filter(result, fn k -> k in keys end)
-      assert remaining == []
-    end
-
-    test "track is fast for 10000 keys with same prefix" do
-      table = PrefixIndex.create_table(9009)
-      on_exit(fn -> safe_ets_delete(table) end)
-
-      {time_us, _} =
-        :timer.tc(fn ->
-          for i <- 1..10_000 do
-            PrefixIndex.track(table, "perf:#{i}", 9009)
-          end
-        end)
-
-      # 10000 inserts should be well under 100ms (10us each is generous)
-      assert time_us < 100_000
-    end
-
-    test "detect_prefix_pattern recognizes simple prefix:* patterns" do
-      assert PrefixIndex.detect_prefix_pattern("session:*") == {:prefix_match, "session"}
-      assert PrefixIndex.detect_prefix_pattern("user:*") == {:prefix_match, "user"}
-    end
-
-    test "detect_prefix_pattern rejects non-prefix patterns" do
-      assert PrefixIndex.detect_prefix_pattern("*") == :not_prefix_match
-      assert PrefixIndex.detect_prefix_pattern("user:*:name") == :not_prefix_match
-      assert PrefixIndex.detect_prefix_pattern("us*r:*") == :not_prefix_match
-    end
   end
 
   # =========================================================================
@@ -616,40 +389,40 @@ defmodule Ferricstore.WritePathOptimizationsTest do
     test "CAS through bypass" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "original", 0)
-      assert 1 == Router.cas(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "original", "updated", nil)
+      assert 1 == Router.cas(FerricStore.Instance.get(:default), key, "original", "updated", nil)
       assert "updated" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS fails when expected value does not match" do
       key = ukey("qw")
       Router.put(FerricStore.Instance.get(:default), key, "actual", 0)
-      assert 0 == Router.cas(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "wrong", "updated", nil)
+      assert 0 == Router.cas(FerricStore.Instance.get(:default), key, "wrong", "updated", nil)
       assert "actual" == Router.get(FerricStore.Instance.get(:default), key)
     end
 
     test "CAS on non-existent key returns nil" do
       key = ukey("qw_nonexist")
-      assert nil == Router.cas(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "any", "new", nil)
+      assert nil == Router.cas(FerricStore.Instance.get(:default), key, "any", "new", nil)
     end
 
     test "LOCK/UNLOCK through bypass" do
       key = ukey("qw")
-      assert :ok = Router.lock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1", 5_000)
-      assert 1 = Router.unlock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1")
+      assert :ok = Router.lock(FerricStore.Instance.get(:default), key, "owner1", 5_000)
+      assert 1 = Router.unlock(FerricStore.Instance.get(:default), key, "owner1")
     end
 
     test "LOCK fails when already held" do
       key = ukey("qw")
-      Router.lock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1", 5_000)
-      assert {:error, _} = Router.lock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner2", 5_000)
-      Router.unlock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1")
+      Router.lock(FerricStore.Instance.get(:default), key, "owner1", 5_000)
+      assert {:error, _} = Router.lock(FerricStore.Instance.get(:default), key, "owner2", 5_000)
+      Router.unlock(FerricStore.Instance.get(:default), key, "owner1")
     end
 
     test "EXTEND through bypass" do
       key = ukey("qw")
-      Router.lock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1", 5_000)
-      assert 1 = Router.extend(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1", 10_000)
-      Router.unlock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), key, "owner1")
+      Router.lock(FerricStore.Instance.get(:default), key, "owner1", 5_000)
+      assert 1 = Router.extend(FerricStore.Instance.get(:default), key, "owner1", 10_000)
+      Router.unlock(FerricStore.Instance.get(:default), key, "owner1")
     end
 
     test "read-your-own-writes after quorum SET" do
@@ -1172,7 +945,7 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   # =========================================================================
 
   describe "RESP parser value size limits" do
-    alias Ferricstore.Resp.Parser
+    alias FerricstoreServer.Resp.Parser
 
     test "bulk string within default limit parses successfully" do
       data = "$5\r\nhello\r\n"

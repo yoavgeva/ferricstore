@@ -31,7 +31,7 @@ defmodule FerricstoreServer.Spec.ErrorHandlingTest do
 
   alias Ferricstore.Commands.{Dispatcher, Expiry, Hash, List, Set, Stream, Strings}
   alias Ferricstore.Config
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.MockStore

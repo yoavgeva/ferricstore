@@ -16,7 +16,7 @@ defmodule Ferricstore.Application do
   ├── Ferricstore.AuditLog                (audit trail)
   ├── Ferricstore.Config                  (runtime config)
   ├── Ferricstore.NamespaceConfig         (per-namespace overrides)
-  ├── Ferricstore.Acl                     (access control lists)
+  ├── (ACL moved to ferricstore_server)
   ├── Ferricstore.HLC                     (Hybrid Logical Clock)
   ├── Ferricstore.Raft.Batcher (x N)     (group-commit batchers)
   ├── Ferricstore.Store.ShardSupervisor   (one_for_one over N Shard GenServers)
@@ -33,15 +33,9 @@ defmodule Ferricstore.Application do
 
   ## Configuration (application env)
 
-    * `:mode`             - `:standalone` (default) or `:embedded`
-    * `:port`             - TCP port to bind (default: `6379`; test env uses `0` for ephemeral)
     * `:data_dir`         - Bitcask data directory (default: `"data"`)
-    * `:health_port`      - HTTP health check port (default: `4000`; test env uses `0`)
-    * `:tls_port`         - TLS port to bind (default: `nil`; not started unless configured)
-    * `:tls_cert_file`    - path to PEM certificate file
-    * `:tls_key_file`     - path to PEM private key file
-    * `:tls_ca_cert_file` - path to CA certificate bundle (optional)
-    * `:require_tls`      - when `true`, reject plaintext connections (default: `false`)
+    * `:shard_count`      - Number of shards (default: `System.schedulers_online()`)
+    * `:max_memory_bytes` - Memory budget for eviction (default: `1 GiB`)
   """
 
   use Application
@@ -52,15 +46,13 @@ defmodule Ferricstore.Application do
 
   @impl true
   def start(_type, _args) do
-    mode = Ferricstore.Mode.current()
-    port = Application.get_env(:ferricstore, :port, 6379)
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     shard_count =
       case Application.get_env(:ferricstore, :shard_count, 0) do
         0 -> System.schedulers_online()
         n when is_integer(n) and n > 0 -> n
       end
-    Logger.info("FerricStore starting in #{mode} mode")
+    Logger.info("FerricStore starting")
 
     # Create the on-disk directory layout (spec 2B.4) before any process
     # tries to open shard directories or Raft WALs.
@@ -118,8 +110,7 @@ defmodule Ferricstore.Application do
 
     # Initialize waiter registry ETS for blocking commands
     Ferricstore.Waiters.init()
-    # Initialize client tracking ETS tables
-    Ferricstore.ClientTracking.init_tables()
+    # Client tracking ETS tables initialized by FerricstoreServer.ClientTracking
     # Initialize stream metadata ETS tables (owned by this long-lived process)
     Ferricstore.Commands.Stream.init_tables()
     # Load the patched ra_log_wal with async fdatasync BEFORE starting
@@ -138,7 +129,6 @@ defmodule Ferricstore.Application do
     _default_ctx = FerricStore.Instance.build(:default, [
       data_dir: data_dir,
       shard_count: shard_count,
-      mode: mode,
       max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824),
       keydir_max_ram: Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024),
       eviction_policy: Application.get_env(:ferricstore, :eviction_policy, :volatile_lfu),
@@ -194,7 +184,6 @@ defmodule Ferricstore.Application do
         Ferricstore.AuditLog,
         Ferricstore.Config,
         Ferricstore.NamespaceConfig,
-        Ferricstore.Acl,
         Ferricstore.HLC
       ] ++
         batcher_children ++
@@ -224,7 +213,7 @@ defmodule Ferricstore.Application do
         :telemetry.execute(
           [:ferricstore, :node, :startup_complete],
           %{duration_ms: System.monotonic_time(:millisecond)},
-          %{shard_count: shard_count, port: port, mode: mode}
+          %{shard_count: shard_count}
         )
 
         # Step 6 - Large value check:

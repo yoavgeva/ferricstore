@@ -30,7 +30,7 @@ defmodule FerricstoreServer.Bench.TcpDetailedProfileTest do
     sample_cmd = "*2\r\n$3\r\nGET\r\n$#{byte_size("#{prefix}:500")}\r\n#{prefix}:500\r\n"
     parse_times = for _ <- 1..10_000 do
       t0 = :erlang.monotonic_time(:nanosecond)
-      {:ok, _cmds, _rest} = Ferricstore.Resp.Parser.parse(sample_cmd)
+      {:ok, _cmds, _rest} = FerricstoreServer.Resp.Parser.parse(sample_cmd)
       t1 = :erlang.monotonic_time(:nanosecond)
       t1 - t0
     end
@@ -48,7 +48,7 @@ defmodule FerricstoreServer.Bench.TcpDetailedProfileTest do
     sample_value = String.duplicate("v", 100)
     encode_times = for _ <- 1..10_000 do
       t0 = :erlang.monotonic_time(:nanosecond)
-      _encoded = Ferricstore.Resp.Encoder.encode(sample_value)
+      _encoded = FerricstoreServer.Resp.Encoder.encode(sample_value)
       t1 = :erlang.monotonic_time(:nanosecond)
       t1 - t0
     end

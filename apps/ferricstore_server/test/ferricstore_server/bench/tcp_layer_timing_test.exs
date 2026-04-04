@@ -20,7 +20,7 @@ defmodule FerricstoreServer.Bench.TcpLayerTimingTest do
 
     # 1. RESP3 parse
     {parse_us, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Resp.Parser.parse(resp3_cmd)
+      for _ <- 1..n, do: FerricstoreServer.Resp.Parser.parse(resp3_cmd)
     end)
 
     # 2. Command dispatch (String.upcase + lookup)
@@ -36,7 +36,7 @@ defmodule FerricstoreServer.Bench.TcpLayerTimingTest do
     # 4. RESP3 encode
     value = String.duplicate("v", 100)
     {encode_us, _} = :timer.tc(fn ->
-      for _ <- 1..n, do: Ferricstore.Resp.Encoder.encode(value)
+      for _ <- 1..n, do: FerricstoreServer.Resp.Encoder.encode(value)
     end)
 
     # 5. Full TCP round-trip (1 GET per round-trip)

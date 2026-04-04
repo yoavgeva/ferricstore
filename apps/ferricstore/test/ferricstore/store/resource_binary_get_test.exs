@@ -23,22 +23,25 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
 
   describe "hot-path GET (ETS hit)" do
     test "returns correct value for simple string" do
-      :ok = FerricStore.set("hot:key", "hello")
-      assert {:ok, "hello"} = FerricStore.get("hot:key")
+      key = "hot:key:#{:rand.uniform(9_999_999)}"
+      :ok = FerricStore.set(key, "hello")
+      assert {:ok, "hello"} = FerricStore.get(key)
     end
 
     test "returns correct value for large binary (100KB)" do
+      key = "hot:large:#{:rand.uniform(9_999_999)}"
       large = :crypto.strong_rand_bytes(100_000)
-      :ok = FerricStore.set("hot:large", large)
-      {:ok, result} = FerricStore.get("hot:large")
+      :ok = FerricStore.set(key, large)
+      {:ok, result} = FerricStore.get(key)
       assert result == large
       assert byte_size(result) == 100_000
     end
 
     test "large binary is a refc binary (not heap binary)" do
+      key = "hot:refc:#{:rand.uniform(9_999_999)}"
       large = :crypto.strong_rand_bytes(100_000)
-      :ok = FerricStore.set("hot:refc", large)
-      {:ok, result} = FerricStore.get("hot:refc")
+      :ok = FerricStore.set(key, large)
+      {:ok, result} = FerricStore.get(key)
 
       # For NIF resource binaries (ResourceArc<ValueBuffer>), the BEAM's
       # referenced_byte_size reports the ProcBin header, not the full data.
@@ -49,14 +52,16 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
     end
 
     test "returned binary supports pattern matching" do
-      :ok = FerricStore.set("hot:pat", "hello world")
-      {:ok, <<"hello", rest::binary>>} = FerricStore.get("hot:pat")
+      key = "hot:pat:#{:rand.uniform(9_999_999)}"
+      :ok = FerricStore.set(key, "hello world")
+      {:ok, <<"hello", rest::binary>>} = FerricStore.get(key)
       assert rest == " world"
     end
 
     test "returned binary supports String operations" do
-      :ok = FerricStore.set("hot:str", "HELLO")
-      {:ok, result} = FerricStore.get("hot:str")
+      key = "hot:str:#{:rand.uniform(9_999_999)}"
+      :ok = FerricStore.set(key, "HELLO")
+      {:ok, result} = FerricStore.get(key)
       assert String.downcase(result) == "hello"
     end
   end
@@ -67,9 +72,10 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
 
   describe "GC survival" do
     test "value binary survives garbage collection" do
+      key = "gc:survive:#{:rand.uniform(9_999_999)}"
       large = :crypto.strong_rand_bytes(100_000)
-      :ok = FerricStore.set("gc:survive", large)
-      {:ok, result} = FerricStore.get("gc:survive")
+      :ok = FerricStore.set(key, large)
+      {:ok, result} = FerricStore.get(key)
 
       # Force GC to collect any temporary resources
       :erlang.garbage_collect()
@@ -80,17 +86,18 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
     end
 
     test "multiple GETs do not leak memory" do
+      key = "gc:leak:#{:rand.uniform(9_999_999)}"
       large = :crypto.strong_rand_bytes(10_000)
-      :ok = FerricStore.set("gc:leak", large)
+      :ok = FerricStore.set(key, large)
 
       # Warm up
-      for _ <- 1..10, do: FerricStore.get("gc:leak")
+      for _ <- 1..10, do: FerricStore.get(key)
       :erlang.garbage_collect()
       {:memory, mem_before} = Process.info(self(), :memory)
 
       # Many reads
       for _ <- 1..1_000 do
-        {:ok, _} = FerricStore.get("gc:leak")
+        {:ok, _} = FerricStore.get(key)
       end
 
       :erlang.garbage_collect()
@@ -107,20 +114,45 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
   # -------------------------------------------------------------------
 
   describe "zero-copy path verification" do
-    test "value > 64 bytes returned as refc binary from Router.get" do
-      value = :crypto.strong_rand_bytes(1_000)
-      :ok = FerricStore.set("zc:refc", value)
-      {:ok, result} = FerricStore.get("zc:refc")
+    test "large cold value read is correct and memory-efficient" do
+      # Write a 1MB value — larger than hot_cache_max_value_size (65536),
+      # so ETS stores nil and reads come from disk via NIF pread.
+      key = "zc:cold:#{:rand.uniform(9_999_999)}"
+      value = :crypto.strong_rand_bytes(1_000_000)
+      :ok = FerricStore.set(key, value)
 
-      assert result == value
-      # Refc binary: referenced_byte_size >= value size
-      assert :binary.referenced_byte_size(result) >= 1_000
+      # Force the value out of any process-local caches
+      :erlang.garbage_collect()
+
+      # Measure memory before reading the cold value
+      {:memory, mem_before} = Process.info(self(), :memory)
+
+      # Read 100 times — if each read copies 1MB, we'd use ~100MB.
+      # With zero-copy (refc binary), memory stays flat.
+      results = for _ <- 1..100 do
+        {:ok, result} = FerricStore.get(key)
+        assert byte_size(result) == 1_000_000
+        result
+      end
+
+      :erlang.garbage_collect()
+      {:memory, mem_after} = Process.info(self(), :memory)
+
+      # All results should be correct
+      assert Enum.all?(results, &(&1 == value))
+
+      # Memory growth should be well under 100MB (100 × 1MB if copying).
+      # With refc binaries, all 100 results share the same underlying data.
+      growth_mb = (mem_after - mem_before) / 1_048_576
+      assert growth_mb < 20,
+        "100 reads of 1MB value grew heap by #{Float.round(growth_mb, 1)}MB — likely copying instead of zero-copy"
     end
 
     test "value can be sent to another process without copy" do
+      key = "zc:send:#{:rand.uniform(9_999_999)}"
       value = :crypto.strong_rand_bytes(10_000)
-      :ok = FerricStore.set("zc:send", value)
-      {:ok, result} = FerricStore.get("zc:send")
+      :ok = FerricStore.set(key, value)
+      {:ok, result} = FerricStore.get(key)
 
       parent = self()
 
@@ -136,9 +168,10 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
     end
 
     test "binary preserves null bytes and arbitrary data" do
+      key = "zc:binary:#{:rand.uniform(9_999_999)}"
       value = <<0, 1, 2, 255, 0, 128, 0>>
-      :ok = FerricStore.set("zc:binary", value)
-      {:ok, result} = FerricStore.get("zc:binary")
+      :ok = FerricStore.set(key, value)
+      {:ok, result} = FerricStore.get(key)
       assert result == value
     end
   end

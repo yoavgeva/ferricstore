@@ -5,7 +5,7 @@ defmodule FerricstoreServer.ConnectionLimitsTest do
   """
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------
@@ -230,11 +230,11 @@ defmodule FerricstoreServer.ConnectionLimitsTest do
 
   describe "parser hard cap" do
     test "hard cap is 64 MB" do
-      assert Ferricstore.Resp.Parser.hard_cap_bytes() == 67_108_864
+      assert FerricstoreServer.Resp.Parser.hard_cap_bytes() == 67_108_864
     end
 
     test "default max value size is 1 MB" do
-      assert Ferricstore.Resp.Parser.default_max_value_size() == 1_048_576
+      assert FerricstoreServer.Resp.Parser.default_max_value_size() == 1_048_576
     end
 
     test "parse/2 enforces custom max_value_size" do
@@ -251,7 +251,7 @@ defmodule FerricstoreServer.ConnectionLimitsTest do
     end
 
     test "parse/2 clamps to hard cap even if max_value_size is higher" do
-      hard_cap = Ferricstore.Resp.Parser.hard_cap_bytes()
+      hard_cap = FerricstoreServer.Resp.Parser.hard_cap_bytes()
       over_hard = hard_cap + 1
 
       assert {:error, {:value_too_large, ^over_hard, ^hard_cap}} =

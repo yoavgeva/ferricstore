@@ -7,7 +7,7 @@ defmodule FerricstoreServer.Connection do
 
   1. Performs the `CLIENT HELLO 3` handshake (RESP3-only; rejects RESP2).
   2. Enters a receive loop, accumulating TCP chunks into a binary buffer.
-  3. Parses all complete RESP3 frames from the buffer via `Ferricstore.Resp.Parser`.
+  3. Parses all complete RESP3 frames from the buffer via `FerricstoreServer.Resp.Parser`.
   4. Dispatches commands using a **sliding window pipeline** (spec section 2C.2):
      - All "pure" commands (those that don't mutate connection state) in a
        pipeline batch are dispatched concurrently as `Task`s.
@@ -59,10 +59,10 @@ defmodule FerricstoreServer.Connection do
   @behaviour :ranch_protocol
 
   alias Ferricstore.AuditLog
-  alias Ferricstore.ClientTracking
+  alias FerricstoreServer.ClientTracking
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.KeyspaceNotifications
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
 
@@ -111,7 +111,7 @@ defmodule FerricstoreServer.Connection do
   @type acl_cache :: %{
           commands: :all | MapSet.t(binary()),
           denied_commands: MapSet.t(binary()),
-          keys: :all | [Ferricstore.Acl.key_pattern()],
+          keys: :all | [FerricstoreServer.Acl.key_pattern()],
           enabled: boolean()
         }
         | nil
@@ -220,7 +220,7 @@ defmodule FerricstoreServer.Connection do
 
       # Fix 3: Protected mode -- reject non-localhost connections when no ACL
       # users are configured and protected mode is active.
-      case Ferricstore.Acl.check_protected_mode(peer) do
+      case FerricstoreServer.Acl.check_protected_mode(peer) do
         {:error, reason} ->
           error_msg = Encoder.encode({:error, reason})
           # transport.send accepts iodata directly; no need to flatten to binary.
@@ -794,7 +794,7 @@ defmodule FerricstoreServer.Connection do
     else
       {:error, _reason} = err ->
         # Fix 5: Log command denials to the audit log.
-        Ferricstore.Acl.log_command_denied(
+        FerricstoreServer.Acl.log_command_denied(
           state.username,
           name,
           format_peer(state.peer),
@@ -835,7 +835,7 @@ defmodule FerricstoreServer.Connection do
         else
           {:error, _reason} = err ->
             # Fix 5: Log command denials to the audit log.
-            Ferricstore.Acl.log_command_denied(
+            FerricstoreServer.Acl.log_command_denied(
               state.username,
               cmd,
               format_peer(state.peer),
@@ -883,7 +883,13 @@ defmodule FerricstoreServer.Connection do
 
     {result, updated_conn_state} =
       try do
-        Dispatcher.dispatch_client(args, conn_state, store)
+        case args do
+          [subcmd | rest] ->
+            FerricstoreServer.Commands.Client.handle(String.upcase(subcmd), rest, conn_state, store)
+
+          [] ->
+            {{:error, "ERR wrong number of arguments for 'client' command"}, conn_state}
+        end
       catch
         :exit, {:noproc, _} ->
           {{:error, "ERR server not ready, shard process unavailable"}, conn_state}
@@ -909,7 +915,7 @@ defmodule FerricstoreServer.Connection do
   # 1. If no requirepass AND no ACL user has a password set, AUTH is rejected
   #    ("no password is set").
   # 2. Otherwise, resolve the username and password from args and delegate
-  #    to `Ferricstore.Acl.authenticate/2`.
+  #    to `FerricstoreServer.Acl.authenticate/2`.
   # 3. Backwards compat: when requirepass is set and the ACL default user
   #    has no password, authenticate against requirepass for the default user.
   defp dispatch("AUTH", [], state) do
@@ -928,7 +934,7 @@ defmodule FerricstoreServer.Connection do
       end
 
     requirepass = Ferricstore.Config.get_value("requirepass")
-    acl_user = Ferricstore.Acl.get_user(username)
+    acl_user = FerricstoreServer.Acl.get_user(username)
     client_ip = format_peer(state.peer)
 
     # Determine whether any auth source is configured for this user.
@@ -975,7 +981,7 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp do_acl_auth(username, password, client_ip, state) do
-    case Ferricstore.Acl.authenticate(username, password) do
+    case FerricstoreServer.Acl.authenticate(username, password) do
       {:ok, ^username} ->
         AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
         new_cache = build_acl_cache(username)
@@ -1001,7 +1007,7 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch_acl("LIST", _, state) do
-    {:continue, Encoder.encode(Ferricstore.Acl.list_users()), state}
+    {:continue, Encoder.encode(FerricstoreServer.Acl.list_users()), state}
   end
 
   defp dispatch_acl("SETUSER", [], state) do
@@ -1009,13 +1015,14 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch_acl("SETUSER", [username | rules], state) do
-    case Ferricstore.Acl.set_user(username, rules) do
+    # Route through Raft so the mutation is replicated to all nodes.
+    ctx = FerricStore.Instance.get(:default)
+    result = Ferricstore.Store.Router.server_command(ctx, {:acl_setuser, username, rules})
+
+    case result do
       :ok ->
-        # Broadcast ACL invalidation to all connections so they refresh
-        # their cached permissions for this user.
         broadcast_acl_invalidation(username)
 
-        # If the admin changed their own user, refresh the local cache too.
         new_state =
           if username == state.username do
             %{state | acl_cache: build_acl_cache(username)}
@@ -1035,14 +1042,15 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch_acl("DELUSER", usernames, state) do
+    ctx = FerricStore.Instance.get(:default)
+
     results =
       Enum.map(usernames, fn username ->
-        Ferricstore.Acl.del_user(username)
+        Ferricstore.Store.Router.server_command(ctx, {:acl_deluser, username})
       end)
 
     case Enum.find(results, fn r -> match?({:error, _}, r) end) do
       nil ->
-        # Broadcast ACL invalidation for all deleted users.
         Enum.each(usernames, &broadcast_acl_invalidation/1)
         {:continue, Encoder.encode(:ok), state}
 
@@ -1083,7 +1091,7 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch_acl("GETUSER", [username | _], state) do
-    case Ferricstore.Acl.get_user_info(username) do
+    case FerricstoreServer.Acl.get_user_info(username) do
       nil ->
         {:continue, Encoder.encode(nil), state}
 
@@ -2032,7 +2040,6 @@ defmodule FerricstoreServer.Connection do
       delete: fn _key -> :ok end,
       exists?: fn _key -> false end,
       keys: fn -> [] end,
-      keys_with_prefix: fn _prefix -> [] end,
       flush: fn -> :ok end,
       dbsize: fn -> 0 end,
       incr: fn _key, _delta -> {:ok, 0} end,
@@ -2108,7 +2115,6 @@ defmodule FerricstoreServer.Connection do
       delete: fn key -> Router.delete(ctx, key) end,
       exists?: fn key -> Router.exists?(ctx, key) end,
       keys: fn -> Router.keys(ctx) end,
-      keys_with_prefix: fn prefix -> Router.keys_with_prefix(ctx, prefix) end,
       flush: fn ->
         for i <- 0..(ctx.shard_count - 1) do
           shard = elem(ctx.shard_names, i)
@@ -2129,8 +2135,6 @@ defmodule FerricstoreServer.Connection do
             end
           end)
 
-          prefix_table = elem(ctx.prefix_table_refs, i)
-          try do :ets.delete_all_objects(prefix_table) catch :error, :badarg -> :ok end
         end
 
         :ok
@@ -2184,7 +2188,8 @@ defmodule FerricstoreServer.Connection do
         idx = Router.shard_for(ctx, key)
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
         Path.join(shard_path, "prob")
-      end
+      end,
+      on_push: &Ferricstore.Waiters.notify_push/1
     }
   end
 
@@ -2542,7 +2547,7 @@ defmodule FerricstoreServer.Connection do
   # and Catalog operations for the common default-user case.
   @spec build_acl_cache(binary()) :: acl_cache() | :full_access | :denied
   defp build_acl_cache(username) do
-    case Ferricstore.Acl.get_user(username) do
+    case FerricstoreServer.Acl.get_user(username) do
       nil ->
         # User doesn't exist. For "default" user this means no ACL configured
         # (allow everything). For any other user, it means the user was deleted
@@ -2643,7 +2648,7 @@ defmodule FerricstoreServer.Connection do
   end
 
   # Check every key against the patterns. Short-circuits on first denial.
-  @spec check_all_keys([binary()], :read | :write | :rw, [Ferricstore.Acl.key_pattern()]) ::
+  @spec check_all_keys([binary()], :read | :write | :rw, [FerricstoreServer.Acl.key_pattern()]) ::
           :ok | {:error, binary()}
   defp check_all_keys([], _access_type, _patterns), do: :ok
 
@@ -2657,7 +2662,7 @@ defmodule FerricstoreServer.Connection do
 
     all_pass =
       Enum.all?(types_to_check, fn t ->
-        Ferricstore.Acl.key_matches_any?(key, t, patterns)
+        FerricstoreServer.Acl.key_matches_any?(key, t, patterns)
       end)
 
     if all_pass do

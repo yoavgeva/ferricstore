@@ -16,7 +16,7 @@ defmodule FerricstoreServer.Spec.EdgeCasesTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

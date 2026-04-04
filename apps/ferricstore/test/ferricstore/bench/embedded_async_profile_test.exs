@@ -40,7 +40,7 @@ defmodule Ferricstore.Bench.EmbeddedAsyncProfileTest do
     # 4. GenServer.call to shard (what async path does)
     key = "aprof:gs_test"
     idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-    shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx)
+    shard_name = Router.shard_name(FerricStore.Instance.get(:default), idx)
     {gs_us, _} = :timer.tc(fn ->
       for i <- 1..@iterations do
         GenServer.call(shard_name, {:put, "aprof:gs:#{i}", value, 0})

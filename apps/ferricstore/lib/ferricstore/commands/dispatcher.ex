@@ -20,7 +20,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   Unknown commands return `{:error, "ERR unknown command ..."}`.
   """
 
-  alias Ferricstore.Commands.{Bitmap, Bloom, Client, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Namespace, Native, PubSub, Server, Set, SortedSet, Stream, Strings}
+  alias Ferricstore.Commands.{Bitmap, Bloom, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Namespace, Native, PubSub, Server, Set, SortedSet, Stream, Strings}
   alias Ferricstore.Commands.CMS
   alias Ferricstore.Commands.TDigest
   alias Ferricstore.Commands.TopK
@@ -171,32 +171,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     result
   end
 
-  @doc """
-  Dispatches a CLIENT subcommand with connection state.
-
-  CLIENT commands may mutate per-connection state (e.g. SETNAME), so they
-  return `{result, updated_conn_state}`.
-
-  ## Parameters
-
-    - `args` - List of string arguments (first element is the subcommand)
-    - `conn_state` - Per-connection state map
-    - `store` - Injected store map
-
-  ## Returns
-
-  `{result, updated_conn_state}` tuple.
-  """
-  @spec dispatch_client([binary()], map(), map()) :: {term(), map()}
-  def dispatch_client(args, conn_state, store) do
-    case args do
-      [subcmd | rest] ->
-        Client.handle(String.upcase(subcmd), rest, conn_state, store)
-
-      [] ->
-        {{:error, "ERR wrong number of arguments for 'client' command"}, conn_state}
-    end
-  end
+  # CLIENT commands handled by FerricstoreServer.Commands.Client
 
   # Multi-word commands need uppercasing of the subcommand portion.
   defp upcase_subcommand(cmd, args) when cmd in ~w(COMMAND DEBUG OBJECT) do

@@ -56,6 +56,7 @@ defmodule Ferricstore.Stats do
   @counter_keyspace_misses 7
   @counter_expired_keys 8
   @counter_evicted_keys 9
+  @counter_keys_with_expiry 10
 
   @hotness_table :ferricstore_hotness
   @max_tracked_prefixes 1000
@@ -173,6 +174,23 @@ defmodule Ferricstore.Stats do
   @doc "Returns evicted keys count."
   @spec evicted_keys() :: non_neg_integer()
   def evicted_keys, do: :counters.get(counter_ref(), @counter_evicted_keys)
+
+  @doc "Increments the keys_with_expiry counter (key gained a TTL)."
+  @spec incr_keys_with_expiry() :: :ok
+  def incr_keys_with_expiry, do: (:counters.add(counter_ref(), @counter_keys_with_expiry, 1); :ok)
+
+  @doc "Decrements the keys_with_expiry counter (key lost TTL or was deleted)."
+  @spec decr_keys_with_expiry() :: :ok
+  def decr_keys_with_expiry do
+    ref = counter_ref()
+    current = :counters.get(ref, @counter_keys_with_expiry)
+    if current > 0, do: :counters.add(ref, @counter_keys_with_expiry, -1)
+    :ok
+  end
+
+  @doc "Returns the number of keys that currently have a TTL set."
+  @spec keys_with_expiry() :: non_neg_integer()
+  def keys_with_expiry, do: max(0, :counters.get(counter_ref(), @counter_keys_with_expiry))
 
   @doc """
   Records a hot read (ETS cache hit) for the given key.
@@ -388,7 +406,7 @@ defmodule Ferricstore.Stats do
 
   @impl true
   def init(_opts) do
-    ref = :counters.new(9, [:atomics])
+    ref = :counters.new(10, [:atomics])
     run_id = :crypto.strong_rand_bytes(20) |> Base.encode16(case: :lower)
     start_time = System.monotonic_time(:millisecond)
 

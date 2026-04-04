@@ -29,7 +29,6 @@ end
 
 ```elixir
 # config/config.exs
-config :ferricstore, :mode, :embedded
 config :ferricstore, :data_dir, "priv/ferricstore_data"
 config :ferricstore, :shard_count, 0  # 0 = auto-detect from CPU cores
 config :ferricstore, :max_memory_bytes, 1_073_741_824  # 1 GB
@@ -59,15 +58,12 @@ The embedded API (`FerricStore` module) and the RESP3/TCP mode execute the same 
 |--------|---------------|---------------|
 | **Return values** | Raw RESP3 types (bulk strings, integers, arrays) | Elixir-idiomatic types (`{:ok, value}`, `:ok`, etc.) |
 | **Blocking commands** | `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` supported | Not available -- return immediately |
-| **Sandbox** | Not applicable (test feature) | Test-only: provides Ecto-level per-test isolation with private shards. Not a production embedded feature. |
 | **Set algebra** | `SINTER`/`SUNION`/`SDIFF` scan the single shard owning the key | Same behavior -- set members are co-located per key |
 | **Transactions** | `MULTI`/`EXEC`/`WATCH` at connection level | `FerricStore.multi/1` with function-based API |
 | **ACL** | Per-connection ACL enforcement | No ACL checks |
 | **Client tracking** | `CLIENT TRACKING` with invalidation messages | Not applicable |
 
 ## Elixir API -- Complete Reference
-
-Every `FerricStore` function is sandbox-aware: when `FerricStore.Sandbox.checkout/1` has been called, a unique prefix is transparently prepended to all keys. Production code runs with zero overhead.
 
 ### Strings
 
@@ -757,73 +753,30 @@ If you routinely store values larger than 64 KB, consider:
 - Chunking values into smaller pieces
 - Using the standalone mode with sendfile zero-copy
 
-## Testing with Sandbox
+## Testing
 
-FerricStore provides true Ecto-level test isolation. Each test gets private shards, private ETS tables, a private Raft WAL, and a private tmpdir. The full production stack runs with complete isolation, supporting `async: true`.
-
-Requires `config :ferricstore, :sandbox_enabled, true` in test config (set by default).
+With the instance-based architecture, each test gets its own fully isolated FerricStore instance -- separate shards, ETS tables, Raft WAL, and data directory. No shared state, supporting `async: true`.
 
 ```elixir
 defmodule MyApp.CacheTest do
   use ExUnit.Case, async: true
 
   setup do
-    sandbox = FerricStore.Sandbox.checkout()
-    on_exit(fn -> FerricStore.Sandbox.checkin(sandbox) end)
+    {:ok, _} = TestCache.start_link(data_dir: make_temp_dir(), shard_count: 2)
+    on_exit(fn -> TestCache.stop() end)
     :ok
   end
 
   test "set and get" do
-    :ok = FerricStore.set("key", "value")
-    assert {:ok, "value"} = FerricStore.get("key")
+    TestCache.set("key", "value")
+    assert {:ok, "value"} = TestCache.get("key")
   end
 
   test "isolated from other tests" do
-    # "key" here lives in a completely separate shard/ETS/WAL
-    assert {:ok, nil} = FerricStore.get("key")
+    # Each test has its own instance -- no shared state
+    assert {:ok, nil} = TestCache.get("key")
   end
 end
-```
-
-Or use the built-in case template:
-
-```elixir
-use FerricStore.Sandbox.Case
-```
-
-### How Sandbox Works
-
-1. `checkout/0` creates a private set of shards, ETS tables, Raft WAL directories, and a tmpdir for the test
-2. The sandbox reference is stored in the process dictionary under `:ferricstore_sandbox`
-3. Every FerricStore API call routes to the test's private shards instead of the application-level ones
-4. `checkin/1` tears down the private shards, deletes all ETS tables, and cleans up the tmpdir
-5. Production code runs with `Process.get(:ferricstore_sandbox) == nil` -- zero overhead
-
-### Sharing Sandbox with Spawned Processes
-
-When your test spawns tasks or processes that need to access the same sandbox:
-
-```elixir
-# Allow another process to use this test's private shards
-FerricStore.Sandbox.allow(self(), worker_pid)
-```
-
-### TTL Freeze
-
-Prevent flaky tests due to timing:
-
-```elixir
-sandbox = FerricStore.Sandbox.checkout(freeze_ttl: true)
-
-# Set a key with short TTL
-:ok = FerricStore.set("key", "value", ttl: 100)
-
-# Key is still there (TTL frozen)
-assert {:ok, "value"} = FerricStore.get("key")
-
-# Force expiry manually
-FerricStore.Sandbox.expire_now("key")
-assert {:ok, nil} = FerricStore.get("key")
 ```
 
 ## Integration with Phoenix

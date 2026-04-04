@@ -3,7 +3,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Config
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
   # Reset requirepass after each test to avoid contaminating other tests.
@@ -403,7 +403,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
 
   describe "ACL SETUSER" do
     setup %{port: port} do
-      on_exit(fn -> Ferricstore.Acl.reset!() end)
+      on_exit(fn -> FerricstoreServer.Acl.reset!() end)
       %{port: port}
     end
 
@@ -530,7 +530,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
   describe "AUTH with ACL users" do
     setup %{port: port} do
       on_exit(fn ->
-        Ferricstore.Acl.reset!()
+        FerricstoreServer.Acl.reset!()
         Config.set("requirepass", "")
       end)
 
@@ -539,7 +539,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
 
     test "AUTH with new ACL user works", %{port: port} do
       # Create user with password via ACL.
-      Ferricstore.Acl.set_user("testuser", ["on", ">testpass"])
+      FerricstoreServer.Acl.set_user("testuser", ["on", ">testpass"])
 
       sock = connect_and_hello(port)
 
@@ -550,7 +550,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
     end
 
     test "AUTH with wrong password for ACL user is rejected", %{port: port} do
-      Ferricstore.Acl.set_user("testuser2", ["on", ">correctpass"])
+      FerricstoreServer.Acl.set_user("testuser2", ["on", ">correctpass"])
 
       sock = connect_and_hello(port)
 
@@ -563,7 +563,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
     end
 
     test "AUTH with disabled ACL user is rejected", %{port: port} do
-      Ferricstore.Acl.set_user("disableduser", ["off", ">somepass"])
+      FerricstoreServer.Acl.set_user("disableduser", ["off", ">somepass"])
 
       sock = connect_and_hello(port)
 
@@ -590,7 +590,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
     end
 
     test "ACL WHOAMI reflects authenticated user", %{port: port} do
-      Ferricstore.Acl.set_user("whoami_user", ["on", ">mypass"])
+      FerricstoreServer.Acl.set_user("whoami_user", ["on", ">mypass"])
 
       sock = connect_and_hello(port)
 
@@ -610,7 +610,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
 
   describe "ACL DELUSER" do
     setup %{port: port} do
-      on_exit(fn -> Ferricstore.Acl.reset!() end)
+      on_exit(fn -> FerricstoreServer.Acl.reset!() end)
       %{port: port}
     end
 
@@ -670,7 +670,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
 
   describe "ACL LIST with custom users" do
     setup %{port: port} do
-      on_exit(fn -> Ferricstore.Acl.reset!() end)
+      on_exit(fn -> FerricstoreServer.Acl.reset!() end)
       %{port: port}
     end
 
@@ -717,7 +717,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
 
   describe "ACL GETUSER for ACL-created users" do
     setup %{port: port} do
-      on_exit(fn -> Ferricstore.Acl.reset!() end)
+      on_exit(fn -> FerricstoreServer.Acl.reset!() end)
       %{port: port}
     end
 

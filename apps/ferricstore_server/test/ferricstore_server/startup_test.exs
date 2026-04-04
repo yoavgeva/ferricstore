@@ -29,7 +29,7 @@ defmodule FerricstoreServer.StartupTest do
   describe "all shards alive after startup" do
     test "all 4 shard GenServers are registered and alive" do
       for i <- 0..3 do
-        name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i)
+        name = Router.shard_name(FerricStore.Instance.get(:default), i)
         pid = Process.whereis(name)
         assert is_pid(pid), "Shard #{i} should be registered as #{name}"
         assert Process.alive?(pid), "Shard #{i} should be alive"
@@ -66,7 +66,7 @@ defmodule FerricstoreServer.StartupTest do
 
       # Flush to ensure data is on disk (shard pending + background writer).
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
       :ok = GenServer.call(shard_name, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
 

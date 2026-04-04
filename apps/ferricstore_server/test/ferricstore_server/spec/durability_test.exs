@@ -53,7 +53,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
   # Returns the PID of the shard GenServer that owns `key`.
   defp shard_pid_for(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     Process.whereis(name)
   end
 
@@ -650,7 +650,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
   end
 
   defp send_cmd(sock, cmd) do
-    data = IO.iodata_to_binary(Ferricstore.Resp.Encoder.encode(cmd))
+    data = IO.iodata_to_binary(FerricstoreServer.Resp.Encoder.encode(cmd))
     :ok = :gen_tcp.send(sock, data)
   end
 
@@ -662,7 +662,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
     {:ok, data} = :gen_tcp.recv(sock, 0, 10_000)
     buf2 = buf <> data
 
-    case Ferricstore.Resp.Parser.parse(buf2) do
+    case FerricstoreServer.Resp.Parser.parse(buf2) do
       {:ok, [val], ""} -> val
       {:ok, [val], _rest} -> val
       {:ok, [], _} -> recv_response(sock, buf2)
@@ -670,7 +670,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
   end
 
   defp kill_shard_and_wait(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     pid = Process.whereis(name)
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)

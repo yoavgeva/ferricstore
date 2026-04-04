@@ -1,4 +1,4 @@
-defmodule Ferricstore.Resp.ParserBugHuntTest do
+defmodule FerricstoreServer.Resp.ParserBugHuntTest do
   @moduledoc """
   Adversarial / edge-case tests for the RESP3 parser.
 
@@ -8,7 +8,7 @@ defmodule Ferricstore.Resp.ParserBugHuntTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Resp.Parser
+  alias FerricstoreServer.Resp.Parser
 
   # ---------------------------------------------------------------------------
   # 1. Incomplete bulk string (truncated mid-value)

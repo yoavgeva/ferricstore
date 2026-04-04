@@ -1,4 +1,4 @@
-defmodule Ferricstore.ClientTracking do
+defmodule FerricstoreServer.ClientTracking do
   @moduledoc """
   Server-assisted client-side caching via RESP3 push invalidation messages.
 
@@ -57,7 +57,7 @@ defmodule Ferricstore.ClientTracking do
   "invalidate" followed by an array of invalidated keys.
   """
 
-  alias Ferricstore.Resp.Encoder
+  alias FerricstoreServer.Resp.Encoder
 
   require Logger
 

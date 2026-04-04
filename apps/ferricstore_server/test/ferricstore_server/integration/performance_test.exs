@@ -18,7 +18,7 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
 
   @moduletag :bench
 
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
   alias Ferricstore.Store.Router
 

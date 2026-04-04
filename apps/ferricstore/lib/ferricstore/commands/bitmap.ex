@@ -365,7 +365,9 @@ defmodule Ferricstore.Commands.Bitmap do
     e = min(end_byte, len - 1)
 
     if s > e or s >= len do
-      -1
+      # Redis: when searching for 0 without explicit end, virtual bits past
+      # the string are all zeros. Return length * 8 as the first virtual 0.
+      if bit_val == 0 and not explicit_end, do: len * 8, else: -1
     else
       bin
       |> scan_bytes_for_bit(bit_val, s, e)

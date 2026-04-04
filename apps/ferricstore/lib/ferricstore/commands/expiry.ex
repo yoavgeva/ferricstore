@@ -81,10 +81,8 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp set_expiry_seconds(key, secs_str, store) do
     case Integer.parse(secs_str) do
-      {secs, ""} when secs < 0 ->
-        {:error, "ERR invalid expire time in 'expire' command"}
-
-      {0, ""} ->
+      {secs, ""} when secs <= 0 ->
+        # Redis 7+: negative or zero EXPIRE deletes the key
         delete_if_exists(key, store)
 
       {secs, ""} ->
@@ -97,10 +95,8 @@ defmodule Ferricstore.Commands.Expiry do
 
   defp set_expiry_ms(key, ms_str, store) do
     case Integer.parse(ms_str) do
-      {ms, ""} when ms < 0 ->
-        {:error, "ERR invalid expire time in 'pexpire' command"}
-
-      {0, ""} ->
+      {ms, ""} when ms <= 0 ->
+        # Redis 7+: negative or zero PEXPIRE deletes the key
         delete_if_exists(key, store)
 
       {ms, ""} ->

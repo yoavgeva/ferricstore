@@ -1,6 +1,6 @@
-defmodule Ferricstore.ClientTrackingTest do
+defmodule FerricstoreServer.ClientTrackingTest do
   @moduledoc """
-  Tests for the `Ferricstore.ClientTracking` module.
+  Tests for the `FerricstoreServer.ClientTracking` module.
 
   Covers default tracking mode, BCAST mode, OPTIN/OPTOUT modes, NOLOOP,
   invalidation dispatch, and the CLIENT TRACKING/CACHING command handlers.
@@ -8,7 +8,7 @@ defmodule Ferricstore.ClientTrackingTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.ClientTracking
+  alias FerricstoreServer.ClientTracking
 
   setup do
     # Ensure tracking tables exist

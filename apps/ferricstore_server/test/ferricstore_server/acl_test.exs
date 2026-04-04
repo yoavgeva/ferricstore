@@ -1,6 +1,6 @@
-defmodule Ferricstore.AclTest do
+defmodule FerricstoreServer.AclTest do
   @moduledoc """
-  Unit tests for the Ferricstore.Acl GenServer module.
+  Unit tests for the FerricstoreServer.Acl GenServer module.
 
   Tests the ACL module directly (not via TCP), covering user creation,
   modification, deletion, authentication, password handling, key patterns,
@@ -12,7 +12,7 @@ defmodule Ferricstore.AclTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Acl
+  alias FerricstoreServer.Acl
 
   setup do
     Acl.reset!()

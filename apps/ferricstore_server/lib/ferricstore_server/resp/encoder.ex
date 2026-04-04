@@ -1,4 +1,4 @@
-defmodule Ferricstore.Resp.Encoder do
+defmodule FerricstoreServer.Resp.Encoder do
   @moduledoc """
   Encodes Elixir terms into RESP3 wire format.
 
@@ -27,13 +27,13 @@ defmodule Ferricstore.Resp.Encoder do
 
   ## Examples
 
-      iex> Ferricstore.Resp.Encoder.encode(:ok) |> IO.iodata_to_binary()
+      iex> FerricstoreServer.Resp.Encoder.encode(:ok) |> IO.iodata_to_binary()
       "+OK\\r\\n"
 
-      iex> Ferricstore.Resp.Encoder.encode(42) |> IO.iodata_to_binary()
+      iex> FerricstoreServer.Resp.Encoder.encode(42) |> IO.iodata_to_binary()
       ":42\\r\\n"
 
-      iex> Ferricstore.Resp.Encoder.encode("hello") |> IO.iodata_to_binary()
+      iex> FerricstoreServer.Resp.Encoder.encode("hello") |> IO.iodata_to_binary()
       "$5\\r\\nhello\\r\\n"
   """
 
@@ -77,10 +77,10 @@ defmodule Ferricstore.Resp.Encoder do
 
   ## Examples
 
-      iex> Ferricstore.Resp.Encoder.encode(nil) |> IO.iodata_to_binary()
+      iex> FerricstoreServer.Resp.Encoder.encode(nil) |> IO.iodata_to_binary()
       "_\\r\\n"
 
-      iex> Ferricstore.Resp.Encoder.encode([1, 2, 3]) |> IO.iodata_to_binary()
+      iex> FerricstoreServer.Resp.Encoder.encode([1, 2, 3]) |> IO.iodata_to_binary()
       "*3\\r\\n:1\\r\\n:2\\r\\n:3\\r\\n"
   """
   @spec encode(encodable()) :: iodata()

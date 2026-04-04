@@ -22,7 +22,7 @@
 #   Run with `mix test test/ferricstore/cluster/throughput_bench_test.exs --include bench`.
 ExUnit.start(
   exclude: [:bench, :linux_io_uring, :large_alloc, :cluster, :jepsen, :legacy_hot_cache, :shard_kill, :compaction, :conn_lifecycle, :concurrency],
-  formatters: [ExUnit.CLIFormatter, Ferricstore.Test.AuditFormatter]
+  formatters: [ExUnit.CLIFormatter, JUnitFormatter, Ferricstore.Test.AuditFormatter]
 )
 
 # NOTE: data directory cleanup is handled by the ferricstore_server app's

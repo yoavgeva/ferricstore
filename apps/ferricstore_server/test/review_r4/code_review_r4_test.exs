@@ -5,55 +5,21 @@ defmodule FerricstoreServer.ReviewR4Test do
   Each test group corresponds to a review issue and documents whether the finding
   is a confirmed bug, false positive, or needs further investigation.
 
-  The listener is started manually in setup_all because the test environment
-  defaults to embedded mode (no Ranch listener).
+  The listener is started automatically by the server application.
   """
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
   @moduletag timeout: 30_000
 
   # ---------------------------------------------------------------------------
-  # Setup: start Ranch listener since test env defaults to embedded mode
+  # Setup: the server app starts automatically, just get the port
   # ---------------------------------------------------------------------------
 
   setup_all do
-    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
-
-    Enum.each(0..(shard_count - 1), fn i ->
-      name = Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i)
-
-      Enum.find_value(1..50, fn _ ->
-        pid = Process.whereis(name)
-        if is_pid(pid) and Process.alive?(pid), do: true, else: Process.sleep(100)
-      end)
-    end)
-
-    # Start :pg scope for ACL invalidation broadcasts (needed by connection init).
-    pg_group = FerricstoreServer.Connection.acl_pg_group()
-
-    case :pg.start_link(pg_group) do
-      {:ok, _pid} -> :ok
-      {:error, {:already_started, _pid}} -> :ok
-    end
-
-    # Start Ranch TCP listener on ephemeral port.
-    case Listener.start(0) do
-      {:ok, _pid} -> :ok
-      {:error, {:already_started, _}} -> :ok
-    end
-
-    on_exit(fn ->
-      try do
-        Listener.stop()
-      catch
-        _, _ -> :ok
-      end
-    end)
-
     %{port: Listener.port()}
   end
 

@@ -1,4 +1,4 @@
-defmodule Ferricstore.AclSecurityTest do
+defmodule FerricstoreServer.AclSecurityTest do
   @moduledoc """
   Security-focused tests for the ACL Phase 1 hardening.
 
@@ -15,7 +15,7 @@ defmodule Ferricstore.AclSecurityTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Acl
+  alias FerricstoreServer.Acl
   alias Ferricstore.AuditLog
 
   setup do
@@ -27,7 +27,6 @@ defmodule Ferricstore.AclSecurityTest do
       Application.put_env(:ferricstore, :audit_log_enabled, false)
       Application.delete_env(:ferricstore, :max_acl_users)
       Application.delete_env(:ferricstore, :protected_mode)
-      Application.delete_env(:ferricstore, :mode)
     end)
 
     :ok
@@ -247,36 +246,25 @@ defmodule Ferricstore.AclSecurityTest do
   # ---------------------------------------------------------------------------
 
   describe "protected mode" do
-    test "protected_mode? returns true when standalone mode and config is true" do
-      Application.put_env(:ferricstore, :mode, :standalone)
+    test "protected_mode? returns true when config is true" do
       Application.put_env(:ferricstore, :protected_mode, true)
 
       assert Acl.protected_mode?() == true
     end
 
-    test "protected_mode? defaults to true for standalone mode" do
-      Application.put_env(:ferricstore, :mode, :standalone)
-      Application.delete_env(:ferricstore, :protected_mode)
-
-      assert Acl.protected_mode?() == true
-    end
-
-    test "protected_mode? defaults to false for embedded mode" do
-      Application.put_env(:ferricstore, :mode, :embedded)
+    test "protected_mode? defaults to false" do
       Application.delete_env(:ferricstore, :protected_mode)
 
       assert Acl.protected_mode?() == false
     end
 
-    test "protected_mode? can be overridden to false for standalone" do
-      Application.put_env(:ferricstore, :mode, :standalone)
+    test "protected_mode? returns false when config is false" do
       Application.put_env(:ferricstore, :protected_mode, false)
 
       assert Acl.protected_mode?() == false
     end
 
-    test "protected_mode? can be overridden to true for embedded" do
-      Application.put_env(:ferricstore, :mode, :embedded)
+    test "protected_mode? can be set to true" do
       Application.put_env(:ferricstore, :protected_mode, true)
 
       assert Acl.protected_mode?() == true
@@ -319,14 +307,12 @@ defmodule Ferricstore.AclSecurityTest do
     end
 
     test "check_protected_mode allows localhost regardless of config" do
-      Application.put_env(:ferricstore, :mode, :standalone)
       Application.put_env(:ferricstore, :protected_mode, true)
 
       assert :ok = Acl.check_protected_mode({{127, 0, 0, 1}, 12345})
     end
 
     test "check_protected_mode rejects non-localhost when no configured users" do
-      Application.put_env(:ferricstore, :mode, :standalone)
       Application.put_env(:ferricstore, :protected_mode, true)
 
       assert {:error, msg} = Acl.check_protected_mode({{192, 168, 1, 1}, 12345})
@@ -335,7 +321,6 @@ defmodule Ferricstore.AclSecurityTest do
     end
 
     test "check_protected_mode allows non-localhost after creating ACL user" do
-      Application.put_env(:ferricstore, :mode, :standalone)
       Application.put_env(:ferricstore, :protected_mode, true)
 
       assert :ok = Acl.set_user("admin", ["on", ">s3cret"])
@@ -343,14 +328,12 @@ defmodule Ferricstore.AclSecurityTest do
     end
 
     test "check_protected_mode allows everything when protected_mode is false" do
-      Application.put_env(:ferricstore, :mode, :standalone)
       Application.put_env(:ferricstore, :protected_mode, false)
 
       assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12345})
     end
 
     test "check_protected_mode with nil peer is treated as non-localhost" do
-      Application.put_env(:ferricstore, :mode, :standalone)
       Application.put_env(:ferricstore, :protected_mode, true)
 
       assert {:error, _} = Acl.check_protected_mode(nil)

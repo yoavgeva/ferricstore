@@ -42,7 +42,7 @@ defmodule Ferricstore.Store.Shard do
   use GenServer
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Store.{LFU, PrefixIndex, Router, ValueCodec}
+  alias Ferricstore.Store.{LFU, Router, ValueCodec}
 
   require Logger
 
@@ -82,7 +82,6 @@ defmodule Ferricstore.Store.Shard do
   defstruct [
     :ets,
     :keydir,
-    :prefix_keys,
     :index,
     :data_dir,
     # Cached result of DataDir.shard_data_path(data_dir, index).
@@ -188,18 +187,6 @@ defmodule Ferricstore.Store.Shard do
       _ref -> :ets.delete(:"hot_cache_#{index}")
     end
 
-    prefix_name =
-      if ctx, do: elem(ctx.prefix_table_refs, index), else: :"prefix_keys_#{index}"
-
-    prefix_keys =
-      case :ets.whereis(prefix_name) do
-        :undefined ->
-          :ets.new(prefix_name, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, :auto}])
-        _ref ->
-          :ets.delete_all_objects(prefix_name)
-          prefix_name
-      end
-
     ets = keydir
 
     # v2: recover ETS keydir from hint files or by scanning log files BEFORE
@@ -209,7 +196,7 @@ defmodule Ferricstore.Store.Shard do
     # replay and start from nil instead of the correct prior value.
     # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
     # Must run BEFORE recover_promoted so PM: markers are in ETS.
-    recover_keydir(path, keydir, prefix_keys, index)
+    recover_keydir(path, keydir, index)
 
     # Start the Raft server for this shard (unless explicitly disabled).
     raft? =
@@ -249,7 +236,7 @@ defmodule Ferricstore.Store.Shard do
     max_file_size = :persistent_term.get(:ferricstore_max_active_file_size, @default_max_active_file_size)
 
     {:ok, %__MODULE__{ets: keydir, keydir: keydir,
-                       prefix_keys: prefix_keys, index: index, data_dir: data_dir,
+                       index: index, data_dir: data_dir,
                        shard_data_path: path,
                        instance_ctx: ctx,
                        active_file_id: active_file_id,
@@ -305,7 +292,7 @@ defmodule Ferricstore.Store.Shard do
 
   # Recovers the ETS keydir from hint files or by scanning log files.
   # Uses last-writer-wins semantics (higher file_id + higher offset wins).
-  defp recover_keydir(shard_path, keydir, prefix_keys, shard_index) do
+  defp recover_keydir(shard_path, keydir, shard_index) do
     case File.ls(shard_path) do
       {:ok, files} ->
         log_files =
@@ -332,7 +319,6 @@ defmodule Ferricstore.Store.Shard do
                 # NIF returns: {key, file_id, offset, value_size, expire_at_ms}
                 Enum.each(entries, fn {key, _file_id, offset, value_size, expire_at_ms} ->
                   :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
-                  PrefixIndex.track(prefix_keys, key, shard_index)
                 end)
               _ -> :ok
             end
@@ -349,12 +335,12 @@ defmodule Ferricstore.Store.Shard do
           end)
 
           Enum.each(unhinted_logs, fn log_name ->
-            recover_from_log(shard_path, log_name, keydir, prefix_keys, shard_index)
+            recover_from_log(shard_path, log_name, keydir, shard_index)
           end)
         else
           # No hint files -- full scan of all log files
           Enum.each(log_files, fn log_name ->
-            recover_from_log(shard_path, log_name, keydir, prefix_keys, shard_index)
+            recover_from_log(shard_path, log_name, keydir, shard_index)
           end)
         end
 
@@ -368,7 +354,7 @@ defmodule Ferricstore.Store.Shard do
     Logger.debug("Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}, keys: #{inspect(sample_keys)}")
   end
 
-  defp recover_from_log(shard_path, log_name, keydir, prefix_keys, shard_index) do
+  defp recover_from_log(shard_path, log_name, keydir, shard_index) do
     log_path = Path.join(shard_path, log_name)
     fid = log_name |> String.trim_trailing(".log") |> String.to_integer()
 
@@ -378,10 +364,8 @@ defmodule Ferricstore.Store.Shard do
         Enum.each(records, fn {key, offset, value_size, expire_at_ms, is_tombstone} ->
           if is_tombstone do
             :ets.delete(keydir, key)
-            PrefixIndex.untrack(prefix_keys, key, shard_index)
           else
             :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
-            PrefixIndex.track(prefix_keys, key, shard_index)
           end
         end)
 
@@ -1602,7 +1586,6 @@ defmodule Ferricstore.Store.Shard do
     # promoted_instances, etc. that hold stale references).
     ctx = %{
       keydir: state.keydir,
-      prefix_keys: state.prefix_keys,
       index: state.index,
       shard_data_path: state.shard_data_path,
       data_dir: state.data_dir
@@ -2036,7 +2019,8 @@ defmodule Ferricstore.Store.Shard do
         Router.prob_write(instance_ctx, command)
       end,
       shard_index: ctx.index,
-      data_dir: ctx.data_dir
+      data_dir: ctx.data_dir,
+      on_push: &Ferricstore.Waiters.notify_push/1
     }
   end
 
@@ -2457,13 +2441,6 @@ defmodule Ferricstore.Store.Shard do
     {:reply, live_keys(state), state}
   end
 
-  # Returns all live keys matching a given prefix (text before ':'). Uses the
-  # prefix_keys bag table for O(matching) lookup instead of scanning all keys.
-  def handle_call({:keys_with_prefix, prefix}, _from, state) do
-    keys = PrefixIndex.keys_for_prefix(state.prefix_keys, state.keydir, prefix)
-    {:reply, keys, state}
-  end
-
   # Merge-related calls: delegate to NIF and return results directly.
 
   def handle_call(:shard_stats, _from, state) do
@@ -2702,7 +2679,6 @@ defmodule Ferricstore.Store.Shard do
       active_file_path: state.active_file_path,
       ets: state.ets,
       data_dir: state.data_dir,
-      prefix_keys: state.prefix_keys,
       applied_count: 0,
       release_cursor_interval: 20_000,
       cross_shard_locks: %{},
@@ -3270,20 +3246,12 @@ defmodule Ferricstore.Store.Shard do
   defp ets_insert(state, key, value, expire_at_ms) do
     value_for_ets = value_for_ets(value)
     :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
-
-    if state.prefix_keys do
-      PrefixIndex.track(state.prefix_keys, key, state.index)
-    end
   end
 
   # Inserts a key/value/expiry into the keydir with known disk location (v2).
   defp ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
     value_for_ets = value_for_ets(value)
     :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), file_id, offset, value_size})
-
-    if state.prefix_keys do
-      PrefixIndex.track(state.prefix_keys, key, state.index)
-    end
   end
 
   # Returns nil for values exceeding the hot cache max value size threshold,
@@ -3306,13 +3274,9 @@ defmodule Ferricstore.Store.Shard do
   defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
   defp to_disk_binary(v) when is_binary(v), do: v
 
-  # Deletes a key from the keydir table and removes it from the prefix index.
+  # Deletes a key from the keydir table.
   defp ets_delete_key(state, key) do
     :ets.delete(state.keydir, key)
-
-    if state.prefix_keys do
-      PrefixIndex.untrack(state.prefix_keys, key, state.index)
-    end
   end
 
   # Classifies an ETS lookup as a cache hit, cold (evicted), expired, or miss.
@@ -3526,10 +3490,6 @@ defmodule Ferricstore.Store.Shard do
       :ok
     else
       :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
-
-      if state.prefix_keys do
-        PrefixIndex.track(state.prefix_keys, key, state.index)
-      end
     end
   end
 

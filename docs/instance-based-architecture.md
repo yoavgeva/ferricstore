@@ -94,7 +94,9 @@ defmodule FerricStore.Instance do
     :keydir_max_ram,    # Integer
     :memory_limit,      # Integer (cgroup or host RAM)
     :durability_mode,   # :all_quorum | :all_async | :mixed
-    :mode,              # :standalone | :embedded
+    :connected_clients_fn, # fn -> integer (injected by server via inject_callbacks/2)
+    :process_rss_fn,       # fn -> integer (injected by server via inject_callbacks/2)
+    :server_info_fn,       # fn -> map (injected by server via inject_callbacks/2)
   ]
 end
 ```
@@ -127,6 +129,11 @@ Every persistent_term, named ETS table, and named process becomes instance-scope
 | `:ferricstore_has_async_ns` | `ctx.durability_mode` | Derived |
 | `:ferricstore_active_file` | Per-shard in instance | Handled by shard |
 | `:ferricstore_config` | ETS per instance | Config table |
+
+The `Ferricstore.Mode` module has been deleted entirely — there is no `:mode` config or
+standalone/embedded distinction in the library. The `protected_mode` flag is a simple
+`Application.get_env(:ferricstore, :protected_mode, false)` that the server sets to `true`
+in its `runtime.exs`.
 
 **Performance gain: ~5ns × 3-5 lookups per operation = 15-25ns saved per request.**
 
@@ -276,6 +283,20 @@ defp build_raw_store(ctx) do
 
 The connection receives the instance ctx at init (from the listener config).
 Multiple listeners can point to different instances.
+
+After startup, the server application injects server-specific callbacks into the
+instance via `FerricStore.Instance.inject_callbacks/2`. This provides the library
+with access to server-only information (connected clients count, process RSS,
+server info) without creating any compile-time or runtime dependency on the server:
+
+```elixir
+# In ferricstore_server startup (e.g., application.ex):
+FerricStore.Instance.inject_callbacks(:default, %{
+  connected_clients_fn: fn -> ConnectionRegistry.count() end,
+  process_rss_fn: fn -> SystemInfo.rss_bytes() end,
+  server_info_fn: fn -> ServerInfo.collect() end
+})
+```
 
 ## Supervision Tree
 

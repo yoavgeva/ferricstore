@@ -638,6 +638,28 @@ defmodule Ferricstore.Commands.BitmapTest do
       assert 10 == Bitmap.handle("BITPOS", ["mykey", "1"], store)
     end
 
+    test "BITPOS 0 with start beyond string length returns length*8 (virtual zero)" do
+      # Redis compat: virtual bits past the string are all zeros
+      store = MockStore.make(%{"allones" => {<<0xFF, 0xFF>>, 0}})
+
+      # 2 bytes = 16 bits, all 1s. Searching for 0 starting at byte 5.
+      # Start is past the string, so the first virtual 0 is at bit 16.
+      assert 16 == Bitmap.handle("BITPOS", ["allones", "0", "5"], store)
+    end
+
+    test "BITPOS 1 with start beyond string length returns -1" do
+      store = MockStore.make(%{"short" => {<<0xFF>>, 0}})
+
+      # Looking for 1 past the string — no virtual 1 bits exist
+      assert -1 == Bitmap.handle("BITPOS", ["short", "1", "5"], store)
+    end
+
+    test "BITPOS 0 with explicit end beyond string length returns -1" do
+      # With explicit end range, no virtual bits — return -1
+      store = MockStore.make(%{"allones" => {<<0xFF, 0xFF>>, 0}})
+      assert -1 == Bitmap.handle("BITPOS", ["allones", "0", "5", "10"], store)
+    end
+
     test "BITOP result can be read with GETBIT" do
       store = MockStore.make(%{
         "a" => {<<0xF0>>, 0},

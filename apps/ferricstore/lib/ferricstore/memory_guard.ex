@@ -565,13 +565,13 @@ defmodule Ferricstore.MemoryGuard do
     # In embedded mode, RSS includes the host app's memory — not meaningful
     # for our pressure decisions.
     {rss_bytes, rss_ratio, rss_pressure_level} =
-      if Ferricstore.Mode.standalone?() do
-        rss = process_rss_bytes() || 0
-        limit = state.memory_limit
-        r = if limit > 0, do: rss / limit, else: 0.0
-        {rss, r, classify_pressure(r)}
-      else
-        {0, 0.0, :ok}
+      case FerricStore.Instance.get(:default).process_rss_fn do
+        nil -> {0, 0.0, :ok}
+        rss_fn ->
+          rss = rss_fn.() || 0
+          limit = state.memory_limit
+          r = if limit > 0, do: rss / limit, else: 0.0
+          {rss, r, classify_pressure(r)}
       end
 
     # Overall pressure is the worse of keydir-based and RSS-based.

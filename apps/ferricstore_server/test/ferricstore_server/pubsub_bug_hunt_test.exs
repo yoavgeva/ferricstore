@@ -15,7 +15,7 @@ defmodule FerricstoreServer.PubSubBugHuntTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
   alias Ferricstore.PubSub
 

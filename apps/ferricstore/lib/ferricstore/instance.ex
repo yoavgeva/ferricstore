@@ -23,7 +23,6 @@ defmodule FerricStore.Instance do
           slot_map: tuple(),
           shard_names: tuple(),
           keydir_refs: tuple(),
-          prefix_table_refs: tuple(),
           ra_system: atom(),
           pressure_flags: reference(),
           disk_pressure: reference(),
@@ -41,9 +40,12 @@ defmodule FerricStore.Instance do
           memory_limit: non_neg_integer(),
           raft_enabled: boolean(),
           durability_mode: atom(),
-          mode: atom(),
           hotness_table: atom() | reference(),
-          config_table: atom() | reference()
+          config_table: atom() | reference(),
+          connected_clients_fn: (-> non_neg_integer()),
+          process_rss_fn: (-> non_neg_integer() | nil) | nil,
+          server_info_fn: (-> map()),
+          raft_apply_hook: (term() -> term()) | nil
         }
 
   defstruct [
@@ -53,7 +55,6 @@ defmodule FerricStore.Instance do
     :slot_map,
     :shard_names,
     :keydir_refs,
-    :prefix_table_refs,
     :ra_system,
     :pressure_flags,
     :disk_pressure,
@@ -70,10 +71,13 @@ defmodule FerricStore.Instance do
     :keydir_max_ram,
     :memory_limit,
     :durability_mode,
-    :mode,
     :hotness_table,
     :config_table,
-    raft_enabled: true
+    raft_enabled: true,
+    connected_clients_fn: nil,
+    process_rss_fn: nil,
+    server_info_fn: nil,
+    raft_apply_hook: nil
   ]
 
   @doc """
@@ -87,14 +91,12 @@ defmodule FerricStore.Instance do
   def build(name, opts) do
     shard_count = Keyword.get(opts, :shard_count, 4)
     data_dir = Keyword.get(opts, :data_dir, "data")
-    mode = Keyword.get(opts, :mode, :embedded)
 
     # Slot map: 1024 slots → shard indices
     slot_map = build_slot_map(shard_count)
 
     # Per-shard ETS tables (anonymous — no global name pollution)
     keydir_refs = build_keydir_tables(name, shard_count)
-    prefix_table_refs = build_prefix_tables(name, shard_count)
 
     # Shard process names (via Registry or atoms)
     shard_names = build_shard_names(name, shard_count)
@@ -108,15 +110,15 @@ defmodule FerricStore.Instance do
         {
           try_get_pt(:ferricstore_pressure_flags, fn -> :atomics.new(3, signed: false) end),
           try_get_pt(:ferricstore_disk_pressure, fn -> :atomics.new(shard_count, signed: false) end),
-          try_get_pt(:ferricstore_write_version, fn -> :counters.new(shard_count, [:write_concurrency]) end),
-          try_get_pt(:ferricstore_stats_counter_ref, fn -> :counters.new(9, [:atomics]) end)
+          try_get_pt(:ferricstore_write_versions, fn -> :counters.new(shard_count, [:write_concurrency]) end),
+          try_get_pt(:ferricstore_stats_counter_ref, fn -> :counters.new(10, [:atomics]) end)
         }
       else
         {
           :atomics.new(3, signed: false),
           :atomics.new(shard_count, signed: false),
           :counters.new(shard_count, [:write_concurrency]),
-          :counters.new(9, [:atomics])
+          :counters.new(10, [:atomics])
         }
       end
 
@@ -155,7 +157,6 @@ defmodule FerricStore.Instance do
       slot_map: slot_map,
       shard_names: shard_names,
       keydir_refs: keydir_refs,
-      prefix_table_refs: prefix_table_refs,
       ra_system: :"#{name}_raft",
       pressure_flags: pressure_flags,
       disk_pressure: disk_pressure,
@@ -173,9 +174,11 @@ defmodule FerricStore.Instance do
       memory_limit: memory_limit,
       raft_enabled: Keyword.get(opts, :raft_enabled, true),
       durability_mode: :all_quorum,
-      mode: mode,
       hotness_table: hotness_table,
-      config_table: config_table
+      config_table: config_table,
+      connected_clients_fn: Keyword.get(opts, :connected_clients_fn, fn -> 0 end),
+      process_rss_fn: Keyword.get(opts, :process_rss_fn),
+      server_info_fn: Keyword.get(opts, :server_info_fn, fn -> %{} end)
     }
 
     # Cache in persistent_term for ~0ns access via __instance__/0
@@ -190,6 +193,22 @@ defmodule FerricStore.Instance do
   @spec get(atom()) :: t()
   def get(name) do
     :persistent_term.get({FerricStore.Instance, name})
+  end
+
+  @doc """
+  Injects optional callbacks into an existing instance.
+
+  Used by server apps (e.g., ferricstore_server) to provide server-specific
+  functions without the library needing to know about the server.
+
+  Accepted keys: `:connected_clients_fn`, `:process_rss_fn`, `:server_info_fn`.
+  """
+  @spec inject_callbacks(atom(), keyword()) :: t()
+  def inject_callbacks(name, callbacks) do
+    ctx = get(name)
+    updated = struct!(ctx, callbacks)
+    :persistent_term.put({FerricStore.Instance, name}, updated)
+    updated
   end
 
   @doc """
@@ -225,14 +244,6 @@ defmodule FerricStore.Instance do
       # Don't create the table here — Shard.init creates it.
       # Just record the name so Router can find it.
       table_name
-    end)
-    |> List.to_tuple()
-  end
-
-  defp build_prefix_tables(name, shard_count) do
-    0..(shard_count - 1)
-    |> Enum.map(fn i ->
-      if name == :default, do: :"prefix_keys_#{i}", else: :"#{name}_prefix_#{i}"
     end)
     |> List.to_tuple()
   end

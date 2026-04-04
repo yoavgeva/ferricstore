@@ -4,7 +4,7 @@ defmodule FerricstoreServer.KeyspaceNotificationsTest do
   alias Ferricstore.Config
   alias Ferricstore.KeyspaceNotifications
   alias Ferricstore.PubSub
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------

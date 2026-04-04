@@ -329,7 +329,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
       # Kill the shard that owns this key
       idx = Router.shard_for(FerricStore.Instance.get(:default), "restart_key")
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), idx)
       pid = Process.whereis(shard_name)
       Process.exit(pid, :kill)
       Process.sleep(200)
@@ -758,7 +758,7 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
     # Test 36: Promotion still works with single table
     test "36. promotion still works with single table" do
       # Write enough hash fields to verify the compound key path works
-      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), "promo_hash"))
+      shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), "promo_hash"))
 
       GenServer.call(shard, {:compound_put, "promo_hash", "H:promo_hash\0field1", "val1", 0})
       drain_all()
@@ -767,14 +767,15 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
       assert result == "val1"
     end
 
-    # Test 37: Prefix index still works
-    test "37. prefix index still works with single table" do
+    # Test 37: Key scanning with prefix pattern still works
+    test "37. key scanning with prefix pattern still works with single table" do
       Router.put(FerricStore.Instance.get(:default), "prefix:key1", "v1")
       Router.put(FerricStore.Instance.get(:default), "prefix:key2", "v2")
       Router.put(FerricStore.Instance.get(:default), "other:key3", "v3")
       drain_all()
 
-      prefix_keys = Router.keys_with_prefix(FerricStore.Instance.get(:default), "prefix")
+      all_keys = Router.keys(FerricStore.Instance.get(:default))
+      prefix_keys = Enum.filter(all_keys, &String.starts_with?(&1, "prefix:"))
       assert "prefix:key1" in prefix_keys
       assert "prefix:key2" in prefix_keys
       refute "other:key3" in prefix_keys

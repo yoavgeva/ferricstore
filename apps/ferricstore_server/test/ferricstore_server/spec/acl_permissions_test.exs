@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
   @moduledoc """
   Tests for ACL command-level permission enforcement.
 
-  Verifies that the `Ferricstore.Acl.check_command/2` function correctly
+  Verifies that the `FerricstoreServer.Acl.check_command/2` function correctly
   enforces command-level restrictions based on user ACL rules:
 
     - `+@all` grants access to every command
@@ -20,8 +20,8 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Acl
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Acl
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------

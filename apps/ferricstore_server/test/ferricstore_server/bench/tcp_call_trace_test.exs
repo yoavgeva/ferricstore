@@ -30,8 +30,8 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
 
     # Enable call count tracing on key modules
     modules_to_trace = [
-      {Ferricstore.Resp.Parser, "RESP3 parse"},
-      {Ferricstore.Resp.Encoder, "RESP3 encode"},
+      {FerricstoreServer.Resp.Parser, "RESP3 parse"},
+      {FerricstoreServer.Resp.Encoder, "RESP3 encode"},
       {Ferricstore.Store.Router, "Router"},
       {Ferricstore.Store.LFU, "LFU"},
       {Ferricstore.Commands.Dispatcher, "Dispatcher"},
@@ -120,7 +120,7 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
     # 1. RESP3 parse
     {parse_us, _} = :timer.tc(fn ->
       for _ <- 1..10_000 do
-        Ferricstore.Resp.Parser.parse(resp3_cmd)
+        FerricstoreServer.Resp.Parser.parse(resp3_cmd)
       end
     end)
 
@@ -142,7 +142,7 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
     value = String.duplicate("v", 100)
     {encode_us, _} = :timer.tc(fn ->
       for _ <- 1..10_000 do
-        Ferricstore.Resp.Encoder.encode(value)
+        FerricstoreServer.Resp.Encoder.encode(value)
       end
     end)
 

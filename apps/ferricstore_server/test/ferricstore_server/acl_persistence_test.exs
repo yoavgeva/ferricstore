@@ -1,4 +1,4 @@
-defmodule Ferricstore.AclPersistenceTest do
+defmodule FerricstoreServer.AclPersistenceTest do
   @moduledoc """
   Tests for ACL file persistence: SAVE, LOAD, auto-load on startup,
   auto-save on mutations, and comprehensive edge cases.
@@ -10,7 +10,7 @@ defmodule Ferricstore.AclPersistenceTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Acl
+  alias FerricstoreServer.Acl
 
   setup do
     Acl.reset!()

@@ -8,9 +8,10 @@ defmodule FerricstoreServer.Application do
     * Ranch TLS listener (`FerricstoreServer.TlsListener`) -- optional
     * HTTP health/metrics endpoint (`FerricstoreServer.Health.Endpoint`)
 
-  This application depends on `:ferricstore` (the core engine). In embedded
-  mode (`config :ferricstore, :mode, :embedded`), this application is not
-  started -- the host application uses the core engine API directly.
+  This application depends on `:ferricstore` (the core engine). It injects
+  server-specific callbacks (connected clients count, RSS tracking, server
+  info) into the default Instance so the library can report them without
+  knowing about the server.
 
   ## Supervision tree (`:one_for_one`)
 
@@ -29,28 +30,34 @@ defmodule FerricstoreServer.Application do
 
   @impl true
   def start(_type, _args) do
-    mode = Ferricstore.Mode.current()
+    port = Application.get_env(:ferricstore, :port, 6379)
+    health_port = Application.get_env(:ferricstore, :health_port, 4000)
 
-    if mode == :embedded do
-      Logger.info("FerricstoreServer skipping startup (embedded mode)")
-      Supervisor.start_link([], strategy: :one_for_one, name: FerricstoreServer.Supervisor)
-    else
-      port = Application.get_env(:ferricstore, :port, 6379)
-      health_port = Application.get_env(:ferricstore, :health_port, 4000)
+    # Initialize ClientTracking ETS tables before any connection starts.
+    FerricstoreServer.ClientTracking.init_tables()
 
-      children =
-        [
-          # Start :pg scope for ACL invalidation broadcasts before the Ranch
-          # listener so it's ready when the first connection process starts.
-          pg_child_spec()
-        ] ++
-        [ranch_listener_spec(port)] ++
-          tls_listener_children() ++
-          [FerricstoreServer.Health.Endpoint.child_spec(health_port)]
+    children =
+      [
+        # ACL GenServer — manages user accounts, authentication, permissions.
+        # Must start before Ranch listener so connections can authenticate.
+        FerricstoreServer.Acl,
+        # Start :pg scope for ACL invalidation broadcasts before the Ranch
+        # listener so it's ready when the first connection process starts.
+        pg_child_spec()
+      ] ++
+      [ranch_listener_spec(port)] ++
+        tls_listener_children() ++
+        [FerricstoreServer.Health.Endpoint.child_spec(health_port)]
 
-      opts = [strategy: :one_for_one, name: FerricstoreServer.Supervisor, max_restarts: 20, max_seconds: 10]
-      Supervisor.start_link(children, opts)
-    end
+    opts = [strategy: :one_for_one, name: FerricstoreServer.Supervisor, max_restarts: 20, max_seconds: 10]
+    result = Supervisor.start_link(children, opts)
+
+    # Inject server-specific callbacks into the default Instance.
+    # The library uses these to report connected clients, RSS, etc.
+    # without needing to know about the server app.
+    inject_server_callbacks(port)
+
+    result
   end
 
   @impl true
@@ -84,6 +91,30 @@ defmodule FerricstoreServer.Application do
 
     Logger.info("FerricstoreServer: graceful shutdown complete")
     state
+  end
+
+  # ---------------------------------------------------------------------------
+  # Server callback injection
+  # ---------------------------------------------------------------------------
+
+  defp inject_server_callbacks(port) do
+    FerricStore.Instance.inject_callbacks(:default,
+      connected_clients_fn: fn ->
+        try do
+          :ranch.procs(FerricstoreServer.Listener, :connections) |> length()
+        rescue
+          _ -> 0
+        end
+      end,
+      process_rss_fn: &Ferricstore.MemoryGuard.process_rss_bytes/0,
+      server_info_fn: fn ->
+        %{
+          tcp_port: port,
+          redis_mode: "standalone"
+        }
+      end,
+      raft_apply_hook: &FerricstoreServer.Acl.handle_raft_command/1
+    )
   end
 
   # ---------------------------------------------------------------------------

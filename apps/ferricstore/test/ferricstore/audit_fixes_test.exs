@@ -9,7 +9,7 @@ defmodule Ferricstore.AuditFixesTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.GlobMatcher
-  alias Ferricstore.Resp.{Parser, Encoder}
+  alias FerricstoreServer.Resp.{Parser, Encoder}
   alias Ferricstore.Commands.{Strings, Hash, Set, SortedSet, Server, Generic}
 
   # ---------------------------------------------------------------------------
@@ -29,7 +29,6 @@ defmodule Ferricstore.AuditFixesTest do
       delete: fn _key -> :ok end,
       exists?: fn key -> Map.has_key?(data, key) end,
       keys: fn -> Map.keys(data) |> Enum.reject(&Ferricstore.Store.CompoundKey.internal_key?/1) end,
-      keys_with_prefix: fn _prefix -> [] end,
       flush: fn -> :ok end,
       dbsize: fn -> map_size(data) end,
       incr: fn _key, _delta -> {:ok, 1} end,
@@ -445,7 +444,7 @@ defmodule Ferricstore.AuditFixesTest do
     test "notify_key_modified does not crash with empty tracking tables" do
       # Just verify the BCAST path doesn't crash
       result =
-        Ferricstore.ClientTracking.notify_key_modified(
+        FerricstoreServer.ClientTracking.notify_key_modified(
           "test_key",
           self(),
           fn _pid, _msg, _keys -> :ok end
@@ -596,15 +595,12 @@ defmodule Ferricstore.AuditFixesTest do
           "user:charlie" => {"v", 0},
           "post:1" => {"v", 0}
         })
-        |> Map.put(:keys_with_prefix, fn prefix ->
-          Enum.filter(all_keys, &String.starts_with?(&1, prefix))
-        end)
 
-      # ? pattern forces GlobMatcher path (not prefix fast-path)
+      # ? pattern forces GlobMatcher path
       result = Server.handle("KEYS", ["user:???"], store) |> Enum.sort()
       assert result == ["user:bob"]
 
-      # * pattern uses prefix index fast path via keys_with_prefix
+      # * pattern uses full key scan with GlobMatcher
       result = Server.handle("KEYS", ["user:*"], store) |> Enum.sort()
       assert result == ["user:alice", "user:bob", "user:charlie"]
 
@@ -992,11 +988,7 @@ defmodule Ferricstore.AuditFixesTest do
 
       all_key_list = Map.keys(all_data)
 
-      store =
-        mock_store(all_data)
-        |> Map.put(:keys_with_prefix, fn prefix ->
-          Enum.filter(all_key_list, &String.starts_with?(&1, prefix))
-        end)
+      store = mock_store(all_data)
 
       all_keys = collect_scan_keys_with_match(store, "0", 1, "user:*", [])
       assert Enum.sort(all_keys) == ["user:1", "user:2"]

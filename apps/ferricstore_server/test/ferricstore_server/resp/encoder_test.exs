@@ -1,8 +1,8 @@
-defmodule Ferricstore.Resp.EncoderTest do
+defmodule FerricstoreServer.Resp.EncoderTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Resp.Encoder
-  alias Ferricstore.Resp.Parser
+  alias FerricstoreServer.Resp.Encoder
+  alias FerricstoreServer.Resp.Parser
 
   # Helper to flatten iodata for assertion
   defp to_binary(iodata), do: IO.iodata_to_binary(iodata)

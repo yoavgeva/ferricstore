@@ -164,20 +164,21 @@ If patched `ra_log_wal` can't load, falls back to unpatched silently. 10x slower
 
 | Severity | Count | Key Areas |
 |----------|-------|-----------|
-| C1 | CRITICAL | NOT A BUG — sandbox routes through GenServer |
+| C1 | CRITICAL | OBSOLETE — sandbox removed entirely, instance-based architecture replaces it |
 | H1 | HIGH | FIXED — set ops propagate errors |
 | H2 | HIGH | FIXED — sorted set ops propagate errors |
 | H3 | HIGH | NOT A BUG — DBSIZE already filters |
 | H4 | HIGH | NOT A BUG — randomkey filters |
 | H5 | HIGH | Regression guard |
-| H6 | HIGH | FIXED — FLUSHDB clears registries |
+| H6 | HIGH | OBSOLETE — registries deleted, prob uses stateless NIFs, FLUSHDB cleans prob dirs |
 | H7 | HIGH | Regression guard (fallback path) |
-| M1 | MEDIUM | FIXED — mode doc updated |
+| M1 | MEDIUM | OBSOLETE — Mode module deleted entirely |
 | M2 | MEDIUM | FIXED — queries ra.members for actual role |
 | M3 | MEDIUM | FIXED — validates min <= max |
 | M4 | MEDIUM | FIXED — del returns {:ok, count}, multi-key |
 | M5 | MEDIUM | FIXED — sismember returns {:ok, boolean} |
 | M6 | MEDIUM | FIXED — HLC consistently |
-| M7 | MEDIUM | NOT A BUG — sandbox never publishes |
-| L1-L5 | LOW | Accepted |
+| M7 | MEDIUM | OBSOLETE — sandbox removed entirely |
+| L1-L3, L5 | LOW | Accepted |
+| L4 | LOW | OBSOLETE — sandbox removed |
 

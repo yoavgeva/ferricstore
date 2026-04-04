@@ -1,4 +1,4 @@
-defmodule Ferricstore.Acl do
+defmodule FerricstoreServer.Acl do
   @moduledoc """
   GenServer managing the Access Control List (ACL) for FerricStore.
 
@@ -60,17 +60,17 @@ defmodule Ferricstore.Acl do
 
   ## Usage
 
-      Ferricstore.Acl.set_user("alice", ["on", ">s3cret", "~cache:*", "+get", "+set"])
-      Ferricstore.Acl.authenticate("alice", "s3cret")
+      FerricstoreServer.Acl.set_user("alice", ["on", ">s3cret", "~cache:*", "+get", "+set"])
+      FerricstoreServer.Acl.authenticate("alice", "s3cret")
       #=> {:ok, user}
 
-      Ferricstore.Acl.check_command("alice", "GET")
+      FerricstoreServer.Acl.check_command("alice", "GET")
       #=> :ok
 
-      Ferricstore.Acl.check_command("alice", "FLUSHDB")
+      FerricstoreServer.Acl.check_command("alice", "FLUSHDB")
       #=> {:error, "NOPERM this user has no permissions to run the 'flushdb' command"}
 
-      Ferricstore.Acl.del_user("alice")
+      FerricstoreServer.Acl.del_user("alice")
       #=> :ok
   """
 
@@ -220,10 +220,10 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.set_user("alice", ["on", ">s3cret", "~*", "+@all"])
+      FerricstoreServer.Acl.set_user("alice", ["on", ">s3cret", "~*", "+@all"])
       #=> :ok
 
-      Ferricstore.Acl.set_user("reader", ["on", ">pass", "-@all", "+@read"])
+      FerricstoreServer.Acl.set_user("reader", ["on", ">pass", "-@all", "+@read"])
       #=> :ok
   """
   @spec set_user(binary(), [binary()]) :: :ok | {:error, binary()}
@@ -245,7 +245,7 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.del_user("alice")
+      FerricstoreServer.Acl.del_user("alice")
       #=> :ok
   """
   @spec del_user(binary()) :: :ok | {:error, binary()}
@@ -262,7 +262,7 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.get_user("default")
+      FerricstoreServer.Acl.get_user("default")
       #=> %{enabled: true, password: nil, commands: :all, denied_commands: MapSet.new(), keys: :all}
   """
   @spec get_user(binary()) :: user() | nil
@@ -280,7 +280,7 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.list_users()
+      FerricstoreServer.Acl.list_users()
       #=> ["user default on ~* &* +@all", "user alice on ~cache:* +get +set"]
   """
   @spec list_users() :: [binary()]
@@ -302,7 +302,7 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.get_user_info("default")
+      FerricstoreServer.Acl.get_user_info("default")
       #=> ["flags", ["on"], "passwords", [], "commands", "+@all", "keys", "~*", "channels", "&*"]
   """
   @spec get_user_info(binary()) :: [term()] | nil
@@ -339,10 +339,10 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.authenticate("default", "secret123")
+      FerricstoreServer.Acl.authenticate("default", "secret123")
       #=> {:ok, "default"}
 
-      Ferricstore.Acl.authenticate("unknown", "pass")
+      FerricstoreServer.Acl.authenticate("unknown", "pass")
       #=> {:error, "WRONGPASS invalid username-password pair or user is disabled."}
   """
   @spec authenticate(binary(), binary()) :: {:ok, binary()} | {:error, binary()}
@@ -421,10 +421,10 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.check_command("default", "GET")
+      FerricstoreServer.Acl.check_command("default", "GET")
       #=> :ok
 
-      Ferricstore.Acl.check_command("readonly_user", "SET")
+      FerricstoreServer.Acl.check_command("readonly_user", "SET")
       #=> {:error, "NOPERM this user has no permissions to run the 'set' command"}
   """
   @spec check_command(binary(), binary()) :: :ok | {:error, binary()}
@@ -469,10 +469,10 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.check_key_access("default", "mykey", :read)
+      FerricstoreServer.Acl.check_key_access("default", "mykey", :read)
       #=> :ok
 
-      Ferricstore.Acl.check_key_access("reader", "forbidden:key", :write)
+      FerricstoreServer.Acl.check_key_access("reader", "forbidden:key", :write)
       #=> {:error, "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
   """
   @spec check_key_access(binary(), binary(), :read | :write) :: :ok | {:error, binary()}
@@ -541,10 +541,10 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.compile_glob("cache:*")
+      FerricstoreServer.Acl.compile_glob("cache:*")
       #=> ~r/\\Acache:.*\\z/s
 
-      Ferricstore.Acl.compile_glob("user:?:profile")
+      FerricstoreServer.Acl.compile_glob("user:?:profile")
       #=> ~r/\\Auser:..:profile\\z/s
   """
   @spec compile_glob(binary()) :: Regex.t()
@@ -586,7 +586,7 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.categories()
+      FerricstoreServer.Acl.categories()
       #=> %{"READ" => MapSet.new(["GET", "MGET", ...]), ...}
   """
   @spec categories() :: %{binary() => MapSet.t(binary())}
@@ -601,6 +601,31 @@ defmodule Ferricstore.Acl do
   def reset! do
     GenServer.call(__MODULE__, :reset)
   end
+
+  # ---------------------------------------------------------------------------
+  # Raft replication hook
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Handles ACL commands replicated through Raft.
+
+  Called by the state machine's `:server_command` clause on all nodes.
+  This ensures ACL mutations are applied consistently across the cluster.
+  """
+  @spec handle_raft_command(term()) :: term()
+  def handle_raft_command({:acl_setuser, username, rules}) do
+    set_user(username, rules)
+  end
+
+  def handle_raft_command({:acl_deluser, username}) do
+    del_user(username)
+  end
+
+  def handle_raft_command({:acl_reset}) do
+    reset!()
+  end
+
+  def handle_raft_command(_unknown), do: {:error, :unknown_acl_command}
 
   # ---------------------------------------------------------------------------
   # File persistence API (ACL SAVE / ACL LOAD)
@@ -681,18 +706,12 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.protected_mode?()
+      FerricstoreServer.Acl.protected_mode?()
       #=> true
   """
   @spec protected_mode?() :: boolean()
   def protected_mode? do
-    case Ferricstore.Mode.current() do
-      :embedded ->
-        Application.get_env(:ferricstore, :protected_mode, false)
-
-      :standalone ->
-        Application.get_env(:ferricstore, :protected_mode, true)
-    end
+    Application.get_env(:ferricstore, :protected_mode, false)
   end
 
   @doc """
@@ -704,7 +723,7 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.has_configured_users?()
+      FerricstoreServer.Acl.has_configured_users?()
       #=> false
   """
   @spec has_configured_users?() :: boolean()
@@ -727,10 +746,10 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.localhost?({{127, 0, 0, 1}, 12345})
+      FerricstoreServer.Acl.localhost?({{127, 0, 0, 1}, 12345})
       #=> true
 
-      Ferricstore.Acl.localhost?({{192, 168, 1, 1}, 12345})
+      FerricstoreServer.Acl.localhost?({{192, 168, 1, 1}, 12345})
       #=> false
   """
   @spec localhost?({:inet.ip_address(), :inet.port_number()} | nil) :: boolean()
@@ -757,10 +776,10 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.check_protected_mode({{127, 0, 0, 1}, 12345})
+      FerricstoreServer.Acl.check_protected_mode({{127, 0, 0, 1}, 12345})
       #=> :ok
 
-      Ferricstore.Acl.check_protected_mode({{192, 168, 1, 1}, 12345})
+      FerricstoreServer.Acl.check_protected_mode({{192, 168, 1, 1}, 12345})
       #=> {:error, "DENIED FerricStore is in protected mode..."}
   """
   @spec check_protected_mode({:inet.ip_address(), :inet.port_number()} | nil) ::
@@ -795,7 +814,7 @@ defmodule Ferricstore.Acl do
 
   ## Examples
 
-      Ferricstore.Acl.log_command_denied("alice", "SET", "127.0.0.1:1234", 42)
+      FerricstoreServer.Acl.log_command_denied("alice", "SET", "127.0.0.1:1234", 42)
   """
   @spec log_command_denied(binary(), binary(), binary(), term()) :: :ok
   def log_command_denied(username, command, client_ip, client_id) do

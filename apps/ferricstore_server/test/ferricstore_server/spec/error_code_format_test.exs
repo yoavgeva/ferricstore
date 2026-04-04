@@ -17,7 +17,7 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
 
   alias Ferricstore.Commands.{Dispatcher, Generic, Strings}
   alias Ferricstore.Config
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.MockStore
@@ -452,7 +452,7 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
       exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
       keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
       flush: fn ->
-        Enum.each(Router.keys(FerricStore.Instance.get(:default)), &Router.delete/1)
+        Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
         :ok
       end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
@@ -463,38 +463,38 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
       getdel: fn k -> Router.getdel(FerricStore.Instance.get(:default), k) end,
       getex: fn k, e -> Router.getex(FerricStore.Instance.get(:default), k, e) end,
       setrange: fn k, o, v -> Router.setrange(FerricStore.Instance.get(:default), k, o, v) end,
-      cas: fn k, e, n, t -> Router.cas(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), k, e, n, t) end,
-      lock: fn k, o, t -> Router.lock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), k, o, t) end,
-      unlock: fn k, o -> Router.unlock(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), k, o) end,
-      extend: fn k, o, t -> Router.extend(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), k, o, t) end,
-      ratelimit_add: fn k, w, m, c -> Router.ratelimit_add(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), k, w, m, c) end,
+      cas: fn k, e, n, t -> Router.cas(FerricStore.Instance.get(:default), k, e, n, t) end,
+      lock: fn k, o, t -> Router.lock(FerricStore.Instance.get(:default), k, o, t) end,
+      unlock: fn k, o -> Router.unlock(FerricStore.Instance.get(:default), k, o) end,
+      extend: fn k, o, t -> Router.extend(FerricStore.Instance.get(:default), k, o, t) end,
+      ratelimit_add: fn k, w, m, c -> Router.ratelimit_add(FerricStore.Instance.get(:default), k, w, m, c) end,
       list_op: fn k, op -> Router.list_op(FerricStore.Instance.get(:default), k, op) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:get, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:get_meta, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:put, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:delete, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:scan_prefix, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:count_prefix, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:delete_prefix, prefix})
       end
     }

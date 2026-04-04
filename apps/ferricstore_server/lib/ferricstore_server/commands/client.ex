@@ -1,5 +1,5 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
-defmodule Ferricstore.Commands.Client do
+defmodule FerricstoreServer.Commands.Client do
   @moduledoc """
   Handles Redis CLIENT subcommands: ID, SETNAME, GETNAME, INFO, LIST,
   TRACKING, CACHING, TRACKINGINFO, GETREDIR.
@@ -30,7 +30,7 @@ defmodule Ferricstore.Commands.Client do
     * `CLIENT GETREDIR` -- returns the redirect target client ID or 0
   """
 
-  alias Ferricstore.ClientTracking
+  alias FerricstoreServer.ClientTracking
 
   @doc """
   Handles a CLIENT subcommand.

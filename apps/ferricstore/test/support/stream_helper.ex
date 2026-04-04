@@ -78,13 +78,14 @@ defmodule Ferricstore.Jepsen.StreamHelper do
   """
   @spec exec(binary(), [binary()]) :: term()
   def exec(cmd, args) do
+    ctx = FerricStore.Instance.get(:default)
     store = %{
-      get: &Ferricstore.Store.Router.get/1,
-      get_meta: &Ferricstore.Store.Router.get_meta/1,
-      put: &Ferricstore.Store.Router.put/3,
-      delete: &Ferricstore.Store.Router.delete/1,
-      exists?: &Ferricstore.Store.Router.exists?/1,
-      keys: &Ferricstore.Store.Router.keys/0
+      get: fn k -> Ferricstore.Store.Router.get(ctx, k) end,
+      get_meta: fn k -> Ferricstore.Store.Router.get_meta(ctx, k) end,
+      put: fn k, v, e -> Ferricstore.Store.Router.put(ctx, k, v, e) end,
+      delete: fn k -> Ferricstore.Store.Router.delete(ctx, k) end,
+      exists?: fn k -> Ferricstore.Store.Router.exists?(ctx, k) end,
+      keys: fn -> Ferricstore.Store.Router.keys(ctx) end
     }
 
     Ferricstore.Commands.Stream.handle(cmd, args, store)

@@ -9,7 +9,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
   @moduletag timeout: 60_000
@@ -24,7 +24,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
     shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
 
     Enum.each(0..(shard_count - 1), fn i ->
-      name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i)
+      name = Router.shard_name(FerricStore.Instance.get(:default), i)
 
       Enum.find_value(1..50, fn _ ->
         pid = Process.whereis(name)
@@ -616,7 +616,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       # 513 MiB — over the 512 MiB guard.
       # Per spec section 4.6: "Connection is disconnected immediately after this error."
       oversized_value = :binary.copy("v", @max_value_bytes + 1)
-      :gen_tcp.send(sock, IO.iodata_to_binary(Ferricstore.Resp.Encoder.encode(["SET", "guard_key", oversized_value])))
+      :gen_tcp.send(sock, IO.iodata_to_binary(FerricstoreServer.Resp.Encoder.encode(["SET", "guard_key", oversized_value])))
       # Connection should close (TOOBIG disconnects)
       case :gen_tcp.recv(sock, 0, 10_000) do
         {:error, :closed} -> :ok
@@ -629,7 +629,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
     @tag :large_alloc
     test "MSET with oversized value disconnects (TOOBIG per spec)", %{sock: sock} do
       oversized_value = :binary.copy("v", @max_value_bytes + 1)
-      :gen_tcp.send(sock, IO.iodata_to_binary(Ferricstore.Resp.Encoder.encode(["MSET", "guard_key2", oversized_value])))
+      :gen_tcp.send(sock, IO.iodata_to_binary(FerricstoreServer.Resp.Encoder.encode(["MSET", "guard_key2", oversized_value])))
       case :gen_tcp.recv(sock, 0, 10_000) do
         {:error, :closed} -> :ok
         {:ok, data} ->

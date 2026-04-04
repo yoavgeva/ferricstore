@@ -1,9 +1,9 @@
-defmodule Ferricstore.Commands.ClientTest do
+defmodule FerricstoreServer.Commands.ClientTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.Client
-  alias Ferricstore.ClientTracking
+  alias FerricstoreServer.Commands.Client
+  alias FerricstoreServer.ClientTracking
   alias Ferricstore.Test.MockStore
 
   setup do

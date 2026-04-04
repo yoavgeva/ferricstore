@@ -90,20 +90,11 @@ defmodule Ferricstore.Commands.Server do
   # ---------------------------------------------------------------------------
 
   def handle("KEYS", [pattern], store) do
-    alias Ferricstore.Store.{CompoundKey, PrefixIndex}
+    alias Ferricstore.Store.CompoundKey
 
-    # Fast path: when the pattern is a simple 'prefix:*', use the prefix
-    # index for O(matching) lookup instead of scanning all keys.
-    case PrefixIndex.detect_prefix_pattern(pattern) do
-      {:prefix_match, prefix} when is_map_key(store, :keys_with_prefix) ->
-        store.keys_with_prefix.(prefix)
-        |> CompoundKey.user_visible_keys()
-
-      _ ->
-        store.keys.()
-        |> CompoundKey.user_visible_keys()
-        |> Enum.filter(&Ferricstore.GlobMatcher.match?(&1, pattern))
-    end
+    store.keys.()
+    |> CompoundKey.user_visible_keys()
+    |> Enum.filter(&Ferricstore.GlobMatcher.match?(&1, pattern))
   end
 
   def handle("KEYS", [], _store) do
@@ -356,14 +347,10 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("server", _store) do
-    mode = Ferricstore.Mode.current()
-
-    port =
-      if mode == :standalone do
-        Application.get_env(:ferricstore, :port, 6379)
-      else
-        0
-      end
+    ctx = FerricStore.Instance.get(:default)
+    info = if ctx.server_info_fn, do: ctx.server_info_fn.(), else: %{}
+    port = Map.get(info, :tcp_port, 0)
+    redis_mode = Map.get(info, :redis_mode, "embedded")
 
     uptime_seconds = Stats.uptime_seconds()
     uptime_days = div(uptime_seconds, 86_400)
@@ -375,7 +362,7 @@ defmodule Ferricstore.Commands.Server do
     fields = [
       {"redis_version", "7.4.0"},
       {"ferricstore_version", "0.1.0"},
-      {"redis_mode", Atom.to_string(mode)},
+      {"redis_mode", redis_mode},
       {"os", os_string},
       {"arch_bits", "64"},
       {"tcp_port", Integer.to_string(port)},
@@ -392,16 +379,8 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("clients", _store) do
-    connected =
-      if Ferricstore.Mode.standalone?() do
-        try do
-          :ranch.procs(FerricstoreServer.Listener, :connections) |> length()
-        rescue
-          _ -> 0
-        end
-      else
-        0
-      end
+    ctx = FerricStore.Instance.get(:default)
+    connected = if ctx.connected_clients_fn, do: ctx.connected_clients_fn.(), else: 0
 
     blocked = safe_ets_size(:ferricstore_waiters)
 
@@ -466,14 +445,48 @@ defmodule Ferricstore.Commands.Server do
 
   defp build_section("keyspace", store) do
     key_count = store.dbsize.()
-    # We do not track per-key expiry stats in aggregate, so expires=0 and avg_ttl=0.
-    line = "db0:keys=#{key_count},expires=0,avg_ttl=0"
+    ctx = try do FerricStore.Instance.get(:default) rescue _ -> nil end
+    {expires, avg_ttl} = if ctx, do: compute_expiry_stats(ctx), else: {0, 0}
 
     fields = [
-      {"db0", line}
+      {"db0", "keys=#{key_count},expires=#{expires},avg_ttl=#{avg_ttl}"}
     ]
 
     format_section("Keyspace", fields)
+  end
+
+  # Compute expires count and avg_ttl from ETS keydirs.
+  # Uses :ets.select_count for expires (O(n) at C level, no term creation)
+  # and samples up to 20 keys per shard for avg_ttl.
+  defp compute_expiry_stats(ctx) do
+    now = System.os_time(:millisecond)
+    count_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [true]}]
+    sample_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [:"$1"]}]
+
+    {total_expires, ttl_samples} =
+      for i <- 0..(ctx.shard_count - 1), reduce: {0, []} do
+        {exp_acc, ttl_acc} ->
+          keydir = elem(ctx.keydir_refs, i)
+          try do
+            count = :ets.select_count(keydir, count_spec)
+            samples = case :ets.select(keydir, sample_spec, 20) do
+              {results, _cont} -> results
+              :"$end_of_table" -> []
+            end
+            {exp_acc + count, samples ++ ttl_acc}
+          rescue
+            ArgumentError -> {exp_acc, ttl_acc}
+          end
+      end
+
+    avg_ttl = case ttl_samples do
+      [] -> 0
+      _ ->
+        remaining = Enum.map(ttl_samples, fn exp -> max(0, exp - now) end)
+        div(Enum.sum(remaining), length(remaining))
+    end
+
+    {total_expires, avg_ttl}
   end
 
   defp build_section("stats", _store) do
@@ -787,11 +800,12 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp safe_ets_size(table) do
-    try do
-      :ets.info(table, :size)
-    rescue
-      ArgumentError -> 0
+    case :ets.info(table, :size) do
+      :undefined -> 0
+      n -> n
     end
+  rescue
+    ArgumentError -> 0
   end
 
   defp format_float_field(val) do

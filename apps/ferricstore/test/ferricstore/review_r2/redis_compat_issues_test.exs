@@ -244,32 +244,23 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
     # Redis behavior: negative EXPIRE/PEXPIRE returns 0 and does NOT modify
     # the key. Zero EXPIRE/PEXPIRE deletes the key (returns 1 if existed).
 
-    test "EXPIRE with negative seconds returns error (Redis 7+)" do
+    test "EXPIRE with negative seconds deletes the key (Redis 7+)" do
       store = MockStore.make(%{"mykey" => {"myvalue", 0}})
 
       result = Expiry.handle("EXPIRE", ["mykey", "-1"], store)
 
-      assert {:error, msg} = result
-      assert msg =~ "invalid expire time"
+      # Redis 7+: negative EXPIRE deletes the key (returns 1 if existed)
+      assert result == 1
+      assert store.get.("mykey") == nil
     end
 
-    test "PEXPIRE with negative milliseconds returns error (Redis 7+)" do
+    test "PEXPIRE with negative milliseconds deletes the key (Redis 7+)" do
       store = MockStore.make(%{"mykey" => {"myvalue", 0}})
 
       result = Expiry.handle("PEXPIRE", ["mykey", "-1"], store)
 
-      assert {:error, msg} = result
-      assert msg =~ "invalid expire time"
-    end
-
-    test "EXPIRE with negative TTL should not delete the key" do
-      store = MockStore.make(%{"mykey" => {"myvalue", 0}})
-
-      Expiry.handle("EXPIRE", ["mykey", "-1"], store)
-
-      # Key should still exist — error doesn't modify state
-      assert store.get.("mykey") == "myvalue",
-             "R2-H8: EXPIRE -1 should not delete the key"
+      assert result == 1
+      assert store.get.("mykey") == nil
     end
   end
 
@@ -416,31 +407,31 @@ defmodule Ferricstore.ReviewR2.RedisCompatIssuesTest do
       getex: fn k, e -> Router.getex(FerricStore.Instance.get(:default), k, e) end,
       setrange: fn k, o, v -> Router.setrange(FerricStore.Instance.get(:default), k, o, v) end,
       compound_get: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get, redis_key, compound_key})
       end,
       compound_get_meta: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn redis_key, compound_key ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_delete, redis_key, compound_key})
       end,
       compound_scan: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_scan, redis_key, prefix})
       end,
       compound_count: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_count, redis_key, prefix})
       end,
       compound_delete_prefix: fn redis_key, prefix ->
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), redis_key))
         GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
       end
     }

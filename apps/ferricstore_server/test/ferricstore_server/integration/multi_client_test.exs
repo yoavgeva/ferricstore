@@ -2,7 +2,7 @@ defmodule FerricstoreServer.Integration.MultiClientTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------

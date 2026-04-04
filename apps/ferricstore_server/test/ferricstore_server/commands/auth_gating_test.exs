@@ -9,7 +9,7 @@ defmodule FerricstoreServer.Commands.AuthGatingTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Config
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
 
   # Reset requirepass after each test to avoid contaminating other tests.

@@ -1,4 +1,4 @@
-defmodule Ferricstore.Resp.Parser do
+defmodule FerricstoreServer.Resp.Parser do
   @moduledoc """
   Pure binary state-machine parser for the RESP3 protocol.
 
@@ -45,13 +45,13 @@ defmodule Ferricstore.Resp.Parser do
 
   ## Examples
 
-      iex> Ferricstore.Resp.Parser.parse("+OK\\r\\n")
+      iex> FerricstoreServer.Resp.Parser.parse("+OK\\r\\n")
       {:ok, [{:simple, "OK"}], ""}
 
-      iex> Ferricstore.Resp.Parser.parse(":42\\r\\n:99\\r\\n")
+      iex> FerricstoreServer.Resp.Parser.parse(":42\\r\\n:99\\r\\n")
       {:ok, [42, 99], ""}
 
-      iex> Ferricstore.Resp.Parser.parse(":42\\r\\n:99\\r")
+      iex> FerricstoreServer.Resp.Parser.parse(":42\\r\\n:99\\r")
       {:ok, [42], ":99\\r"}
   """
 
@@ -116,13 +116,13 @@ defmodule Ferricstore.Resp.Parser do
 
   ## Examples
 
-      iex> Ferricstore.Resp.Parser.parse("+OK\\r\\n")
+      iex> FerricstoreServer.Resp.Parser.parse("+OK\\r\\n")
       {:ok, [{:simple, "OK"}], ""}
 
-      iex> Ferricstore.Resp.Parser.parse("PING\\r\\n")
+      iex> FerricstoreServer.Resp.Parser.parse("PING\\r\\n")
       {:ok, [{:inline, ["PING"]}], ""}
 
-      iex> Ferricstore.Resp.Parser.parse("+OK\\r")
+      iex> FerricstoreServer.Resp.Parser.parse("+OK\\r")
       {:ok, [], "+OK\\r"}
   """
   @spec parse(binary()) :: parse_result()

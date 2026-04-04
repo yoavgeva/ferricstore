@@ -75,7 +75,6 @@ defmodule Ferricstore.ReviewR4.D14StaleActiveFileTest do
         active_file_id: 1,
         active_file_path: "/tmp/test/00001.log",
         ets: :test_ets,
-        prefix_keys: :test_prefix
       }
 
       state = Ferricstore.Raft.StateMachine.init(config)

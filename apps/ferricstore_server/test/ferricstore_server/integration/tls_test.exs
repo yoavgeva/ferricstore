@@ -14,7 +14,7 @@ defmodule FerricstoreServer.Integration.TlsTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.TlsListener
   alias Ferricstore.Test.TlsCertHelper
 

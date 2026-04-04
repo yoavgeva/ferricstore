@@ -209,7 +209,6 @@ defmodule FerricStore do
       if the key did not exist).
     * `:keepttl` - Retain the existing TTL associated with the key instead of
       clearing it. Mutually exclusive with `:ttl`, `:exat`, `:pxat`.
-    * `:cache` - Named cache instance (default: the default cache).
 
   ## Examples
 
@@ -245,7 +244,7 @@ defmodule FerricStore do
   @spec set(key(), value(), set_opts()) :: :ok | {:ok, value() | nil} | nil | {:error, binary()}
   def set(key, value, opts \\ []) do
     max_value_size =
-      Application.get_env(:ferricstore, :max_value_size, Ferricstore.Resp.Parser.default_max_value_size())
+      Application.get_env(:ferricstore, :max_value_size, 1_048_576)
 
     if is_binary(value) and byte_size(value) > max_value_size do
       {:error, "ERR value too large (#{byte_size(value)} bytes, max #{max_value_size} bytes)"}
@@ -311,10 +310,6 @@ defmodule FerricStore do
   Returns `{:ok, value}` if the key exists and has not expired, or `{:ok, nil}`
   if the key does not exist or has expired.
 
-  ## Options
-
-    * `:cache` - Named cache instance (default: the default cache).
-
   ## Examples
 
       iex> FerricStore.set("user:42:name", "alice")
@@ -327,14 +322,9 @@ defmodule FerricStore do
 
   """
   @spec get(key(), get_opts()) :: {:ok, value() | nil}
-  def get(key, opts \\ []) do
+  def get(key, _opts \\ []) do
     ctx = default_ctx()
-    _cache = Keyword.get(opts, :cache)
-
-    result =
-      Router.get(ctx, key)
-
-    {:ok, result}
+    {:ok, Router.get(ctx, key)}
   end
 
   @doc """
@@ -1690,8 +1680,6 @@ defmodule FerricStore do
           :exit, _ -> :ok
         end
       end)
-
-      try do :ets.delete_all_objects(:"prefix_keys_#{i}") catch :error, :badarg -> :ok end
 
       # Clear probabilistic structure registries for this shard.
       # These are local mmap handles / NIF resources not managed by Raft.

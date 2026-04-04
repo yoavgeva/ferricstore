@@ -61,4 +61,32 @@ defmodule FerricstoreServer.Listener do
   def stop do
     :ranch.stop_listener(@listener_ref)
   end
+
+  @doc "Returns true if the Ranch TCP listener is currently running."
+  @spec running?() :: boolean()
+  def running? do
+    match?({:ok, _}, try_port())
+  end
+
+  @doc """
+  Ensures the listener is running. If it was stopped (e.g. by a test),
+  restarts it on an ephemeral port. No-op if already running.
+  """
+  @spec ensure_started() :: :ok
+  def ensure_started do
+    unless running?() do
+      case start(0) do
+        {:ok, _} -> :ok
+        {:error, {:already_started, _}} -> :ok
+      end
+    end
+
+    :ok
+  end
+
+  defp try_port do
+    {:ok, :ranch.get_port(@listener_ref)}
+  rescue
+    ArgumentError -> :error
+  end
 end

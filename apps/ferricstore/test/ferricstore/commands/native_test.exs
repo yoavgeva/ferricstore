@@ -415,12 +415,7 @@ defmodule Ferricstore.Commands.NativeTest do
       assert [0, 0] == Dispatcher.dispatch("WAITAOF", ["0", "0", "100"], dummy_store())
     end
 
-    test "CLIENT is routed through dispatch_client (not dispatch)" do
-      # CLIENT is handled in connection.ex via dispatch_client/3, not dispatch/3.
-      conn_state = %{client_id: 1, client_name: nil, created_at: 0, peer: nil}
-      {result, _updated} = Dispatcher.dispatch_client(["GETNAME"], conn_state, dummy_store())
-      assert result == nil || is_binary(result)
-    end
+    # CLIENT commands moved to FerricstoreServer.Commands.Client (server app)
 
     test "DEBUG is routed through dispatcher" do
       assert :ok = Dispatcher.dispatch("DEBUG", ["RELOAD"], dummy_store())

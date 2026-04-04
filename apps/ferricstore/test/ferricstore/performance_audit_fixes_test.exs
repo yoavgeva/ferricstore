@@ -131,16 +131,16 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
       for i <- 0..(shard_count - 1) do
         expected = :"Ferricstore.Store.Shard.#{i}"
-        assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i) == expected
+        assert Router.shard_name(FerricStore.Instance.get(:default), i) == expected
       end
     end
 
     test "shard_name is fast (no string interpolation overhead)" do
       # Just verify functional correctness - the perf improvement is structural
-      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0) == :"Ferricstore.Store.Shard.0"
-      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 1) == :"Ferricstore.Store.Shard.1"
-      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 2) == :"Ferricstore.Store.Shard.2"
-      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 3) == :"Ferricstore.Store.Shard.3"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 0) == :"Ferricstore.Store.Shard.0"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 1) == :"Ferricstore.Store.Shard.1"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 2) == :"Ferricstore.Store.Shard.2"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 3) == :"Ferricstore.Store.Shard.3"
     end
 
     test "routing works correctly with pre-computed names" do
@@ -179,11 +179,11 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
   # M-C1: Prefix-based ETS lookups instead of foldl
   # ---------------------------------------------------------------
 
-  describe "M-C1: Prefix-based lookups use prefix_keys index" do
-    test "compound_scan uses prefix index instead of foldl" do
+  describe "M-C1: Prefix-based lookups use ETS match specs" do
+    test "compound_scan uses ETS prefix match instead of foldl" do
       # Create a hash with some fields
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "myhash")
-      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
 
       # Use compound_put to create hash fields
       prefix = "H:myhash\0"
@@ -199,9 +199,9 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       assert fields == ["field1", "field2", "field3"]
     end
 
-    test "compound_count uses prefix index instead of foldl" do
+    test "compound_count uses ETS prefix match instead of foldl" do
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "counthash")
-      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
 
       prefix = "H:counthash\0"
       GenServer.call(shard, {:compound_put, "counthash", prefix <> "a", "1", 0})
@@ -214,7 +214,7 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
 
     test "compound_delete_prefix works with prefix index" do
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "delhash")
-      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
+      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
 
       prefix = "H:delhash\0"
       GenServer.call(shard, {:compound_put, "delhash", prefix <> "x", "1", 0})

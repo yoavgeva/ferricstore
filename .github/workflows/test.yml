@@ -125,6 +125,22 @@ jobs:
         if: always() && runner.os == 'Linux' && steps.uring.outputs.available == 'true'
         run: mix test apps/ferricstore/test --only linux_io_uring
 
+      - name: Upload JUnit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}-elixir${{ matrix.elixir }}
+          path: test-results/
+          retention-days: 14
+
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: "Tests (${{ matrix.os }}, Elixir ${{ matrix.elixir }})"
+          path: "test-results/**/test-results.xml"
+          reporter: java-junit
+
       - name: Upload test audit logs
         if: always()
         uses: actions/upload-artifact@v4

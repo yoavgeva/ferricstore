@@ -5,7 +5,7 @@ defmodule Ferricstore.Commands.ServerStubsTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Client, Server}
+  alias Ferricstore.Commands.Server
   alias Ferricstore.Test.MockStore
 
   # ===========================================================================
@@ -175,72 +175,5 @@ defmodule Ferricstore.Commands.ServerStubsTest do
     end
   end
 
-  # ===========================================================================
-  # CLIENT subcommands
-  # ===========================================================================
-
-  describe "CLIENT KILL" do
-    test "returns OK" do
-      assert {:ok, _} = Client.handle("KILL", ["127.0.0.1:1234"], %{}, MockStore.make())
-    end
-
-    test "returns OK with no additional args" do
-      assert {:ok, _} = Client.handle("KILL", [], %{}, MockStore.make())
-    end
-  end
-
-  describe "CLIENT PAUSE" do
-    test "returns OK with timeout" do
-      assert {:ok, _} = Client.handle("PAUSE", ["1000"], %{}, MockStore.make())
-    end
-
-    test "returns OK with no timeout" do
-      assert {:ok, _} = Client.handle("PAUSE", [], %{}, MockStore.make())
-    end
-  end
-
-  describe "CLIENT UNPAUSE" do
-    test "returns OK" do
-      assert {:ok, _} = Client.handle("UNPAUSE", [], %{}, MockStore.make())
-    end
-  end
-
-  describe "CLIENT NO-EVICT" do
-    test "returns OK with ON" do
-      assert {:ok, _} = Client.handle("NO-EVICT", ["ON"], %{}, MockStore.make())
-    end
-
-    test "returns OK with OFF" do
-      assert {:ok, _} = Client.handle("NO-EVICT", ["OFF"], %{}, MockStore.make())
-    end
-
-    test "returns error with invalid flag" do
-      assert {{:error, _}, _} = Client.handle("NO-EVICT", ["MAYBE"], %{}, MockStore.make())
-    end
-  end
-
-  describe "CLIENT NO-TOUCH" do
-    test "returns OK with ON" do
-      assert {:ok, _} = Client.handle("NO-TOUCH", ["ON"], %{}, MockStore.make())
-    end
-
-    test "returns OK with OFF" do
-      assert {:ok, _} = Client.handle("NO-TOUCH", ["OFF"], %{}, MockStore.make())
-    end
-
-    test "returns error with invalid flag" do
-      assert {{:error, _}, _} = Client.handle("NO-TOUCH", ["MAYBE"], %{}, MockStore.make())
-    end
-  end
-
-  describe "CLIENT unknown subcommand" do
-    test "returns error for unknown subcommand" do
-      assert {{:error, msg}, _} = Client.handle("UNKNOWN", [], %{}, MockStore.make())
-      assert msg =~ "unknown subcommand"
-    end
-
-    test "returns error with no args" do
-      assert {{:error, _}, _} = Client.handle("", [], %{}, MockStore.make())
-    end
-  end
+  # CLIENT subcommands moved to apps/ferricstore_server/test/ferricstore_server/commands/client_test.exs
 end

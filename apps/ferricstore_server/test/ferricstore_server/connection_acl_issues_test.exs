@@ -1,4 +1,4 @@
-defmodule Ferricstore.ReviewR2.ConnectionAclIssuesTest do
+defmodule FerricstoreServer.ConnectionAclIssuesTest do
   @moduledoc """
   Regression tests for issues found in code review R2.
 
@@ -15,7 +15,7 @@ defmodule Ferricstore.ReviewR2.ConnectionAclIssuesTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Acl
+  alias FerricstoreServer.Acl
 
   # ---------------------------------------------------------------------------
   # R2-C1: Deleted user ACL cache becomes nil, granting full access

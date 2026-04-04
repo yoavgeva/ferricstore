@@ -1,7 +1,7 @@
-defmodule Ferricstore.Resp.ParserTest do
+defmodule FerricstoreServer.Resp.ParserTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Resp.Parser
+  alias FerricstoreServer.Resp.Parser
 
   # ---------------------------------------------------------------------------
   # Simple string (+)

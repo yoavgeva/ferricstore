@@ -61,7 +61,7 @@ defmodule FerricstoreServer.ShutdownTest do
   describe "shard not alive after stop" do
     @tag :capture_log
     test "killing a shard makes it temporarily unregistered" do
-      name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0)
+      name = Router.shard_name(FerricStore.Instance.get(:default), 0)
       old_pid = Process.whereis(name)
       assert is_pid(old_pid) and Process.alive?(old_pid)
 
@@ -79,7 +79,7 @@ defmodule FerricstoreServer.ShutdownTest do
 
     @tag :capture_log
     test "stopped shard is restarted by supervisor with a new PID" do
-      name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 1)
+      name = Router.shard_name(FerricStore.Instance.get(:default), 1)
       old_pid = Process.whereis(name)
       ref = Process.monitor(old_pid)
       Process.exit(old_pid, :kill)
@@ -108,7 +108,7 @@ defmodule FerricstoreServer.ShutdownTest do
 
       # Explicitly flush to ensure pending async writes hit disk.
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_idx)
+      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
       :ok = GenServer.call(shard_name, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
 

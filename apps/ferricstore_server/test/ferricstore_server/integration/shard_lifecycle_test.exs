@@ -20,7 +20,7 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
 
   alias Ferricstore.Store.Router
   alias Ferricstore.Commands.Expiry
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
   alias Ferricstore.Test.ShardHelpers
 
@@ -46,11 +46,11 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
   defp ukey(base), do: "slc_#{base}_#{:rand.uniform(9_999_999)}"
 
   defp shard_pid(index) do
-    Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), index))
+    Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), index))
   end
 
   defp shard_index_for(key), do: Router.shard_for(FerricStore.Instance.get(:default), key)
-  defp shard_name_for(key), do: Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), shard_index_for(key))
+  defp shard_name_for(key), do: Router.shard_name(FerricStore.Instance.get(:default), shard_index_for(key))
   defp shard_pid_for(key), do: Process.whereis(shard_name_for(key))
 
   # Builds a store map backed by the real Router (application-supervised shards).
@@ -93,7 +93,7 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
   # Kills a shard by index, waits for DOWN, then waits for the supervisor
   # to restart it. Returns the new PID.
   defp kill_and_wait_restart(index) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), index)
+    name = Router.shard_name(FerricStore.Instance.get(:default), index)
     old_pid = Process.whereis(name)
     ref = Process.monitor(old_pid)
     Process.exit(old_pid, :kill)
@@ -199,7 +199,7 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       assert new_pid != old_pid,
              "New shard PID should differ from old PID after restart"
 
-      assert Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0)) == new_pid,
+      assert Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), 0)) == new_pid,
              "Shard 0 should be re-registered under its canonical name"
     end
 
@@ -283,7 +283,7 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
       assert result in [:ok, :exit_caught]
 
       # After restart is complete, writes should succeed
-      _new_pid = wait_for_new_pid(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0), old_pid)
+      _new_pid = wait_for_new_pid(Router.shard_name(FerricStore.Instance.get(:default), 0), old_pid)
       ShardHelpers.wait_shards_alive()
       ShardHelpers.eventually(fn ->
         Router.put(FerricStore.Instance.get(:default), k, "after_restart", 0) == :ok

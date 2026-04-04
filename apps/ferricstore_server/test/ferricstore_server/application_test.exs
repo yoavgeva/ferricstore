@@ -199,11 +199,11 @@ defmodule FerricstoreServer.ApplicationTest do
       port = Listener.port()
       {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 1000)
 
-      ping = IO.iodata_to_binary(Ferricstore.Resp.Encoder.encode(["PING"]))
+      ping = IO.iodata_to_binary(FerricstoreServer.Resp.Encoder.encode(["PING"]))
       :ok = :gen_tcp.send(sock, ping)
 
       {:ok, data} = :gen_tcp.recv(sock, 0, 2000)
-      {:ok, [response], _} = Ferricstore.Resp.Parser.parse(data)
+      {:ok, [response], _} = FerricstoreServer.Resp.Parser.parse(data)
 
       assert response == {:simple, "PONG"}
       :gen_tcp.close(sock)
@@ -215,16 +215,16 @@ defmodule FerricstoreServer.ApplicationTest do
 
       key = "app_test_#{:rand.uniform(9_999_999)}"
 
-      set_cmd = IO.iodata_to_binary(Ferricstore.Resp.Encoder.encode(["SET", key, "hello"]))
+      set_cmd = IO.iodata_to_binary(FerricstoreServer.Resp.Encoder.encode(["SET", key, "hello"]))
       :ok = :gen_tcp.send(sock, set_cmd)
       {:ok, set_data} = :gen_tcp.recv(sock, 0, 2000)
-      {:ok, [set_resp], _} = Ferricstore.Resp.Parser.parse(set_data)
+      {:ok, [set_resp], _} = FerricstoreServer.Resp.Parser.parse(set_data)
       assert set_resp == {:simple, "OK"}
 
-      get_cmd = IO.iodata_to_binary(Ferricstore.Resp.Encoder.encode(["GET", key]))
+      get_cmd = IO.iodata_to_binary(FerricstoreServer.Resp.Encoder.encode(["GET", key]))
       :ok = :gen_tcp.send(sock, get_cmd)
       {:ok, get_data} = :gen_tcp.recv(sock, 0, 2000)
-      {:ok, [get_resp], _} = Ferricstore.Resp.Parser.parse(get_data)
+      {:ok, [get_resp], _} = FerricstoreServer.Resp.Parser.parse(get_data)
       assert get_resp == "hello"
 
       :gen_tcp.close(sock)
@@ -284,10 +284,10 @@ defmodule FerricstoreServer.ApplicationTest do
 
       port = Listener.port()
       {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 1000)
-      ping = IO.iodata_to_binary(Ferricstore.Resp.Encoder.encode(["PING"]))
+      ping = IO.iodata_to_binary(FerricstoreServer.Resp.Encoder.encode(["PING"]))
       :ok = :gen_tcp.send(sock, ping)
       {:ok, data} = :gen_tcp.recv(sock, 0, 2000)
-      {:ok, [response], _} = Ferricstore.Resp.Parser.parse(data)
+      {:ok, [response], _} = FerricstoreServer.Resp.Parser.parse(data)
       assert response == {:simple, "PONG"}
       :gen_tcp.close(sock)
     end

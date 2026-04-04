@@ -28,8 +28,8 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Resp.Encoder
-  alias Ferricstore.Resp.Parser
+  alias FerricstoreServer.Resp.Encoder
+  alias FerricstoreServer.Resp.Parser
   alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------

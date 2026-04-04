@@ -87,7 +87,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       {src, dst} = cross_shard_keys()
 
       # Create source set
-      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
+      shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
       GenServer.call(shard, {:tx_execute, [{"SADD", [src, "a", "b"]}], nil}, 10_000)
 
       # Two sequential SMOVE (concurrent is hard to guarantee without races)
@@ -102,7 +102,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
       [src_members] = GenServer.call(shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
       assert src_members == [] or src_members == nil
 
-      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
+      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
       [dst_members] = GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
       assert "a" in dst_members
       assert "b" in dst_members
@@ -170,7 +170,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
         NamespaceConfig.set("quorumns", "durability", "quorum")
 
         # Set up source
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
         GenServer.call(shard, {:tx_execute, [{"SADD", [src, "member"]}], nil}, 10_000)
 
         result = Set.handle("SMOVE", [src, dst, "member"], %{})
@@ -189,7 +189,7 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
         NamespaceConfig.set("asyncns", "durability", "async")
         NamespaceConfig.set("quorumns", "durability", "quorum")
 
-        shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
+        shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
         GenServer.call(shard, {:tx_execute, [{"SADD", [src, "member"]}], nil}, 10_000)
 
         result = Set.handle("SMOVE", [src, dst, "member"], %{})

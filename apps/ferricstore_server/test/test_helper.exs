@@ -4,5 +4,5 @@
 # while shards are still running, causing cascading failures in subsequent apps.
 ExUnit.start(
   exclude: [:bench, :linux_io_uring, :large_alloc, :cluster, :jepsen, :shard_kill, :compaction, :conn_lifecycle, :concurrency],
-  formatters: [ExUnit.CLIFormatter, Ferricstore.Test.AuditFormatter]
+  formatters: [ExUnit.CLIFormatter, JUnitFormatter, Ferricstore.Test.AuditFormatter]
 )

@@ -115,15 +115,6 @@ defmodule Ferricstore.Test.ShardHelpers do
         ArgumentError -> :ok
       end
 
-      # Also clear the prefix index bag table. Without this, stale
-      # {prefix, key} entries accumulate across tests and cause
-      # keys_for_prefix to return duplicates for keys that were
-      # deleted from the keydir but not untracked from the prefix bag.
-      try do
-        :ets.delete_all_objects(:"prefix_keys_#{i}")
-      rescue
-        ArgumentError -> :ok
-      end
     end)
   end
 

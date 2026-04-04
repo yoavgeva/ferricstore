@@ -25,7 +25,7 @@ defmodule FerricstoreServer.Spec.PerformanceContractsTest do
   @moduletag :bench
   @moduletag timeout: 120_000
 
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

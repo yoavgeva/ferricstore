@@ -5,7 +5,6 @@ defmodule Ferricstore.Commands.List do
 
   alias Ferricstore.CrossShardOp
   alias Ferricstore.Store.{ListOps, TypeRegistry}
-  alias Ferricstore.Waiters
 
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
@@ -13,7 +12,7 @@ defmodule Ferricstore.Commands.List do
   def handle("LPUSH", [key | elements], store) when elements != [] do
     with :ok <- TypeRegistry.check_or_set(key, :list, store) do
       result = ListOps.execute(key, store, {:lpush, elements})
-      if is_integer(result) and result > 0, do: Waiters.notify_push(key)
+      if is_integer(result) and result > 0, do: if(on_push = store[:on_push], do: on_push.(key))
       result
     end
   end
@@ -22,7 +21,7 @@ defmodule Ferricstore.Commands.List do
   def handle("RPUSH", [key | elements], store) when elements != [] do
     with :ok <- TypeRegistry.check_or_set(key, :list, store) do
       result = ListOps.execute(key, store, {:rpush, elements})
-      if is_integer(result) and result > 0, do: Waiters.notify_push(key)
+      if is_integer(result) and result > 0, do: if(on_push = store[:on_push], do: on_push.(key))
       result
     end
   end

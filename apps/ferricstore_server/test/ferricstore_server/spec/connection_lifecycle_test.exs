@@ -12,7 +12,7 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
   @moduletag :conn_lifecycle
 
   alias Ferricstore.Config
-  alias Ferricstore.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias Ferricstore.Test.ShardHelpers
   alias FerricstoreServer.Listener
 

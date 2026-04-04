@@ -16,8 +16,8 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Resp.Encoder
-  alias Ferricstore.Resp.Parser
+  alias FerricstoreServer.Resp.Encoder
+  alias FerricstoreServer.Resp.Parser
   alias FerricstoreServer.Listener
   alias Ferricstore.Test.ShardHelpers
 

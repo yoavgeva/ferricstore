@@ -95,7 +95,7 @@ defmodule Ferricstore.Test.AuditFormatter do
   end
 
   defp ets_snapshot(shard_count) do
-    Enum.reduce(0..(shard_count - 1), {0, 0}, fn i, {ets_acc, prefix_acc} ->
+    Enum.reduce(0..(shard_count - 1), {0, 0}, fn i, {ets_acc, _prefix_acc} ->
       ets =
         try do
           :ets.info(:"keydir_#{i}", :size)
@@ -103,14 +103,7 @@ defmodule Ferricstore.Test.AuditFormatter do
           _ -> 0
         end
 
-      prefix =
-        try do
-          :ets.info(:"prefix_keys_#{i}", :size)
-        rescue
-          _ -> 0
-        end
-
-      {ets_acc + (ets || 0), prefix_acc + (prefix || 0)}
+      {ets_acc + (ets || 0), 0}
     end)
   end
 

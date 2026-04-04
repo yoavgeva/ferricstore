@@ -19,7 +19,7 @@ defmodule Ferricstore.Store.Router do
   """
 
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{LFU, PrefixIndex}
+  alias Ferricstore.Store.LFU
 
   import Bitwise, only: [band: 2]
 
@@ -33,8 +33,6 @@ defmodule Ferricstore.Store.Router do
   def resolve_shard(ctx, idx), do: elem(ctx.shard_names, idx)
   @doc false
   def resolve_keydir(ctx, idx), do: elem(ctx.keydir_refs, idx)
-  @doc false
-  def resolve_prefix_table(ctx, idx), do: elem(ctx.prefix_table_refs, idx)
   @doc false
   def effective_shard_count(ctx), do: ctx.shard_count
 
@@ -215,7 +213,6 @@ defmodule Ferricstore.Store.Router do
         if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
     end
     disk_value = to_disk_binary(value)
-    PrefixIndex.track(elem(ctx.prefix_table_refs, idx), key, idx)
     {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
 
     if value_for_ets == nil do
@@ -253,7 +250,6 @@ defmodule Ferricstore.Store.Router do
     else
       keydir = elem(ctx.keydir_refs, idx)
       :ets.delete(keydir, key)
-      PrefixIndex.untrack(elem(ctx.prefix_table_refs, idx), key, idx)
 
       {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
       Ferricstore.Store.BitcaskWriter.delete(idx, file_path, key)
@@ -919,11 +915,19 @@ defmodule Ferricstore.Store.Router do
   end
 
   @doc """
-  Routes a probabilistic data structure write command through Raft.
+  Submits a server command through Raft for replication to all nodes.
 
-  Extracts the key from the command tuple and dispatches to raft_write
-  with the appropriate shard index. Supports both quorum and async
-  durability modes.
+  Server commands are opaque to the library — the state machine dispatches
+  them via the `raft_apply_hook` callback on the Instance struct. Routed
+  through shard 0 for consistent ordering.
+  """
+  @spec server_command(FerricStore.Instance.t(), term()) :: term()
+  def server_command(ctx, command) do
+    raft_write(ctx, 0, "__server__", {:server_command, command})
+  end
+
+  @doc """
+  Routes a probabilistic data structure write command through Raft.
   """
   @spec prob_write(FerricStore.Instance.t(), tuple()) :: term()
   def prob_write(ctx, command) do
@@ -1066,21 +1070,6 @@ defmodule Ferricstore.Store.Router do
     sc = ctx.shard_count
     Enum.flat_map(0..(sc - 1), fn i ->
       GenServer.call(resolve_shard(ctx, i), :keys)
-    end)
-  end
-
-  @doc """
-  Returns all live keys that have the given prefix (text before the first `:`).
-
-  Uses the per-shard prefix index for O(matching) lookup instead of scanning
-  all keys. This is the fast path for `SCAN MATCH 'prefix:*'` and
-  `KEYS 'prefix:*'`.
-  """
-  @spec keys_with_prefix(FerricStore.Instance.t(), binary()) :: [binary()]
-  def keys_with_prefix(ctx, prefix) when is_binary(prefix) do
-    sc = ctx.shard_count
-    Enum.flat_map(0..(sc - 1), fn i ->
-      GenServer.call(resolve_shard(ctx, i), {:keys_with_prefix, prefix})
     end)
   end
 

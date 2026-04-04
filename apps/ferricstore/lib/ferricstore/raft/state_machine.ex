@@ -64,7 +64,7 @@ defmodule Ferricstore.Raft.StateMachine do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.HLC
-  alias Ferricstore.Store.{BitcaskWriter, LFU, ListOps, PrefixIndex, Router, ValueCodec}
+  alias Ferricstore.Store.{BitcaskWriter, LFU, ListOps, Router, ValueCodec}
 
   @default_release_cursor_interval 20_000
 
@@ -116,7 +116,6 @@ defmodule Ferricstore.Raft.StateMachine do
       active_file_path: config.active_file_path,
       ets: config.ets,
       data_dir: Map.get(config, :data_dir, Path.dirname(config.shard_data_path)),
-      prefix_keys: Map.get(config, :prefix_keys, PrefixIndex.table_name(config.shard_index)),
       instance_ctx: Map.get(config, :instance_ctx),
       applied_count: 0,
       release_cursor_interval: interval,
@@ -699,6 +698,25 @@ defmodule Ferricstore.Raft.StateMachine do
   # ensures follower HLCs stay synchronized with the leader.
   # ---------------------------------------------------------------------------
 
+  # Generic server command hook — allows server apps to replicate their own
+  # commands through Raft without the library knowing what they are.
+  # The server registers a raft_apply_hook callback on the Instance struct.
+  def apply(meta, {:server_command, command}, state) do
+    hook =
+      case state.instance_ctx do
+        %{raft_apply_hook: fun} when is_function(fun) -> fun
+        _ ->
+          try do
+            FerricStore.Instance.get(:default).raft_apply_hook
+          rescue
+            _ -> nil
+          end
+      end
+
+    result = if hook, do: hook.(command), else: {:error, :no_hook}
+    bump_applied(meta, state, result)
+  end
+
   def apply(meta, {inner_command, %{hlc_ts: remote_ts}}, state) when is_tuple(inner_command) do
     merge_hlc(remote_ts)
     __MODULE__.apply(meta, inner_command, state)
@@ -857,7 +875,6 @@ defmodule Ferricstore.Raft.StateMachine do
       if shard_idx == anchor_state.shard_index do
         %{
           keydir: anchor_state.ets,
-          prefix_keys: anchor_state.prefix_keys,
           index: shard_idx,
           shard_data_path: anchor_state.shard_data_path,
           active_file_path: anchor_state.active_file_path,
@@ -874,16 +891,8 @@ defmodule Ferricstore.Raft.StateMachine do
             :"keydir_#{shard_idx}"
           end
 
-        prefix_keys =
-          if instance_ctx do
-            elem(instance_ctx.prefix_table_refs, shard_idx)
-          else
-            PrefixIndex.table_name(shard_idx)
-          end
-
         %{
           keydir: keydir,
-          prefix_keys: prefix_keys,
           index: shard_idx,
           shard_data_path: shard_data_path,
           active_file_path: file_path,
@@ -895,11 +904,6 @@ defmodule Ferricstore.Raft.StateMachine do
       value_for = value_for_ets(value)
       disk_val = to_disk_binary(value)
       :ets.insert(ctx.keydir, {key, value_for, expire_at_ms, LFU.initial(), 0, 0, 0})
-      try do
-        PrefixIndex.track(ctx.prefix_keys, key, ctx.index)
-      rescue
-        ArgumentError -> :ok
-      end
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
       if MapSet.member?(deleted, key) do
         Process.put(:tx_deleted_keys, MapSet.delete(deleted, key))
@@ -918,11 +922,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
     local_delete = fn key ->
       :ets.delete(ctx.keydir, key)
-      try do
-        PrefixIndex.untrack(ctx.prefix_keys, key, ctx.index)
-      rescue
-        ArgumentError -> :ok
-      end
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
       Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
       # Write tombstone via BitcaskWriter to ensure ordering
@@ -1494,8 +1493,6 @@ defmodule Ferricstore.Raft.StateMachine do
       {key, ets_val, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_val)}
     )
 
-    sm_prefix_track(state, key)
-
     # Accumulate for batch disk write — flushed by flush_pending_writes
     # at the end of apply/3 before returning to ra.
     pending = Process.get(:sm_pending_writes, [])
@@ -1562,7 +1559,6 @@ defmodule Ferricstore.Raft.StateMachine do
     case NIF.v2_append_tombstone(state.active_file_path, key) do
       {:ok, _} ->
         :ets.delete(state.ets, key)
-        sm_prefix_untrack(state, key)
         :ok
 
       {:error, reason} ->
@@ -1588,25 +1584,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
       _ ->
         :ok
-    end
-  end
-
-  # Tracks a key in the prefix index. Safe to call even if the prefix_keys
-  # table does not exist yet (during state machine init before the shard
-  # has fully started).
-  defp sm_prefix_track(%{prefix_keys: table, shard_index: idx}, key) do
-    try do
-      PrefixIndex.track(table, key, idx)
-    rescue
-      ArgumentError -> :ok
-    end
-  end
-
-  defp sm_prefix_untrack(%{prefix_keys: table, shard_index: idx}, key) do
-    try do
-      PrefixIndex.untrack(table, key, idx)
-    rescue
-      ArgumentError -> :ok
     end
   end
 
@@ -2051,7 +2028,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
       [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
         :ets.delete(state.ets, key)
-        sm_prefix_untrack(state, key)
         :expired
 
       [] ->

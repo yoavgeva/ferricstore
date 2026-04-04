@@ -89,7 +89,6 @@ defmodule Ferricstore.Test.IsolatedInstance do
     # Delete ETS tables
     for i <- 0..(ctx.shard_count - 1) do
       try do :ets.delete(elem(ctx.keydir_refs, i)) rescue _ -> :ok end
-      try do :ets.delete(elem(ctx.prefix_table_refs, i)) rescue _ -> :ok end
     end
 
     try do :ets.delete(ctx.hotness_table) rescue _ -> :ok end

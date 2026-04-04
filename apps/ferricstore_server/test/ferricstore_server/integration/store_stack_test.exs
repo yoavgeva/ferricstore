@@ -48,7 +48,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
 
   # Returns the PID of the shard GenServer that owns `key`.
   defp shard_pid_for(key) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
+    name = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), key))
     Process.whereis(name)
   end
 
@@ -128,7 +128,7 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
 
       # Verify every key is retrievable through shard GenServer calls
       for i <- 0..3 do
-        shard_keys = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i), :keys)
+        shard_keys = GenServer.call(Router.shard_name(FerricStore.Instance.get(:default), i), :keys)
         matching = Enum.filter(keys, fn k -> k in shard_keys end)
 
         for k <- matching do

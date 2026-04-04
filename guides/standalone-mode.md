@@ -48,6 +48,13 @@ config :ferricstore, :max_memory_bytes, 8_589_934_592  # 8 GB
 config :ferricstore, :eviction_policy, :allkeys_lru
 ```
 
+The server's `runtime.exs` also sets `protected_mode: true`, which prevents destructive operations (like `FLUSHALL`) from being executed without authentication. This defaults to `false` in the library and is only enabled by the server:
+
+```elixir
+# config/runtime.exs (in ferricstore_server)
+config :ferricstore, :protected_mode, true
+```
+
 ## Connecting
 
 ### redis-cli

@@ -38,7 +38,7 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.shard_for(FerricStore.Instance.get(:default), src) == Router.shard_for(FerricStore.Instance.get(:default), dst)
 
       # Create source set with members via tx_execute (writes to ETS directly)
-      shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
+      shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
       [sadd_result] =
         GenServer.call(shard, {:tx_execute, [{"SADD", [src, "a", "b", "c"]}], nil}, 10_000)
 
@@ -80,7 +80,7 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.shard_for(FerricStore.Instance.get(:default), src) != Router.shard_for(FerricStore.Instance.get(:default), dst)
 
       # Create source set via its shard
-      src_shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
+      src_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
       GenServer.call(src_shard, {:tx_execute, [{"SADD", [src, "x", "y"]}], nil}, 10_000)
 
       # Call SMOVE directly -- the handler calls CrossShardOp.execute internally
@@ -92,7 +92,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [src_members] =
         GenServer.call(src_shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
 
-      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
+      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
 
       [dst_members] =
         GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
@@ -454,7 +454,7 @@ defmodule Ferricstore.CrossShardOpTest do
       assert Router.shard_for(FerricStore.Instance.get(:default), src) != Router.shard_for(FerricStore.Instance.get(:default), dst)
 
       # Create source set
-      src_shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
+      src_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), src))
       GenServer.call(src_shard, {:tx_execute, [{"SADD", [src, "member1"]}], nil}, 10_000)
 
       # Call SMOVE directly -- handler uses CrossShardOp internally
@@ -465,7 +465,7 @@ defmodule Ferricstore.CrossShardOpTest do
       [src_members] =
         GenServer.call(src_shard, {:tx_execute, [{"SMEMBERS", [src]}], nil}, 10_000)
 
-      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
+      dst_shard = Router.shard_name(FerricStore.Instance.get(:default), Router.shard_for(FerricStore.Instance.get(:default), dst))
       [dst_members] =
         GenServer.call(dst_shard, {:tx_execute, [{"SMEMBERS", [dst]}], nil}, 10_000)
 

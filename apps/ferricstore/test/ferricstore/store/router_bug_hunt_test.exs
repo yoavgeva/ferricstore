@@ -63,7 +63,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
   # Kills a shard by index, waits for supervisor to restart it, returns {old_pid, new_pid}.
   defp kill_and_wait_restart(index) do
-    name = Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), index)
+    name = Router.shard_name(FerricStore.Instance.get(:default), index)
     old_pid = Process.whereis(name)
     ref = Process.monitor(old_pid)
     Process.exit(old_pid, :kill)
@@ -184,11 +184,11 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
     test "returns nil and does not crash the shard process" do
       key = ukey("safe_miss")
       idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx))
+      pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
 
       assert nil == Router.get(FerricStore.Instance.get(:default), key)
 
-      pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx))
+      pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
       assert pid_before == pid_after, "Shard should not have crashed on get-miss"
     end
   end
@@ -205,11 +205,11 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
     test "returns :ok and does not crash the shard process" do
       key = ukey("safe_delete")
       idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx))
+      pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
 
       assert :ok = Router.delete(FerricStore.Instance.get(:default), key)
 
-      pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx))
+      pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
       assert pid_before == pid_after, "Shard should not have crashed on delete-miss"
     end
 
@@ -470,7 +470,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
       key = ukey("conc_rw")
       Router.put(FerricStore.Instance.get(:default), key, "initial")
 
-      pids_before = for i <- 0..3, do: {i, Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i))}
+      pids_before = for i <- 0..3, do: {i, Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), i))}
 
       tasks =
         for i <- 1..20 do
@@ -487,7 +487,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
 
       # All shards should still be alive with the same PIDs.
       for {i, old_pid} <- pids_before do
-        current_pid = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i))
+        current_pid = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), i))
 
         assert current_pid == old_pid,
                "Shard #{i} should not have crashed during concurrent read/write"
@@ -527,12 +527,12 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
     test "does not crash the shard on non-integer incr" do
       key = ukey("incr_safe")
       idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx))
+      pid_before = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
 
       Router.put(FerricStore.Instance.get(:default), key, "hello")
       {:error, _} = Router.incr(FerricStore.Instance.get(:default), key, 1)
 
-      pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), idx))
+      pid_after = Process.whereis(Router.shard_name(FerricStore.Instance.get(:default), idx))
 
       assert pid_before == pid_after,
              "Shard should not crash on incr of non-integer value"

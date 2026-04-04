@@ -1,4 +1,4 @@
-defmodule Ferricstore.Resp.RespEdgeCasesTest do
+defmodule FerricstoreServer.Resp.RespEdgeCasesTest do
   @moduledoc """
   Comprehensive edge case tests for the RESP3 parser and encoder.
 
@@ -9,8 +9,8 @@ defmodule Ferricstore.Resp.RespEdgeCasesTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Resp.Parser
-  alias Ferricstore.Resp.Encoder
+  alias FerricstoreServer.Resp.Parser
+  alias FerricstoreServer.Resp.Encoder
 
   # Helper to flatten iodata for assertion
   defp to_bin(iodata), do: IO.iodata_to_binary(iodata)

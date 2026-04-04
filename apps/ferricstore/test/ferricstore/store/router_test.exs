@@ -45,17 +45,17 @@ defmodule Ferricstore.Store.RouterTest do
 
   describe "shard_name/1" do
     test "returns unique atoms per index" do
-      names = Enum.map(0..3, fn i -> Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), i) end)
+      names = Enum.map(0..3, fn i -> Router.shard_name(FerricStore.Instance.get(:default), i) end)
       assert length(Enum.uniq(names)) == 4
     end
 
     test "returns atoms" do
-      assert is_atom(Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0))
+      assert is_atom(Router.shard_name(FerricStore.Instance.get(:default), 0))
     end
 
     test "returns expected format" do
-      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 0) == :"Ferricstore.Store.Shard.0"
-      assert Router.shard_name(FerricStore.Instance.get(:default), FerricStore.Instance.get(:default), 7) == :"Ferricstore.Store.Shard.7"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 0) == :"Ferricstore.Store.Shard.0"
+      assert Router.shard_name(FerricStore.Instance.get(:default), 3) == :"Ferricstore.Store.Shard.3"
     end
   end
 end
