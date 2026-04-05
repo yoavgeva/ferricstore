@@ -499,10 +499,10 @@ defmodule Ferricstore.Commands.Server do
     rescue
       ArgumentError -> 100
     end
-    hot_sampled = Stats.total_hot_reads()
-    cold_sampled = Stats.total_cold_reads()
-    hits_sampled = Stats.keyspace_hits()
-    misses = Stats.keyspace_misses()
+    hot_sampled = Stats.total_hot_reads(FerricStore.Instance.get(:default))
+    cold_sampled = Stats.total_cold_reads(FerricStore.Instance.get(:default))
+    hits_sampled = Stats.keyspace_hits(FerricStore.Instance.get(:default))
+    misses = Stats.keyspace_misses(FerricStore.Instance.get(:default))
 
     # Estimated actuals: sampled counters × sample rate
     hot_est = hot_sampled * rate
@@ -522,8 +522,8 @@ defmodule Ferricstore.Commands.Server do
       {"cold_reads", Integer.to_string(cold_est)},
       {"hot_cache_hit_ratio", format_float_field(hot_pct)},
       {"read_sample_rate", "1:#{rate}"},
-      {"expired_keys", Integer.to_string(Stats.expired_keys())},
-      {"evicted_keys", Integer.to_string(Stats.evicted_keys())}
+      {"expired_keys", Integer.to_string(Stats.expired_keys(FerricStore.Instance.get(:default)))},
+      {"evicted_keys", Integer.to_string(Stats.evicted_keys(FerricStore.Instance.get(:default)))}
     ]
 
     format_section("Stats", fields)

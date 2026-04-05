@@ -115,8 +115,8 @@ defmodule Ferricstore.Commands.Cluster do
     entries = Stats.hotness_top(top_n)
 
     header = [
-      "hot_reads", Integer.to_string(Stats.total_hot_reads()),
-      "cold_reads", Integer.to_string(Stats.total_cold_reads()),
+      "hot_reads", Integer.to_string(Stats.total_hot_reads(FerricStore.Instance.get(:default))),
+      "cold_reads", Integer.to_string(Stats.total_cold_reads(FerricStore.Instance.get(:default))),
       "hot_read_pct", format_pct(Stats.hot_read_pct()),
       "cold_reads_per_second", format_pct(Stats.cold_reads_per_second()),
       "top_n", Integer.to_string(top_n)

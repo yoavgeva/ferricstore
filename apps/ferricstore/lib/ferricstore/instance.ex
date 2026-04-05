@@ -111,7 +111,7 @@ defmodule FerricStore.Instance do
           try_get_pt(:ferricstore_pressure_flags, fn -> :atomics.new(3, signed: false) end),
           try_get_pt(:ferricstore_disk_pressure, fn -> :atomics.new(shard_count, signed: false) end),
           try_get_pt(:ferricstore_write_versions, fn -> :counters.new(shard_count, [:write_concurrency]) end),
-          try_get_pt(:ferricstore_stats_counter_ref, fn -> :counters.new(10, [:atomics]) end)
+          :counters.new(10, [:atomics])
         }
       else
         {
