@@ -45,6 +45,8 @@ defmodule Ferricstore.Store.Shard do
   alias Ferricstore.Store.{LFU, Router, ValueCodec}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+  alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
+  alias Ferricstore.Store.Shard.Reads, as: ShardReads
 
   require Logger
 
@@ -160,7 +162,7 @@ defmodule Ferricstore.Store.Shard do
     File.mkdir_p!(path)
 
     # v2: scan data_dir for existing .log files, find highest file_id
-    {active_file_id, active_file_size} = discover_active_file(path)
+    {active_file_id, active_file_size} = ShardLifecycle.discover_active_file(path)
     active_file_path = file_path(path, active_file_id)
 
     # Ensure the active file exists (touch it)
@@ -198,12 +200,12 @@ defmodule Ferricstore.Store.Shard do
     # replay and start from nil instead of the correct prior value.
     # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
     # Must run BEFORE recover_promoted so PM: markers are in ETS.
-    recover_keydir(path, keydir, index)
+    ShardLifecycle.recover_keydir(path, keydir, index)
 
     # Start the Raft server for this shard (unless explicitly disabled).
     raft? =
       if Keyword.get(opts, :raft_enabled, true) do
-        start_raft_if_available(index, path, active_file_id, active_file_path, ets)
+        ShardLifecycle.start_raft_if_available(index, path, active_file_id, active_file_path, ets)
       else
         false
       end
@@ -214,7 +216,7 @@ defmodule Ferricstore.Store.Shard do
     # Migrate existing prob files: scan prob dir for files without
     # corresponding metadata markers in the keydir. Write markers so
     # DEL can clean up prob files and BF.INFO/CMS.INFO can recover metadata.
-    migrate_prob_files(path, keydir, index)
+    ShardLifecycle.migrate_prob_files(path, keydir, index)
 
     # Publish active file metadata to ActiveFile registry
     Ferricstore.Store.ActiveFile.publish(index, active_file_id, active_file_path, path)
@@ -233,8 +235,8 @@ defmodule Ferricstore.Store.Shard do
     }
 
     schedule_flush(flush_ms)
-    schedule_expiry_sweep()
-    schedule_frag_check()
+    ShardLifecycle.schedule_expiry_sweep()
+    ShardLifecycle.schedule_frag_check()
     max_file_size = if ctx, do: ctx.max_active_file_size, else: @default_max_active_file_size
 
     {:ok, %__MODULE__{ets: keydir, keydir: keydir,
@@ -253,129 +255,6 @@ defmodule Ferricstore.Store.Shard do
      {:continue, {:flush_interval, flush_ms}}}
   end
 
-  # Scans the shard data directory for .log files and returns
-  # {highest_file_id, file_size_of_highest}. Starts at 0 if no files exist.
-  # Uses a single Enum.reduce pass instead of filter + map + max to avoid
-  # creating intermediate lists (perf audit L5).
-  defp discover_active_file(shard_path) do
-    case File.ls(shard_path) do
-      {:ok, files} ->
-        # Clean up leftover compaction temp files from a previous crash.
-        # These are always incomplete — if compaction had finished, the
-        # rename would have replaced the original and the temp is gone.
-        Enum.each(files, fn name ->
-          if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
-            File.rm(Path.join(shard_path, name))
-            Logger.warning("Shard: removed leftover compaction temp file #{name}")
-          end
-        end)
-
-        max_id =
-          Enum.reduce(files, -1, fn name, best ->
-            if String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_") do
-              id = name |> String.trim_trailing(".log") |> String.to_integer()
-              max(id, best)
-            else
-              best
-            end
-          end)
-
-        if max_id < 0 do
-          {0, 0}
-        else
-          size = File.stat!(file_path(shard_path, max_id)).size
-          {max_id, size}
-        end
-
-      {:error, _} ->
-        {0, 0}
-    end
-  end
-
-  # Recovers the ETS keydir from hint files or by scanning log files.
-  # Uses last-writer-wins semantics (higher file_id + higher offset wins).
-  defp recover_keydir(shard_path, keydir, shard_index) do
-    case File.ls(shard_path) do
-      {:ok, files} ->
-        log_files =
-          files
-          |> Enum.filter(&String.ends_with?(&1, ".log"))
-          |> Enum.sort()
-
-        Logger.debug("Shard #{shard_index}: recover_keydir scanning #{length(log_files)} log file(s) at #{shard_path}")
-
-        # Try hint files first for faster recovery
-        hint_files =
-          files
-          |> Enum.filter(&String.ends_with?(&1, ".hint"))
-          |> Enum.sort()
-
-        if hint_files != [] do
-          # Recover from hint files
-          Enum.each(hint_files, fn hint_name ->
-            hint_path = Path.join(shard_path, hint_name)
-            fid = hint_name |> String.trim_trailing(".hint") |> String.to_integer()
-
-            case NIF.v2_read_hint_file(hint_path) do
-              {:ok, entries} ->
-                # NIF returns: {key, file_id, offset, value_size, expire_at_ms}
-                Enum.each(entries, fn {key, _file_id, offset, value_size, expire_at_ms} ->
-                  :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
-                end)
-              _ -> :ok
-            end
-          end)
-
-          # Scan any log files that don't have corresponding hints (e.g. the active file)
-          hinted_ids = MapSet.new(hint_files, fn name ->
-            name |> String.trim_trailing(".hint") |> String.to_integer()
-          end)
-
-          unhinted_logs = Enum.reject(log_files, fn name ->
-            fid = name |> String.trim_trailing(".log") |> String.to_integer()
-            MapSet.member?(hinted_ids, fid)
-          end)
-
-          Enum.each(unhinted_logs, fn log_name ->
-            recover_from_log(shard_path, log_name, keydir, shard_index)
-          end)
-        else
-          # No hint files -- full scan of all log files
-          Enum.each(log_files, fn log_name ->
-            recover_from_log(shard_path, log_name, keydir, shard_index)
-          end)
-        end
-
-      {:error, reason} ->
-        Logger.warning("Shard #{shard_index}: recover_keydir failed to list #{shard_path}: #{inspect(reason)}")
-    end
-
-    ets_size = :ets.info(keydir, :size)
-    # Log recovered keys for debugging (only first 10 to avoid log spam)
-    sample_keys = :ets.tab2list(keydir) |> Enum.take(10) |> Enum.map(fn {k, _v, _e, _l, fid, off, vs} -> "#{k}(fid=#{inspect(fid)},off=#{off},vs=#{vs})" end)
-    Logger.debug("Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}, keys: #{inspect(sample_keys)}")
-  end
-
-  defp recover_from_log(shard_path, log_name, keydir, _shard_index) do
-    log_path = Path.join(shard_path, log_name)
-    fid = log_name |> String.trim_trailing(".log") |> String.to_integer()
-
-    # v2_scan_file returns {:ok, [{key, offset, value_size, expire_at_ms, is_tombstone}, ...]}
-    case NIF.v2_scan_file(log_path) do
-      {:ok, records} ->
-        Enum.each(records, fn {key, offset, value_size, expire_at_ms, is_tombstone} ->
-          if is_tombstone do
-            :ets.delete(keydir, key)
-          else
-            :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
-          end
-        end)
-
-      _ ->
-        :ok
-    end
-  end
-
   defp file_path(shard_path, file_id), do: ShardETS.file_path(shard_path, file_id)
 
   @impl true
@@ -386,91 +265,12 @@ defmodule Ferricstore.Store.Shard do
   end
 
   @impl true
-  def handle_call({:get, key}, _from, state) do
-    # Fast path: ETS hit — no need to wait for in-flight writes.
-    case ets_lookup(state, key) do
-      {:hit, value, _expire_at_ms} ->
-        {:reply, value, state}
+  def handle_call({:get, key}, _from, state), do: ShardReads.handle_get(key, state)
 
-      :expired ->
-        {:reply, nil, state}
-
-      {:cold, fid, off, _vsize, exp} ->
-        # Cold key — value evicted from ETS but disk location known.
-        # Use synchronous pread (v2_pread_at_async NIF not yet available).
-        state = await_in_flight(state)
-        state = flush_pending_sync(state)
-        p = file_path(state.shard_data_path, fid)
-
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
-            cold_read_warm_ets(state, key, value, exp, fid, off, byte_size(value))
-            {:reply, value, state}
-
-          _ ->
-            {:reply, nil, state}
-        end
-
-      :miss ->
-        # Key not in ETS at all — it doesn't exist.
-        {:reply, nil, state}
-    end
-  end
-
-  # Returns {file_path, value_offset, value_size} for sendfile optimization,
-  # or nil if the key is not found / expired / only in ETS (hot cache).
-  # The offset stored in ETS is the RECORD offset (start of header).
-  # For sendfile, we need the VALUE offset = record_offset + 26 (header) + key_len.
   @bitcask_header_size 26
-  def handle_call({:get_file_ref, key}, _from, state) do
-    case ets_lookup(state, key) do
-      {:hit, _value, _expire_at_ms} ->
-        # Key is hot (in ETS). The value may not yet be flushed to disk,
-        # so we cannot safely sendfile. Return nil to fall back to normal path.
-        {:reply, nil, state}
+  def handle_call({:get_file_ref, key}, _from, state), do: ShardReads.handle_get_file_ref(key, state)
 
-      :expired ->
-        {:reply, nil, state}
-
-      {:cold, fid, off, vsize, _exp} ->
-        # Cold key — location known from ETS 7-tuple.
-        # Adjust offset to skip header and key bytes to get to the value.
-        p = file_path(state.shard_data_path, fid)
-        value_offset = off + @bitcask_header_size + byte_size(key)
-        {:reply, {p, value_offset, vsize}, state}
-
-      :miss ->
-        {:reply, nil, state}
-    end
-  end
-
-  def handle_call({:get_meta, key}, _from, state) do
-    case ets_lookup(state, key) do
-      {:hit, value, expire_at_ms} ->
-        {:reply, {value, expire_at_ms}, state}
-
-      :expired ->
-        {:reply, nil, state}
-
-      {:cold, fid, off, _vsize, exp} ->
-        # Cold key — use synchronous pread (v2_pread_at_async NIF not yet available).
-        state = await_in_flight(state)
-        state = flush_pending_sync(state)
-        p = file_path(state.shard_data_path, fid)
-
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
-            cold_read_warm_ets(state, key, value, exp, fid, off, byte_size(value))
-            {:reply, {value, exp}, state}
-
-          _ ->
-            {:reply, nil, state}
-        end
-
-      :miss ->
-        {:reply, nil, state}
-    end
-  end
+  def handle_call({:get_meta, key}, _from, state), do: ShardReads.handle_get_meta(key, state)
 
   # Compound key scan: returns all live entries matching a prefix.
   # Used by HSCAN, SSCAN, ZSCAN via the compound_scan store callback.
@@ -2407,32 +2207,9 @@ defmodule Ferricstore.Store.Shard do
     {:reply, result, state}
   end
 
-  def handle_call({:exists, key}, _from, state) do
-    # For ETS misses we need Bitcask to be up to date — flush first.
-    case ets_lookup(state, key) do
-      {:hit, _value, _expire_at_ms} ->
-        {:reply, true, state}
+  def handle_call({:exists, key}, _from, state), do: ShardReads.handle_exists(key, state)
 
-      {:cold, _fid, _off, _vsize, _exp} ->
-        # Cold key — value evicted from RAM but key exists on disk.
-        {:reply, true, state}
-
-      :expired ->
-        {:reply, false, state}
-
-      :miss ->
-        state = await_in_flight(state)
-        state = flush_pending_sync(state)
-        {:reply, do_get(state, key) != nil, state}
-    end
-  end
-
-  def handle_call(:keys, _from, state) do
-    # Flush first so NIF.keys() sees all pending writes.
-    state = await_in_flight(state)
-    state = flush_pending_sync(state)
-    {:reply, live_keys(state), state}
-  end
+  def handle_call(:keys, _from, state), do: ShardReads.handle_keys(state)
 
   # Merge-related calls: delegate to NIF and return results directly.
 
@@ -2656,7 +2433,7 @@ defmodule Ferricstore.Store.Shard do
   # Synchronous expiry sweep — used by tests to trigger a sweep and wait for
   # completion before making assertions.
   def handle_call(:expiry_sweep, _from, state) do
-    state = do_expiry_sweep(state)
+    state = ShardLifecycle.do_expiry_sweep(state)
     {:reply, :ok, state}
   end
 
@@ -2694,7 +2471,7 @@ defmodule Ferricstore.Store.Shard do
     end
 
     state = maybe_notify_fragmentation(state)
-    schedule_frag_check()
+    ShardLifecycle.schedule_frag_check()
     {:noreply, state}
   end
 
@@ -2704,8 +2481,8 @@ defmodule Ferricstore.Store.Shard do
   # and shrink the heap. This reclaims memory accumulated during busy periods
   # on idle shards (memory audit L1).
   def handle_info(:expiry_sweep, state) do
-    state = do_expiry_sweep(state)
-    schedule_expiry_sweep()
+    state = ShardLifecycle.do_expiry_sweep(state)
+    ShardLifecycle.schedule_expiry_sweep()
 
     if state.sweep_at_ceiling_count == 0 and
          state.pending == [] and
@@ -2828,41 +2605,7 @@ defmodule Ferricstore.Store.Shard do
   # -------------------------------------------------------------------
 
   @impl true
-  def terminate(_reason, state) do
-    t0 = System.monotonic_time(:microsecond)
-
-    # Step 1: drain any in-flight async flush and flush remaining pending
-    # writes synchronously to guarantee all data hits disk before exit.
-    state = await_in_flight(state)
-    state = flush_pending_sync(state)
-
-    t_flush = System.monotonic_time(:microsecond)
-
-    # Step 2: write v2 hint file for the active file so the next startup
-    # can rebuild the keydir from hints instead of replaying the full log.
-    write_hint_for_file(state, state.active_file_id)
-    NIF.v2_fsync(state.active_file_path)
-
-    t_hint = System.monotonic_time(:microsecond)
-
-    # Step 3: emit shutdown telemetry for operator visibility.
-    :telemetry.execute(
-      [:ferricstore, :shard, :shutdown],
-      %{
-        flush_duration_us: t_flush - t0,
-        hint_duration_us: t_hint - t_flush,
-        total_duration_us: t_hint - t0
-      },
-      %{shard_index: state.index}
-    )
-
-    Logger.info(
-      "Shard #{state.index}: shutdown complete " <>
-        "(flush=#{t_flush - t0}us, hint=#{t_hint - t_flush}us)"
-    )
-
-    :ok
-  end
+  def terminate(reason, state), do: ShardLifecycle.do_terminate(reason, state)
 
   # -------------------------------------------------------------------
   # Private: flush
@@ -2879,85 +2622,16 @@ defmodule Ferricstore.Store.Shard do
   defp schedule_flush(ms), do: ShardFlush.schedule_flush(ms)
 
   # -------------------------------------------------------------------
-  # Private: read helpers
+  # Private: read helpers (delegates to Shard.Reads)
   # -------------------------------------------------------------------
-
-  # v2 local read for transaction closures. Returns {:ok, value} or {:ok, nil}.
-  # Replaces NIF.get_zero_copy(state.store, key) in the 2PC local store.
-  defp v2_local_read(state, key) do
-    case :ets.lookup(state.keydir, key) do
-      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil ->
-        {:ok, value}
-
-      [{^key, nil, _exp, _lfu, :pending, _off, _vsize}] ->
-        # Not yet flushed to disk — should never reach here. If it does,
-        # it means ets_lookup_warm failed to catch the :pending sentinel.
-        {:error, "ERR internal: pending entry reached cold read path for #{inspect(key)}"}
-
-      [{^key, nil, _exp, _lfu, fid, off, _vsize}] ->
-        # Cold key -- pread from disk
-        p = file_path(state.shard_data_path, fid)
-        NIF.v2_pread_at(p, off)
-
-      _ ->
-        {:ok, nil}
-    end
-  end
 
   # Alias for compound key reads — same logic as do_get since compound keys
   # are stored as regular ETS/Bitcask entries.
   defp do_compound_get(state, compound_key), do: do_get(state, compound_key)
 
-  defp do_get(state, key) do
-    case ets_lookup(state, key) do
-      {:hit, value, _expire_at_ms} ->
-        value
+  defp do_get(state, key), do: ShardReads.do_get(state, key)
 
-      {:cold, fid, off, vsize, exp} ->
-        # Zero-copy cold read via v2 pread (ResourceBinary).
-        p = file_path(state.shard_data_path, fid)
-
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
-            cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
-            value
-
-          _ ->
-            nil
-        end
-
-      :expired ->
-        nil
-
-      :miss ->
-        nil
-    end
-  end
-
-  defp do_get_meta(state, key) do
-    case ets_lookup(state, key) do
-      {:hit, value, expire_at_ms} ->
-        {value, expire_at_ms}
-
-      {:cold, fid, off, vsize, exp} ->
-        p = file_path(state.shard_data_path, fid)
-
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
-            cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
-            {value, exp}
-
-          _ ->
-            nil
-        end
-
-      :expired ->
-        nil
-
-      :miss ->
-        nil
-    end
-  end
+  defp do_get_meta(state, key), do: ShardReads.do_get_meta(state, key)
 
   # Inserts a key/value/expiry into the single keydir table with LFU counter
   # and v2 disk location fields, and updates the prefix index.
@@ -2994,21 +2668,7 @@ defmodule Ferricstore.Store.Shard do
 
   defp warm_from_store(state, key), do: ShardETS.warm_from_store(state, key)
 
-  # Synchronous local read from disk for use inside handle_call (avoids
-  # GenServer.call deadlock). Returns {:ok, value}, {:ok, nil}, or :error.
-  defp v2_local_read(state, key) do
-    case :ets.lookup(state.keydir, key) do
-      [{^key, nil, _exp, _lfu, fid, off, _vsize}] ->
-        p = file_path(state.shard_data_path, fid)
-        NIF.v2_pread_at(p, off)
-
-      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] when value != nil ->
-        {:ok, value}
-
-      _ ->
-        {:ok, nil}
-    end
-  end
+  defp v2_local_read(state, key), do: ShardReads.v2_local_read(state, key)
 
   defp cold_read_warm_ets(state, key, value),
     do: ShardETS.cold_read_warm_ets(state, key, value)
@@ -3018,21 +2678,7 @@ defmodule Ferricstore.Store.Shard do
 
   defp warm_meta_from_store(state, key), do: ShardETS.warm_meta_from_store(state, key)
 
-  defp live_keys(state) do
-    now = System.os_time(:millisecond)
-
-    :ets.foldl(
-      fn {key, _value, exp, _lfu, _fid, _off, _vsize}, acc ->
-        if exp == 0 or exp > now do
-          [key | acc]
-        else
-          acc
-        end
-      end,
-      [],
-      state.keydir
-    )
-  end
+  defp live_keys(state), do: ShardReads.live_keys(state)
 
   # -------------------------------------------------------------------
   # Private: integer / float parsing — delegates to shared ValueCodec
@@ -3075,103 +2721,6 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # -------------------------------------------------------------------
-  # Private: active expiry sweep
-  # -------------------------------------------------------------------
-
-  # Number of consecutive ceiling-hit sweeps before emitting the
-  # :expiry_struggling telemetry event.
-  @struggling_threshold 3
-
-  # Performs a single expiry sweep pass: scans ETS for up to `max_keys`
-  # expired entries, deletes them from ETS, and purges expired entries
-  # from the Bitcask store. Tracks consecutive ceiling-hit sweeps and
-  # emits telemetry when the sweep is struggling or recovers.
-  defp do_expiry_sweep(state) do
-    now = System.os_time(:millisecond)
-    max_keys = Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
-    expired_keys = scan_expired(state.keydir, now, max_keys)
-
-    count = length(expired_keys)
-
-    if count > 0 do
-      # v2: write tombstones for expired keys and remove from ETS
-      Enum.each(expired_keys, fn key ->
-        case NIF.v2_append_tombstone(state.active_file_path, key) do
-          {:ok, _} ->
-            ets_delete_key(state, key)
-
-          {:error, reason} ->
-            Logger.warning("Shard #{state.index}: tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}")
-        end
-      end)
-      if state.instance_ctx do
-        Ferricstore.Stats.incr_expired_keys(state.instance_ctx, count)
-      else
-        Ferricstore.Stats.incr_expired_keys(count)
-      end
-
-      require Logger
-      Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")
-    end
-
-    # Track whether the sweep hit the ceiling (removed exactly max_keys).
-    hit_ceiling = count >= max_keys and count > 0
-
-    {new_ceiling_count, new_struggling} =
-      if hit_ceiling do
-        new_count = state.sweep_at_ceiling_count + 1
-
-        if new_count >= @struggling_threshold and not state.sweep_struggling do
-          :telemetry.execute(
-            [:ferricstore, :expiry, :struggling],
-            %{shard_index: state.index, consecutive_ceiling_sweeps: new_count, max_keys_per_sweep: max_keys},
-            %{}
-          )
-
-          {new_count, true}
-        else
-          {new_count, state.sweep_struggling}
-        end
-      else
-        if state.sweep_struggling do
-          :telemetry.execute(
-            [:ferricstore, :expiry, :recovered],
-            %{shard_index: state.index, previous_ceiling_sweeps: state.sweep_at_ceiling_count},
-            %{}
-          )
-        end
-
-        {0, false}
-      end
-
-    %{state | sweep_at_ceiling_count: new_ceiling_count, sweep_struggling: new_struggling}
-  end
-
-  defp scan_expired(keydir, now, limit) do
-    # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
-    # Match entries where expire_at_ms > 0 and expire_at_ms <= now
-    match_spec = [
-      {{:"$1", :_, :"$2", :_, :_, :_, :_},
-       [{:andalso, {:>, :"$2", 0}, {:"=<", :"$2", now}}],
-       [:"$1"]}
-    ]
-
-    case :ets.select(keydir, match_spec, limit) do
-      {keys, _continuation} -> keys
-      :"$end_of_table" -> []
-    end
-  end
-
-  defp schedule_expiry_sweep do
-    interval = Application.get_env(:ferricstore, :expiry_sweep_interval_ms, @default_sweep_interval_ms)
-    Process.send_after(self(), :expiry_sweep, interval)
-  end
-
-  defp schedule_frag_check do
-    interval = Application.get_env(:ferricstore, :frag_check_interval_ms, @default_frag_check_interval_ms)
-    Process.send_after(self(), :frag_check, interval)
-  end
 
   # --- Native command helpers ---
 
@@ -3583,159 +3132,5 @@ defmodule Ferricstore.Store.Shard do
     Ferricstore.Raft.Batcher.write_async(index, command, from)
   end
 
-  # Returns true if this shard has a pre-existing Batcher process (started by
-  # Application.start for shards 0..N-1). If so, also starts the ra server
-  # for this shard. Isolated test shards with ad-hoc indices won't have a
-  # Batcher and fall back to the direct write path.
-  defp start_raft_if_available(index, shard_data_path, active_file_id, active_file_path, ets) do
-    batcher_name = Ferricstore.Raft.Batcher.batcher_name(index)
-
-    if Process.whereis(batcher_name) != nil do
-      try do
-        Ferricstore.Raft.Cluster.start_shard_server(index, shard_data_path, active_file_id, active_file_path, ets)
-        true
-      catch
-        _, _ -> false
-      end
-    else
-      false
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Prob file migration (Phase 8: backward compatibility)
-  #
-  # Scans the prob directory for existing .bloom/.cms/.cuckoo/.topk files
-  # that were created before Raft replication was added. For each file
-  # without a corresponding metadata entry in the keydir (ETS), writes a
-  # metadata marker so DEL can clean up the file and INFO commands can
-  # recover parameters.
-  #
-  # Old files used sanitized key filenames (non-alnum → _). New files use
-  # Base64 URL-safe encoding. This migration handles both conventions.
-  # ---------------------------------------------------------------------------
-
-  defp migrate_prob_files(shard_data_path, keydir, _index) do
-    prob_dir = Path.join(shard_data_path, "prob")
-
-    case File.ls(prob_dir) do
-      {:ok, files} ->
-        migrated =
-          Enum.reduce(files, 0, fn filename, count ->
-            migrate_prob_file(prob_dir, filename, keydir, count)
-          end)
-
-        if migrated > 0 do
-          Logger.info("Shard: migrated #{migrated} existing prob file(s) to Raft metadata")
-        end
-
-      {:error, :enoent} ->
-        :ok
-    end
-  end
-
-  defp migrate_prob_file(prob_dir, filename, keydir, count) do
-    path = Path.join(prob_dir, filename)
-
-    cond do
-      String.ends_with?(filename, ".bloom") ->
-        key = filename |> String.trim_trailing(".bloom")
-        migrate_if_missing(keydir, key, path, :bloom_meta, count)
-
-      String.ends_with?(filename, ".cms") ->
-        key = filename |> String.trim_trailing(".cms")
-        migrate_if_missing(keydir, key, path, :cms_meta, count)
-
-      String.ends_with?(filename, ".cuckoo") ->
-        key = filename |> String.trim_trailing(".cuckoo")
-        migrate_if_missing(keydir, key, path, :cuckoo_meta, count)
-
-      String.ends_with?(filename, ".topk") ->
-        key = filename |> String.trim_trailing(".topk")
-        migrate_if_missing(keydir, key, path, :topk_meta, count)
-
-      true ->
-        count
-    end
-  end
-
-  # Writes a metadata marker into ETS if the key doesn't already have one.
-  # The key in the filename may be Base64-encoded (new) or sanitized (old).
-  # We try to decode as Base64 first; if that fails, treat the filename
-  # stem as the literal key.
-  defp migrate_if_missing(keydir, filename_key, path, type, count) do
-    key =
-      case Base.url_decode64(filename_key, padding: false) do
-        {:ok, decoded} -> decoded
-        :error -> filename_key
-      end
-
-    case :ets.lookup(keydir, key) do
-      [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
-        # Already has an ETS entry — no migration needed
-        count
-
-      [] ->
-        # No ETS entry — write a metadata marker
-        meta = build_prob_meta(type, path, key)
-        meta_bin = :erlang.term_to_binary(meta)
-        :ets.insert(keydir, {key, meta_bin, 0, 0, 0, 0, byte_size(meta_bin)})
-        count + 1
-    end
-  rescue
-    ArgumentError -> count
-  end
-
-  defp build_prob_meta(:bloom_meta, path, _key) do
-    # Try to read bloom header for capacity/error_rate derivation
-    case Ferricstore.Bitcask.NIF.bloom_file_info(path) do
-      {:ok, {num_bits, _count, num_hashes}} ->
-        capacity =
-          if num_hashes > 0,
-            do: max(1, round(num_bits * :math.log(2) / num_hashes)),
-            else: 100
-
-        error_rate =
-          if capacity > 0,
-            do: :math.exp(-num_bits * :math.pow(:math.log(2), 2) / capacity),
-            else: 0.01
-
-        {:bloom_meta, %{path: path, num_bits: num_bits, num_hashes: num_hashes,
-                         capacity: capacity, error_rate: error_rate}}
-
-      _ ->
-        {:bloom_meta, %{path: path}}
-    end
-  end
-
-  defp build_prob_meta(:cms_meta, path, _key) do
-    case Ferricstore.Bitcask.NIF.cms_file_info(path) do
-      {:ok, {width, depth, _count}} ->
-        {:cms_meta, %{width: width, depth: depth}}
-
-      _ ->
-        {:cms_meta, %{path: path}}
-    end
-  end
-
-  defp build_prob_meta(:cuckoo_meta, path, _key) do
-    case Ferricstore.Bitcask.NIF.cuckoo_file_info(path) do
-      {:ok, {num_buckets, _bs, _fp, _ni, _nd, _ts, _mk}} ->
-        {:cuckoo_meta, %{capacity: num_buckets}}
-
-      _ ->
-        {:cuckoo_meta, %{path: path}}
-    end
-  end
-
-  defp build_prob_meta(:topk_meta, path, _key) do
-    case Ferricstore.Bitcask.NIF.topk_file_info_v2(path) do
-      {k, width, depth, decay} ->
-        {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
-
-      _ ->
-        {:topk_meta, %{path: path}}
-    end
-  end
 
 end

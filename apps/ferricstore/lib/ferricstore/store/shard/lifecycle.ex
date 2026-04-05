@@ -1,0 +1,441 @@
+defmodule Ferricstore.Store.Shard.Lifecycle do
+  @moduledoc false
+
+  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.LFU
+  alias Ferricstore.Store.Shard.ETS, as: ShardETS
+  alias Ferricstore.Store.Shard.Flush, as: ShardFlush
+
+  require Logger
+
+  @default_sweep_interval_ms 1_000
+  @default_max_keys_per_sweep 100
+  @default_frag_check_interval_ms 60_000
+
+  # Number of consecutive ceiling-hit sweeps before emitting the
+  # :expiry_struggling telemetry event.
+  @struggling_threshold 3
+
+  # -------------------------------------------------------------------
+  # Discovery / Recovery
+  # -------------------------------------------------------------------
+
+  # Scans the shard data directory for .log files and returns
+  # {highest_file_id, file_size_of_highest}. Starts at 0 if no files exist.
+  # Uses a single Enum.reduce pass instead of filter + map + max to avoid
+  # creating intermediate lists (perf audit L5).
+  @doc false
+  def discover_active_file(shard_path) do
+    case File.ls(shard_path) do
+      {:ok, files} ->
+        # Clean up leftover compaction temp files from a previous crash.
+        # These are always incomplete — if compaction had finished, the
+        # rename would have replaced the original and the temp is gone.
+        Enum.each(files, fn name ->
+          if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
+            File.rm(Path.join(shard_path, name))
+            Logger.warning("Shard: removed leftover compaction temp file #{name}")
+          end
+        end)
+
+        max_id =
+          Enum.reduce(files, -1, fn name, best ->
+            if String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_") do
+              id = name |> String.trim_trailing(".log") |> String.to_integer()
+              max(id, best)
+            else
+              best
+            end
+          end)
+
+        if max_id < 0 do
+          {0, 0}
+        else
+          size = File.stat!(ShardETS.file_path(shard_path, max_id)).size
+          {max_id, size}
+        end
+
+      {:error, _} ->
+        {0, 0}
+    end
+  end
+
+  # Recovers the ETS keydir from hint files or by scanning log files.
+  # Uses last-writer-wins semantics (higher file_id + higher offset wins).
+  @doc false
+  def recover_keydir(shard_path, keydir, shard_index) do
+    case File.ls(shard_path) do
+      {:ok, files} ->
+        log_files =
+          files
+          |> Enum.filter(&String.ends_with?(&1, ".log"))
+          |> Enum.sort()
+
+        Logger.debug("Shard #{shard_index}: recover_keydir scanning #{length(log_files)} log file(s) at #{shard_path}")
+
+        # Try hint files first for faster recovery
+        hint_files =
+          files
+          |> Enum.filter(&String.ends_with?(&1, ".hint"))
+          |> Enum.sort()
+
+        if hint_files != [] do
+          # Recover from hint files
+          Enum.each(hint_files, fn hint_name ->
+            hint_path = Path.join(shard_path, hint_name)
+            fid = hint_name |> String.trim_trailing(".hint") |> String.to_integer()
+
+            case NIF.v2_read_hint_file(hint_path) do
+              {:ok, entries} ->
+                # NIF returns: {key, file_id, offset, value_size, expire_at_ms}
+                Enum.each(entries, fn {key, _file_id, offset, value_size, expire_at_ms} ->
+                  :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
+                end)
+              _ -> :ok
+            end
+          end)
+
+          # Scan any log files that don't have corresponding hints (e.g. the active file)
+          hinted_ids = MapSet.new(hint_files, fn name ->
+            name |> String.trim_trailing(".hint") |> String.to_integer()
+          end)
+
+          unhinted_logs = Enum.reject(log_files, fn name ->
+            fid = name |> String.trim_trailing(".log") |> String.to_integer()
+            MapSet.member?(hinted_ids, fid)
+          end)
+
+          Enum.each(unhinted_logs, fn log_name ->
+            recover_from_log(shard_path, log_name, keydir, shard_index)
+          end)
+        else
+          # No hint files -- full scan of all log files
+          Enum.each(log_files, fn log_name ->
+            recover_from_log(shard_path, log_name, keydir, shard_index)
+          end)
+        end
+
+      {:error, reason} ->
+        Logger.warning("Shard #{shard_index}: recover_keydir failed to list #{shard_path}: #{inspect(reason)}")
+    end
+
+    ets_size = :ets.info(keydir, :size)
+    # Log recovered keys for debugging (only first 10 to avoid log spam)
+    sample_keys = :ets.tab2list(keydir) |> Enum.take(10) |> Enum.map(fn {k, _v, _e, _l, fid, off, vs} -> "#{k}(fid=#{inspect(fid)},off=#{off},vs=#{vs})" end)
+    Logger.debug("Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}, keys: #{inspect(sample_keys)}")
+  end
+
+  @doc false
+  def recover_from_log(shard_path, log_name, keydir, _shard_index) do
+    log_path = Path.join(shard_path, log_name)
+    fid = log_name |> String.trim_trailing(".log") |> String.to_integer()
+
+    # v2_scan_file returns {:ok, [{key, offset, value_size, expire_at_ms, is_tombstone}, ...]}
+    case NIF.v2_scan_file(log_path) do
+      {:ok, records} ->
+        Enum.each(records, fn {key, offset, value_size, expire_at_ms, is_tombstone} ->
+          if is_tombstone do
+            :ets.delete(keydir, key)
+          else
+            :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
+          end
+        end)
+
+      _ ->
+        :ok
+    end
+  end
+
+  # -------------------------------------------------------------------
+  # Expiry sweep
+  # -------------------------------------------------------------------
+
+  # Performs a single expiry sweep pass: scans ETS for up to `max_keys`
+  # expired entries, deletes them from ETS, and purges expired entries
+  # from the Bitcask store. Tracks consecutive ceiling-hit sweeps and
+  # emits telemetry when the sweep is struggling or recovers.
+  @doc false
+  def do_expiry_sweep(state) do
+    now = System.os_time(:millisecond)
+    max_keys = Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
+    expired_keys = scan_expired(state.keydir, now, max_keys)
+
+    count = length(expired_keys)
+
+    if count > 0 do
+      # v2: write tombstones for expired keys and remove from ETS
+      Enum.each(expired_keys, fn key ->
+        case NIF.v2_append_tombstone(state.active_file_path, key) do
+          {:ok, _} ->
+            ShardETS.ets_delete_key(state, key)
+
+          {:error, reason} ->
+            Logger.warning("Shard #{state.index}: tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}")
+        end
+      end)
+      if state.instance_ctx do
+        Ferricstore.Stats.incr_expired_keys(state.instance_ctx, count)
+      else
+        Ferricstore.Stats.incr_expired_keys(count)
+      end
+
+      Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")
+    end
+
+    # Track whether the sweep hit the ceiling (removed exactly max_keys).
+    hit_ceiling = count >= max_keys and count > 0
+
+    {new_ceiling_count, new_struggling} =
+      if hit_ceiling do
+        new_count = state.sweep_at_ceiling_count + 1
+
+        if new_count >= @struggling_threshold and not state.sweep_struggling do
+          :telemetry.execute(
+            [:ferricstore, :expiry, :struggling],
+            %{shard_index: state.index, consecutive_ceiling_sweeps: new_count, max_keys_per_sweep: max_keys},
+            %{}
+          )
+
+          {new_count, true}
+        else
+          {new_count, state.sweep_struggling}
+        end
+      else
+        if state.sweep_struggling do
+          :telemetry.execute(
+            [:ferricstore, :expiry, :recovered],
+            %{shard_index: state.index, previous_ceiling_sweeps: state.sweep_at_ceiling_count},
+            %{}
+          )
+        end
+
+        {0, false}
+      end
+
+    %{state | sweep_at_ceiling_count: new_ceiling_count, sweep_struggling: new_struggling}
+  end
+
+  @doc false
+  def scan_expired(keydir, now, limit) do
+    # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
+    # Match entries where expire_at_ms > 0 and expire_at_ms <= now
+    match_spec = [
+      {{:"$1", :_, :"$2", :_, :_, :_, :_},
+       [{:andalso, {:>, :"$2", 0}, {:"=<", :"$2", now}}],
+       [:"$1"]}
+    ]
+
+    case :ets.select(keydir, match_spec, limit) do
+      {keys, _continuation} -> keys
+      :"$end_of_table" -> []
+    end
+  end
+
+  @doc false
+  def schedule_expiry_sweep do
+    interval = Application.get_env(:ferricstore, :expiry_sweep_interval_ms, @default_sweep_interval_ms)
+    Process.send_after(self(), :expiry_sweep, interval)
+  end
+
+  @doc false
+  def schedule_frag_check do
+    interval = Application.get_env(:ferricstore, :frag_check_interval_ms, @default_frag_check_interval_ms)
+    Process.send_after(self(), :frag_check, interval)
+  end
+
+  # -------------------------------------------------------------------
+  # Prob file migration
+  # -------------------------------------------------------------------
+
+  @doc false
+  def migrate_prob_files(shard_data_path, keydir, _index) do
+    prob_dir = Path.join(shard_data_path, "prob")
+
+    case File.ls(prob_dir) do
+      {:ok, files} ->
+        migrated =
+          Enum.reduce(files, 0, fn filename, count ->
+            migrate_prob_file(prob_dir, filename, keydir, count)
+          end)
+
+        if migrated > 0 do
+          Logger.info("Shard: migrated #{migrated} existing prob file(s) to Raft metadata")
+        end
+
+      {:error, :enoent} ->
+        :ok
+    end
+  end
+
+  @doc false
+  def migrate_prob_file(prob_dir, filename, keydir, count) do
+    path = Path.join(prob_dir, filename)
+
+    cond do
+      String.ends_with?(filename, ".bloom") ->
+        key = filename |> String.trim_trailing(".bloom")
+        migrate_if_missing(keydir, key, path, :bloom_meta, count)
+
+      String.ends_with?(filename, ".cms") ->
+        key = filename |> String.trim_trailing(".cms")
+        migrate_if_missing(keydir, key, path, :cms_meta, count)
+
+      String.ends_with?(filename, ".cuckoo") ->
+        key = filename |> String.trim_trailing(".cuckoo")
+        migrate_if_missing(keydir, key, path, :cuckoo_meta, count)
+
+      String.ends_with?(filename, ".topk") ->
+        key = filename |> String.trim_trailing(".topk")
+        migrate_if_missing(keydir, key, path, :topk_meta, count)
+
+      true ->
+        count
+    end
+  end
+
+  # Writes a metadata marker into ETS if the key doesn't already have one.
+  # The key in the filename may be Base64-encoded (new) or sanitized (old).
+  # We try to decode as Base64 first; if that fails, treat the filename
+  # stem as the literal key.
+  @doc false
+  def migrate_if_missing(keydir, filename_key, path, type, count) do
+    key =
+      case Base.url_decode64(filename_key, padding: false) do
+        {:ok, decoded} -> decoded
+        :error -> filename_key
+      end
+
+    case :ets.lookup(keydir, key) do
+      [{^key, _val, _exp, _lfu, _fid, _off, _vsize}] ->
+        # Already has an ETS entry — no migration needed
+        count
+
+      [] ->
+        # No ETS entry — write a metadata marker
+        meta = build_prob_meta(type, path, key)
+        meta_bin = :erlang.term_to_binary(meta)
+        :ets.insert(keydir, {key, meta_bin, 0, 0, 0, 0, byte_size(meta_bin)})
+        count + 1
+    end
+  rescue
+    ArgumentError -> count
+  end
+
+  @doc false
+  def build_prob_meta(:bloom_meta, path, _key) do
+    # Try to read bloom header for capacity/error_rate derivation
+    case NIF.bloom_file_info(path) do
+      {:ok, {num_bits, _count, num_hashes}} ->
+        capacity =
+          if num_hashes > 0,
+            do: max(1, round(num_bits * :math.log(2) / num_hashes)),
+            else: 100
+
+        error_rate =
+          if capacity > 0,
+            do: :math.exp(-num_bits * :math.pow(:math.log(2), 2) / capacity),
+            else: 0.01
+
+        {:bloom_meta, %{path: path, num_bits: num_bits, num_hashes: num_hashes,
+                         capacity: capacity, error_rate: error_rate}}
+
+      _ ->
+        {:bloom_meta, %{path: path}}
+    end
+  end
+
+  def build_prob_meta(:cms_meta, path, _key) do
+    case NIF.cms_file_info(path) do
+      {:ok, {width, depth, _count}} ->
+        {:cms_meta, %{width: width, depth: depth}}
+
+      _ ->
+        {:cms_meta, %{path: path}}
+    end
+  end
+
+  def build_prob_meta(:cuckoo_meta, path, _key) do
+    case NIF.cuckoo_file_info(path) do
+      {:ok, {num_buckets, _bs, _fp, _ni, _nd, _ts, _mk}} ->
+        {:cuckoo_meta, %{capacity: num_buckets}}
+
+      _ ->
+        {:cuckoo_meta, %{path: path}}
+    end
+  end
+
+  def build_prob_meta(:topk_meta, path, _key) do
+    case NIF.topk_file_info_v2(path) do
+      {k, width, depth, decay} ->
+        {:topk_meta, %{path: path, k: k, width: width, depth: depth, decay: decay}}
+
+      _ ->
+        {:topk_meta, %{path: path}}
+    end
+  end
+
+  # -------------------------------------------------------------------
+  # Raft startup
+  # -------------------------------------------------------------------
+
+  # Returns true if this shard has a pre-existing Batcher process (started by
+  # Application.start for shards 0..N-1). If so, also starts the ra server
+  # for this shard. Isolated test shards with ad-hoc indices won't have a
+  # Batcher and fall back to the direct write path.
+  @doc false
+  def start_raft_if_available(index, shard_data_path, active_file_id, active_file_path, ets) do
+    batcher_name = Ferricstore.Raft.Batcher.batcher_name(index)
+
+    if Process.whereis(batcher_name) != nil do
+      try do
+        Ferricstore.Raft.Cluster.start_shard_server(index, shard_data_path, active_file_id, active_file_path, ets)
+        true
+      catch
+        _, _ -> false
+      end
+    else
+      false
+    end
+  end
+
+  # -------------------------------------------------------------------
+  # Terminate
+  # -------------------------------------------------------------------
+
+  @doc false
+  def do_terminate(_reason, state) do
+    t0 = System.monotonic_time(:microsecond)
+
+    # Step 1: drain any in-flight async flush and flush remaining pending
+    # writes synchronously to guarantee all data hits disk before exit.
+    state = ShardFlush.await_in_flight(state)
+    state = ShardFlush.flush_pending_sync(state)
+
+    t_flush = System.monotonic_time(:microsecond)
+
+    # Step 2: write v2 hint file for the active file so the next startup
+    # can rebuild the keydir from hints instead of replaying the full log.
+    ShardFlush.write_hint_for_file(state, state.active_file_id)
+    NIF.v2_fsync(state.active_file_path)
+
+    t_hint = System.monotonic_time(:microsecond)
+
+    # Step 3: emit shutdown telemetry for operator visibility.
+    :telemetry.execute(
+      [:ferricstore, :shard, :shutdown],
+      %{
+        flush_duration_us: t_flush - t0,
+        hint_duration_us: t_hint - t_flush,
+        total_duration_us: t_hint - t0
+      },
+      %{shard_index: state.index}
+    )
+
+    Logger.info(
+      "Shard #{state.index}: shutdown complete " <>
+        "(flush=#{t_flush - t0}us, hint=#{t_hint - t_flush}us)"
+    )
+
+    :ok
+  end
+end

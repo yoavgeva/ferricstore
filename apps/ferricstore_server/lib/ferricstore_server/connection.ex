@@ -64,6 +64,8 @@ defmodule FerricstoreServer.Connection do
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
+  alias FerricstoreServer.Connection.Auth, as: ConnAuth
+  alias FerricstoreServer.Connection.PubSub, as: ConnPubSub
   alias FerricstoreServer.Connection.Store, as: ConnStore
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
@@ -130,26 +132,8 @@ defmodule FerricstoreServer.Connection do
     XLEN XRANGE XREVRANGE XREAD XINFO
     JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET)
 
-  # Commands that write keys and should trigger client tracking invalidation.
-  @write_cmds ~w(SET SETNX SETEX PSETEX MSET MSETNX APPEND SETRANGE
-    INCR DECR INCRBY DECRBY INCRBYFLOAT
-    DEL UNLINK
-    EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
-    RENAME RENAMENX COPY
-    HSET HDEL HINCRBY HINCRBYFLOAT HSETNX
-    LPUSH RPUSH LPOP RPOP LSET LINSERT LTRIM LREM LMOVE LPUSHX RPUSHX
-    SADD SREM SPOP SMOVE SDIFFSTORE SINTERSTORE SUNIONSTORE
-    ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX
-    SETBIT BITOP PFADD PFMERGE
-    GEOADD GEOSEARCHSTORE
-    XADD XTRIM XDEL
-    JSON.SET JSON.DEL JSON.NUMINCRBY JSON.TOGGLE JSON.CLEAR JSON.ARRAPPEND
-    GETSET GETDEL
-    CAS LOCK UNLOCK EXTEND)
-
-  # O(1) MapSet lookups for hot-path classification (replaces linear `in` scans).
+  # O(1) MapSet lookup for hot-path read classification (replaces linear `in` scans).
   @read_cmds_set MapSet.new(@read_cmds)
-  @write_cmds_set MapSet.new(@write_cmds)
 
   @type t :: %__MODULE__{
           socket: :inet.socket(),
@@ -232,7 +216,7 @@ defmodule FerricstoreServer.Connection do
         :ok ->
           # Populate ACL cache for the default user at connection init.
           # This avoids ETS lookups on every command for the common case.
-          default_cache = build_acl_cache("default")
+          default_cache = ConnAuth.build_acl_cache("default")
 
           # Join the ACL invalidation process group so we receive
           # {:acl_invalidate, username} messages when ACL rules change.
@@ -318,7 +302,7 @@ defmodule FerricstoreServer.Connection do
         loop(state)
 
       {:acl_invalidate, username} ->
-        loop(maybe_refresh_acl_cache(state, username))
+        loop(ConnAuth.maybe_refresh_acl_cache(state, username))
     end
   end
 
@@ -765,8 +749,8 @@ defmodule FerricstoreServer.Connection do
 
   defp dispatch_pure_command_normalised({name, args}, store, state) do
     # ACL command-level + key pattern check for pipelined commands (cached, no ETS lookup)
-    with :ok <- check_command_cached(state.acl_cache, name),
-         :ok <- check_keys_cached(state.acl_cache, name, args) do
+    with :ok <- ConnAuth.check_command_cached(state.acl_cache, name),
+         :ok <- ConnAuth.check_keys_cached(state.acl_cache, name, args) do
       Stats.incr_commands()
 
       result =
@@ -821,8 +805,8 @@ defmodule FerricstoreServer.Connection do
         {:continue, Encoder.encode({:error, "NOAUTH Authentication required."}), state}
 
       cmd not in @acl_bypass_cmds ->
-        with :ok <- check_command_cached(state.acl_cache, cmd),
-             :ok <- check_keys_cached(state.acl_cache, cmd, args) do
+        with :ok <- ConnAuth.check_command_cached(state.acl_cache, cmd),
+             :ok <- ConnAuth.check_keys_cached(state.acl_cache, cmd, args) do
           Stats.incr_commands()
           dispatch(cmd, args, state)
         else
@@ -902,203 +886,14 @@ defmodule FerricstoreServer.Connection do
 
   defp dispatch("QUIT", _args, state), do: {:quit, Encoder.encode(:ok), state}
 
-  # AUTH command
-  #
-  # Authentication flow:
-  # 1. If no requirepass AND no ACL user has a password set, AUTH is rejected
-  #    ("no password is set").
-  # 2. Otherwise, resolve the username and password from args and delegate
-  #    to `FerricstoreServer.Acl.authenticate/2`.
-  # 3. Backwards compat: when requirepass is set and the ACL default user
-  #    has no password, authenticate against requirepass for the default user.
-  defp dispatch("AUTH", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
-  end
+  # AUTH command — delegated to Connection.Auth
+  defp dispatch("AUTH", args, state), do: ConnAuth.dispatch_auth(args, state)
 
-  defp dispatch("AUTH", [_, _, _ | _], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'auth' command"}), state}
-  end
-
-  defp dispatch("AUTH", args, state) do
-    {username, password} =
-      case args do
-        [pass] -> {"default", pass}
-        [user, pass] -> {user, pass}
-      end
-
-    requirepass = Ferricstore.Config.get_value("requirepass")
-    acl_user = FerricstoreServer.Acl.get_user(username)
-    client_ip = format_peer(state.peer)
-
-    # Determine whether any auth source is configured for this user.
-    has_acl_password = acl_user != nil and acl_user.password != nil
-    has_requirepass = requirepass != nil and requirepass != ""
-
-    cond do
-      # No authentication source configured at all.
-      not has_acl_password and not has_requirepass ->
-        {:continue, Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}), state}
-
-      # ACL user has a password -- always use ACL auth.
-      has_acl_password ->
-        do_acl_auth(username, password, client_ip, state)
-
-      # Backwards compat: requirepass is set, default user has no ACL password.
-      has_requirepass and username == "default" ->
-        if constant_time_equal?(password, requirepass) do
-          AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
-          new_cache = build_acl_cache(username)
-          {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: username, acl_cache: new_cache}}
-        else
-          AuditLog.log(:auth_failure, %{username: username, client_ip: client_ip})
-          {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
-        end
-
-      # Non-default user with no ACL password, requirepass is set.
-      # Fall through to ACL auth (which accepts any password for nopass users).
-      has_requirepass ->
-        do_acl_auth(username, password, client_ip, state)
-
-      # Catch-all (should not happen with the above conditions).
-      true ->
-        {:continue, Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}), state}
-    end
-  end
-
-  # Constant-time string comparison to prevent timing attacks on passwords.
-  # Hashes both inputs to ensure equal length before comparing.
-  defp constant_time_equal?(a, b) when is_binary(a) and is_binary(b) do
-    hash_a = :crypto.hash(:sha256, a)
-    hash_b = :crypto.hash(:sha256, b)
-    :crypto.hash_equals(hash_a, hash_b)
-  end
-
-  defp do_acl_auth(username, password, client_ip, state) do
-    case FerricstoreServer.Acl.authenticate(username, password) do
-      {:ok, ^username} ->
-        AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
-        new_cache = build_acl_cache(username)
-        {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: username, acl_cache: new_cache}}
-
-      {:error, reason} ->
-        AuditLog.log(:auth_failure, %{username: username, client_ip: client_ip})
-        {:continue, Encoder.encode({:error, reason}), state}
-    end
-  end
-
-  # ACL subcommands — upcase subcommand for case-insensitive matching
-  defp dispatch("ACL", [subcmd | rest], state) do
-    dispatch_acl(String.upcase(subcmd), rest, state)
-  end
+  # ACL subcommands — delegated to Connection.Auth
+  defp dispatch("ACL", [subcmd | rest], state), do: ConnAuth.dispatch_acl(String.upcase(subcmd), rest, state)
 
   defp dispatch("ACL", [], state) do
     {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl' command"}), state}
-  end
-
-  defp dispatch_acl("WHOAMI", _, state) do
-    {:continue, Encoder.encode(state.username), state}
-  end
-
-  defp dispatch_acl("LIST", _, state) do
-    {:continue, Encoder.encode(FerricstoreServer.Acl.list_users()), state}
-  end
-
-  defp dispatch_acl("SETUSER", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|setuser' command"}), state}
-  end
-
-  defp dispatch_acl("SETUSER", [username | rules], state) do
-    # Route through Raft so the mutation is replicated to all nodes.
-    ctx = FerricStore.Instance.get(:default)
-    result = Ferricstore.Store.Router.server_command(ctx, {:acl_setuser, username, rules})
-
-    case result do
-      :ok ->
-        broadcast_acl_invalidation(username)
-
-        new_state =
-          if username == state.username do
-            %{state | acl_cache: build_acl_cache(username)}
-          else
-            state
-          end
-
-        {:continue, Encoder.encode(:ok), new_state}
-
-      {:error, reason} ->
-        {:continue, Encoder.encode({:error, reason}), state}
-    end
-  end
-
-  defp dispatch_acl("DELUSER", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|deluser' command"}), state}
-  end
-
-  defp dispatch_acl("DELUSER", usernames, state) do
-    ctx = FerricStore.Instance.get(:default)
-
-    results =
-      Enum.map(usernames, fn username ->
-        Ferricstore.Store.Router.server_command(ctx, {:acl_deluser, username})
-      end)
-
-    case Enum.find(results, fn r -> match?({:error, _}, r) end) do
-      nil ->
-        Enum.each(usernames, &broadcast_acl_invalidation/1)
-        {:continue, Encoder.encode(:ok), state}
-
-      {:error, reason} ->
-        {:continue, Encoder.encode({:error, reason}), state}
-    end
-  end
-
-  defp dispatch_acl("CAT", _, state) do
-    cats = ~w(keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast slow blocking dangerous connection transaction server generic)
-    {:continue, Encoder.encode(cats), state}
-  end
-
-  defp dispatch_acl("LOG", ["RESET" | _], state) do
-    AuditLog.reset()
-    {:continue, Encoder.encode(:ok), state}
-  end
-
-  defp dispatch_acl("LOG", ["COUNT", count_str | _], state) do
-    case Integer.parse(count_str) do
-      {count, ""} when count >= 0 ->
-        entries = AuditLog.get(count) |> AuditLog.format_entries()
-        {:continue, Encoder.encode(entries), state}
-
-      _ ->
-        {:continue, Encoder.encode({:error, "ERR value is not an integer or out of range"}), state}
-    end
-  end
-
-  defp dispatch_acl("LOG", [], state) do
-    entries = AuditLog.get() |> AuditLog.format_entries()
-    {:continue, Encoder.encode(entries), state}
-  end
-
-  defp dispatch_acl("LOG", _, state) do
-    entries = AuditLog.get() |> AuditLog.format_entries()
-    {:continue, Encoder.encode(entries), state}
-  end
-
-  defp dispatch_acl("GETUSER", [username | _], state) do
-    case FerricstoreServer.Acl.get_user_info(username) do
-      nil ->
-        {:continue, Encoder.encode(nil), state}
-
-      info ->
-        {:continue, Encoder.encode(info), state}
-    end
-  end
-
-  defp dispatch_acl("GETUSER", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl|getuser' command"}), state}
-  end
-
-  defp dispatch_acl(_, _, state) do
-    {:continue, Encoder.encode({:error, "ERR unknown subcommand or wrong number of arguments for 'acl' command"}), state}
   end
 
   defp dispatch("RESET", _args, state) do
@@ -1118,7 +913,7 @@ defmodule FerricstoreServer.Connection do
       username: "default",
       pubsub_channels: nil,
       pubsub_patterns: nil,
-      acl_cache: build_acl_cache("default")
+      acl_cache: ConnAuth.build_acl_cache("default")
     }
     {:continue, Encoder.encode({:simple, "RESET"}), new_state}
   end
@@ -1265,115 +1060,12 @@ defmodule FerricstoreServer.Connection do
     {:continue, Encoder.encode(:ok), %{state | watched_keys: %{}}}
   end
 
-  # -- Pub/Sub commands handled in connection layer -------------------------
+  # -- Pub/Sub commands — delegated to Connection.PubSub --------------------
 
-  defp dispatch("SUBSCRIBE", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'subscribe' command"}), state}
-  end
-
-  # Max channels + patterns per connection to prevent per-connection heap exhaustion.
-  @max_subscriptions 100_000
-
-  defp dispatch("SUBSCRIBE", channels, state) do
-    # Lazily initialize MapSets on first subscribe (memory audit L3).
-    state = ensure_pubsub_sets(state)
-
-    current_count = MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
-
-    if current_count + length(channels) > @max_subscriptions do
-      {:continue,
-       Encoder.encode({:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}), state}
-    else
-      {responses, new_state} =
-        Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
-          PS.subscribe(ch, self())
-          new_channels = MapSet.put(st.pubsub_channels, ch)
-          new_st = %{st | pubsub_channels: new_channels}
-          count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
-          push = {:push, ["subscribe", ch, count]}
-          {[Encoder.encode(push) | acc], new_st}
-        end)
-
-      {:continue, Enum.reverse(responses), new_state}
-    end
-  end
-
-  defp dispatch("UNSUBSCRIBE", [], state) do
-    if state.pubsub_channels == nil do
-      {:continue, [], state}
-    else
-      dispatch("UNSUBSCRIBE", MapSet.to_list(state.pubsub_channels), state)
-    end
-  end
-
-  defp dispatch("UNSUBSCRIBE", channels, state) do
-    state = ensure_pubsub_sets(state)
-
-    {responses, new_state} =
-      Enum.reduce(channels, {[], state}, fn ch, {acc, st} ->
-        PS.unsubscribe(ch, self())
-        new_channels = MapSet.delete(st.pubsub_channels, ch)
-        new_st = %{st | pubsub_channels: new_channels}
-        count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
-        push = {:push, ["unsubscribe", ch, count]}
-        {[Encoder.encode(push) | acc], new_st}
-      end)
-
-    # No socket mode switch needed — the main loop handles re-arming active: :once.
-    {:continue, Enum.reverse(responses), new_state}
-  end
-
-  defp dispatch("PSUBSCRIBE", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'psubscribe' command"}), state}
-  end
-
-  defp dispatch("PSUBSCRIBE", patterns, state) do
-    state = ensure_pubsub_sets(state)
-
-    current_count = MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
-
-    if current_count + length(patterns) > @max_subscriptions do
-      {:continue,
-       Encoder.encode({:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached"}), state}
-    else
-      {responses, new_state} =
-        Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
-          PS.psubscribe(pat, self())
-          new_patterns = MapSet.put(st.pubsub_patterns, pat)
-          new_st = %{st | pubsub_patterns: new_patterns}
-          count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
-          push = {:push, ["psubscribe", pat, count]}
-          {[Encoder.encode(push) | acc], new_st}
-        end)
-
-      {:continue, Enum.reverse(responses), new_state}
-    end
-  end
-
-  defp dispatch("PUNSUBSCRIBE", [], state) do
-    if state.pubsub_patterns == nil do
-      {:continue, [], state}
-    else
-      dispatch("PUNSUBSCRIBE", MapSet.to_list(state.pubsub_patterns), state)
-    end
-  end
-
-  defp dispatch("PUNSUBSCRIBE", patterns, state) do
-    state = ensure_pubsub_sets(state)
-
-    {responses, new_state} =
-      Enum.reduce(patterns, {[], state}, fn pat, {acc, st} ->
-        PS.punsubscribe(pat, self())
-        new_patterns = MapSet.delete(st.pubsub_patterns, pat)
-        new_st = %{st | pubsub_patterns: new_patterns}
-        count = MapSet.size(new_st.pubsub_channels) + MapSet.size(new_st.pubsub_patterns)
-        push = {:push, ["punsubscribe", pat, count]}
-        {[Encoder.encode(push) | acc], new_st}
-      end)
-
-    # No socket mode switch needed — the main loop handles re-arming active: :once.
-    {:continue, Enum.reverse(responses), new_state}
-  end
+  defp dispatch("SUBSCRIBE", args, state), do: ConnPubSub.dispatch_subscribe(args, state)
+  defp dispatch("UNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_unsubscribe(args, state)
+  defp dispatch("PSUBSCRIBE", args, state), do: ConnPubSub.dispatch_psubscribe(args, state)
+  defp dispatch("PUNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_punsubscribe(args, state)
 
   # -- Queuing mode: intercept all non-passthrough commands ------------------
 
@@ -2150,20 +1842,12 @@ defmodule FerricstoreServer.Connection do
         pubsub_loop(state)
 
       {:acl_invalidate, username} ->
-        pubsub_loop(maybe_refresh_acl_cache(state, username))
+        pubsub_loop(ConnAuth.maybe_refresh_acl_cache(state, username))
     end
   end
 
   defp in_pubsub_mode?(%{pubsub_channels: nil}), do: false
   defp in_pubsub_mode?(state), do: MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
-
-  # Lazily initializes pubsub_channels and pubsub_patterns MapSets.
-  # Called on first SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE to avoid allocating
-  # ~80 bytes of empty MapSets on every connection (memory audit L3).
-  defp ensure_pubsub_sets(%{pubsub_channels: nil} = state) do
-    %{state | pubsub_channels: MapSet.new(), pubsub_patterns: MapSet.new()}
-  end
-  defp ensure_pubsub_sets(state), do: state
 
   defp cleanup_connection(state) do
     duration_ms = System.monotonic_time(:millisecond) - state.created_at
@@ -2206,7 +1890,7 @@ defmodule FerricstoreServer.Connection do
   end
 
   # ---------------------------------------------------------------------------
-  # ACL cache — eliminates ETS lookups on every command
+  # ACL cache — delegated to Connection.Auth
   # ---------------------------------------------------------------------------
 
   # The process group name for ACL invalidation broadcasts.
@@ -2216,159 +1900,6 @@ defmodule FerricstoreServer.Connection do
   @spec acl_pg_group() :: atom()
   def acl_pg_group, do: @acl_pg_group
 
-  # Builds a cached ACL permission snapshot for the given username.
-  # Does a single ETS lookup and extracts the fields needed for command checks.
-  # Returns nil if the user does not exist, `:full_access` for unrestricted
-  # users (commands: :all, no denied commands, keys: :all, enabled: true),
-  # or a map with the ACL fields for restricted users.
-  #
-  # The `:full_access` atom enables O(1) fast-path checks in
-  # `check_command_cached/2` and `check_keys_cached/3`, skipping all MapSet
-  # and Catalog operations for the common default-user case.
-  @spec build_acl_cache(binary()) :: acl_cache() | :full_access | :denied
-  defp build_acl_cache(username) do
-    case FerricstoreServer.Acl.get_user(username) do
-      nil ->
-        # User doesn't exist. For "default" user this means no ACL configured
-        # (allow everything). For any other user, it means the user was deleted
-        # (deny everything).
-        if username == "default", do: :full_access, else: :denied
-
-      user ->
-        denied = Map.get(user, :denied_commands, MapSet.new())
-
-        if user.enabled and user.commands == :all and
-             MapSet.size(denied) == 0 and user.keys == :all do
-          :full_access
-        else
-          %{
-            commands: user.commands,
-            denied_commands: denied,
-            keys: user.keys,
-            enabled: user.enabled
-          }
-        end
-    end
-  end
-
-  # Pure function: checks if a command is permitted using the cached ACL data.
-  # No ETS lookup, no process call — just pattern matching on local state.
-  # The `cmd` argument is expected to be already uppercase (from normalise_cmd).
-  # Returns `:ok` if permitted, `{:error, reason}` if denied.
-  @spec check_command_cached(acl_cache() | :full_access | :denied, binary()) :: :ok | {:error, binary()}
-
-  # Deleted user or unknown user — deny all commands.
-  defp check_command_cached(:denied, _cmd),
-    do: {:error, "NOPERM user session expired or user was deleted"}
-
-  # Fast path: unrestricted user — single atom comparison, zero MapSet/map ops.
-  # Covers the common default-user case (commands: :all, no denied, keys: :all).
-  defp check_command_cached(:full_access, _cmd), do: :ok
-
-  # Fast path: full-access user with no denied commands — skip all MapSet ops.
-  # This covers the case where build_acl_cache returned a map (e.g. user has
-  # keys restrictions but commands: :all with no denied commands).
-  defp check_command_cached(%{commands: :all, denied_commands: %MapSet{map: denied_map}, enabled: true}, _cmd)
-       when map_size(denied_map) == 0 do
-    :ok
-  end
-
-  defp check_command_cached(cache, cmd) do
-    cond do
-      not cache.enabled ->
-        {:error,
-         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-
-      cache.commands == :all and not MapSet.member?(cache.denied_commands, cmd) ->
-        :ok
-
-      cache.commands == :all ->
-        {:error,
-         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-
-      MapSet.member?(cache.commands, cmd) and
-          not MapSet.member?(cache.denied_commands, cmd) ->
-        :ok
-
-      true ->
-        {:error,
-         "NOPERM this user has no permissions to run the '#{String.downcase(cmd)}' command"}
-    end
-  end
-
-  # Pure function: checks if the cached ACL key patterns allow access to
-  # all keys touched by a command. Uses Catalog.get_keys/2 to extract keys
-  # from the command arguments, then checks each key against the user's
-  # compiled patterns.
-  #
-  # Returns `:ok` if all keys pass, `{:error, reason}` if any key is denied.
-  # Commands with no keys (PING, INFO, etc.) always pass.
-  @spec check_keys_cached(acl_cache() | :full_access, binary(), [binary()]) :: :ok | {:error, binary()}
-  defp check_keys_cached(nil, _cmd, _args), do: :ok
-  defp check_keys_cached(:full_access, _cmd, _args), do: :ok
-  defp check_keys_cached(%{keys: :all}, _cmd, _args), do: :ok
-
-  defp check_keys_cached(%{keys: patterns}, cmd, args) do
-    alias Ferricstore.Commands.Catalog
-
-    # cmd is already uppercase from normalise_cmd — use get_keys_upper to
-    # skip the String.downcase inside Catalog.lookup.
-    case Catalog.get_keys_upper(cmd, args) do
-      {:ok, []} ->
-        :ok
-
-      {:ok, keys} ->
-        access_type = command_access_type(cmd)
-        check_all_keys(keys, access_type, patterns)
-
-      {:error, _} ->
-        # Unknown command — let the dispatcher handle the error later.
-        :ok
-    end
-  end
-
-  # Check every key against the patterns. Short-circuits on first denial.
-  @spec check_all_keys([binary()], :read | :write | :rw, [FerricstoreServer.Acl.key_pattern()]) ::
-          :ok | {:error, binary()}
-  defp check_all_keys([], _access_type, _patterns), do: :ok
-
-  defp check_all_keys([key | rest], access_type, patterns) do
-    # For :rw access (both read and write), the key must pass BOTH read and write checks.
-    types_to_check =
-      case access_type do
-        :rw -> [:read, :write]
-        other -> [other]
-      end
-
-    all_pass =
-      Enum.all?(types_to_check, fn t ->
-        FerricstoreServer.Acl.key_matches_any?(key, t, patterns)
-      end)
-
-    if all_pass do
-      check_all_keys(rest, access_type, patterns)
-    else
-      {:error,
-       "NOPERM this user has no permissions to access one of the keys mentioned in the command"}
-    end
-  end
-
-  # Determines the access type for a command: :read, :write, or :rw (both).
-  # Commands that both read and write (GETSET, GETDEL, GETEX, CAS) require
-  # both read and write key permissions.
-  # The `cmd` argument is expected to be already uppercase (from normalise_cmd).
-  @read_write_cmds_set MapSet.new(~w(GETSET GETDEL GETEX CAS))
-  @spec command_access_type(binary()) :: :read | :write | :rw
-  defp command_access_type(cmd) do
-    cond do
-      MapSet.member?(@read_write_cmds_set, cmd) -> :rw
-      MapSet.member?(@read_cmds_set, cmd) -> :read
-      MapSet.member?(@write_cmds_set, cmd) -> :write
-      # Default to :rw for unknown commands — most conservative.
-      true -> :rw
-    end
-  end
-
   # Joins the OTP :pg process group for ACL invalidation broadcasts.
   # Called once during connection init. The process is automatically removed
   # from the group when it terminates (no explicit leave needed).
@@ -2377,35 +1908,5 @@ defmodule FerricstoreServer.Connection do
   defp join_acl_invalidation_group do
     :pg.join(@acl_pg_group, @acl_pg_group, self())
     :ok
-  end
-
-  # Broadcasts an ACL invalidation message to all connection processes.
-  # Called by SETUSER/DELUSER after successfully modifying a user.
-  @spec broadcast_acl_invalidation(binary()) :: :ok
-  defp broadcast_acl_invalidation(username) do
-    members =
-      try do
-        :pg.get_members(@acl_pg_group, @acl_pg_group)
-      catch
-        :error, _ -> []
-      end
-
-    for pid <- members, pid != self() do
-      send(pid, {:acl_invalidate, username})
-    end
-
-    :ok
-  end
-
-  # Refreshes the local ACL cache if the invalidated username matches
-  # the current connection's username. If the user was deleted, the cache
-  # becomes nil (subsequent commands will be denied).
-  @spec maybe_refresh_acl_cache(t(), binary()) :: t()
-  defp maybe_refresh_acl_cache(state, invalidated_username) do
-    if invalidated_username == state.username do
-      %{state | acl_cache: build_acl_cache(state.username)}
-    else
-      state
-    end
   end
 end
