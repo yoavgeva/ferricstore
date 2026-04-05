@@ -174,15 +174,16 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
   describe "CONFIG RESETSTAT behavior" do
     test "isolated instance counters are independent of global reset", %{ctx: ctx} do
       # Generate counter values on isolated instance
-      Router.put(ctx, "resetstat_key", "value", 0)
-      Router.get(ctx, "resetstat_key")
-      Router.get(ctx, "no_such_key")
+      assert :ok = Router.put(ctx, "resetstat_key", "value", 0)
+      assert "value" = Router.get(ctx, "resetstat_key")
+      assert nil == Router.get(ctx, "no_such_key")
+
+      # Counter increments are synchronous — no eventually needed
+      assert Stats.keyspace_hits(ctx) > 0, "hits should be > 0 after successful GET"
+      assert Stats.keyspace_misses(ctx) > 0, "misses should be > 0 after GET on missing key"
 
       hits_before = Stats.keyspace_hits(ctx)
       misses_before = Stats.keyspace_misses(ctx)
-
-      assert hits_before > 0
-      assert misses_before > 0
 
       # Global reset does NOT affect isolated instance counters
       # (they use separate :counters refs)

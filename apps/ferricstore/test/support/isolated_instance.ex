@@ -61,8 +61,14 @@ defmodule Ferricstore.Test.IsolatedInstance do
       ])
     end
 
-    # Wait for shards to be ready
-    Process.sleep(50)
+    # Wait for all shards to be alive and responding
+    Enum.each(0..(shard_count - 1), fn i ->
+      shard = elem(ctx.shard_names, i)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        pid = Process.whereis(shard)
+        is_pid(pid) and Process.alive?(pid)
+      end, "shard #{i} not ready", 20, 10)
+    end)
 
     ctx
   end
