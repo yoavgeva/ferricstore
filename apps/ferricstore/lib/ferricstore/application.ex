@@ -373,11 +373,6 @@ defmodule Ferricstore.Application do
         _, _ -> :ok
       end
     end
-
-    elapsed = System.monotonic_time(:millisecond) - t0
-    Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
-
-    state
   end
 
   defp list_wal_files(ra_dir) do
