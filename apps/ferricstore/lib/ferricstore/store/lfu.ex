@@ -79,6 +79,24 @@ defmodule Ferricstore.Store.LFU do
     end
   end
 
+  @doc "Returns the initial packed LFU value using instance ctx."
+  @spec initial(FerricStore.Instance.t()) :: non_neg_integer()
+  def initial(ctx) do
+    current_min = now_minutes()
+    ref = ctx.lfu_initial_ref
+
+    case :atomics.get(ref, 1) do
+      ^current_min ->
+        :atomics.get(ref, 2)
+
+      _ ->
+        packed = pack(current_min, @initial_counter)
+        :atomics.put(ref, 1, current_min)
+        :atomics.put(ref, 2, packed)
+        packed
+    end
+  end
+
   @doc "Returns the initial counter value (5)."
   @spec initial_counter() :: non_neg_integer()
   def initial_counter, do: @initial_counter
@@ -127,6 +145,20 @@ defmodule Ferricstore.Store.LFU do
     end
   end
 
+  @doc "Returns the effective (decayed) counter using instance ctx."
+  @spec effective_counter(FerricStore.Instance.t(), non_neg_integer()) :: non_neg_integer()
+  def effective_counter(ctx, packed) do
+    {ldt, counter} = unpack(packed)
+    decay_time = ctx.lfu_decay_time
+    elapsed = elapsed_minutes(now_minutes(), ldt)
+
+    if decay_time > 0 do
+      max(0, counter - div(elapsed, decay_time))
+    else
+      counter
+    end
+  end
+
   @doc """
   Performs an LFU touch: decays the counter, then probabilistically increments it.
 
@@ -160,6 +192,40 @@ defmodule Ferricstore.Store.LFU do
       end
 
     # Step 3: Update ETS with new packed LFU — skip write when unchanged
+    new_packed = pack(now_min, new_counter)
+
+    if new_packed != packed do
+      :ets.update_element(keydir, key, {4, new_packed})
+    end
+
+    :ok
+  end
+
+  @doc "Performs an LFU touch using instance ctx for config values."
+  @spec touch(FerricStore.Instance.t(), atom(), binary(), non_neg_integer()) :: :ok
+  def touch(ctx, keydir, key, packed) do
+    {ldt, counter} = unpack(packed)
+    now_min = now_minutes()
+
+    decay_time = ctx.lfu_decay_time
+    elapsed = elapsed_minutes(now_min, ldt)
+
+    decayed_counter =
+      if decay_time > 0 do
+        max(0, counter - div(elapsed, decay_time))
+      else
+        counter
+      end
+
+    log_factor = ctx.lfu_log_factor
+
+    new_counter =
+      if :rand.uniform() < 1.0 / (decayed_counter * log_factor + 1) do
+        min(decayed_counter + 1, 255)
+      else
+        decayed_counter
+      end
+
     new_packed = pack(now_min, new_counter)
 
     if new_packed != packed do

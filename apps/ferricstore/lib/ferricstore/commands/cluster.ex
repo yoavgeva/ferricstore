@@ -168,7 +168,8 @@ defmodule Ferricstore.Commands.Cluster do
   # -------------------------------------------------------------------
 
   defp collect_shard_info do
-    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+    ctx = FerricStore.Instance.get(:default)
+    shard_count = ctx.shard_count
     Enum.map(0..(shard_count - 1), fn index ->
       keydir = :"keydir_#{index}"
       ctx = FerricStore.Instance.get(:default)

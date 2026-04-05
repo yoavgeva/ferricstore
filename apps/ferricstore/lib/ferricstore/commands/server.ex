@@ -122,7 +122,7 @@ defmodule Ferricstore.Commands.Server do
 
   defp flush_all_prob_dirs do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+    shard_count = shard_count()
 
     for i <- 0..(shard_count - 1) do
       shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
@@ -327,8 +327,12 @@ defmodule Ferricstore.Commands.Server do
   # Read shard_count from persistent_term (set by application.ex) with
   # Application.get_env fallback for early startup / test environments.
   defp shard_count do
-    :persistent_term.get(:ferricstore_shard_count, nil) ||
-      Application.get_env(:ferricstore, :shard_count, 4)
+    try do
+      FerricStore.Instance.get(:default).shard_count
+    rescue
+      ArgumentError ->
+        Application.get_env(:ferricstore, :shard_count, 4)
+    end
   end
 
   defp info_string(section, store) when section in ["all", "everything"] do
@@ -490,7 +494,11 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("stats", _store) do
-    rate = :persistent_term.get(:ferricstore_read_sample_rate, 100)
+    rate = try do
+      FerricStore.Instance.get(:default).read_sample_rate
+    rescue
+      ArgumentError -> 100
+    end
     hot_sampled = Stats.total_hot_reads()
     cold_sampled = Stats.total_cold_reads()
     hits_sampled = Stats.keyspace_hits()

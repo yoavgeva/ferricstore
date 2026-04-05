@@ -122,7 +122,8 @@ defmodule Ferricstore.Health do
   """
   @spec check() :: health_result()
   def check do
-    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+    ctx = FerricStore.Instance.get(:default)
+    shard_count = ctx.shard_count
     shards = collect_shard_info(shard_count)
 
     # Readiness requires: flag set + all shards alive + all Raft leaders elected

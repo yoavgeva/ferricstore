@@ -563,7 +563,7 @@ defmodule Ferricstore.Store.Router do
         GenServer.call(resolve_shard(ctx, idx), {:get_file_ref, key})
 
       :expired ->
-        Stats.incr_keyspace_misses()
+        Stats.incr_keyspace_misses(ctx)
         nil
 
       :miss ->
@@ -600,37 +600,37 @@ defmodule Ferricstore.Store.Router do
         # Use DataDir directly to avoid GenServer roundtrip.
         shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
         path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
-        Stats.record_cold_read(key)
+        Stats.record_cold_read(ctx, key)
         {:cold_ref, path, offset, value_size}
 
       {:cold, _file_id, _offset, _value_size} ->
         # Cold entry but no valid file ref — ask GenServer
         result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
         if result != nil do
-          Stats.record_cold_read(key)
+          Stats.record_cold_read(ctx, key)
           {:cold_value, result}
         else
-          Stats.incr_keyspace_misses()
+          Stats.incr_keyspace_misses(ctx)
           :miss
         end
 
       :expired ->
-        Stats.incr_keyspace_misses()
+        Stats.incr_keyspace_misses(ctx)
         :miss
 
       :miss ->
         # Key not in ETS = doesn't exist. No GenServer needed.
-        Stats.incr_keyspace_misses()
+        Stats.incr_keyspace_misses(ctx)
         :miss
 
       :no_table ->
         # ETS table unavailable (shard restarting). Fall back to GenServer.
         result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
         if result != nil do
-          Stats.record_cold_read(key)
+          Stats.record_cold_read(ctx, key)
           {:cold_value, result}
         else
-          Stats.incr_keyspace_misses()
+          Stats.incr_keyspace_misses(ctx)
           :miss
         end
     end
@@ -698,7 +698,7 @@ defmodule Ferricstore.Store.Router do
 
         case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
           {:ok, value} ->
-            Stats.record_cold_read(key)
+            Stats.record_cold_read(ctx, key)
             # Warm ETS: promote back to hot if value fits in cache
             warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
             value
@@ -712,20 +712,20 @@ defmodule Ferricstore.Store.Router do
         result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
 
         if result != nil do
-          Stats.record_cold_read(key)
+          Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses()
+          Stats.incr_keyspace_misses(ctx)
         end
 
         result
 
       :expired ->
-        Stats.incr_keyspace_misses()
+        Stats.incr_keyspace_misses(ctx)
         nil
 
       :miss ->
         # Key not in ETS at all — doesn't exist. No GenServer needed.
-        Stats.incr_keyspace_misses()
+        Stats.incr_keyspace_misses(ctx)
         nil
 
       :no_table ->
@@ -733,9 +733,9 @@ defmodule Ferricstore.Store.Router do
         result = GenServer.call(resolve_shard(ctx, idx), {:get, key})
 
         if result != nil do
-          Stats.record_cold_read(key)
+          Stats.record_cold_read(ctx, key)
         else
-          Stats.incr_keyspace_misses()
+          Stats.incr_keyspace_misses(ctx)
         end
 
         result
@@ -787,7 +787,7 @@ defmodule Ferricstore.Store.Router do
 
         case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
           {:ok, value} ->
-            Stats.record_cold_read(key)
+            Stats.record_cold_read(ctx, key)
             warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
             {value, expire_at_ms}
 
@@ -797,19 +797,19 @@ defmodule Ferricstore.Store.Router do
 
       {:cold, _file_id, _offset, _value_size} ->
         # Invalid file ref — ask GenServer.
-        Stats.record_cold_read(key)
+        Stats.record_cold_read(ctx, key)
         GenServer.call(resolve_shard(ctx, idx), {:get_meta, key})
 
       :expired ->
-        Stats.incr_keyspace_misses()
+        Stats.incr_keyspace_misses(ctx)
         nil
 
       :miss ->
-        Stats.incr_keyspace_misses()
+        Stats.incr_keyspace_misses(ctx)
         nil
 
       :no_table ->
-        Stats.record_cold_read(key)
+        Stats.record_cold_read(ctx, key)
         GenServer.call(resolve_shard(ctx, idx), {:get_meta, key})
     end
   end
@@ -826,9 +826,9 @@ defmodule Ferricstore.Store.Router do
     rate = ctx.read_sample_rate
 
     if rate <= 1 or :rand.uniform(rate) == 1 do
-      Stats.incr_keyspace_hits()
-      LFU.touch(keydir, key, lfu)
-      Stats.record_hot_read(key)
+      Stats.incr_keyspace_hits(ctx)
+      LFU.touch(ctx, keydir, key, lfu)
+      Stats.record_hot_read(ctx, key)
     end
   end
 

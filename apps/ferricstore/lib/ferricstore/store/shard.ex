@@ -233,7 +233,7 @@ defmodule Ferricstore.Store.Shard do
     schedule_flush(flush_ms)
     schedule_expiry_sweep()
     schedule_frag_check()
-    max_file_size = :persistent_term.get(:ferricstore_max_active_file_size, @default_max_active_file_size)
+    max_file_size = if ctx, do: ctx.max_active_file_size, else: @default_max_active_file_size
 
     {:ok, %__MODULE__{ets: keydir, keydir: keydir,
                        index: index, data_dir: data_dir,
@@ -2696,8 +2696,8 @@ defmodule Ferricstore.Store.Shard do
   # Catches shards that accumulated dead data then stopped receiving writes.
   # Also clears disk pressure flag periodically so writes can probe recovery.
   def handle_info(:frag_check, state) do
-    if Ferricstore.Store.DiskPressure.under_pressure?(state.index) do
-      Ferricstore.Store.DiskPressure.clear(state.index)
+    if Ferricstore.Store.DiskPressure.under_pressure?(state.instance_ctx, state.index) do
+      Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
     end
 
     state = maybe_notify_fragmentation(state)
@@ -2893,7 +2893,7 @@ defmodule Ferricstore.Store.Shard do
 
     case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
       {:ok, locations} ->
-        Ferricstore.Store.DiskPressure.clear(state.index)
+        Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
         written = total_written(locations)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
@@ -2902,7 +2902,7 @@ defmodule Ferricstore.Store.Shard do
         maybe_notify_fragmentation(state)
 
       {:error, reason} ->
-        Ferricstore.Store.DiskPressure.set(state.index)
+        Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
         Logger.error("Shard #{state.index}: flush_pending (nosync) failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
         state
     end
@@ -2931,7 +2931,7 @@ defmodule Ferricstore.Store.Shard do
 
     case NIF.v2_append_batch(state.active_file_path, batch) do
       {:ok, locations} ->
-        Ferricstore.Store.DiskPressure.clear(state.index)
+        Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
         written = total_written(locations)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
@@ -2940,7 +2940,7 @@ defmodule Ferricstore.Store.Shard do
         maybe_notify_fragmentation(state)
 
       {:error, reason} ->
-        Ferricstore.Store.DiskPressure.set(state.index)
+        Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
         Logger.error("Shard #{state.index}: flush_pending_sync failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
         state
     end
@@ -3244,25 +3244,32 @@ defmodule Ferricstore.Store.Shard do
   # Values larger than :ferricstore_hot_cache_max_value_size are stored as
   # nil (cold) to avoid copying large binaries on every :ets.lookup.
   defp ets_insert(state, key, value, expire_at_ms) do
-    value_for_ets = value_for_ets(value)
+    threshold = hot_cache_threshold(state)
+    value_for_ets = value_for_ets(value, threshold)
     :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
   end
 
   # Inserts a key/value/expiry into the keydir with known disk location (v2).
   defp ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
-    value_for_ets = value_for_ets(value)
+    threshold = hot_cache_threshold(state)
+    value_for_ets = value_for_ets(value, threshold)
     :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), file_id, offset, value_size})
   end
+
+  # Returns the hot cache max value size threshold from instance ctx.
+  @compile {:inline, hot_cache_threshold: 1}
+  defp hot_cache_threshold(%{instance_ctx: ctx}) when ctx != nil, do: ctx.hot_cache_max_value_size
+  defp hot_cache_threshold(_state), do: 65_536
 
   # Returns nil for values exceeding the hot cache max value size threshold,
   # or the value itself if it fits. This prevents large values from being
   # stored in ETS, avoiding expensive binary copies on every :ets.lookup.
-  @compile {:inline, value_for_ets: 1}
-  defp value_for_ets(nil), do: nil
-  defp value_for_ets(value) when is_integer(value), do: Integer.to_string(value)
-  defp value_for_ets(value) when is_float(value), do: Float.to_string(value)
-  defp value_for_ets(value) when is_binary(value) do
-    if byte_size(value) > :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536) do
+  @compile {:inline, value_for_ets: 2}
+  defp value_for_ets(nil, _threshold), do: nil
+  defp value_for_ets(value, _threshold) when is_integer(value), do: Integer.to_string(value)
+  defp value_for_ets(value, _threshold) when is_float(value), do: Float.to_string(value)
+  defp value_for_ets(value, threshold) when is_binary(value) do
+    if byte_size(value) > threshold do
       nil
     else
       value
@@ -3434,7 +3441,7 @@ defmodule Ferricstore.Store.Shard do
 
         case NIF.v2_pread_at(p, off) do
           {:ok, value} ->
-            v = value_for_ets(value)
+            v = value_for_ets(value, hot_cache_threshold(state))
             :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
             value
 
@@ -3483,7 +3490,7 @@ defmodule Ferricstore.Store.Shard do
   # they stay cold (nil) in ETS to avoid expensive binary copies on read.
   # Under memory pressure, skip warming to prevent evict/re-promote thrashing.
   defp cold_read_warm_ets(state, key, value, exp, fid, off, vsize) do
-    v = value_for_ets(value)
+    v = value_for_ets(value, hot_cache_threshold(state))
 
     if v != nil and Ferricstore.MemoryGuard.skip_promotion?() do
       # Under pressure — don't re-cache, keep cold
@@ -3502,7 +3509,7 @@ defmodule Ferricstore.Store.Shard do
 
         case NIF.v2_pread_at(p, off) do
           {:ok, value} ->
-            v = value_for_ets(value)
+            v = value_for_ets(value, hot_cache_threshold(state))
             :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
             {value, exp}
 
@@ -3946,7 +3953,7 @@ defmodule Ferricstore.Store.Shard do
             live_entries
             |> Enum.zip(results)
             |> Enum.each(fn {{key, value, expire_at_ms}, {offset, value_size}} ->
-              value_for_ets = value_for_ets(value)
+              value_for_ets = value_for_ets(value, hot_cache_threshold(state))
               :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), new_fid, offset, value_size})
             end)
 

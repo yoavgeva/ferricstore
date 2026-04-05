@@ -30,6 +30,15 @@ defmodule Ferricstore.Store.DiskPressure do
     :ok
   end
 
+  @doc "Sets disk pressure flag for a shard using instance ctx."
+  @spec set(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def set(ctx, shard_index) do
+    ref = ctx.disk_pressure
+    size = :atomics.info(ref).size
+    if shard_index < size, do: :atomics.put(ref, shard_index + 1, 1)
+    :ok
+  end
+
   @spec clear(non_neg_integer()) :: :ok
   def clear(shard_index) do
     ref = :persistent_term.get(@pt_key)
@@ -38,9 +47,30 @@ defmodule Ferricstore.Store.DiskPressure do
     :ok
   end
 
+  @doc "Clears disk pressure flag for a shard using instance ctx."
+  @spec clear(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def clear(ctx, shard_index) do
+    ref = ctx.disk_pressure
+    size = :atomics.info(ref).size
+    if shard_index < size, do: :atomics.put(ref, shard_index + 1, 0)
+    :ok
+  end
+
   @spec under_pressure?(non_neg_integer()) :: boolean()
   def under_pressure?(shard_index) do
     ref = :persistent_term.get(@pt_key)
+    size = :atomics.info(ref).size
+    if shard_index < size do
+      :atomics.get(ref, shard_index + 1) == 1
+    else
+      false
+    end
+  end
+
+  @doc "Checks disk pressure for a shard using instance ctx."
+  @spec under_pressure?(FerricStore.Instance.t(), non_neg_integer()) :: boolean()
+  def under_pressure?(ctx, shard_index) do
+    ref = ctx.disk_pressure
     size = :atomics.info(ref).size
     if shard_index < size do
       :atomics.get(ref, shard_index + 1) == 1

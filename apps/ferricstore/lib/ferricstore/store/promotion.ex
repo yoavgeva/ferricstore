@@ -56,6 +56,15 @@ defmodule Ferricstore.Store.Promotion do
     ArgumentError -> Application.get_env(:ferricstore, :promotion_threshold, 100)
   end
 
+  @doc "Returns the promotion threshold from instance ctx."
+  @spec threshold(FerricStore.Instance.t()) :: non_neg_integer()
+  def threshold(_ctx) do
+    # The promotion threshold is not yet stored on the Instance struct,
+    # so delegate to the global version. This ctx variant exists for
+    # API consistency and can be updated when the field is added.
+    threshold()
+  end
+
   @spec dedicated_path(binary(), non_neg_integer(), atom(), binary()) :: binary()
   def dedicated_path(data_dir, shard_index, type, redis_key) do
     hash = :crypto.hash(:sha256, redis_key) |> Base.encode16(case: :lower)

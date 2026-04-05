@@ -1661,7 +1661,7 @@ defmodule FerricStore do
   @spec flushdb() :: :ok
   def flushdb do
     ctx = default_ctx()
-    shard_count = :persistent_term.get(:ferricstore_shard_count, 4)
+    shard_count = ctx.shard_count
 
     for i <- 0..(shard_count - 1) do
       shard = Router.shard_name(ctx, i)

@@ -151,23 +151,43 @@ defmodule Ferricstore.Stats do
   @doc "Increments the keyspace_hits counter by 1."
   @spec incr_keyspace_hits() :: :ok
   def incr_keyspace_hits, do: (:counters.add(counter_ref(), @counter_keyspace_hits, 1); :ok)
+  @doc "Increments the keyspace_hits counter using instance ctx."
+  @spec incr_keyspace_hits(FerricStore.Instance.t()) :: :ok
+  def incr_keyspace_hits(ctx), do: (:counters.add(ctx.stats_counter, @counter_keyspace_hits, 1); :ok)
   @doc "Increments the keyspace_misses counter by 1."
   @spec incr_keyspace_misses() :: :ok
   def incr_keyspace_misses, do: (:counters.add(counter_ref(), @counter_keyspace_misses, 1); :ok)
+  @doc "Increments the keyspace_misses counter using instance ctx."
+  @spec incr_keyspace_misses(FerricStore.Instance.t()) :: :ok
+  def incr_keyspace_misses(ctx), do: (:counters.add(ctx.stats_counter, @counter_keyspace_misses, 1); :ok)
   @doc "Returns the total number of successful key lookups since startup."
   @spec keyspace_hits() :: non_neg_integer()
   def keyspace_hits, do: :counters.get(counter_ref(), @counter_keyspace_hits)
+  @doc "Returns keyspace hits using instance ctx."
+  @spec keyspace_hits(FerricStore.Instance.t()) :: non_neg_integer()
+  def keyspace_hits(ctx), do: :counters.get(ctx.stats_counter, @counter_keyspace_hits)
   @doc "Returns the total number of failed key lookups since startup."
   @spec keyspace_misses() :: non_neg_integer()
   def keyspace_misses, do: :counters.get(counter_ref(), @counter_keyspace_misses)
+  @doc "Returns keyspace misses using instance ctx."
+  @spec keyspace_misses(FerricStore.Instance.t()) :: non_neg_integer()
+  def keyspace_misses(ctx), do: :counters.get(ctx.stats_counter, @counter_keyspace_misses)
   @doc "Increments the expired_keys counter by `count`."
   @spec incr_expired_keys(non_neg_integer()) :: :ok
   def incr_expired_keys(0), do: :ok
   def incr_expired_keys(count) when is_integer(count) and count > 0, do: (:counters.add(counter_ref(), @counter_expired_keys, count); :ok)
+  @doc "Increments the expired_keys counter using instance ctx."
+  @spec incr_expired_keys(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def incr_expired_keys(_ctx, 0), do: :ok
+  def incr_expired_keys(ctx, count) when is_integer(count) and count > 0, do: (:counters.add(ctx.stats_counter, @counter_expired_keys, count); :ok)
   @doc "Increments the evicted_keys counter by `count`."
   @spec incr_evicted_keys(non_neg_integer()) :: :ok
   def incr_evicted_keys(0), do: :ok
   def incr_evicted_keys(count) when is_integer(count) and count > 0, do: (:counters.add(counter_ref(), @counter_evicted_keys, count); :ok)
+  @doc "Increments the evicted_keys counter using instance ctx."
+  @spec incr_evicted_keys(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def incr_evicted_keys(_ctx, 0), do: :ok
+  def incr_evicted_keys(ctx, count) when is_integer(count) and count > 0, do: (:counters.add(ctx.stats_counter, @counter_evicted_keys, count); :ok)
   @doc "Returns expired keys count."
   @spec expired_keys() :: non_neg_integer()
   def expired_keys, do: :counters.get(counter_ref(), @counter_expired_keys)
@@ -211,6 +231,16 @@ defmodule Ferricstore.Stats do
     :ok
   end
 
+  @doc "Records a hot read using instance ctx."
+  @spec record_hot_read(FerricStore.Instance.t(), binary()) :: :ok
+  def record_hot_read(ctx, key) when is_binary(key) do
+    :counters.add(ctx.stats_counter, @counter_hot_reads, 1)
+    prefix = extract_prefix(key)
+    resolved = resolve_prefix(prefix)
+    update_hotness(resolved, :hot)
+    :ok
+  end
+
   @doc """
   Records a cold read (Bitcask disk fallback) for the given key.
 
@@ -224,6 +254,16 @@ defmodule Ferricstore.Stats do
   @spec record_cold_read(binary()) :: :ok
   def record_cold_read(key) when is_binary(key) do
     :counters.add(counter_ref(), @counter_cold_reads, 1)
+    prefix = extract_prefix(key)
+    resolved = resolve_prefix(prefix)
+    update_hotness(resolved, :cold)
+    :ok
+  end
+
+  @doc "Records a cold read using instance ctx."
+  @spec record_cold_read(FerricStore.Instance.t(), binary()) :: :ok
+  def record_cold_read(ctx, key) when is_binary(key) do
+    :counters.add(ctx.stats_counter, @counter_cold_reads, 1)
     prefix = extract_prefix(key)
     resolved = resolve_prefix(prefix)
     update_hotness(resolved, :cold)

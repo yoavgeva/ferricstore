@@ -901,7 +901,7 @@ defmodule Ferricstore.Raft.StateMachine do
       end
 
     local_put = fn key, value, expire_at_ms ->
-      value_for = value_for_ets(value)
+      value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
       disk_val = to_disk_binary(value)
       :ets.insert(ctx.keydir, {key, value_for, expire_at_ms, LFU.initial(), 0, 0, 0})
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
@@ -1481,7 +1481,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp do_put(state, key, value, expire_at_ms) do
-    ets_val = value_for_ets(value)
+    ets_val = value_for_ets(value, hot_cache_threshold(state))
     disk_val = to_disk_binary(value)
 
     # Insert into ETS immediately so subsequent read-modify-write commands
@@ -1515,7 +1515,11 @@ defmodule Ferricstore.Raft.StateMachine do
 
         case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
           {:ok, locations} ->
-            Ferricstore.Store.DiskPressure.clear(state.shard_index)
+            if state.instance_ctx do
+              Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.shard_index)
+            else
+              Ferricstore.Store.DiskPressure.clear(state.shard_index)
+            end
 
             Enum.zip(batch, locations)
             |> Enum.each(fn {{key, _val, _exp}, {offset, value_size}} ->
@@ -1534,7 +1538,11 @@ defmodule Ferricstore.Raft.StateMachine do
             end)
 
           {:error, reason} ->
-            Ferricstore.Store.DiskPressure.set(state.shard_index)
+            if state.instance_ctx do
+              Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.shard_index)
+            else
+              Ferricstore.Store.DiskPressure.set(state.shard_index)
+            end
             require Logger
             Logger.error("StateMachine flush_pending_writes failed: #{inspect(reason)}")
         end
@@ -1590,17 +1598,21 @@ defmodule Ferricstore.Raft.StateMachine do
   # Returns nil for values exceeding the hot cache max value size threshold,
   # or the value itself if it fits. Prevents large values from being stored
   # in ETS, avoiding expensive binary copies on every :ets.lookup.
-  @compile {:inline, value_for_ets: 1}
-  defp value_for_ets(nil), do: nil
-  defp value_for_ets(value) when is_integer(value), do: Integer.to_string(value)
-  defp value_for_ets(value) when is_float(value), do: Float.to_string(value)
-  defp value_for_ets(value) when is_binary(value) do
-    if byte_size(value) > :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536) do
+  @compile {:inline, value_for_ets: 2}
+  defp value_for_ets(nil, _threshold), do: nil
+  defp value_for_ets(value, _threshold) when is_integer(value), do: Integer.to_string(value)
+  defp value_for_ets(value, _threshold) when is_float(value), do: Float.to_string(value)
+  defp value_for_ets(value, threshold) when is_binary(value) do
+    if byte_size(value) > threshold do
       nil
     else
       value
     end
   end
+
+  @compile {:inline, hot_cache_threshold: 1}
+  defp hot_cache_threshold(%{instance_ctx: ctx}) when ctx != nil, do: ctx.hot_cache_max_value_size
+  defp hot_cache_threshold(_state), do: 65_536
 
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
   defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
@@ -2070,7 +2082,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
     case NIF.v2_pread_at(path, off) do
       {:ok, value} when is_binary(value) ->
-        v = value_for_ets(value)
+        v = value_for_ets(value, hot_cache_threshold(state))
         :ets.insert(state.ets, {key, v, expire_at_ms, LFU.initial(), fid, off, byte_size(value)})
         {:hit, value, expire_at_ms}
 

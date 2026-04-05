@@ -52,12 +52,33 @@ defmodule Ferricstore.Store.WriteVersion do
     :ok
   end
 
+  @doc "Atomically increments the write version using instance ctx."
+  @spec increment(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def increment(ctx, shard_index) do
+    ref = ctx.write_version
+    size = :counters.info(ref).size
+    if shard_index < size, do: :counters.add(ref, shard_index + 1, 1)
+    :ok
+  end
+
   @doc """
   Returns the current write version for `shard_index`.
   """
   @spec get(non_neg_integer()) :: non_neg_integer()
   def get(shard_index) do
     ref = :persistent_term.get(@pt_key)
+    size = :counters.info(ref).size
+    if shard_index < size do
+      :counters.get(ref, shard_index + 1)
+    else
+      0
+    end
+  end
+
+  @doc "Returns the current write version using instance ctx."
+  @spec get(FerricStore.Instance.t(), non_neg_integer()) :: non_neg_integer()
+  def get(ctx, shard_index) do
+    ref = ctx.write_version
     size = :counters.info(ref).size
     if shard_index < size do
       :counters.get(ref, shard_index + 1)

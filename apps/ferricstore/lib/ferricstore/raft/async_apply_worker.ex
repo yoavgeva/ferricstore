@@ -479,7 +479,10 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   @compile {:inline, value_for_ets: 1}
   defp value_for_ets(nil), do: nil
   defp value_for_ets(value) when is_binary(value) do
-    if byte_size(value) > :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536) do
+    ctx = FerricStore.Instance.get(:default)
+    threshold = if ctx, do: ctx.hot_cache_max_value_size, else: 65_536
+
+    if byte_size(value) > threshold do
       nil
     else
       value

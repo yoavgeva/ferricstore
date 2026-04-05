@@ -169,7 +169,7 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec reject_writes?() :: boolean()
   def reject_writes? do
-    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    ref = FerricStore.Instance.get(:default).pressure_flags
     :atomics.get(ref, 2) == 1
   end
 
@@ -185,7 +185,7 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec keydir_full?() :: boolean()
   def keydir_full? do
-    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    ref = FerricStore.Instance.get(:default).pressure_flags
     :atomics.get(ref, 1) == 1
   end
 
@@ -194,7 +194,7 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec set_keydir_full(boolean()) :: :ok
   def set_keydir_full(value) do
-    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    ref = FerricStore.Instance.get(:default).pressure_flags
     :atomics.put(ref, 1, if(value, do: 1, else: 0))
     :ok
   end
@@ -204,7 +204,7 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec set_reject_writes(boolean()) :: :ok
   def set_reject_writes(value) do
-    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    ref = FerricStore.Instance.get(:default).pressure_flags
     :atomics.put(ref, 2, if(value, do: 1, else: 0))
     :ok
   end
@@ -218,7 +218,7 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec skip_promotion?() :: boolean()
   def skip_promotion? do
-    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    ref = FerricStore.Instance.get(:default).pressure_flags
     :atomics.get(ref, 3) == 1
   end
 
@@ -227,7 +227,7 @@ defmodule Ferricstore.MemoryGuard do
   """
   @spec set_skip_promotion(boolean()) :: :ok
   def set_skip_promotion(value) do
-    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    ref = FerricStore.Instance.get(:default).pressure_flags
     :atomics.put(ref, 3, if(value, do: 1, else: 0))
     :ok
   end
@@ -410,7 +410,7 @@ defmodule Ferricstore.MemoryGuard do
     end
 
     # Publish pressure levels to atomics for lock-free hot-path reads.
-    ref = :persistent_term.get(:ferricstore_pressure_flags)
+    ref = FerricStore.Instance.get(:default).pressure_flags
     # Slot 1: keydir_full — reject new key writes (only at :reject)
     :atomics.put(ref, 1, if(stats.keydir_pressure_level == :reject, do: 1, else: 0))
     # Slot 2: reject_writes — reject ALL writes (only :reject + :noeviction)
