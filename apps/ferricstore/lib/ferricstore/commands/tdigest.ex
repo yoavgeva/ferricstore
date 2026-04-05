@@ -35,6 +35,7 @@ defmodule Ferricstore.Commands.TDigest do
     * `TDIGEST.MERGE destkey numkeys src [src ...] [COMPRESSION c] [OVERRIDE]`
   """
 
+  alias Ferricstore.Store.Ops
   alias Ferricstore.TDigest.Core
 
   @doc """
@@ -58,7 +59,7 @@ defmodule Ferricstore.Commands.TDigest do
   # ---------------------------------------------------------------------------
 
   def handle("TDIGEST.CREATE", [key], store) do
-    if store.exists?.(key) do
+    if Ops.exists?(store, key) do
       {:error, "ERR TDIGEST: key already exists"}
     else
       digest = Core.new(100)
@@ -69,7 +70,7 @@ defmodule Ferricstore.Commands.TDigest do
 
   def handle("TDIGEST.CREATE", [key, "COMPRESSION", comp_str], store) do
     with {:ok, compression} <- parse_pos_integer(comp_str, "compression") do
-      if store.exists?.(key) do
+      if Ops.exists?(store, key) do
         {:error, "ERR TDIGEST: key already exists"}
       else
         digest = Core.new(compression)
@@ -323,7 +324,7 @@ defmodule Ferricstore.Commands.TDigest do
   # ===========================================================================
 
   defp get_digest(store, key) do
-    case store.get.(key) do
+    case Ops.get(store, key) do
       nil ->
         if key_held_by_other_registry?(key, store) do
           {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
@@ -357,7 +358,7 @@ defmodule Ferricstore.Commands.TDigest do
 
   defp persist!(key, %Core{} = digest, store) do
     encoded = serialize(digest)
-    store.put.(key, :erlang.term_to_binary(encoded), 0)
+    Ops.put(store, key, :erlang.term_to_binary(encoded), 0)
   end
 
   defp serialize(%Core{} = digest) do

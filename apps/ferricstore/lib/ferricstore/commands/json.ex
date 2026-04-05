@@ -35,6 +35,8 @@ defmodule Ferricstore.Commands.Json do
     * `JSON.MGET key [key ...] path` -- get value at path from multiple keys
   """
 
+  alias Ferricstore.Store.Ops
+
   @doc """
   Handles a JSON command.
 
@@ -329,8 +331,8 @@ defmodule Ferricstore.Commands.Json do
 
   # Deletes the entire key if it holds a JSON value.
   defp do_json_del_root(key, store) do
-    if store.exists?.(key) and match?({:ok, _}, read_json(key, store)) do
-      store.delete.(key)
+    if Ops.exists?(store, key) and match?({:ok, _}, read_json(key, store)) do
+      Ops.delete(store, key)
       1
     else
       0
@@ -465,7 +467,7 @@ defmodule Ferricstore.Commands.Json do
   # ===========================================================================
 
   defp do_json_set(key, "$", new_value, nx?, xx?, store) do
-    key_exists? = store.exists?.(key)
+    key_exists? = Ops.exists?(store, key)
 
     if blocked_by_flags?(nx?, xx?, key_exists?) do
       nil
@@ -551,7 +553,7 @@ defmodule Ferricstore.Commands.Json do
   # Reads a JSON value from the store. Returns {:ok, decoded}, nil, or {:error, msg}.
   @spec read_json(binary(), map()) :: {:ok, term()} | nil | {:error, binary()}
   defp read_json(key, store) do
-    case store.get.(key) do
+    case Ops.get(store, key) do
       nil -> nil
       raw -> decode_raw_json(raw)
     end
@@ -585,7 +587,7 @@ defmodule Ferricstore.Commands.Json do
   defp write_json(key, value, store) do
     json_str = Jason.encode!(value)
     raw = :erlang.term_to_binary({:json, json_str})
-    store.put.(key, raw, 0)
+    Ops.put(store, key, raw, 0)
   end
 
   # Decodes a stored binary. JSON values are stored as `:erlang.term_to_binary({:json, str})`.

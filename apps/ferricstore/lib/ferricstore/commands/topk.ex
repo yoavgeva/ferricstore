@@ -8,6 +8,7 @@ defmodule Ferricstore.Commands.TopK do
   """
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.Ops
 
   @default_width 8
   @default_depth 7
@@ -213,7 +214,7 @@ defmodule Ferricstore.Commands.TopK do
           if is_nil(Map.get(store, :prob_write)) do
             path = prob_path(store, key, "topk")
             meta = {:topk_path, path}
-            store.put.(key, meta, 0)
+            Ops.put(store, key, meta, 0)
           end
           :ok
 
@@ -221,7 +222,7 @@ defmodule Ferricstore.Commands.TopK do
           if is_nil(Map.get(store, :prob_write)) do
             path = prob_path(store, key, "topk")
             meta = {:topk_path, path}
-            store.put.(key, meta, 0)
+            Ops.put(store, key, meta, 0)
           end
           :ok
 
@@ -232,7 +233,7 @@ defmodule Ferricstore.Commands.TopK do
   end
 
   defp check_not_exists(key, store) do
-    if store.exists?.(key), do: {:error, "ERR item already exists"}, else: :ok
+    if Ops.exists?(store, key), do: {:error, "ERR item already exists"}, else: :ok
   end
 
   defp prob_path(store, key, ext) do

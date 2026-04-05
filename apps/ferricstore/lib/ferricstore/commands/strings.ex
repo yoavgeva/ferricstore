@@ -1,5 +1,6 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Strings do
+  alias Ferricstore.Store.Ops
   @moduledoc """
   Handles Redis string commands.
 
@@ -70,12 +71,12 @@ defmodule Ferricstore.Commands.Strings do
   def handle("GET", [key], _store) when byte_size(key) > 65_535, do: {:error, "ERR key too large"}
 
   def handle("GET", [key], store) do
-    case store.get.(key) do
+    case Ops.get(store, key) do
       nil ->
         # Plain key is nil. Check if this is a data structure key (compound keys).
         if is_map_key(store, :compound_get) do
           type_key = Ferricstore.Store.CompoundKey.type_key(key)
-          case store.compound_get.(key, type_key) do
+          case Ops.compound_get(store, key, type_key) do
             nil -> nil
             _type_str -> @wrongtype_error
           end
@@ -115,11 +116,11 @@ defmodule Ferricstore.Commands.Strings do
 
   def handle("EXISTS", keys, store) do
     Enum.reduce(keys, 0, fn key, acc ->
-      exists = store.exists?.(key)
+      exists = Ops.exists?(store, key)
       # Also check TypeRegistry for compound-key-based data structures
       # (lists, hashes, sets, zsets) that don't use the plain key store.
       exists = exists or (is_map_key(store, :compound_get) and
-        store.compound_get.(key, Ferricstore.Store.CompoundKey.type_key(key)) != nil)
+        Ops.compound_get(store, key, Ferricstore.Store.CompoundKey.type_key(key)) != nil)
       if exists, do: acc + 1, else: acc
     end)
   end
@@ -128,7 +129,7 @@ defmodule Ferricstore.Commands.Strings do
     {:error, "ERR wrong number of arguments for 'mget' command"}
   end
 
-  def handle("MGET", keys, store), do: Enum.map(keys, &store.get.(&1))
+  def handle("MGET", keys, store), do: Enum.map(keys, &Ops.get(store, &1))
 
   def handle("MSET", [], _store) do
     {:error, "ERR wrong number of arguments for 'mset' command"}
@@ -154,10 +155,10 @@ defmodule Ferricstore.Commands.Strings do
   # INCR / DECR / INCRBY / DECRBY
   # ---------------------------------------------------------------------------
 
-  def handle("INCR", [key], store), do: store.incr.(key, 1)
+  def handle("INCR", [key], store), do: Ops.incr(store, key, 1)
   def handle("INCR", _args, _store), do: {:error, "ERR wrong number of arguments for 'incr' command"}
 
-  def handle("DECR", [key], store), do: store.incr.(key, -1)
+  def handle("DECR", [key], store), do: Ops.incr(store, key, -1)
   def handle("DECR", _args, _store), do: {:error, "ERR wrong number of arguments for 'decr' command"}
 
   # Redis range: [-2^63, 2^63-1] for integer operations.
@@ -167,7 +168,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("INCRBY", [key, delta_str], store) do
     case Integer.parse(delta_str) do
       {delta, ""} when delta >= @min_int64 and delta <= @max_int64 ->
-        store.incr.(key, delta)
+        Ops.incr(store, key, delta)
 
       {_delta, ""} ->
         {:error, "ERR value is not an integer or out of range"}
@@ -183,7 +184,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("DECRBY", [key, delta_str], store) do
     case Integer.parse(delta_str) do
       {delta, ""} when delta >= @min_int64 and delta <= @max_int64 ->
-        store.incr.(key, -delta)
+        Ops.incr(store, key, -delta)
 
       {_delta, ""} ->
         {:error, "ERR value is not an integer or out of range"}
@@ -203,7 +204,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("INCRBYFLOAT", [key, delta_str], store) do
     case parse_float_arg(delta_str) do
       {:ok, delta} ->
-        case store.incr_float.(key, delta) do
+        case Ops.incr_float(store, key, delta) do
           {:ok, new_val} when is_float(new_val) ->
             Ferricstore.Store.ValueCodec.format_float(new_val)
           {:ok, new_str} when is_binary(new_str) -> new_str
@@ -223,7 +224,7 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("APPEND", [key, value], store) do
-    {:ok, new_len} = store.append.(key, value)
+    {:ok, new_len} = Ops.append(store, key, value)
     new_len
   end
 
@@ -235,7 +236,7 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("STRLEN", [key], store) do
-    case store.get.(key) do
+    case Ops.get(store, key) do
       nil -> 0
       v when is_integer(v) -> byte_size(Integer.to_string(v))
       v when is_float(v) -> byte_size(Float.to_string(v))
@@ -250,7 +251,7 @@ defmodule Ferricstore.Commands.Strings do
   # GETSET (deprecated but supported)
   # ---------------------------------------------------------------------------
 
-  def handle("GETSET", [key, value], store), do: store.getset.(key, value)
+  def handle("GETSET", [key, value], store), do: Ops.getset(store, key, value)
 
   def handle("GETSET", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'getset' command"}
@@ -259,7 +260,7 @@ defmodule Ferricstore.Commands.Strings do
   # GETDEL
   # ---------------------------------------------------------------------------
 
-  def handle("GETDEL", [key], store), do: store.getdel.(key)
+  def handle("GETDEL", [key], store), do: Ops.getdel(store, key)
 
   def handle("GETDEL", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'getdel' command"}
@@ -268,7 +269,7 @@ defmodule Ferricstore.Commands.Strings do
   # GETEX
   # ---------------------------------------------------------------------------
 
-  def handle("GETEX", [key], store), do: store.get.(key)
+  def handle("GETEX", [key], store), do: Ops.get(store, key)
 
   def handle("GETEX", [key | opts], store), do: do_getex(key, opts, store)
 
@@ -280,7 +281,7 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("SETNX", [key, value], store) do
-    if store.exists?.(key), do: 0, else: (store.put.(key, value, 0); 1)
+    if Ops.exists?(store, key), do: 0, else: (Ops.put(store, key, value, 0); 1)
   end
 
   def handle("SETNX", _args, _store),
@@ -294,7 +295,7 @@ defmodule Ferricstore.Commands.Strings do
     case Integer.parse(secs_str) do
       {secs, ""} when secs > 0 ->
         expire_at_ms = Ferricstore.HLC.now_ms() + secs * 1_000
-        store.put.(key, value, expire_at_ms)
+        Ops.put(store, key, value, expire_at_ms)
 
       {_secs, ""} ->
         {:error, "ERR invalid expire time in 'setex' command"}
@@ -315,7 +316,7 @@ defmodule Ferricstore.Commands.Strings do
     case Integer.parse(ms_str) do
       {ms, ""} when ms > 0 ->
         expire_at_ms = Ferricstore.HLC.now_ms() + ms
-        store.put.(key, value, expire_at_ms)
+        Ops.put(store, key, value, expire_at_ms)
 
       {_ms, ""} ->
         {:error, "ERR invalid expire time in 'psetex' command"}
@@ -335,7 +336,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("GETRANGE", [key, start_str, end_str], store) do
     with {start_idx, ""} <- Integer.parse(start_str),
          {end_idx, ""} <- Integer.parse(end_str) do
-      case store.get.(key) do
+      case Ops.get(store, key) do
         nil -> ""
         v when is_integer(v) -> do_getrange(Integer.to_string(v), start_idx, end_idx)
         v when is_float(v) -> do_getrange(Float.to_string(v), start_idx, end_idx)
@@ -359,7 +360,7 @@ defmodule Ferricstore.Commands.Strings do
   def handle("SETRANGE", [key, offset_str, value], store) do
     case Integer.parse(offset_str) do
       {offset, ""} when offset >= 0 and offset <= @max_setrange_offset ->
-        {:ok, new_len} = store.setrange.(key, offset, value)
+        {:ok, new_len} = Ops.setrange(store, key, offset, value)
         new_len
 
       {offset, ""} when offset > @max_setrange_offset ->
@@ -404,7 +405,7 @@ defmodule Ferricstore.Commands.Strings do
   defp do_getex(key, opts, store) do
     case parse_getex_opts(opts) do
       {:ok, expire_at_ms} ->
-        store.getex.(key, expire_at_ms)
+        Ops.getex(store, key, expire_at_ms)
 
       {:error, _} = err ->
         err
@@ -532,7 +533,7 @@ defmodule Ferricstore.Commands.Strings do
       # and the old value for GET (to return it).
       {old_value, effective_expire} =
         if get? or keepttl? do
-          case store.get_meta.(key) do
+          case Ops.get_meta(store, key) do
             nil ->
               {nil, expire_at_ms}
 
@@ -548,8 +549,8 @@ defmodule Ferricstore.Commands.Strings do
       # Condition check: NX (only if not exists) / XX (only if exists)
       skip? =
         cond do
-          nx? and store.exists?.(key) -> true
-          xx? and not store.exists?.(key) -> true
+          nx? and Ops.exists?(store, key) -> true
+          xx? and not Ops.exists?(store, key) -> true
           true -> false
         end
 
@@ -557,7 +558,7 @@ defmodule Ferricstore.Commands.Strings do
         # When GET is set, return old value even if NX/XX prevented the write
         if get?, do: old_value, else: nil
       else
-        store.put.(key, value, effective_expire)
+        Ops.put(store, key, value, effective_expire)
         if get?, do: old_value, else: :ok
       end
     end
@@ -676,7 +677,7 @@ defmodule Ferricstore.Commands.Strings do
   defp mset_exec([], _store), do: :ok
 
   defp mset_exec([k, v | rest], store) do
-    store.put.(k, v, 0)
+    Ops.put(store, k, v, 0)
     mset_exec(rest, store)
   end
 
@@ -684,7 +685,7 @@ defmodule Ferricstore.Commands.Strings do
   defp msetnx_any_exists?([], _store), do: false
 
   defp msetnx_any_exists?([k, _v | rest], store) do
-    if store.exists?.(k), do: true, else: msetnx_any_exists?(rest, store)
+    if Ops.exists?(store, k), do: true, else: msetnx_any_exists?(rest, store)
   end
 
   # O(n/2) parity check without computing full length.
@@ -761,11 +762,11 @@ defmodule Ferricstore.Commands.Strings do
     if has_compound? do
       type_key = CompoundKey.type_key(key)
 
-      case store.compound_get.(key, type_key) do
+      case Ops.compound_get(store, key, type_key) do
         nil ->
           # No type metadata -- plain string key
-          if store.exists?.(key) do
-            store.delete.(key)
+          if Ops.exists?(store, key) do
+            Ops.delete(store, key)
             true
           else
             false
@@ -783,17 +784,17 @@ defmodule Ferricstore.Commands.Strings do
               "zset" -> CompoundKey.zset_prefix(key)
             end
 
-          store.compound_delete_prefix.(key, prefix)
+          Ops.compound_delete_prefix(store, key, prefix)
           if type_str == "list" do
             meta_key = CompoundKey.list_meta_key(key)
-            store.compound_delete.(key, meta_key)
+            Ops.compound_delete(store, key, meta_key)
           end
           TypeRegistry.delete_type(key, store)
           true
       end
     else
-      if store.exists?.(key) do
-        store.delete.(key)
+      if Ops.exists?(store, key) do
+        Ops.delete(store, key)
         true
       else
         false

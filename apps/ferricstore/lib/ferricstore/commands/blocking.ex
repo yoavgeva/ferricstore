@@ -200,6 +200,8 @@ defmodule Ferricstore.Commands.Blocking do
 
   defp parse_blmpop_count(_), do: {:error, "ERR syntax error"}
 
+  alias Ferricstore.Store.Ops
+
   # Simple non-blocking handle/3 for commands dispatched from connection.ex.
   # Returns the result immediately without blocking (timeout=0 behavior).
   @spec handle(binary(), [binary()], map()) :: term()
@@ -207,9 +209,9 @@ defmodule Ferricstore.Commands.Blocking do
     case parse_blpop_args(args) do
       {:ok, keys, _timeout_ms} ->
         result = Enum.find_value(keys, fn key ->
-          case store.get.(key) do
+          case Ops.get(store, key) do
             nil -> nil
-            _val -> {key, store.get.(key)}
+            _val -> {key, Ops.get(store, key)}
           end
         end)
         if result, do: Tuple.to_list(result), else: nil

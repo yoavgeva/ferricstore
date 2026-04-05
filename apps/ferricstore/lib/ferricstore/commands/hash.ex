@@ -26,6 +26,7 @@ defmodule Ferricstore.Commands.Hash do
   """
 
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
 
   @doc """
@@ -71,7 +72,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HGET", [key, field], store) do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       compound_key = CompoundKey.hash_field(key, field)
-      store.compound_get.(key, compound_key)
+      Ops.compound_get(store, key, compound_key)
     end
   end
 
@@ -89,8 +90,8 @@ defmodule Ferricstore.Commands.Hash do
         Enum.reduce(fields, 0, fn field, acc ->
           compound_key = CompoundKey.hash_field(key, field)
 
-          if store.compound_get.(key, compound_key) != nil do
-            store.compound_delete.(key, compound_key)
+          if Ops.compound_get(store, key, compound_key) != nil do
+            Ops.compound_delete(store, key, compound_key)
             acc + 1
           else
             acc
@@ -114,7 +115,7 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       Enum.map(fields, fn field ->
         compound_key = CompoundKey.hash_field(key, field)
-        store.compound_get.(key, compound_key)
+        Ops.compound_get(store, key, compound_key)
       end)
     end
   end
@@ -130,7 +131,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HGETALL", [key], store) do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       prefix = CompoundKey.hash_prefix(key)
-      pairs = store.compound_scan.(key, prefix)
+      pairs = Ops.compound_scan(store, key, prefix)
 
       # Return flat list [field1, value1, field2, value2, ...]
       Enum.flat_map(pairs, fn {field, value} -> [field, value] end)
@@ -148,7 +149,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HLEN", [key], store) do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       prefix = CompoundKey.hash_prefix(key)
-      store.compound_count.(key, prefix)
+      Ops.compound_count(store, key, prefix)
     end
   end
 
@@ -164,7 +165,7 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       compound_key = CompoundKey.hash_field(key, field)
 
-      if store.compound_get.(key, compound_key) != nil do
+      if Ops.compound_get(store, key, compound_key) != nil do
         1
       else
         0
@@ -183,7 +184,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HKEYS", [key], store) do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       prefix = CompoundKey.hash_prefix(key)
-      pairs = store.compound_scan.(key, prefix)
+      pairs = Ops.compound_scan(store, key, prefix)
       Enum.map(pairs, fn {field, _value} -> field end)
     end
   end
@@ -199,7 +200,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HVALS", [key], store) do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       prefix = CompoundKey.hash_prefix(key)
-      pairs = store.compound_scan.(key, prefix)
+      pairs = Ops.compound_scan(store, key, prefix)
       Enum.map(pairs, fn {_field, value} -> value end)
     end
   end
@@ -216,10 +217,10 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
       compound_key = CompoundKey.hash_field(key, field)
 
-      if store.compound_get.(key, compound_key) != nil do
+      if Ops.compound_get(store, key, compound_key) != nil do
         0
       else
-        store.compound_put.(key, compound_key, value, 0)
+        Ops.compound_put(store, key, compound_key, value, 0)
         1
       end
     end
@@ -256,13 +257,13 @@ defmodule Ferricstore.Commands.Hash do
       case Float.parse(increment_str) do
         {increment, ""} ->
           compound_key = CompoundKey.hash_field(key, field)
-          current = store.compound_get.(key, compound_key)
+          current = Ops.compound_get(store, key, compound_key)
 
           case parse_float_value(current) do
             {:ok, current_float} ->
               new_val = current_float + increment
               result_str = format_float(new_val)
-              store.compound_put.(key, compound_key, result_str, 0)
+              Ops.compound_put(store, key, compound_key, result_str, 0)
               result_str
 
             :error ->
@@ -295,12 +296,12 @@ defmodule Ferricstore.Commands.Hash do
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
 
-          case store.compound_get_meta.(key, compound_key) do
+          case Ops.compound_get_meta(store, key, compound_key) do
             nil ->
               -2
 
             {value, _old_expire} ->
-              store.compound_put.(key, compound_key, value, expire_at_ms)
+              Ops.compound_put(store, key, compound_key, value, expire_at_ms)
               1
           end
         end)
@@ -327,7 +328,7 @@ defmodule Ferricstore.Commands.Hash do
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
 
-          case store.compound_get_meta.(key, compound_key) do
+          case Ops.compound_get_meta(store, key, compound_key) do
             nil ->
               -2
 
@@ -360,7 +361,7 @@ defmodule Ferricstore.Commands.Hash do
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
 
-          case store.compound_get_meta.(key, compound_key) do
+          case Ops.compound_get_meta(store, key, compound_key) do
             nil ->
               -2
 
@@ -368,7 +369,7 @@ defmodule Ferricstore.Commands.Hash do
               -1
 
             {value, _expire_at_ms} ->
-              store.compound_put.(key, compound_key, value, 0)
+              Ops.compound_put(store, key, compound_key, value, 0)
               1
           end
         end)
@@ -396,12 +397,12 @@ defmodule Ferricstore.Commands.Hash do
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
 
-          case store.compound_get_meta.(key, compound_key) do
+          case Ops.compound_get_meta(store, key, compound_key) do
             nil ->
               -2
 
             {value, _old_expire} ->
-              store.compound_put.(key, compound_key, value, expire_at_ms)
+              Ops.compound_put(store, key, compound_key, value, expire_at_ms)
               1
           end
         end)
@@ -428,7 +429,7 @@ defmodule Ferricstore.Commands.Hash do
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
 
-          case store.compound_get_meta.(key, compound_key) do
+          case Ops.compound_get_meta(store, key, compound_key) do
             nil ->
               -2
 
@@ -461,7 +462,7 @@ defmodule Ferricstore.Commands.Hash do
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
 
-          case store.compound_get_meta.(key, compound_key) do
+          case Ops.compound_get_meta(store, key, compound_key) do
             nil ->
               -2
 
@@ -494,12 +495,12 @@ defmodule Ferricstore.Commands.Hash do
           Enum.map(fields, fn field ->
             compound_key = CompoundKey.hash_field(key, field)
 
-            case store.compound_get.(key, compound_key) do
+            case Ops.compound_get(store, key, compound_key) do
               nil ->
                 nil
 
               value ->
-                store.compound_delete.(key, compound_key)
+                Ops.compound_delete(store, key, compound_key)
                 value
             end
           end)
@@ -532,12 +533,12 @@ defmodule Ferricstore.Commands.Hash do
             Enum.map(fields, fn field ->
               compound_key = CompoundKey.hash_field(key, field)
 
-              case store.compound_get_meta.(key, compound_key) do
+              case Ops.compound_get_meta(store, key, compound_key) do
                 nil ->
                   nil
 
                 {value, _old_expire} ->
-                  store.compound_put.(key, compound_key, value, expire_at_ms)
+                  Ops.compound_put(store, key, compound_key, value, expire_at_ms)
                   value
               end
             end)
@@ -556,12 +557,12 @@ defmodule Ferricstore.Commands.Hash do
         Enum.map(fields, fn field ->
           compound_key = CompoundKey.hash_field(key, field)
 
-          case store.compound_get_meta.(key, compound_key) do
+          case Ops.compound_get_meta(store, key, compound_key) do
             nil ->
               nil
 
             {value, _old_expire} ->
-              store.compound_put.(key, compound_key, value, 0)
+              Ops.compound_put(store, key, compound_key, value, 0)
               value
           end
         end)
@@ -606,7 +607,7 @@ defmodule Ferricstore.Commands.Hash do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       compound_key = CompoundKey.hash_field(key, field)
 
-      case store.compound_get.(key, compound_key) do
+      case Ops.compound_get(store, key, compound_key) do
         nil -> 0
         value -> byte_size(value)
       end
@@ -626,7 +627,7 @@ defmodule Ferricstore.Commands.Hash do
          {:ok, cursor} <- parse_cursor(cursor_str),
          {:ok, match_pattern, count} <- parse_hscan_opts(opts) do
       prefix = CompoundKey.hash_prefix(key)
-      pairs = store.compound_scan.(key, prefix)
+      pairs = Ops.compound_scan(store, key, prefix)
 
       filtered =
         case match_pattern do
@@ -658,7 +659,7 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HRANDFIELD", [key], store) do
     with :ok <- TypeRegistry.check_type(key, :hash, store) do
       prefix = CompoundKey.hash_prefix(key)
-      pairs = store.compound_scan.(key, prefix)
+      pairs = Ops.compound_scan(store, key, prefix)
 
       case pairs do
         [] -> nil
@@ -674,7 +675,7 @@ defmodule Ferricstore.Commands.Hash do
       case Integer.parse(count_str) do
         {count, ""} ->
           prefix = CompoundKey.hash_prefix(key)
-          pairs = store.compound_scan.(key, prefix)
+          pairs = Ops.compound_scan(store, key, prefix)
           select_random_fields(pairs, count, false)
 
         _ ->
@@ -691,7 +692,7 @@ defmodule Ferricstore.Commands.Hash do
         case Integer.parse(count_str) do
           {count, ""} ->
             prefix = CompoundKey.hash_prefix(key)
-            pairs = store.compound_scan.(key, prefix)
+            pairs = Ops.compound_scan(store, key, prefix)
             select_random_fields(pairs, count, true)
 
           _ ->
@@ -711,12 +712,12 @@ defmodule Ferricstore.Commands.Hash do
 
   defp do_hincrby(key, field, increment, store) do
     compound_key = CompoundKey.hash_field(key, field)
-    current = store.compound_get.(key, compound_key)
+    current = Ops.compound_get(store, key, compound_key)
 
     case parse_integer_value(current) do
       {:ok, current_int} ->
         new_val = current_int + increment
-        store.compound_put.(key, compound_key, Integer.to_string(new_val), 0)
+        Ops.compound_put(store, key, compound_key, Integer.to_string(new_val), 0)
         new_val
 
       :error ->
@@ -729,7 +730,7 @@ defmodule Ferricstore.Commands.Hash do
   defp maybe_cleanup_empty_hash(key, _deleted, store) do
     prefix = CompoundKey.hash_prefix(key)
 
-    if store.compound_count.(key, prefix) == 0 do
+    if Ops.compound_count(store, key, prefix) == 0 do
       TypeRegistry.delete_type(key, store)
     end
   end
@@ -740,8 +741,8 @@ defmodule Ferricstore.Commands.Hash do
 
   defp hset_pairs([field, value | rest], key, store, acc) do
     compound_key = CompoundKey.hash_field(key, field)
-    existing = store.compound_get.(key, compound_key)
-    store.compound_put.(key, compound_key, value, 0)
+    existing = Ops.compound_get(store, key, compound_key)
+    Ops.compound_put(store, key, compound_key, value, 0)
     new_acc = if existing == nil, do: acc + 1, else: acc
     hset_pairs(rest, key, store, new_acc)
   end
@@ -751,8 +752,8 @@ defmodule Ferricstore.Commands.Hash do
 
   defp hset_pairs_with_ttl([field, value | rest], key, store, expire_at_ms, acc) do
     compound_key = CompoundKey.hash_field(key, field)
-    existing = store.compound_get.(key, compound_key)
-    store.compound_put.(key, compound_key, value, expire_at_ms)
+    existing = Ops.compound_get(store, key, compound_key)
+    Ops.compound_put(store, key, compound_key, value, expire_at_ms)
     new_acc = if existing == nil, do: acc + 1, else: acc
     hset_pairs_with_ttl(rest, key, store, expire_at_ms, new_acc)
   end

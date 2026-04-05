@@ -1,4 +1,5 @@
 defmodule Ferricstore.Commands.Generic do
+  alias Ferricstore.Store.Ops
   @moduledoc """
   Handles Redis generic key commands: TYPE, UNLINK, RENAME, RENAMENX, COPY,
   RANDOMKEY, SCAN, EXPIRETIME, PEXPIRETIME, OBJECT, WAIT.
@@ -81,15 +82,15 @@ defmodule Ferricstore.Commands.Generic do
     CrossShardOp.execute(
       [{key, :read_write}, {newkey, :write}],
       fn unified_store ->
-        case unified_store.get_meta.(key) do
+        case Ops.get_meta(unified_store, key) do
           nil ->
             {:error, "ERR no such key"}
 
           {value, expire_at_ms} ->
-            unified_store.put.(newkey, value, expire_at_ms)
+            Ops.put(unified_store, newkey, value, expire_at_ms)
 
             if key != newkey do
-              unified_store.delete.(key)
+              Ops.delete(unified_store, key)
             end
 
             :ok
@@ -112,7 +113,7 @@ defmodule Ferricstore.Commands.Generic do
     CrossShardOp.execute(
       [{key, :read_write}, {newkey, :write}],
       fn unified_store ->
-        case unified_store.get_meta.(key) do
+        case Ops.get_meta(unified_store, key) do
           nil ->
             {:error, "ERR no such key"}
 
@@ -121,11 +122,11 @@ defmodule Ferricstore.Commands.Generic do
             0
 
           {value, expire_at_ms} ->
-            if unified_store.exists?.(newkey) do
+            if Ops.exists?(unified_store, newkey) do
               0
             else
-              unified_store.put.(newkey, value, expire_at_ms)
-              unified_store.delete.(key)
+              Ops.put(unified_store, newkey, value, expire_at_ms)
+              Ops.delete(unified_store, key)
               1
             end
         end
@@ -169,7 +170,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("RANDOMKEY", [], store) do
-    case store.keys.() do
+    case Ops.keys(store) do
       [] -> nil
       keys -> Enum.random(keys)
     end
@@ -198,7 +199,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("EXPIRETIME", [key], store) do
-    case store.get_meta.(key) do
+    case Ops.get_meta(store, key) do
       nil -> -2
       {_value, 0} -> -1
       {_value, expire_at_ms} -> div(expire_at_ms, 1_000)
@@ -214,7 +215,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   def handle("PEXPIRETIME", [key], store) do
-    case store.get_meta.(key) do
+    case Ops.get_meta(store, key) do
       nil -> -2
       {_value, 0} -> -1
       {_value, expire_at_ms} -> expire_at_ms
@@ -255,7 +256,7 @@ defmodule Ferricstore.Commands.Generic do
   # ---------------------------------------------------------------------------
 
   defp do_object("ENCODING", [key], store) do
-    if store.exists?.(key) do
+    if Ops.exists?(store, key) do
       case Ferricstore.Store.TypeRegistry.get_type(key, store) do
         "hash" -> "hashtable"
         "list" -> "quicklist"
@@ -263,7 +264,7 @@ defmodule Ferricstore.Commands.Generic do
         "zset" -> "skiplist"
         "stream" -> "stream"
         "string" ->
-          value = store.get.(key)
+          value = Ops.get(store, key)
           if value != nil and byte_size(value) <= 44, do: "embstr", else: "raw"
         _other -> "raw"
       end
@@ -289,7 +290,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_object("FREQ", [key], store) do
-    if store.exists?.(key) do
+    if Ops.exists?(store, key) do
       ctx = FerricStore.Instance.get(:default)
       idx = Ferricstore.Store.Router.shard_for(ctx, key)
       keydir = Ferricstore.Store.Router.resolve_keydir(ctx, idx)
@@ -307,7 +308,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_object("IDLETIME", [key], store) do
-    if store.exists?.(key) do
+    if Ops.exists?(store, key) do
       ctx = FerricStore.Instance.get(:default)
       idx = Ferricstore.Store.Router.shard_for(ctx, key)
       keydir = Ferricstore.Store.Router.resolve_keydir(ctx, idx)
@@ -328,7 +329,7 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_object("REFCOUNT", [key], store) do
-    if store.exists?.(key) do
+    if Ops.exists?(store, key) do
       1
     else
       {:error, "ERR no such key"}
@@ -358,15 +359,15 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   defp do_copy(source, destination, replace?, store) do
-    case store.get_meta.(source) do
+    case Ops.get_meta(store, source) do
       nil ->
         {:error, "ERR no such key"}
 
       {value, expire_at_ms} ->
-        if not replace? and store.exists?.(destination) do
+        if not replace? and Ops.exists?(store, destination) do
           {:error, "ERR target key already exists"}
         else
-          store.put.(destination, value, expire_at_ms)
+          Ops.put(store, destination, value, expire_at_ms)
           1
         end
     end
@@ -410,7 +411,7 @@ defmodule Ferricstore.Commands.Generic do
     alias Ferricstore.Store.CompoundKey
 
     all_keys =
-      store.keys.()
+      Ops.keys(store)
       |> CompoundKey.user_visible_keys()
       |> filter_by_type(type_filter, store)
       |> filter_by_match(match_pattern)

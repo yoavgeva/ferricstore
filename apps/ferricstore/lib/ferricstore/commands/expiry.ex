@@ -1,4 +1,5 @@
 defmodule Ferricstore.Commands.Expiry do
+  alias Ferricstore.Store.Ops
   @moduledoc """
   Handles Redis expiry commands: EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST.
 
@@ -143,21 +144,21 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp delete_if_exists(key, store) do
-    case store.get_meta.(key) do
+    case Ops.get_meta(store, key) do
       nil -> 0
       _ ->
-        store.delete.(key)
+        Ops.delete(store, key)
         1
     end
   end
 
   defp apply_expiry(key, expire_at_ms, store) do
-    case store.get_meta.(key) do
+    case Ops.get_meta(store, key) do
       nil ->
         0
 
       {value, _old_exp} ->
-        store.put.(key, value, expire_at_ms)
+        Ops.put(store, key, value, expire_at_ms)
         1
     end
   end
@@ -167,7 +168,7 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp get_ttl_seconds(key, store) do
-    case store.get_meta.(key) do
+    case Ops.get_meta(store, key) do
       nil -> -2
       {_, 0} -> -1
       {_, exp} -> max(0, div(exp - Ferricstore.HLC.now_ms(), 1_000))
@@ -175,7 +176,7 @@ defmodule Ferricstore.Commands.Expiry do
   end
 
   defp get_ttl_ms(key, store) do
-    case store.get_meta.(key) do
+    case Ops.get_meta(store, key) do
       nil -> -2
       {_, 0} -> -1
       {_, exp} -> max(0, exp - Ferricstore.HLC.now_ms())
@@ -187,11 +188,11 @@ defmodule Ferricstore.Commands.Expiry do
   # ---------------------------------------------------------------------------
 
   defp do_persist(key, store) do
-    case store.get_meta.(key) do
+    case Ops.get_meta(store, key) do
       nil -> 0
       {_, 0} -> 0
       {value, _exp} ->
-        store.put.(key, value, 0)
+        Ops.put(store, key, value, 0)
         1
     end
   end

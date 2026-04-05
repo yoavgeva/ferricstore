@@ -24,6 +24,8 @@ defmodule Ferricstore.Commands.Geo do
     * `GEOSEARCHSTORE destination source [same GEOSEARCH options]`
   """
 
+  alias Ferricstore.Store.Ops
+
   # Earth radius in meters (WGS-84 mean radius)
   @earth_radius_m 6_371_000.0
 
@@ -196,7 +198,7 @@ defmodule Ferricstore.Commands.Geo do
       limited = apply_count(sorted, opts)
 
       if limited == [] do
-        store.delete.(destination)
+        Ops.delete(store, destination)
         0
       else
         new_zset =
@@ -204,7 +206,7 @@ defmodule Ferricstore.Commands.Geo do
           |> Enum.map(fn {score, member, _dist} -> {score, member} end)
           |> Enum.sort()
 
-        store.put.(destination, :erlang.term_to_binary({:zset, new_zset}), 0)
+        Ops.put(store, destination, :erlang.term_to_binary({:zset, new_zset}), 0)
         length(limited)
       end
     end
@@ -298,7 +300,7 @@ defmodule Ferricstore.Commands.Geo do
   @doc false
   @spec read_zset(map(), binary()) :: {:ok, [{float(), binary()}]} | {:error, binary()}
   def read_zset(store, key) do
-    case store.get.(key) do
+    case Ops.get(store, key) do
       nil -> {:ok, []}
       value when is_binary(value) -> decode_zset(value)
     end
@@ -318,7 +320,7 @@ defmodule Ferricstore.Commands.Geo do
   end
 
   defp write_zset(store, key, zset) do
-    store.put.(key, :erlang.term_to_binary({:zset, zset}), 0)
+    Ops.put(store, key, :erlang.term_to_binary({:zset, zset}), 0)
   end
 
   defp zset_to_member_map(zset) do

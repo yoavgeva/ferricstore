@@ -1,4 +1,5 @@
 defmodule Ferricstore.Commands.Bitmap do
+  alias Ferricstore.Store.Ops
   @moduledoc """
   Handles Redis bitmap commands: SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP.
 
@@ -52,7 +53,7 @@ defmodule Ferricstore.Commands.Bitmap do
     with {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
          :ok <- check_bit_offset(offset),
          {:ok, bit_val} <- parse_bit_value(bit_str) do
-      current = store.get.(key) || <<>>
+      current = Ops.get(store, key) || <<>>
       byte_index = div(offset, 8)
       # Extend the binary with zero bytes if needed
       extended = extend_binary(current, byte_index + 1)
@@ -73,7 +74,7 @@ defmodule Ferricstore.Commands.Bitmap do
       <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
       new_value = <<prefix::binary, new_byte::8, suffix::binary>>
 
-      store.put.(key, new_value, 0)
+      Ops.put(store, key, new_value, 0)
       old_bit
     end
   end
@@ -89,7 +90,7 @@ defmodule Ferricstore.Commands.Bitmap do
   def handle("GETBIT", [key, offset_str], store) do
     with {:ok, offset} <- parse_non_negative_integer(offset_str, "bit offset"),
          :ok <- check_bit_offset(offset) do
-      current = store.get.(key) || <<>>
+      current = Ops.get(store, key) || <<>>
       byte_index = div(offset, 8)
 
       if byte_index >= byte_size(current) do
@@ -111,7 +112,7 @@ defmodule Ferricstore.Commands.Bitmap do
   # ---------------------------------------------------------------------------
 
   def handle("BITCOUNT", [key], store) do
-    current = store.get.(key) || <<>>
+    current = Ops.get(store, key) || <<>>
     popcount(current)
   end
 
@@ -121,7 +122,7 @@ defmodule Ferricstore.Commands.Bitmap do
     with {:ok, mode} <- mode,
          {:ok, start_idx} <- parse_integer(start_str),
          {:ok, end_idx} <- parse_integer(end_str) do
-      current = store.get.(key) || <<>>
+      current = Ops.get(store, key) || <<>>
 
       case mode do
         :byte -> bitcount_byte_range(current, start_idx, end_idx)
@@ -144,7 +145,7 @@ defmodule Ferricstore.Commands.Bitmap do
 
   def handle("BITPOS", [key, bit_str], store) do
     with {:ok, bit_val} <- parse_bit_value(bit_str) do
-      current = store.get.(key) || <<>>
+      current = Ops.get(store, key) || <<>>
       bitpos_byte_range(current, bit_val, 0, byte_size(current) - 1, false)
     end
   end
@@ -152,7 +153,7 @@ defmodule Ferricstore.Commands.Bitmap do
   def handle("BITPOS", [key, bit_str, start_str], store) do
     with {:ok, bit_val} <- parse_bit_value(bit_str),
          {:ok, start_idx} <- parse_integer(start_str) do
-      current = store.get.(key) || <<>>
+      current = Ops.get(store, key) || <<>>
       len = byte_size(current)
       start_resolved = resolve_index(start_idx, len)
       bitpos_byte_range(current, bit_val, start_resolved, len - 1, false)
@@ -166,7 +167,7 @@ defmodule Ferricstore.Commands.Bitmap do
          {:ok, bit_val} <- parse_bit_value(bit_str),
          {:ok, start_idx} <- parse_integer(start_str),
          {:ok, end_idx} <- parse_integer(end_str) do
-      current = store.get.(key) || <<>>
+      current = Ops.get(store, key) || <<>>
 
       case mode do
         :byte ->
@@ -200,7 +201,7 @@ defmodule Ferricstore.Commands.Bitmap do
     op = String.upcase(op_str)
 
     with {:ok, result} <- execute_bitop(op, source_keys, store) do
-      store.put.(destkey, result, 0)
+      Ops.put(store, destkey, result, 0)
       byte_size(result)
     end
   end
@@ -432,7 +433,7 @@ defmodule Ferricstore.Commands.Bitmap do
 
   @spec execute_bitop(binary(), [binary()], map()) :: {:ok, binary()} | {:error, binary()}
   defp execute_bitop("NOT", [src_key], store) do
-    src = store.get.(src_key) || <<>>
+    src = Ops.get(store, src_key) || <<>>
     {:ok, bitop_not(src)}
   end
 
@@ -441,7 +442,7 @@ defmodule Ferricstore.Commands.Bitmap do
   end
 
   defp execute_bitop(op, source_keys, store) when op in ~w(AND OR XOR) do
-    values = Enum.map(source_keys, fn k -> store.get.(k) || <<>> end)
+    values = Enum.map(source_keys, fn k -> Ops.get(store, k) || <<>> end)
     max_len = values |> Enum.map(&byte_size/1) |> Enum.max()
     padded = Enum.map(values, &pad_binary(&1, max_len))
 

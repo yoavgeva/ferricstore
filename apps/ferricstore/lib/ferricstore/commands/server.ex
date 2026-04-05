@@ -1,5 +1,6 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Server do
+  alias Ferricstore.Store.Ops
   @moduledoc """
   Handles Redis server commands: PING, ECHO, DBSIZE, KEYS, FLUSHDB, FLUSHALL,
   INFO, COMMAND, SELECT, LOLWUT, and DEBUG.
@@ -76,7 +77,7 @@ defmodule Ferricstore.Commands.Server do
   def handle("DBSIZE", [], store) do
     alias Ferricstore.Store.CompoundKey
 
-    store.keys.()
+    Ops.keys(store)
     |> CompoundKey.user_visible_keys()
     |> length()
   end
@@ -92,7 +93,7 @@ defmodule Ferricstore.Commands.Server do
   def handle("KEYS", [pattern], store) do
     alias Ferricstore.Store.CompoundKey
 
-    store.keys.()
+    Ops.keys(store)
     |> CompoundKey.user_visible_keys()
     |> Enum.filter(&Ferricstore.GlobMatcher.match?(&1, pattern))
   end
@@ -111,7 +112,7 @@ defmodule Ferricstore.Commands.Server do
 
   def handle("FLUSHDB", args, store) when args in [[], ["ASYNC"], ["SYNC"]] do
     AuditLog.log(:dangerous_command, %{command: "FLUSHDB", args: args})
-    store.flush.()
+    Ops.flush(store)
     # Wipe prob files (bloom, CMS, cuckoo, TopK) across all shards.
     # store.flush deletes keys via Raft which should clean up files via
     # maybe_delete_prob_file, but as a safety net we also wipe the prob
@@ -130,7 +131,7 @@ defmodule Ferricstore.Commands.Server do
 
   def handle("FLUSHALL", args, store) when args in [[], ["ASYNC"], ["SYNC"]] do
     AuditLog.log(:dangerous_command, %{command: "FLUSHALL", args: args})
-    store.flush.()
+    Ops.flush(store)
     :ok
   end
 
@@ -527,7 +528,7 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp build_section("keyspace", store) do
-    key_count = store.dbsize.()
+    key_count = Ops.dbsize(store)
     ctx = try do FerricStore.Instance.get(:default) rescue _ -> nil end
     {expires, avg_ttl} = if ctx, do: compute_expiry_stats(ctx), else: {0, 0}
 

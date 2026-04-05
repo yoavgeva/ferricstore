@@ -1,4 +1,5 @@
 defmodule Ferricstore.Commands.HyperLogLog do
+  alias Ferricstore.Store.Ops
   @moduledoc """
   Handles Redis HyperLogLog commands: PFADD, PFCOUNT, PFMERGE.
 
@@ -59,7 +60,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
           end)
 
         if modified? do
-          store.put.(key, updated, 0)
+          Ops.put(store, key, updated, 0)
           1
         else
           0
@@ -132,7 +133,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
 
     case result do
       {:ok, merged} ->
-        store.put.(destkey, merged, 0)
+        Ops.put(store, destkey, merged, 0)
         :ok
 
       {:error, _} = err ->
@@ -152,7 +153,7 @@ defmodule Ferricstore.Commands.HyperLogLog do
   # does not exist.
   @spec get_or_new(binary(), map()) :: binary()
   defp get_or_new(key, store) do
-    case store.get.(key) do
+    case Ops.get(store, key) do
       nil -> HLL.new()
       value -> value
     end

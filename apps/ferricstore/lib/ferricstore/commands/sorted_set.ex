@@ -20,6 +20,7 @@ defmodule Ferricstore.Commands.SortedSet do
   """
 
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
 
   @doc """
@@ -48,7 +49,7 @@ defmodule Ferricstore.Commands.SortedSet do
       {added, changed} =
         Enum.reduce(score_member_pairs, {0, 0}, fn {score, member}, {add_acc, ch_acc} ->
           compound_key = CompoundKey.zset_member(key, member)
-          existing = store.compound_get.(key, compound_key)
+          existing = Ops.compound_get(store, key, compound_key)
 
           cond do
             # NX: only add new elements, don't update existing
@@ -60,7 +61,7 @@ defmodule Ferricstore.Commands.SortedSet do
               {add_acc, ch_acc}
 
             existing == nil ->
-              store.compound_put.(key, compound_key, Float.to_string(score), 0)
+              Ops.compound_put(store, key, compound_key, Float.to_string(score), 0)
               {add_acc + 1, ch_acc}
 
             true ->
@@ -78,7 +79,7 @@ defmodule Ferricstore.Commands.SortedSet do
                 end
 
               if should_update and score != existing_score do
-                store.compound_put.(key, compound_key, Float.to_string(score), 0)
+                Ops.compound_put(store, key, compound_key, Float.to_string(score), 0)
                 {add_acc, ch_acc + 1}
               else
                 {add_acc, ch_acc}
@@ -102,7 +103,7 @@ defmodule Ferricstore.Commands.SortedSet do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       compound_key = CompoundKey.zset_member(key, member)
 
-      case store.compound_get.(key, compound_key) do
+      case Ops.compound_get(store, key, compound_key) do
         nil -> nil
         score_str -> format_score_str(score_str)
       end
@@ -215,7 +216,7 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZCARD", [key], store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       prefix = CompoundKey.zset_prefix(key)
-      store.compound_count.(key, prefix)
+      Ops.compound_count(store, key, prefix)
     end
   end
 
@@ -233,8 +234,8 @@ defmodule Ferricstore.Commands.SortedSet do
         Enum.reduce(members, 0, fn member, acc ->
           compound_key = CompoundKey.zset_member(key, member)
 
-          if store.compound_get.(key, compound_key) != nil do
-            store.compound_delete.(key, compound_key)
+          if Ops.compound_get(store, key, compound_key) != nil do
+            Ops.compound_delete(store, key, compound_key)
             acc + 1
           else
             acc
@@ -244,7 +245,7 @@ defmodule Ferricstore.Commands.SortedSet do
       if removed > 0 do
         prefix = CompoundKey.zset_prefix(key)
 
-        if store.compound_count.(key, prefix) == 0 do
+        if Ops.compound_count(store, key, prefix) == 0 do
           TypeRegistry.delete_type(key, store)
         end
       end
@@ -266,7 +267,7 @@ defmodule Ferricstore.Commands.SortedSet do
       case Float.parse(increment_str) do
         {increment, ""} ->
           compound_key = CompoundKey.zset_member(key, member)
-          existing = store.compound_get.(key, compound_key)
+          existing = Ops.compound_get(store, key, compound_key)
 
           current_score =
             case existing do
@@ -281,7 +282,7 @@ defmodule Ferricstore.Commands.SortedSet do
             end
 
           new_score = current_score + increment
-          store.compound_put.(key, compound_key, Float.to_string(new_score), 0)
+          Ops.compound_put(store, key, compound_key, Float.to_string(new_score), 0)
           format_score(new_score)
 
         :error ->
@@ -289,7 +290,7 @@ defmodule Ferricstore.Commands.SortedSet do
           case Integer.parse(increment_str) do
             {increment, ""} ->
               compound_key = CompoundKey.zset_member(key, member)
-              existing = store.compound_get.(key, compound_key)
+              existing = Ops.compound_get(store, key, compound_key)
 
               current_score =
                 case existing do
@@ -304,7 +305,7 @@ defmodule Ferricstore.Commands.SortedSet do
                 end
 
               new_score = current_score + increment * 1.0
-              store.compound_put.(key, compound_key, Float.to_string(new_score), 0)
+              Ops.compound_put(store, key, compound_key, Float.to_string(new_score), 0)
               format_score(new_score)
 
             _ ->
@@ -362,14 +363,14 @@ defmodule Ferricstore.Commands.SortedSet do
           result =
             Enum.flat_map(to_pop, fn {member, score} ->
               compound_key = CompoundKey.zset_member(key, member)
-              store.compound_delete.(key, compound_key)
+              Ops.compound_delete(store, key, compound_key)
               [member, format_score(score)]
             end)
 
           if to_pop != [] do
             prefix = CompoundKey.zset_prefix(key)
 
-            if store.compound_count.(key, prefix) == 0 do
+            if Ops.compound_count(store, key, prefix) == 0 do
               TypeRegistry.delete_type(key, store)
             end
           end
@@ -404,14 +405,14 @@ defmodule Ferricstore.Commands.SortedSet do
           result =
             Enum.flat_map(to_pop, fn {member, score} ->
               compound_key = CompoundKey.zset_member(key, member)
-              store.compound_delete.(key, compound_key)
+              Ops.compound_delete(store, key, compound_key)
               [member, format_score(score)]
             end)
 
           if to_pop != [] do
             prefix = CompoundKey.zset_prefix(key)
 
-            if store.compound_count.(key, prefix) == 0 do
+            if Ops.compound_count(store, key, prefix) == 0 do
               TypeRegistry.delete_type(key, store)
             end
           end
@@ -437,7 +438,7 @@ defmodule Ferricstore.Commands.SortedSet do
          {:ok, cursor} <- parse_cursor(cursor_str),
          {:ok, match_pattern, count} <- parse_zscan_opts(opts) do
       prefix = CompoundKey.zset_prefix(key)
-      pairs = store.compound_scan.(key, prefix)
+      pairs = Ops.compound_scan(store, key, prefix)
 
       filtered =
         case match_pattern do
@@ -469,7 +470,7 @@ defmodule Ferricstore.Commands.SortedSet do
   def handle("ZRANDMEMBER", [key], store) do
     with :ok <- TypeRegistry.check_type(key, :zset, store) do
       prefix = CompoundKey.zset_prefix(key)
-      pairs = store.compound_scan.(key, prefix)
+      pairs = Ops.compound_scan(store, key, prefix)
 
       case pairs do
         [] -> nil
@@ -485,7 +486,7 @@ defmodule Ferricstore.Commands.SortedSet do
       case Integer.parse(count_str) do
         {count, ""} ->
           prefix = CompoundKey.zset_prefix(key)
-          pairs = store.compound_scan.(key, prefix)
+          pairs = Ops.compound_scan(store, key, prefix)
           select_random_zset_members(pairs, count, false)
 
         _ ->
@@ -502,7 +503,7 @@ defmodule Ferricstore.Commands.SortedSet do
         case Integer.parse(count_str) do
           {count, ""} ->
             prefix = CompoundKey.zset_prefix(key)
-            pairs = store.compound_scan.(key, prefix)
+            pairs = Ops.compound_scan(store, key, prefix)
             select_random_zset_members(pairs, count, true)
 
           _ ->
@@ -525,7 +526,7 @@ defmodule Ferricstore.Commands.SortedSet do
       Enum.map(members, fn member ->
         compound_key = CompoundKey.zset_member(key, member)
 
-        case store.compound_get.(key, compound_key) do
+        case Ops.compound_get(store, key, compound_key) do
           nil -> nil
           score_str -> format_score_str(score_str)
         end
@@ -641,7 +642,7 @@ defmodule Ferricstore.Commands.SortedSet do
 
   defp load_sorted_members(key, store) do
     prefix = CompoundKey.zset_prefix(key)
-    pairs = store.compound_scan.(key, prefix)
+    pairs = Ops.compound_scan(store, key, prefix)
 
     pairs
     |> Enum.map(fn {member, score_str} ->

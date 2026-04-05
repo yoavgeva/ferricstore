@@ -36,6 +36,8 @@ defmodule Ferricstore.Commands.Stream do
   # Types
   # ---------------------------------------------------------------------------
 
+  alias Ferricstore.Store.Ops
+
   @typedoc "A parsed stream ID as `{milliseconds, sequence}`."
   @type stream_id :: {non_neg_integer(), non_neg_integer()}
 
@@ -426,7 +428,7 @@ defmodule Ferricstore.Commands.Stream do
 
         # Serialize field-value pairs as Erlang binary term.
         encoded = :erlang.term_to_binary(fields)
-        store.put.(compound_key, encoded, 0)
+        Ops.put(store, compound_key, encoded, 0)
 
         # Update metadata.
         {new_len, new_first} =
@@ -484,7 +486,7 @@ defmodule Ferricstore.Commands.Stream do
           |> maybe_take(count)
           |> Enum.map(fn {id_str, _id} ->
             compound_key = prefix <> id_str
-            raw = store.get.(compound_key)
+            raw = Ops.get(store, compound_key)
 
             if raw do
               fields = :erlang.binary_to_term(raw)
@@ -577,7 +579,7 @@ defmodule Ferricstore.Commands.Stream do
       to_remove = Enum.take(all_ids, current_len - max_len)
 
       Enum.each(to_remove, fn id_str ->
-        store.delete.(prefix <> id_str)
+        Ops.delete(store, prefix <> id_str)
       end)
 
       deleted_count = length(to_remove)
@@ -608,7 +610,7 @@ defmodule Ferricstore.Commands.Stream do
       end)
 
     Enum.each(to_remove, fn id_str ->
-      store.delete.(prefix <> id_str)
+      Ops.delete(store, prefix <> id_str)
     end)
 
     deleted_count = length(to_remove)
@@ -653,8 +655,8 @@ defmodule Ferricstore.Commands.Stream do
       Enum.reduce(ids, 0, fn id_str, acc ->
         compound_key = prefix <> id_str
 
-        if store.exists?.(compound_key) do
-          store.delete.(compound_key)
+        if Ops.exists?(store, compound_key) do
+          Ops.delete(store, compound_key)
           acc + 1
         else
           acc
@@ -710,7 +712,7 @@ defmodule Ferricstore.Commands.Stream do
 
         first_entry =
           if len > 0 and first != "0-0" do
-            raw = store.get.(prefix <> first)
+            raw = Ops.get(store, prefix <> first)
 
             if raw do
               fields = :erlang.binary_to_term(raw)
@@ -720,7 +722,7 @@ defmodule Ferricstore.Commands.Stream do
 
         last_entry =
           if len > 0 do
-            raw = store.get.(prefix <> last)
+            raw = Ops.get(store, prefix <> last)
 
             if raw do
               fields = :erlang.binary_to_term(raw)
@@ -863,7 +865,7 @@ defmodule Ferricstore.Commands.Stream do
                   |> maybe_take_tuples(count)
                   |> Enum.map(fn {id_str_inner, _} ->
                     prefix = "X:#{key}" <> @sep
-                    raw = store.get.(prefix <> id_str_inner)
+                    raw = Ops.get(store, prefix <> id_str_inner)
 
                     if raw do
                       fields = :erlang.binary_to_term(raw)
@@ -1026,7 +1028,7 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   defp stream_keys_for(store, prefix) do
-    store.keys.()
+    Ops.keys(store)
     |> Enum.filter(&String.starts_with?(&1, prefix))
   end
 

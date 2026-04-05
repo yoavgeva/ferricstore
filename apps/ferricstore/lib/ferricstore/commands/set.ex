@@ -18,6 +18,7 @@ defmodule Ferricstore.Commands.Set do
   """
 
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
   alias Ferricstore.CrossShardOp
 
@@ -47,8 +48,8 @@ defmodule Ferricstore.Commands.Set do
     with :ok <- TypeRegistry.check_or_set(key, :set, store) do
       Enum.reduce(members, 0, fn member, acc ->
         compound_key = CompoundKey.set_member(key, member)
-        existing = store.compound_get.(key, compound_key)
-        store.compound_put.(key, compound_key, @presence_marker, 0)
+        existing = Ops.compound_get(store, key, compound_key)
+        Ops.compound_put(store, key, compound_key, @presence_marker, 0)
         if existing == nil, do: acc + 1, else: acc
       end)
     end
@@ -68,8 +69,8 @@ defmodule Ferricstore.Commands.Set do
         Enum.reduce(members, 0, fn member, acc ->
           compound_key = CompoundKey.set_member(key, member)
 
-          if store.compound_get.(key, compound_key) != nil do
-            store.compound_delete.(key, compound_key)
+          if Ops.compound_get(store, key, compound_key) != nil do
+            Ops.compound_delete(store, key, compound_key)
             acc + 1
           else
             acc
@@ -92,7 +93,7 @@ defmodule Ferricstore.Commands.Set do
   def handle("SMEMBERS", [key], store) do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
       prefix = CompoundKey.set_prefix(key)
-      pairs = store.compound_scan.(key, prefix)
+      pairs = Ops.compound_scan(store, key, prefix)
       Enum.map(pairs, fn {member, _} -> member end)
     end
   end
@@ -109,7 +110,7 @@ defmodule Ferricstore.Commands.Set do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
       compound_key = CompoundKey.set_member(key, member)
 
-      if store.compound_get.(key, compound_key) != nil do
+      if Ops.compound_get(store, key, compound_key) != nil do
         1
       else
         0
@@ -129,7 +130,7 @@ defmodule Ferricstore.Commands.Set do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
       Enum.map(members, fn member ->
         compound_key = CompoundKey.set_member(key, member)
-        if store.compound_get.(key, compound_key) != nil, do: 1, else: 0
+        if Ops.compound_get(store, key, compound_key) != nil, do: 1, else: 0
       end)
     end
   end
@@ -145,7 +146,7 @@ defmodule Ferricstore.Commands.Set do
   def handle("SCARD", [key], store) do
     with :ok <- TypeRegistry.check_type(key, :set, store) do
       prefix = CompoundKey.set_prefix(key)
-      store.compound_count.(key, prefix)
+      Ops.compound_count(store, key, prefix)
     end
   end
 
@@ -217,7 +218,7 @@ defmodule Ferricstore.Commands.Set do
          {:ok, cursor} <- parse_cursor(cursor_str),
          {:ok, match_pattern, count} <- parse_sscan_opts(opts) do
       prefix = CompoundKey.set_prefix(key)
-      pairs = store.compound_scan.(key, prefix)
+      pairs = Ops.compound_scan(store, key, prefix)
       members = Enum.map(pairs, fn {member, _} -> member end)
 
       filtered =
@@ -289,7 +290,7 @@ defmodule Ferricstore.Commands.Set do
         _ ->
           member = Enum.random(members)
           compound_key = CompoundKey.set_member(key, member)
-          store.compound_delete.(key, compound_key)
+          Ops.compound_delete(store, key, compound_key)
           maybe_cleanup_empty_set(key, 1, store)
           member
       end
@@ -306,7 +307,7 @@ defmodule Ferricstore.Commands.Set do
           removed =
             Enum.reduce(selected, 0, fn member, acc ->
               compound_key = CompoundKey.set_member(key, member)
-              store.compound_delete.(key, compound_key)
+              Ops.compound_delete(store, key, compound_key)
               acc + 1
             end)
 
@@ -476,17 +477,17 @@ defmodule Ferricstore.Commands.Set do
          :ok <- TypeRegistry.check_type(destination, :set, store) do
       compound_key = CompoundKey.set_member(source, member)
 
-      if store.compound_get.(source, compound_key) == nil do
+      if Ops.compound_get(store, source, compound_key) == nil do
         0
       else
         # Remove from source
-        store.compound_delete.(source, compound_key)
+        Ops.compound_delete(store, source, compound_key)
         maybe_cleanup_empty_set(source, 1, store)
 
         # Add to destination (check_or_set for destination since it may not exist)
         TypeRegistry.check_or_set(destination, :set, store)
         dst_key = CompoundKey.set_member(destination, member)
-        store.compound_put.(destination, dst_key, @presence_marker, 0)
+        Ops.compound_put(store, destination, dst_key, @presence_marker, 0)
         1
       end
     end
@@ -497,7 +498,7 @@ defmodule Ferricstore.Commands.Set do
   defp store_set_at(destination, members, store) do
     # Clear existing destination data
     prefix = CompoundKey.set_prefix(destination)
-    store.compound_delete_prefix.(destination, prefix)
+    Ops.compound_delete_prefix(store, destination, prefix)
     TypeRegistry.delete_type(destination, store)
 
     members_list = MapSet.to_list(members)
@@ -507,7 +508,7 @@ defmodule Ferricstore.Commands.Set do
 
       Enum.each(members_list, fn member ->
         compound_key = CompoundKey.set_member(destination, member)
-        store.compound_put.(destination, compound_key, @presence_marker, 0)
+        Ops.compound_put(store, destination, compound_key, @presence_marker, 0)
       end)
     end
 
@@ -549,13 +550,13 @@ defmodule Ferricstore.Commands.Set do
 
   defp get_members_set(key, store) do
     prefix = CompoundKey.set_prefix(key)
-    pairs = store.compound_scan.(key, prefix)
+    pairs = Ops.compound_scan(store, key, prefix)
     MapSet.new(pairs, fn {member, _} -> member end)
   end
 
   defp get_members_list(key, store) do
     prefix = CompoundKey.set_prefix(key)
-    pairs = store.compound_scan.(key, prefix)
+    pairs = Ops.compound_scan(store, key, prefix)
     Enum.map(pairs, fn {member, _} -> member end)
   end
 
@@ -573,7 +574,7 @@ defmodule Ferricstore.Commands.Set do
   defp maybe_cleanup_empty_set(key, _removed, store) do
     prefix = CompoundKey.set_prefix(key)
 
-    if store.compound_count.(key, prefix) == 0 do
+    if Ops.compound_count(store, key, prefix) == 0 do
       TypeRegistry.delete_type(key, store)
     end
   end
