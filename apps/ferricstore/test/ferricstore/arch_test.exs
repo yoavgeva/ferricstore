@@ -19,6 +19,7 @@ defmodule Ferricstore.ArchTest do
     # commands within the shard's handle_call for atomicity.
     modules_matching("Ferricstore.Store.**")
     |> excluding("Ferricstore.Store.Shard")
+    |> excluding("Ferricstore.Store.Shard.Transaction")
     |> should_not_depend_on(modules_matching("Ferricstore.Commands.**"))
   end
 

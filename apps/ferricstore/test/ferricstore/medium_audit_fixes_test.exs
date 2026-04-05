@@ -66,7 +66,7 @@ defmodule Ferricstore.MediumAuditFixesTest do
 
       for path <- [
         Path.join([__DIR__, "..", "..", "lib", "ferricstore", "raft", "state_machine.ex"]),
-        Path.join([__DIR__, "..", "..", "lib", "ferricstore", "store", "shard.ex"])
+        Path.join([__DIR__, "..", "..", "lib", "ferricstore", "store", "shard", "native_ops.ex"])
       ] do
         source = File.read!(path)
         # Should have the binary encoding pattern inline OR delegate to ValueCodec
@@ -103,22 +103,8 @@ defmodule Ferricstore.MediumAuditFixesTest do
              "shard format_float should not have no-op then (multiline)"
     end
 
-    test "format_float uses :binary.match instead of String.contains?" do
-      # The format_float implementation may be inlined or in the shared ValueCodec.
-      codec_path = Path.join([__DIR__, "..", "..", "lib", "ferricstore", "store", "value_codec.ex"])
-      codec_source = File.read!(codec_path)
-
-      for path <- [
-        Path.join([__DIR__, "..", "..", "lib", "ferricstore", "raft", "state_machine.ex"]),
-        Path.join([__DIR__, "..", "..", "lib", "ferricstore", "store", "shard.ex"])
-      ] do
-        source = File.read!(path)
-        # The format_float function should use :binary.match inline OR via ValueCodec
-        assert source =~ ~r/binary\.match/ or
-               (source =~ "ValueCodec" and codec_source =~ ~r/binary\.match/),
-               "#{Path.basename(path)} format_float should use :binary.match (inline or via ValueCodec)"
-      end
-    end
+    # format_float was removed from shard.ex and state_machine.ex as unused code.
+    # Float formatting is handled by ValueCodec.format_float/1 which uses :binary.match.
   end
 
   # -----------------------------------------------------------------------
@@ -305,9 +291,9 @@ defmodule Ferricstore.MediumAuditFixesTest do
   # Memory M5: Process dictionary tx state cleanup
   # -----------------------------------------------------------------------
   describe "transaction state cleanup (Memory M5)" do
-    test "shard.ex wraps tx execution in try/after for process dict cleanup" do
+    test "transaction.ex wraps tx execution in try/after for process dict cleanup" do
       source = File.read!(Path.join([
-        __DIR__, "..", "..", "lib", "ferricstore", "store", "shard.ex"
+        __DIR__, "..", "..", "lib", "ferricstore", "store", "shard", "transaction.ex"
       ]))
 
       # The tx_execute handler should wrap its body in try/after to ensure
