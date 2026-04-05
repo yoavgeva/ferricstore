@@ -104,9 +104,12 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
         key
       end)
 
-      Process.sleep(10)
+      # Wait until keys are expired, then sweep
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        now = System.os_time(:millisecond)
+        now > expire_at
+      end, "keys not expired yet", 20, 5)
 
-      # Trigger sweep on all shards of isolated instance
       for i <- 0..(ctx.shard_count - 1) do
         shard = elem(ctx.shard_names, i)
         GenServer.call(shard, :expiry_sweep)
