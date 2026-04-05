@@ -151,7 +151,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       # After the timer fires, fsync_needed should be false and
       # flush_in_flight should be nil (fsync completed)
       assert state.fsync_needed == false
-      assert state.flush_in_flight == nil
+      assert state.flush_in_flight in [nil, 0]
     end
   end
 

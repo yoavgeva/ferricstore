@@ -22,6 +22,13 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
 
   defp ukey(base), do: "conn_dist_#{base}_#{:rand.uniform(999_999)}"
 
+  defp extract_total_keys(result) do
+    case Regex.run(~r/total_keys: (\d+)/, result) do
+      [_, n] -> String.to_integer(n)
+      _ -> 0
+    end
+  end
+
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
     :ok
@@ -156,6 +163,11 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
     end
 
     test "total_keys equals sum of per-shard keys" do
+      # Get baseline key count before adding our keys
+      store_before = MockStore.make()
+      result_before = Dispatcher.dispatch("CLUSTER.STATS", [], store_before)
+      total_before = extract_total_keys(result_before)
+
       # Write some known keys
       keys = for i <- 1..5, do: ukey("stats_#{i}")
 
@@ -191,7 +203,7 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
       total = String.to_integer(total_str)
 
       assert total == Enum.sum(per_shard_keys)
-      assert total >= 5
+      assert total >= total_before + 5
 
       # Cleanup
       Enum.each(keys, fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
