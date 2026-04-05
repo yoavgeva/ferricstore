@@ -481,7 +481,7 @@ defmodule FerricstoreServer.Connection do
   # ---------------------------------------------------------------------------
 
   defp dispatch_client(args, state) do
-    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
+    store = if state.sandbox_namespace, do: ConnStore.build_store(state.instance_ctx, state.sandbox_namespace), else: state.instance_ctx
 
     conn_state = %{
       client_id: state.client_id,
@@ -616,7 +616,15 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp dispatch_normal(cmd, args, state) do
-    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
+    # Hot path: pass ctx directly (no closure allocation).
+    # Ops dispatches Instance structs to Router.
+    # Namespace path: closure map for key prefixing.
+    store =
+      if state.sandbox_namespace do
+        ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
+      else
+        state.instance_ctx
+      end
 
     result =
       try do
