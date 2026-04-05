@@ -1,24 +1,15 @@
 defmodule Ferricstore.Store.ShardTest do
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.Shard
+  alias Ferricstore.Test.IsolatedInstance
 
   setup do
-    dir = Path.join(System.tmp_dir!(), "shard_test_#{:rand.uniform(999_999)}")
-    File.mkdir_p!(dir)
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    pid = Process.whereis(elem(ctx.shard_names, 0))
+    keydir = elem(ctx.keydir_refs, 0)
+    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
 
-    # Use a unique index per test to avoid name collisions.
-    # Isolated shards with ad-hoc indices have no ra server; the shard
-    # auto-detects this and uses the direct write path.
-    index = :erlang.unique_integer([:positive]) |> rem(10_000) |> Kernel.+(10_000)
-    {:ok, pid} = Shard.start_link(index: index, data_dir: dir)
-
-    on_exit(fn ->
-      if Process.alive?(pid), do: catch_exit(GenServer.stop(pid))
-      File.rm_rf!(dir)
-    end)
-
-    %{shard: pid, index: index}
+    %{shard: pid, index: 0, keydir: keydir, ctx: ctx}
   end
 
   describe "put and get" do
@@ -115,19 +106,16 @@ defmodule Ferricstore.Store.ShardTest do
   end
 
   describe "ETS hot cache" do
-    test "put immediately populates ETS", %{shard: shard, index: index} do
+    test "put immediately populates ETS", %{shard: shard, keydir: keydir} do
       :ok = GenServer.call(shard, {:put, "cached_key", "val", 0})
-      keydir = :"keydir_#{index}"
-      assert :ets.whereis(keydir) != :undefined
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
       assert [{"cached_key", "val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "cached_key")
     end
 
-    test "get warms ETS on cold key", %{shard: shard, index: index} do
+    test "get warms ETS on cold key", %{shard: shard, keydir: keydir} do
       # Put via GenServer, flush to disk, then evict value from ETS to simulate cold key
       :ok = GenServer.call(shard, {:put, "warm_key", "warm_val", 0})
       GenServer.call(shard, :flush)
-      keydir = :"keydir_#{index}"
       # Simulate cold key: set value to nil, preserve disk location
       [{_, _val, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, "warm_key")
       :ets.insert(keydir, {"warm_key", nil, exp, lfu, fid, off, vsize})
@@ -136,17 +124,15 @@ defmodule Ferricstore.Store.ShardTest do
       assert [{"warm_key", "warm_val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "warm_key")
     end
 
-    test "delete evicts ETS entry", %{shard: shard, index: index} do
+    test "delete evicts ETS entry", %{shard: shard, keydir: keydir} do
       :ok = GenServer.call(shard, {:put, "evict_key", "val", 0})
       :ok = GenServer.call(shard, {:delete, "evict_key"})
-      keydir = :"keydir_#{index}"
       assert [] == :ets.lookup(keydir, "evict_key")
     end
 
-    test "expired key is evicted from ETS on read", %{shard: shard, index: index} do
+    test "expired key is evicted from ETS on read", %{shard: shard, keydir: keydir} do
       past = System.os_time(:millisecond) - 1000
       :ok = GenServer.call(shard, {:put, "exp_key", "val", past})
-      keydir = :"keydir_#{index}"
       # Confirm entry is in ETS (put always writes to ETS)
       # Single-table format: {key, value, expire_at_ms, lfu_counter}
       assert [{"exp_key", "val", ^past, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "exp_key")

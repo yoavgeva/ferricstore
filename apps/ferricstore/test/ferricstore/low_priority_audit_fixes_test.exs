@@ -289,13 +289,21 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # Also add a non-.log file that should be ignored
       File.write!(Path.join(shard_path, "00001.hint"), "hint")
 
-      index = :erlang.unique_integer([:positive]) |> rem(10_000) |> Kernel.+(20_000)
-      {:ok, pid} = Ferricstore.Store.Shard.start_link(index: index, data_dir: dir)
+      # Build a minimal instance for this isolated shard
+      name = :"discover_test_#{:rand.uniform(999_999)}"
+      ctx = FerricStore.Instance.build(name, [
+        data_dir: dir,
+        shard_count: 1,
+        raft_enabled: false
+      ])
+
+      {:ok, pid} = Ferricstore.Store.Shard.start_link(index: 0, data_dir: dir, instance_ctx: ctx, raft_enabled: false)
 
       # The shard should start successfully
       assert Process.alive?(pid)
 
       GenServer.stop(pid)
+      FerricStore.Instance.cleanup(name)
       File.rm_rf!(dir)
     end
   end

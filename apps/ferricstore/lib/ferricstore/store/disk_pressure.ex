@@ -31,8 +31,8 @@ defmodule Ferricstore.Store.DiskPressure do
   end
 
   @doc "Sets disk pressure flag for a shard using instance ctx."
-  @spec set(FerricStore.Instance.t() | nil, non_neg_integer()) :: :ok
-  def set(nil, shard_index), do: set(shard_index)
+  @spec set(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def set(nil, _shard_index), do: raise(ArgumentError, "instance_ctx is required — shard must be started with instance_ctx")
   def set(ctx, shard_index) do
     ref = ctx.disk_pressure
     size = :atomics.info(ref).size
@@ -49,8 +49,8 @@ defmodule Ferricstore.Store.DiskPressure do
   end
 
   @doc "Clears disk pressure flag for a shard using instance ctx."
-  @spec clear(FerricStore.Instance.t() | nil, non_neg_integer()) :: :ok
-  def clear(nil, shard_index), do: clear(shard_index)
+  @spec clear(FerricStore.Instance.t(), non_neg_integer()) :: :ok
+  def clear(nil, _shard_index), do: raise(ArgumentError, "instance_ctx is required — shard must be started with instance_ctx")
   def clear(ctx, shard_index) do
     ref = ctx.disk_pressure
     size = :atomics.info(ref).size
@@ -70,8 +70,8 @@ defmodule Ferricstore.Store.DiskPressure do
   end
 
   @doc "Checks disk pressure for a shard using instance ctx."
-  @spec under_pressure?(FerricStore.Instance.t() | nil, non_neg_integer()) :: boolean()
-  def under_pressure?(nil, shard_index), do: under_pressure?(shard_index)
+  @spec under_pressure?(FerricStore.Instance.t(), non_neg_integer()) :: boolean()
+  def under_pressure?(nil, _shard_index), do: raise(ArgumentError, "instance_ctx is required — shard must be started with instance_ctx")
   def under_pressure?(ctx, shard_index) do
     ref = ctx.disk_pressure
     size = :atomics.info(ref).size

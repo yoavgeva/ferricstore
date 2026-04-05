@@ -15,27 +15,19 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
   @threshold 128
 
   setup do
-    original = :persistent_term.get(:ferricstore_hot_cache_max_value_size, 65_536)
-    :persistent_term.put(:ferricstore_hot_cache_max_value_size, @threshold)
+    ctx = Ferricstore.Test.IsolatedInstance.checkout(
+      shard_count: 1,
+      hot_cache_max_value_size: @threshold
+    )
+    pid = Process.whereis(elem(ctx.shard_names, 0))
+    keydir = elem(ctx.keydir_refs, 0)
+    on_exit(fn -> Ferricstore.Test.IsolatedInstance.checkin(ctx) end)
 
-    dir = Path.join(System.tmp_dir!(), "h4_cold_fid0_#{:rand.uniform(999_999)}")
-    File.mkdir_p!(dir)
-
-    index = :erlang.unique_integer([:positive]) |> rem(10_000) |> Kernel.+(10_000)
-    {:ok, pid} = Shard.start_link(index: index, data_dir: dir, flush_interval_ms: 60_000)
-
-    on_exit(fn ->
-      :persistent_term.put(:ferricstore_hot_cache_max_value_size, original)
-      if Process.alive?(pid), do: GenServer.stop(pid)
-      File.rm_rf!(dir)
-    end)
-
-    %{shard: pid, index: index}
+    %{shard: pid, index: 0, keydir: keydir, ctx: ctx}
   end
 
   describe "ets_insert uses :pending for unflushed entries" do
-    test "large value ETS entry has fid=:pending", %{shard: shard, index: index} do
-      keydir = :"keydir_#{index}"
+    test "large value ETS entry has fid=:pending", %{shard: shard, keydir: keydir} do
       large = String.duplicate("X", @threshold + 1)
 
       # Seed a small value and flush so offset 0 of 00000.log is occupied.
@@ -58,7 +50,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
   end
 
   describe "GET on unflushed large value works correctly" do
-    test "read triggers flush and returns correct value", %{shard: shard, index: index} do
+    test "read triggers flush and returns correct value", %{shard: shard} do
       large = String.duplicate("L", @threshold + 100)
 
       # Write large value — goes to pending with fid=:pending.
@@ -71,8 +63,7 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
   end
 
   describe "after flush, ETS has real disk location" do
-    test "fid and vsize are updated after flush", %{shard: shard, index: index} do
-      keydir = :"keydir_#{index}"
+    test "fid and vsize are updated after flush", %{shard: shard, keydir: keydir} do
       large = String.duplicate("A", @threshold + 50)
 
       :ok = GenServer.call(shard, {:put, "flushed_big", large, 0})

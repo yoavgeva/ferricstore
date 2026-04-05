@@ -14,6 +14,7 @@ defmodule Ferricstore.Store.ConcurrencyTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Shard
+  alias Ferricstore.Test.IsolatedInstance
 
   @task_timeout 30_000
 
@@ -26,17 +27,15 @@ defmodule Ferricstore.Store.ConcurrencyTest do
   # -------------------------------------------------------------------
 
   defp start_shard(_context) do
-    index = :erlang.unique_integer([:positive]) |> rem(10_000) |> Kernel.+(10_000)
-    dir = Path.join(System.tmp_dir!(), "conc_test_#{index}_#{:rand.uniform(9_999_999)}")
-    File.mkdir_p!(dir)
-    {:ok, pid} = Shard.start_link(index: index, data_dir: dir)
+    # Use IsolatedInstance to get a ctx with matching shard count.
+    # We only use shard 0 from it.
+    ctx = IsolatedInstance.checkout(shard_count: 1)
+    pid = Process.whereis(elem(ctx.shard_names, 0))
+    index = 0
 
-    on_exit(fn ->
-      if Process.alive?(pid), do: catch_exit(GenServer.stop(pid))
-      File.rm_rf!(dir)
-    end)
+    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
 
-    %{shard: pid, index: index, dir: dir}
+    %{shard: pid, index: index, dir: ctx.data_dir, keydir: elem(ctx.keydir_refs, 0), ctx: ctx}
   end
 
   defp parallel(count, fun) do
@@ -291,7 +290,7 @@ defmodule Ferricstore.Store.ConcurrencyTest do
   describe "ETS cache under concurrency" do
     setup :start_shard
 
-    test "concurrent puts populate ETS correctly", %{shard: shard, index: index} do
+    test "concurrent puts populate ETS correctly", %{shard: shard, keydir: keydir} do
       results =
         parallel(30, fn i ->
           GenServer.call(shard, {:put, "ets_key_#{i}", "ets_val_#{i}", 0})
@@ -300,12 +299,11 @@ defmodule Ferricstore.Store.ConcurrencyTest do
       assert Enum.all?(results, &(&1 == :ok))
 
       # Shard uses single-table format: {key, value, expire_at_ms, lfu_counter} in keydir
-      ets = :"keydir_#{index}"
-      entries = :ets.tab2list(ets)
+      entries = :ets.tab2list(keydir)
       assert length(entries) == 30
 
       for i <- 0..29 do
-        [{k, v, 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(ets, "ets_key_#{i}")
+        [{k, v, 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "ets_key_#{i}")
         assert k == "ets_key_#{i}"
         assert v == "ets_val_#{i}"
       end
@@ -328,7 +326,7 @@ defmodule Ferricstore.Store.ConcurrencyTest do
       end
     end
 
-    test "ETS is cleared for deleted keys under concurrency", %{shard: shard, index: index} do
+    test "ETS is cleared for deleted keys under concurrency", %{shard: shard, keydir: keydir} do
       # Seed 20 keys
       for i <- 0..19 do
         :ok = GenServer.call(shard, {:put, "del_ets_#{i}", "val_#{i}", 0})
@@ -342,10 +340,8 @@ defmodule Ferricstore.Store.ConcurrencyTest do
 
       assert Enum.all?(results, &(&1 == :ok))
 
-      ets = :"keydir_#{index}"
-
       for i <- 0..19 do
-        assert [] == :ets.lookup(ets, "del_ets_#{i}"),
+        assert [] == :ets.lookup(keydir, "del_ets_#{i}"),
                "Expected ETS entry for del_ets_#{i} to be removed"
       end
     end

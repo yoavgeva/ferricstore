@@ -22,14 +22,32 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     :ok
   end
 
-  # Start an isolated shard (not the app-supervised ones) for each test.
+  # Start an isolated shard with its own Instance ctx.
   defp start_shard(opts \\ []) do
     dir = Path.join(System.tmp_dir!(), "shard_async_io_#{:rand.uniform(9_999_999)}")
     File.mkdir_p!(dir)
-    index = :erlang.unique_integer([:positive]) |> rem(10_000) |> Kernel.+(30_000)
     flush_ms = Keyword.get(opts, :flush_interval_ms, 1)
-    {:ok, pid} = Shard.start_link(index: index, data_dir: dir, flush_interval_ms: flush_ms)
-    {pid, index, dir}
+
+    name = :"async_io_test_#{:erlang.unique_integer([:positive])}"
+    ctx = FerricStore.Instance.build(name, [
+      data_dir: dir,
+      shard_count: 1,
+      raft_enabled: false
+    ])
+    Ferricstore.DataDir.ensure_layout!(dir, 1)
+
+    {:ok, pid} = Shard.start_link(index: 0, data_dir: dir, flush_interval_ms: flush_ms, instance_ctx: ctx, raft_enabled: false)
+    {pid, 0, dir, ctx}
+  end
+
+  defp cleanup_shard(pid, ctx, dir) do
+    try do
+      if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5000)
+    catch
+      :exit, _ -> :ok
+    end
+    FerricStore.Instance.cleanup(ctx.name)
+    File.rm_rf(dir)
   end
 
   # ---------------------------------------------------------------------------
@@ -79,8 +97,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
   describe "shard nosync write path" do
     test "put is readable immediately via ETS (before fsync)" do
-      {pid, _index, dir} = start_shard(flush_interval_ms: 100)
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 100)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
       :ok = GenServer.call(pid, {:put, "nsk", "nsv", 0})
       # Should be readable from ETS immediately
@@ -88,8 +106,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     end
 
     test "fsync_needed is set after nosync write" do
-      {pid, _index, dir} = start_shard(flush_interval_ms: 5000)
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
       :ok = GenServer.call(pid, {:put, "fk", "fv", 0})
       # Allow the flush_pending to run (triggered by put when no flush_in_flight)
@@ -102,8 +120,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     end
 
     test "data survives flush (sync) call" do
-      {pid, _index, dir} = start_shard()
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      {pid, _index, dir, ctx} = start_shard()
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
       :ok = GenServer.call(pid, {:put, "dk", "dv", 0})
       :ok = GenServer.call(pid, :flush)
@@ -112,8 +130,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     end
 
     test "multiple puts before flush are all readable" do
-      {pid, _index, dir} = start_shard(flush_interval_ms: 5000)
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
       for i <- 1..10 do
         :ok = GenServer.call(pid, {:put, "mkey#{i}", "mval#{i}", 0})
@@ -139,8 +157,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
   describe "deferred fsync on flush timer" do
     test "fsync is performed by flush timer" do
-      {pid, _index, dir} = start_shard(flush_interval_ms: 5)
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
       :ok = GenServer.call(pid, {:put, "tk", "tv", 0})
 
@@ -161,8 +179,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
   describe "update_ets_locations preserves LFU counter" do
     test "LFU counter is preserved after flush updates disk location" do
-      {pid, index, dir} = start_shard(flush_interval_ms: 5000)
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
       # Put a value — this inserts with LFU.initial()
       :ok = GenServer.call(pid, {:put, "lfu_key", "lfu_val", 0})
@@ -173,7 +191,7 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       end
 
       # Get the LFU counter before flush
-      keydir = :"keydir_#{index}"
+      keydir = elem(ctx.keydir_refs, 0)
       [{_, _, _, lfu_before, _, _, _}] = :ets.lookup(keydir, "lfu_key")
 
       # Flush (will call update_ets_locations)
@@ -193,8 +211,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
   describe "concurrent writes" do
     test "many concurrent puts followed by flush all survive" do
-      {pid, _index, dir} = start_shard(flush_interval_ms: 1)
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 1)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
       # Fire 100 concurrent writes
       tasks =
@@ -223,8 +241,8 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
 
   describe "delete forces synchronous flush" do
     test "delete after nosync writes ensures durability" do
-      {pid, _index, dir} = start_shard(flush_interval_ms: 5000)
-      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid); File.rm_rf(dir) end)
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
+      on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
       :ok = GenServer.call(pid, {:put, "del_k1", "del_v1", 0})
       :ok = GenServer.call(pid, {:put, "del_k2", "del_v2", 0})
