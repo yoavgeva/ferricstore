@@ -1164,6 +1164,45 @@ defmodule Ferricstore.Store.Router do
   end
 
   # -------------------------------------------------------------------
+  # Compound key operations
+  # -------------------------------------------------------------------
+
+  def compound_get(ctx, redis_key, compound_key) do
+    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
+    GenServer.call(shard, {:compound_get, redis_key, compound_key})
+  end
+
+  def compound_get_meta(ctx, redis_key, compound_key) do
+    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
+    GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
+  end
+
+  def compound_put(ctx, redis_key, compound_key, value, expire_at_ms) do
+    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
+    GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+  end
+
+  def compound_delete(ctx, redis_key, compound_key) do
+    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
+    GenServer.call(shard, {:compound_delete, redis_key, compound_key})
+  end
+
+  def compound_scan(ctx, redis_key, prefix) do
+    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
+    GenServer.call(shard, {:compound_scan, redis_key, prefix})
+  end
+
+  def compound_count(ctx, redis_key, prefix) do
+    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
+    GenServer.call(shard, {:compound_count, redis_key, prefix})
+  end
+
+  def compound_delete_prefix(ctx, redis_key, prefix) do
+    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
+    GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
+  end
+
+  # -------------------------------------------------------------------
   # List operations
   # -------------------------------------------------------------------
 
