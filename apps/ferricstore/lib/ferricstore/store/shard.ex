@@ -46,7 +46,9 @@ defmodule Ferricstore.Store.Shard do
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.Lifecycle, as: ShardLifecycle
+  alias Ferricstore.Store.Shard.NativeOps, as: ShardNativeOps
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
+  alias Ferricstore.Store.Shard.Writes, as: ShardWrites
 
   require Logger
 
@@ -54,18 +56,9 @@ defmodule Ferricstore.Store.Shard do
   # 1ms gives up to 50k batched writes/s per shard (4 shards → 200k/s total).
   @flush_interval_ms 1
 
-  # Timeout for synchronous flush (blocking receive for async completion).
-  @sync_flush_timeout_ms 5_000
-  @default_sweep_interval_ms 1_000
-  @default_max_keys_per_sweep 100
-
   # Default maximum active file size before rotation (256 MB).
   # Configurable via :max_active_file_size application env.
   @default_max_active_file_size 256 * 1024 * 1024
-
-  # How often (ms) to re-evaluate fragmentation on idle shards.
-  # Catches shards that accumulated dead data then went quiet.
-  @default_frag_check_interval_ms 60_000
 
   # Record header size for dead byte accounting (same as @bitcask_header_size).
   @record_header_size 26
@@ -267,7 +260,6 @@ defmodule Ferricstore.Store.Shard do
   @impl true
   def handle_call({:get, key}, _from, state), do: ShardReads.handle_get(key, state)
 
-  @bitcask_header_size 26
   def handle_call({:get_file_ref, key}, _from, state), do: ShardReads.handle_get_file_ref(key, state)
 
   def handle_call({:get_meta, key}, _from, state), do: ShardReads.handle_get_meta(key, state)
@@ -289,17 +281,7 @@ defmodule Ferricstore.Store.Shard do
   # Delete all entries matching a compound key prefix.
   # Uses :ets.select match spec instead of :ets.foldl full-table scan.
   def handle_call({:delete_prefix, prefix}, _from, state) do
-    keys_to_delete = prefix_collect_keys(state.keydir, prefix)
-
-    if state.raft? do
-  
-      Enum.each(keys_to_delete, fn key -> raft_write(state, {:delete, key}) end)
-      new_version = state.write_version + 1
-      {:reply, :ok, %{state | write_version: new_version}}
-    else
-      Enum.each(keys_to_delete, fn key -> ets_delete_key(state, key) end)
-      {:reply, :ok, state}
-    end
+    ShardWrites.handle_delete_prefix(prefix, state)
   end
 
   # -------------------------------------------------------------------
@@ -648,654 +630,52 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_call({:put, key, value, expire_at_ms}, from, state) do
-    # Reject new-key writes when the keydir is at capacity (spec 2.4).
-    # Updates to existing keys are always allowed regardless of memory pressure.
-    is_new = case :ets.lookup(state.keydir, key) do
-      [] -> true
-      _ -> false
-    end
-
-    if is_new and Ferricstore.MemoryGuard.reject_writes?() do
-      Ferricstore.MemoryGuard.nudge()
-      {:reply, {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}, state}
-    else
-      if state.raft? do
-        # Raft path: forward to Batcher via non-blocking cast. The Batcher
-        # will reply directly to the original caller (from) when the ra
-        # command commits. This frees the Shard GenServer to process the
-        # next request immediately without waiting for Raft consensus.
-    
-        raft_write_async(state, {:put, key, value, expire_at_ms}, from)
-        new_version = state.write_version + 1
-        {:noreply, %{state | write_version: new_version}}
-      else
-        # Direct path (no Raft): write to ETS immediately so reads see it
-        # right away, then queue for async Bitcask flush.
-        ets_insert(state, key, value, expire_at_ms)
-        new_pending = [{key, value, expire_at_ms} | state.pending]
-        new_count = state.pending_count + 1
-        new_version = state.write_version + 1
-
-        # Cap pending list to @max_pending_size to bound heap memory growth
-        # during write bursts. Force a synchronous flush when exceeded.
-        state =
-          if new_count > @max_pending_size do
-            s = %{state | pending: new_pending, pending_count: new_count}
-            s = await_in_flight(s)
-            flush_pending_sync(s)
-          else
-            %{state | pending: new_pending, pending_count: new_count}
-          end
-
-        new_state = %{state | write_version: new_version}
-
-        # Flush immediately when no async flush is in-flight. This ensures every
-        # put is submitted to io_uring (and thus kernel-managed) before the call
-        # returns, providing crash durability even if the process is killed before
-        # the timer fires. Multiple puts arriving while a flush is in-flight are
-        # batched together and flushed on the next timer tick after the CQE.
-        if state.flush_in_flight == nil do
-          {:reply, :ok, flush_pending(new_state)}
-        else
-          {:reply, :ok, new_state}
-        end
-      end
-    end
+    ShardWrites.handle_put(key, value, expire_at_ms, from, state)
   end
 
   # Atomic increment: reads current value, parses as integer, adds delta, writes back.
   # Returns {:ok, new_integer} or {:error, reason}.
   def handle_call({:incr, key, delta}, _from, state) do
-    if state.raft? do
-      handle_incr_raft(key, delta, state)
-    else
-      handle_incr_direct(key, delta, state)
-    end
-  end
-
-  # Raft path for INCR: reads the current value from ETS/Bitcask (local read),
-  # computes the new value, then routes the resulting put through the Raft
-  # Batcher so the write is replicated and committed before replying.
-  defp handle_incr_raft(key, delta, state) do
-
-
-    {current_value, expire_at_ms} =
-      case ets_lookup_warm(state, key) do
-        {:hit, value, exp} -> {value, exp}
-        :expired -> {nil, 0}
-        :miss -> {do_get(state, key), 0}
-      end
-
-    case current_value do
-      nil ->
-        result = raft_write(state, {:put, key, delta, 0})
-        new_version = state.write_version + 1
-
-        case result do
-          :ok -> {:reply, {:ok, delta}, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
-
-      value ->
-        case coerce_integer(value) do
-          {:ok, int_val} ->
-            new_val = int_val + delta
-            result = raft_write(state, {:put, key, new_val, expire_at_ms})
-            new_version = state.write_version + 1
-
-            case result do
-              :ok -> {:reply, {:ok, new_val}, %{state | write_version: new_version}}
-              {:error, _} = err -> {:reply, err, state}
-            end
-
-          :error ->
-            {:reply, {:error, "ERR value is not an integer or out of range"}, state}
-        end
-    end
-  end
-
-  # Direct path for INCR (no Raft): reads current value, computes new value,
-  # writes to ETS + pending batch for async Bitcask flush.
-  defp handle_incr_direct(key, delta, state) do
-    case ets_lookup_warm(state, key) do
-      {:hit, value, expire_at_ms} ->
-        case coerce_integer(value) do
-          {:ok, int_val} ->
-            new_val = int_val + delta
-            ets_insert(state, key, new_val, expire_at_ms)
-            new_pending = [{key, new_val, expire_at_ms} | state.pending]
-            new_version = state.write_version + 1
-            new_state = %{state | pending: new_pending, write_version: new_version}
-
-            new_state =
-              if state.flush_in_flight == nil,
-                do: flush_pending(new_state),
-                else: new_state
-
-            {:reply, {:ok, new_val}, new_state}
-
-          :error ->
-            {:reply, {:error, "ERR value is not an integer or out of range"}, state}
-        end
-
-      :expired ->
-        # Treat as non-existent: set to delta
-        ets_insert(state, key, delta, 0)
-        new_pending = [{key, delta, 0} | state.pending]
-        new_version = state.write_version + 1
-        new_state = %{state | pending: new_pending, write_version: new_version}
-
-        new_state =
-          if state.flush_in_flight == nil,
-            do: flush_pending(new_state),
-            else: new_state
-
-        {:reply, {:ok, delta}, new_state}
-
-      :miss ->
-        # Check Bitcask
-        state = await_in_flight(state)
-        state = flush_pending_sync(state)
-
-        case do_get(state, key) do
-          nil ->
-            ets_insert(state, key, delta, 0)
-            new_pending = [{key, delta, 0} | state.pending]
-            new_version = state.write_version + 1
-            new_state = %{state | pending: new_pending, write_version: new_version}
-
-            new_state =
-              if state.flush_in_flight == nil,
-                do: flush_pending(new_state),
-                else: new_state
-
-            {:reply, {:ok, delta}, new_state}
-
-          value ->
-            # get the metadata for the expire
-            expire_at_ms =
-              case do_get_meta(state, key) do
-                {_, exp} -> exp
-                nil -> 0
-              end
-
-            case coerce_integer(value) do
-              {:ok, int_val} ->
-                new_val = int_val + delta
-                ets_insert(state, key, new_val, expire_at_ms)
-                new_pending = [{key, new_val, expire_at_ms} | state.pending]
-                new_version = state.write_version + 1
-                new_state = %{state | pending: new_pending, write_version: new_version}
-
-                new_state =
-                  if state.flush_in_flight == nil,
-                    do: flush_pending(new_state),
-                    else: new_state
-
-                {:reply, {:ok, new_val}, new_state}
-
-              :error ->
-                {:reply, {:error, "ERR value is not an integer or out of range"}, state}
-            end
-        end
-    end
+    ShardWrites.handle_incr(key, delta, state)
   end
 
   # Atomic float increment: reads current value, parses as float, adds delta, writes back.
   # Returns {:ok, new_float_string} or {:error, reason}.
   def handle_call({:incr_float, key, delta}, _from, state) do
-    if state.raft? do
-      handle_incr_float_raft(key, delta, state)
-    else
-      handle_incr_float_direct(key, delta, state)
-    end
-  end
-
-  # Raft path for INCRBYFLOAT: routes compound command through Raft.
-  # The state machine performs the full read-modify-write atomically.
-  defp handle_incr_float_raft(key, delta, state) do
-
-
-    result = raft_write(state, {:incr_float, key, delta})
-    new_version = state.write_version + 1
-
-    case result do
-      {:ok, _new_str} = ok -> {:reply, ok, %{state | write_version: new_version}}
-      {:error, _} = err -> {:reply, err, state}
-    end
-  end
-
-  # Direct path for INCRBYFLOAT (no Raft).
-  defp handle_incr_float_direct(key, delta, state) do
-    case ets_lookup_warm(state, key) do
-      {:hit, value, expire_at_ms} ->
-        case coerce_float(value) do
-          {:ok, float_val} ->
-            new_val = float_val + delta
-            ets_insert(state, key, new_val, expire_at_ms)
-            new_pending = [{key, new_val, expire_at_ms} | state.pending]
-            new_state = %{state | pending: new_pending}
-
-            new_state =
-              if state.flush_in_flight == nil,
-                do: flush_pending(new_state),
-                else: new_state
-
-            {:reply, {:ok, new_val}, new_state}
-
-          :error ->
-            {:reply, {:error, "ERR value is not a valid float"}, state}
-        end
-
-      :expired ->
-        new_val = delta * 1.0
-        ets_insert(state, key, new_val, 0)
-        new_pending = [{key, new_val, 0} | state.pending]
-        new_state = %{state | pending: new_pending}
-
-        new_state =
-          if state.flush_in_flight == nil,
-            do: flush_pending(new_state),
-            else: new_state
-
-        {:reply, {:ok, new_val}, new_state}
-
-      :miss ->
-        state = await_in_flight(state)
-        state = flush_pending_sync(state)
-
-        case do_get(state, key) do
-          nil ->
-            new_val = delta * 1.0
-            ets_insert(state, key, new_val, 0)
-            new_pending = [{key, new_val, 0} | state.pending]
-            new_state = %{state | pending: new_pending}
-
-            new_state =
-              if state.flush_in_flight == nil,
-                do: flush_pending(new_state),
-                else: new_state
-
-            {:reply, {:ok, new_val}, new_state}
-
-          value ->
-            expire_at_ms =
-              case do_get_meta(state, key) do
-                {_, exp} -> exp
-                nil -> 0
-              end
-
-            case coerce_float(value) do
-              {:ok, float_val} ->
-                new_val = float_val + delta
-                ets_insert(state, key, new_val, expire_at_ms)
-                new_pending = [{key, new_val, expire_at_ms} | state.pending]
-                new_state = %{state | pending: new_pending}
-
-                new_state =
-                  if state.flush_in_flight == nil,
-                    do: flush_pending(new_state),
-                    else: new_state
-
-                {:reply, {:ok, new_val}, new_state}
-
-              :error ->
-                {:reply, {:error, "ERR value is not a valid float"}, state}
-            end
-        end
-    end
+    ShardWrites.handle_incr_float(key, delta, state)
   end
 
   # Atomic append: reads current value (or ""), appends suffix, writes back.
   # Returns {:ok, new_byte_length}.
   def handle_call({:append, key, suffix}, _from, state) do
-    if state.raft? do
-      handle_append_raft(key, suffix, state)
-    else
-      handle_append_direct(key, suffix, state)
-    end
-  end
-
-  # Raft path for APPEND: routes compound command through Raft.
-  # The state machine performs the full read-modify-write atomically.
-  defp handle_append_raft(key, suffix, state) do
-
-
-    result = raft_write(state, {:append, key, suffix})
-    new_version = state.write_version + 1
-
-    case result do
-      {:ok, _len} = ok -> {:reply, ok, %{state | write_version: new_version}}
-      {:error, _} = err -> {:reply, err, state}
-    end
-  end
-
-  # Direct path for APPEND (no Raft).
-  defp handle_append_direct(key, suffix, state) do
-    case ets_lookup_warm(state, key) do
-      {:hit, value, expire_at_ms} ->
-        new_val = to_disk_binary(value) <> suffix
-        ets_insert(state, key, new_val, expire_at_ms)
-        new_pending = [{key, new_val, expire_at_ms} | state.pending]
-        new_state = %{state | pending: new_pending}
-
-        new_state =
-          if state.flush_in_flight == nil,
-            do: flush_pending(new_state),
-            else: new_state
-
-        {:reply, {:ok, byte_size(new_val)}, new_state}
-
-      :expired ->
-        ets_insert(state, key, suffix, 0)
-        new_pending = [{key, suffix, 0} | state.pending]
-        new_state = %{state | pending: new_pending}
-
-        new_state =
-          if state.flush_in_flight == nil,
-            do: flush_pending(new_state),
-            else: new_state
-
-        {:reply, {:ok, byte_size(suffix)}, new_state}
-
-      :miss ->
-        state = await_in_flight(state)
-        state = flush_pending_sync(state)
-
-        {old_val, expire_at_ms} =
-          case do_get_meta(state, key) do
-            {v, exp} -> {to_disk_binary(v), exp}
-            nil -> {"", 0}
-          end
-
-        new_val = old_val <> suffix
-        ets_insert(state, key, new_val, expire_at_ms)
-        new_pending = [{key, new_val, expire_at_ms} | state.pending]
-        new_state = %{state | pending: new_pending}
-
-        new_state =
-          if state.flush_in_flight == nil,
-            do: flush_pending(new_state),
-            else: new_state
-
-        {:reply, {:ok, byte_size(new_val)}, new_state}
-    end
+    ShardWrites.handle_append(key, suffix, state)
   end
 
   # Atomic get-and-set: returns old value (or nil), sets new value.
   def handle_call({:getset, key, new_value}, _from, state) do
-    if state.raft? do
-      handle_getset_raft(key, new_value, state)
-    else
-      handle_getset_direct(key, new_value, state)
-    end
-  end
-
-  # Raft path for GETSET: routes compound command through Raft.
-  # The state machine performs the atomic get-and-set.
-  defp handle_getset_raft(key, new_value, state) do
-
-
-    result = raft_write(state, {:getset, key, new_value})
-    new_version = state.write_version + 1
-
-    case result do
-      {:error, _} = err -> {:reply, err, state}
-      old -> {:reply, old, %{state | write_version: new_version}}
-    end
-  end
-
-  # Direct path for GETSET (no Raft).
-  defp handle_getset_direct(key, new_value, state) do
-    {old, state} =
-      case ets_lookup_warm(state, key) do
-        {:hit, value, _expire_at_ms} -> {value, state}
-        :expired -> {nil, state}
-        :miss ->
-          state = await_in_flight(state)
-          state = flush_pending_sync(state)
-          {do_get(state, key), state}
-      end
-
-    ets_insert(state, key, new_value, 0)
-    new_pending = [{key, new_value, 0} | state.pending]
-    new_state = %{state | pending: new_pending}
-
-    new_state =
-      if state.flush_in_flight == nil,
-        do: flush_pending(new_state),
-        else: new_state
-
-    {:reply, old, new_state}
+    ShardWrites.handle_getset(key, new_value, state)
   end
 
   # Atomic get-and-delete: returns value (or nil), deletes key.
   def handle_call({:getdel, key}, _from, state) do
-    if state.raft? do
-      handle_getdel_raft(key, state)
-    else
-      handle_getdel_direct(key, state)
-    end
-  end
-
-  # Raft path for GETDEL: routes compound command through Raft.
-  # The state machine performs the atomic get-and-delete.
-  defp handle_getdel_raft(key, state) do
-
-
-    result = raft_write(state, {:getdel, key})
-    new_version = state.write_version + 1
-
-    case result do
-      {:error, _} = err -> {:reply, err, state}
-      old -> {:reply, old, %{state | write_version: new_version}}
-    end
-  end
-
-  # Direct path for GETDEL (no Raft).
-  defp handle_getdel_direct(key, state) do
-    {old, state} =
-      case ets_lookup_warm(state, key) do
-        {:hit, value, _expire_at_ms} -> {value, state}
-        :expired -> {nil, state}
-        :miss ->
-          state = await_in_flight(state)
-          state = flush_pending_sync(state)
-          {do_get(state, key), state}
-      end
-
-    if old != nil do
-      # Synchronous delete for durability
-      state = await_in_flight(state)
-      state = flush_pending_sync(state)
-      state = track_delete_dead_bytes(state, key)
-
-      case NIF.v2_append_tombstone(state.active_file_path, key) do
-        {:ok, _} ->
-          ets_delete_key(state, key)
-          # flush_pending_sync already sets pending to []. Only scan if non-empty.
-          new_pending =
-            case state.pending do
-              [] -> []
-              pending -> Enum.reject(pending, fn {k, _, _} -> k == key end)
-            end
-          {:reply, old, %{state | pending: new_pending}}
-
-        {:error, reason} ->
-          Logger.error("Shard #{state.index}: tombstone write failed for GETDEL: #{inspect(reason)}")
-          {:reply, {:error, reason}, state}
-      end
-    else
-      {:reply, nil, state}
-    end
+    ShardWrites.handle_getdel(key, state)
   end
 
   # Atomic get-and-update-expiry: returns value, updates TTL.
   # expire_at_ms = 0 means PERSIST (remove expiry).
   def handle_call({:getex, key, expire_at_ms}, _from, state) do
-    if state.raft? do
-      handle_getex_raft(key, expire_at_ms, state)
-    else
-      handle_getex_direct(key, expire_at_ms, state)
-    end
-  end
-
-  # Raft path for GETEX: routes compound command through Raft.
-  # The state machine performs the atomic get-and-update-expiry.
-  defp handle_getex_raft(key, expire_at_ms, state) do
-
-
-    result = raft_write(state, {:getex, key, expire_at_ms})
-    new_version = state.write_version + 1
-
-    case result do
-      {:error, _} = err -> {:reply, err, state}
-      value -> {:reply, value, %{state | write_version: new_version}}
-    end
-  end
-
-  # Direct path for GETEX (no Raft).
-  defp handle_getex_direct(key, expire_at_ms, state) do
-    case ets_lookup_warm(state, key) do
-      {:hit, value, _old_exp} ->
-        ets_insert(state, key, value, expire_at_ms)
-        new_pending = [{key, value, expire_at_ms} | state.pending]
-        new_state = %{state | pending: new_pending}
-
-        new_state =
-          if state.flush_in_flight == nil,
-            do: flush_pending(new_state),
-            else: new_state
-
-        {:reply, value, new_state}
-
-      :expired ->
-        {:reply, nil, state}
-
-      :miss ->
-        state = await_in_flight(state)
-        state = flush_pending_sync(state)
-
-        case do_get(state, key) do
-          nil ->
-            {:reply, nil, state}
-
-          value ->
-            ets_insert(state, key, value, expire_at_ms)
-            new_pending = [{key, value, expire_at_ms} | state.pending]
-            new_state = %{state | pending: new_pending}
-
-            new_state =
-              if state.flush_in_flight == nil,
-                do: flush_pending(new_state),
-                else: new_state
-
-            {:reply, value, new_state}
-        end
-    end
+    ShardWrites.handle_getex(key, expire_at_ms, state)
   end
 
   # Atomic set-range: overwrites portion of string at offset with value.
   # Zero-pads if key doesn't exist or string is shorter than offset.
   # Returns {:ok, new_byte_length}.
   def handle_call({:setrange, key, offset, value}, _from, state) do
-    if state.raft? do
-      handle_setrange_raft(key, offset, value, state)
-    else
-      handle_setrange_direct(key, offset, value, state)
-    end
-  end
-
-  # Raft path for SETRANGE: routes compound command through Raft.
-  # The state machine performs the full read-modify-write atomically.
-  defp handle_setrange_raft(key, offset, value, state) do
-
-
-    result = raft_write(state, {:setrange, key, offset, value})
-    new_version = state.write_version + 1
-
-    case result do
-      {:ok, _len} = ok -> {:reply, ok, %{state | write_version: new_version}}
-      {:error, _} = err -> {:reply, err, state}
-    end
-  end
-
-  # Direct path for SETRANGE (no Raft).
-  defp handle_setrange_direct(key, offset, value, state) do
-    {old_val, expire_at_ms} =
-      case ets_lookup_warm(state, key) do
-        {:hit, v, exp} -> {to_disk_binary(v), exp}
-        :expired -> {"", 0}
-        :miss ->
-          state = await_in_flight(state)
-          state = flush_pending_sync(state)
-
-          case do_get_meta(state, key) do
-            {v, exp} -> {to_disk_binary(v), exp}
-            nil -> {"", 0}
-          end
-      end
-
-    new_val = apply_setrange(old_val, offset, value)
-    ets_insert(state, key, new_val, expire_at_ms)
-    new_pending = [{key, new_val, expire_at_ms} | state.pending]
-    new_state = %{state | pending: new_pending}
-
-    new_state =
-      if state.flush_in_flight == nil,
-        do: flush_pending(new_state),
-        else: new_state
-
-    {:reply, {:ok, byte_size(new_val)}, new_state}
+    ShardWrites.handle_setrange(key, offset, value, state)
   end
 
   def handle_call({:delete, key}, from, state) do
-    if state.raft? do
-      # Raft path: forward to Batcher via non-blocking cast. The Batcher
-      # will reply directly to the original caller when ra commits.
-  
-      raft_write_async(state, {:delete, key}, from)
-      new_version = state.write_version + 1
-      {:noreply, %{state | write_version: new_version}}
-    else
-      # Direct path: delete is always synchronous — tombstones must be durable
-      # immediately so a crash doesn't resurrect the key.
-      #
-      # 1. Wait for any in-flight async flush to complete.
-      # 2. Flush remaining pending writes synchronously.
-      # 3. Write the tombstone.
-      # 4. Remove the deleted key from pending to prevent resurrection.
-      state = await_in_flight(state)
-      state = flush_pending_sync(state)
-      state = track_delete_dead_bytes(state, key)
-
-      case NIF.v2_append_tombstone(state.active_file_path, key) do
-        {:ok, _} ->
-          ets_delete_key(state, key)
-          # flush_pending_sync already sets pending to []. Only scan if non-empty
-          # (belt-and-suspenders guard; avoids O(n) Enum.reject on every DELETE).
-          new_pending =
-            case state.pending do
-              [] -> []
-              pending -> Enum.reject(pending, fn {k, _, _} -> k == key end)
-            end
-          new_version = state.write_version + 1
-          {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
-
-        {:error, reason} ->
-          Logger.error("Shard #{state.index}: tombstone write failed for DELETE: #{inspect(reason)}")
-          # Still remove from ETS so the key is gone for the current session.
-          # The data file may have been removed externally (e.g. test cleanup).
-          ets_delete_key(state, key)
-          new_pending =
-            case state.pending do
-              [] -> []
-              pending -> Enum.reject(pending, fn {k, _, _} -> k == key end)
-            end
-          new_version = state.write_version + 1
-          {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
-      end
-    end
+    ShardWrites.handle_delete(key, from, state)
   end
 
   # Returns the active file info for the AsyncApplyWorker.
@@ -1828,276 +1208,28 @@ defmodule Ferricstore.Store.Shard do
   # --- Native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD ---
 
   def handle_call({:cas, key, expected, new_value, ttl_ms}, _from, state) do
-    if state.raft? do
-      handle_cas_raft(key, expected, new_value, ttl_ms, state)
-    else
-      handle_cas_direct(key, expected, new_value, ttl_ms, state)
-    end
-  end
-
-  # Raft path for CAS: sends compound command through Raft so the entire
-  # read-compare-write is atomic within the replicated state machine.
-  defp handle_cas_raft(key, expected, new_value, ttl_ms, state) do
-
-
-    # Pre-compute absolute expiry before entering Raft so the state machine
-    # apply/3 remains deterministic (no clock calls inside apply).
-    # Use HLC for consistency across all code paths and multi-node.
-    expire_at_ms = if ttl_ms, do: Ferricstore.HLC.now_ms() + ttl_ms, else: nil
-    result = raft_write(state, {:cas, key, expected, new_value, expire_at_ms})
-
-    case result do
-      r when r in [1, 0, nil] ->
-        new_version = if r == 1, do: state.write_version + 1, else: state.write_version
-        {:reply, r, %{state | write_version: new_version}}
-
-      {:error, _} = err ->
-        {:reply, err, state}
-    end
-  end
-
-  # Direct path for CAS (no Raft).
-  defp handle_cas_direct(key, expected, new_value, ttl_ms, state) do
-    case resolve_for_native(state, key) do
-      {{:hit, ^expected, old_exp}, state} ->
-        expire = if ttl_ms, do: Ferricstore.HLC.now_ms() + ttl_ms, else: old_exp
-        ets_insert(state, key, new_value, expire)
-        new_pending = [{key, new_value, expire} | state.pending]
-        new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
-        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
-        {:reply, 1, new_state}
-
-      {{:hit, _other, _exp}, state} -> {:reply, 0, state}
-      {:expired, state} -> {:reply, nil, state}
-      {:missing, state} -> {:reply, nil, state}
-    end
+    ShardNativeOps.handle_cas(key, expected, new_value, ttl_ms, state)
   end
 
   def handle_call({:lock, key, owner, ttl_ms}, _from, state) do
-    if state.raft? do
-      handle_lock_raft(key, owner, ttl_ms, state)
-    else
-      handle_lock_direct(key, owner, ttl_ms, state)
-    end
-  end
-
-  # Raft path for LOCK: sends compound command through Raft so the entire
-  # check-and-acquire is atomic within the replicated state machine.
-  defp handle_lock_raft(key, owner, ttl_ms, state) do
-
-
-    # Pre-compute absolute expiry before entering Raft so the state machine
-    # apply/3 remains deterministic. Use HLC for multi-node consistency.
-    expire_at_ms = Ferricstore.HLC.now_ms() + ttl_ms
-    result = raft_write(state, {:lock, key, owner, expire_at_ms})
-
-    case result do
-      :ok ->
-        {:reply, :ok, %{state | write_version: state.write_version + 1}}
-
-      {:error, _} = err ->
-        {:reply, err, state}
-    end
-  end
-
-  # Direct path for LOCK (no Raft).
-  defp handle_lock_direct(key, owner, ttl_ms, state) do
-    expire = Ferricstore.HLC.now_ms() + ttl_ms
-
-    case resolve_for_native(state, key) do
-      {{:hit, ^owner, _exp}, state} ->
-        ets_insert(state, key, owner, expire)
-        new_pending = [{key, owner, expire} | state.pending]
-        new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
-        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
-        {:reply, :ok, new_state}
-
-      {{:hit, _other, _exp}, state} ->
-        {:reply, {:error, "DISTLOCK lock is held by another owner"}, state}
-
-      {_, state} ->
-        ets_insert(state, key, owner, expire)
-        new_pending = [{key, owner, expire} | state.pending]
-        new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
-        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
-        {:reply, :ok, new_state}
-    end
+    ShardNativeOps.handle_lock(key, owner, ttl_ms, state)
   end
 
   def handle_call({:unlock, key, owner}, _from, state) do
-    if state.raft? do
-      handle_unlock_raft(key, owner, state)
-    else
-      handle_unlock_direct(key, owner, state)
-    end
-  end
-
-  # Raft path for UNLOCK: sends compound command through Raft so the entire
-  # check-and-delete is atomic within the replicated state machine.
-  defp handle_unlock_raft(key, owner, state) do
-
-
-    result = raft_write(state, {:unlock, key, owner})
-
-    case result do
-      1 ->
-        {:reply, 1, %{state | write_version: state.write_version + 1}}
-
-      {:error, _} = err ->
-        {:reply, err, state}
-    end
-  end
-
-  # Direct path for UNLOCK (no Raft).
-  defp handle_unlock_direct(key, owner, state) do
-    case resolve_for_native(state, key) do
-      {{:hit, ^owner, _exp}, state} ->
-        state = await_in_flight(state)
-        state = flush_pending_sync(state)
-        state = track_delete_dead_bytes(state, key)
-
-        case NIF.v2_append_tombstone(state.active_file_path, key) do
-          {:ok, _} ->
-            ets_delete_key(state, key)
-            {:reply, 1, %{state | write_version: state.write_version + 1}}
-
-          {:error, reason} ->
-            Logger.error("Shard #{state.index}: tombstone write failed for UNLOCK: #{inspect(reason)}")
-            {:reply, {:error, reason}, state}
-        end
-
-      {{:hit, _other, _exp}, state} ->
-        {:reply, {:error, "DISTLOCK caller is not the lock owner"}, state}
-
-      {_, state} -> {:reply, 1, state}
-    end
+    ShardNativeOps.handle_unlock(key, owner, state)
   end
 
   def handle_call({:extend, key, owner, ttl_ms}, _from, state) do
-    if state.raft? do
-      handle_extend_raft(key, owner, ttl_ms, state)
-    else
-      handle_extend_direct(key, owner, ttl_ms, state)
-    end
-  end
-
-  # Raft path for EXTEND: sends compound command through Raft so the entire
-  # check-and-update is atomic within the replicated state machine.
-  defp handle_extend_raft(key, owner, ttl_ms, state) do
-
-
-    # Pre-compute absolute expiry before entering Raft so the state machine
-    # apply/3 remains deterministic. Use HLC for multi-node consistency.
-    expire_at_ms = Ferricstore.HLC.now_ms() + ttl_ms
-    result = raft_write(state, {:extend, key, owner, expire_at_ms})
-
-    case result do
-      1 ->
-        {:reply, 1, %{state | write_version: state.write_version + 1}}
-
-      {:error, _} = err ->
-        {:reply, err, state}
-    end
-  end
-
-  # Direct path for EXTEND (no Raft).
-  defp handle_extend_direct(key, owner, ttl_ms, state) do
-    new_expire = Ferricstore.HLC.now_ms() + ttl_ms
-
-    case resolve_for_native(state, key) do
-      {{:hit, ^owner, _exp}, state} ->
-        ets_insert(state, key, owner, new_expire)
-        new_pending = [{key, owner, new_expire} | state.pending]
-        new_state = %{state | pending: new_pending, write_version: state.write_version + 1}
-        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
-        {:reply, 1, new_state}
-
-      {{:hit, _other, _exp}, state} ->
-        {:reply, {:error, "DISTLOCK caller is not the lock owner"}, state}
-
-      {_, state} ->
-        {:reply, {:error, "DISTLOCK lock does not exist or has expired"}, state}
-    end
+    ShardNativeOps.handle_extend(key, owner, ttl_ms, state)
   end
 
   def handle_call({:ratelimit_add, key, window_ms, max, count}, _from, state) do
-    if state.raft? do
-      handle_ratelimit_add_raft(key, window_ms, max, count, state)
-    else
-      handle_ratelimit_add_direct(key, window_ms, max, count, state)
-    end
+    ShardNativeOps.handle_ratelimit_add(key, window_ms, max, count, state)
   end
 
   # 6-tuple variant: includes pre-computed now_ms from Router.raft_write.
   def handle_call({:ratelimit_add, key, window_ms, max, count, _now_ms}, _from, state) do
-    handle_ratelimit_add_direct(key, window_ms, max, count, state)
-  end
-
-  # Raft path for RATELIMIT.ADD: sends compound command through Raft so the
-  # entire read-compute-write is atomic within the replicated state machine.
-  defp handle_ratelimit_add_raft(key, window_ms, max, count, state) do
-
-
-    # Pre-compute `now` before entering Raft so the state machine
-    # apply/3 remains deterministic.
-    now_ms = System.os_time(:millisecond)
-    result = raft_write(state, {:ratelimit_add, key, window_ms, max, count, now_ms})
-
-    case result do
-      [_status, _count, _remaining, _ttl] = reply ->
-        new_version = state.write_version + 1
-        {:reply, reply, %{state | write_version: new_version}}
-
-      {:error, _} = err ->
-        {:reply, err, state}
-    end
-  end
-
-  # Direct path for RATELIMIT.ADD (no Raft).
-  defp handle_ratelimit_add_direct(key, window_ms, max, count, state) do
-    now = Ferricstore.HLC.now_ms()
-
-    {cur_count, cur_start, prv_count} =
-      case ets_lookup_warm(state, key) do
-        {:hit, value, _exp} -> decode_ratelimit(value)
-        _ -> {0, now, 0}
-      end
-
-    # Rotate windows
-    {cur_count, cur_start, prv_count} =
-      cond do
-        now - cur_start >= window_ms * 2 -> {0, now, 0}
-        now - cur_start >= window_ms -> {0, now, cur_count}
-        true -> {cur_count, cur_start, prv_count}
-      end
-
-    # Compute effective count with sliding window approximation
-    elapsed = now - cur_start
-    weight = max(0.0, 1.0 - elapsed / window_ms)
-    effective = cur_count + trunc(Float.round(prv_count * weight))
-    expire_at_ms = cur_start + window_ms * 2
-
-    {status, final_count, remaining, state} =
-      if effective + count > max do
-        value = encode_ratelimit(cur_count, cur_start, prv_count)
-        ets_insert(state, key, value, expire_at_ms)
-        new_pending = [{key, value, expire_at_ms} | state.pending]
-        new_state = %{state | pending: new_pending}
-        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
-        {"denied", effective, max(0, max - effective), new_state}
-      else
-        new_cur = cur_count + count
-        new_eff = effective + count
-        value = encode_ratelimit(new_cur, cur_start, prv_count)
-        ets_insert(state, key, value, expire_at_ms)
-        new_pending = [{key, value, expire_at_ms} | state.pending]
-        new_state = %{state | pending: new_pending}
-        new_state = if state.flush_in_flight == nil, do: flush_pending(new_state), else: new_state
-        {"allowed", new_eff, max(0, max - new_eff), new_state}
-      end
-
-    ms_until_reset = max(0, cur_start + window_ms - now)
-    {:reply, [status, final_count, remaining, ms_until_reset], state}
+    ShardNativeOps.handle_ratelimit_add_direct(key, window_ms, max, count, state)
   end
 
   # ---------------------------------------------------------------------------
@@ -2617,8 +1749,6 @@ defmodule Ferricstore.Store.Shard do
   defp track_delete_dead_bytes(state, key), do: ShardFlush.track_delete_dead_bytes(state, key)
   defp maybe_notify_fragmentation(state), do: ShardFlush.maybe_notify_fragmentation(state)
   defp compute_file_stats(shard_path, keydir), do: ShardFlush.compute_file_stats(shard_path, keydir)
-  defp write_hint_for_file(state, target_fid), do: ShardFlush.write_hint_for_file(state, target_fid)
-
   defp schedule_flush(ms), do: ShardFlush.schedule_flush(ms)
 
   # -------------------------------------------------------------------
@@ -2661,24 +1791,16 @@ defmodule Ferricstore.Store.Shard do
 
   defp prefix_collect_keys(keydir, prefix), do: ShardETS.prefix_collect_keys(keydir, prefix)
 
-  defp ets_lookup(state, key), do: ShardETS.ets_lookup(state, key)
-
   defp ets_lookup_warm(state, key), do: ShardETS.ets_lookup_warm(state, key)
 
 
   defp warm_from_store(state, key), do: ShardETS.warm_from_store(state, key)
+  defp warm_meta_from_store(state, key), do: ShardETS.warm_meta_from_store(state, key)
 
   defp v2_local_read(state, key), do: ShardReads.v2_local_read(state, key)
 
   defp cold_read_warm_ets(state, key, value),
     do: ShardETS.cold_read_warm_ets(state, key, value)
-
-  defp cold_read_warm_ets(state, key, value, exp, fid, off, vsize),
-    do: ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
-
-  defp warm_meta_from_store(state, key), do: ShardETS.warm_meta_from_store(state, key)
-
-  defp live_keys(state), do: ShardReads.live_keys(state)
 
   # -------------------------------------------------------------------
   # Private: integer / float parsing — delegates to shared ValueCodec
