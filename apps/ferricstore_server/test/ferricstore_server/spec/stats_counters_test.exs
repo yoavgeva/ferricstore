@@ -59,8 +59,15 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
 
     test "does not increment on successful GET", %{ctx: ctx} do
       Router.put(ctx, "exists_key", "value", 0)
+
+      # Wait until the key is readable (shard may still be processing)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get(ctx, "exists_key") == "value"
+      end, "key not readable after put", 10, 10)
+
+      misses_before = Stats.keyspace_misses(ctx)
       _val = Router.get(ctx, "exists_key")
-      assert Stats.keyspace_misses(ctx) == 0
+      assert Stats.keyspace_misses(ctx) == misses_before
     end
 
     test "increments multiple times on consecutive misses", %{ctx: ctx} do
