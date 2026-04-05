@@ -43,6 +43,8 @@ defmodule Ferricstore.Store.Shard do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.{LFU, Router, ValueCodec}
+  alias Ferricstore.Store.Shard.ETS, as: ShardETS
+  alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
   require Logger
 
@@ -374,10 +376,7 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # Returns the file path for a given file_id within the shard data directory.
-  defp file_path(shard_path, file_id) do
-    Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
-  end
+  defp file_path(shard_path, file_id), do: ShardETS.file_path(shard_path, file_id)
 
   @impl true
   def handle_continue({:flush_interval, ms}, state) do
@@ -2869,285 +2868,15 @@ defmodule Ferricstore.Store.Shard do
   # Private: flush
   # -------------------------------------------------------------------
 
-  # Async flush — used by the timer and by put (first-write-in-window).
-  # Writes to page cache only (no fsync) — durability comes from the
-  # periodic fsync on the flush timer. This reduces per-write latency
-  # from ~50-200us (NVMe fsync) to ~1-10us (memcpy to page cache).
-  # If a flush is already in-flight or pending is empty, this is a no-op.
-  defp flush_pending(%{pending: []} = state), do: state
-  defp flush_pending(%{flush_in_flight: op_id} = state) when op_id != nil, do: state
+  defp flush_pending(state), do: ShardFlush.flush_pending(state)
+  defp flush_pending_sync(state), do: ShardFlush.flush_pending_sync(state)
+  defp await_in_flight(state), do: ShardFlush.await_in_flight(state)
+  defp track_delete_dead_bytes(state, key), do: ShardFlush.track_delete_dead_bytes(state, key)
+  defp maybe_notify_fragmentation(state), do: ShardFlush.maybe_notify_fragmentation(state)
+  defp compute_file_stats(shard_path, keydir), do: ShardFlush.compute_file_stats(shard_path, keydir)
+  defp write_hint_for_file(state, target_fid), do: ShardFlush.write_hint_for_file(state, target_fid)
 
-  defp flush_pending(%{pending: pending} = state) do
-    raw_batch = Enum.reverse(pending)
-    batch = Enum.map(raw_batch, fn {key, value, exp} ->
-      {key, to_disk_binary(value), exp}
-    end)
-
-    state = maybe_rotate_file(state)
-
-    case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
-      {:ok, locations} ->
-        Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
-        written = total_written(locations)
-        state = update_ets_locations(state, batch, locations)
-        state = track_flush_bytes(state, written)
-        state = %{state | pending: [], pending_count: 0, fsync_needed: true,
-          active_file_size: state.active_file_size + written}
-        maybe_notify_fragmentation(state)
-
-      {:error, reason} ->
-        Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
-        Logger.error("Shard #{state.index}: flush_pending (nosync) failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
-        state
-    end
-  end
-
-  # Synchronous flush — used by delete, :flush, and :keys calls that need
-  # durability guarantees. Uses v2_append_batch (write + fsync in one call).
-  # Also ensures any previously-nosync'd data is fsynced.
-  defp flush_pending_sync(%{pending: []} = state) do
-    # Even with empty pending, we may need to fsync previously-nosync'd data.
-    if state.fsync_needed do
-      NIF.v2_fsync(state.active_file_path)
-      %{state | fsync_needed: false}
-    else
-      state
-    end
-  end
-
-  defp flush_pending_sync(%{pending: pending} = state) do
-    raw_batch = Enum.reverse(pending)
-    batch = Enum.map(raw_batch, fn {key, value, exp} ->
-      {key, to_disk_binary(value), exp}
-    end)
-
-    state = maybe_rotate_file(state)
-
-    case NIF.v2_append_batch(state.active_file_path, batch) do
-      {:ok, locations} ->
-        Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
-        written = total_written(locations)
-        state = update_ets_locations(state, batch, locations)
-        state = track_flush_bytes(state, written)
-        state = %{state | pending: [], pending_count: 0, fsync_needed: false,
-          active_file_size: state.active_file_size + written}
-        maybe_notify_fragmentation(state)
-
-      {:error, reason} ->
-        Ferricstore.Store.DiskPressure.set(state.instance_ctx, state.index)
-        Logger.error("Shard #{state.index}: flush_pending_sync failed: #{inspect(reason)} — retaining #{length(raw_batch)} pending entries")
-        state
-    end
-  end
-
-  # Wait for any in-flight async fsync to complete before proceeding.
-  # This blocks the GenServer until the Tokio fsync result arrives.
-  # Used before durability-critical operations (delete, keys, explicit flush).
-  defp await_in_flight(%{flush_in_flight: nil} = state), do: state
-
-  defp await_in_flight(%{flush_in_flight: corr_id} = state) do
-    receive do
-      {:tokio_complete, ^corr_id, :ok, :ok} ->
-        %{state | flush_in_flight: nil}
-
-      {:tokio_complete, ^corr_id, :error, _reason} ->
-        # Fsync failed — log at caller site if needed. Clear in-flight.
-        %{state | flush_in_flight: nil}
-    after
-      @sync_flush_timeout_ms ->
-        # Timeout — clear in-flight to avoid permanent blocking.
-        Logger.error("Shard #{state.index}: await_in_flight timed out for corr_id #{corr_id}")
-        %{state | flush_in_flight: nil}
-    end
-  end
-
-  defp update_ets_locations(state, batch, locations) do
-    fid = state.active_file_id
-
-    new_file_stats =
-      Enum.zip(batch, locations)
-      |> Enum.reduce(state.file_stats, fn {{key, value, _exp}, {offset, _record_size}}, fs ->
-        # Use update_element for the disk-location fields only.
-        # This preserves the LFU counter (position 4) and is a single
-        # ETS operation — no lookup+insert round-trip needed.
-        # Positions: {1=key, 2=value, 3=exp, 4=lfu, 5=fid, 6=offset, 7=vsize}
-        #
-        # vsize is computed from the original batch value (not the ETS value)
-        # because large values are stored as nil in ETS due to
-        # hot_cache_max_value_size, which would incorrectly produce vsize=0.
-        case :ets.lookup(state.keydir, key) do
-          [{^key, _ets_value, _exp, _lfu, old_fid, _old_off, old_vsize}] ->
-            vsize = byte_size(value)
-            :ets.update_element(state.keydir, key, [
-              {5, fid}, {6, offset}, {7, vsize}
-            ])
-
-            # Track dead bytes: if the old entry was on disk (not :pending/0),
-            # the overwritten data is now dead in the old file.
-            if old_fid != 0 and old_vsize > 0 do
-              dead_increment = old_vsize + @record_header_size + byte_size(key)
-              {old_total, old_dead} = Map.get(fs, old_fid, {0, 0})
-              Map.put(fs, old_fid, {old_total, old_dead + dead_increment})
-            else
-              fs
-            end
-
-          [] ->
-            fs
-        end
-      end)
-
-    %{state | file_stats: new_file_stats}
-  end
-
-  defp total_written(locations) do
-    Enum.reduce(locations, 0, fn {_offset, size}, acc -> acc + size end)
-  end
-
-  # Increment total_bytes for the active file after a flush.
-  defp track_flush_bytes(state, written_bytes) do
-    fid = state.active_file_id
-    {total, dead} = Map.get(state.file_stats, fid, {0, 0})
-    %{state | file_stats: Map.put(state.file_stats, fid, {total + written_bytes, dead})}
-  end
-
-  # Track dead bytes when a key is deleted via tombstone (direct path only).
-  # Reads the old ETS entry to determine which file contains the now-dead record.
-  defp track_delete_dead_bytes(state, key) do
-    case :ets.lookup(state.keydir, key) do
-      [{^key, _v, _exp, _lfu, old_fid, _off, old_vsize}] when old_fid != 0 and old_vsize > 0 ->
-        dead_increment = old_vsize + @record_header_size + byte_size(key)
-        {old_total, old_dead} = Map.get(state.file_stats, old_fid, {0, 0})
-        %{state | file_stats: Map.put(state.file_stats, old_fid, {old_total, old_dead + dead_increment})}
-
-      _ ->
-        state
-    end
-  end
-
-  # Check if any non-active file exceeds fragmentation thresholds and notify
-  # the merge scheduler. Cheap: iterates a small map (typically <20 files).
-  defp maybe_notify_fragmentation(state) do
-    frag_threshold = state.merge_config.fragmentation_threshold
-    dead_bytes_min = state.merge_config.dead_bytes_threshold
-
-    candidates =
-      state.file_stats
-      |> Enum.filter(fn {fid, {total, dead}} ->
-        fid != state.active_file_id and
-          total > 0 and
-          dead / total >= frag_threshold and
-          dead >= dead_bytes_min
-      end)
-      |> Enum.map(fn {fid, _} -> fid end)
-
-    if candidates != [] do
-      file_count = map_size(state.file_stats)
-      Ferricstore.Merge.Scheduler.notify_fragmentation(state.index, candidates, file_count)
-    end
-
-    state
-  end
-
-  # Compute per-file dead bytes stats from disk file sizes + ETS live data.
-  # Called once during init after recover_keydir. O(file_count + key_count).
-  defp compute_file_stats(shard_path, keydir) do
-    case File.ls(shard_path) do
-      {:ok, files} ->
-        # 1. Get total bytes per file from disk
-        file_totals =
-          files
-          |> Enum.filter(&String.ends_with?(&1, ".log"))
-          |> Enum.reject(&String.starts_with?(&1, "compact_"))
-          |> Enum.reduce(%{}, fn name, acc ->
-            fid = name |> String.trim_trailing(".log") |> String.to_integer()
-            full_path = Path.join(shard_path, name)
-
-            size =
-              case File.stat(full_path) do
-                {:ok, %{size: s}} -> s
-                _ -> 0
-              end
-
-            Map.put(acc, fid, size)
-          end)
-
-        # 2. Sum live bytes per file from ETS (record_header + key + value per entry)
-        live_per_file =
-          :ets.foldl(
-            fn {key, _value, _exp, _lfu, fid, _off, vsize}, acc ->
-              if fid != 0 and is_integer(fid) do
-                record_bytes = @record_header_size + byte_size(key) + vsize
-                Map.update(acc, fid, record_bytes, &(&1 + record_bytes))
-              else
-                acc
-              end
-            end,
-            %{},
-            keydir
-          )
-
-        # 3. dead_bytes = total_bytes - live_bytes per file
-        Map.new(file_totals, fn {fid, total} ->
-          live = Map.get(live_per_file, fid, 0)
-          dead = max(total - live, 0)
-          {fid, {total, dead}}
-        end)
-
-      _ ->
-        %{}
-    end
-  end
-
-  defp maybe_rotate_file(state) do
-    if state.active_file_size >= state.max_active_file_size do
-      write_hint_for_file(state, state.active_file_id)
-      new_id = state.active_file_id + 1
-      sp = state.shard_data_path
-      new_path = file_path(sp, new_id)
-      File.touch!(new_path)
-      Ferricstore.Store.ActiveFile.publish(state.index, new_id, new_path, sp)
-
-      # Initialize file_stats for the new file
-      new_file_stats = Map.put(state.file_stats, new_id, {0, 0})
-
-      # Notify the merge scheduler that a rotation happened.
-      # file_count = new_id + 1 (files are 0-indexed: 0, 1, ..., new_id)
-      Ferricstore.Merge.Scheduler.notify_rotation(state.index, new_id + 1)
-
-      %{state | active_file_id: new_id, active_file_path: new_path, active_file_size: 0,
-        file_stats: new_file_stats}
-    else
-      state
-    end
-  end
-
-  defp write_hint_for_file(state, target_fid) do
-    sp = state.shard_data_path
-    hint_path = Path.join(sp, "#{String.pad_leading(Integer.to_string(target_fid), 5, "0")}.hint")
-
-    entries =
-      :ets.foldl(
-        fn {key, _value, exp, _lfu, fid, off, vsize}, acc ->
-          if fid == target_fid do
-            # NIF expects: {key, file_id, offset, value_size, expire_at_ms}
-            [{key, target_fid, off, vsize, exp} | acc]
-          else
-            acc
-          end
-        end,
-        [],
-        state.keydir
-      )
-
-    if entries != [] do
-      NIF.v2_write_hint_file(hint_path, entries)
-    end
-  end
-
-  defp schedule_flush(ms) do
-    Process.send_after(self(), :flush, ms)
-  end
+  defp schedule_flush(ms), do: ShardFlush.schedule_flush(ms)
 
   # -------------------------------------------------------------------
   # Private: read helpers
@@ -3237,216 +2966,33 @@ defmodule Ferricstore.Store.Shard do
   #
   # Values larger than :ferricstore_hot_cache_max_value_size are stored as
   # nil (cold) to avoid copying large binaries on every :ets.lookup.
-  defp ets_insert(state, key, value, expire_at_ms) do
-    threshold = hot_cache_threshold(state)
-    value_for_ets = value_for_ets(value, threshold)
-    :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
-  end
+  defp ets_insert(state, key, value, expire_at_ms),
+    do: ShardETS.ets_insert(state, key, value, expire_at_ms)
 
-  # Inserts a key/value/expiry into the keydir with known disk location (v2).
-  defp ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
-    threshold = hot_cache_threshold(state)
-    value_for_ets = value_for_ets(value, threshold)
-    :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), file_id, offset, value_size})
-  end
+  defp ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size),
+    do: ShardETS.ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size)
 
-  # Returns the hot cache max value size threshold from instance ctx.
-  @compile {:inline, hot_cache_threshold: 1}
-  defp hot_cache_threshold(%{instance_ctx: ctx}) when ctx != nil, do: ctx.hot_cache_max_value_size
-  defp hot_cache_threshold(_state), do: 65_536
+  defp hot_cache_threshold(state), do: ShardETS.hot_cache_threshold(state)
 
-  # Returns nil for values exceeding the hot cache max value size threshold,
-  # or the value itself if it fits. This prevents large values from being
-  # stored in ETS, avoiding expensive binary copies on every :ets.lookup.
-  @compile {:inline, value_for_ets: 2}
-  defp value_for_ets(nil, _threshold), do: nil
-  defp value_for_ets(value, _threshold) when is_integer(value), do: Integer.to_string(value)
-  defp value_for_ets(value, _threshold) when is_float(value), do: Float.to_string(value)
-  defp value_for_ets(value, threshold) when is_binary(value) do
-    if byte_size(value) > threshold do
-      nil
-    else
-      value
-    end
-  end
+  defp value_for_ets(value, threshold), do: ShardETS.value_for_ets(value, threshold)
 
-  @compile {:inline, to_disk_binary: 1}
-  defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
-  defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
-  defp to_disk_binary(v) when is_binary(v), do: v
+  defp to_disk_binary(v), do: ShardETS.to_disk_binary(v)
 
-  # Deletes a key from the keydir table.
-  defp ets_delete_key(state, key) do
-    :ets.delete(state.keydir, key)
-  end
+  defp ets_delete_key(state, key), do: ShardETS.ets_delete_key(state, key)
 
-  # Classifies an ETS lookup as a cache hit, cold (evicted), expired, or miss.
+  defp prefix_scan_entries(keydir, prefix, shard_data_path),
+    do: ShardETS.prefix_scan_entries(keydir, prefix, shard_data_path)
 
-  # ---------------------------------------------------------------------------
-  # Prefix-based ETS helpers (replaces O(N) :ets.foldl full-table scans)
-  # ---------------------------------------------------------------------------
+  defp prefix_count_entries(keydir, prefix), do: ShardETS.prefix_count_entries(keydir, prefix)
 
-  defp prefix_scan_entries(keydir, prefix, shard_data_path) do
-    now = System.os_time(:millisecond)
-    prefix_len = byte_size(prefix)
-    # Select all 7-tuple fields so we can cold-read nil values
-    ms = [{{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
-           [{:andalso, {:is_binary, :"$1"},
-             {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-           [{{:"$1", :"$2", :"$3", :"$4", :"$5", :"$6"}}]}]
-    :ets.select(keydir, ms)
-    |> Enum.reduce([], fn {key, value, exp, fid, off, _vsize}, acc ->
-      if exp == 0 or exp > now do
-        # For cold keys (value=nil), do a disk read to get the actual value
-        actual_value =
-          if value == nil and shard_data_path != nil do
-            p = file_path(shard_data_path, fid)
-            case NIF.v2_pread_at(p, off) do
-              {:ok, v} -> v
-              _ -> nil
-            end
-          else
-            value
-          end
+  defp prefix_collect_keys(keydir, prefix), do: ShardETS.prefix_collect_keys(keydir, prefix)
 
-        if actual_value != nil do
-          field = case :binary.split(key, <<0>>) do
-            [_pre, sub] -> sub
-            _ -> key
-          end
-          [{field, actual_value} | acc]
-        else
-          acc
-        end
-      else
-        acc
-      end
-    end)
-  end
+  defp ets_lookup(state, key), do: ShardETS.ets_lookup(state, key)
 
-  defp prefix_count_entries(keydir, prefix) do
-    now = System.os_time(:millisecond)
-    prefix_len = byte_size(prefix)
-    ms = [{{:"$1", :_, :"$3", :_, :_, :_, :_},
-           [{:andalso, {:is_binary, :"$1"},
-             {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-           [:"$3"]}]
-    :ets.select(keydir, ms)
-    |> Enum.count(fn exp -> exp == 0 or exp > now end)
-  end
+  defp ets_lookup_warm(state, key), do: ShardETS.ets_lookup_warm(state, key)
 
-  defp prefix_collect_keys(keydir, prefix) do
-    prefix_len = byte_size(prefix)
-    ms = [{{:"$1", :_, :_, :_, :_, :_, :_},
-           [{:andalso, {:is_binary, :"$1"},
-             {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
-               {:==, {:binary_part, :"$1", 0, prefix_len}, prefix}}}],
-           [:"$1"]}]
-    :ets.select(keydir, ms)
-  end
 
-  # v2 7-tuple format: {key, value | nil, expire_at_ms, lfu_counter, file_id, offset, value_size}
-  # A hit requires value != nil (hot). value = nil means cold (evicted from RAM).
-  # On a hit, probabilistically increments the LFU counter.
-  # Returns:
-  #   {:hit, value, expire_at_ms}
-  #   {:cold, file_id, offset, value_size, expire_at_ms}  -- value evicted, disk location known
-  #   :expired
-  #   :miss
-  defp ets_lookup(%{keydir: keydir}, key) do
-    now = System.os_time(:millisecond)
-
-    case :ets.lookup(keydir, key) do
-      [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
-        lfu_touch(keydir, key, lfu)
-        {:hit, value, 0}
-
-      [{^key, nil, 0, _lfu, :pending, _off, _vsize}] ->
-        # Background write pending, value evicted before disk write.
-        # Cannot read from disk yet. Treat as miss (rare edge case).
-        :miss
-
-      [{^key, nil, 0, _lfu, fid, off, vsize}] ->
-        # Cold key (evicted from RAM) with no expiry -- disk location known.
-        {:cold, fid, off, vsize, 0}
-
-      [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-        lfu_touch(keydir, key, lfu)
-        {:hit, value, exp}
-
-      [{^key, nil, exp, _lfu, :pending, _off, _vsize}] when exp > now ->
-        # Background write pending with TTL, value evicted before disk write.
-        :miss
-
-      [{^key, nil, exp, _lfu, fid, off, vsize}] when exp > now ->
-        # Cold key with valid TTL -- disk location known.
-        {:cold, fid, off, vsize, exp}
-
-      [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-        # Expired entry -- delete it
-        :ets.delete(keydir, key)
-        :expired
-
-      [] ->
-        :miss
-    end
-  end
-
-  # Like ets_lookup/2, but transparently warms cold keys via v2_pread_at.
-  # Returns {:hit, value, expire_at_ms}, :expired, or :miss — never {:cold, ...}.
-  # Use this for read-modify-write operations that need the value in memory.
-  defp ets_lookup_warm(state, key) do
-    case ets_lookup(state, key) do
-      {:cold, fid, off, _vsize, exp} ->
-        p = file_path(state.shard_data_path, fid)
-
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
-            cold_read_warm_ets(state, key, value)
-            {:hit, value, exp}
-
-          _ ->
-            :miss
-        end
-
-      other ->
-        other
-    end
-  end
-
-  # LFU touch with time-based decay (Redis-compatible).
-  # Decays counter based on elapsed minutes, then probabilistically increments.
-  defp lfu_touch(keydir, key, packed_lfu) do
-    LFU.touch(keydir, key, packed_lfu)
-  end
-
-  # v2: cold read via pread_at using disk location from ETS 7-tuple.
-  # Applies the hot_cache_max_value_size threshold when re-warming ETS.
-  defp warm_from_store(state, key) do
-    case :ets.lookup(state.keydir, key) do
-      [{^key, nil, _exp, _lfu, :pending, _off, _vsize}] ->
-        # Background write not yet completed -- cannot read from disk.
-        nil
-
-      [{^key, nil, exp, _lfu, fid, off, vsize}] ->
-        p = file_path(state.shard_data_path, fid)
-
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
-            v = value_for_ets(value, hot_cache_threshold(state))
-            :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
-            value
-
-          _ ->
-            nil
-        end
-
-      _ ->
-        nil
-    end
-  end
+  defp warm_from_store(state, key), do: ShardETS.warm_from_store(state, key)
 
   # Synchronous local read from disk for use inside handle_call (avoids
   # GenServer.call deadlock). Returns {:ok, value}, {:ok, nil}, or :error.
@@ -3464,57 +3010,13 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  # 3-arity convenience: looks up the cold ETS entry to recover disk location
-  # metadata, then delegates to the 7-arity version. Used by async read
-  # completion handlers that only have {from, key} and the value from disk.
-  defp cold_read_warm_ets(state, key, value) do
-    case :ets.lookup(state.keydir, key) do
-      [{^key, nil, exp, _lfu, fid, off, vsize}] ->
-        cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
+  defp cold_read_warm_ets(state, key, value),
+    do: ShardETS.cold_read_warm_ets(state, key, value)
 
-      _ ->
-        # Entry was already evicted or overwritten — skip warming.
-        :ok
-    end
-  end
+  defp cold_read_warm_ets(state, key, value, exp, fid, off, vsize),
+    do: ShardETS.cold_read_warm_ets(state, key, value, exp, fid, off, vsize)
 
-  # Re-warms the ETS cache after a successful cold read.
-  # Preserves the disk location (file_id, offset, value_size) and expire_at_ms.
-  # Values exceeding the hot_cache_max_value_size threshold are NOT warmed --
-  # they stay cold (nil) in ETS to avoid expensive binary copies on read.
-  # Under memory pressure, skip warming to prevent evict/re-promote thrashing.
-  defp cold_read_warm_ets(state, key, value, exp, fid, off, vsize) do
-    v = value_for_ets(value, hot_cache_threshold(state))
-
-    if v != nil and Ferricstore.MemoryGuard.skip_promotion?() do
-      # Under pressure — don't re-cache, keep cold
-      :ok
-    else
-      :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
-    end
-  end
-
-  # v2: cold read meta via pread_at using disk location from ETS 7-tuple.
-  # Applies the hot_cache_max_value_size threshold when re-warming ETS.
-  defp warm_meta_from_store(state, key) do
-    case :ets.lookup(state.keydir, key) do
-      [{^key, nil, exp, _lfu, fid, off, vsize}] ->
-        p = file_path(state.shard_data_path, fid)
-
-        case NIF.v2_pread_at(p, off) do
-          {:ok, value} ->
-            v = value_for_ets(value, hot_cache_threshold(state))
-            :ets.insert(state.keydir, {key, v, exp, LFU.initial(), fid, off, vsize})
-            {value, exp}
-
-          _ ->
-            nil
-        end
-
-      _ ->
-        nil
-    end
-  end
+  defp warm_meta_from_store(state, key), do: ShardETS.warm_meta_from_store(state, key)
 
   defp live_keys(state) do
     now = System.os_time(:millisecond)
@@ -3536,16 +3038,10 @@ defmodule Ferricstore.Store.Shard do
   # Private: integer / float parsing — delegates to shared ValueCodec
   # -------------------------------------------------------------------
 
-  defp parse_integer(str), do: ValueCodec.parse_integer(str)
-  defp parse_float(str), do: ValueCodec.parse_float(str)
 
-  defp coerce_integer(v) when is_integer(v), do: {:ok, v}
-  defp coerce_integer(v) when is_float(v), do: :error
-  defp coerce_integer(v) when is_binary(v), do: parse_integer(v)
+  defp coerce_integer(v), do: ShardETS.coerce_integer(v)
 
-  defp coerce_float(v) when is_float(v), do: {:ok, v}
-  defp coerce_float(v) when is_integer(v), do: {:ok, v * 1.0}
-  defp coerce_float(v) when is_binary(v), do: parse_float(v)
+  defp coerce_float(v), do: ShardETS.coerce_float(v)
 
   # Applies SETRANGE logic: overwrites bytes at `offset` with `value`,
   # zero-padding if the original string is shorter than offset.

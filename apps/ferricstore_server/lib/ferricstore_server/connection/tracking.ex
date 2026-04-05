@@ -1,0 +1,212 @@
+defmodule FerricstoreServer.Connection.Tracking do
+  @moduledoc false
+
+  alias Ferricstore.KeyspaceNotifications
+  alias FerricstoreServer.ClientTracking
+
+  # Commands that read keys and should trigger client tracking registration.
+  @read_cmds ~w(GET MGET GETRANGE STRLEN GETEX GETDEL GETSET
+    HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN
+    LRANGE LLEN LINDEX LPOS
+    SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER
+    ZSCORE ZRANK ZREVRANK ZRANGE ZCARD ZCOUNT ZRANDMEMBER ZMSCORE
+    TYPE EXISTS TTL PTTL EXPIRETIME PEXPIRETIME
+    GETBIT BITCOUNT BITPOS PFCOUNT
+    OBJECT SUBSTR
+    GEOHASH GEOPOS GEODIST GEOSEARCH
+    XLEN XRANGE XREVRANGE XREAD XINFO
+    JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET)
+
+  # Commands that write keys and should trigger client tracking invalidation.
+  @write_cmds ~w(SET SETNX SETEX PSETEX MSET MSETNX APPEND SETRANGE
+    INCR DECR INCRBY DECRBY INCRBYFLOAT
+    DEL UNLINK
+    EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
+    RENAME RENAMENX COPY
+    HSET HDEL HINCRBY HINCRBYFLOAT HSETNX
+    LPUSH RPUSH LPOP RPOP LSET LINSERT LTRIM LREM LMOVE LPUSHX RPUSHX
+    SADD SREM SPOP SMOVE SDIFFSTORE SINTERSTORE SUNIONSTORE
+    ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX
+    SETBIT BITOP PFADD PFMERGE
+    GEOADD GEOSEARCHSTORE
+    XADD XTRIM XDEL
+    JSON.SET JSON.DEL JSON.NUMINCRBY JSON.TOGGLE JSON.CLEAR JSON.ARRAPPEND
+    GETSET GETDEL
+    CAS LOCK UNLOCK EXTEND)
+
+  # O(1) MapSet lookups for hot-path classification.
+  @write_cmds_set MapSet.new(@write_cmds)
+
+  # Maps command names to their keyspace notification event names.
+  # Only fires on successful results (not errors).
+  @keyspace_events %{
+    "SET" => "set", "SETNX" => "set", "SETEX" => "set", "PSETEX" => "set",
+    "MSET" => "mset", "MSETNX" => "mset",
+    "APPEND" => "append", "GETSET" => "getset", "GETDEL" => "getdel",
+    "SETRANGE" => "setrange",
+    "INCR" => "incr", "DECR" => "decr", "INCRBY" => "incrby",
+    "DECRBY" => "decrby", "INCRBYFLOAT" => "incrbyfloat",
+    "DEL" => "del", "UNLINK" => "del",
+    "EXPIRE" => "expire", "PEXPIRE" => "pexpire",
+    "EXPIREAT" => "expireat", "PEXPIREAT" => "pexpireat",
+    "PERSIST" => "persist",
+    "RENAME" => "rename",
+    "LPUSH" => "lpush", "RPUSH" => "rpush",
+    "LPOP" => "lpop", "RPOP" => "rpop",
+    "LSET" => "lset", "LINSERT" => "linsert", "LTRIM" => "ltrim",
+    "LREM" => "lrem", "LMOVE" => "lmove",
+    "SADD" => "sadd", "SREM" => "srem", "SPOP" => "spop",
+    "HSET" => "hset", "HDEL" => "hdel", "HINCRBY" => "hincrby",
+    "HINCRBYFLOAT" => "hincrbyfloat",
+    "ZADD" => "zadd", "ZREM" => "zrem", "ZINCRBY" => "zincrby",
+    "COPY" => "copy"
+  }
+
+  @doc false
+  @spec maybe_notify_keyspace(binary(), [binary()], term()) :: :ok
+  def maybe_notify_keyspace(cmd, args, result) do
+    case Map.get(@keyspace_events, cmd) do
+      nil -> :ok
+      event -> do_notify_keyspace(cmd, event, args, result)
+    end
+  end
+
+  # For DEL/UNLINK with multiple keys, notify per key
+  @doc false
+  def do_notify_keyspace(cmd, event, keys, count)
+      when cmd in ~w(DEL UNLINK) and is_integer(count) and count > 0 do
+    Enum.each(keys, fn key -> KeyspaceNotifications.notify(key, event) end)
+  end
+
+  # For MSET, notify per key
+  def do_notify_keyspace("MSET", event, args, :ok) do
+    args
+    |> Enum.chunk_every(2)
+    |> Enum.each(fn [key, _val] -> KeyspaceNotifications.notify(key, event) end)
+  end
+
+  # Single-key commands: first arg is the key. Skip errors.
+  def do_notify_keyspace(_cmd, _event, _args, {:error, _}), do: :ok
+  def do_notify_keyspace(_cmd, _event, [], _result), do: :ok
+
+  def do_notify_keyspace(_cmd, event, [key | _], _result) do
+    KeyspaceNotifications.notify(key, event)
+  end
+
+  @doc false
+  @spec tracking_socket_sender() :: (pid(), iodata(), [binary()] -> :ok)
+  def tracking_socket_sender do
+    fn target_pid, iodata, keys ->
+      send(target_pid, {:tracking_invalidation, iodata, keys})
+      :ok
+    end
+  end
+
+  # After a successful read command, register the read key(s) for tracking.
+  # Only called when tracking is enabled on the connection.
+  # Returns the (potentially updated) connection state.
+  @doc false
+  @spec maybe_track_read(binary(), [binary()], term(), map()) :: map()
+  def maybe_track_read(_cmd, _args, _result, %{tracking: %{enabled: false}} = state), do: state
+  def maybe_track_read(_cmd, _args, _result, %{tracking: nil} = state), do: state
+  def maybe_track_read(_cmd, _args, {:error, _}, state), do: state
+
+  def maybe_track_read(cmd, args, _result, state) when cmd in @read_cmds do
+    conn_pid = self()
+
+    case cmd do
+      "MGET" ->
+        new_tracking = ClientTracking.track_keys(conn_pid, args, state.tracking)
+        %{state | tracking: new_tracking}
+
+      "HMGET" ->
+        # HMGET key field [field ...] -- track the top-level key
+        case args do
+          [key | _] ->
+            new_tracking = ClientTracking.track_key(conn_pid, key, state.tracking)
+            %{state | tracking: new_tracking}
+
+          _ ->
+            state
+        end
+
+      "JSON.MGET" ->
+        # JSON.MGET key [key ...] path -- track all keys (last arg is the path)
+        keys = Enum.drop(args, -1)
+        new_tracking = ClientTracking.track_keys(conn_pid, keys, state.tracking)
+        %{state | tracking: new_tracking}
+
+      _ ->
+        # Single-key commands: first arg is the key
+        case args do
+          [key | _] ->
+            new_tracking = ClientTracking.track_key(conn_pid, key, state.tracking)
+            %{state | tracking: new_tracking}
+
+          _ ->
+            state
+        end
+    end
+  end
+
+  def maybe_track_read(_cmd, _args, _result, state), do: state
+
+  # After a successful write command, notify all tracking connections.
+  # This can be called from any process (connection process or Task).
+  @doc false
+  @spec maybe_notify_tracking(binary(), [binary()], term(), map()) :: :ok
+  def maybe_notify_tracking(_cmd, _args, {:error, _}, _state), do: :ok
+
+  def maybe_notify_tracking(cmd, args, _result, _state) do
+    # O(1) MapSet check replaces linear `when cmd in @write_cmds` guard (~55 chained ==).
+    if MapSet.member?(@write_cmds_set, cmd) do
+      writer_pid = self()
+      sender = tracking_socket_sender()
+
+      case cmd do
+        c when c in ~w(MSET MSETNX) ->
+          keys =
+            args
+            |> Enum.chunk_every(2)
+            |> Enum.map(fn [key | _] -> key end)
+
+          ClientTracking.notify_keys_modified(keys, writer_pid, sender)
+
+        c when c in ~w(DEL UNLINK) ->
+          ClientTracking.notify_keys_modified(args, writer_pid, sender)
+
+        "RENAME" ->
+          # RENAME source destination -- both keys are affected
+          case args do
+            [src, dst | _] ->
+              ClientTracking.notify_keys_modified([src, dst], writer_pid, sender)
+
+            _ ->
+              :ok
+          end
+
+        "COPY" ->
+          # COPY source destination -- destination is modified
+          case args do
+            [_src, dst | _] ->
+              ClientTracking.notify_key_modified(dst, writer_pid, sender)
+
+            _ ->
+              :ok
+          end
+
+        _ ->
+          # Single-key commands: first arg is the key
+          case args do
+            [key | _] ->
+              ClientTracking.notify_key_modified(key, writer_pid, sender)
+
+            _ ->
+              :ok
+          end
+      end
+    else
+      :ok
+    end
+  end
+end

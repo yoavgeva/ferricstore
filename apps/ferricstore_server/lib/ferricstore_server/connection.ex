@@ -61,10 +61,11 @@ defmodule FerricstoreServer.Connection do
   alias Ferricstore.AuditLog
   alias FerricstoreServer.ClientTracking
   alias Ferricstore.Commands.Dispatcher
-  alias Ferricstore.KeyspaceNotifications
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
+  alias FerricstoreServer.Connection.Store, as: ConnStore
+  alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
   alias Ferricstore.PubSub, as: PS
 
@@ -568,7 +569,7 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp flush_pure_group_pre(normalised, all_reads?, state) do
-    store = build_store(state.instance_ctx, state.sandbox_namespace)
+    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
     # Fast path: if ALL commands are pure reads (tracked during accumulation),
     # skip the sliding window entirely. No Task spawning, no shard grouping,
@@ -779,9 +780,9 @@ defmodule FerricstoreServer.Connection do
             {:error, "ERR internal error: #{inspect(reason)}"}
         end
 
-      maybe_notify_keyspace(name, args, result)
+      ConnTracking.maybe_notify_keyspace(name, args, result)
       # Client tracking: notify writes from pipelined commands
-      maybe_notify_tracking(name, args, result, state)
+      ConnTracking.maybe_notify_tracking(name, args, result, state)
       {:continue, Encoder.encode(result)}
     else
       {:error, _reason} = err ->
@@ -862,7 +863,7 @@ defmodule FerricstoreServer.Connection do
 
   # CLIENT subcommands that need connection state.
   defp dispatch("CLIENT", args, state) do
-    store = build_store(state.instance_ctx, state.sandbox_namespace)
+    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
     conn_state = %{
       client_id: state.client_id,
@@ -1391,7 +1392,7 @@ defmodule FerricstoreServer.Connection do
     else
       # Validate command syntax at queue time. If the dispatcher returns an
       # error, send it immediately but stay in MULTI mode.
-      store = build_store(state.instance_ctx, state.sandbox_namespace)
+      store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
       case validate_command(cmd, args, store) do
         :ok ->
@@ -1434,7 +1435,7 @@ defmodule FerricstoreServer.Connection do
 
     case Blocking.parse_blpop_args(args) do
       {:ok, keys, timeout_ms} ->
-        store = build_store(state.instance_ctx, state.sandbox_namespace)
+        store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
         pop_cmd = if pop_dir == :blpop, do: "LPOP", else: "RPOP"
 
         # Try immediate pop on each key (first non-empty wins)
@@ -1544,7 +1545,7 @@ defmodule FerricstoreServer.Connection do
 
     case Blocking.parse_blmove_args(args) do
       {:ok, source, destination, from_dir, to_dir, timeout_ms} ->
-        store = build_store(state.instance_ctx, state.sandbox_namespace)
+        store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
         # Try immediate LMOVE
         case List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store) do
@@ -1621,7 +1622,7 @@ defmodule FerricstoreServer.Connection do
 
     case Blocking.parse_blmpop_args(args) do
       {:ok, keys, direction, count, timeout_ms} ->
-        store = build_store(state.instance_ctx, state.sandbox_namespace)
+        store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
         pop_cmd = if direction == :left, do: "LPOP", else: "RPOP"
 
         # Build the count arg list: omit count arg when count == 1
@@ -1751,9 +1752,9 @@ defmodule FerricstoreServer.Connection do
     case Router.get_with_file_ref(state.instance_ctx, lookup_key) do
       {:hot, value} ->
         result = value
-        new_state = maybe_track_read("GET", [lookup_key], result, state)
-        maybe_notify_keyspace("GET", [lookup_key], result)
-        maybe_notify_tracking("GET", [lookup_key], result, state)
+        new_state = ConnTracking.maybe_track_read("GET", [lookup_key], result, state)
+        ConnTracking.maybe_notify_keyspace("GET", [lookup_key], result)
+        ConnTracking.maybe_notify_tracking("GET", [lookup_key], result, state)
         {:continue, Encoder.encode(result), new_state}
 
       {:cold_ref, path, offset, size} when size >= @sendfile_threshold_bytes ->
@@ -1769,9 +1770,9 @@ defmodule FerricstoreServer.Connection do
 
       {:cold_value, value} ->
         result = value
-        new_state = maybe_track_read("GET", [lookup_key], result, state)
-        maybe_notify_keyspace("GET", [lookup_key], result)
-        maybe_notify_tracking("GET", [lookup_key], result, state)
+        new_state = ConnTracking.maybe_track_read("GET", [lookup_key], result, state)
+        ConnTracking.maybe_notify_keyspace("GET", [lookup_key], result)
+        ConnTracking.maybe_notify_tracking("GET", [lookup_key], result, state)
         {:continue, Encoder.encode(result), new_state}
 
       :miss ->
@@ -1807,7 +1808,7 @@ defmodule FerricstoreServer.Connection do
                   case :gen_tcp.send(socket, trailer) do
                     :ok ->
                       set_cork(socket, false)
-                      new_state = maybe_track_read_sendfile("GET", [key], state)
+                      new_state = ConnTracking.maybe_track_read("GET", [key], :sendfile_ok, state)
                       {:sent, new_state}
 
                     {:error, reason} ->
@@ -1852,15 +1853,9 @@ defmodule FerricstoreServer.Connection do
     end
   end
 
-  # Track reads for sendfile path (client tracking support).
-  # We pass a non-nil result so that maybe_track_read registers the key.
-  defp maybe_track_read_sendfile(cmd, args, state) do
-    maybe_track_read(cmd, args, :sendfile_ok, state)
-  end
-
   # Normal dispatch path (extracted for reuse by sendfile fallback).
   defp dispatch_normal(cmd, args, state) do
-    store = build_store(state.instance_ctx, state.sandbox_namespace)
+    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
     result =
       try do
@@ -1873,9 +1868,9 @@ defmodule FerricstoreServer.Connection do
           {:error, "ERR internal error: #{inspect(reason)}"}
       end
 
-    maybe_notify_keyspace(cmd, args, result)
-    new_state = maybe_track_read(cmd, args, result, state)
-    maybe_notify_tracking(cmd, args, result, state)
+    ConnTracking.maybe_notify_keyspace(cmd, args, result)
+    new_state = ConnTracking.maybe_track_read(cmd, args, result, state)
+    ConnTracking.maybe_notify_tracking(cmd, args, result, state)
 
     {:continue, Encoder.encode(result), new_state}
   end
@@ -1886,7 +1881,7 @@ defmodule FerricstoreServer.Connection do
   # no data is immediately available and BLOCK was specified.
 
   defp dispatch("XREAD", args, state) do
-    store = build_store(state.instance_ctx, state.sandbox_namespace)
+    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
     result =
       try do
@@ -1904,9 +1899,9 @@ defmodule FerricstoreServer.Connection do
         dispatch_xread_block(timeout_ms, stream_ids, count, store, state)
 
       other ->
-        maybe_notify_keyspace("XREAD", args, other)
-        new_state = maybe_track_read("XREAD", args, other, state)
-        maybe_notify_tracking("XREAD", args, other, state)
+        ConnTracking.maybe_notify_keyspace("XREAD", args, other)
+        new_state = ConnTracking.maybe_track_read("XREAD", args, other, state)
+        ConnTracking.maybe_notify_tracking("XREAD", args, other, state)
         {:continue, Encoder.encode(other), new_state}
     end
   end
@@ -2070,135 +2065,6 @@ defmodule FerricstoreServer.Connection do
   end
 
   # ---------------------------------------------------------------------------
-  # Store builder — wraps Router functions into the store map contract
-  # ---------------------------------------------------------------------------
-
-  # The raw store map captures `ctx` (the FerricStore.Instance context) in
-  # closures, routing all operations through the instance rather than global
-  # state. Each ctx produces its own store map; caching per instance name
-  # avoids rebuilding the ~25 closures on every command dispatch.
-  #
-  # Audit C3 note: this is a plain map rather than a struct. A struct would
-  # give OTP 26+ type inference transparent field types, but converting would
-  # require touching every command handler (~25 modules) since they all
-  # access `store.get.()` etc. The practical impact is negligible:
-  #   - Each closure call is a direct function dispatch (~10ns); the type
-  #     opacity only prevents the JIT from inlining across the store boundary,
-  #     which would save <5ns per call — well below the GenServer/ETS cost
-  #     that dominates every operation.
-  # The struct conversion is tracked as a future cleanup but is not worth the
-  # risk of a cross-cutting refactor for the marginal type inference benefit.
-  defp raw_store(ctx) do
-    case :persistent_term.get({:ferricstore_raw_store, ctx.name}, nil) do
-      nil ->
-        store = build_raw_store(ctx)
-        :persistent_term.put({:ferricstore_raw_store, ctx.name}, store)
-        store
-      store ->
-        store
-    end
-  end
-
-  defp build_raw_store(ctx) do
-    %{
-      get: fn key -> Router.get(ctx, key) end,
-      get_meta: fn key -> Router.get_meta(ctx, key) end,
-      put: fn key, value, exp -> Router.put(ctx, key, value, exp) end,
-      delete: fn key -> Router.delete(ctx, key) end,
-      exists?: fn key -> Router.exists?(ctx, key) end,
-      keys: fn -> Router.keys(ctx) end,
-      flush: fn ->
-        for i <- 0..(ctx.shard_count - 1) do
-          shard = elem(ctx.shard_names, i)
-          keydir = elem(ctx.keydir_refs, i)
-
-          raw_keys =
-            try do
-              :ets.foldl(fn {key, _, _, _, _, _, _}, acc -> [key | acc] end, [], keydir)
-            rescue
-              ArgumentError -> []
-            end
-
-          Enum.each(raw_keys, fn key ->
-            try do
-              GenServer.call(shard, {:delete, key}, 10_000)
-            catch
-              :exit, _ -> :ok
-            end
-          end)
-
-        end
-
-        :ok
-      end,
-      dbsize: fn -> Router.dbsize(ctx) end,
-      incr: fn key, delta -> Router.incr(ctx, key, delta) end,
-      incr_float: fn key, delta -> Router.incr_float(ctx, key, delta) end,
-      append: fn key, suffix -> Router.append(ctx, key, suffix) end,
-      getset: fn key, value -> Router.getset(ctx, key, value) end,
-      getdel: fn key -> Router.getdel(ctx, key) end,
-      getex: fn key, exp -> Router.getex(ctx, key, exp) end,
-      setrange: fn key, offset, value -> Router.setrange(ctx, key, offset, value) end,
-      cas: fn key, exp, new_val, ttl -> Router.cas(ctx, key, exp, new_val, ttl) end,
-      lock: fn key, owner, ttl -> Router.lock(ctx, key, owner, ttl) end,
-      unlock: fn key, owner -> Router.unlock(ctx, key, owner) end,
-      extend: fn key, owner, ttl -> Router.extend(ctx, key, owner, ttl) end,
-      ratelimit_add: fn key, window, max, count -> Router.ratelimit_add(ctx, key, window, max, count) end,
-      list_op: fn key, op -> Router.list_op(ctx, key, op) end,
-      compound_get: fn redis_key, compound_key ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_get, redis_key, compound_key})
-      end,
-      compound_get_meta: fn redis_key, compound_key ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
-      end,
-      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
-      end,
-      compound_delete: fn redis_key, compound_key ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
-      end,
-      compound_scan: fn redis_key, prefix ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_scan, redis_key, prefix})
-      end,
-      compound_count: fn redis_key, prefix ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_count, redis_key, prefix})
-      end,
-      compound_delete_prefix: fn redis_key, prefix ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
-      end,
-      prob_write: fn cmd -> Router.prob_write(ctx, cmd) end,
-      # prob_dir_for_key resolves the correct shard's prob directory.
-      # Used by command handlers to compute file paths for reads.
-      prob_dir_for_key: fn key ->
-        idx = Router.shard_for(ctx, key)
-        shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
-        Path.join(shard_path, "prob")
-      end,
-      on_push: &Ferricstore.Waiters.notify_push/1
-    }
-  end
-
-  defp build_store(ctx, nil), do: raw_store(ctx)
-
-  defp build_store(ctx, ns) when is_binary(ns) do
-    raw = raw_store(ctx)
-    %{raw |
-      get: fn key -> raw.get.(ns <> key) end,
-      get_meta: fn key -> raw.get_meta.(ns <> key) end,
-      put: fn key, val, exp -> raw.put.(ns <> key, val, exp) end,
-      delete: fn key -> raw.delete.(ns <> key) end,
-      exists?: fn key -> raw.exists?.(ns <> key) end
-    }
-  end
-
-  # ---------------------------------------------------------------------------
   # Greeting map
   # ---------------------------------------------------------------------------
 
@@ -2298,184 +2164,6 @@ defmodule FerricstoreServer.Connection do
     %{state | pubsub_channels: MapSet.new(), pubsub_patterns: MapSet.new()}
   end
   defp ensure_pubsub_sets(state), do: state
-
-  # ---------------------------------------------------------------------------
-  # Keyspace notification helpers
-  # ---------------------------------------------------------------------------
-
-  # Maps command names to their keyspace notification event names.
-  # Only fires on successful results (not errors).
-  @keyspace_events %{
-    "SET" => "set", "SETNX" => "set", "SETEX" => "set", "PSETEX" => "set",
-    "MSET" => "mset", "MSETNX" => "mset",
-    "APPEND" => "append", "GETSET" => "getset", "GETDEL" => "getdel",
-    "SETRANGE" => "setrange",
-    "INCR" => "incr", "DECR" => "decr", "INCRBY" => "incrby",
-    "DECRBY" => "decrby", "INCRBYFLOAT" => "incrbyfloat",
-    "DEL" => "del", "UNLINK" => "del",
-    "EXPIRE" => "expire", "PEXPIRE" => "pexpire",
-    "EXPIREAT" => "expireat", "PEXPIREAT" => "pexpireat",
-    "PERSIST" => "persist",
-    "RENAME" => "rename",
-    "LPUSH" => "lpush", "RPUSH" => "rpush",
-    "LPOP" => "lpop", "RPOP" => "rpop",
-    "LSET" => "lset", "LINSERT" => "linsert", "LTRIM" => "ltrim",
-    "LREM" => "lrem", "LMOVE" => "lmove",
-    "SADD" => "sadd", "SREM" => "srem", "SPOP" => "spop",
-    "HSET" => "hset", "HDEL" => "hdel", "HINCRBY" => "hincrby",
-    "HINCRBYFLOAT" => "hincrbyfloat",
-    "ZADD" => "zadd", "ZREM" => "zrem", "ZINCRBY" => "zincrby",
-    "COPY" => "copy"
-  }
-
-  defp maybe_notify_keyspace(cmd, args, result) do
-    case Map.get(@keyspace_events, cmd) do
-      nil -> :ok
-      event -> do_notify_keyspace(cmd, event, args, result)
-    end
-  end
-
-  # For DEL/UNLINK with multiple keys, notify per key
-  defp do_notify_keyspace(cmd, event, keys, count)
-       when cmd in ~w(DEL UNLINK) and is_integer(count) and count > 0 do
-    Enum.each(keys, fn key -> KeyspaceNotifications.notify(key, event) end)
-  end
-
-  # For MSET, notify per key
-  defp do_notify_keyspace("MSET", event, args, :ok) do
-    args
-    |> Enum.chunk_every(2)
-    |> Enum.each(fn [key, _val] -> KeyspaceNotifications.notify(key, event) end)
-  end
-
-  # Single-key commands: first arg is the key. Skip errors.
-  defp do_notify_keyspace(_cmd, _event, _args, {:error, _}), do: :ok
-  defp do_notify_keyspace(_cmd, _event, [], _result), do: :ok
-
-  defp do_notify_keyspace(_cmd, event, [key | _], _result) do
-    KeyspaceNotifications.notify(key, event)
-  end
-
-  # ---------------------------------------------------------------------------
-  # Client tracking helpers
-  # ---------------------------------------------------------------------------
-
-  # The socket_sender callback passed to ClientTracking.notify_key_modified/3.
-  # Sends a message to the target connection process, which will write the
-  # invalidation push to its socket in its main loop.
-  @spec tracking_socket_sender() :: (pid(), iodata(), [binary()] -> :ok)
-  defp tracking_socket_sender do
-    fn target_pid, iodata, keys ->
-      send(target_pid, {:tracking_invalidation, iodata, keys})
-      :ok
-    end
-  end
-
-  # After a successful read command, register the read key(s) for tracking.
-  # Only called when tracking is enabled on the connection.
-  # Returns the (potentially updated) connection state.
-  @spec maybe_track_read(binary(), [binary()], term(), t()) :: t()
-  defp maybe_track_read(_cmd, _args, _result, %{tracking: %{enabled: false}} = state), do: state
-  defp maybe_track_read(_cmd, _args, _result, %{tracking: nil} = state), do: state
-  defp maybe_track_read(_cmd, _args, {:error, _}, state), do: state
-
-  defp maybe_track_read(cmd, args, _result, state) when cmd in @read_cmds do
-    conn_pid = self()
-
-    case cmd do
-      "MGET" ->
-        new_tracking = ClientTracking.track_keys(conn_pid, args, state.tracking)
-        %{state | tracking: new_tracking}
-
-      "HMGET" ->
-        # HMGET key field [field ...] — track the top-level key
-        case args do
-          [key | _] ->
-            new_tracking = ClientTracking.track_key(conn_pid, key, state.tracking)
-            %{state | tracking: new_tracking}
-
-          _ ->
-            state
-        end
-
-      "JSON.MGET" ->
-        # JSON.MGET key [key ...] path — track all keys (last arg is the path)
-        keys = Enum.drop(args, -1)
-        new_tracking = ClientTracking.track_keys(conn_pid, keys, state.tracking)
-        %{state | tracking: new_tracking}
-
-      _ ->
-        # Single-key commands: first arg is the key
-        case args do
-          [key | _] ->
-            new_tracking = ClientTracking.track_key(conn_pid, key, state.tracking)
-            %{state | tracking: new_tracking}
-
-          _ ->
-            state
-        end
-    end
-  end
-
-  defp maybe_track_read(_cmd, _args, _result, state), do: state
-
-  # After a successful write command, notify all tracking connections.
-  # This can be called from any process (connection process or Task).
-  @spec maybe_notify_tracking(binary(), [binary()], term(), t()) :: :ok
-  defp maybe_notify_tracking(_cmd, _args, {:error, _}, _state), do: :ok
-
-  defp maybe_notify_tracking(cmd, args, _result, _state) do
-    # O(1) MapSet check replaces linear `when cmd in @write_cmds` guard (~55 chained ==).
-    if MapSet.member?(@write_cmds_set, cmd) do
-      writer_pid = self()
-      sender = tracking_socket_sender()
-
-      case cmd do
-        c when c in ~w(MSET MSETNX) ->
-          keys =
-            args
-            |> Enum.chunk_every(2)
-            |> Enum.map(fn [key | _] -> key end)
-
-          ClientTracking.notify_keys_modified(keys, writer_pid, sender)
-
-        c when c in ~w(DEL UNLINK) ->
-          ClientTracking.notify_keys_modified(args, writer_pid, sender)
-
-        "RENAME" ->
-          # RENAME source destination — both keys are affected
-          case args do
-            [src, dst | _] ->
-              ClientTracking.notify_keys_modified([src, dst], writer_pid, sender)
-
-            _ ->
-              :ok
-          end
-
-        "COPY" ->
-          # COPY source destination — destination is modified
-          case args do
-            [_src, dst | _] ->
-              ClientTracking.notify_key_modified(dst, writer_pid, sender)
-
-            _ ->
-              :ok
-          end
-
-        _ ->
-          # Single-key commands: first arg is the key
-          case args do
-            [key | _] ->
-              ClientTracking.notify_key_modified(key, writer_pid, sender)
-
-            _ ->
-              :ok
-          end
-      end
-    else
-      :ok
-    end
-  end
 
   defp cleanup_connection(state) do
     duration_ms = System.monotonic_time(:millisecond) - state.created_at
