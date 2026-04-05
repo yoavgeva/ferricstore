@@ -422,8 +422,7 @@ pub fn bloom_file_exists_async<'a>(
                     e.to_string()
                 }
             })?;
-            let (num_bits, num_hashes, _count) =
-                file_read_header(&file).map_err(|e| e.clone())?;
+            let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
             let positions = file_hash_positions(&element_owned, num_bits, num_hashes);
             for pos in positions {
                 let byte_index = pos / 8;
@@ -478,8 +477,7 @@ pub fn bloom_file_mexists_async<'a>(
                     e.to_string()
                 }
             })?;
-            let (num_bits, num_hashes, _count) =
-                file_read_header(&file).map_err(|e| e.clone())?;
+            let (num_bits, num_hashes, _count) = file_read_header(&file).map_err(|e| e.clone())?;
             let mut results: Vec<u32> = Vec::with_capacity(elements_owned.len());
             for element in &elements_owned {
                 let positions = file_hash_positions(element, num_bits, num_hashes);
@@ -537,8 +535,7 @@ pub fn bloom_file_card_async(
                     e.to_string()
                 }
             })?;
-            let (_num_bits, _num_hashes, count) =
-                file_read_header(&file).map_err(|e| e.clone())?;
+            let (_num_bits, _num_hashes, count) = file_read_header(&file).map_err(|e| e.clone())?;
             crate::fadvise_dontneed(&file, 0, 0);
             Ok(count)
         })
@@ -578,8 +575,7 @@ pub fn bloom_file_info_async(
                     e.to_string()
                 }
             })?;
-            let (num_bits, num_hashes, count) =
-                file_read_header(&file).map_err(|e| e.clone())?;
+            let (num_bits, num_hashes, count) = file_read_header(&file).map_err(|e| e.clone())?;
             crate::fadvise_dontneed(&file, 0, 0);
             Ok((num_bits, count, num_hashes as u64))
         })
