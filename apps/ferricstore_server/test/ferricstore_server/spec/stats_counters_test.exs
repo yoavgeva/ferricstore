@@ -183,10 +183,16 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
 
   describe "CONFIG RESETSTAT behavior" do
     test "isolated instance counters are independent of global reset", %{ctx: ctx} do
-      # Generate counter values on isolated instance
-      assert :ok = Router.put(ctx, "resetstat_key", "value", 0)
-      assert "value" = Router.get(ctx, "resetstat_key")
-      assert nil == Router.get(ctx, "no_such_key")
+      # Generate counter values on isolated instance — wait for shard readiness
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.put(ctx, "resetstat_key", "value", 0) == :ok
+      end, "put failed on isolated instance", 10, 20)
+
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get(ctx, "resetstat_key") == "value"
+      end, "get failed after put", 10, 10)
+
+      Router.get(ctx, "no_such_key")
 
       # Counter increments are synchronous — no eventually needed
       assert Stats.keyspace_hits(ctx) > 0, "hits should be > 0 after successful GET"

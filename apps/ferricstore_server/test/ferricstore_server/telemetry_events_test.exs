@@ -523,15 +523,18 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
     test "hot read is recorded when key is in ETS cache" do
       key = "hotcold_hot_#{System.unique_integer([:positive])}"
-      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
+      ctx = FerricStore.Instance.get(:default)
+      Router.put(ctx, key, "value", 0)
 
-      # First GET warms the cache.
-      _val = Router.get(FerricStore.Instance.get(:default), key)
+      # Wait until key is readable
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get(ctx, key) == "value"
+      end, "key not readable after put", 10, 10)
 
       before_hot = Ferricstore.Stats.total_hot_reads()
 
       # Second GET should be hot (ETS hit).
-      assert Router.get(FerricStore.Instance.get(:default), key) == "value"
+      assert Router.get(ctx, key) == "value"
 
       assert Ferricstore.Stats.total_hot_reads() >= before_hot + 1
     end
