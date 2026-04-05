@@ -93,11 +93,17 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
     test "increments when expiry sweep removes a key", %{ctx: ctx} do
       expire_at = System.os_time(:millisecond) + 1
       Router.put(ctx, "sweep_target", "value", expire_at)
-      Process.sleep(10)
 
-      # Trigger expiry sweep on shard 0 of isolated instance
-      shard = elem(ctx.shard_names, 0)
-      GenServer.call(shard, :expiry_sweep)
+      # Wait until key is expired
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        System.os_time(:millisecond) > expire_at
+      end, "key not expired yet", 20, 5)
+
+      # Trigger expiry sweep on ALL shards (key may be on any shard)
+      for i <- 0..(ctx.shard_count - 1) do
+        shard = elem(ctx.shard_names, i)
+        GenServer.call(shard, :expiry_sweep)
+      end
 
       assert :counters.get(ctx.stats_counter, 8) >= 1
     end
