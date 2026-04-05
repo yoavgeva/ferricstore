@@ -17,42 +17,41 @@ defmodule FerricStore.Impl do
     exat = Keyword.get(opts, :exat)
     pxat = Keyword.get(opts, :pxat)
 
-    expire_at_ms = cond do
-      keepttl -> :keepttl
-      pxat -> pxat
-      exat -> exat * 1000
-      ttl > 0 -> System.os_time(:millisecond) + ttl
-      true -> 0
+    expire_at_ms = resolve_expire_at(keepttl, pxat, exat, ttl)
+    do_set(ctx, key, value, expire_at_ms, get, nx, xx)
+  end
+
+  defp resolve_expire_at(true, _pxat, _exat, _ttl), do: :keepttl
+  defp resolve_expire_at(_kttl, pxat, _exat, _ttl) when pxat != nil, do: pxat
+  defp resolve_expire_at(_kttl, _pxat, exat, _ttl) when exat != nil, do: exat * 1000
+  defp resolve_expire_at(_kttl, _pxat, _exat, ttl) when ttl > 0, do: System.os_time(:millisecond) + ttl
+  defp resolve_expire_at(_kttl, _pxat, _exat, _ttl), do: 0
+
+  defp do_set(ctx, key, value, expire_at_ms, true, nx, xx) do
+    old = Router.get(ctx, key)
+    unless (nx and old != nil) or (xx and old == nil) do
+      Router.put(ctx, key, value, expire_at_ms)
     end
+    {:ok, old}
+  end
 
-    cond do
-      get ->
-        old = Router.get(ctx, key)
-        unless (nx and old != nil) or (xx and old == nil) do
-          Router.put(ctx, key, value, expire_at_ms)
-        end
-        {:ok, old}
-
-      nx ->
-        if Router.exists?(ctx, key) do
-          {:ok, false}
-        else
-          Router.put(ctx, key, value, expire_at_ms)
-          {:ok, true}
-        end
-
-      xx ->
-        if Router.exists?(ctx, key) do
-          Router.put(ctx, key, value, expire_at_ms)
-          :ok
-        else
-          :ok
-        end
-
-      true ->
-        Router.put(ctx, key, value, expire_at_ms)
-        :ok
+  defp do_set(ctx, key, value, expire_at_ms, _get, true, _xx) do
+    if Router.exists?(ctx, key) do
+      {:ok, false}
+    else
+      Router.put(ctx, key, value, expire_at_ms)
+      {:ok, true}
     end
+  end
+
+  defp do_set(ctx, key, value, expire_at_ms, _get, _nx, true) do
+    if Router.exists?(ctx, key), do: Router.put(ctx, key, value, expire_at_ms)
+    :ok
+  end
+
+  defp do_set(ctx, key, value, expire_at_ms, _get, _nx, _xx) do
+    Router.put(ctx, key, value, expire_at_ms)
+    :ok
   end
 
   def get(ctx, key, _opts \\ []) do

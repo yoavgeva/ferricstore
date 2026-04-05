@@ -342,30 +342,7 @@ defmodule Ferricstore.Config do
     # Use cons + reverse to avoid O(n^2) from repeated ++ [line] appends.
     {reversed_lines, written_keys} =
       Enum.reduce(existing_lines, {[], MapSet.new()}, fn line, {lines_acc, written_acc} ->
-        trimmed = String.trim(line)
-
-        cond do
-          # Comment line or blank line -- preserve as-is
-          trimmed == "" or String.starts_with?(trimmed, "#") ->
-            {[line | lines_acc], written_acc}
-
-          # Config line: extract key
-          true ->
-            case String.split(trimmed, " ", parts: 2) do
-              [key | _rest] ->
-                if Map.has_key?(state, key) do
-                  # Known key -- write with live value
-                  value = Map.get(state, key, "")
-                  {["#{key} #{value}" | lines_acc], MapSet.put(written_acc, key)}
-                else
-                  # Unknown key -- preserve verbatim
-                  {[line | lines_acc], written_acc}
-                end
-
-              _ ->
-                {[line | lines_acc], written_acc}
-            end
-        end
+        rewrite_config_line(line, state, lines_acc, written_acc)
       end)
 
     output_lines = Enum.reverse(reversed_lines)
@@ -393,19 +370,40 @@ defmodule Ferricstore.Config do
     content = Enum.join(all_lines, "\n") <> "\n"
 
     # Atomic write: write to tmp then rename
-    case File.write(tmp_path, content) do
-      :ok ->
-        case File.rename(tmp_path, path) do
-          :ok ->
-            {:reply, :ok, state}
+    result = atomic_write_file(tmp_path, path, content)
+    {:reply, result, state}
+  end
 
-          {:error, reason} ->
-            File.rm(tmp_path)
-            {:reply, {:error, "ERR failed to rename config file: #{inspect(reason)}"}, state}
+  defp rewrite_config_line(line, state, lines_acc, written_acc) do
+    trimmed = String.trim(line)
+
+    cond do
+      trimmed == "" or String.starts_with?(trimmed, "#") ->
+        {[line | lines_acc], written_acc}
+
+      true ->
+        case String.split(trimmed, " ", parts: 2) do
+          [key | _rest] when is_map_key(state, key) ->
+            value = Map.get(state, key, "")
+            {["#{key} #{value}" | lines_acc], MapSet.put(written_acc, key)}
+
+          [_key | _rest] ->
+            {[line | lines_acc], written_acc}
+
+          _ ->
+            {[line | lines_acc], written_acc}
         end
+    end
+  end
 
+  defp atomic_write_file(tmp_path, path, content) do
+    with :ok <- File.write(tmp_path, content),
+         :ok <- File.rename(tmp_path, path) do
+      :ok
+    else
       {:error, reason} ->
-        {:reply, {:error, "ERR failed to write config file: #{inspect(reason)}"}, state}
+        File.rm(tmp_path)
+        {:error, "ERR failed to write/rename config file: #{inspect(reason)}"}
     end
   end
 
