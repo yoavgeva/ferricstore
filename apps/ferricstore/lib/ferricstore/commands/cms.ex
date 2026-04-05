@@ -80,31 +80,13 @@ defmodule Ferricstore.Commands.CMS do
 
   def handle("CMS.MERGE", [dst, numkeys_str | rest], store) do
     with {:ok, numkeys} <- parse_pos_integer(numkeys_str, "numkeys"),
-         {:ok, src_keys, weights} <- parse_merge_args(rest, numkeys) do
-      # Validate source sketches exist and get dimensions
-      first_info = cms_file_info_for_key(store, hd(src_keys))
-
-      case first_info do
-        {:error, _} = err -> err
-        {:ok, {first_w, first_d, _}} ->
-          # Validate all sources have same dimensions
-          all_valid = Enum.all?(src_keys, fn k ->
-            case cms_file_info_for_key(store, k) do
-              {:ok, {w, d, _}} -> w == first_w and d == first_d
-              _ -> false
-            end
-          end)
-
-          if all_valid do
-            create_params = %{width: first_w, depth: first_d}
-            # Pre-resolve source paths — sources may be on different shards
-            src_paths = Enum.map(src_keys, &prob_path(store, &1, "cms"))
-            result = do_prob_write(store, {:cms_merge, dst, src_paths, weights, create_params})
-            normalize_result(result)
-          else
-            {:error, "ERR CMS: width/depth of src sketches must be equal"}
-          end
-      end
+         {:ok, src_keys, weights} <- parse_merge_args(rest, numkeys),
+         {:ok, first_w, first_d} <- get_first_sketch_dims(store, src_keys),
+         :ok <- validate_sketch_dims(store, src_keys, first_w, first_d) do
+      create_params = %{width: first_w, depth: first_d}
+      src_paths = Enum.map(src_keys, &prob_path(store, &1, "cms"))
+      result = do_prob_write(store, {:cms_merge, dst, src_paths, weights, create_params})
+      normalize_result(result)
     end
   end
 

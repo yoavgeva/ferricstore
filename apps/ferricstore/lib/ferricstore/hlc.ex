@@ -416,17 +416,31 @@ defmodule Ferricstore.HLC do
 
   defp merge_timestamps(wall, local_phys, local_logical, remote_phys, remote_log) do
     max_phys = Enum.max([wall, local_phys, remote_phys])
-
-    cond do
-      wall > local_phys and wall > remote_phys -> {wall, 0}
-      local_phys == max_phys and local_phys > remote_phys -> {local_phys, local_logical + 1}
-      remote_phys == max_phys and remote_phys > local_phys -> {remote_phys, remote_log + 1}
-      local_phys == remote_phys -> {local_phys, max(local_logical, remote_log) + 1}
-      wall == local_phys -> {local_phys, local_logical + 1}
-      wall == remote_phys -> {wall, remote_log + 1}
-      true -> {max_phys, 0}
-    end
+    merge_by_max(max_phys, wall, local_phys, local_logical, remote_phys, remote_log)
   end
+
+  # Wall clock is strictly ahead of both local and remote.
+  defp merge_by_max(wall, wall, local_phys, _ll, remote_phys, _rl)
+       when wall > local_phys and wall > remote_phys,
+       do: {wall, 0}
+
+  # Local and remote physical tie -- merge logical counters.
+  defp merge_by_max(_max, _wall, lp, ll, lp, rl), do: {lp, max(ll, rl) + 1}
+
+  # Wall ties with local physical (both >= remote).
+  defp merge_by_max(lp, lp, lp, ll, _rp, _rl), do: {lp, ll + 1}
+
+  # Wall ties with remote physical (both >= local).
+  defp merge_by_max(rp, rp, _lp, _ll, rp, rl), do: {rp, rl + 1}
+
+  # Local physical is the sole max.
+  defp merge_by_max(lp, _wall, lp, ll, _rp, _rl), do: {lp, ll + 1}
+
+  # Remote physical is the sole max.
+  defp merge_by_max(rp, _wall, _lp, _ll, rp, rl), do: {rp, rl + 1}
+
+  # Fallback.
+  defp merge_by_max(max_phys, _wall, _lp, _ll, _rp, _rl), do: {max_phys, 0}
 
   # Returns the atomics ref from :persistent_term, or nil if not yet created.
   @spec atomics_ref() :: reference() | nil
