@@ -130,40 +130,7 @@ defmodule Ferricstore.Commands.Dispatcher do
 
     start = System.monotonic_time(:microsecond)
 
-    result =
-      case Map.get(@cmd_dispatch_map, cmd) do
-        :strings -> Strings.handle(cmd, args, store)
-        :expiry -> Expiry.handle(cmd, args, store)
-        :generic -> Generic.handle(cmd, upcase_subcommand(cmd, args), store)
-        :bitmap -> Bitmap.handle(cmd, args, store)
-        :hll -> HyperLogLog.handle(cmd, args, store)
-        :hash -> Hash.handle(cmd, args, store)
-        :list -> List.handle(cmd, args, store)
-        :set -> Set.handle(cmd, args, store)
-        :zset -> SortedSet.handle(cmd, args, store)
-        :geo -> Geo.handle(cmd, args, store)
-        :stream -> Stream.handle(cmd, args, store)
-        :json -> Json.handle(cmd, args, store)
-        :native -> Native.handle(cmd, args, store)
-        :bloom -> Bloom.handle(cmd, args, store)
-        :cuckoo -> Cuckoo.handle(cmd, args, store)
-        :cms -> CMS.handle(cmd, args, store)
-        :topk -> TopK.handle(cmd, args, store)
-        :tdigest -> TDigest.handle(cmd, args, store)
-        :pubsub -> PubSub.handle(cmd, args)
-        :server -> Server.handle(cmd, upcase_subcommand(cmd, args), store)
-        :ratelimit -> Native.handle("RATELIMIT.ADD", args, store)
-        :cluster -> Cluster.handle(cmd, args, store)
-        :ferricstore_config -> Namespace.handle(cmd, upcase_subcommand_ferricstore(args), store)
-        :ferricstore_metrics -> Ferricstore.Metrics.handle(cmd, args)
-        :ferricstore_key_info -> Native.handle("KEY_INFO", args, store)
-        :memory ->
-          case args do
-            [subcmd | rest] -> Memory.handle(String.upcase(subcmd), rest, store)
-            [] -> {:error, "ERR wrong number of arguments for 'memory' command"}
-          end
-        nil -> {:error, "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "}
-      end
+    result = dispatch_to_handler(Map.get(@cmd_dispatch_map, cmd), cmd, args, store)
 
     duration = System.monotonic_time(:microsecond) - start
     Ferricstore.SlowLog.maybe_log([cmd | args], duration)
@@ -187,4 +154,32 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp upcase_subcommand_ferricstore([subcmd | rest]), do: [String.upcase(subcmd) | rest]
   defp upcase_subcommand_ferricstore([]), do: []
 
+  defp dispatch_to_handler(:strings, cmd, args, store), do: Strings.handle(cmd, args, store)
+  defp dispatch_to_handler(:expiry, cmd, args, store), do: Expiry.handle(cmd, args, store)
+  defp dispatch_to_handler(:generic, cmd, args, store), do: Generic.handle(cmd, upcase_subcommand(cmd, args), store)
+  defp dispatch_to_handler(:bitmap, cmd, args, store), do: Bitmap.handle(cmd, args, store)
+  defp dispatch_to_handler(:hll, cmd, args, store), do: HyperLogLog.handle(cmd, args, store)
+  defp dispatch_to_handler(:hash, cmd, args, store), do: Hash.handle(cmd, args, store)
+  defp dispatch_to_handler(:list, cmd, args, store), do: List.handle(cmd, args, store)
+  defp dispatch_to_handler(:set, cmd, args, store), do: Set.handle(cmd, args, store)
+  defp dispatch_to_handler(:zset, cmd, args, store), do: SortedSet.handle(cmd, args, store)
+  defp dispatch_to_handler(:geo, cmd, args, store), do: Geo.handle(cmd, args, store)
+  defp dispatch_to_handler(:stream, cmd, args, store), do: Stream.handle(cmd, args, store)
+  defp dispatch_to_handler(:json, cmd, args, store), do: Json.handle(cmd, args, store)
+  defp dispatch_to_handler(:native, cmd, args, store), do: Native.handle(cmd, args, store)
+  defp dispatch_to_handler(:bloom, cmd, args, store), do: Bloom.handle(cmd, args, store)
+  defp dispatch_to_handler(:cuckoo, cmd, args, store), do: Cuckoo.handle(cmd, args, store)
+  defp dispatch_to_handler(:cms, cmd, args, store), do: CMS.handle(cmd, args, store)
+  defp dispatch_to_handler(:topk, cmd, args, store), do: TopK.handle(cmd, args, store)
+  defp dispatch_to_handler(:tdigest, cmd, args, store), do: TDigest.handle(cmd, args, store)
+  defp dispatch_to_handler(:pubsub, cmd, args, _store), do: PubSub.handle(cmd, args)
+  defp dispatch_to_handler(:server, cmd, args, store), do: Server.handle(cmd, upcase_subcommand(cmd, args), store)
+  defp dispatch_to_handler(:ratelimit, _cmd, args, store), do: Native.handle("RATELIMIT.ADD", args, store)
+  defp dispatch_to_handler(:cluster, cmd, args, store), do: Cluster.handle(cmd, args, store)
+  defp dispatch_to_handler(:ferricstore_config, cmd, args, store), do: Namespace.handle(cmd, upcase_subcommand_ferricstore(args), store)
+  defp dispatch_to_handler(:ferricstore_metrics, cmd, args, _store), do: Ferricstore.Metrics.handle(cmd, args)
+  defp dispatch_to_handler(:ferricstore_key_info, _cmd, args, store), do: Native.handle("KEY_INFO", args, store)
+  defp dispatch_to_handler(:memory, _cmd, [subcmd | rest], store), do: Memory.handle(String.upcase(subcmd), rest, store)
+  defp dispatch_to_handler(:memory, _cmd, [], _store), do: {:error, "ERR wrong number of arguments for 'memory' command"}
+  defp dispatch_to_handler(nil, cmd, _args, _store), do: {:error, "ERR unknown command '#{String.downcase(cmd)}', with args beginning with: "}
 end

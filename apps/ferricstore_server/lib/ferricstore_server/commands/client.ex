@@ -214,28 +214,31 @@ defmodule FerricstoreServer.Commands.Client do
     conn_pid = Map.get(conn_state, :conn_pid, self())
     tracking = Map.get(conn_state, :tracking, ClientTracking.new_config())
 
-    case parse_opts(raw_opts) do
-      {:ok, parsed} ->
-        if parsed.prefixes != [] and not parsed.bcast do
-          {{:error, "ERR PREFIX requires BCAST mode to be enabled"}, conn_state}
-        else
-          kw = [
-            mode: if(parsed.bcast, do: :bcast, else: :default),
-            prefixes: parsed.prefixes,
-            redirect: parsed.redirect,
-            optin: parsed.optin,
-            optout: parsed.optout,
-            noloop: parsed.noloop
-          ]
+    with {:ok, parsed} <- parse_opts(raw_opts),
+         :ok <- validate_prefix_bcast(parsed) do
+      kw = [
+        mode: if(parsed.bcast, do: :bcast, else: :default),
+        prefixes: parsed.prefixes,
+        redirect: parsed.redirect,
+        optin: parsed.optin,
+        optout: parsed.optout,
+        noloop: parsed.noloop
+      ]
 
-          case ClientTracking.enable(conn_pid, tracking, kw) do
-            {:ok, new_tracking} -> {:ok, %{conn_state | tracking: new_tracking}}
-            {:error, _} = err -> {err, conn_state}
-          end
-        end
+      case ClientTracking.enable(conn_pid, tracking, kw) do
+        {:ok, new_tracking} -> {:ok, %{conn_state | tracking: new_tracking}}
+        {:error, _} = err -> {err, conn_state}
+      end
+    else
+      {:error, _} = err -> {err, conn_state}
+    end
+  end
 
-      {:error, _} = err ->
-        {err, conn_state}
+  defp validate_prefix_bcast(parsed) do
+    if parsed.prefixes != [] and not parsed.bcast do
+      {:error, "ERR PREFIX requires BCAST mode to be enabled"}
+    else
+      :ok
     end
   end
 
