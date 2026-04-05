@@ -452,7 +452,9 @@ defmodule Ferricstore.Stats do
 
   @impl true
   def init(_opts) do
-    ref = :counters.new(10, [:atomics])
+    # Reuse the existing counter ref if it was pre-initialized by application.ex
+    # (ensures the :default Instance and Stats share the same counter ref).
+    ref = :persistent_term.get(:ferricstore_stats_counter_ref, nil) || :counters.new(10, [:atomics])
     run_id = :crypto.strong_rand_bytes(20) |> Base.encode16(case: :lower)
     start_time = System.monotonic_time(:millisecond)
 

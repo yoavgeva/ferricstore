@@ -94,6 +94,13 @@ defmodule Ferricstore.Application do
     ref = :atomics.new(3, signed: false)
     :persistent_term.put(:ferricstore_pressure_flags, ref)
 
+    # Pre-initialize Stats counter ref BEFORE Instance.build so the
+    # :default instance reuses it (try_get_pt finds it).
+    unless :persistent_term.get(:ferricstore_stats_counter_ref, nil) do
+      stats_ref = :counters.new(10, [:atomics])
+      :persistent_term.put(:ferricstore_stats_counter_ref, stats_ref)
+    end
+
     # Initialize keyspace notification events config in persistent_term
     # (default: empty string = disabled). Updated by Config.apply_side_effect
     # when CONFIG SET notify-keyspace-events is called.
