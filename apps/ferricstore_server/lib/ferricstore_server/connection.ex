@@ -1,4 +1,3 @@
-# Suppress function clause grouping warnings (clauses added by different agents)
 defmodule FerricstoreServer.Connection do
   @moduledoc """
   Ranch protocol handler for a single FerricStore client connection.
@@ -66,6 +65,7 @@ defmodule FerricstoreServer.Connection do
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Blocking, as: ConnBlocking
+  alias FerricstoreServer.Connection.Pipeline, as: ConnPipeline
   alias FerricstoreServer.Connection.PubSub, as: ConnPubSub
   alias FerricstoreServer.Connection.Sendfile, as: ConnSendfile
   alias FerricstoreServer.Connection.Store, as: ConnStore
@@ -77,8 +77,6 @@ defmodule FerricstoreServer.Connection do
   # Connection safety limits -- prevent unbounded memory growth per connection.
   # Maximum receive buffer size before the connection is closed (128 MB).
   @max_buffer_size 134_217_728
-  # Maximum commands in a single pipeline batch (100K).
-  @max_pipeline_size 100_000
 
   # Connection state
   defstruct [
@@ -119,22 +117,6 @@ defmodule FerricstoreServer.Connection do
           enabled: boolean()
         }
         | nil
-
-  # Commands that read keys and should trigger client tracking registration.
-  @read_cmds ~w(GET MGET GETRANGE STRLEN GETEX GETDEL GETSET
-    HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN
-    LRANGE LLEN LINDEX LPOS
-    SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER
-    ZSCORE ZRANK ZREVRANK ZRANGE ZCARD ZCOUNT ZRANDMEMBER ZMSCORE
-    TYPE EXISTS TTL PTTL EXPIRETIME PEXPIRETIME
-    GETBIT BITCOUNT BITPOS PFCOUNT
-    OBJECT SUBSTR
-    GEOHASH GEOPOS GEODIST GEOSEARCH
-    XLEN XRANGE XREVRANGE XREAD XINFO
-    JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET)
-
-  # O(1) MapSet lookup for hot-path read classification (replaces linear `in` scans).
-  @read_cmds_set MapSet.new(@read_cmds)
 
   @type t :: %__MODULE__{
           socket: :inet.socket(),
@@ -358,19 +340,21 @@ defmodule FerricstoreServer.Connection do
   defp handle_parsed(%__MODULE__{socket: socket, transport: transport} = state, commands) do
     # Pipeline batch limit: reject batches with too many commands to prevent
     # unbounded memory from accumulated Task results and response buffers.
-    if length(commands) > @max_pipeline_size do
+    max_size = ConnPipeline.max_pipeline_size()
+
+    if length(commands) > max_size do
       send_response(
         socket,
         transport,
         Encoder.encode(
           {:error,
-           "ERR pipeline batch too large (#{length(commands)} commands, max #{@max_pipeline_size})"}
+           "ERR pipeline batch too large (#{length(commands)} commands, max #{max_size})"}
         )
       )
 
       loop(state)
     else
-      case pipeline_dispatch(commands, state) do
+      case ConnPipeline.pipeline_dispatch(commands, state, &handle_command/2, &send_response/3) do
         {:quit, quit_state} ->
           cleanup_connection(quit_state)
           transport.close(socket)
@@ -388,415 +372,19 @@ defmodule FerricstoreServer.Connection do
   end
 
   # ---------------------------------------------------------------------------
-  # Sliding window pipeline dispatch (spec section 2C.2)
-  # ---------------------------------------------------------------------------
-
-  # Commands that must be executed synchronously because they read or mutate
-  # connection-level state (transaction mode, pub/sub subscriptions, auth,
-  # sandbox, blocking ops, etc.).
-  @stateful_cmds ~w(
-    HELLO CLIENT QUIT AUTH ACL RESET READMODE SANDBOX
-    MULTI EXEC DISCARD WATCH UNWATCH
-    SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
-    BLPOP BRPOP BLMOVE BLMPOP
-  )
-
-  # Normalises a parsed command into `{uppercase_name, args}` for classification.
-  # Returns `:unknown` for un-parsable forms.
-  defp normalise_cmd({:inline, [name | args]}) when is_binary(name),
-    do: {String.upcase(name), args}
-
-  defp normalise_cmd({:inline, []}), do: :unknown
-
-  defp normalise_cmd([name | args]) when is_binary(name),
-    do: {String.upcase(name), args}
-
-  defp normalise_cmd(_other), do: :unknown
-
-  # Returns true if the command must be handled sequentially (it reads or
-  # mutates connection state, or we are in a mode where all commands are
-  # stateful -- e.g. MULTI queuing, pub/sub, pre-auth).
-  # Variant that accepts a pre-normalised command to avoid redundant String.upcase.
-  defp stateful_command_normalised?(:unknown, _state), do: true
-
-  defp stateful_command_normalised?({name, _args}, state) do
-    state.multi_state == :queuing or
-      in_pubsub_mode?(state) or
-      requires_auth?(state) or
-      name in @stateful_cmds or
-      String.starts_with?(name, "CLIENT")
-  end
-
-  # Dispatches a pipeline of commands using a sliding window.
-  #
-  # For a single command, falls through to sequential dispatch (no benefit from
-  # async). For multiple commands, groups consecutive "pure" commands and
-  # dispatches them concurrently as Tasks. Responses are sent over the socket
-  # in-order as soon as the leading contiguous completed responses are available.
-  #
-  # Stateful commands (MULTI, AUTH, SUBSCRIBE, blocking ops, etc.) act as
-  # barriers: all prior pure-command Tasks are awaited and flushed before the
-  # stateful command executes synchronously.
-  defp pipeline_dispatch([single_cmd], state) do
-    # Single command -- no pipeline, no sliding window needed.
-    case handle_command(single_cmd, state) do
-      {:quit, response, quit_state} ->
-        send_response(state.socket, state.transport, response)
-        {:quit, quit_state}
-
-      {:continue, response, new_state} ->
-        send_response(state.socket, state.transport, response)
-        {:continue, new_state}
-    end
-  end
-
-  defp pipeline_dispatch(commands, state) do
-    sliding_window_dispatch(commands, state)
-  end
-
-  # Walks through the command list, building groups of consecutive pure commands
-  # that can be dispatched concurrently. When a stateful command is encountered
-  # (or the list ends), the current pure group is flushed via the sliding window
-  # and the stateful command is executed synchronously.
-  defp sliding_window_dispatch(commands, state) do
-    # Accumulate consecutive pure commands into a buffer.
-    # Track normalised forms and all_reads? flag during accumulation to
-    # avoid redundant normalise_cmd calls and a separate all_pure_reads? pass.
-    do_sliding_window(commands, [], true, state)
-  end
-
-  # Base case: no more commands, flush any remaining pure group.
-  defp do_sliding_window([], pure_acc, all_reads?, state) do
-    case flush_pure_group_pre(Enum.reverse(pure_acc), all_reads?, state) do
-      {:quit, _quit_state} = quit -> quit
-      {:continue, new_state} -> {:continue, new_state}
-    end
-  end
-
-  # Classify current command and either accumulate it (pure) or flush + execute
-  # (stateful or barrier).
-  #
-  # Normalise once and pass the result through to avoid redundant String.upcase
-  # calls in stateful_command?, barrier_command?, and command_shard_key.
-  # Track all_reads? flag during accumulation (optimization #8).
-  defp do_sliding_window([cmd | rest], pure_acc, all_reads?, state) do
-    normalised = normalise_cmd(cmd)
-
-    cond do
-      stateful_command_normalised?(normalised, state) ->
-        # Stateful: flush pure group, execute synchronously, may change state.
-        case flush_pure_group_pre(Enum.reverse(pure_acc), all_reads?, state) do
-          {:quit, _quit_state} = quit ->
-            quit
-
-          {:continue, flushed_state} ->
-            case handle_command(cmd, flushed_state) do
-              {:quit, response, quit_state} ->
-                send_response(quit_state.socket, quit_state.transport, response)
-                {:quit, quit_state}
-
-              {:continue, response, new_state} ->
-                send_response(new_state.socket, new_state.transport, response)
-                # After a stateful command, re-classify the remaining commands
-                # because state may have changed (e.g. entered MULTI mode).
-                do_sliding_window(rest, [], true, new_state)
-            end
-        end
-
-      barrier_command_normalised?(normalised) ->
-        # Barrier: flush pure group (so all prior commands complete first),
-        # then include this barrier command as the start of a new pure group.
-        case flush_pure_group_pre(Enum.reverse(pure_acc), all_reads?, state) do
-          {:quit, _quit_state} = quit ->
-            quit
-
-          {:continue, flushed_state} ->
-            # Start a new pure group with the barrier command.
-            # Barrier commands are not reads, so all_reads? = false.
-            is_read = is_read_cmd?(normalised)
-            do_sliding_window(rest, [{cmd, normalised}], is_read, flushed_state)
-        end
-
-      true ->
-        # Pure command -- accumulate for concurrent dispatch.
-        # Track whether this command is a read for the all_reads? flag.
-        is_read = is_read_cmd?(normalised)
-        do_sliding_window(rest, [{cmd, normalised} | pure_acc], all_reads? and is_read, state)
-    end
-  end
-
-  # Flushes a group of pure commands by dispatching them concurrently as Tasks,
-  # then sending responses in order via the sliding window.
-  #
-  # **Shard-aware ordering**: commands that target the same shard are executed
-  # sequentially (preserving causal order), while commands targeting different
-  # shards execute concurrently. Each Task waits for its predecessor on the
-  # same shard to complete before executing, using a lightweight ref-based
-  # signalling mechanism.
-  #
-  # An empty group is a no-op.
-  # A single-command group skips Task overhead and dispatches inline.
-  # flush_pure_group_pre accepts pre-normalised {cmd, normalised} pairs and
-  # a pre-computed all_reads? flag from do_sliding_window accumulation.
-  # This eliminates the separate Enum.reverse + all_pure_reads? pass.
-  defp flush_pure_group_pre([], _all_reads?, state), do: {:continue, state}
-
-  defp flush_pure_group_pre([{single_cmd, _norm}], _all_reads?, state) do
-    case handle_command(single_cmd, state) do
-      {:quit, response, quit_state} ->
-        send_response(quit_state.socket, quit_state.transport, response)
-        {:quit, quit_state}
-
-      {:continue, response, new_state} ->
-        send_response(new_state.socket, new_state.transport, response)
-        {:continue, new_state}
-    end
-  end
-
-  defp flush_pure_group_pre(normalised, all_reads?, state) do
-    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
-
-    # Fast path: if ALL commands are pure reads (tracked during accumulation),
-    # skip the sliding window entirely. No Task spawning, no shard grouping,
-    # no Map buffer. Just dispatch sequentially and send each response immediately.
-    if all_reads? do
-      flush_pure_reads_fast_normalised(normalised, store, state)
-    else
-      flush_pure_group_sliding_window_normalised(normalised, store, state)
-    end
-  end
-
-  defp flush_pure_reads_fast_normalised(normalised, store, state) do
-    Enum.reduce_while(normalised, {:continue, state}, fn {_cmd, norm}, {:continue, acc_state} ->
-      case dispatch_pure_command_normalised(norm, store, acc_state) do
-        {:quit, response} ->
-          send_response(acc_state.socket, acc_state.transport, response)
-          {:halt, {:quit, acc_state}}
-
-        {:continue, response} ->
-          send_response(acc_state.socket, acc_state.transport, response)
-          {:cont, {:continue, acc_state}}
-      end
-    end)
-  end
-
-  defp flush_pure_group_sliding_window_normalised(normalised, store, state) do
-    # Shard-aware concurrent dispatch with sliding-window response delivery.
-    #
-    # Commands are grouped by shard lane. Each lane gets its own Task that
-    # executes that lane's commands sequentially (preserving per-key causal
-    # order). Lanes targeting different shards run concurrently, reducing
-    # total wall-clock time when a pipeline spans multiple shards.
-    #
-    # Each lane Task sends `{:lane_result, original_index, result}` messages
-    # to the connection process as each command completes, enabling the
-    # sliding window to send response N as soon as responses 0..N are ready.
-
-    # Step 1: Assign each command an index and shard lane.
-    # Uses pre-normalised commands to avoid redundant normalise_cmd calls
-    # in command_shard_key.
-    indexed_cmds =
-      normalised
-      |> Enum.with_index()
-      |> Enum.map(fn {{_cmd, norm}, idx} -> {norm, idx, command_shard_key_normalised(state.instance_ctx, norm)} end)
-
-    # Step 2: Group by shard lane (preserving original order within each lane).
-    lanes = Enum.group_by(indexed_cmds, fn {_norm, _idx, shard_key} -> shard_key end)
-
-    total = length(normalised)
-    conn_pid = self()
-
-    # Step 3: Spawn one Task per shard lane. Each task executes its commands
-    # sequentially and sends results back to the connection process.
-    lane_tasks =
-      Enum.map(lanes, fn {_shard_key, lane_cmds} ->
-        Task.async(fn ->
-          Enum.each(lane_cmds, fn {norm, idx, _shard_key} ->
-            result = dispatch_pure_command_normalised(norm, store, state)
-            send(conn_pid, {:lane_result, idx, result})
-          end)
-        end)
-      end)
-
-    # Step 4: Sliding window -- receive results and send responses in order.
-    # We maintain a cursor (next index to send) and a buffer for out-of-order
-    # arrivals. Response N is sent as soon as responses 0..N are all available.
-    result = sliding_window_collect(state, 0, total, %{})
-
-    # Step 5: Ensure all lane tasks have completed (they should be done by
-    # now since we've collected all results, but await to clean up refs).
-    Enum.each(lane_tasks, fn task ->
-      Task.await(task, :infinity)
-    end)
-
-    result
-  end
-
-  # Collects results from lane tasks and sends responses in sliding-window order.
-  # `cursor` is the next index to send. `buffer` holds results that arrived
-  # out of order (index > cursor).
-  defp sliding_window_collect(state, cursor, total, _buffer) when cursor >= total do
-    {:continue, state}
-  end
-
-  defp sliding_window_collect(state, cursor, total, buffer) do
-    # Check if the next response is already buffered.
-    case Map.pop(buffer, cursor) do
-      {{action, response}, new_buffer} ->
-        case action do
-          :quit ->
-            send_response(state.socket, state.transport, response)
-            {:quit, state}
-
-          :continue ->
-            send_response(state.socket, state.transport, response)
-            sliding_window_collect(state, cursor + 1, total, new_buffer)
-        end
-
-      {nil, _buffer} ->
-        # Not buffered yet -- wait for any lane result message.
-        receive do
-          {:lane_result, ^cursor, {action, response}} ->
-            # It's the one we need -- send immediately.
-            case action do
-              :quit ->
-                send_response(state.socket, state.transport, response)
-                {:quit, state}
-
-              :continue ->
-                send_response(state.socket, state.transport, response)
-                sliding_window_collect(state, cursor + 1, total, buffer)
-            end
-
-          {:lane_result, idx, result} when idx > cursor ->
-            # Arrived out of order -- buffer it and keep waiting.
-            new_buffer = Map.put(buffer, idx, result)
-            sliding_window_collect(state, cursor, total, new_buffer)
-        end
-    end
-  end
-
-  # Commands that ALWAYS span multiple shards regardless of arg count. They
-  # act as pipeline barriers: the sliding window flushes all preceding
-  # commands before allowing a barrier command to execute, ensuring that
-  # prior writes are visible.
-  @always_multi_cmds ~w(MGET MSET MSETNX BITOP PFCOUNT PFMERGE
-    SDIFF SINTER SUNION SDIFFSTORE SINTERSTORE SUNIONSTORE SINTERCARD)
-
-  # Commands that take a variable number of keys. With a single key they can
-  # be routed to that key's shard. With multiple keys, they become a barrier.
-  @variadic_key_cmds ~w(DEL UNLINK EXISTS)
-
-  # Server-level commands that span all shards and must act as barriers.
-  @barrier_server_cmds ~w(DBSIZE FLUSHDB FLUSHALL KEYS SCAN RANDOMKEY)
-
-  # Returns true if a normalised command is a read command (O(1) MapSet lookup).
-  defp is_read_cmd?({name, _args}), do: MapSet.member?(@read_cmds_set, name)
-  defp is_read_cmd?(:unknown), do: false
-
-  # Returns true if the command is a cross-shard barrier that must wait
-  # for all preceding pipeline commands to complete before executing.
-  # Variant that accepts a pre-normalised command to avoid redundant String.upcase.
-  defp barrier_command_normalised?(:unknown), do: false
-
-  defp barrier_command_normalised?({name, args}) do
-    name in @always_multi_cmds or
-      name in @barrier_server_cmds or
-      (name in @variadic_key_cmds and match?([_, _ | _], args))
-  end
-
-  # Server-level commands that don't target a specific key.
-  @server_cmds_no_key ~w(PING ECHO DBSIZE FLUSHDB FLUSHALL KEYS INFO COMMAND
-    SELECT LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF
-    MEMORY RANDOMKEY SCAN OBJECT WAIT
-    CLUSTER.HEALTH CLUSTER.STATS FERRICSTORE.HOTNESS FERRICSTORE.METRICS)
-
-  # Variant that accepts pre-normalised commands to avoid redundant normalise_cmd.
-  defp command_shard_key_normalised(_ctx, :unknown), do: :server
-
-  defp command_shard_key_normalised(ctx, {name, args}) do
-    cond do
-      name in @always_multi_cmds ->
-        :barrier
-
-      name in @variadic_key_cmds ->
-        case args do
-          # Single key: route to that key's shard lane.
-          [single_key] -> {:shard, Router.shard_for(ctx, single_key)}
-          # Multiple keys: global barrier.
-          _ -> :barrier
-        end
-
-      name in @server_cmds_no_key ->
-        :server
-
-      # Single-key commands: first arg is the key
-      args != [] ->
-        {:shard, Router.shard_for(ctx, hd(args))}
-
-      # No args
-      true ->
-        :server
-    end
-  end
-
-  # Dispatches a single pure command inside a Task. Returns {action, encoded_response}.
-  # Pure commands don't modify connection state, so we don't thread state through.
-  # ACL command-level checks are applied here for pipelined commands.
-  # Accepts a pre-normalised {name, args} tuple to avoid redundant String.upcase.
-  defp dispatch_pure_command_normalised(:unknown, _store, _state) do
-    {:continue, Encoder.encode({:error, "ERR unknown command format"})}
-  end
-
-  defp dispatch_pure_command_normalised({name, args}, store, state) do
-    # ACL command-level + key pattern check for pipelined commands (cached, no ETS lookup)
-    with :ok <- ConnAuth.check_command_cached(state.acl_cache, name),
-         :ok <- ConnAuth.check_keys_cached(state.acl_cache, name, args) do
-      Stats.incr_commands()
-
-      result =
-        try do
-          Dispatcher.dispatch(name, args, store)
-        catch
-          :exit, {:noproc, _} ->
-            {:error, "ERR server not ready, shard process unavailable"}
-
-          :exit, {reason, _} ->
-            {:error, "ERR internal error: #{inspect(reason)}"}
-        end
-
-      ConnTracking.maybe_notify_keyspace(name, args, result)
-      # Client tracking: notify writes from pipelined commands
-      ConnTracking.maybe_notify_tracking(name, args, result, state)
-      {:continue, Encoder.encode(result)}
-    else
-      {:error, _reason} = err ->
-        # Fix 5: Log command denials to the audit log.
-        FerricstoreServer.Acl.log_command_denied(
-          state.username,
-          name,
-          format_peer(state.peer),
-          state.client_id
-        )
-
-        {:continue, Encoder.encode(err)}
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # Individual command handlers
   # ---------------------------------------------------------------------------
-
-  # Normalise any command form to {name, args} where name is uppercase binary.
-  defp handle_command({:inline, tokens}, state) do
-    handle_command(tokens, state)
-  end
 
   @pre_auth_cmds ~w(AUTH HELLO QUIT RESET)
 
   # Commands that bypass ACL command-level checks. These are protocol-level
   # commands needed for connection setup, teardown, and user switching.
   @acl_bypass_cmds ~w(AUTH HELLO QUIT RESET)
+
+  # Normalise any command form to {name, args} where name is uppercase binary.
+  defp handle_command({:inline, tokens}, state) do
+    handle_command(tokens, state)
+  end
 
   defp handle_command([name | args], state) when is_binary(name) do
     cmd = String.upcase(name)
@@ -829,25 +417,70 @@ defmodule FerricstoreServer.Connection do
     end
   end
 
-  defp requires_auth?(state) do
-    not state.authenticated and Ferricstore.Config.get_value("requirepass") != ""
-  end
-
   defp handle_command(_unknown, state) do
     {:continue, Encoder.encode({:error, "ERR unknown command format"}), state}
   end
 
+  defp requires_auth?(state) do
+    not state.authenticated and Ferricstore.Config.get_value("requirepass") != ""
+  end
+
   # ---------------------------------------------------------------------------
-  # Dispatch table
+  # Dispatch table (all clauses contiguous)
   # ---------------------------------------------------------------------------
 
-  # Protocol-level commands stay in the connection layer.
   defp dispatch("HELLO", args, state), do: handle_hello(args, state)
-  # CLIENT HELLO [version] is the two-token form sent by some Redis clients.
   defp dispatch("CLIENT", ["HELLO" | args], state), do: handle_hello(args, state)
+  defp dispatch("CLIENT", args, state), do: dispatch_client(args, state)
+  defp dispatch("QUIT", _args, state), do: {:quit, Encoder.encode(:ok), state}
+  defp dispatch("AUTH", args, state), do: ConnAuth.dispatch_auth(args, state)
+  defp dispatch("ACL", [subcmd | rest], state), do: ConnAuth.dispatch_acl(String.upcase(subcmd), rest, state)
+  defp dispatch("ACL", [], state), do: {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl' command"}), state}
+  defp dispatch("RESET", _args, state), do: dispatch_reset(state)
+  defp dispatch("READMODE", args, state), do: dispatch_readmode(args, state)
+  defp dispatch("SANDBOX", args, state), do: dispatch_sandbox(args, state)
+  defp dispatch("MULTI", args, state), do: ConnTransaction.dispatch_multi(args, state)
+  defp dispatch("EXEC", args, state), do: ConnTransaction.dispatch_exec(args, state)
+  defp dispatch("DISCARD", args, state), do: ConnTransaction.dispatch_discard(args, state)
+  defp dispatch("WATCH", args, state), do: ConnTransaction.dispatch_watch(args, state)
+  defp dispatch("UNWATCH", args, state), do: ConnTransaction.dispatch_unwatch(args, state)
+  defp dispatch("SUBSCRIBE", args, state), do: ConnPubSub.dispatch_subscribe(args, state)
+  defp dispatch("UNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_unsubscribe(args, state)
+  defp dispatch("PSUBSCRIBE", args, state), do: ConnPubSub.dispatch_psubscribe(args, state)
+  defp dispatch("PUNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_punsubscribe(args, state)
 
-  # CLIENT subcommands that need connection state.
-  defp dispatch("CLIENT", args, state) do
+  defp dispatch(cmd, args, %{multi_state: :queuing} = state)
+       when cmd not in @multi_passthrough_cmds do
+    ConnTransaction.dispatch_queue(cmd, args, state)
+  end
+
+  defp dispatch("BLPOP", args, state), do: ConnBlocking.dispatch_blpop(args, state)
+  defp dispatch("BRPOP", args, state), do: ConnBlocking.dispatch_brpop(args, state)
+  defp dispatch("BLMOVE", args, state), do: ConnBlocking.dispatch_blmove(args, state)
+  defp dispatch("BLMPOP", args, state), do: ConnBlocking.dispatch_blmpop(args, state)
+
+  defp dispatch("GET", [key], %{transport: :ranch_tcp} = state)
+       when byte_size(key) > 0 and byte_size(key) <= 65_535 do
+    ConnSendfile.dispatch_get([key], state, &dispatch_normal/3)
+  end
+
+  defp dispatch("XREAD", args, state), do: ConnBlocking.dispatch_xread(args, state)
+
+  defp dispatch(cmd, args, state) do
+    if in_pubsub_mode?(state) and cmd not in ~w(PING) do
+      {:continue,
+       Encoder.encode({:error, "ERR Can't execute '#{String.downcase(cmd)}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"}),
+       state}
+    else
+      dispatch_normal(cmd, args, state)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Dispatch helpers (called from dispatch table above)
+  # ---------------------------------------------------------------------------
+
+  defp dispatch_client(args, state) do
     store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
     conn_state = %{
@@ -885,21 +518,7 @@ defmodule FerricstoreServer.Connection do
     {:continue, Encoder.encode(result), updated_state}
   end
 
-  defp dispatch("QUIT", _args, state), do: {:quit, Encoder.encode(:ok), state}
-
-  # AUTH command — delegated to Connection.Auth
-  defp dispatch("AUTH", args, state), do: ConnAuth.dispatch_auth(args, state)
-
-  # ACL subcommands — delegated to Connection.Auth
-  defp dispatch("ACL", [subcmd | rest], state), do: ConnAuth.dispatch_acl(String.upcase(subcmd), rest, state)
-
-  defp dispatch("ACL", [], state) do
-    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl' command"}), state}
-  end
-
-  defp dispatch("RESET", _args, state) do
-    # RESET clears transaction state, sandbox namespace, read mode, tracking state,
-    # auth state, pub/sub subscriptions, and rebuilds ACL cache for the default user.
+  defp dispatch_reset(state) do
     cleanup_pubsub(state)
     ClientTracking.cleanup(self())
     new_state = %{state |
@@ -919,9 +538,7 @@ defmodule FerricstoreServer.Connection do
     {:continue, Encoder.encode({:simple, "RESET"}), new_state}
   end
 
-  # -- READMODE command (spec section 5.4) ------------------------------------
-
-  defp dispatch("READMODE", [mode], state) do
+  defp dispatch_readmode([mode], state) do
     case String.upcase(mode) do
       "STALE" ->
         {:continue, Encoder.encode(:ok), %{state | read_mode: :stale}}
@@ -936,15 +553,13 @@ defmodule FerricstoreServer.Connection do
     end
   end
 
-  defp dispatch("READMODE", _args, state) do
+  defp dispatch_readmode(_args, state) do
     {:continue,
      Encoder.encode({:error, "ERR wrong number of arguments for 'readmode' command"}),
      state}
   end
 
-  # -- SANDBOX commands -------------------------------------------------------
-
-  defp dispatch("SANDBOX", [subcmd | rest], state) do
+  defp dispatch_sandbox([subcmd | rest], state) do
     sandbox_mode = Ferricstore.Config.get_value("sandbox_mode")
     sandbox_enabled? = sandbox_mode in ["local", "enabled"]
 
@@ -964,7 +579,6 @@ defmodule FerricstoreServer.Connection do
 
       "END" when sandbox_enabled? ->
         if state.sandbox_namespace do
-          # Flush keys with sandbox prefix
           ns = state.sandbox_namespace
 
           try do
@@ -991,7 +605,7 @@ defmodule FerricstoreServer.Connection do
     end
   end
 
-  defp dispatch("SANDBOX", _args, state) do
+  defp dispatch_sandbox(_args, state) do
     sandbox_mode = Ferricstore.Config.get_value("sandbox_mode")
 
     if sandbox_mode in ["local", "enabled"] do
@@ -1001,43 +615,6 @@ defmodule FerricstoreServer.Connection do
     end
   end
 
-  # -- Transaction commands — delegated to Connection.Transaction ------------
-
-  defp dispatch("MULTI", args, state), do: ConnTransaction.dispatch_multi(args, state)
-  defp dispatch("EXEC", args, state), do: ConnTransaction.dispatch_exec(args, state)
-  defp dispatch("DISCARD", args, state), do: ConnTransaction.dispatch_discard(args, state)
-  defp dispatch("WATCH", args, state), do: ConnTransaction.dispatch_watch(args, state)
-  defp dispatch("UNWATCH", args, state), do: ConnTransaction.dispatch_unwatch(args, state)
-
-  # -- Pub/Sub commands — delegated to Connection.PubSub --------------------
-
-  defp dispatch("SUBSCRIBE", args, state), do: ConnPubSub.dispatch_subscribe(args, state)
-  defp dispatch("UNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_unsubscribe(args, state)
-  defp dispatch("PSUBSCRIBE", args, state), do: ConnPubSub.dispatch_psubscribe(args, state)
-  defp dispatch("PUNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_punsubscribe(args, state)
-
-  # -- Queuing mode: intercept all non-passthrough commands ------------------
-
-  defp dispatch(cmd, args, %{multi_state: :queuing} = state)
-       when cmd not in @multi_passthrough_cmds do
-    ConnTransaction.dispatch_queue(cmd, args, state)
-  end
-
-  # -- Blocking list commands — delegated to Connection.Blocking -------------
-
-  defp dispatch("BLPOP", args, state), do: ConnBlocking.dispatch_blpop(args, state)
-  defp dispatch("BRPOP", args, state), do: ConnBlocking.dispatch_brpop(args, state)
-  defp dispatch("BLMOVE", args, state), do: ConnBlocking.dispatch_blmove(args, state)
-  defp dispatch("BLMPOP", args, state), do: ConnBlocking.dispatch_blmpop(args, state)
-
-  # -- GET sendfile optimisation — delegated to Connection.Sendfile -----------
-
-  defp dispatch("GET", [key], %{transport: :ranch_tcp} = state)
-       when byte_size(key) > 0 and byte_size(key) <= 65_535 do
-    ConnSendfile.dispatch_get([key], state, &dispatch_normal/3)
-  end
-
-  # Normal dispatch path (extracted for reuse by sendfile fallback).
   defp dispatch_normal(cmd, args, state) do
     store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
 
@@ -1057,22 +634,6 @@ defmodule FerricstoreServer.Connection do
     ConnTracking.maybe_notify_tracking(cmd, args, result, state)
 
     {:continue, Encoder.encode(result), new_state}
-  end
-
-  # -- XREAD BLOCK dispatch — delegated to Connection.Blocking ---------------
-
-  defp dispatch("XREAD", args, state), do: ConnBlocking.dispatch_xread(args, state)
-
-  # All other commands go through the Dispatcher with an injected store.
-  # But first check pub/sub mode restriction (PING is allowed in pub/sub mode).
-  defp dispatch(cmd, args, state) do
-    if in_pubsub_mode?(state) and cmd not in ~w(PING) do
-      {:continue,
-       Encoder.encode({:error, "ERR Can't execute '#{String.downcase(cmd)}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"}),
-       state}
-    else
-      dispatch_normal(cmd, args, state)
-    end
   end
 
 
