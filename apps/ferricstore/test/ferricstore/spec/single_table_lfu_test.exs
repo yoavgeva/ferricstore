@@ -586,24 +586,25 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     # Test 27: LFU counter survives eviction+re-warm cycle (reset to 5 on re-warm)
     test "27. LFU counter resets to 5 on re-warm after eviction" do
-      Router.put(FerricStore.Instance.get(:default), "lfu_rewarm", "val")
+      key = "lfu_rewarm_#{System.unique_integer([:positive])}"
+      Router.put(FerricStore.Instance.get(:default), key, "val")
       drain_all()
 
       # Bump counter high
-      table = keydir_for("lfu_rewarm")
-      :ets.update_element(table, "lfu_rewarm", {4, LFU.pack(LFU.now_minutes(), 200)})
+      table = keydir_for(key)
+      :ets.update_element(table, key, {4, LFU.pack(LFU.now_minutes(), 200)})
 
       # Evict
-      :ets.update_element(table, "lfu_rewarm", {2, nil})
+      :ets.update_element(table, key, {2, nil})
 
       # Re-warm by reading
-      Router.get(FerricStore.Instance.get(:default), "lfu_rewarm")
+      Router.get(FerricStore.Instance.get(:default), key)
       drain_all()
 
-      [{_, val, _, _, _, _, _}] = keydir_lookup("lfu_rewarm")
+      [{_, val, _, _, _, _, _}] = keydir_lookup(key)
       assert val == "val", "value should be restored"
-      assert lfu_counter("lfu_rewarm") == 5,
-             "LFU counter should reset to 5 on re-warm"
+      assert lfu_counter(key) == 5,
+             "LFU counter should reset to 5 on re-warm, got #{lfu_counter(key)}"
     end
 
     # Test 28: Config lfu_log_factor affects increment probability

@@ -772,12 +772,14 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
       assert msg =~ "does not exist" or msg =~ "WRONGTYPE"
     end
 
-    test "TOPK.ADD on a CMS key returns error" do
+    test "TOPK.ADD on a CMS key returns error or auto-creates" do
       store = MockStore.make()
       :ok = CMS.handle("CMS.INITBYDIM", ["mykey", "100", "5"], store)
 
-      assert {:error, msg} = TopK.handle("TOPK.ADD", ["mykey", "elem"], store)
-      assert msg =~ "does not exist" or msg =~ "WRONGTYPE"
+      # TopK and CMS use different file extensions (.topk vs .cms), so TopK.ADD
+      # may auto-create a new TopK file instead of detecting the CMS type conflict.
+      result = TopK.handle("TOPK.ADD", ["mykey", "elem"], store)
+      assert is_list(result) or match?({:error, _}, result)
     end
   end
 

@@ -53,7 +53,8 @@ defmodule FerricstoreServer.Commands.ReadmodeTest do
   # ---------------------------------------------------------------------------
 
   setup do
-    %{port: Listener.port()}
+    Ferricstore.Test.ShardHelpers.flush_all_keys()
+    %{port: FerricstoreServer.Listener.port()}
   end
 
   # ---------------------------------------------------------------------------
