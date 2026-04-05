@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.TypeRegistry do
   """
 
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Ops
 
   @wrongtype_msg "WRONGTYPE Operation against a key holding the wrong kind of value"
 
@@ -32,7 +33,7 @@ defmodule Ferricstore.Store.TypeRegistry do
 
     - `redis_key` - the Redis key to check
     - `type` - the expected data type (`:hash`, `:list`, `:set`, `:zset`)
-    - `store` - the injected store map
+    - `store` - the store (Instance, LocalTxStore, or closure map)
 
   ## Returns
 
@@ -44,13 +45,13 @@ defmodule Ferricstore.Store.TypeRegistry do
     type_key = CompoundKey.type_key(redis_key)
     expected = CompoundKey.encode_type(type)
 
-    case store.compound_get.(redis_key, type_key) do
+    case Ops.compound_get(store, redis_key, type_key) do
       nil ->
         # No type metadata. If the key exists as a plain string, reject.
-        if is_map_key(store, :exists?) and store.exists?.(redis_key) do
+        if has_exists?(store) and Ops.exists?(store, redis_key) do
           {:error, @wrongtype_msg}
         else
-          store.compound_put.(redis_key, type_key, expected, 0)
+          Ops.compound_put(store, redis_key, type_key, expected, 0)
           :ok
         end
 
@@ -70,7 +71,7 @@ defmodule Ferricstore.Store.TypeRegistry do
   ## Parameters
 
     - `redis_key` - the Redis key to look up
-    - `store` - the injected store map
+    - `store` - the store (Instance, LocalTxStore, or closure map)
 
   ## Returns
 
@@ -81,15 +82,15 @@ defmodule Ferricstore.Store.TypeRegistry do
     # Check compound key type registry first (for hash/set/zset)
     type_key = CompoundKey.type_key(redis_key)
 
-    case store.compound_get.(redis_key, type_key) do
+    case Ops.compound_get(store, redis_key, type_key) do
       nil ->
         # No explicit type marker — check for list metadata (compound key lists)
         list_meta_key = CompoundKey.list_meta_key(redis_key)
 
-        case store.compound_get.(redis_key, list_meta_key) do
+        case Ops.compound_get(store, redis_key, list_meta_key) do
           nil ->
             # Check if plain string or legacy serialized list
-            case store.get.(redis_key) do
+            case Ops.get(store, redis_key) do
               nil -> "none"
               value when is_binary(value) -> detect_serialized_type(value)
               _ -> "string"
@@ -123,12 +124,12 @@ defmodule Ferricstore.Store.TypeRegistry do
   ## Parameters
 
     - `redis_key` - the Redis key whose type to remove
-    - `store` - the injected store map
+    - `store` - the store (Instance, LocalTxStore, or closure map)
   """
   @spec delete_type(binary(), map()) :: :ok
   def delete_type(redis_key, store) do
     type_key = CompoundKey.type_key(redis_key)
-    store.compound_delete.(redis_key, type_key)
+    Ops.compound_delete(store, redis_key, type_key)
   end
 
   @doc """
@@ -146,12 +147,12 @@ defmodule Ferricstore.Store.TypeRegistry do
     type_key = CompoundKey.type_key(redis_key)
     expected = CompoundKey.encode_type(type)
 
-    case store.compound_get.(redis_key, type_key) do
+    case Ops.compound_get(store, redis_key, type_key) do
       nil ->
         # No type metadata. Check if the key exists as a plain string --
         # if so, it is a type mismatch for data structure commands.
-        if is_map_key(store, :get) and is_map_key(store, :exists?) do
-          if store.exists?.(redis_key), do: {:error, @wrongtype_msg}, else: :ok
+        if has_exists?(store) do
+          if Ops.exists?(store, redis_key), do: {:error, @wrongtype_msg}, else: :ok
         else
           :ok
         end
@@ -160,4 +161,9 @@ defmodule Ferricstore.Store.TypeRegistry do
       _other_type -> {:error, @wrongtype_msg}
     end
   end
+
+  # Check if the store supports `exists?` — closure maps may omit it.
+  defp has_exists?(%FerricStore.Instance{}), do: true
+  defp has_exists?(%Ferricstore.Store.LocalTxStore{}), do: true
+  defp has_exists?(store) when is_map(store), do: is_map_key(store, :exists?)
 end

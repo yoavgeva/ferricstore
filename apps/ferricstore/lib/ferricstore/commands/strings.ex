@@ -74,7 +74,7 @@ defmodule Ferricstore.Commands.Strings do
     case Ops.get(store, key) do
       nil ->
         # Plain key is nil. Check if this is a data structure key (compound keys).
-        if is_map_key(store, :compound_get) do
+        if Ops.has_compound?(store) do
           type_key = Ferricstore.Store.CompoundKey.type_key(key)
           case Ops.compound_get(store, key, type_key) do
             nil -> nil
@@ -119,7 +119,7 @@ defmodule Ferricstore.Commands.Strings do
       exists = Ops.exists?(store, key)
       # Also check TypeRegistry for compound-key-based data structures
       # (lists, hashes, sets, zsets) that don't use the plain key store.
-      exists = exists or (is_map_key(store, :compound_get) and
+      exists = exists or (Ops.has_compound?(store) and
         Ops.compound_get(store, key, Ferricstore.Store.CompoundKey.type_key(key)) != nil)
       if exists, do: acc + 1, else: acc
     end)
@@ -757,7 +757,7 @@ defmodule Ferricstore.Commands.Strings do
     # available (the store has compound_get). When they are not available
     # (e.g. raw Router-based store without data structure support), fall
     # through to plain key deletion.
-    has_compound? = is_map_key(store, :compound_get)
+    has_compound? = Ops.has_compound?(store)
 
     if has_compound? do
       type_key = CompoundKey.type_key(key)

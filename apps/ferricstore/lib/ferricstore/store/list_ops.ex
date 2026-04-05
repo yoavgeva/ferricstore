@@ -14,6 +14,7 @@ defmodule Ferricstore.Store.ListOps do
   """
 
   alias Ferricstore.Store.CompoundKey
+  alias Ferricstore.Store.Ops
 
   @initial_position 0.0
   @position_step 1.0
@@ -45,7 +46,7 @@ defmodule Ferricstore.Store.ListOps do
             :left -> hd(sorted)
             :right -> List.last(sorted)
           end
-          store.compound_delete.(src_key, CompoundKey.list_element(src_key, pos))
+          Ops.compound_delete(store, src_key, CompoundKey.list_element(src_key, pos))
           remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
           if remaining == [] do
             delete_meta(src_key, store)
@@ -56,14 +57,14 @@ defmodule Ferricstore.Store.ListOps do
           case dst_meta do
             nil ->
               new_pos = @initial_position
-              store.compound_put.(dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
+              Ops.compound_put(store, dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
               write_meta(dst_key, store, {1, new_pos - @position_step, new_pos + @position_step})
             {dst_len, dst_left, dst_right} ->
               new_pos = case to_dir do
                 :left -> dst_left
                 :right -> dst_right
               end
-              store.compound_put.(dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
+              Ops.compound_put(store, dst_key, CompoundKey.list_element(dst_key, new_pos), element, 0)
               new_left = if to_dir == :left, do: new_pos - @position_step, else: dst_left
               new_right = if to_dir == :right, do: new_pos + @position_step, else: dst_right
               write_meta(dst_key, store, {dst_len + 1, new_left, new_right})
@@ -111,23 +112,23 @@ defmodule Ferricstore.Store.ListOps do
   @doc false
   def read_meta(key, store) do
     meta_key = CompoundKey.list_meta_key(key)
-    case store.compound_get.(key, meta_key) do
+    case Ops.compound_get(store, key, meta_key) do
       nil -> nil
       binary -> :erlang.binary_to_term(binary)
     end
   end
 
   defp write_meta(key, store, {_len, _left, _right} = meta) do
-    store.compound_put.(key, CompoundKey.list_meta_key(key), :erlang.term_to_binary(meta), 0)
+    Ops.compound_put(store, key, CompoundKey.list_meta_key(key), :erlang.term_to_binary(meta), 0)
   end
 
   defp delete_meta(key, store) do
-    store.compound_delete.(key, CompoundKey.list_meta_key(key))
+    Ops.compound_delete(store, key, CompoundKey.list_meta_key(key))
   end
 
   defp sorted_elements(key, store) do
     prefix = CompoundKey.list_prefix(key)
-    store.compound_scan.(key, prefix)
+    Ops.compound_scan(store, key, prefix)
     |> Enum.map(fn {encoded_pos, value} -> {CompoundKey.decode_position(encoded_pos), value} end)
   end
 
@@ -148,7 +149,7 @@ defmodule Ferricstore.Store.ListOps do
     # reversed=[c,b,a]. Assign: c at left_pos-(count-1)*step, b at left_pos-(count-2)*step, a at left_pos
     Enum.with_index(reversed) |> Enum.each(fn {elem, idx} ->
       pos = left_pos - (count - 1 - idx) * @position_step
-      store.compound_put.(key, CompoundKey.list_element(key, pos), elem, 0)
+      Ops.compound_put(store, key, CompoundKey.list_element(key, pos), elem, 0)
     end)
     new_left = left_pos - (count - 1) * @position_step - @position_step
     new_len = len + length(new_elements)
@@ -160,7 +161,7 @@ defmodule Ferricstore.Store.ListOps do
   defp do_execute(key, store, nil, {:rpush, new_elements}), do: do_rpush_new(key, store, new_elements)
   defp do_execute(key, store, {len, left_pos, right_pos}, {:rpush, new_elements}) do
     {new_right, _} = Enum.reduce(new_elements, {right_pos, 0}, fn elem, {pos, idx} ->
-      store.compound_put.(key, CompoundKey.list_element(key, pos), elem, 0)
+      Ops.compound_put(store, key, CompoundKey.list_element(key, pos), elem, 0)
       {pos + @position_step, idx + 1}
     end)
     new_len = len + length(new_elements)
@@ -176,7 +177,7 @@ defmodule Ferricstore.Store.ListOps do
     if sorted == [] do nil else
       actual_count = min(count, length(sorted))
       {to_pop, remaining} = Enum.split(sorted, actual_count)
-      Enum.each(to_pop, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+      Enum.each(to_pop, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
       if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - actual_count, remaining)
       popped_values = Enum.map(to_pop, fn {_, val} -> val end)
       case count do 1 -> List.first(popped_values); _ -> popped_values end
@@ -192,7 +193,7 @@ defmodule Ferricstore.Store.ListOps do
       total = length(sorted)
       actual_count = min(count, total)
       {remaining, to_pop} = Enum.split(sorted, total - actual_count)
-      Enum.each(to_pop, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+      Enum.each(to_pop, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
       if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - actual_count, remaining)
       popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
       case count do 1 -> List.first(popped_values); _ -> popped_values end
@@ -222,7 +223,7 @@ defmodule Ferricstore.Store.ListOps do
     norm = normalize_index(index, len)
     if norm >= 0 and norm < len do
       {old_pos, _} = sorted_elements(key, store) |> Enum.at(norm)
-      store.compound_put.(key, CompoundKey.list_element(key, old_pos), element, 0)
+      Ops.compound_put(store, key, CompoundKey.list_element(key, old_pos), element, 0)
       :ok
     else
       {:error, "ERR index out of range"}
@@ -237,10 +238,10 @@ defmodule Ferricstore.Store.ListOps do
     cond do
       removed_count == 0 -> 0
       remaining == [] ->
-        Enum.each(to_remove, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+        Enum.each(to_remove, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
         delete_meta(key, store); removed_count
       true ->
-        Enum.each(to_remove, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+        Enum.each(to_remove, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
         update_meta_from_remaining(key, store, len - removed_count, remaining); removed_count
     end
   end
@@ -254,7 +255,7 @@ defmodule Ferricstore.Store.ListOps do
       ns > ne -> {[], sorted}; ns >= len -> {[], sorted}
       true -> (kept = Enum.slice(sorted, ns..ne//1); ks = MapSet.new(kept, fn {p, _} -> p end); {kept, Enum.reject(sorted, fn {p, _} -> MapSet.member?(ks, p) end)})
     end
-    Enum.each(to_delete, fn {pos, _} -> store.compound_delete.(key, CompoundKey.list_element(key, pos)) end)
+    Enum.each(to_delete, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
     if to_keep == [], do: delete_meta(key, store), else: (
       {mp, _} = hd(to_keep); {xp, _} = List.last(to_keep)
       write_meta(key, store, {length(to_keep), mp - @position_step, xp + @position_step})
@@ -280,7 +281,7 @@ defmodule Ferricstore.Store.ListOps do
           :before -> if idx == 0, do: (elem(hd(sorted), 0) - @position_step), else: ((elem(Enum.at(sorted, idx - 1), 0) + elem(Enum.at(sorted, idx), 0)) / 2.0)
           :after -> if idx == length(sorted) - 1, do: (elem(List.last(sorted), 0) + @position_step), else: ((elem(Enum.at(sorted, idx), 0) + elem(Enum.at(sorted, idx + 1), 0)) / 2.0)
         end
-        store.compound_put.(key, CompoundKey.list_element(key, new_pos), element, 0)
+        Ops.compound_put(store, key, CompoundKey.list_element(key, new_pos), element, 0)
         write_meta(key, store, {len + 1, min(left_pos, new_pos - @position_step), max(right_pos, new_pos + @position_step)})
         len + 1
     end
@@ -295,7 +296,7 @@ defmodule Ferricstore.Store.ListOps do
     sorted = sorted_elements(key, store)
     if sorted == [] do nil else
       {pos, element} = case dir do :left -> hd(sorted); :right -> List.last(sorted) end
-      store.compound_delete.(key, CompoundKey.list_element(key, pos))
+      Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
       remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
       if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - 1, remaining)
       element
@@ -314,7 +315,7 @@ defmodule Ferricstore.Store.ListOps do
     # Assign: c at -(count-1)*step, b at -(count-2)*step, ..., a at 0.0
     Enum.with_index(reversed) |> Enum.each(fn {elem, idx} ->
       pos = @initial_position - (count - 1 - idx) * @position_step
-      store.compound_put.(key, CompoundKey.list_element(key, pos), elem, 0)
+      Ops.compound_put(store, key, CompoundKey.list_element(key, pos), elem, 0)
     end)
     min_a = @initial_position - (count - 1) * @position_step
     write_meta(key, store, {count, min_a - @position_step, @initial_position + @position_step})
@@ -324,7 +325,7 @@ defmodule Ferricstore.Store.ListOps do
   defp do_rpush_new(key, store, elements) do
     count = length(elements)
     Enum.with_index(elements) |> Enum.each(fn {elem, idx} ->
-      store.compound_put.(key, CompoundKey.list_element(key, @initial_position + idx * @position_step), elem, 0)
+      Ops.compound_put(store, key, CompoundKey.list_element(key, @initial_position + idx * @position_step), elem, 0)
     end)
     max_a = @initial_position + (count - 1) * @position_step
     write_meta(key, store, {count, @initial_position - @position_step, max_a + @position_step})
