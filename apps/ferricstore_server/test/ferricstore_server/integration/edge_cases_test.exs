@@ -186,7 +186,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
     test "expire_at_ms = 0 means no expiry (key lives forever)" do
       k = ukey("no_expiry")
       Router.put(FerricStore.Instance.get(:default), k, "permanent", 0)
-      Process.sleep(50)
+      # PUT with expire_at=0 is synchronous via Raft — no sleep needed
       assert "permanent" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
@@ -197,14 +197,16 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       assert nil == Router.get(FerricStore.Instance.get(:default), k)
     end
 
-    test "key expiring in 1ms: readable immediately, nil after sleep" do
+    test "key expiring in 1ms: readable immediately, nil after expiry" do
       k = ukey("1ms_ttl")
       expire_at = System.os_time(:millisecond) + 1
       Router.put(FerricStore.Instance.get(:default), k, "ephemeral", expire_at)
       # May or may not be readable immediately depending on scheduling
       _ = Router.get(FerricStore.Instance.get(:default), k)
-      Process.sleep(10)
-      assert nil == Router.get(FerricStore.Instance.get(:default), k)
+
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        nil == Router.get(FerricStore.Instance.get(:default), k)
+      end, "key with 1ms TTL should expire", 20, 5)
     end
 
     test "key expiring in 50ms is readable before expiry, nil after" do
@@ -212,8 +214,10 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       expire_at = System.os_time(:millisecond) + 50
       Router.put(FerricStore.Instance.get(:default), k, "brief", expire_at)
       assert "brief" == Router.get(FerricStore.Instance.get(:default), k)
-      Process.sleep(100)
-      assert nil == Router.get(FerricStore.Instance.get(:default), k)
+
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        nil == Router.get(FerricStore.Instance.get(:default), k)
+      end, "key with 50ms TTL should expire", 30, 10)
     end
 
     test "expired key is not included in Router.keys(FerricStore.Instance.get(:default))" do
@@ -239,10 +243,12 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       expire_at = System.os_time(:millisecond) + 50
       Router.put(FerricStore.Instance.get(:default), k, "expiring", expire_at)
       assert "expiring" == Router.get(FerricStore.Instance.get(:default), k)
-      # Overwrite with no expiry
+      # Overwrite with no expiry — synchronous via Raft, should persist the TTL removal
       Router.put(FerricStore.Instance.get(:default), k, "permanent", 0)
-      Process.sleep(100)
-      assert "permanent" == Router.get(FerricStore.Instance.get(:default), k)
+
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        "permanent" == Router.get(FerricStore.Instance.get(:default), k)
+      end, "overwrite with no-expiry should clear TTL", 20, 10)
     end
 
     test "PUT then overwrite with earlier TTL takes effect" do
@@ -684,6 +690,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
       {part1, part2} = String.split_at(full, 3)
 
       :ok = send_raw(sock, part1)
+      # intentional delay — testing grace/timeout behavior (server must buffer partial data)
       Process.sleep(50)
       :ok = send_raw(sock, part2)
 
@@ -841,9 +848,6 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
 
       # Abruptly close without completing the command
       :gen_tcp.close(sock)
-
-      # Brief pause for server cleanup
-      Process.sleep(50)
 
       # Server must still accept new connections
       fresh = connect_and_hello()

@@ -55,8 +55,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
   describe "file rotation notification" do
     test "notify_rotation updates file count in scheduler state" do
       Scheduler.notify_rotation(0, 5)
-      # Give cast time to process
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        Scheduler.status(0).file_count == 5
+      end, "file count not updated", 20, 10)
 
       status = Scheduler.status(0)
       assert status.file_count == 5
@@ -65,7 +67,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
     test "notify_rotation with count below threshold does not trigger merge" do
       # min_files_for_merge defaults to 2, send count of 1
       Scheduler.notify_rotation(0, 1)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        Scheduler.status(0).file_count == 1
+      end, "file count not updated", 20, 10)
 
       status = Scheduler.status(0)
       assert status.merging == false
@@ -81,7 +86,9 @@ defmodule Ferricstore.Merge.SchedulerTest do
         Scheduler.notify_rotation(0, i)
       end
 
-      Process.sleep(50)
+      ShardHelpers.eventually(fn ->
+        Scheduler.status(0).file_count == 10
+      end, "file count not updated to 10", 20, 10)
 
       # Scheduler should be alive and have the latest file count
       status = Scheduler.status(0)
@@ -98,7 +105,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
     test "trigger_check with sufficient files attempts merge" do
       # Set file count above threshold via notification
       Scheduler.notify_rotation(0, 5)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        Scheduler.status(0).file_count == 5
+      end, "file count not updated", 20, 10)
 
       # trigger_check should run the merge check
       assert :ok = Scheduler.trigger_check(0)
@@ -106,7 +116,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
 
     test "trigger_check with insufficient files does not merge" do
       Scheduler.notify_rotation(0, 1)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        Scheduler.status(0).file_count == 1
+      end, "file count not updated", 20, 10)
 
       assert :ok = Scheduler.trigger_check(0)
       status = Scheduler.status(0)
@@ -130,7 +143,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
 
       # Send file count below threshold
       GenServer.cast(pid, {:file_rotated, 5})
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        GenServer.call(pid, :status).file_count == 5
+      end, "file count not updated", 20, 10)
 
       status = GenServer.call(pid, :status)
       assert status.merging == false
@@ -156,7 +172,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
 
       # Send file count above threshold
       GenServer.cast(pid, {:file_rotated, 10})
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        GenServer.call(pid, :status).file_count == 10
+      end, "file count not updated", 20, 10)
 
       status = GenServer.call(pid, :status)
       # Should NOT be merging because we're outside the window
@@ -191,7 +210,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
         )
 
       GenServer.cast(pid, {:file_rotated, 10})
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        GenServer.call(pid, :status).file_count == 10
+      end, "file count not updated", 20, 10)
 
       status = GenServer.call(pid, :status)
       # Should not be merging — semaphore was held by shard 99
@@ -217,7 +239,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
       # Two rapid rotations
       Scheduler.notify_rotation(0, 5)
       Scheduler.notify_rotation(0, 6)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        Scheduler.status(0).file_count == 6
+      end, "file count not updated to 6", 20, 10)
 
       # At most one merge should have been triggered
       status_after = Scheduler.status(0)
@@ -242,7 +267,10 @@ defmodule Ferricstore.Merge.SchedulerTest do
 
       # Manually notify (simulates what the shard does on rotation)
       Scheduler.notify_rotation(0, initial_count + 1)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        Scheduler.status(0).file_count == initial_count + 1
+      end, "file count not updated", 20, 10)
 
       new_status = Scheduler.status(0)
       assert new_status.file_count == initial_count + 1

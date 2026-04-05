@@ -63,7 +63,11 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
 
     test "INCRBYFLOAT uses shared format_float (no dead then)" do
       Router.put(FerricStore.Instance.get(:default), "incr_float_test", "10.5", 0)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "incr_float_test") == "10.5"
+      end, "key not readable after put", 20, 10)
+
       assert {:ok, result} = Router.incr_float(FerricStore.Instance.get(:default), "incr_float_test", 1.5)
       assert_in_delta result, 12.0, 0.001
     end
@@ -79,18 +83,33 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # The fix replaced charlist-based SETRANGE with binary_part-based.
       # Verify correct behavior through the store.
       Router.put(FerricStore.Instance.get(:default), "setrange_test", "Hello World", 0)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "setrange_test") == "Hello World"
+      end, "key not readable after put", 20, 10)
+
       assert {:ok, 11} = Router.setrange(FerricStore.Instance.get(:default), "setrange_test", 6, "Redis")
-      Process.sleep(50)
-      assert Router.get(FerricStore.Instance.get(:default), "setrange_test") == "Hello Redis"
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "setrange_test") == "Hello Redis"
+      end, "setrange result not readable", 20, 10)
     end
 
     test "SETRANGE with padding works correctly" do
       Router.put(FerricStore.Instance.get(:default), "setrange_pad", "Hi", 0)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "setrange_pad") == "Hi"
+      end, "key not readable after put", 20, 10)
+
       # Offset beyond current string length should zero-pad
       assert {:ok, _len} = Router.setrange(FerricStore.Instance.get(:default), "setrange_pad", 5, "X")
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        result = Router.get(FerricStore.Instance.get(:default), "setrange_pad")
+        result != nil and byte_size(result) >= 6
+      end, "setrange result not readable", 20, 10)
+
       result = Router.get(FerricStore.Instance.get(:default), "setrange_pad")
       assert binary_part(result, 0, 2) == "Hi"
       # Bytes 2..4 should be zero-padded
@@ -100,8 +119,10 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
 
     test "SETRANGE on empty key works" do
       assert {:ok, 5} = Router.setrange(FerricStore.Instance.get(:default), "setrange_empty", 0, "Hello")
-      Process.sleep(50)
-      assert Router.get(FerricStore.Instance.get(:default), "setrange_empty") == "Hello"
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "setrange_empty") == "Hello"
+      end, "setrange result not readable", 20, 10)
     end
   end
 
@@ -115,7 +136,10 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
       # `[{cmd, args} | multi_queue]` with Enum.reverse at EXEC time.
       # Commands must still execute in order.
       Router.put(FerricStore.Instance.get(:default), "multi_order", "0", 0)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "multi_order") == "0"
+      end, "key not readable after put", 20, 10)
 
       # INCR three times: result should be 3, not some other value
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "multi_order")
@@ -154,11 +178,12 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
 
       # Trigger an expiry sweep and wait for it to complete
       GenServer.call(pid, :expiry_sweep)
-      # Give time for the handle_info expiry_sweep to trigger hibernate
-      Process.sleep(100)
 
-      # After hibernation, the process should still be responsive
-      assert Process.alive?(pid)
+      ShardHelpers.eventually(fn ->
+        # After hibernation, the process should still be responsive
+        Process.alive?(pid)
+      end, "shard process not alive after sweep", 20, 10)
+
       # Verify the shard still works
       :ok = GenServer.call(pid, {:put, "hibernate_test", "value", 0})
       assert "value" == GenServer.call(pid, {:get, "hibernate_test"})
@@ -333,8 +358,10 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
     test "non-pubsub operations work with nil pubsub fields" do
       # Regular GET/PUT should work fine with nil pubsub fields
       Router.put(FerricStore.Instance.get(:default), "nil_pubsub_test", "value", 0)
-      Process.sleep(50)
-      assert Router.get(FerricStore.Instance.get(:default), "nil_pubsub_test") == "value"
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "nil_pubsub_test") == "value"
+      end, "key not readable after put", 20, 10)
     end
   end
 

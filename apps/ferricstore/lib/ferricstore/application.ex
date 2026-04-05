@@ -126,7 +126,7 @@ defmodule Ferricstore.Application do
     # All code that calls FerricStore.Instance.get(:default) will find it.
     # Note: we pass the EXISTING refs (pressure_flags, etc.) rather than
     # creating new ones, since the global init above already created them.
-    _default_ctx = FerricStore.Instance.build(:default, [
+    default_ctx = FerricStore.Instance.build(:default, [
       data_dir: data_dir,
       shard_count: shard_count,
       max_memory_bytes: Application.get_env(:ferricstore, :max_memory_bytes, 1_073_741_824),
@@ -189,7 +189,7 @@ defmodule Ferricstore.Application do
         batcher_children ++
         bitcask_writer_children ++
         [
-        {Ferricstore.Store.ShardSupervisor, data_dir: data_dir, shard_count: shard_count, instance_ctx: _default_ctx}
+        {Ferricstore.Store.ShardSupervisor, data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}
       ] ++
         async_worker_children ++
         [
@@ -436,7 +436,7 @@ defmodule Ferricstore.Application do
 
       try do
         :ets.foldl(
-          fn {key, value, _expire_at_ms, _lfu, _fid, _off, vsize}, {c, lk, ls} when is_binary(value) ->
+          fn {key, value, _expire_at_ms, _lfu, _fid, _off, _vsize}, {c, lk, ls} when is_binary(value) ->
             size = byte_size(value)
 
             if size > threshold do

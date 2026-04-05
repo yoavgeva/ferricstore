@@ -10,7 +10,7 @@ defmodule Ferricstore.Commands.SlowLogTest do
 
   alias Ferricstore.Commands.Server
   alias Ferricstore.SlowLog
-  alias Ferricstore.Test.MockStore
+  alias Ferricstore.Test.{MockStore, ShardHelpers}
 
   setup do
     # Reset the slow log before each test to ensure isolation.
@@ -45,10 +45,11 @@ defmodule Ferricstore.Commands.SlowLogTest do
       end)
 
       SlowLog.maybe_log(["SET", "key", "value"], 100)
-      # Cast is async — give GenServer time to process.
-      Process.sleep(50)
 
-      assert SlowLog.len() == 1
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 1
+      end, "slowlog entry not recorded", 20, 10)
+
       entries = SlowLog.get()
       assert length(entries) == 1
       [{id, timestamp_us, duration_us, command}] = entries
@@ -61,9 +62,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
     test "maybe_log does not record when duration is below threshold" do
       # Default threshold is 10_000 us.
       SlowLog.maybe_log(["GET", "key"], 5)
-      Process.sleep(50)
 
-      assert SlowLog.len() == 0
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 0
+      end, "slowlog should remain empty", 10, 10)
     end
 
     test "maybe_log does not record when threshold is -1 (disabled)" do
@@ -75,9 +77,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
       end)
 
       SlowLog.maybe_log(["SET", "key", "value"], 999_999)
-      Process.sleep(50)
 
-      assert SlowLog.len() == 0
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 0
+      end, "slowlog should remain empty when disabled", 10, 10)
     end
 
     test "get with count limits results" do
@@ -93,9 +96,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
         Process.sleep(10)
       end
 
-      Process.sleep(50)
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 5
+      end, "5 slowlog entries not recorded", 20, 10)
 
-      assert SlowLog.len() == 5
       assert length(SlowLog.get(2)) == 2
       assert length(SlowLog.get(0)) == 0
     end
@@ -111,7 +115,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
       SlowLog.maybe_log(["FIRST"], 100)
       Process.sleep(10)
       SlowLog.maybe_log(["SECOND"], 200)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 2
+      end, "2 slowlog entries not recorded", 20, 10)
 
       [{id1, _, _, cmd1}, {id2, _, _, cmd2}] = SlowLog.get()
       assert id1 > id2
@@ -136,9 +143,9 @@ defmodule Ferricstore.Commands.SlowLogTest do
         Process.sleep(10)
       end
 
-      Process.sleep(50)
-
-      assert SlowLog.len() == 3
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 3
+      end, "slowlog eviction not complete", 20, 10)
 
       # The newest 3 entries should be retained.
       entries = SlowLog.get()
@@ -157,8 +164,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
       end)
 
       SlowLog.maybe_log(["OLD_CMD"], 100)
-      Process.sleep(50)
-      assert SlowLog.len() == 1
+
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 1
+      end, "slowlog entry not recorded", 20, 10)
 
       SlowLog.reset()
       assert SlowLog.len() == 0
@@ -166,7 +175,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
 
       # After reset, IDs restart from 0.
       SlowLog.maybe_log(["NEW_CMD"], 200)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 1
+      end, "slowlog entry not recorded after reset", 20, 10)
 
       [{id, _, _, _}] = SlowLog.get()
       assert id == 0
@@ -192,7 +204,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
       end)
 
       SlowLog.maybe_log(["SET", "mykey", "myval"], 15_000)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 1
+      end, "slowlog entry not recorded", 20, 10)
 
       result = Server.handle("SLOWLOG", ["GET"], MockStore.make())
       assert length(result) == 1
@@ -216,7 +231,9 @@ defmodule Ferricstore.Commands.SlowLogTest do
         Process.sleep(10)
       end
 
-      Process.sleep(50)
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 5
+      end, "5 slowlog entries not recorded", 20, 10)
 
       result = Server.handle("SLOWLOG", ["GET", "2"], MockStore.make())
       assert length(result) == 2
@@ -236,7 +253,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
       end)
 
       SlowLog.maybe_log(["GET", "foo"], 42)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 1
+      end, "slowlog entry not recorded", 20, 10)
 
       [[id, timestamp, duration, command]] =
         Server.handle("SLOWLOG", ["GET"], MockStore.make())
@@ -263,7 +283,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
 
       SlowLog.maybe_log(["A"], 10)
       SlowLog.maybe_log(["B"], 20)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() == 2
+      end, "2 slowlog entries not recorded", 20, 10)
 
       assert 2 == Server.handle("SLOWLOG", ["LEN"], MockStore.make())
     end
@@ -283,8 +306,10 @@ defmodule Ferricstore.Commands.SlowLogTest do
       end)
 
       SlowLog.maybe_log(["CMD"], 100)
-      Process.sleep(50)
-      assert SlowLog.len() > 0
+
+      ShardHelpers.eventually(fn ->
+        SlowLog.len() > 0
+      end, "slowlog entry not recorded", 20, 10)
 
       Server.handle("SLOWLOG", ["RESET"], MockStore.make())
       assert 0 == Server.handle("SLOWLOG", ["LEN"], MockStore.make())

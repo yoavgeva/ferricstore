@@ -128,24 +128,29 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       MemoryGuard.reconfigure(%{keydir_max_ram: 1})
       # Trigger a check so pressure level gets updated
       MemoryGuard.force_check()
-      Process.sleep(50)
 
-      assert MemoryGuard.keydir_full?() == true
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == true
+      end, "keydir_full? should be true with tiny budget", 20, 20)
     end
 
     test "keydir_full? returns false with generous keydir budget" do
       MemoryGuard.reconfigure(%{keydir_max_ram: 1_073_741_824})
       MemoryGuard.force_check()
-      Process.sleep(50)
 
-      assert MemoryGuard.keydir_full?() == false
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == false
+      end, "keydir_full? should be false with generous budget", 20, 20)
     end
 
     test "new key write rejected when keydir budget exceeded" do
       # Set keydir budget to 1 byte (guaranteed to be exceeded)
       MemoryGuard.reconfigure(%{keydir_max_ram: 1})
       MemoryGuard.force_check()
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == true
+      end, "keydir_full? should be true", 20, 20)
 
       # Use a unique key that definitely doesn't exist
       unique_key = "keydir_full_test_#{System.unique_integer([:positive])}"
@@ -160,7 +165,10 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       # First, write a key while budget is generous
       MemoryGuard.reconfigure(%{keydir_max_ram: 1_073_741_824})
       MemoryGuard.force_check()
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == false
+      end, "keydir_full? should be false with generous budget", 20, 20)
 
       key = "existing_key_update_test_#{System.unique_integer([:positive])}"
       assert :ok = Router.put(FerricStore.Instance.get(:default), key, "original_value", 0)
@@ -168,9 +176,10 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       # Now shrink the keydir budget to trigger KEYDIR_FULL
       MemoryGuard.reconfigure(%{keydir_max_ram: 1})
       MemoryGuard.force_check()
-      Process.sleep(50)
 
-      assert MemoryGuard.keydir_full?() == true
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == true
+      end, "keydir_full? should be true after shrinking budget", 20, 20)
 
       # Update to existing key should succeed
       assert :ok = Router.put(FerricStore.Instance.get(:default), key, "updated_value", 0)
@@ -179,7 +188,10 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
     test "KEYDIR_FULL error message format" do
       MemoryGuard.reconfigure(%{keydir_max_ram: 1})
       MemoryGuard.force_check()
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == true
+      end, "keydir_full? should be true", 20, 20)
 
       unique_key = "keydir_full_format_#{System.unique_integer([:positive])}"
       {:error, msg} = Router.put(FerricStore.Instance.get(:default), unique_key, "value", 0)
@@ -197,19 +209,19 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
     test "keydir pressure is :ok when well below 70%" do
       MemoryGuard.reconfigure(%{keydir_max_ram: 1_073_741_824})
       MemoryGuard.force_check()
-      Process.sleep(50)
 
-      stats = MemoryGuard.stats()
-      assert stats.keydir_pressure_level == :ok
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.stats().keydir_pressure_level == :ok
+      end, "keydir pressure should be :ok", 20, 20)
     end
 
     test "keydir pressure is :reject when at 95%+ of budget" do
       MemoryGuard.reconfigure(%{keydir_max_ram: 1})
       MemoryGuard.force_check()
-      Process.sleep(50)
 
-      stats = MemoryGuard.stats()
-      assert stats.keydir_pressure_level == :reject
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.stats().keydir_pressure_level == :reject
+      end, "keydir pressure should be :reject", 20, 20)
     end
   end
 
@@ -446,7 +458,10 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       tight_budget = stats.keydir_bytes + 256
       MemoryGuard.reconfigure(%{keydir_max_ram: tight_budget})
       MemoryGuard.force_check()
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.stats().keydir_pressure_level in [:pressure, :reject]
+      end, "keydir pressure should be elevated with tight budget", 20, 20)
 
       # Rapidly write keys until we get KEYDIR_FULL or exhaust attempts
       results =
@@ -466,7 +481,9 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
               # Periodically force a check so MemoryGuard picks up new usage
               if rem(i, 50) == 0 do
                 MemoryGuard.force_check()
-                Process.sleep(10)
+                ShardHelpers.eventually(fn ->
+                  MemoryGuard.stats().keydir_bytes > 0
+                end, "MemoryGuard check should complete", 5, 5)
               end
 
               {:cont, [{:ok, i} | acc]}
@@ -486,7 +503,10 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       # Trigger KEYDIR_FULL
       MemoryGuard.reconfigure(%{keydir_max_ram: 1})
       MemoryGuard.force_check()
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == true
+      end, "keydir_full? should be true", 20, 20)
 
       unique_key = "recovery_test_#{System.unique_integer([:positive])}"
       assert {:error, _} = Router.put(FerricStore.Instance.get(:default), unique_key, "value", 0)
@@ -494,7 +514,10 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
       # Restore generous budget
       MemoryGuard.reconfigure(%{keydir_max_ram: 1_073_741_824})
       MemoryGuard.force_check()
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == false
+      end, "keydir_full? should be false after restoring budget", 20, 20)
 
       # New writes should succeed
       assert :ok = Router.put(FerricStore.Instance.get(:default), unique_key, "value", 0)

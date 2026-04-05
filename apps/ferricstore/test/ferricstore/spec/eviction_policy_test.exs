@@ -56,10 +56,13 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
   describe "hot_cache stores last_access_ms" do
     test "writing a key stores value in hot_cache" do
       Router.put(FerricStore.Instance.get(:default), "access_test_key", "hello", 0)
-      Process.sleep(20)
 
       hot_cache = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), "access_test_key")}"
       expected_key = "access_test_key"
+
+      eventually(fn ->
+        :ets.lookup(hot_cache, expected_key) != []
+      end, "access_test_key not in hot_cache", 20, 10)
 
       # hot_cache entries are always 3-tuples {key, value, access_ms}.
       assert [{^expected_key, "hello", access_ms}] = :ets.lookup(hot_cache, expected_key)
@@ -69,7 +72,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
 
     test "reading a key upgrades hot_cache entry to 3-tuple with access time" do
       Router.put(FerricStore.Instance.get(:default), "access_read_key", "world", 0)
-      Process.sleep(20)
+      eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "access_read_key") != nil
+      end, "access_read_key not readable", 20, 10)
 
       hot_cache = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), "access_read_key")}"
 
@@ -101,7 +106,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "volatile_#{i}", "value_#{i}", future)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("permanent_") == 5 and count_hot_cache_entries("volatile_") == 10
+      end, "keys not fully written to hot_cache", 20, 10)
 
       # Count hot_cache entries before eviction
       permanent_hot_before = count_hot_cache_entries("permanent_")
@@ -117,7 +124,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("volatile_") < 10
+      end, "volatile keys not evicted", 20, 10)
 
       # Permanent keys should all still be in hot_cache
       permanent_hot_after = count_hot_cache_entries("permanent_")
@@ -143,7 +152,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "no_ttl_key_#{i}", String.duplicate("x", 100), 0)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("no_ttl_key_") == 20
+      end, "no_ttl_keys not in hot_cache", 20, 10)
 
       hot_before = count_hot_cache_entries("no_ttl_key_")
 
@@ -154,7 +165,11 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      # force_check is synchronous — no sleep needed for the check itself.
+      # Small wait to let any async side effects settle.
+      eventually(fn ->
+        count_hot_cache_entries("no_ttl_key_") == hot_before
+      end, "hot_cache changed unexpectedly", 10, 10)
 
       hot_after = count_hot_cache_entries("no_ttl_key_")
       assert hot_after == hot_before,
@@ -179,7 +194,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "allkeys_ttl_#{i}", "val_#{i}", future)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("allkeys_notl_") == 10 and count_hot_cache_entries("allkeys_ttl_") == 10
+      end, "allkeys keys not in hot_cache", 20, 10)
 
       hot_before = count_all_hot_cache_entries()
 
@@ -189,7 +206,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        count_all_hot_cache_entries() < hot_before
+      end, "allkeys_lru eviction not completed", 20, 10)
 
       hot_after = count_all_hot_cache_entries()
       assert hot_after < hot_before,
@@ -205,7 +224,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "lru_test_#{i}", String.duplicate("v", 50), 0)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("lru_test_") == 20
+      end, "lru_test keys not in hot_cache", 20, 10)
 
       # Access only a subset of keys (make them "hot")
       hot_keys = for i <- 1..5, do: "lru_test_#{i}"
@@ -214,8 +235,6 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.get(FerricStore.Instance.get(:default), key)
       end
 
-      Process.sleep(10)
-
       # Trigger eviction with allkeys_lru
       MemoryGuard.reconfigure(%{
         eviction_policy: :allkeys_lru,
@@ -223,7 +242,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "allkeys_lru eviction not triggered", 20, 10)
 
       # Hot keys are more likely to survive in hot_cache (probabilistic)
       hot_surviving = Enum.count(hot_keys, fn key ->
@@ -260,7 +281,11 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "no_ttl_#{i}", "val_#{i}", 0)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("short_ttl_") == 5 and
+          count_hot_cache_entries("long_ttl_") == 5 and
+          count_hot_cache_entries("no_ttl_") == 5
+      end, "ttl keys not in hot_cache", 20, 10)
 
       MemoryGuard.reconfigure(%{
         eviction_policy: :volatile_ttl,
@@ -268,7 +293,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "volatile_ttl eviction not triggered", 20, 10)
 
       # Short TTL keys should be evicted from hot_cache first
       short_remaining = count_hot_cache_entries("short_ttl_")
@@ -292,7 +319,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "persist_#{i}", String.duplicate("x", 100), 0)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("persist_") == 20
+      end, "persist keys not in hot_cache", 20, 10)
 
       hot_before = count_hot_cache_entries("persist_")
 
@@ -302,7 +331,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("persist_") == hot_before
+      end, "persist keys changed unexpectedly", 10, 10)
 
       hot_after = count_hot_cache_entries("persist_")
       assert hot_after == hot_before,
@@ -320,7 +351,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "noevict_#{i}", "val_#{i}", 0)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("noevict_") == 10
+      end, "noevict keys not in hot_cache", 20, 10)
 
       hot_before = count_hot_cache_entries("noevict_")
 
@@ -330,7 +363,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("noevict_") == hot_before
+      end, "noevict keys changed unexpectedly", 10, 10)
 
       hot_after = count_hot_cache_entries("noevict_")
       assert hot_after == hot_before,
@@ -346,7 +381,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        MemoryGuard.reject_writes?() == true
+      end, "reject_writes not set", 20, 10)
 
       assert MemoryGuard.reject_writes?() == true
     end
@@ -364,7 +401,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "evict_check_#{i}", "val_#{i}", future)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("evict_check_") == 20
+      end, "evict_check keys not in hot_cache", 20, 10)
 
       MemoryGuard.reconfigure(%{
         eviction_policy: :volatile_lru,
@@ -372,7 +411,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "eviction not triggered", 20, 10)
 
       evicted_count = Stats.evicted_keys()
       assert evicted_count > 0
@@ -397,7 +438,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "stat_evict_#{i}", String.duplicate("x", 100), future)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("stat_evict_") == 30
+      end, "stat_evict keys not in hot_cache", 20, 10)
 
       Stats.reset()
       assert Stats.evicted_keys() == 0
@@ -408,7 +451,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "eviction stat not incremented", 20, 10)
 
       assert Stats.evicted_keys() > 0
     end
@@ -427,7 +472,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "readable_#{i}", "data_#{i}", future)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("readable_") == 20
+      end, "readable keys not in hot_cache", 20, 10)
 
       # Trigger eviction
       MemoryGuard.reconfigure(%{
@@ -436,7 +483,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "eviction not triggered", 20, 10)
 
       assert Stats.evicted_keys() > 0
 
@@ -459,7 +508,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
           key
         end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("keydir_check_") == 20
+      end, "keydir_check keys not in hot_cache", 20, 10)
 
       # Trigger eviction
       MemoryGuard.reconfigure(%{
@@ -468,7 +519,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "eviction not triggered", 20, 10)
 
       assert Stats.evicted_keys() > 0
 
@@ -489,7 +542,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "warm_#{i}", "val_#{i}", future)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("warm_") == 20
+      end, "warm keys not in hot_cache", 20, 10)
 
       # Trigger eviction
       MemoryGuard.reconfigure(%{
@@ -498,7 +553,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "eviction not triggered", 20, 10)
 
       assert Stats.evicted_keys() > 0
 
@@ -538,7 +595,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
           {key, "value_#{i}"}
         end
 
-      Process.sleep(50)
+      eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "pressure_data_50") != nil
+      end, "pressure_data keys not written", 20, 10)
 
       # Trigger aggressive eviction with allkeys_lru (can evict any key)
       MemoryGuard.reconfigure(%{
@@ -549,10 +608,11 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       # Multiple eviction rounds
       for _ <- 1..10 do
         MemoryGuard.force_check()
-        Process.sleep(10)
       end
 
-      assert Stats.evicted_keys() > 0
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "eviction not triggered", 20, 10)
 
       # CRITICAL: every single key must still be readable with correct value
       for {key, expected_value} <- all_keys do
@@ -575,7 +635,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "stress_#{i}", String.duplicate("v", 50), 0)
       end
 
-      Process.sleep(100)
+      eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "stress_200") != nil
+      end, "stress keys not written", 20, 10)
 
       # Mark keys 1-20 as "hot" by reading them recently
       hot_keys = for i <- 1..20, do: "stress_#{i}"
@@ -583,8 +645,6 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       for key <- hot_keys do
         Router.get(FerricStore.Instance.get(:default), key)
       end
-
-      Process.sleep(10)
 
       # Trigger multiple rounds of eviction
       MemoryGuard.reconfigure(%{
@@ -594,8 +654,11 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
 
       for _ <- 1..5 do
         MemoryGuard.force_check()
-        Process.sleep(20)
       end
+
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "stress eviction not triggered", 20, 10)
 
       # Count surviving hot_cache entries
       total_hot = count_all_hot_cache_entries()
@@ -627,7 +690,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
         Router.put(FerricStore.Instance.get(:default), "pressure_test_#{i}", String.duplicate("x", 100), future)
       end
 
-      Process.sleep(50)
+      eventually(fn ->
+        count_hot_cache_entries("pressure_test_") == 30
+      end, "pressure_test keys not in hot_cache", 20, 10)
 
       # Set tiny budget to force reject-level pressure
       MemoryGuard.reconfigure(%{
@@ -636,7 +701,9 @@ defmodule Ferricstore.Spec.EvictionPolicyTest do
       })
 
       MemoryGuard.force_check()
-      Process.sleep(50)
+      eventually(fn ->
+        Stats.evicted_keys() > 0
+      end, "eviction not triggered", 20, 10)
 
       # Verify eviction happened
       assert Stats.evicted_keys() > 0

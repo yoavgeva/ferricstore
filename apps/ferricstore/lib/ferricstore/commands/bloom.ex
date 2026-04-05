@@ -280,8 +280,8 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   # Direct NIF application for test stores without Raft.
-  defp apply_prob_locally(store, {:bloom_create, _key, num_bits, num_hashes, _meta}) do
-    path = prob_path(store, _key, "bloom")
+  defp apply_prob_locally(store, {:bloom_create, key, num_bits, num_hashes, _meta}) do
+    path = prob_path(store, key, "bloom")
     dir = Path.dirname(path)
     File.mkdir_p!(dir)
     NIF.bloom_file_create(path, num_bits, num_hashes)

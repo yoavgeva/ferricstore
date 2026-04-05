@@ -725,14 +725,6 @@ defmodule FerricstoreServer.Connection do
     MEMORY RANDOMKEY SCAN OBJECT WAIT
     CLUSTER.HEALTH CLUSTER.STATS FERRICSTORE.HOTNESS FERRICSTORE.METRICS)
 
-  # Determines the shard lane for a command. Returns:
-  #   - `{:shard, index}` for single-key commands
-  #   - `:barrier` for multi-key/multi-shard commands (global ordering barrier)
-  #   - `:server` for server-level commands with no key
-  defp command_shard_key(ctx, cmd) do
-    command_shard_key_normalised(ctx, normalise_cmd(cmd))
-  end
-
   # Variant that accepts pre-normalised commands to avoid redundant normalise_cmd.
   defp command_shard_key_normalised(_ctx, :unknown), do: :server
 

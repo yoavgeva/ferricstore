@@ -295,10 +295,10 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       assert :ok == Batcher.write(shard, {:put, k, "readable_val", 0})
 
-      # Give the async worker time to process the batch
-      Process.sleep(100)
-
-      assert "readable_val" == Router.get(FerricStore.Instance.get(:default), k)
+      # Wait for the async worker to process the batch
+      ShardHelpers.eventually(fn ->
+        "readable_val" == Router.get(FerricStore.Instance.get(:default), k)
+      end, "async write should be readable after processing", 20, 20)
     end
 
     @tag :durability
@@ -314,11 +314,10 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
         end
 
       # Wait for async processing
-      Process.sleep(200)
-
       for {k, i} <- keys do
-        assert "val_#{i}" == Router.get(FerricStore.Instance.get(:default), k),
-               "Expected key #{k} to be readable after async write"
+        ShardHelpers.eventually(fn ->
+          "val_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
+        end, "key #{k} should be readable after async write", 20, 20)
       end
     end
 
@@ -341,8 +340,9 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
 
       # Async write -- fire-and-forget, eventually consistent
       assert :ok == Batcher.write(shard_sensor, {:put, k_sensor, "sensor_val", 0})
-      Process.sleep(100)
-      assert "sensor_val" == Router.get(FerricStore.Instance.get(:default), k_sensor)
+      ShardHelpers.eventually(fn ->
+        "sensor_val" == Router.get(FerricStore.Instance.get(:default), k_sensor)
+      end, "async sensor write should be readable", 20, 20)
 
       # Verify the durability modes are actually different
       assert :quorum == NamespaceConfig.durability_for("session")
@@ -369,18 +369,21 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
         |> List.flatten()
 
       results = Task.await_many(tasks, 15_000)
-      Process.sleep(100)
 
       # Every key should be readable regardless of namespace
       session_keys = Enum.take_every(results, 2)
       sensor_keys = Enum.drop(results, 1) |> Enum.take_every(2)
 
       for {k, i} <- Enum.with_index(session_keys, 1) do
-        assert "s_#{i}" == Router.get(FerricStore.Instance.get(:default), k), "Session key #{k} not readable"
+        ShardHelpers.eventually(fn ->
+          "s_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
+        end, "Session key #{k} not readable", 20, 20)
       end
 
       for {k, i} <- Enum.with_index(sensor_keys, 1) do
-        assert "n_#{i}" == Router.get(FerricStore.Instance.get(:default), k), "Sensor key #{k} not readable"
+        ShardHelpers.eventually(fn ->
+          "n_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
+        end, "Sensor key #{k} not readable", 20, 20)
       end
     end
 
@@ -500,8 +503,9 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       assert "fast_val" == Router.get(FerricStore.Instance.get(:default), k_fast)
 
       # Slow namespace needs time for its window to expire
-      Process.sleep(150)
-      assert "slow_val" == Router.get(FerricStore.Instance.get(:default), k_slow)
+      ShardHelpers.eventually(fn ->
+        "slow_val" == Router.get(FerricStore.Instance.get(:default), k_slow)
+      end, "slow namespace write should be readable after window expires", 30, 20)
 
       # The fast namespace write should complete well before the slow window
       # (this is a soft assertion -- timing-dependent but generous enough for CI)
@@ -534,7 +538,7 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
           Batcher.write(shard_b, {:put, k_b, "flush_val_b", 0})
         end)
 
-      # Give the writes a moment to arrive at the batcher
+      # intentional delay — let writes arrive at the batcher before flushing
       Process.sleep(50)
 
       # Explicit flush should drain all slots across all shards
@@ -578,8 +582,10 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
       shard_async = Router.shard_for(FerricStore.Instance.get(:default), k_async)
       assert :ok == Batcher.write(shard_async, {:put, k_async, "async_data", 0})
 
-      # Give async worker time to process
-      Process.sleep(100)
+      # Wait for async worker to process
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), k_async) == "async_data"
+      end, "async write should be readable before crash", 20, 20)
 
       # Verify both are readable before the crash
       assert "quorum_survives" == Router.get(FerricStore.Instance.get(:default), k_quorum)
@@ -623,15 +629,15 @@ defmodule FerricstoreServer.Spec.DurabilityTest do
           k
         end
 
-      Process.sleep(200)
-
-      # All keys should be readable
+      # All keys should be readable (async keys need time to process)
       for {k, i} <- Enum.with_index(quorum_keys, 1) do
         assert "q_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
       end
 
       for {k, i} <- Enum.with_index(async_keys, 1) do
-        assert "a_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
+        ShardHelpers.eventually(fn ->
+          "a_#{i}" == Router.get(FerricStore.Instance.get(:default), k)
+        end, "async key #{k} should be readable", 20, 20)
       end
     end
   end

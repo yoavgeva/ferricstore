@@ -454,7 +454,7 @@ defmodule Ferricstore.Stats do
   def init(_opts) do
     # Use the counter ref from the :default Instance (built before Stats starts).
     # No separate counter — Stats and Instance share the same ref.
-    ref = FerricStore.Instance.get(:default).stats_counter
+    _ref = FerricStore.Instance.get(:default).stats_counter
     run_id = :crypto.strong_rand_bytes(20) |> Base.encode16(case: :lower)
     start_time = System.monotonic_time(:millisecond)
 

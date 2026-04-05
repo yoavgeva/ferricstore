@@ -1686,7 +1686,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Delegates to the shared ValueCodec to avoid duplication with shard.ex.
   defp parse_float(str), do: ValueCodec.parse_float(str)
-  defp format_float(val), do: ValueCodec.format_float(val)
 
   # Atomic APPEND: reads current value (or ""), concatenates suffix, writes
   # back. Preserves the existing expire_at_ms on the key.

@@ -773,9 +773,4 @@ defmodule Ferricstore.MemoryGuard do
   defp maybe_update(state, _key, nil), do: state
   defp maybe_update(state, key, value), do: Map.put(state, key, value)
 
-  defp format_ratio(ratio), do: "#{Float.round(ratio * 100, 1)}%"
-  defp format_bytes(bytes) when bytes >= 1_073_741_824, do: "#{Float.round(bytes / 1_073_741_824, 2)} GB"
-  defp format_bytes(bytes) when bytes >= 1_048_576, do: "#{Float.round(bytes / 1_048_576, 2)} MB"
-  defp format_bytes(bytes) when bytes >= 1_024, do: "#{Float.round(bytes / 1_024, 2)} KB"
-  defp format_bytes(bytes), do: "#{bytes} B"
 end

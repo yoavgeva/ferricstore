@@ -129,9 +129,11 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
 
       # Abrupt close while the parser is waiting for more data
       :gen_tcp.close(sock)
-      Process.sleep(100)
 
-      assert_server_healthy(port)
+      ShardHelpers.eventually(fn ->
+        assert_server_healthy(port)
+        true
+      end, "server should be healthy after mid-command disconnect", 20, 50)
     end
   end
 
@@ -155,9 +157,11 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
 
       # Close immediately without reading any responses
       :gen_tcp.close(sock)
-      Process.sleep(100)
 
-      assert_server_healthy(port)
+      ShardHelpers.eventually(fn ->
+        assert_server_healthy(port)
+        true
+      end, "server should be healthy after mid-pipeline disconnect", 20, 50)
     end
   end
 
@@ -181,7 +185,6 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
 
       # Close without EXEC or DISCARD
       :gen_tcp.close(sock)
-      Process.sleep(100)
 
       # Verify server is healthy and the queued commands were NOT executed
       check = connect_and_hello(port)
@@ -204,13 +207,12 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
         Task.async(fn ->
           sock = connect_and_hello(port)
           send_cmd(sock, ["BLPOP", k, "10"])
-          # Don't wait for response — close immediately
+          # intentional delay — let BLPOP register as a waiter before closing
           Process.sleep(200)
           :gen_tcp.close(sock)
         end)
 
       Task.await(task, 5_000)
-      Process.sleep(200)
 
       # Server should be healthy and the waiter should be cleaned up.
       # Pushing to the key should NOT crash the server.
@@ -237,10 +239,10 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
         :gen_tcp.close(sock)
       end
 
-      # Brief pause for server to process all the closes
-      Process.sleep(200)
-
-      assert_server_healthy(port)
+      ShardHelpers.eventually(fn ->
+        assert_server_healthy(port)
+        true
+      end, "server should be healthy after rapid connect/disconnect", 20, 50)
     end
   end
 
@@ -255,7 +257,7 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
     test "idle connection stays open and is usable after 2s of inactivity", %{port: port} do
       sock = connect_and_hello(port)
 
-      # Do nothing for 2 seconds
+      # intentional delay — testing grace/timeout behavior
       Process.sleep(2_000)
 
       # Connection should still work
@@ -284,9 +286,11 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
       assert closed_or_error?(sock)
 
       :gen_tcp.close(sock)
-      Process.sleep(100)
 
-      assert_server_healthy(port)
+      ShardHelpers.eventually(fn ->
+        assert_server_healthy(port)
+        true
+      end, "server should be healthy after half-close", 20, 50)
     end
   end
 
@@ -420,8 +424,6 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
       {:push, ["subscribe", ^channel, 1]} = recv_response(sub_sock)
       :gen_tcp.close(sub_sock)
 
-      Process.sleep(200)
-
       # Publishing to the channel should NOT crash the server
       pub_sock = connect_and_hello(port)
       send_cmd(pub_sock, ["PUBLISH", channel, "after_dc"])
@@ -458,7 +460,6 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
       assert {:simple, "PONG"} = recv_response(sock)
 
       :gen_tcp.close(sock)
-      Process.sleep(100)
 
       # New connection: should still need to authenticate
       sock2 = connect_and_hello(port)
@@ -501,19 +502,18 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
       end
 
       :gen_tcp.close(sock)
-      Process.sleep(100)
 
-      assert_server_healthy(port)
+      ShardHelpers.eventually(fn ->
+        assert_server_healthy(port)
+        true
+      end, "server should be healthy after garbage input", 20, 50)
     end
 
     test "garbage followed by valid RESP on new connection works", %{port: port} do
       # Send garbage on first connection
       bad_sock = raw_connect(port)
       raw_send(bad_sock, :crypto.strong_rand_bytes(512))
-      Process.sleep(100)
       :gen_tcp.close(bad_sock)
-
-      Process.sleep(100)
 
       # Fresh connection with valid RESP should work perfectly
       good_sock = connect_and_hello(port)

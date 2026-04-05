@@ -1318,7 +1318,7 @@ defmodule FerricStore do
   """
   @spec zrange(key(), integer(), integer(), zrange_opts()) :: {:ok, [binary() | {binary(), float()}]}
   def zrange(key, start, stop, opts \\ []) do
-    ctx = default_ctx()
+    _ctx = default_ctx()
     store = build_compound_store(key)
     with_scores = Keyword.get(opts, :withscores, false)
 
@@ -1689,7 +1689,7 @@ defmodule FerricStore do
     :ok
   end
 
-  defp clear_shard_registries(shard_index) do
+  defp clear_shard_registries(_shard_index) do
     # Close mmap handles and delete files for probabilistic structures.
     # create_table on an existing table calls close_all + delete_all_objects.
     #
@@ -3224,7 +3224,7 @@ defmodule FerricStore do
 
   """
   @spec zrangebyscore(key(), binary(), binary(), keyword()) :: {:ok, [binary()]}
-  def zrangebyscore(key, min, max, opts \\ []) do
+  def zrangebyscore(key, min, max, _opts \\ []) do
     store = build_compound_store(key)
     result = Ferricstore.Commands.SortedSet.handle("ZRANGEBYSCORE", [key, min, max], store)
     wrap_result(result)

@@ -29,7 +29,10 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     test "LFU.touch works correctly after persistent_term caching" do
       # Put a key and verify touch updates the LFU counter
       Router.put(FerricStore.Instance.get(:default), "lfu_test_key", "value", 0)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "lfu_test_key") == "value"
+      end, "key not readable after put", 20, 10)
 
       idx = Router.shard_for(FerricStore.Instance.get(:default), "lfu_test_key")
       keydir = :"keydir_#{idx}"
@@ -95,8 +98,10 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
   describe "C3: Router.exists_fast? ETS bypass" do
     test "exists_fast? returns true for present key" do
       Router.put(FerricStore.Instance.get(:default), "exists_fast_test", "value", 0)
-      Process.sleep(50)
-      assert Router.exists_fast?(FerricStore.Instance.get(:default), "exists_fast_test") == true
+
+      ShardHelpers.eventually(fn ->
+        Router.exists_fast?(FerricStore.Instance.get(:default), "exists_fast_test") == true
+      end, "key not visible via exists_fast?", 20, 10)
     end
 
     test "exists_fast? returns false for absent key" do
@@ -106,16 +111,21 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     test "exists_fast? returns false for expired key" do
       # Set a key with an expiry in the past
       Router.put(FerricStore.Instance.get(:default), "expired_fast_test", "value", 1)
-      Process.sleep(50)
-      # Expired key should return false
-      assert Router.exists_fast?(FerricStore.Instance.get(:default), "expired_fast_test") == false
+
+      ShardHelpers.eventually(fn ->
+        Router.exists_fast?(FerricStore.Instance.get(:default), "expired_fast_test") == false
+      end, "expired key should return false", 20, 10)
     end
 
     test "check_keydir_full uses exists_fast? instead of GenServer" do
       # This is an indirect test - if keydir is full, it should be able
       # to check existence via ETS without GenServer.call
       Router.put(FerricStore.Instance.get(:default), "keydir_full_test", "value", 0)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "keydir_full_test") == "value"
+      end, "key not readable after put", 20, 10)
+
       # Put should succeed (updates existing key even when full)
       assert :ok = Router.put(FerricStore.Instance.get(:default), "keydir_full_test", "updated", 0)
     end
@@ -146,9 +156,11 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     test "routing works correctly with pre-computed names" do
       Router.put(FerricStore.Instance.get(:default), "route_test_1", "v1", 0)
       Router.put(FerricStore.Instance.get(:default), "route_test_2", "v2", 0)
-      Process.sleep(50)
-      assert Router.get(FerricStore.Instance.get(:default), "route_test_1") == "v1"
-      assert Router.get(FerricStore.Instance.get(:default), "route_test_2") == "v2"
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "route_test_1") == "v1" and
+          Router.get(FerricStore.Instance.get(:default), "route_test_2") == "v2"
+      end, "keys not readable after put", 20, 10)
     end
   end
 
@@ -160,17 +172,26 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
     test "all store operations work with cached store" do
       # Test core operations through the command pipeline
       Router.put(FerricStore.Instance.get(:default), "store_cache_test", "hello", 0)
-      Process.sleep(50)
-      assert Router.get(FerricStore.Instance.get(:default), "store_cache_test") == "hello"
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "store_cache_test") == "hello"
+      end, "key not readable after put", 20, 10)
+
       assert Router.exists?(FerricStore.Instance.get(:default), "store_cache_test") == true
       Router.delete(FerricStore.Instance.get(:default), "store_cache_test")
-      Process.sleep(50)
-      assert Router.get(FerricStore.Instance.get(:default), "store_cache_test") == nil
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "store_cache_test") == nil
+      end, "key not deleted", 20, 10)
     end
 
     test "incr works with cached store" do
       Router.put(FerricStore.Instance.get(:default), "incr_cache_test", "10", 0)
-      Process.sleep(50)
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "incr_cache_test") == "10"
+      end, "key not readable after put", 20, 10)
+
       assert {:ok, 15} = Router.incr(FerricStore.Instance.get(:default), "incr_cache_test", 5)
     end
   end
@@ -190,9 +211,8 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       GenServer.call(shard, {:compound_put, "myhash", prefix <> "field1", "value1", 0})
       GenServer.call(shard, {:compound_put, "myhash", prefix <> "field2", "value2", 0})
       GenServer.call(shard, {:compound_put, "myhash", prefix <> "field3", "value3", 0})
-      Process.sleep(50)
 
-      # Scan should find all 3 fields
+      # Scan should find all 3 fields (compound_put via GenServer.call is synchronous)
       results = GenServer.call(shard, {:compound_scan, "myhash", prefix})
       assert length(results) == 3
       fields = Enum.map(results, fn {f, _v} -> f end) |> Enum.sort()
@@ -206,8 +226,8 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       prefix = "H:counthash\0"
       GenServer.call(shard, {:compound_put, "counthash", prefix <> "a", "1", 0})
       GenServer.call(shard, {:compound_put, "counthash", prefix <> "b", "2", 0})
-      Process.sleep(50)
 
+      # compound_put via GenServer.call is synchronous
       count = GenServer.call(shard, {:compound_count, "counthash", prefix})
       assert count == 2
     end
@@ -219,10 +239,8 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       prefix = "H:delhash\0"
       GenServer.call(shard, {:compound_put, "delhash", prefix <> "x", "1", 0})
       GenServer.call(shard, {:compound_put, "delhash", prefix <> "y", "2", 0})
-      Process.sleep(50)
 
       GenServer.call(shard, {:compound_delete_prefix, "delhash", prefix})
-      Process.sleep(50)
 
       count = GenServer.call(shard, {:compound_count, "delhash", prefix})
       assert count == 0
@@ -238,8 +256,10 @@ defmodule Ferricstore.PerformanceAuditFixesTest do
       # This is structural - the optimization is in handle_data
       # Verify through a successful TCP pipeline that the buffer works
       Router.put(FerricStore.Instance.get(:default), "buffer_test", "hello", 0)
-      Process.sleep(50)
-      assert Router.get(FerricStore.Instance.get(:default), "buffer_test") == "hello"
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "buffer_test") == "hello"
+      end, "key not readable after put", 20, 10)
     end
   end
 end

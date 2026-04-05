@@ -636,14 +636,6 @@ defmodule Ferricstore.Commands.Json do
   defp parse_path(<<"$", rest::binary>>), do: parse_path_segments(rest, [])
   defp parse_path(_), do: :error
 
-  # Validates path and calls fun with segments. Returns error for malformed paths.
-  defp with_valid_path(path, fun) do
-    case parse_path(path) do
-      :error -> {:error, "ERR invalid JSONPath syntax"}
-      segments -> fun.(segments)
-    end
-  end
-
   defp parse_path_segments(<<>>, acc), do: Enum.reverse(acc)
 
   defp parse_path_segments(<<".", rest::binary>>, acc) do

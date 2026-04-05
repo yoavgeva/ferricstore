@@ -88,10 +88,9 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       assert {:error, _} = Native.handle("LOCK", [key, "owner_b", "5000"], dummy_store())
 
       # Wait for TTL to expire
-      Process.sleep(150)
-
-      # After expiry a new owner can acquire the lock
-      assert :ok = Native.handle("LOCK", [key, "owner_b", "5000"], dummy_store())
+      ShardHelpers.eventually(fn ->
+        :ok == Native.handle("LOCK", [key, "owner_b", "5000"], dummy_store())
+      end, "lock TTL should expire and allow new acquisition", 20, 20)
       assert "owner_b" == Router.get(FerricStore.Instance.get(:default), key)
 
       # Cleanup
@@ -128,7 +127,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       assert :ok = Native.handle("LOCK", [key, "owner1", "500"], dummy_store())
       {_val, original_exp} = Router.get_meta(FerricStore.Instance.get(:default), key)
 
-      # Wait briefly, then extend with a much longer TTL
+      # intentional delay — testing grace/timeout behavior
       Process.sleep(50)
       assert 1 == Native.handle("EXTEND", [key, "owner1", "60000"], dummy_store())
 
@@ -152,6 +151,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       assert :ok = Native.handle("LOCK", [key, "worker", "2000"], dummy_store())
 
       # Heartbeat: extend every 200ms for 5 iterations (1s total)
+      # intentional delay — testing grace/timeout behavior
       for _ <- 1..5 do
         Process.sleep(200)
         assert 1 == Native.handle("EXTEND", [key, "worker", "2000"], dummy_store())
@@ -173,6 +173,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       assert :ok = Native.handle("LOCK", [key, "owner1", "1000"], dummy_store())
       {_val, exp1} = Router.get_meta(FerricStore.Instance.get(:default), key)
 
+      # intentional delay — testing grace/timeout behavior
       Process.sleep(50)
 
       # Same owner re-locks with a longer TTL -- should succeed and refresh TTL
@@ -234,11 +235,9 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       # rotation, the previous window's count still contributes weighted by
       # (1 - elapsed/window_ms). We need to wait >= 2 * window_ms so the
       # implementation fully clears both the current and previous windows.
-      Process.sleep(450)
-
-      # Now requests should be allowed again -- the old requests have slid out
-      result = Native.handle("RATELIMIT.ADD", [key, window_ms, max], dummy_store())
-      assert ["allowed" | _] = result
+      ShardHelpers.eventually(fn ->
+        match?(["allowed" | _], Native.handle("RATELIMIT.ADD", [key, window_ms, max], dummy_store()))
+      end, "old requests should slide out of window", 30, 50)
     end
   end
 
@@ -284,7 +283,8 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       assert ["denied" | _] =
                Native.handle("RATELIMIT.ADD", [key, window_ms, max], dummy_store())
 
-      # Wait for window + some margin (2x the window to ensure full rotation)
+      # intentional delay — testing grace/timeout behavior
+      # Wait for window + margin (2x window to ensure full sliding window rotation)
       Process.sleep(250)
 
       # All 3 slots should be available again
@@ -373,7 +373,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
               {:compute, _hint} ->
                 # This caller is the compute winner
                 :counters.add(compute_count, 1, 1)
-                # Simulate expensive computation
+                # intentional delay — testing grace/timeout behavior
                 Process.sleep(50)
                 FetchOrCompute.fetch_or_compute_result(key, "rendered_html", 5_000)
                 {:ok, "rendered_html"}
@@ -409,6 +409,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
             case FetchOrCompute.fetch_or_compute(key, 5_000, "hint") do
               {:compute, _hint} ->
                 :counters.add(compute_count, 1, 1)
+                # intentional delay — testing grace/timeout behavior
                 Process.sleep(100)
                 FetchOrCompute.fetch_or_compute_result(key, "big_result", 5_000)
                 {:ok, "big_result"}
@@ -442,7 +443,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
           FetchOrCompute.fetch_or_compute(key, 5_000, "slow_hint")
         end)
 
-      # Give the computer time to register
+      # intentional delay — let computer task register before spawning waiters
       Process.sleep(50)
 
       # Spawn waiters that will block
@@ -453,7 +454,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
           end)
         end
 
-      # Give waiters time to register
+      # intentional delay — let waiters register before checking results
       Process.sleep(50)
 
       # Computer got :compute
@@ -487,7 +488,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
           FetchOrCompute.fetch_or_compute(key, 5_000, "sweep_hint")
         end)
 
-      # Give the task time to become the computer
+      # intentional delay — let task register as the computer
       Process.sleep(50)
       result = Task.await(computer_task, 200)
       assert {:compute, "sweep_hint"} = result
@@ -498,7 +499,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
           FetchOrCompute.fetch_or_compute(key, 5_000, "sweep_hint")
         end)
 
-      # Give the waiter time to register
+      # intentional delay — let waiter register before manipulating ETS
       Process.sleep(50)
 
       # Use :sys.replace_state to backdoor-modify the ETS entry's started_at
@@ -559,7 +560,7 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
           Task.async(fn ->
             case FetchOrCompute.fetch_or_compute(key, 5_000, "err_hint") do
               {:compute, _hint} ->
-                # Give other tasks time to register as waiters
+                # intentional delay — let other tasks register as waiters
                 Process.sleep(100)
                 FetchOrCompute.fetch_or_compute_error(key, "db_down")
                 {:compute_winner, i}

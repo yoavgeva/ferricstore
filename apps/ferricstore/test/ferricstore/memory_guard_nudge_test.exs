@@ -87,8 +87,9 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
 
       # nudge should recalculate and update persistent_term based on actual ETS memory
       MemoryGuard.nudge()
-      # Give the cast time to process
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == false and MemoryGuard.reject_writes?() == false
+      end, "nudge did not clear persistent_term flags", 20, 10)
 
       # Under normal test conditions, actual memory is well below thresholds
       assert MemoryGuard.keydir_full?() == false
@@ -173,8 +174,10 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       force_reject_mode()
 
       # Drain the periodic check events and nudge from force_reject
-      Process.sleep(150)
-      # Flush mailbox
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        flush_messages()
+        Process.info(self(), :message_queue_len) |> elem(1) == 0
+      end, "messages not drained", 20, 10)
       flush_messages()
 
       :telemetry.attach(
@@ -219,7 +222,9 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
 
       # nudge fires → perform_check recalculates from actual ETS memory
       # Under normal test conditions, actual pressure is :ok
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == false
+      end, "nudge did not clear keydir_full", 20, 10)
 
       # persistent_term should be updated by the nudge check
       # (actual ETS memory is well below the keydir_max_ram threshold)
@@ -240,7 +245,9 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       MemoryGuard.reconfigure(%{max_memory_bytes: 1, keydir_max_ram: 1})
 
       MemoryGuard.nudge()
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        MemoryGuard.stats().pressure_level == :reject
+      end, "nudge did not reach reject pressure", 20, 10)
 
       # Should be in reject state after nudge recalculates
       stats = MemoryGuard.stats()
@@ -254,7 +261,9 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       assert MemoryGuard.keydir_full?() == true
 
       MemoryGuard.nudge()
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        MemoryGuard.keydir_full?() == false and MemoryGuard.reject_writes?() == false
+      end, "nudge did not clear flags with huge budget", 20, 10)
 
       # With a 100GB budget, actual usage is well below thresholds
       assert MemoryGuard.keydir_full?() == false
@@ -304,7 +313,9 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       # Reconfigure to tiny budget
       MemoryGuard.reconfigure(%{max_memory_bytes: 1, keydir_max_ram: 1})
       MemoryGuard.nudge()
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        MemoryGuard.stats().pressure_level == :reject
+      end, "nudge did not reach reject after tiny budget", 20, 10)
 
       stats = MemoryGuard.stats()
       assert stats.pressure_level == :reject
@@ -312,7 +323,9 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       # Reconfigure to huge budget
       MemoryGuard.reconfigure(%{max_memory_bytes: 100_000_000_000, keydir_max_ram: 100_000_000_000})
       MemoryGuard.nudge()
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        MemoryGuard.stats().pressure_level == :ok
+      end, "nudge did not reach ok after huge budget", 20, 10)
 
       stats = MemoryGuard.stats()
       assert stats.pressure_level == :ok

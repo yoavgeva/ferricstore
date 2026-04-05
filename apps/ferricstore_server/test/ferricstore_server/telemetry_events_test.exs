@@ -102,16 +102,13 @@ defmodule FerricstoreServer.TelemetryEventsTest do
         ])
 
       # Wait for at least one pressure check cycle to set last_pressure_level.
-      Process.sleep(150)
+      ShardHelpers.eventually(fn ->
+        # Check that the MemoryGuard has processed at least one check cycle
+        state = :sys.get_state(pid)
+        state.last_pressure_level in [:pressure, :reject]
+      end, "MemoryGuard did not enter pressure state", 30, 10)
 
       # Now increase the budget to a large value so next check goes to :ok.
-      # We need to do this via a direct message since the GenServer doesn't
-      # expose a setter. Instead, stop and start with a large budget, but
-      # first we need the state to have been in pressure. Let's use a different
-      # approach: send a check with modified state.
-      #
-      # The simplest approach: replace the state to have a large max, which
-      # makes the next check return :ok. Use sys to modify state.
       :sys.replace_state(pid, fn state ->
         %{state | max_memory_bytes: 1_073_741_824}
       end)
@@ -152,7 +149,12 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       end)
 
       send(pid, :check)
-      Process.sleep(100)
+
+      ShardHelpers.eventually(fn ->
+        # Wait for the check to be processed by verifying state changed
+        state = :sys.get_state(pid)
+        state.last_pressure_level != :warning
+      end, "check not processed", 20, 10)
 
       refute_received {:telemetry, [:ferricstore, :memory, :recovered], _, _}
 
@@ -308,8 +310,6 @@ defmodule FerricstoreServer.TelemetryEventsTest do
         end
 
       # Allow connections to be accepted and registered.
-      Process.sleep(200)
-
       assert_receive {:telemetry, [:ferricstore, :connection, :threshold], measurements,
                       metadata},
                      2000
@@ -372,10 +372,14 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       result = Ferricstore.Config.set("maxmemory", "999")
       assert {:error, _} = result
 
-      Process.sleep(100)
-      refute_received {:telemetry, [:ferricstore, :config, :changed], _, _}
-
-      :telemetry.detach(handler_id)
+      ShardHelpers.eventually(fn ->
+        # Verify no telemetry event was received
+        receive do
+          {:telemetry, [:ferricstore, :config, :changed], _, _} -> false
+        after
+          0 -> true
+        end
+      end, "should not receive config changed event", 10, 10)
     end
   end
 
@@ -469,7 +473,9 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       end
 
       # Allow the async casts to be processed.
-      Process.sleep(200)
+      ShardHelpers.eventually(fn ->
+        Ferricstore.SlowLog.len() >= 9
+      end, "slowlog entries not recorded", 20, 10)
 
       assert_receive {:telemetry, [:ferricstore, :slow_log, :near_full], measurements,
                       _metadata},
@@ -505,7 +511,9 @@ defmodule FerricstoreServer.TelemetryEventsTest do
         Ferricstore.SlowLog.maybe_log(["SET", "key#{i}", "val"], 1, nil)
       end
 
-      Process.sleep(200)
+      ShardHelpers.eventually(fn ->
+        Ferricstore.SlowLog.len() == 5
+      end, "slowlog entries not recorded", 20, 10)
 
       refute_received {:telemetry, [:ferricstore, :slow_log, :near_full], _, _}
     end

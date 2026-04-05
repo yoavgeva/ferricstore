@@ -67,7 +67,9 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
 
       # Write a key, then evict its value to make it cold
       Router.put(FerricStore.Instance.get(:default), "promo_test", "hello", 0)
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "promo_test") != nil
+      end, "promo_test not readable", 20, 10)
 
       # Evict to cold
       idx = Router.shard_for(FerricStore.Instance.get(:default), "promo_test")
@@ -89,7 +91,9 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
       MemoryGuard.set_skip_promotion(true)
 
       Router.put(FerricStore.Instance.get(:default), "nopromo_test", "world", 0)
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "nopromo_test") != nil
+      end, "nopromo_test not readable", 20, 10)
 
       idx = Router.shard_for(FerricStore.Instance.get(:default), "nopromo_test")
       keydir = :"keydir_#{idx}"
@@ -137,7 +141,9 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
         Router.put(FerricStore.Instance.get(:default), "evict_test_#{i}", String.duplicate("x", 100), 0)
       end
 
-      Process.sleep(100)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "evict_test_1") != nil
+      end, "evict_test_1 not readable", 20, 10)
 
       # Count hot entries before eviction
       idx = Router.shard_for(FerricStore.Instance.get(:default), "evict_test_1")
@@ -160,7 +166,9 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
 
     test "eviction sets value to nil, keeps key and disk location" do
       Router.put(FerricStore.Instance.get(:default), "evict_keep", "keep_this", 0)
-      Process.sleep(100)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "evict_keep") != nil
+      end, "evict_keep not readable", 20, 10)
 
       idx = Router.shard_for(FerricStore.Instance.get(:default), "evict_keep")
       keydir = :"keydir_#{idx}"
@@ -244,7 +252,9 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
     test "eviction skips cold entries (value=nil)" do
       # Write and evict a key to make it cold
       Router.put(FerricStore.Instance.get(:default), "cold_skip", "val", 0)
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "cold_skip") != nil
+      end, "cold_skip not readable", 20, 10)
 
       idx = Router.shard_for(FerricStore.Instance.get(:default), "cold_skip")
       keydir = :"keydir_#{idx}"
@@ -273,7 +283,9 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
 
     test "eviction finds hot entries" do
       Router.put(FerricStore.Instance.get(:default), "hot_find", "val", 0)
-      Process.sleep(50)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), "hot_find") != nil
+      end, "hot_find not readable", 20, 10)
 
       idx = Router.shard_for(FerricStore.Instance.get(:default), "hot_find")
       keydir = :"keydir_#{idx}"

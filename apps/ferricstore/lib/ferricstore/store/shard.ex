@@ -354,7 +354,7 @@ defmodule Ferricstore.Store.Shard do
     Logger.debug("Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}, keys: #{inspect(sample_keys)}")
   end
 
-  defp recover_from_log(shard_path, log_name, keydir, shard_index) do
+  defp recover_from_log(shard_path, log_name, keydir, _shard_index) do
     log_path = Path.join(shard_path, log_name)
     fid = log_name |> String.trim_trailing(".log") |> String.to_integer()
 
@@ -379,12 +379,6 @@ defmodule Ferricstore.Store.Shard do
     Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
   end
 
-  # Returns the shard data path for the current state.
-  # Deprecated: prefer state.shard_data_path which is cached during init.
-  defp shard_path(state) do
-    state.shard_data_path || Ferricstore.DataDir.shard_data_path(state.data_dir, state.index)
-  end
-
   @impl true
   def handle_continue({:flush_interval, ms}, state) do
     # Store flush interval in process dictionary so handle_info can reschedule.
@@ -393,7 +387,7 @@ defmodule Ferricstore.Store.Shard do
   end
 
   @impl true
-  def handle_call({:get, key}, from, state) do
+  def handle_call({:get, key}, _from, state) do
     # Fast path: ETS hit — no need to wait for in-flight writes.
     case ets_lookup(state, key) do
       {:hit, value, _expire_at_ms} ->
@@ -451,7 +445,7 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  def handle_call({:get_meta, key}, from, state) do
+  def handle_call({:get_meta, key}, _from, state) do
     case ets_lookup(state, key) do
       {:hit, value, expire_at_ms} ->
         {:reply, {value, expire_at_ms}, state}
@@ -3292,7 +3286,7 @@ defmodule Ferricstore.Store.Shard do
   # Prefix-based ETS helpers (replaces O(N) :ets.foldl full-table scans)
   # ---------------------------------------------------------------------------
 
-  defp prefix_scan_entries(keydir, prefix, shard_data_path \\ nil) do
+  defp prefix_scan_entries(keydir, prefix, shard_data_path) do
     now = System.os_time(:millisecond)
     prefix_len = byte_size(prefix)
     # Select all 7-tuple fields so we can cold-read nil values
@@ -3538,21 +3532,12 @@ defmodule Ferricstore.Store.Shard do
     )
   end
 
-  defp key_alive?(keydir, key, now) do
-    case :ets.lookup(keydir, key) do
-      [{_, _, 0, _, _, _, _}] -> true
-      [{_, _, exp, _, _, _, _}] -> exp > now
-      [] -> true
-    end
-  end
-
   # -------------------------------------------------------------------
   # Private: integer / float parsing — delegates to shared ValueCodec
   # -------------------------------------------------------------------
 
   defp parse_integer(str), do: ValueCodec.parse_integer(str)
   defp parse_float(str), do: ValueCodec.parse_float(str)
-  defp format_float(val), do: ValueCodec.format_float(val)
 
   defp coerce_integer(v) when is_integer(v), do: {:ok, v}
   defp coerce_integer(v) when is_float(v), do: :error

@@ -131,8 +131,6 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
       # Force the key out of ETS hot cache by reconnecting
       :gen_tcp.close(sock)
-      # Wait for the shard to flush writes to disk
-      Process.sleep(50)
       sock = connect_and_hello(port)
 
       send_cmd(sock, ["GET", key])
@@ -153,7 +151,6 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       assert recv_response(sock) == {:simple, "OK"}
 
       :gen_tcp.close(sock)
-      Process.sleep(50)
       sock = connect_and_hello(port)
 
       send_cmd(sock, ["GET", key])
@@ -179,7 +176,6 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       assert recv_response(sock) == {:simple, "OK"}
 
       :gen_tcp.close(sock)
-      Process.sleep(50)
       sock = connect_and_hello(port)
 
       send_cmd(sock, ["GET", key])
@@ -200,7 +196,6 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       assert recv_response(sock) == {:simple, "OK"}
 
       :gen_tcp.close(sock)
-      Process.sleep(50)
       sock = connect_and_hello(port)
 
       send_cmd(sock, ["GET", key])
@@ -229,7 +224,6 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       assert recv_response(sock) == {:simple, "OK"}
 
       :gen_tcp.close(sock)
-      Process.sleep(50)
       sock = connect_and_hello(port)
 
       # Send GET of large value followed by GET of small value
@@ -256,7 +250,6 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       end
 
       :gen_tcp.close(sock)
-      Process.sleep(50)
       sock = connect_and_hello(port)
 
       for {k, v} <- Enum.zip(keys, values) do
@@ -281,7 +274,6 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       assert recv_response(sock) == {:simple, "OK"}
 
       :gen_tcp.close(sock)
-      Process.sleep(50)
       sock = connect_and_hello(port)
 
       # Interleave: small, large, PING, small, large
@@ -317,7 +309,6 @@ defmodule FerricstoreServer.Integration.SendfileTest do
       assert recv_response(sock) == {:simple, "OK"}
 
       :gen_tcp.close(sock)
-      Process.sleep(50)
       sock = connect_and_hello(port)
 
       # The recv_response helper accumulates TCP chunks and parses RESP3.

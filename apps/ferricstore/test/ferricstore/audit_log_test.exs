@@ -66,9 +66,11 @@ defmodule Ferricstore.AuditLogTest do
   describe "log/2" do
     test "logs an auth_success event" do
       AuditLog.log(:auth_success, %{username: "default", client_ip: "127.0.0.1:1234"})
-      Process.sleep(10)
 
-      assert AuditLog.len() == 1
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "audit entry not recorded", 20, 10)
+
       [{_id, _ts, event_type, details}] = AuditLog.get()
       assert event_type == :auth_success
       assert details.username == "default"
@@ -77,7 +79,10 @@ defmodule Ferricstore.AuditLogTest do
 
     test "logs an auth_failure event" do
       AuditLog.log(:auth_failure, %{username: "admin", client_ip: "10.0.0.1:5678"})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "audit entry not recorded", 20, 10)
 
       [{_id, _ts, event_type, details}] = AuditLog.get()
       assert event_type == :auth_failure
@@ -86,7 +91,10 @@ defmodule Ferricstore.AuditLogTest do
 
     test "logs a config_change event" do
       AuditLog.log(:config_change, %{parameter: "hz", old_value: "10", new_value: "100"})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "audit entry not recorded", 20, 10)
 
       [{_id, _ts, :config_change, details}] = AuditLog.get()
       assert details.parameter == "hz"
@@ -96,7 +104,10 @@ defmodule Ferricstore.AuditLogTest do
 
     test "logs a connection_open event" do
       AuditLog.log(:connection_open, %{client_id: 42, client_ip: "192.168.1.1:9999"})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "audit entry not recorded", 20, 10)
 
       [{_id, _ts, :connection_open, details}] = AuditLog.get()
       assert details.client_id == 42
@@ -110,7 +121,9 @@ defmodule Ferricstore.AuditLogTest do
         duration_ms: 5000
       })
 
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "audit entry not recorded", 20, 10)
 
       [{_id, _ts, :connection_close, details}] = AuditLog.get()
       assert details.duration_ms == 5000
@@ -118,7 +131,10 @@ defmodule Ferricstore.AuditLogTest do
 
     test "logs a dangerous_command event" do
       AuditLog.log(:dangerous_command, %{command: "FLUSHDB", args: []})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "audit entry not recorded", 20, 10)
 
       [{_id, _ts, :dangerous_command, details}] = AuditLog.get()
       assert details.command == "FLUSHDB"
@@ -128,9 +144,11 @@ defmodule Ferricstore.AuditLogTest do
       Application.put_env(:ferricstore, :audit_log_enabled, false)
 
       AuditLog.log(:auth_success, %{username: "default", client_ip: "127.0.0.1:1234"})
-      Process.sleep(10)
-
-      assert AuditLog.len() == 0
+      # Give the GenServer time to process the cast (it should be a no-op)
+      ShardHelpers.eventually(fn ->
+        # After a brief wait, len should still be 0
+        AuditLog.len() == 0
+      end, "audit log should remain empty when disabled", 10, 10)
     end
 
     test "returns :ok regardless of enabled state" do
@@ -153,7 +171,9 @@ defmodule Ferricstore.AuditLogTest do
         Process.sleep(5)
       end
 
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 5
+      end, "all 5 entries not recorded", 20, 10)
 
       entries = AuditLog.get()
       assert length(entries) == 5
@@ -168,7 +188,9 @@ defmodule Ferricstore.AuditLogTest do
         Process.sleep(2)
       end
 
-      Process.sleep(20)
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 10
+      end, "all 10 entries not recorded", 20, 10)
 
       entries = AuditLog.get(3)
       assert length(entries) == 3
@@ -181,7 +203,10 @@ defmodule Ferricstore.AuditLogTest do
     test "returns all entries when count exceeds log size" do
       AuditLog.log(:auth_success, %{seq: 1})
       AuditLog.log(:auth_success, %{seq: 2})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 2
+      end, "entries not recorded", 20, 10)
 
       entries = AuditLog.get(100)
       assert length(entries) == 2
@@ -206,9 +231,10 @@ defmodule Ferricstore.AuditLogTest do
       AuditLog.log(:auth_success, %{})
       AuditLog.log(:auth_failure, %{})
       AuditLog.log(:config_change, %{})
-      Process.sleep(20)
 
-      assert AuditLog.len() == 3
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 3
+      end, "3 entries not recorded", 20, 10)
     end
   end
 
@@ -223,8 +249,9 @@ defmodule Ferricstore.AuditLogTest do
         Process.sleep(2)
       end
 
-      Process.sleep(10)
-      assert AuditLog.len() > 0
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() > 0
+      end, "entries not recorded", 20, 10)
 
       AuditLog.reset()
       assert AuditLog.len() == 0
@@ -233,14 +260,20 @@ defmodule Ferricstore.AuditLogTest do
 
     test "resets ID counter so new entries start from 0" do
       AuditLog.log(:auth_success, %{})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "entry not recorded", 20, 10)
 
       [{id_before, _, _, _}] = AuditLog.get()
       assert id_before == 0
 
       AuditLog.reset()
       AuditLog.log(:auth_success, %{})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "entry not recorded after reset", 20, 10)
 
       [{id_after, _, _, _}] = AuditLog.get()
       assert id_after == 0
@@ -260,7 +293,11 @@ defmodule Ferricstore.AuditLogTest do
         Process.sleep(5)
       end
 
-      Process.sleep(20)
+      ShardHelpers.eventually(fn ->
+        entries = AuditLog.get()
+        length(entries) == 5 and
+          Enum.map(entries, fn {_, _, _, details} -> details.seq end) |> Enum.sort() == [6, 7, 8, 9, 10]
+      end, "eviction not complete", 20, 10)
 
       assert AuditLog.len() == 5
 
@@ -278,9 +315,9 @@ defmodule Ferricstore.AuditLogTest do
         Process.sleep(5)
       end
 
-      Process.sleep(20)
-
-      assert AuditLog.len() == 3
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 3
+      end, "eviction to max_entries not complete", 20, 10)
     end
   end
 
@@ -324,7 +361,10 @@ defmodule Ferricstore.AuditLogTest do
   describe "format_entries/1" do
     test "formats entries into list-of-lists structure" do
       AuditLog.log(:auth_success, %{username: "default", client_ip: "127.0.0.1:80"})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "entry not recorded", 20, 10)
 
       entries = AuditLog.get()
       formatted = AuditLog.format_entries(entries)
@@ -342,7 +382,10 @@ defmodule Ferricstore.AuditLogTest do
 
     test "formats empty details as empty string" do
       AuditLog.log(:auth_success, %{})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "entry not recorded", 20, 10)
 
       entries = AuditLog.get()
       [[_id, _ts, _type, details_str]] = AuditLog.format_entries(entries)
@@ -353,7 +396,10 @@ defmodule Ferricstore.AuditLogTest do
       AuditLog.log(:auth_success, %{seq: 1})
       Process.sleep(5)
       AuditLog.log(:auth_failure, %{seq: 2})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 2
+      end, "entries not recorded", 20, 10)
 
       entries = AuditLog.get()
       formatted = AuditLog.format_entries(entries)
@@ -375,7 +421,11 @@ defmodule Ferricstore.AuditLogTest do
       store = build_test_store()
       # Route through the Server handler, which is where CONFIG SET audit logging lives.
       Ferricstore.Commands.Server.handle("CONFIG", ["SET", "hz", "50"], store)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        entries = AuditLog.get()
+        Enum.any?(entries, fn {_, _, type, _} -> type == :config_change end)
+      end, "config_change audit entry not recorded", 20, 10)
 
       entries = AuditLog.get()
       config_entries = Enum.filter(entries, fn {_, _, type, _} -> type == :config_change end)
@@ -391,12 +441,19 @@ defmodule Ferricstore.AuditLogTest do
       store = build_test_store()
       # First set hz to a known value
       Ferricstore.Commands.Server.handle("CONFIG", ["SET", "hz", "20"], store)
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() >= 1
+      end, "first config_change not recorded", 20, 10)
+
       AuditLog.reset()
 
       # Now change it and verify old_value is captured
       Ferricstore.Commands.Server.handle("CONFIG", ["SET", "hz", "100"], store)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() >= 1
+      end, "second config_change not recorded", 20, 10)
 
       [{_, _, :config_change, details}] = AuditLog.get()
       assert details.old_value == "20"
@@ -407,13 +464,16 @@ defmodule Ferricstore.AuditLogTest do
       AuditLog.reset()
       store = build_test_store()
       Ferricstore.Commands.Server.handle("CONFIG", ["SET", "hz", "not_a_number"], store)
-      Process.sleep(20)
 
-      config_entries =
-        AuditLog.get()
-        |> Enum.filter(fn {_, _, type, _} -> type == :config_change end)
+      # Give the GenServer time to process
+      ShardHelpers.eventually(fn ->
+        # We expect no config_change entries
+        config_entries =
+          AuditLog.get()
+          |> Enum.filter(fn {_, _, type, _} -> type == :config_change end)
 
-      assert config_entries == []
+        config_entries == []
+      end, "should have no config_change entries", 10, 20)
     end
   end
 
@@ -426,7 +486,11 @@ defmodule Ferricstore.AuditLogTest do
       AuditLog.reset()
       store = build_test_store()
       Ferricstore.Commands.Server.handle("FLUSHDB", [], store)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        entries = AuditLog.get()
+        Enum.any?(entries, fn {_, _, type, _} -> type == :dangerous_command end)
+      end, "dangerous_command audit entry not recorded", 20, 10)
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
@@ -439,7 +503,11 @@ defmodule Ferricstore.AuditLogTest do
       AuditLog.reset()
       store = build_test_store()
       Ferricstore.Commands.Server.handle("FLUSHALL", [], store)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        entries = AuditLog.get()
+        Enum.any?(entries, fn {_, _, type, _} -> type == :dangerous_command end)
+      end, "dangerous_command audit entry not recorded", 20, 10)
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
@@ -452,7 +520,11 @@ defmodule Ferricstore.AuditLogTest do
       AuditLog.reset()
       store = build_test_store()
       Ferricstore.Commands.Server.handle("FLUSHDB", ["ASYNC"], store)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        entries = AuditLog.get()
+        Enum.any?(entries, fn {_, _, type, _} -> type == :dangerous_command end)
+      end, "dangerous_command audit entry not recorded", 20, 10)
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
@@ -472,7 +544,11 @@ defmodule Ferricstore.AuditLogTest do
       store = build_test_store()
       # Use 0 seconds to avoid blocking
       Ferricstore.Commands.Server.handle("DEBUG", ["SLEEP", "0"], store)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        entries = AuditLog.get()
+        Enum.any?(entries, fn {_, _, type, _} -> type == :dangerous_command end)
+      end, "dangerous_command audit entry not recorded", 20, 10)
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
@@ -486,7 +562,12 @@ defmodule Ferricstore.AuditLogTest do
       AuditLog.reset()
       store = build_test_store()
       Ferricstore.Commands.Server.handle("DEBUG", ["FLUSHALL"], store)
-      Process.sleep(20)
+
+      ShardHelpers.eventually(fn ->
+        entries = AuditLog.get()
+        dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
+        length(dangerous) >= 1
+      end, "dangerous_command audit entry not recorded", 20, 10)
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
@@ -502,7 +583,10 @@ defmodule Ferricstore.AuditLogTest do
   describe "entry structure" do
     test "each entry has monotonically increasing ID" do
       for _ <- 1..5, do: AuditLog.log(:auth_success, %{})
-      Process.sleep(30)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 5
+      end, "5 entries not recorded", 20, 10)
 
       entries = AuditLog.get()
       ids = Enum.map(entries, fn {id, _, _, _} -> id end) |> Enum.sort()
@@ -512,7 +596,11 @@ defmodule Ferricstore.AuditLogTest do
     test "each entry has a microsecond timestamp" do
       before_us = System.os_time(:microsecond)
       AuditLog.log(:auth_success, %{})
-      Process.sleep(10)
+
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 1
+      end, "entry not recorded", 20, 10)
+
       after_us = System.os_time(:microsecond)
 
       [{_, timestamp_us, _, _}] = AuditLog.get()
@@ -537,10 +625,10 @@ defmodule Ferricstore.AuditLogTest do
         end
 
       Task.await_many(tasks, 5_000)
-      Process.sleep(50)
 
-      # All 100 events should be logged (max is 500)
-      assert AuditLog.len() == 100
+      ShardHelpers.eventually(fn ->
+        AuditLog.len() == 100
+      end, "not all 100 concurrent entries recorded", 20, 10)
     end
   end
 

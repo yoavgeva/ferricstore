@@ -230,8 +230,9 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       # AsyncApplyWorker. The write returns immediately; the data
       # becomes visible after the worker processes the batch.
       assert :ok == Batcher.write(shard, {:put, k, "async_val", 0})
-      Process.sleep(100)
-      assert "async_val" == Router.get(FerricStore.Instance.get(:default), k)
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), k) == "async_val"
+      end, "async write not visible", 30, 20)
     end
 
     test "quorum durability commands complete successfully" do
@@ -446,7 +447,9 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       # Allow the :ns_config_changed broadcast to be processed by the batcher
       # so the cache is cleared from any prior test state
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        7 == NamespaceConfig.window_for("cached_ns")
+      end, "ns config not applied", 20, 10)
 
       k1 = pkey("cached_ns", "cache_hit_1")
       shard = Router.shard_for(FerricStore.Instance.get(:default), k1)
@@ -481,7 +484,9 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
     test "NamespaceConfig.set broadcasts :ns_config_changed and clears batcher cache" do
       # Pre-populate cache by writing with a known prefix
       NamespaceConfig.set("inval_ns", "window_ms", "5")
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        5 == NamespaceConfig.window_for("inval_ns")
+      end, "ns config not applied", 20, 10)
 
       k1 = pkey("inval_ns", "inval_1")
       shard = Router.shard_for(FerricStore.Instance.get(:default), k1)
@@ -495,8 +500,11 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       # Change the config -- this should broadcast :ns_config_changed
       NamespaceConfig.set("inval_ns", "window_ms", "20")
 
-      # Give the batcher time to process the :ns_config_changed message
-      Process.sleep(10)
+      # Wait for the batcher to process the :ns_config_changed message
+      ShardHelpers.eventually(fn ->
+        state = :sys.get_state(batcher_pid)
+        state.ns_cache == %{}
+      end, "batcher cache not invalidated", 20, 10)
 
       # Cache should now be empty
       state_after = :sys.get_state(batcher_pid)
@@ -517,7 +525,9 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
     test "NamespaceConfig.reset clears batcher cache" do
       NamespaceConfig.set("reset_ns", "window_ms", "15")
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        15 == NamespaceConfig.window_for("reset_ns")
+      end, "ns config not applied", 20, 10)
 
       k = pkey("reset_ns", "reset_1")
       shard = Router.shard_for(FerricStore.Instance.get(:default), k)
@@ -529,7 +539,10 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       # Reset the namespace -- should broadcast invalidation
       NamespaceConfig.reset("reset_ns")
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        state = :sys.get_state(batcher_pid)
+        state.ns_cache == %{}
+      end, "batcher cache not invalidated after reset", 20, 10)
 
       state_after = :sys.get_state(batcher_pid)
       assert state_after.ns_cache == %{}
@@ -538,7 +551,10 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
     test "NamespaceConfig.reset_all clears batcher cache" do
       NamespaceConfig.set("resetall_a", "window_ms", "3")
       NamespaceConfig.set("resetall_b", "window_ms", "4")
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        3 == NamespaceConfig.window_for("resetall_a") and
+          4 == NamespaceConfig.window_for("resetall_b")
+      end, "ns config not applied", 20, 10)
 
       # Write with both prefixes to shard 0 to populate its cache
       shard = 0
@@ -565,7 +581,10 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
       # Reset all -- should clear all batcher caches
       NamespaceConfig.reset_all()
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        state = :sys.get_state(batcher_pid)
+        state.ns_cache == %{}
+      end, "batcher cache not invalidated after reset_all", 20, 10)
 
       state_after = :sys.get_state(batcher_pid)
       assert state_after.ns_cache == %{}
@@ -577,7 +596,10 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       NamespaceConfig.set("indep_x", "window_ms", "3")
       NamespaceConfig.set("indep_y", "window_ms", "8")
       NamespaceConfig.set("indep_y", "durability", "async")
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        3 == NamespaceConfig.window_for("indep_x") and
+          8 == NamespaceConfig.window_for("indep_y")
+      end, "ns config not applied", 20, 10)
 
       shard = 0
 
@@ -596,7 +618,10 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       assert :ok == Batcher.write(shard, {:put, k_x, "vx", 0})
       # Async needs a small wait for AsyncApplyWorker
       assert :ok == Batcher.write(shard, {:put, k_y, "vy", 0})
-      Process.sleep(100)
+
+      ShardHelpers.eventually(fn ->
+        Router.get(FerricStore.Instance.get(:default), k_y) == "vy"
+      end, "async write not visible", 30, 20)
 
       batcher_pid = Process.whereis(Batcher.batcher_name(shard))
       state = :sys.get_state(batcher_pid)
@@ -612,8 +637,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
 
   describe "ns_cache: default prefix (_root) cached" do
     test "root namespace (no colon in key) is cached as _root" do
-      # Ensure no override for _root -- defaults apply
-      Process.sleep(10)
+      # Ensure no override for _root -- defaults apply (config already reset in setup)
 
       k = rootkey("rootcache")
       shard = Router.shard_for(FerricStore.Instance.get(:default), k)
@@ -634,7 +658,9 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
     test "1K writes with cached config complete and cache stays populated" do
       # Configure the namespace once
       NamespaceConfig.set("stress", "window_ms", "1")
-      Process.sleep(10)
+      ShardHelpers.eventually(fn ->
+        1 == NamespaceConfig.window_for("stress")
+      end, "ns config not applied", 20, 10)
 
       shard = 0
       count = 1_000
