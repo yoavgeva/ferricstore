@@ -233,6 +233,25 @@ defmodule Ferricstore.Commands.CMS do
     end
   end
 
+  defp get_first_sketch_dims(store, src_keys) do
+    case cms_file_info_for_key(store, hd(src_keys)) do
+      {:ok, {w, d, _}} -> {:ok, w, d}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp validate_sketch_dims(store, src_keys, first_w, first_d) do
+    all_valid =
+      Enum.all?(src_keys, fn k ->
+        case cms_file_info_for_key(store, k) do
+          {:ok, {w, d, _}} -> w == first_w and d == first_d
+          _ -> false
+        end
+      end)
+
+    if all_valid, do: :ok, else: {:error, "ERR CMS: width/depth of src sketches must be equal"}
+  end
+
   defp parse_prob_float(str, label) do
     case Float.parse(str) do
       {f, ""} when f > 0 and f < 1 -> {:ok, f}

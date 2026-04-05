@@ -66,35 +66,7 @@ defmodule FerricstoreServer.Connection.Auth do
     has_acl_password = acl_user != nil and acl_user.password != nil
     has_requirepass = requirepass != nil and requirepass != ""
 
-    cond do
-      # No authentication source configured at all.
-      not has_acl_password and not has_requirepass ->
-        {:continue, Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}), state}
-
-      # ACL user has a password -- always use ACL auth.
-      has_acl_password ->
-        do_acl_auth(username, password, client_ip, state)
-
-      # Backwards compat: requirepass is set, default user has no ACL password.
-      has_requirepass and username == "default" ->
-        if constant_time_equal?(password, requirepass) do
-          AuditLog.log(:auth_success, %{username: username, client_ip: client_ip})
-          new_cache = build_acl_cache(username)
-          {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: username, acl_cache: new_cache}}
-        else
-          AuditLog.log(:auth_failure, %{username: username, client_ip: client_ip})
-          {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
-        end
-
-      # Non-default user with no ACL password, requirepass is set.
-      # Fall through to ACL auth (which accepts any password for nopass users).
-      has_requirepass ->
-        do_acl_auth(username, password, client_ip, state)
-
-      # Catch-all (should not happen with the above conditions).
-      true ->
-        {:continue, Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}), state}
-    end
+    do_dispatch_auth(has_acl_password, has_requirepass, username, password, requirepass, client_ip, state)
   end
 
   # ── ACL subcommand dispatch ────────────────────────────────────────────
@@ -387,6 +359,31 @@ defmodule FerricstoreServer.Connection.Auth do
   end
 
   # ── Private ────────────────────────────────────────────────────────────
+
+  defp do_dispatch_auth(false, false, _user, _pass, _rp, _ip, state) do
+    {:continue,
+     Encoder.encode({:error, "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?"}),
+     state}
+  end
+
+  defp do_dispatch_auth(true, _has_rp, username, password, _rp, client_ip, state) do
+    do_acl_auth(username, password, client_ip, state)
+  end
+
+  defp do_dispatch_auth(false, true, "default", password, requirepass, client_ip, state) do
+    if constant_time_equal?(password, requirepass) do
+      AuditLog.log(:auth_success, %{username: "default", client_ip: client_ip})
+      new_cache = build_acl_cache("default")
+      {:continue, Encoder.encode(:ok), %{state | authenticated: true, username: "default", acl_cache: new_cache}}
+    else
+      AuditLog.log(:auth_failure, %{username: "default", client_ip: client_ip})
+      {:continue, Encoder.encode({:error, "WRONGPASS invalid username-password pair or user is disabled."}), state}
+    end
+  end
+
+  defp do_dispatch_auth(false, true, username, password, _rp, client_ip, state) do
+    do_acl_auth(username, password, client_ip, state)
+  end
 
   defp format_peer(nil), do: "unknown"
   defp format_peer({ip, port}), do: "#{:inet.ntoa(ip)}:#{port}"

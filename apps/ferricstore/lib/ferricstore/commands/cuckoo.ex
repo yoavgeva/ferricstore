@@ -24,17 +24,11 @@ defmodule Ferricstore.Commands.Cuckoo do
   # ---------------------------------------------------------------------------
 
   def handle("CF.RESERVE", [key, capacity_str], store) do
-    with {:ok, capacity} <- parse_pos_integer(capacity_str, "capacity") do
-      if cuckoo_file_exists?(key, store) do
-        {:error, "ERR item exists"}
-      else
-        result = do_prob_write(store, {:cuckoo_create, key, capacity, @bucket_size})
-        case result do
-          {:ok, _} -> :ok
-          :ok -> :ok
-          other -> other
-        end
-      end
+    with {:ok, capacity} <- parse_pos_integer(capacity_str, "capacity"),
+         :ok <- check_cuckoo_not_exists(key, store) do
+      store
+      |> do_prob_write({:cuckoo_create, key, capacity, @bucket_size})
+      |> normalize_create_result()
     end
   end
 
@@ -290,6 +284,14 @@ defmodule Ferricstore.Commands.Cuckoo do
         exists_fn.(key)
     end
   end
+
+  defp check_cuckoo_not_exists(key, store) do
+    if cuckoo_file_exists?(key, store), do: {:error, "ERR item exists"}, else: :ok
+  end
+
+  defp normalize_create_result({:ok, _}), do: :ok
+  defp normalize_create_result(:ok), do: :ok
+  defp normalize_create_result(other), do: other
 
   @spec parse_pos_integer(binary(), binary()) :: {:ok, pos_integer()} | {:error, binary()}
   defp parse_pos_integer(str, name) do

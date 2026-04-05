@@ -35,17 +35,14 @@ defmodule Ferricstore.Store.ValueCodec do
         {:ok, val * 1.0}
 
       _ ->
-        case Float.parse(str) do
-          {val, ""} ->
-            if val in [:infinity, :neg_infinity, :nan] do
-              :error
-            else
-              {:ok, val}
-            end
+        parse_float_value(str)
+    end
+  end
 
-          _ ->
-            :error
-        end
+  defp parse_float_value(str) do
+    case Float.parse(str) do
+      {val, ""} when val not in [:infinity, :neg_infinity, :nan] -> {:ok, val}
+      _ -> :error
     end
   end
 

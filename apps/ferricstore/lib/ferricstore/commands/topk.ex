@@ -205,31 +205,23 @@ defmodule Ferricstore.Commands.TopK do
   defp do_reserve(key, k_str, width, depth, decay, store) do
     with {:ok, k} <- parse_pos_integer(k_str, "k"),
          :ok <- check_not_exists(key, store) do
-      result = do_prob_write(store, {:topk_create, key, k, width, depth, decay * 1.0})
-
-      case result do
-        {:ok, _} ->
-          # In non-Raft mode, register the key in the store so exists? works.
-          # In Raft mode, the state machine's do_put handles this.
-          if is_nil(Map.get(store, :prob_write)) do
-            path = prob_path(store, key, "topk")
-            meta = {:topk_path, path}
-            Ops.put(store, key, meta, 0)
-          end
-          :ok
-
-        :ok ->
-          if is_nil(Map.get(store, :prob_write)) do
-            path = prob_path(store, key, "topk")
-            meta = {:topk_path, path}
-            Ops.put(store, key, meta, 0)
-          end
-          :ok
-
-        other ->
-          other
-      end
+      store
+      |> do_prob_write({:topk_create, key, k, width, depth, decay * 1.0})
+      |> maybe_register_topk(store, key)
     end
+  end
+
+  defp maybe_register_topk({:ok, _}, store, key), do: do_register_topk(store, key)
+  defp maybe_register_topk(:ok, store, key), do: do_register_topk(store, key)
+  defp maybe_register_topk(other, _store, _key), do: other
+
+  defp do_register_topk(store, key) do
+    if is_nil(Map.get(store, :prob_write)) do
+      path = prob_path(store, key, "topk")
+      Ops.put(store, key, {:topk_path, path}, 0)
+    end
+
+    :ok
   end
 
   defp check_not_exists(key, store) do

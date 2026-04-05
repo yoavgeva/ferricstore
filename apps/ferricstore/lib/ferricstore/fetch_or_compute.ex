@@ -220,19 +220,7 @@ defmodule Ferricstore.FetchOrCompute do
     # Scan all compute locks for timed-out computers.
     :ets.tab2list(@table)
     |> Enum.each(fn {key, _computer_pid, waiters, started_at, hint} ->
-      if now - started_at > timeout_ms do
-        case waiters do
-          [{next_from, next_pid} | rest_waiters] ->
-            # Promote the next waiter to computer.
-            new_started = System.monotonic_time(:millisecond)
-            :ets.insert(@table, {key, next_pid, rest_waiters, new_started, hint})
-            GenServer.reply(next_from, {:compute, hint})
-
-          [] ->
-            # No waiters -- just clear the stale lock.
-            :ets.delete(@table, key)
-        end
-      end
+      if now - started_at > timeout_ms, do: promote_or_clear(key, waiters, hint)
     end)
 
     schedule_sweep(timeout_ms)
@@ -242,6 +230,14 @@ defmodule Ferricstore.FetchOrCompute do
   # -------------------------------------------------------------------
   # Private
   # -------------------------------------------------------------------
+
+  defp promote_or_clear(key, [{next_from, next_pid} | rest_waiters], hint) do
+    new_started = System.monotonic_time(:millisecond)
+    :ets.insert(@table, {key, next_pid, rest_waiters, new_started, hint})
+    GenServer.reply(next_from, {:compute, hint})
+  end
+
+  defp promote_or_clear(key, [], _hint), do: :ets.delete(@table, key)
 
   defp schedule_sweep(timeout_ms) do
     # Sweep at half the timeout interval for reasonable responsiveness.

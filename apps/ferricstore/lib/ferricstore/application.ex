@@ -245,7 +245,22 @@ defmodule Ferricstore.Application do
     )
 
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
 
+    shutdown_flush_batchers(shard_count)
+    shutdown_flush_bitcask_writers(shard_count)
+    shutdown_fsync_bitcask(shard_count, data_dir)
+    shutdown_flush_shards(shard_count)
+    shutdown_wal_rollover(data_dir)
+    shutdown_check_snapshots(shard_count)
+
+    elapsed = System.monotonic_time(:millisecond) - t0
+    Logger.info("Shutdown: graceful flush complete in \#{elapsed}ms")
+
+    state
+  end
+
+  defp shutdown_flush_batchers(shard_count) do
     # Step 2: Flush all Raft batchers — drain pending commands to Raft
     for i <- 0..(shard_count - 1) do
       try do
@@ -255,7 +270,9 @@ defmodule Ferricstore.Application do
       end
     end
     Logger.info("Shutdown: batchers flushed")
+  end
 
+  defp shutdown_flush_bitcask_writers(shard_count) do
     # Step 3: Flush all BitcaskWriters — drain deferred disk writes
     try do
       Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
@@ -263,12 +280,13 @@ defmodule Ferricstore.Application do
       :exit, _ -> :ok
     end
     Logger.info("Shutdown: BitcaskWriters flushed")
+  end
 
+  defp shutdown_fsync_bitcask(shard_count, data_dir) do
     # Step 3b: Fsync all active Bitcask log files.
     # BitcaskWriter uses v2_append_batch_nosync (data in OS page cache only).
     # Without fsync, a subsequent Process.exit(:kill) can lose unsynced data
     # on Linux (Docker overlayfs). macOS APFS retains page cache across kills.
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
 
     for i <- 0..(shard_count - 1) do
       try do
@@ -294,7 +312,9 @@ defmodule Ferricstore.Application do
       end
     end
     Logger.info("Shutdown: Bitcask files fsynced")
+  end
 
+  defp shutdown_flush_shards(shard_count) do
     # Step 4: Flush all shards — hint files + fsync
     # (terminate/1 on each shard will also do this, but doing it here
     # while the system is still healthy is more reliable)
@@ -307,7 +327,9 @@ defmodule Ferricstore.Application do
       end
     end
     Logger.info("Shutdown: shards flushed")
+  end
 
+  defp shutdown_wal_rollover(data_dir) do
     # Step 5: Force WAL rollover and poll until segment writer finishes.
     # After force_roll_over, the old WAL file is handed to the segment writer.
     # When the segment writer finishes processing it, the old WAL file is deleted.
@@ -328,7 +350,9 @@ defmodule Ferricstore.Application do
       _, _ -> :ok
     end
     Logger.info("Shutdown: WAL rolled over")
+  end
 
+  defp shutdown_check_snapshots(shard_count) do
     # Step 6: Check snapshot state for each shard and log warning if
     # there are many entries since last snapshot (will need replay on restart)
     for i <- 0..(shard_count - 1) do

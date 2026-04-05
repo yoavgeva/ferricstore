@@ -382,20 +382,19 @@ defmodule Ferricstore.Commands.Server do
       shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
       prob_dir = Path.join(shard_path, "prob")
 
-      if File.exists?(prob_dir) do
-        case File.ls(prob_dir) do
-          {:ok, files} ->
-            Enum.each(files, fn file ->
-              File.rm(Path.join(prob_dir, file))
-            end)
-
-          _ ->
-            :ok
-        end
-      end
+      clear_prob_dir(prob_dir)
     end
   rescue
     _ -> :ok
+  end
+
+  defp clear_prob_dir(prob_dir) do
+    with true <- File.exists?(prob_dir),
+         {:ok, files} <- File.ls(prob_dir) do
+      Enum.each(files, fn file -> File.rm(Path.join(prob_dir, file)) end)
+    else
+      _ -> :ok
+    end
   end
 
   # ---------------------------------------------------------------------------

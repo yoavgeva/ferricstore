@@ -389,36 +389,7 @@ defmodule Ferricstore.HLC do
     local_logical = :atomics.get(ref, @slot_logical)
 
     {new_physical, new_logical} =
-      cond do
-        # Wall clock is strictly ahead of both local and remote.
-        wall > local_phys and wall > remote_phys ->
-          {wall, 0}
-
-        # Local physical is ahead of both wall clock and remote.
-        local_phys > wall and local_phys > remote_phys ->
-          {local_phys, local_logical + 1}
-
-        # Remote physical is ahead of both wall clock and local.
-        remote_phys > wall and remote_phys > local_phys ->
-          {remote_phys, remote_log + 1}
-
-        # Local and remote tie, both ahead of or equal to wall clock.
-        local_phys == remote_phys ->
-          {local_phys, max(local_logical, remote_log) + 1}
-
-        # Wall clock ties with local physical, both >= remote.
-        wall == local_phys ->
-          {local_phys, local_logical + 1}
-
-        # Wall clock ties with remote physical, both >= local.
-        wall == remote_phys ->
-          {wall, remote_log + 1}
-
-        # Fallback (shouldn't reach here, but for safety).
-        true ->
-          new_p = Enum.max([wall, local_phys, remote_phys])
-          {new_p, 0}
-      end
+      merge_timestamps(wall, local_phys, local_logical, remote_phys, remote_log)
 
     :atomics.put(ref, @slot_physical, new_physical)
     :atomics.put(ref, @slot_logical, new_logical)
@@ -442,6 +413,20 @@ defmodule Ferricstore.HLC do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp merge_timestamps(wall, local_phys, local_logical, remote_phys, remote_log) do
+    max_phys = Enum.max([wall, local_phys, remote_phys])
+
+    cond do
+      wall > local_phys and wall > remote_phys -> {wall, 0}
+      local_phys == max_phys and local_phys > remote_phys -> {local_phys, local_logical + 1}
+      remote_phys == max_phys and remote_phys > local_phys -> {remote_phys, remote_log + 1}
+      local_phys == remote_phys -> {local_phys, max(local_logical, remote_log) + 1}
+      wall == local_phys -> {local_phys, local_logical + 1}
+      wall == remote_phys -> {wall, remote_log + 1}
+      true -> {max_phys, 0}
+    end
+  end
 
   # Returns the atomics ref from :persistent_term, or nil if not yet created.
   @spec atomics_ref() :: reference() | nil

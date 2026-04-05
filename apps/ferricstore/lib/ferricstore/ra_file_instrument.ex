@@ -93,20 +93,14 @@ defmodule Ferricstore.RaFileInstrument do
     if elapsed_us < current_min, do: :counters.put(counters, 4, elapsed_us)
 
     # Histogram bucket
-    bucket =
-      cond do
-        elapsed_us < 100 -> 100
-        elapsed_us < 500 -> 500
-        elapsed_us < 1_000 -> 1_000
-        elapsed_us < 5_000 -> 5_000
-        elapsed_us < 10_000 -> 10_000
-        elapsed_us < 50_000 -> 50_000
-        elapsed_us < 100_000 -> 100_000
-        elapsed_us < 500_000 -> 500_000
-        true -> :overflow
-      end
-
+    bucket = histogram_bucket(elapsed_us)
     :ets.update_counter(@table, bucket, {2, 1})
+  end
+
+  @histogram_thresholds [100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000]
+
+  defp histogram_bucket(elapsed_us) do
+    Enum.find(@histogram_thresholds, :overflow, fn threshold -> elapsed_us < threshold end)
   end
 
   @doc "Print collected fsync stats"

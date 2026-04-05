@@ -225,17 +225,20 @@ defmodule Ferricstore.Transaction.Coordinator do
             fn {idx, cmd, args, _shard_idx} -> {idx, cmd, args} end
           )
 
-        index_map =
-          Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds}, acc ->
-            cmds
-            |> Enum.with_index()
-            |> Enum.reduce(acc, fn {{orig_idx, _cmd, _args}, pos}, inner ->
-              Map.put(inner, orig_idx, {shard_idx, pos})
-            end)
-          end)
+        index_map = build_index_map(shard_groups)
 
         {:multi_shard, shard_groups, index_map}
     end
+  end
+
+  defp build_index_map(shard_groups) do
+    Enum.reduce(shard_groups, %{}, fn {shard_idx, cmds}, acc ->
+      cmds
+      |> Enum.with_index()
+      |> Enum.reduce(acc, fn {{orig_idx, _cmd, _args}, pos}, inner ->
+        Map.put(inner, orig_idx, {shard_idx, pos})
+      end)
+    end)
   end
 
   defp command_shard(args, sandbox_namespace) do

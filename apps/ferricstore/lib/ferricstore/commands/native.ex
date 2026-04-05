@@ -97,29 +97,9 @@ defmodule Ferricstore.Commands.Native do
     type = Ferricstore.Store.TypeRegistry.get_type(key, store)
     alive? = type != "none"
 
-    {value, expire_at_ms, hot_status} =
-      if alive? do
-        {val, exp, hot} = ets_key_info(keydir, key, now)
-        if val != nil do
-          {val, exp, hot}
-        else
-          case Router.get_meta(ctx, key) do
-            nil -> {nil, 0, "cold"}
-            {v, e} -> {v, e, "cold"}
-          end
-        end
-      else
-        {nil, 0, "cold"}
-      end
-
+    {value, expire_at_ms, hot_status} = resolve_key_value(alive?, ctx, keydir, key, now)
     value_size = if alive? and is_binary(value), do: byte_size(value), else: 0
-
-    ttl_ms =
-      cond do
-        not alive? -> -2
-        expire_at_ms == 0 -> -1
-        true -> max(expire_at_ms - now, 0)
-      end
+    ttl_ms = compute_ttl_ms(alive?, expire_at_ms, now)
 
     [
       "type", type,
@@ -129,6 +109,25 @@ defmodule Ferricstore.Commands.Native do
       "last_write_shard", Integer.to_string(idx)
     ]
   end
+
+  defp resolve_key_value(false, _ctx, _keydir, _key, _now), do: {nil, 0, "cold"}
+
+  defp resolve_key_value(true, ctx, keydir, key, now) do
+    {val, exp, hot} = ets_key_info(keydir, key, now)
+
+    if val != nil do
+      {val, exp, hot}
+    else
+      case Router.get_meta(ctx, key) do
+        nil -> {nil, 0, "cold"}
+        {v, e} -> {v, e, "cold"}
+      end
+    end
+  end
+
+  defp compute_ttl_ms(false, _expire_at_ms, _now), do: -2
+  defp compute_ttl_ms(true, 0, _now), do: -1
+  defp compute_ttl_ms(true, expire_at_ms, now), do: max(expire_at_ms - now, 0)
 
   # 7-tuple keydir lookup: {key, value | nil, expire_at_ms, lfu_counter, file_id, offset, value_size}
   defp ets_key_info(keydir, key, now) do
