@@ -84,6 +84,11 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
 
       ShardHelpers.flush_all_shards()
 
+      # Wait for disk writes to settle
+      ShardHelpers.eventually(fn ->
+        MapSet.member?(keys_on_disk(shard0), k0) and MapSet.member?(keys_on_disk(shard1), k1)
+      end, "keys not on disk after flush", 20, 50)
+
       disk_keys_shard0 = keys_on_disk(shard0)
       disk_keys_shard1 = keys_on_disk(shard1)
 

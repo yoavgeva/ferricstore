@@ -290,31 +290,32 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
 
     test "decay=0 disables time-based decay" do
-      original = Application.get_env(:ferricstore, :lfu_decay_time, 1)
-      Application.put_env(:ferricstore, :lfu_decay_time, 0)
-      LFU.init_config_cache()
+      # Temporarily set decay_time=0 on the default Instance
+      ctx = FerricStore.Instance.get(:default)
+      original_ctx = ctx
+      updated = %{ctx | lfu_decay_time: 0}
+      :persistent_term.put({FerricStore.Instance, :default}, updated)
 
       try do
-        Router.put(FerricStore.Instance.get(:default), "lfu_no_decay", "val")
+        key = "lfu_no_decay_#{System.unique_integer([:positive])}"
+        Router.put(updated, key, "val", 0)
         drain_all()
 
         # Simulate old ldt with high counter
-        keydir = keydir_for("lfu_no_decay")
+        keydir = keydir_for(key)
         old_ldt = (LFU.now_minutes() - 100) &&& 0xFFFF
-        :ets.update_element(keydir, "lfu_no_decay", {4, LFU.pack(old_ldt, 200)})
+        :ets.update_element(keydir, key, {4, LFU.pack(old_ldt, 200)})
 
-        # Read the key
-        Router.get(FerricStore.Instance.get(:default), "lfu_no_decay")
+        # Read the key — with decay=0, counter should not decrease
+        Router.get(updated, key)
 
-        packed = get_packed_lfu("lfu_no_decay")
+        packed = get_packed_lfu(key)
         {_ldt, counter} = LFU.unpack(packed)
 
-        # With decay disabled, counter should not have decreased
         assert counter >= 200,
                "with decay=0, counter should not decrease, got #{counter}"
       after
-        Application.put_env(:ferricstore, :lfu_decay_time, original)
-        LFU.init_config_cache()
+        :persistent_term.put({FerricStore.Instance, :default}, original_ctx)
       end
     end
   end

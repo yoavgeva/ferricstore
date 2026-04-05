@@ -3624,7 +3624,11 @@ defmodule Ferricstore.Store.Shard do
             Logger.warning("Shard #{state.index}: tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}")
         end
       end)
-      Ferricstore.Stats.incr_expired_keys(count)
+      if state.instance_ctx do
+        Ferricstore.Stats.incr_expired_keys(state.instance_ctx, count)
+      else
+        Ferricstore.Stats.incr_expired_keys(count)
+      end
 
       require Logger
       Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")

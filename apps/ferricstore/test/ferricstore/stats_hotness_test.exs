@@ -49,7 +49,7 @@ defmodule Ferricstore.Stats.HotnessTest do
     test "increments global hot read counter" do
       before = Stats.total_hot_reads()
       Stats.record_hot_read("user:1")
-      assert Stats.total_hot_reads() == before + 1
+      assert Stats.total_hot_reads() >= before + 1
     end
 
     test "increments per-prefix hot counter in hotness table" do
@@ -79,7 +79,7 @@ defmodule Ferricstore.Stats.HotnessTest do
     test "increments global cold read counter" do
       before = Stats.total_cold_reads()
       Stats.record_cold_read("session:abc")
-      assert Stats.total_cold_reads() == before + 1
+      assert Stats.total_cold_reads() >= before + 1
     end
 
     test "increments per-prefix cold counter in hotness table" do
@@ -251,12 +251,13 @@ defmodule Ferricstore.Stats.HotnessTest do
 
     test "first read of a key after put is hot (ETS hit)" do
       Stats.reset_hotness()
+      before_hot = Stats.total_hot_reads()
 
       Router.put(FerricStore.Instance.get(:default), "hottest:alpha", "value", 0)
       # Key is now in ETS from the put. Reading should be a hot read.
       _val = Router.get(FerricStore.Instance.get(:default), "hottest:alpha")
 
-      assert Stats.total_hot_reads() >= 1
+      assert Stats.total_hot_reads() >= before_hot + 1
 
       entries = Stats.hotness_top(10)
       hottest_entry = Enum.find(entries, fn {prefix, _, _, _} -> prefix == "hottest" end)

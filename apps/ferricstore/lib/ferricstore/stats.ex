@@ -194,6 +194,12 @@ defmodule Ferricstore.Stats do
   @doc "Returns evicted keys count."
   @spec evicted_keys() :: non_neg_integer()
   def evicted_keys, do: :counters.get(counter_ref(), @counter_evicted_keys)
+  @doc "Returns evicted keys count using instance ctx."
+  @spec evicted_keys(FerricStore.Instance.t()) :: non_neg_integer()
+  def evicted_keys(ctx), do: :counters.get(ctx.stats_counter, @counter_evicted_keys)
+  @doc "Returns expired keys count using instance ctx."
+  @spec expired_keys(FerricStore.Instance.t()) :: non_neg_integer()
+  def expired_keys(ctx) when is_map(ctx), do: :counters.get(ctx.stats_counter, @counter_expired_keys)
 
   @doc "Increments the keys_with_expiry counter (key gained a TTL)."
   @spec incr_keys_with_expiry() :: :ok

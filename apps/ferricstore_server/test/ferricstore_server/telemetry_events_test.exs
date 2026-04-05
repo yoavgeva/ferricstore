@@ -525,17 +525,15 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       key = "hotcold_hot_#{System.unique_integer([:positive])}"
       Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
-      # First GET warms the cache (may be cold if not yet in ETS).
+      # First GET warms the cache.
       _val = Router.get(FerricStore.Instance.get(:default), key)
 
-      # Reset counters after warm-up.
-      Ferricstore.Stats.reset_hotness()
+      before_hot = Ferricstore.Stats.total_hot_reads()
 
       # Second GET should be hot (ETS hit).
       assert Router.get(FerricStore.Instance.get(:default), key) == "value"
 
-      hot = Ferricstore.Stats.total_hot_reads()
-      assert hot >= 1
+      assert Ferricstore.Stats.total_hot_reads() >= before_hot + 1
     end
 
     test "cold read is recorded when key is not in ETS cache" do
@@ -554,12 +552,11 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       # slot is nil so the next GET falls through to Bitcask.
       :ets.update_element(:"keydir_#{shard_idx}", key, {2, nil})
 
-      Ferricstore.Stats.reset_hotness()
+      before_cold = Ferricstore.Stats.total_cold_reads()
 
       assert Router.get(FerricStore.Instance.get(:default), key) == "cold_value"
 
-      cold = Ferricstore.Stats.total_cold_reads()
-      assert cold >= 1
+      assert Ferricstore.Stats.total_cold_reads() >= before_cold + 1
     end
 
     test "INFO stats section includes hot/cold read fields" do

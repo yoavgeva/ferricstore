@@ -445,7 +445,8 @@ defmodule Ferricstore.MemoryGuard do
         end)
 
       if total_evicted > 0 do
-        Ferricstore.Stats.incr_evicted_keys(total_evicted)
+        ctx = FerricStore.Instance.get(:default)
+        Ferricstore.Stats.incr_evicted_keys(ctx, total_evicted)
       end
 
       :ok
