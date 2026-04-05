@@ -35,14 +35,13 @@ defmodule Ferricstore.Test.IsolatedInstance do
     ctx = FerricStore.Instance.build(name, [
       data_dir: tmp_dir,
       shard_count: shard_count,
-      mode: :embedded,
       raft_enabled: false,
       max_memory_bytes: Keyword.get(opts, :max_memory_bytes, 256 * 1024 * 1024),
       keydir_max_ram: Keyword.get(opts, :keydir_max_ram, 64 * 1024 * 1024),
       eviction_policy: Keyword.get(opts, :eviction_policy, :volatile_lfu),
       hot_cache_max_value_size: 65_536,
       max_active_file_size: 64 * 1024 * 1024,
-      read_sample_rate: 100,
+      read_sample_rate: Keyword.get(opts, :read_sample_rate, 1),
       lfu_decay_time: 1,
       lfu_log_factor: 10
     ])

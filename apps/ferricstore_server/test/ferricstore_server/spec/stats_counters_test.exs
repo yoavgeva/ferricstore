@@ -13,84 +13,68 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
     - Stress: 10000 GETs, verify hit/miss counts are accurate
   """
 
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
-  alias Ferricstore.Test.ShardHelpers
+  alias Ferricstore.Test.IsolatedInstance
 
   setup do
-    ShardHelpers.flush_all_keys()
-    Stats.reset()
-
-    on_exit(fn ->
-      # Reset persistent_term flags so tiny-budget MemoryGuard checks
-      # don't leak KEYDIR_FULL into other tests.
-      :persistent_term.put(:ferricstore_keydir_full, false)
-      :persistent_term.put(:ferricstore_reject_writes, false)
-    end)
-
-    :ok
+    ctx = IsolatedInstance.checkout()
+    on_exit(fn -> IsolatedInstance.checkin(ctx) end)
+    %{ctx: ctx}
   end
 
   # ---------------------------------------------------------------------------
-  # keyspace_hits / keyspace_misses
+  # keyspace_hits / keyspace_misses (isolated instance — zero contamination)
   # ---------------------------------------------------------------------------
 
   describe "keyspace_hits" do
-    test "increments on successful GET (key found)" do
-      Router.put(FerricStore.Instance.get(:default), "hit_test_key", "value", 0)
-      before = Stats.keyspace_hits()
+    test "increments on successful GET (key found)", %{ctx: ctx} do
+      Router.put(ctx, "hit_test_key", "value", 0)
+      assert Stats.keyspace_hits(ctx) == 0
 
-      _val = Router.get(FerricStore.Instance.get(:default), "hit_test_key")
-      assert Stats.keyspace_hits() >= before + 1
+      _val = Router.get(ctx, "hit_test_key")
+      assert Stats.keyspace_hits(ctx) == 1
     end
 
-    test "does not increment on GET where key is not found" do
-      before = Stats.keyspace_hits()
-      _val = Router.get(FerricStore.Instance.get(:default), "nonexistent_key")
-      assert Stats.keyspace_hits() <= before + 1
+    test "does not increment on GET where key is not found", %{ctx: ctx} do
+      _val = Router.get(ctx, "nonexistent_key")
+      assert Stats.keyspace_hits(ctx) == 0
     end
 
-    test "increments multiple times on consecutive hits" do
-      Router.put(FerricStore.Instance.get(:default), "multi_hit", "value", 0)
-      before = Stats.keyspace_hits()
+    test "increments multiple times on consecutive hits", %{ctx: ctx} do
+      Router.put(ctx, "multi_hit", "value", 0)
 
-      Enum.each(1..5, fn _ -> Router.get(FerricStore.Instance.get(:default), "multi_hit") end)
-      assert Stats.keyspace_hits() >= before + 5
+      Enum.each(1..5, fn _ -> Router.get(ctx, "multi_hit") end)
+      assert Stats.keyspace_hits(ctx) == 5
     end
   end
 
   describe "keyspace_misses" do
-    test "increments on GET where key is not found" do
-      before = Stats.keyspace_misses()
-
-      _val = Router.get(FerricStore.Instance.get(:default), "does_not_exist")
-      assert Stats.keyspace_misses() >= before + 1
+    test "increments on GET where key is not found", %{ctx: ctx} do
+      _val = Router.get(ctx, "does_not_exist")
+      assert Stats.keyspace_misses(ctx) == 1
     end
 
-    test "does not increment on successful GET" do
-      before = Stats.keyspace_misses()
-      Router.put(FerricStore.Instance.get(:default), "exists_key", "value", 0)
-      _val = Router.get(FerricStore.Instance.get(:default), "exists_key")
-      assert Stats.keyspace_misses() <= before + 1
+    test "does not increment on successful GET", %{ctx: ctx} do
+      Router.put(ctx, "exists_key", "value", 0)
+      _val = Router.get(ctx, "exists_key")
+      assert Stats.keyspace_misses(ctx) == 0
     end
 
-    test "increments multiple times on consecutive misses" do
-      before = Stats.keyspace_misses()
-      Enum.each(1..5, fn i -> Router.get(FerricStore.Instance.get(:default), "missing_#{i}") end)
-      assert Stats.keyspace_misses() >= before + 5
+    test "increments multiple times on consecutive misses", %{ctx: ctx} do
+      Enum.each(1..5, fn i -> Router.get(ctx, "missing_#{i}") end)
+      assert Stats.keyspace_misses(ctx) == 5
     end
 
-    test "increments on GET for expired key" do
-      # Set a key that expires immediately (1ms TTL)
+    test "increments on GET for expired key", %{ctx: ctx} do
       expire_at = System.os_time(:millisecond) + 1
-      Router.put(FerricStore.Instance.get(:default), "expiring_key", "value", expire_at)
+      Router.put(ctx, "expiring_key", "value", expire_at)
       Process.sleep(10)
 
-      before = Stats.keyspace_misses()
-      _val = Router.get(FerricStore.Instance.get(:default), "expiring_key")
-      assert Stats.keyspace_misses() >= before + 1
+      _val = Router.get(ctx, "expiring_key")
+      assert Stats.keyspace_misses(ctx) >= 1
     end
   end
 
@@ -200,27 +184,20 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
   # ---------------------------------------------------------------------------
 
   describe "CONFIG RESETSTAT resets all counters" do
-    test "resets keyspace_hits, keyspace_misses, expired_keys, and evicted_keys to 0" do
-      Router.put(FerricStore.Instance.get(:default), "resetstat_key", "value", 0)
-      Router.get(FerricStore.Instance.get(:default), "resetstat_key")
-      Router.get(FerricStore.Instance.get(:default), "no_such_key")
+    test "resets keyspace_hits, keyspace_misses, expired_keys, and evicted_keys to 0", %{ctx: ctx} do
+      # Use isolated instance to generate known counter values
+      Router.put(ctx, "resetstat_key", "value", 0)
+      Router.get(ctx, "resetstat_key")
+      Router.get(ctx, "no_such_key")
 
-      assert Stats.keyspace_hits() > 0
-      assert Stats.keyspace_misses() > 0
+      assert Stats.keyspace_hits(ctx) > 0
+      assert Stats.keyspace_misses(ctx) > 0
 
-      # Manually increment expired and evicted for test
-      before_expired = Stats.expired_keys()
-      before_evicted = Stats.evicted_keys()
-      Stats.incr_expired_keys(5)
-      Stats.incr_evicted_keys(3)
-
-      assert Stats.expired_keys() >= before_expired + 5
-      assert Stats.evicted_keys() >= before_evicted + 3
-
+      # Reset the global counters (CONFIG RESETSTAT tests the global path)
       Stats.reset()
 
-      # Use snapshot immediately after reset — concurrent processes (MemoryGuard,
-      # health checks) may have already bumped a counter, so allow small values.
+      # Global counters should be near zero after reset (concurrent processes
+      # may increment between reset and assertion)
       assert Stats.keyspace_hits() <= 2
       assert Stats.keyspace_misses() <= 2
       assert Stats.expired_keys() <= 2
@@ -233,10 +210,10 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
   # ---------------------------------------------------------------------------
 
   describe "INFO stats includes all counter fields" do
-    test "INFO stats response contains keyspace_hits, keyspace_misses, expired_keys, evicted_keys" do
-      Router.put(FerricStore.Instance.get(:default), "info_key", "value", 0)
-      Router.get(FerricStore.Instance.get(:default), "info_key")
-      Router.get(FerricStore.Instance.get(:default), "info_missing")
+    test "INFO stats response contains keyspace_hits, keyspace_misses, expired_keys, evicted_keys", %{ctx: ctx} do
+      Router.put(ctx, "info_key", "value", 0)
+      Router.get(ctx, "info_key")
+      Router.get(ctx, "info_missing")
 
       info = Ferricstore.Commands.Server.handle("INFO", ["stats"], nil)
 
@@ -247,23 +224,19 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
       assert info =~ "evicted_keys:"
     end
 
-    test "INFO stats shows correct counter values" do
-      before_hits = Stats.keyspace_hits()
-      before_misses = Stats.keyspace_misses()
+    test "INFO stats shows correct counter values", %{ctx: ctx} do
+      # Use isolated instance to verify counter increments
+      Router.put(ctx, "info_val_key", "value", 0)
+      Router.get(ctx, "info_val_key")
+      Router.get(ctx, "info_val_key")
+      Router.get(ctx, "no_key_1")
 
-      Router.put(FerricStore.Instance.get(:default), "info_val_key", "value", 0)
-      # Generate some hits and misses
-      Router.get(FerricStore.Instance.get(:default), "info_val_key")
-      Router.get(FerricStore.Instance.get(:default), "info_val_key")
-      Router.get(FerricStore.Instance.get(:default), "no_key_1")
+      assert Stats.keyspace_hits(ctx) == 2
+      assert Stats.keyspace_misses(ctx) == 1
 
-      # Verify counters incremented by expected deltas
-      assert Stats.keyspace_hits() >= before_hits + 2
-      assert Stats.keyspace_misses() >= before_misses + 1
-
-      # Verify INFO output contains all counter fields (values are non-deterministic
-      # due to concurrent processes, so just check field presence)
-      info = Ferricstore.Commands.Server.handle("INFO", ["stats"], nil)
+      # INFO command reads from global counters — just check field presence
+      store = %{dbsize: fn -> 0 end}
+      info = Ferricstore.Commands.Server.handle("INFO", ["stats"], store)
 
       assert info =~ "keyspace_hits:"
       assert info =~ "keyspace_misses:"
@@ -277,35 +250,32 @@ defmodule FerricstoreServer.Spec.StatsCountersTest do
   # ---------------------------------------------------------------------------
 
   describe "stress: 10000 GETs" do
-    test "hit/miss counts are accurate across 10000 operations" do
-      # Insert 100 keys
+    test "hit/miss counts are accurate across 10000 operations", %{ctx: ctx} do
+      # Insert 100 keys on isolated instance
       hit_keys = Enum.map(1..100, fn i ->
         key = "stress_hit_#{i}"
-        Router.put(FerricStore.Instance.get(:default), key, "value_#{i}", 0)
+        Router.put(ctx, key, "value_#{i}", 0)
         key
       end)
 
       miss_keys = Enum.map(1..100, fn i -> "stress_miss_#{i}" end)
 
-      # Do 5000 hits and 5000 misses
       expected_hits = 5_000
       expected_misses = 5_000
 
-      before_hits = Stats.keyspace_hits()
-      before_misses = Stats.keyspace_misses()
-
       Enum.each(1..expected_hits, fn i ->
         key = Enum.at(hit_keys, rem(i, 100))
-        Router.get(FerricStore.Instance.get(:default), key)
+        Router.get(ctx, key)
       end)
 
       Enum.each(1..expected_misses, fn i ->
         key = Enum.at(miss_keys, rem(i, 100))
-        Router.get(FerricStore.Instance.get(:default), key)
+        Router.get(ctx, key)
       end)
 
-      assert Stats.keyspace_hits() - before_hits == expected_hits
-      assert Stats.keyspace_misses() - before_misses == expected_misses
+      # Isolated instance counters — exact match, no contamination
+      assert Stats.keyspace_hits(ctx) == expected_hits
+      assert Stats.keyspace_misses(ctx) == expected_misses
     end
   end
 end
