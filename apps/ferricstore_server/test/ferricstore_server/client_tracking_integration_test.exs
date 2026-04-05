@@ -477,18 +477,13 @@ defmodule FerricstoreServer.ClientTrackingIntegrationTest do
       assert recv_response(conn) == {:simple, "OK"}
 
       # Should NOT receive invalidation due to NOLOOP.
-      # Small delay to ensure any push would have arrived.
-      Process.sleep(50)
+      # Check that no data arrives on the socket within 100ms (no push).
+      assert {:error, :timeout} = :gen_tcp.recv(conn, 0, 100),
+             "Received unexpected data — invalidation may have leaked through NOLOOP"
 
-      # Flush socket buffer — if an invalidation leaked through, it would
-      # be sitting in the TCP buffer before our PING response.
-      :inet.setopts(conn, active: false)
-
+      # Verify connection is still functional
       send_cmd(conn, ["PING"])
-      response = recv_response(conn)
-      # Response should be PONG, not an invalidation push
-      assert response == {:simple, "PONG"} or response == "PONG",
-             "Expected PONG but got #{inspect(response)} — invalidation may have leaked through NOLOOP"
+      assert recv_response(conn) == {:simple, "PONG"}
     end
   end
 
