@@ -47,27 +47,6 @@ defmodule Ferricstore.Commands.Namespace do
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, _store)
 
-  @doc """
-  4-arity variant that accepts `conn_state` for audit trail (changed_by).
-
-  When `conn_state` contains a `:client_id`, it is recorded as `"client:<id>"`
-  in the audit trail.
-  """
-  @spec handle(binary(), [binary()], map(), map()) :: term()
-  def handle("FERRICSTORE.CONFIG", ["SET", prefix, field, value], _store, conn_state) do
-    changed_by =
-      case Map.get(conn_state, :client_id) do
-        nil -> ""
-        id -> "client:#{id}"
-      end
-
-    NamespaceConfig.set(prefix, String.downcase(field), value, changed_by)
-  end
-
-  def handle(cmd, args, store, _conn_state) do
-    handle(cmd, args, store)
-  end
-
   # ---------------------------------------------------------------------------
   # FERRICSTORE.CONFIG SET prefix field value
   # ---------------------------------------------------------------------------
@@ -120,6 +99,31 @@ defmodule Ferricstore.Commands.Namespace do
 
   def handle("FERRICSTORE.CONFIG", [], _store) do
     {:error, "ERR wrong number of arguments for 'ferricstore.config' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # 4-arity variant: accepts conn_state for audit trail (changed_by)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  4-arity variant that accepts `conn_state` for audit trail (changed_by).
+
+  When `conn_state` contains a `:client_id`, it is recorded as `"client:<id>"`
+  in the audit trail.
+  """
+  @spec handle(binary(), [binary()], map(), map()) :: term()
+  def handle("FERRICSTORE.CONFIG", ["SET", prefix, field, value], _store, conn_state) do
+    changed_by =
+      case Map.get(conn_state, :client_id) do
+        nil -> ""
+        id -> "client:#{id}"
+      end
+
+    NamespaceConfig.set(prefix, String.downcase(field), value, changed_by)
+  end
+
+  def handle(cmd, args, store, _conn_state) do
+    handle(cmd, args, store)
   end
 
   # ---------------------------------------------------------------------------

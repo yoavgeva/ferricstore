@@ -109,61 +109,6 @@ defmodule Ferricstore.Commands.Strings do
     end)
   end
 
-  # Deletes a single key, handling both plain string keys and data structure
-  # keys that use compound sub-keys. Returns `true` if the key existed and
-  # was deleted, `false` otherwise.
-  defp do_del_key(key, store) do
-    alias Ferricstore.Store.{CompoundKey, TypeRegistry}
-
-    # Check for data structure type metadata when compound operations are
-    # available (the store has compound_get). When they are not available
-    # (e.g. raw Router-based store without data structure support), fall
-    # through to plain key deletion.
-    has_compound? = is_map_key(store, :compound_get)
-
-    if has_compound? do
-      type_key = CompoundKey.type_key(key)
-
-      case store.compound_get.(key, type_key) do
-        nil ->
-          # No type metadata -- plain string key
-          if store.exists?.(key) do
-            store.delete.(key)
-            true
-          else
-            false
-          end
-
-        type_str ->
-          # Data structure key -- delete compound sub-keys, then type metadata.
-          # Lists store data as serialized Erlang terms in the plain key store,
-          # so we must also delete the plain key for list types.
-          prefix =
-            case type_str do
-              "hash" -> CompoundKey.hash_prefix(key)
-              "list" -> CompoundKey.list_prefix(key)
-              "set" -> CompoundKey.set_prefix(key)
-              "zset" -> CompoundKey.zset_prefix(key)
-            end
-
-          store.compound_delete_prefix.(key, prefix)
-          if type_str == "list" do
-            meta_key = CompoundKey.list_meta_key(key)
-            store.compound_delete.(key, meta_key)
-          end
-          TypeRegistry.delete_type(key, store)
-          true
-      end
-    else
-      if store.exists?.(key) do
-        store.delete.(key)
-        true
-      else
-        false
-      end
-    end
-  end
-
   def handle("EXISTS", [], _store) do
     {:error, "ERR wrong number of arguments for 'exists' command"}
   end
@@ -796,4 +741,63 @@ defmodule Ferricstore.Commands.Strings do
   # SMALL_ATOM_EXT (tag 115): 1-byte length + atom bytes (Latin1)
   defp extract_etf_atom_name(<<115, len::8, name::binary-size(len), _::binary>>), do: name
   defp extract_etf_atom_name(_), do: nil
+
+  # ---------------------------------------------------------------------------
+  # Private — DEL key deletion (plain + compound)
+  # ---------------------------------------------------------------------------
+
+  # Deletes a single key, handling both plain string keys and data structure
+  # keys that use compound sub-keys. Returns `true` if the key existed and
+  # was deleted, `false` otherwise.
+  defp do_del_key(key, store) do
+    alias Ferricstore.Store.{CompoundKey, TypeRegistry}
+
+    # Check for data structure type metadata when compound operations are
+    # available (the store has compound_get). When they are not available
+    # (e.g. raw Router-based store without data structure support), fall
+    # through to plain key deletion.
+    has_compound? = is_map_key(store, :compound_get)
+
+    if has_compound? do
+      type_key = CompoundKey.type_key(key)
+
+      case store.compound_get.(key, type_key) do
+        nil ->
+          # No type metadata -- plain string key
+          if store.exists?.(key) do
+            store.delete.(key)
+            true
+          else
+            false
+          end
+
+        type_str ->
+          # Data structure key -- delete compound sub-keys, then type metadata.
+          # Lists store data as serialized Erlang terms in the plain key store,
+          # so we must also delete the plain key for list types.
+          prefix =
+            case type_str do
+              "hash" -> CompoundKey.hash_prefix(key)
+              "list" -> CompoundKey.list_prefix(key)
+              "set" -> CompoundKey.set_prefix(key)
+              "zset" -> CompoundKey.zset_prefix(key)
+            end
+
+          store.compound_delete_prefix.(key, prefix)
+          if type_str == "list" do
+            meta_key = CompoundKey.list_meta_key(key)
+            store.compound_delete.(key, meta_key)
+          end
+          TypeRegistry.delete_type(key, store)
+          true
+      end
+    else
+      if store.exists?.(key) do
+        store.delete.(key)
+        true
+      else
+        false
+      end
+    end
+  end
 end

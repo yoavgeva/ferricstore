@@ -289,11 +289,6 @@ defmodule Ferricstore.Raft.Batcher do
     enqueue_write(command, from, state)
   end
 
-  @impl true
-  def handle_cast({:write, command, reply_to}, state) do
-    enqueue_write(command, reply_to, state)
-  end
-
   def handle_call(:flush, from, state) do
     # Flush all pending slots (submits pipelined ra commands)
     new_state = flush_all_slots(state)
@@ -305,6 +300,11 @@ defmodule Ferricstore.Raft.Batcher do
     else
       {:noreply, %{new_state | flush_waiters: [from | new_state.flush_waiters]}}
     end
+  end
+
+  @impl true
+  def handle_cast({:write, command, reply_to}, state) do
+    enqueue_write(command, reply_to, state)
   end
 
   @impl true

@@ -120,30 +120,6 @@ defmodule Ferricstore.Commands.Server do
     :ok
   end
 
-  defp flush_all_prob_dirs do
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
-    shard_count = shard_count()
-
-    for i <- 0..(shard_count - 1) do
-      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
-      prob_dir = Path.join(shard_path, "prob")
-
-      if File.exists?(prob_dir) do
-        case File.ls(prob_dir) do
-          {:ok, files} ->
-            Enum.each(files, fn file ->
-              File.rm(Path.join(prob_dir, file))
-            end)
-
-          _ ->
-            :ok
-        end
-      end
-    end
-  rescue
-    _ -> :ok
-  end
-
   def handle("FLUSHDB", _args, _store) do
     {:error, "ERR syntax error"}
   end
@@ -319,7 +295,110 @@ defmodule Ferricstore.Commands.Server do
   end
 
   # ---------------------------------------------------------------------------
-  # Private — INFO section builders
+  # CONFIG
+  # ---------------------------------------------------------------------------
+
+  def handle("CONFIG", [subcmd | rest], _store) do
+    handle_config(String.upcase(subcmd), upcase_local_modifier(rest))
+  end
+
+  def handle("CONFIG", [], _store) do
+    {:error, "ERR wrong number of arguments for 'config' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # MODULE stubs
+  # ---------------------------------------------------------------------------
+
+  def handle("MODULE", ["LIST" | _], _store), do: []
+  def handle("MODULE", ["LOAD" | _], _store), do: {:error, "ERR FerricStore does not support modules"}
+  def handle("MODULE", ["UNLOAD" | _], _store), do: {:error, "ERR FerricStore does not support modules"}
+  def handle("MODULE", _, _store), do: {:error, "ERR unknown subcommand for 'module' command"}
+
+  # ---------------------------------------------------------------------------
+  # WAITAOF stub
+  # ---------------------------------------------------------------------------
+
+  def handle("WAITAOF", [_, _, _], _store), do: [0, 0]
+  def handle("WAITAOF", _args, _store), do: {:error, "ERR wrong number of arguments for 'waitaof' command"}
+
+  # ---------------------------------------------------------------------------
+  # SLOWLOG
+  # ---------------------------------------------------------------------------
+
+  def handle("SLOWLOG", ["GET"], _store), do: format_slowlog_entries(Ferricstore.SlowLog.get())
+
+  def handle("SLOWLOG", ["GET", count_str], _store) do
+    case Integer.parse(count_str) do
+      {count, ""} when count >= 0 ->
+        format_slowlog_entries(Ferricstore.SlowLog.get(count))
+
+      _ ->
+        {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
+  def handle("SLOWLOG", ["LEN"], _store), do: Ferricstore.SlowLog.len()
+
+  def handle("SLOWLOG", ["RESET"], _store) do
+    Ferricstore.SlowLog.reset()
+    :ok
+  end
+
+  def handle("SLOWLOG", ["HELP"], _store) do
+    [
+      "SLOWLOG GET [<count>] -- Return top entries from the slowlog.",
+      "SLOWLOG LEN -- Return the number of entries in the slowlog.",
+      "SLOWLOG RESET -- Reset the slowlog."
+    ]
+  end
+
+  def handle("SLOWLOG", _args, _store) do
+    {:error, "ERR unknown subcommand or wrong number of arguments for 'slowlog' command"}
+  end
+
+  # ---------------------------------------------------------------------------
+  # SAVE / BGSAVE / LASTSAVE
+  # ---------------------------------------------------------------------------
+
+  def handle("SAVE", _args, _store), do: :ok
+  def handle("BGSAVE", _args, _store), do: {:simple, "Background saving started"}
+  def handle("LASTSAVE", _args, _store), do: System.os_time(:second)
+
+  # ===========================================================================
+  # Private helpers
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # FLUSHDB helper
+  # ---------------------------------------------------------------------------
+
+  defp flush_all_prob_dirs do
+    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    shard_count = shard_count()
+
+    for i <- 0..(shard_count - 1) do
+      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
+      prob_dir = Path.join(shard_path, "prob")
+
+      if File.exists?(prob_dir) do
+        case File.ls(prob_dir) do
+          {:ok, files} ->
+            Enum.each(files, fn file ->
+              File.rm(Path.join(prob_dir, file))
+            end)
+
+          _ ->
+            :ok
+        end
+      end
+    end
+  rescue
+    _ -> :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO section builders
   # ---------------------------------------------------------------------------
 
   @all_sections ["server", "clients", "memory", "keyspace", "stats", "persistence", "replication", "cpu", "namespace_config", "raft", "bitcask", "ferricstore", "keydir_analysis"]
@@ -457,40 +536,6 @@ defmodule Ferricstore.Commands.Server do
     ]
 
     format_section("Keyspace", fields)
-  end
-
-  # Compute expires count and avg_ttl from ETS keydirs.
-  # Uses :ets.select_count for expires (O(n) at C level, no term creation)
-  # and samples up to 20 keys per shard for avg_ttl.
-  defp compute_expiry_stats(ctx) do
-    now = System.os_time(:millisecond)
-    count_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [true]}]
-    sample_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [:"$1"]}]
-
-    {total_expires, ttl_samples} =
-      for i <- 0..(ctx.shard_count - 1), reduce: {0, []} do
-        {exp_acc, ttl_acc} ->
-          keydir = elem(ctx.keydir_refs, i)
-          try do
-            count = :ets.select_count(keydir, count_spec)
-            samples = case :ets.select(keydir, sample_spec, 20) do
-              {results, _cont} -> results
-              :"$end_of_table" -> []
-            end
-            {exp_acc + count, samples ++ ttl_acc}
-          rescue
-            ArgumentError -> {exp_acc, ttl_acc}
-          end
-      end
-
-    avg_ttl = case ttl_samples do
-      [] -> 0
-      _ ->
-        remaining = Enum.map(ttl_samples, fn exp -> max(0, exp - now) end)
-        div(Enum.sum(remaining), length(remaining))
-    end
-
-    {total_expires, avg_ttl}
   end
 
   defp build_section("stats", _store) do
@@ -800,6 +845,48 @@ defmodule Ferricstore.Commands.Server do
     format_section("Keydir_Analysis", fields)
   end
 
+  # ---------------------------------------------------------------------------
+  # Keyspace expiry stats helper
+  # ---------------------------------------------------------------------------
+
+  # Compute expires count and avg_ttl from ETS keydirs.
+  # Uses :ets.select_count for expires (O(n) at C level, no term creation)
+  # and samples up to 20 keys per shard for avg_ttl.
+  defp compute_expiry_stats(ctx) do
+    now = System.os_time(:millisecond)
+    count_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [true]}]
+    sample_spec = [{{:_, :_, :"$1", :_, :_, :_, :_}, [{:>, :"$1", 0}], [:"$1"]}]
+
+    {total_expires, ttl_samples} =
+      for i <- 0..(ctx.shard_count - 1), reduce: {0, []} do
+        {exp_acc, ttl_acc} ->
+          keydir = elem(ctx.keydir_refs, i)
+          try do
+            count = :ets.select_count(keydir, count_spec)
+            samples = case :ets.select(keydir, sample_spec, 20) do
+              {results, _cont} -> results
+              :"$end_of_table" -> []
+            end
+            {exp_acc + count, samples ++ ttl_acc}
+          rescue
+            ArgumentError -> {exp_acc, ttl_acc}
+          end
+      end
+
+    avg_ttl = case ttl_samples do
+      [] -> 0
+      _ ->
+        remaining = Enum.map(ttl_samples, fn exp -> max(0, exp - now) end)
+        div(Enum.sum(remaining), length(remaining))
+    end
+
+    {total_expires, avg_ttl}
+  end
+
+  # ---------------------------------------------------------------------------
+  # INFO formatting helpers
+  # ---------------------------------------------------------------------------
+
   defp format_section(header, fields) do
     lines = Enum.map(fields, fn {k, v} -> [k, ":", v] end)
 
@@ -838,20 +925,8 @@ defmodule Ferricstore.Commands.Server do
   end
 
   # ---------------------------------------------------------------------------
-  # Private — glob-to-regex conversion
+  # CONFIG helpers
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
-  # CONFIG
-  # ---------------------------------------------------------------------------
-
-  def handle("CONFIG", [subcmd | rest], _store) do
-    handle_config(String.upcase(subcmd), upcase_local_modifier(rest))
-  end
-
-  def handle("CONFIG", [], _store) do
-    {:error, "ERR wrong number of arguments for 'config' command"}
-  end
 
   defp handle_config("GET", ["LOCAL" | rest]) do
     handle_config_get_local(rest)
@@ -888,6 +963,22 @@ defmodule Ferricstore.Commands.Server do
 
   defp handle_config("SET", _args), do: {:error, "ERR wrong number of arguments for 'config|set' command"}
 
+  defp handle_config("RESETSTAT", []) do
+    Stats.reset()
+    Ferricstore.SlowLog.reset()
+    :ok
+  end
+
+  defp handle_config("RESETSTAT", _), do: {:error, "ERR wrong number of arguments for 'config|resetstat' command"}
+  defp handle_config("REWRITE", []) do
+    Ferricstore.Config.rewrite()
+  end
+  defp handle_config("REWRITE", _), do: {:error, "ERR wrong number of arguments for 'config|rewrite' command"}
+
+  defp handle_config(subcmd, _) do
+    {:error, "ERR unknown subcommand '#{String.downcase(subcmd)}' for 'config' command"}
+  end
+
   # -- CONFIG SET LOCAL key value -------------------------------------------------
 
   defp handle_config_set_local([key, value]) do
@@ -911,22 +1002,6 @@ defmodule Ferricstore.Commands.Server do
     {:error, "ERR wrong number of arguments for 'config|get|local' command"}
   end
 
-  defp handle_config("RESETSTAT", []) do
-    Stats.reset()
-    Ferricstore.SlowLog.reset()
-    :ok
-  end
-
-  defp handle_config("RESETSTAT", _), do: {:error, "ERR wrong number of arguments for 'config|resetstat' command"}
-  defp handle_config("REWRITE", []) do
-    Ferricstore.Config.rewrite()
-  end
-  defp handle_config("REWRITE", _), do: {:error, "ERR wrong number of arguments for 'config|rewrite' command"}
-
-  defp handle_config(subcmd, _) do
-    {:error, "ERR unknown subcommand '#{String.downcase(subcmd)}' for 'config' command"}
-  end
-
   # When the first arg to CONFIG GET/SET is "local" (any case), upcase it so
   # the pattern match `["LOCAL" | rest]` works regardless of client casing.
   defp upcase_local_modifier(["local" | rest]), do: ["LOCAL" | rest]
@@ -941,66 +1016,7 @@ defmodule Ferricstore.Commands.Server do
   defp upcase_local_modifier(args), do: args
 
   # ---------------------------------------------------------------------------
-  # MODULE stubs
-  # ---------------------------------------------------------------------------
-
-  def handle("MODULE", ["LIST" | _], _store), do: []
-  def handle("MODULE", ["LOAD" | _], _store), do: {:error, "ERR FerricStore does not support modules"}
-  def handle("MODULE", ["UNLOAD" | _], _store), do: {:error, "ERR FerricStore does not support modules"}
-  def handle("MODULE", _, _store), do: {:error, "ERR unknown subcommand for 'module' command"}
-
-  # ---------------------------------------------------------------------------
-  # WAITAOF stub
-  # ---------------------------------------------------------------------------
-
-  def handle("WAITAOF", [_, _, _], _store), do: [0, 0]
-  def handle("WAITAOF", _args, _store), do: {:error, "ERR wrong number of arguments for 'waitaof' command"}
-
-  # ---------------------------------------------------------------------------
-  # SLOWLOG
-  # ---------------------------------------------------------------------------
-
-  def handle("SLOWLOG", ["GET"], _store), do: format_slowlog_entries(Ferricstore.SlowLog.get())
-
-  def handle("SLOWLOG", ["GET", count_str], _store) do
-    case Integer.parse(count_str) do
-      {count, ""} when count >= 0 ->
-        format_slowlog_entries(Ferricstore.SlowLog.get(count))
-
-      _ ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
-  end
-
-  def handle("SLOWLOG", ["LEN"], _store), do: Ferricstore.SlowLog.len()
-
-  def handle("SLOWLOG", ["RESET"], _store) do
-    Ferricstore.SlowLog.reset()
-    :ok
-  end
-
-  def handle("SLOWLOG", ["HELP"], _store) do
-    [
-      "SLOWLOG GET [<count>] -- Return top entries from the slowlog.",
-      "SLOWLOG LEN -- Return the number of entries in the slowlog.",
-      "SLOWLOG RESET -- Reset the slowlog."
-    ]
-  end
-
-  def handle("SLOWLOG", _args, _store) do
-    {:error, "ERR unknown subcommand or wrong number of arguments for 'slowlog' command"}
-  end
-
-  # ---------------------------------------------------------------------------
-  # SAVE / BGSAVE / LASTSAVE
-  # ---------------------------------------------------------------------------
-
-  def handle("SAVE", _args, _store), do: :ok
-  def handle("BGSAVE", _args, _store), do: {:simple, "Background saving started"}
-  def handle("LASTSAVE", _args, _store), do: System.os_time(:second)
-
-  # ---------------------------------------------------------------------------
-  # Private — SLOWLOG formatting
+  # SLOWLOG formatting
   # ---------------------------------------------------------------------------
 
   defp format_slowlog_entries(entries) do

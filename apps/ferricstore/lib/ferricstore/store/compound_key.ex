@@ -341,6 +341,17 @@ defmodule Ferricstore.Store.CompoundKey do
 
   """
   @spec internal_key?(binary()) :: boolean()
+  def internal_key?(<<"H:", _rest::binary>>), do: true
+  def internal_key?(<<"L:", _rest::binary>>), do: true
+  def internal_key?(<<"S:", _rest::binary>>), do: true
+  def internal_key?(<<"Z:", _rest::binary>>), do: true
+  def internal_key?(<<"T:", _rest::binary>>), do: true
+  def internal_key?(<<"V:", _rest::binary>>), do: true
+  def internal_key?(<<"VM:", _rest::binary>>), do: true
+  def internal_key?(<<"PM:", _rest::binary>>), do: true
+  def internal_key?(<<"LM:", _rest::binary>>), do: true
+  def internal_key?(_), do: false
+
   @doc """
   Extracts the Redis-level key from a compound key.
 
@@ -381,17 +392,6 @@ defmodule Ferricstore.Store.CompoundKey do
       [redis_key] -> redis_key
     end
   end
-
-  def internal_key?(<<"H:", _rest::binary>>), do: true
-  def internal_key?(<<"L:", _rest::binary>>), do: true
-  def internal_key?(<<"S:", _rest::binary>>), do: true
-  def internal_key?(<<"Z:", _rest::binary>>), do: true
-  def internal_key?(<<"T:", _rest::binary>>), do: true
-  def internal_key?(<<"V:", _rest::binary>>), do: true
-  def internal_key?(<<"VM:", _rest::binary>>), do: true
-  def internal_key?(<<"PM:", _rest::binary>>), do: true
-  def internal_key?(<<"LM:", _rest::binary>>), do: true
-  def internal_key?(_), do: false
 
   @doc """
   Filters a list of raw ETS/store keys to only user-visible logical keys.

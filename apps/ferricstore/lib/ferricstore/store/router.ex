@@ -204,43 +204,6 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp async_write_put(ctx, idx, key, value, expire_at_ms) do
-    keydir = elem(ctx.keydir_refs, idx)
-    value_for_ets = case value do
-      v when is_integer(v) -> Integer.to_string(v)
-      v when is_float(v) -> Float.to_string(v)
-      v when is_binary(v) ->
-        if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
-    end
-    disk_value = to_disk_binary(value)
-    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
-
-    if value_for_ets == nil do
-      # Large value: sync NIF write to get offset, then ETS with real location.
-      # Cannot use async BitcaskWriter because ETS value is nil (too large for
-      # hot cache) and readers would see nil until the async write completes.
-      case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, [{key, disk_value, expire_at_ms}]) do
-        {:ok, [{offset, _record_size}]} ->
-          :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)})
-          size = :counters.info(ctx.write_version).size
-          if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-          async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
-          :ok
-
-        {:error, reason} ->
-          {:error, "ERR disk write failed: #{inspect(reason)}"}
-      end
-    else
-      # Small value: inline in ETS for instant reads, async Bitcask write.
-      :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
-      Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, key, disk_value, expire_at_ms)
-      size = :counters.info(ctx.write_version).size
-      if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-      async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
-      :ok
-    end
-  end
-
   defp async_write(ctx, idx, {:delete, key}) do
     size = :atomics.info(ctx.disk_pressure).size
     under_pressure = if idx < size, do: :atomics.get(ctx.disk_pressure, idx + 1) == 1, else: false
@@ -429,6 +392,43 @@ defmodule Ferricstore.Store.Router do
   # fall back to quorum (CAS, LOCK, UNLOCK, EXTEND, RATELIMIT, LIST_OP).
   defp async_write(ctx, idx, command) do
     quorum_write(ctx, idx, command)
+  end
+
+  defp async_write_put(ctx, idx, key, value, expire_at_ms) do
+    keydir = elem(ctx.keydir_refs, idx)
+    value_for_ets = case value do
+      v when is_integer(v) -> Integer.to_string(v)
+      v when is_float(v) -> Float.to_string(v)
+      v when is_binary(v) ->
+        if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
+    end
+    disk_value = to_disk_binary(value)
+    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+
+    if value_for_ets == nil do
+      # Large value: sync NIF write to get offset, then ETS with real location.
+      # Cannot use async BitcaskWriter because ETS value is nil (too large for
+      # hot cache) and readers would see nil until the async write completes.
+      case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, [{key, disk_value, expire_at_ms}]) do
+        {:ok, [{offset, _record_size}]} ->
+          :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)})
+          size = :counters.info(ctx.write_version).size
+          if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
+          async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
+          :ok
+
+        {:error, reason} ->
+          {:error, "ERR disk write failed: #{inspect(reason)}"}
+      end
+    else
+      # Small value: inline in ETS for instant reads, async Bitcask write.
+      :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
+      Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, key, disk_value, expire_at_ms)
+      size = :counters.info(ctx.write_version).size
+      if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
+      async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
+      :ok
+    end
   end
 
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
@@ -850,17 +850,17 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  @doc """
-  Stores `key` with `value`. `expire_at_ms` is an absolute Unix-epoch
-  timestamp in milliseconds; pass `0` for no expiry.
-  """
-  @spec put(FerricStore.Instance.t(), binary(), binary(), non_neg_integer()) :: :ok | {:error, binary()}
   @max_key_size 65_535
   @max_value_size 512 * 1024 * 1024
 
   @doc "Returns the maximum allowed value size in bytes."
   def max_value_size, do: @max_value_size
 
+  @doc """
+  Stores `key` with `value`. `expire_at_ms` is an absolute Unix-epoch
+  timestamp in milliseconds; pass `0` for no expiry.
+  """
+  @spec put(FerricStore.Instance.t(), binary(), binary(), non_neg_integer()) :: :ok | {:error, binary()}
   def put(ctx, key, value, expire_at_ms \\ 0) do
     cond do
       byte_size(key) > @max_key_size ->
