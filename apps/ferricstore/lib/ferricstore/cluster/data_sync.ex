@@ -183,51 +183,94 @@ defmodule Ferricstore.Cluster.DataSync do
   @spec do_sync_shard(non_neg_integer(), node(), node(), FerricStore.Instance.t()) ::
           {:ok, non_neg_integer()} | {:error, term()}
   defp do_sync_shard(shard_index, target_node, leader_node, ctx) do
-    shard = elem(ctx.shard_names, shard_index)
-    shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
-    ra_path = Path.join(ctx.data_dir, "ra")
+    shard_name = :"Ferricstore.Store.Shard.#{shard_index}"
+    leader_data_dir = get_leader_data_dir(leader_node, ctx)
+    leader_shard_data = Ferricstore.DataDir.shard_data_path(leader_data_dir, shard_index)
+    target_shard_data = Ferricstore.DataDir.shard_data_path(leader_data_dir, shard_index)
 
-    # 1. Pause writes
-    :ok = GenServer.call(shard, {:pause_writes}, 30_000)
+    Logger.info("Shard #{shard_index}: syncing from #{leader_node} to #{target_node}")
+
+    # 1. Pause writes on the LEADER's shard (not local)
+    pause_shard(leader_node, shard_name)
 
     try do
       # 2. Get current Raft index from the leader
       leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
-      raft_index = get_raft_index(leader_server_id)
+      raft_index = get_raft_index_on(leader_node, leader_server_id)
 
       # 3. Copy shard data directory from leader to target
-      leader_shard_data =
-        if leader_node == node() do
-          shard_data_path
-        else
-          :erpc.call(leader_node, Ferricstore.DataDir, :shard_data_path, [ctx.data_dir, shard_index])
-        end
-
-      copy_directory_from(leader_node, leader_shard_data, target_node, shard_data_path)
+      copy_directory_from(leader_node, leader_shard_data, target_node, target_shard_data)
 
       # 4. Copy the ra WAL dir for this shard
-      leader_ra_shard_dir = Path.join(ra_path, "ferricstore_shard_#{shard_index}")
+      leader_ra_dir = Path.join(leader_data_dir, "ra")
+      ra_shard_name = "ferricstore_shard_#{shard_index}"
+      leader_ra_shard_dir = Path.join(leader_ra_dir, ra_shard_name)
 
-      leader_ra_exists =
-        if leader_node == node() do
-          File.exists?(leader_ra_shard_dir)
-        else
-          :erpc.call(leader_node, File, :exists?, [leader_ra_shard_dir])
-        end
+      ra_exists = file_exists_on?(leader_node, leader_ra_shard_dir)
 
-      if leader_ra_exists do
-        target_ra_dir =
-          Path.join(Path.dirname(shard_data_path), "ra/ferricstore_shard_#{shard_index}")
-
+      if ra_exists do
+        target_ra_dir = Path.join(leader_data_dir, "ra/#{ra_shard_name}")
         copy_directory_from(leader_node, leader_ra_shard_dir, target_node, target_ra_dir)
       end
 
+      Logger.info("Shard #{shard_index}: sync complete at raft index #{raft_index}")
       {:ok, raft_index}
     rescue
       e -> {:error, Exception.message(e)}
     after
-      # 5. Always resume writes
-      GenServer.call(shard, {:resume_writes}, 5_000)
+      # 5. Always resume writes on the leader
+      resume_shard(leader_node, shard_name)
+    end
+  end
+
+  defp pause_shard(node, shard_name) do
+    if node == node() do
+      GenServer.call(shard_name, {:pause_writes}, 30_000)
+    else
+      :erpc.call(node, GenServer, :call, [shard_name, {:pause_writes}, 30_000])
+    end
+  end
+
+  defp resume_shard(node, shard_name) do
+    if node == node() do
+      GenServer.call(shard_name, {:resume_writes}, 5_000)
+    else
+      try do
+        :erpc.call(node, GenServer, :call, [shard_name, {:resume_writes}, 5_000])
+      catch
+        _, _ -> :ok
+      end
+    end
+  end
+
+  defp get_leader_data_dir(leader_node, ctx) do
+    if leader_node == node() do
+      ctx.data_dir
+    else
+      :erpc.call(leader_node, fn ->
+        FerricStore.Instance.get(:default).data_dir
+      end, [])
+    end
+  end
+
+  defp get_raft_index_on(leader_node, server_id) do
+    if leader_node == node() do
+      get_raft_index(server_id)
+    else
+      :erpc.call(leader_node, fn ->
+        case :ra.member_overview(server_id) do
+          {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
+          _ -> 0
+        end
+      end, [])
+    end
+  end
+
+  defp file_exists_on?(node, path) do
+    if node == node() do
+      File.exists?(path)
+    else
+      :erpc.call(node, File, :exists?, [path])
     end
   end
 

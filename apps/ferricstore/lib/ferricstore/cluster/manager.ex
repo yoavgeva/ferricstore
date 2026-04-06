@@ -144,10 +144,9 @@ defmodule Ferricstore.Cluster.Manager do
 
   def handle_call({:add_node, target_node, role}, _from, state) do
     membership = role_to_membership(role)
-    {result, shard_sync} = do_add_node(target_node, membership, state)
+    result = do_join_node(target_node, membership, state)
     new_known = MapSet.put(state.known_nodes, target_node)
-    merged_sync = Map.merge(state.shard_sync_status, %{target_node => shard_sync})
-    {:reply, result, %{state | known_nodes: new_known, shard_sync_status: merged_sync}}
+    {:reply, result, %{state | known_nodes: new_known}}
   end
 
   def handle_call({:remove_node, target_node}, _from, state) do
@@ -177,9 +176,11 @@ defmodule Ferricstore.Cluster.Manager do
     # Cancel any pending removal timer for this node
     state = cancel_remove_timer(state, node)
 
-    # Check if this node is in our cluster config
+    # Check if this node is in our cluster config — auto-join if so
     if node in state.cluster_nodes do
       new_known = MapSet.put(state.known_nodes, node)
+      # Auto-join: add to Raft groups + sync data (same path as CLUSTER.JOIN)
+      spawn(fn -> do_auto_join(node, state.role) end)
       {:noreply, %{state | known_nodes: new_known}}
     else
       {:noreply, state}
@@ -213,6 +214,74 @@ defmodule Ferricstore.Cluster.Manager do
 
   def handle_info(_msg, state) do
     {:noreply, state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: join flow (add to Raft + data sync — used by both auto and manual)
+  # ---------------------------------------------------------------------------
+
+  # Full join: add to Raft groups, then sync data if needed.
+  # This is the single code path for both :nodeup auto-join and CLUSTER.JOIN.
+  defp do_join_node(target_node, membership, state) do
+    Logger.info("ClusterManager: joining #{target_node} (#{membership})")
+
+    # Step 1: Add to all Raft groups
+    {raft_result, _shard_results} = do_add_node(target_node, membership, state)
+
+    case raft_result do
+      :ok ->
+        # Step 2: Sync data — copies shard dirs from leader to target
+        ctx = FerricStore.Instance.get(:default)
+
+        case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
+          {:ok, sync_results} ->
+            Logger.info("ClusterManager: #{target_node} fully synced: #{inspect(sync_results)}")
+            :ok
+
+          {:error, reason} ->
+            Logger.error("ClusterManager: data sync failed for #{target_node}: #{inspect(reason)}")
+            {:error, {:sync_failed, reason}}
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # Auto-join: triggered by :nodeup, runs in a spawned process so
+  # handle_info returns immediately. Same code path as manual join.
+  defp do_auto_join(target_node, role) do
+    membership = role_to_membership(role)
+    Logger.info("ClusterManager: auto-joining #{target_node} as #{role}")
+
+    # Small delay to let the new node's application finish starting
+    Process.sleep(2_000)
+
+    case do_join_node_standalone(target_node, membership) do
+      :ok ->
+        Logger.info("ClusterManager: auto-join complete for #{target_node}")
+
+      {:error, reason} ->
+        Logger.error("ClusterManager: auto-join failed for #{target_node}: #{inspect(reason)}")
+    end
+  end
+
+  # Standalone version of do_join_node that doesn't need GenServer state
+  defp do_join_node_standalone(target_node, membership) do
+    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
+
+    # Step 1: Add to all Raft groups
+    for shard_idx <- 0..(shard_count - 1) do
+      RaftCluster.add_member(shard_idx, target_node, membership)
+    end
+
+    # Step 2: Sync data
+    ctx = FerricStore.Instance.get(:default)
+
+    case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   # ---------------------------------------------------------------------------

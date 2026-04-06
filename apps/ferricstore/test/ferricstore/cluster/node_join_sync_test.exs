@@ -258,44 +258,47 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   # Helpers — these call into :peer nodes via :erpc
   # ---------------------------------------------------------------------------
 
+  # Extract node name from map or pass through atom
+  defp node_name(%{name: name}), do: name
+  defp node_name(name) when is_atom(name), do: name
+
   defp write_keys(node, prefix, range) do
+    n = node_name(node)
     Enum.map(range, fn i ->
       key = "#{prefix}_#{i}"
-      :erpc.call(node, Ferricstore.Store.Router, :put, [
-        :erpc.call(node, FerricStore.Instance, :get, [:default]),
-        key,
-        "value_#{i}",
-        0
-      ])
+      ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
+      :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{i}", 0])
       key
     end)
   end
 
   defp write_key(node, key, value) do
-    ctx = :erpc.call(node, FerricStore.Instance, :get, [:default])
-    :erpc.call(node, Ferricstore.Store.Router, :put, [ctx, key, value, 0])
+    n = node_name(node)
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
+    :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, value, 0])
   end
 
   defp read_key(node, key) do
-    ctx = :erpc.call(node, FerricStore.Instance, :get, [:default])
-    :erpc.call(node, Ferricstore.Store.Router, :get, [ctx, key])
+    n = node_name(node)
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
+    :erpc.call(n, Ferricstore.Store.Router, :get, [ctx, key])
   end
 
   defp write_keys_to_shard(node, shard_idx, prefix, range) do
-    ctx = :erpc.call(node, FerricStore.Instance, :get, [:default])
+    n = node_name(node)
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
 
-    # Generate keys that hash to the target shard
     Enum.flat_map(range, fn i ->
-      key = find_key_for_shard(node, ctx, "#{prefix}_#{i}", shard_idx)
-      :erpc.call(node, Ferricstore.Store.Router, :put, [ctx, key, "value_#{i}", 0])
+      key = find_key_for_shard(n, ctx, "#{prefix}_#{i}", shard_idx)
+      :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{i}", 0])
       [key]
     end)
   end
 
-  defp find_key_for_shard(node, ctx, base_key, target_shard) do
+  defp find_key_for_shard(n, ctx, base_key, target_shard) do
     Enum.find_value(0..1000, fn suffix ->
       key = "#{base_key}_#{suffix}"
-      shard = :erpc.call(node, Ferricstore.Store.Router, :shard_for, [ctx, key])
+      shard = :erpc.call(n, Ferricstore.Store.Router, :shard_for, [ctx, key])
       if shard == target_shard, do: key
     end)
   end
@@ -310,15 +313,16 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   defp start_continuous_writer(node, prefix) do
+    n = node_name(node)
     parent = self()
 
     spawn_link(fn ->
-      ctx = :erpc.call(node, FerricStore.Instance, :get, [:default])
-      continuous_write_loop(node, ctx, prefix, 1, [], parent)
+      ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
+      continuous_write_loop(n, ctx, prefix, 1, [], parent)
     end)
   end
 
-  defp continuous_write_loop(node, ctx, prefix, seq, keys, parent) do
+  defp continuous_write_loop(n, ctx, prefix, seq, keys, parent) do
     receive do
       :stop ->
         send(parent, {:writer_done, keys, seq - 1})
@@ -327,13 +331,12 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         key = "#{prefix}_#{seq}"
 
         try do
-          :erpc.call(node, Ferricstore.Store.Router, :put, [ctx, key, "value_#{seq}", 0])
-          continuous_write_loop(node, ctx, prefix, seq + 1, [key | keys], parent)
+          :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{seq}", 0])
+          continuous_write_loop(n, ctx, prefix, seq + 1, [key | keys], parent)
         rescue
           _ ->
-            # Write failed (node busy during sync) — retry after brief pause
             Process.sleep(10)
-            continuous_write_loop(node, ctx, prefix, seq, keys, parent)
+            continuous_write_loop(n, ctx, prefix, seq, keys, parent)
         end
     end
   end
@@ -349,15 +352,17 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   defp write_loop(node, prefix, write_log, seq) do
+    n = node_name(node)
+
     receive do
       :stop -> :ok
     after
       0 ->
         key = "#{prefix}_#{seq}"
-        ctx = :erpc.call(node, FerricStore.Instance, :get, [:default])
+        ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
 
         try do
-          :erpc.call(node, Ferricstore.Store.Router, :put, [ctx, key, "value_#{seq}", 0])
+          :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{seq}", 0])
           :ets.insert(write_log, {key, seq})
         rescue
           _ -> :ok
@@ -368,33 +373,33 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   defp join_cluster(new_node, existing_node) do
-    :erpc.call(existing_node, Ferricstore.Cluster.Manager, :add_node, [new_node])
+    :erpc.call(node_name(existing_node), Ferricstore.Cluster.Manager, :add_node, [node_name(new_node)])
   end
 
   defp assert_node_synced(node, opts) do
+    n = node_name(node)
     timeout = Keyword.get(opts, :timeout, 60_000)
-    deadline = System.monotonic_time(:millisecond) + timeout
 
     eventually(fn ->
-      status = :erpc.call(node, Ferricstore.Cluster.Manager, :sync_status, [])
+      status = :erpc.call(n, Ferricstore.Cluster.Manager, :sync_status, [])
       assert status == :synced, "node sync status: #{inspect(status)}"
     end, "node not synced within #{timeout}ms", div(timeout, 500), 500)
   end
 
   defp get_shard_count(node) do
-    ctx = :erpc.call(node, FerricStore.Instance, :get, [:default])
+    n = node_name(node)
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
     ctx.shard_count
   end
 
   defp dump_keydir(node) do
-    ctx = :erpc.call(node, FerricStore.Instance, :get, [:default])
+    n = node_name(node)
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
 
     for shard_idx <- 0..(ctx.shard_count - 1) do
-      keydir = :erpc.call(node, fn ->
-        elem(FerricStore.Instance.get(:default).keydir_refs, shard_idx)
-      end, [])
-
-      :erpc.call(node, :ets, :tab2list, [keydir])
+      keydir = :erpc.call(n, FerricStore.Instance, :get, [:default])
+               |> Map.get(:keydir_refs) |> elem(shard_idx)
+      :erpc.call(n, :ets, :tab2list, [keydir])
     end
     |> List.flatten()
   end
@@ -407,21 +412,19 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   defp shard_data_checksums(node) do
-    ctx = :erpc.call(node, FerricStore.Instance, :get, [:default])
+    n = node_name(node)
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
 
     for shard_idx <- 0..(ctx.shard_count - 1) do
-      data_dir = :erpc.call(node, fn ->
-        ctx = FerricStore.Instance.get(:default)
-        Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_idx)
-      end, [])
+      shard_path = :erpc.call(n, Ferricstore.DataDir, :shard_data_path, [ctx.data_dir, shard_idx])
 
-      files = :erpc.call(node, File, :ls!, [data_dir])
+      files = :erpc.call(n, File, :ls!, [shard_path])
       |> Enum.filter(&String.ends_with?(&1, ".log"))
       |> Enum.sort()
 
       checksums = Enum.map(files, fn file ->
-        path = Path.join(data_dir, file)
-        content = :erpc.call(node, File, :read!, [path])
+        path = Path.join(shard_path, file)
+        content = :erpc.call(n, File, :read!, [path])
         {file, :crypto.hash(:sha256, content) |> Base.encode16()}
       end)
 
@@ -430,11 +433,12 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   defp trigger_compaction(node) do
-    ctx = :erpc.call(node, FerricStore.Instance, :get, [:default])
+    n = node_name(node)
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
 
     for shard_idx <- 0..(ctx.shard_count - 1) do
       shard = elem(ctx.shard_names, shard_idx)
-      :erpc.call(node, GenServer, :call, [shard, :run_compaction])
+      :erpc.call(n, GenServer, :call, [shard, :run_compaction])
     end
   end
 
