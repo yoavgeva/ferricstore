@@ -482,18 +482,38 @@ Shard uploads run in parallel (Task.async_stream, max_concurrency: shard_count)
 Per-file: S3 multipart upload for files > 100MB (5MB parts)
 ```
 
-#### What about the Raft WAL?
+#### Raft WAL: include it in the snapshot
 
-We do NOT include the WAL in the object storage snapshot. The WAL is managed by
-ra and lives in a separate directory (`ra/`). When the new node joins the Raft
-group, ra handles WAL synchronization automatically — it sends entries from
-`snapshot_raft_index` to current. This is the WAL catch-up that bridges the gap
-between the snapshot and the live cluster.
+The ra WAL directory IS included in the snapshot alongside the Bitcask files.
+Both are captured at the same consistent point (during the write pause).
 
-If the WAL gap is too large (ra truncated entries), the universal sync check
-detects it and falls through to direct copy. The object storage snapshot still
-helps — it provides most of the data, and direct copy only needs to sync the
-delta.
+```
+Snapshot contents per shard:
+  data/shard_i/*.log          (Bitcask data files)
+  data/shard_i/*.hint         (hint files)
+  data/shard_i/promoted/      (dedicated collection stores)
+  data/shard_i/prob/          (probabilistic structure files)
+  ra/shard_i/                 (Raft WAL segments + ra snapshots)
+```
+
+**Why include it:** Without the WAL, the new node starts ra from index 0. The
+leader would replay entries from its earliest available index — but entries
+before `snapshot_index` are already in the Bitcask files. This causes:
+- Duplicate Bitcask writes (garbage until compaction)
+- Wasted replay time (re-applying thousands of already-applied entries)
+
+With the WAL included, the new node's ra server starts from `snapshot_index`.
+It only needs to replay the delta (entries since the snapshot was taken). Clean,
+no duplicates, minimal replay time.
+
+**Consistency:** The write pause ensures both the Bitcask files and the ra WAL
+are captured at the exact same Raft index. The hardlink snapshot captures both
+directories atomically — they represent the same point-in-time state.
+
+**Universal sync check still applies:** The new node starts ra from the
+snapshot's WAL state. ra checks if the leader's current WAL can bridge from
+`snapshot_index` to `current_index`. If yes → WAL replay. If the gap is too
+large (leader truncated entries) → falls through to direct copy.
 
 ### Object storage configuration
 
