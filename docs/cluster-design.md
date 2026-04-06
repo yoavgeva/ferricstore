@@ -347,63 +347,167 @@ Other shards serve traffic throughout
 ### Strategy 2: Object storage snapshots
 
 The leader periodically uploads a consistent snapshot of each shard's data directory
-to object storage (S3, GCS, MinIO). New nodes bootstrap from these snapshots instead
-of copying from the leader.
+to object storage. New nodes bootstrap from these snapshots instead of copying from
+the leader.
+
+#### How to snapshot without blocking writes
+
+Bitcask's append-only property is the key. Old .log files are **never modified** —
+only the active file gets appended to. We exploit this with hardlinks:
 
 ```
-Leader (periodic, every ~1 hour):
+For each shard i (sequentially, same as direct copy):
 
-For each shard i:
-  1. Pause writes briefly (same as direct copy)
-  2. Record Raft log index as snapshot_index
-  3. tar + compress shard_i data directory
-  4. Upload to: s3://bucket/ferricstore/shard_i/snapshot_{timestamp}.tar.gz
-  5. Write manifest: s3://bucket/ferricstore/manifest.json
-     {
-       "timestamp": "2026-04-06T12:00:00Z",
-       "raft_index_per_shard": {0: 45892, 1: 44100, 2: 46000, 3: 43500},
-       "shards": [
-         {"index": 0, "path": "shard_0/snapshot_20260406T120000.tar.gz", "size_bytes": 1073741824},
-         ...
-       ]
-     }
-  6. Resume writes
-  7. Clean up old snapshots (keep last N)
+Step 1: Pause writes (milliseconds)
+  └─ Flush pending writes to disk (fsync)
+  └─ Record Raft log index as snapshot_index
+
+Step 2: Hardlink all files to a snapshot dir (instant)
+  └─ mkdir /tmp/snapshot_shard_i/
+  └─ For each file in data/shard_i/:
+     File.ln!(source, dest)              ← hardlink, not copy
+  └─ Same for promoted/, prob/ subdirs
+  └─ Hardlinks are metadata-only — takes microseconds regardless of file size
+
+Step 3: Resume writes (immediate)
+  └─ New writes go to the active file (or a new rotated file)
+  └─ The hardlinked files are a frozen point-in-time copy
+  └─ Reads from the live dir are unaffected — hardlinks share inodes
+
+Step 4: Tar + upload in background (minutes, zero impact)
+  └─ tar czf /tmp/shard_i_snapshot.tar.gz -C /tmp/snapshot_shard_i/ .
+  └─ SnapshotStore.upload(tar_path, "shard_i/snapshot_{timestamp}.tar.gz")
+  └─ rm -rf /tmp/snapshot_shard_i/       ← cleanup hardlinks
+
+Write pause duration: <10ms (flush + fsync + hardlink creation)
+Upload duration: minutes (but writes already resumed, zero impact)
+```
+
+**Why hardlinks work:** Bitcask is append-only. Once a record is written to a
+.log file, that file region is never modified. Compaction creates NEW files and
+deletes old ones — but hardlinks prevent the old inode from being freed until
+the snapshot dir is cleaned up. The snapshot sees a consistent point-in-time view
+of all files, even if the live dir compacts or rotates during upload.
+
+#### Incremental uploads
+
+Most .log files don't change between upload cycles (only the active file is
+appended to, and maybe compaction created/deleted files). Track file checksums
+in the manifest to upload only changed/new files:
+
+```
+Manifest structure:
+{
+  "timestamp": "2026-04-06T12:00:00Z",
+  "shard_count": 4,
+  "shards": [
+    {
+      "index": 0,
+      "raft_index": 45892,
+      "files": [
+        {"name": "00000.log", "size": 67108864, "sha256": "abc123...", "key": "shard_0/00000.log"},
+        {"name": "00001.log", "size": 52428800, "sha256": "def456...", "key": "shard_0/00001.log"},
+        {"name": "00000.hint", "size": 1048576, "sha256": "ghi789...", "key": "shard_0/00000.hint"},
+        ...
+      ]
+    },
+    ...
+  ]
+}
 ```
 
 ```
-New node joining:
+Upload cycle:
+  1. Create hardlink snapshot (as above)
+  2. Compute SHA256 of each file in snapshot dir
+  3. Compare with previous manifest:
+     → File exists with same sha256 → skip upload (already in S3)
+     → File exists with different sha256 → re-upload (compaction rewrote it)
+     → New file → upload
+     → File in old manifest but not in snapshot → mark for deletion in S3
+  4. Upload only changed/new files
+  5. Write new manifest (atomically — see below)
+  6. Delete orphaned files from S3 (from previous manifests)
 
-  1. Download manifest from object storage
-  2. For each shard i (in parallel — no leader impact):
-     a. Download snapshot tar.gz
-     b. Extract to local data/shard_i/
-     c. Download Raft WAL snapshot
-  3. Start all shards:
-     a. recover_keydir from disk files (same code path as restart)
-     b. Join Raft groups — ra replays WAL entries since snapshot_index
-     c. Catches up the ~1 hour delta of writes
-  4. Node is fully operational
-
-Advantages:
-  - Zero impact on leader during new node bootstrap
-  - Parallel download of all shards (vs sequential in direct copy)
-  - Disaster recovery: spin up entire cluster from object storage
-  - Works across regions / slow networks
+First upload: full upload of all files (~100% of data)
+Subsequent uploads: only active file + any compacted files (~1-5% of data)
 ```
+
+#### Upload atomicity
+
+The manifest is the commit point. Partial uploads are invisible to downloaders.
+
+```
+Upload flow:
+  1. Upload shard files to: s3://bucket/prefix/pending/{timestamp}/shard_i/...
+  2. After ALL shard files uploaded successfully:
+     → Write manifest to: s3://bucket/prefix/manifests/{timestamp}.json
+  3. Update "latest" pointer: s3://bucket/prefix/latest.json → points to timestamp
+  4. Clean up old manifests beyond retention_count
+
+Download flow:
+  1. Read s3://bucket/prefix/latest.json → get timestamp
+  2. Read s3://bucket/prefix/manifests/{timestamp}.json → get file list
+  3. Download all files listed in manifest
+  4. Verify SHA256 checksums
+
+If upload crashes midway:
+  → No manifest written → pending files are invisible
+  → Next upload cycle overwrites pending dir
+  → No corruption, no partial state
+```
+
+#### Compression
+
+Optional, configurable. Bitcask values are arbitrary binaries — compression ratio
+varies. For text-heavy workloads (JSON, strings), gzip saves 50-70%. For binary
+data (images, protobuf), minimal savings.
+
+```elixir
+config :ferricstore, :cluster_snapshots,
+  compression: :gzip,    # :gzip | :zstd | :none
+```
+
+Recommend `:zstd` — faster than gzip at similar ratios. Falls back to `:none` if
+zstd isn't available.
+
+#### Upload parallelism
+
+Upload multiple shard snapshots simultaneously to S3. Each shard's files are
+independent — no ordering constraint. Use S3 multipart upload for files >100MB.
+
+```
+Shard snapshots created sequentially (each needs a brief write pause)
+Shard uploads run in parallel (Task.async_stream, max_concurrency: shard_count)
+Per-file: S3 multipart upload for files > 100MB (5MB parts)
+```
+
+#### What about the Raft WAL?
+
+We do NOT include the WAL in the object storage snapshot. The WAL is managed by
+ra and lives in a separate directory (`ra/`). When the new node joins the Raft
+group, ra handles WAL synchronization automatically — it sends entries from
+`snapshot_raft_index` to current. This is the WAL catch-up that bridges the gap
+between the snapshot and the live cluster.
+
+If the WAL gap is too large (ra truncated entries), the universal sync check
+detects it and falls through to direct copy. The object storage snapshot still
+helps — it provides most of the data, and direct copy only needs to sync the
+delta.
 
 ### Object storage configuration
 
 ```elixir
 # config/prod.exs
-config :ferricstore, :cluster_snapshots,
-  enabled: true,
-  backend: :s3,                              # :s3 | :gcs | :local
+config :ferricstore, :snapshot_store,
+  adapter: Ferricstore.Cluster.SnapshotStore.S3,
   bucket: "ferricstore-snapshots",
   prefix: "cluster-prod",
   interval_ms: 3_600_000,                    # 1 hour
-  retention_count: 24,                        # keep last 24 snapshots
-  aws_region: "us-east-1"                     # for S3
+  retention_count: 24,                        # keep last 24 manifests
+  compression: :zstd,                         # :gzip | :zstd | :none
+  multipart_threshold: 104_857_600,           # 100MB — use multipart above this
+  upload_concurrency: 4                       # parallel shard uploads
 ```
 
 ### Which strategy is chosen?
