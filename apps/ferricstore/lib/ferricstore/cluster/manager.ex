@@ -181,9 +181,9 @@ defmodule Ferricstore.Cluster.Manager do
         spawn(fn -> do_auto_join(node, state.role) end)
         {:noreply, %{state | known_nodes: new_known, mode: :cluster}}
 
-      # Case 2: We're standalone but the remote node wants to join us.
+      # Case 2: We don't know this node, but it might want to join us.
       # Check if the remote node's cluster_nodes includes us.
-      state.mode == :standalone ->
+      true ->
         spawn(fn ->
           try do
             remote_nodes = :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_nodes, []], 5_000)
@@ -195,9 +195,6 @@ defmodule Ferricstore.Cluster.Manager do
             _, _ -> :ok
           end
         end)
-        {:noreply, state}
-
-      true ->
         {:noreply, state}
     end
   end

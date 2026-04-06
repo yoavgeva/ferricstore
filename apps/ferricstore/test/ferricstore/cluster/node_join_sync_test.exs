@@ -97,6 +97,53 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     end
 
     @tag timeout: 120_000
+    test "4th node auto-discovers and syncs while writes continue" do
+      # 1. Start 3-node cluster with data
+      nodes = ClusterHelper.start_cluster(3)
+      on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+
+      [node_a, node_b, _node_c] = nodes
+
+      initial_keys = write_keys(node_a, "pre_sync", 1..100)
+      assert_keys_readable(node_b, initial_keys)
+
+      # 2. Continuous writer
+      writer_pid = start_continuous_writer(node_a, "during_sync")
+
+      # 3. Start 4th node with cluster_nodes pointing to existing cluster
+      #    No manual join — auto-discovery handles it
+      all_cluster_nodes = Enum.map(nodes, &node_name/1)
+      node_d = ClusterHelper.start_node(cluster_nodes: all_cluster_nodes)
+      on_exit(fn -> ClusterHelper.stop_node(node_d) end)
+
+      # 4. Connect node_d to the cluster (simulates libcluster)
+      :erpc.call(node_name(node_a), Node, :connect, [node_name(node_d)])
+
+      # 5. Stop writer after giving auto-join time to complete
+      Process.sleep(3_000)
+      {during_sync_keys, during_sync_count} = stop_continuous_writer(writer_pid)
+      IO.puts("Writes during sync: #{during_sync_count}")
+
+      final_keys = write_keys(node_a, "post_sync", 1..50)
+      all_keys = initial_keys ++ during_sync_keys ++ final_keys
+
+      # 6. Wait for all keys on node_d
+      eventually(fn ->
+        missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
+        assert missing_count == 0, "#{missing_count} keys still missing on node_d"
+      end, "not all keys replicated to node_d", 60, 500)
+
+      IO.puts("Total keys: #{length(all_keys)}, missing on node_d: 0")
+
+      # 7. Keydirs identical
+      eventually(fn ->
+        assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_d), "keydir mismatch"
+      end, "keydirs not converged", 20, 500)
+
+      IO.puts("SUCCESS: #{length(all_keys)} keys identical (auto-discovery)")
+    end
+
+    @tag timeout: 120_000
     test "no writes lost during sync — every write is durable" do
       nodes = ClusterHelper.start_cluster(3)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
