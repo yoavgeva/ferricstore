@@ -38,6 +38,14 @@ defmodule Ferricstore.Cluster.RateLimitTest do
     %{nodes: nodes}
   end
 
+  # Helper: execute a Router function on a remote peer node with ctx.
+  # Uses two MFA-form :erpc calls to avoid sending anonymous functions
+  # (which would fail with :undef on peer nodes that lack test module code).
+  defp remote_router(node_name, fun, args) do
+    ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
+    :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
+  end
+
   # ---------------------------------------------------------------------------
   # Section 14: Rate Limit Correctness Per Node
   # ---------------------------------------------------------------------------
@@ -53,7 +61,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
         # Send exactly `limit` requests -- all should be allowed
         for i <- 1..limit do
           result =
-            :rpc.call(node.name, Ferricstore.Store.Router, :ratelimit_add, [
+            remote_router(node.name, :ratelimit_add, [
               key,
               window,
               limit,
@@ -68,7 +76,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
         # Next request should be denied
         result =
-          :rpc.call(node.name, Ferricstore.Store.Router, :ratelimit_add, [
+          remote_router(node.name, :ratelimit_add, [
             key,
             window,
             limit,
@@ -91,7 +99,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
       # First request
       [status, count, remaining, _ttl] =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
       assert status == "allowed"
       assert count == 1
@@ -99,11 +107,11 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
       # Fifth request
       for _ <- 2..5 do
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
       end
 
       [status, count, remaining, _ttl] =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
       assert status == "allowed"
       assert count == 6
@@ -127,13 +135,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
       tasks =
         for _i <- 1..50 do
           Task.async(fn ->
-            :rpc.call(
-              n1.name,
-              Ferricstore.Store.Router,
-              :ratelimit_add,
-              [key, window, limit, 1],
-              10_000
-            )
+            remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
           end)
         end
 
@@ -176,13 +178,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
           for _i <- 1..25 do
             Task.async(fn ->
               result =
-                :rpc.call(
-                  node.name,
-                  Ferricstore.Store.Router,
-                  :ratelimit_add,
-                  [key, window, limit, 1],
-                  10_000
-                )
+                remote_router(node.name, :ratelimit_add, [key, window, limit, 1])
 
               {node.index, result}
             end)
@@ -224,25 +220,25 @@ defmodule Ferricstore.Cluster.RateLimitTest do
       # Use 8 of 10 allowed requests
       for _ <- 1..8 do
         [status | _] =
-          :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+          remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
         assert status == "allowed"
       end
 
       # Verify 2 more are allowed
       [status | _] =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
       assert status == "allowed"
 
       [status | _] =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
       assert status == "allowed"
 
       # 11th should be denied
       [status | _] =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
       assert status == "denied",
              "11th request should be denied (used 8 + 2 = 10, limit is 10)"
@@ -255,7 +251,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
       # Exhaust rate limit on one key on n1
       for _ <- 1..5 do
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [
+        remote_router(n1.name, :ratelimit_add, [
           "rl:indep:api:user1",
           window,
           5,
@@ -265,7 +261,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
       # That key is exhausted on n1
       [status | _] =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [
+        remote_router(n1.name, :ratelimit_add, [
           "rl:indep:api:user1",
           window,
           5,
@@ -276,7 +272,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
       # Different key on n2 is independent
       [status2 | _] =
-        :rpc.call(n2.name, Ferricstore.Store.Router, :ratelimit_add, [
+        remote_router(n2.name, :ratelimit_add, [
           "rl:indep:search:user1",
           window,
           5,
@@ -311,14 +307,14 @@ defmodule Ferricstore.Cluster.RateLimitTest do
       # Send 3 requests through n1
       for _ <- 1..3 do
         [status | _] =
-          :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+          remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
         assert status == "allowed"
       end
 
       # Check n1's effective count
       [_status, n1_count, _remaining, _ttl] =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
       assert n1_count == 4, "n1 should have count of 4 after 4 requests"
 
@@ -326,7 +322,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
       # (no replication). When multi-node Raft is added, n2 should see
       # the aggregate count from n1's requests.
       [status2, n2_count, _remaining2, _ttl2] =
-        :rpc.call(n2.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n2.name, :ratelimit_add, [key, window, limit, 1])
 
       assert status2 == "allowed"
 
@@ -336,7 +332,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
 
       # Same for n3
       [status3, n3_count, _remaining3, _ttl3] =
-        :rpc.call(n3.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n3.name, :ratelimit_add, [key, window, limit, 1])
 
       assert status3 == "allowed"
       assert n3_count == 1, "n3 counter should also be independent"
@@ -354,21 +350,21 @@ defmodule Ferricstore.Cluster.RateLimitTest do
       # Exhaust rate limit on n1
       for _ <- 1..5 do
         [status | _] =
-          :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+          remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
         assert status == "allowed"
       end
 
       # n1 is exhausted
       [denied_status | _] =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n1.name, :ratelimit_add, [key, window, limit, 1])
 
       assert denied_status == "denied", "n1 should be rate-limited"
 
       # n2 is NOT exhausted (independent state in single-node mode)
       # When multi-node Raft is added, n2 should also return "denied".
       [n2_status | _] =
-        :rpc.call(n2.name, Ferricstore.Store.Router, :ratelimit_add, [key, window, limit, 1])
+        remote_router(n2.name, :ratelimit_add, [key, window, limit, 1])
 
       assert n2_status == "allowed",
              "in single-node mode, n2 should not be affected by n1's exhausted counter"
@@ -387,13 +383,7 @@ defmodule Ferricstore.Cluster.RateLimitTest do
           for _i <- 1..30 do
             Task.async(fn ->
               result =
-                :rpc.call(
-                  node.name,
-                  Ferricstore.Store.Router,
-                  :ratelimit_add,
-                  ["rl:cross:concurrent", window, limit, 1],
-                  10_000
-                )
+                remote_router(node.name, :ratelimit_add, ["rl:cross:concurrent", window, limit, 1])
 
               {node.index, result}
             end)

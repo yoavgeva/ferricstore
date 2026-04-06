@@ -38,6 +38,14 @@ defmodule Ferricstore.Cluster.LockTest do
     %{nodes: nodes}
   end
 
+  # Helper: execute a Router function on a remote peer node with ctx.
+  # Uses two MFA-form :erpc calls to avoid sending anonymous functions
+  # (which would fail with :undef on peer nodes that lack test module code).
+  defp remote_router(node_name, fun, args) do
+    ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
+    :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
+  end
+
   # ---------------------------------------------------------------------------
   # Section 13: Lock Visibility
   # ---------------------------------------------------------------------------
@@ -49,7 +57,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Acquire lock on n1
       result =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cluster:vis",
           "owner1",
           30_000
@@ -59,7 +67,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Second acquire with different owner on same node should fail
       result2 =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cluster:vis",
           "owner2",
           5_000
@@ -77,7 +85,7 @@ defmodule Ferricstore.Cluster.LockTest do
       # that only one node can hold the lock.
       Enum.each(nodes, fn node ->
         result =
-          :rpc.call(node.name, Ferricstore.Store.Router, :lock, [
+          remote_router(node.name, :lock, [
             "lock:cluster:independent:#{node.index}",
             "owner_#{node.index}",
             30_000
@@ -102,12 +110,7 @@ defmodule Ferricstore.Cluster.LockTest do
       tasks =
         for i <- 1..5 do
           Task.async(fn ->
-            :rpc.call(
-              n1.name,
-              Ferricstore.Store.Router,
-              :lock,
-              ["lock:cluster:race", "worker_#{i}", 10_000]
-            )
+            remote_router(n1.name, :lock, ["lock:cluster:race", "worker_#{i}", 10_000])
           end)
         end
 
@@ -136,7 +139,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Acquire a lock with long TTL
       :ok =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cluster:durable",
           "worker1",
           60_000
@@ -144,7 +147,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Verify it is held
       result =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cluster:durable",
           "worker2",
           5_000
@@ -154,7 +157,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Same owner can re-acquire (idempotent)
       result2 =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cluster:durable",
           "worker1",
           60_000
@@ -175,7 +178,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Acquire lock
       :ok =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cluster:unlock_val",
           "real_owner",
           30_000
@@ -183,7 +186,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Attempt to unlock with wrong owner
       result =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :unlock, [
+        remote_router(n1.name, :unlock, [
           "lock:cluster:unlock_val",
           "impostor"
         ])
@@ -193,7 +196,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Lock should still be held
       lock_check =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cluster:unlock_val",
           "another",
           100
@@ -209,7 +212,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Acquire lock
       :ok =
-        :rpc.call(n2.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n2.name, :lock, [
           "lock:cluster:unlock_ok",
           "the_owner",
           30_000
@@ -217,7 +220,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Unlock with correct owner
       result =
-        :rpc.call(n2.name, Ferricstore.Store.Router, :unlock, [
+        remote_router(n2.name, :unlock, [
           "lock:cluster:unlock_ok",
           "the_owner"
         ])
@@ -226,7 +229,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Lock should now be re-acquirable by anyone
       result2 =
-        :rpc.call(n2.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n2.name, :lock, [
           "lock:cluster:unlock_ok",
           "new_owner",
           10_000
@@ -241,7 +244,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Acquire lock on n1
       :ok =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cluster:cross_unlock:#{n1.index}",
           "owner_a",
           30_000
@@ -251,7 +254,7 @@ defmodule Ferricstore.Cluster.LockTest do
       # its own lock state. This test verifies unlock validation per-node.
       # First acquire the same key on n3
       :ok =
-        :rpc.call(n3.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n3.name, :lock, [
           "lock:cluster:cross_unlock:#{n3.index}",
           "owner_a",
           30_000
@@ -259,7 +262,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Attempt to unlock with wrong owner on n3
       result =
-        :rpc.call(n3.name, Ferricstore.Store.Router, :unlock, [
+        remote_router(n3.name, :unlock, [
           "lock:cluster:cross_unlock:#{n3.index}",
           "impostor_b"
         ])
@@ -290,7 +293,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Acquire lock on n1
       result =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cross:vis",
           "owner_alpha",
           30_000
@@ -300,7 +303,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # On n1, the lock is held -- another owner cannot acquire
       blocked =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cross:vis",
           "owner_beta",
           5_000
@@ -312,7 +315,7 @@ defmodule Ferricstore.Cluster.LockTest do
       # In single-node mode, n2 has independent state -- the same key
       # is NOT locked on n2 (no Raft replication between nodes).
       n2_result =
-        :rpc.call(n2.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n2.name, :lock, [
           "lock:cross:vis",
           "owner_gamma",
           30_000
@@ -325,7 +328,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Same for n3
       n3_result =
-        :rpc.call(n3.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n3.name, :lock, [
           "lock:cross:vis",
           "owner_delta",
           30_000
@@ -341,18 +344,18 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # Acquire and release on n1
       :ok =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cross:iso",
           "worker_a",
           30_000
         ])
 
-      result = :rpc.call(n1.name, Ferricstore.Store.Router, :unlock, ["lock:cross:iso", "worker_a"])
+      result = remote_router(n1.name, :unlock, ["lock:cross:iso", "worker_a"])
       assert result == 1, "unlock on n1 should succeed"
 
       # n1 lock is released, re-acquirable
       reacquire =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n1.name, :lock, [
           "lock:cross:iso",
           "worker_b",
           30_000
@@ -362,7 +365,7 @@ defmodule Ferricstore.Cluster.LockTest do
 
       # n2 never had this lock, so it can acquire independently
       n2_result =
-        :rpc.call(n2.name, Ferricstore.Store.Router, :lock, [
+        remote_router(n2.name, :lock, [
           "lock:cross:iso",
           "worker_c",
           30_000

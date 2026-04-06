@@ -34,6 +34,12 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
     %{nodes: nodes}
   end
 
+  # Helper: execute a Router function on a remote peer node with ctx.
+  defp remote_router(node_name, fun, args) do
+    ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
+    :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
+  end
+
   # ---------------------------------------------------------------------------
   # RA-001: Entry committed to quorum before ACK
   # (Section 6.1)
@@ -52,13 +58,13 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
         val = "quorum_val_#{node.index}"
 
         # PUT should return :ok only after Raft commit
-        result = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, val, 0])
+        result = remote_router(node.name, :put, [key, val, 0])
         assert result == :ok, "PUT should succeed (Raft commit on self-quorum)"
 
         # Immediately after ACK, the entry must be in the ra log.
         # We verify by checking ra:members returns a valid leader and
         # the value is readable (proving apply() ran after commit).
-        shard_idx = :rpc.call(node.name, Ferricstore.Store.Router, :shard_for, [key])
+        shard_idx = remote_router(node.name, :shard_for, [key])
         server_id = {:"ferricstore_shard_#{shard_idx}", node.name}
 
         # ra:members confirms the server is healthy with a committed log
@@ -71,7 +77,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
         assert members != [], "ra group should have at least 1 member"
 
         # Value must be readable immediately after ACK (apply ran)
-        read_val = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+        read_val = remote_router(node.name, :get, [key])
         assert read_val == val, "value should be readable immediately after Raft commit ACK"
       end)
     end
@@ -93,18 +99,18 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
       [n1, n2, n3] = nodes
 
       # Write on n1
-      :ok = :rpc.call(n1.name, Ferricstore.Store.Router, :put, ["ra002:key", "applied", 0])
+      :ok = remote_router(n1.name, :put, ["ra002:key", "applied", 0])
 
       # Readable on n1 (the only member of its Raft group)
-      assert :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["ra002:key"]) == "applied"
+      assert remote_router(n1.name, :get, ["ra002:key"]) == "applied"
 
       # In single-node mode, n2 and n3 are independent and won't see n1's data.
       # Verify they each independently apply their own writes.
-      :ok = :rpc.call(n2.name, Ferricstore.Store.Router, :put, ["ra002:n2_key", "n2_val", 0])
-      :ok = :rpc.call(n3.name, Ferricstore.Store.Router, :put, ["ra002:n3_key", "n3_val", 0])
+      :ok = remote_router(n2.name, :put, ["ra002:n2_key", "n2_val", 0])
+      :ok = remote_router(n3.name, :put, ["ra002:n3_key", "n3_val", 0])
 
-      assert :rpc.call(n2.name, Ferricstore.Store.Router, :get, ["ra002:n2_key"]) == "n2_val"
-      assert :rpc.call(n3.name, Ferricstore.Store.Router, :get, ["ra002:n3_key"]) == "n3_val"
+      assert remote_router(n2.name, :get, ["ra002:n2_key"]) == "n2_val"
+      assert remote_router(n3.name, :get, ["ra002:n3_key"]) == "n3_val"
     end
 
     @tag :cluster
@@ -114,7 +120,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
       # Write 100 keys
       for i <- 1..100 do
         :ok =
-          :rpc.call(n1.name, Ferricstore.Store.Router, :put, [
+          remote_router(n1.name, :put, [
             "ra002:batch:#{i}",
             "v#{i}",
             0
@@ -123,7 +129,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
 
       # All 100 should be readable
       for i <- 1..100 do
-        val = :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["ra002:batch:#{i}"])
+        val = remote_router(n1.name, :get, ["ra002:batch:#{i}"])
         assert val == "v#{i}", "key ra002:batch:#{i} should be applied and readable"
       end
     end
@@ -150,21 +156,21 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
       # Apply the exact same command sequence on every node
       Enum.each(nodes, fn node ->
         Enum.each(commands, fn {key, val} ->
-          :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, val, 0])
+          :ok = remote_router(node.name, :put, [key, val, 0])
         end)
       end)
 
       # Verify all nodes have identical state
       expected_state =
         Enum.map(commands, fn {key, _val} ->
-          read = :rpc.call(hd(nodes).name, Ferricstore.Store.Router, :get, [key])
+          read = remote_router(hd(nodes).name, :get, [key])
           {key, read}
         end)
 
       Enum.each(nodes, fn node ->
         actual_state =
           Enum.map(commands, fn {key, _val} ->
-            read = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+            read = remote_router(node.name, :get, [key])
             {key, read}
           end)
 
@@ -178,13 +184,13 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
       # Write, then overwrite with different values -- all nodes should
       # end up at the same final state
       Enum.each(nodes, fn node ->
-        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:ow", "first", 0])
-        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:ow", "second", 0])
-        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:ow", "final", 0])
+        :ok = remote_router(node.name, :put, ["ra005:ow", "first", 0])
+        :ok = remote_router(node.name, :put, ["ra005:ow", "second", 0])
+        :ok = remote_router(node.name, :put, ["ra005:ow", "final", 0])
       end)
 
       Enum.each(nodes, fn node ->
-        val = :rpc.call(node.name, Ferricstore.Store.Router, :get, ["ra005:ow"])
+        val = remote_router(node.name, :get, ["ra005:ow"])
         assert val == "final", "RA-005: all nodes should have 'final' after overwrite sequence"
       end)
     end
@@ -192,16 +198,16 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
     @tag :cluster
     test "delete + re-write sequence is deterministic across nodes", %{nodes: nodes} do
       Enum.each(nodes, fn node ->
-        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:del", "exists", 0])
-        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :delete, ["ra005:del"])
-        nil_val = :rpc.call(node.name, Ferricstore.Store.Router, :get, ["ra005:del"])
+        :ok = remote_router(node.name, :put, ["ra005:del", "exists", 0])
+        :ok = remote_router(node.name, :delete, ["ra005:del"])
+        nil_val = remote_router(node.name, :get, ["ra005:del"])
         assert nil_val == nil, "key should be nil after delete"
 
-        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, ["ra005:del", "reborn", 0])
+        :ok = remote_router(node.name, :put, ["ra005:del", "reborn", 0])
       end)
 
       Enum.each(nodes, fn node ->
-        val = :rpc.call(node.name, Ferricstore.Store.Router, :get, ["ra005:del"])
+        val = remote_router(node.name, :get, ["ra005:del"])
         assert val == "reborn", "RA-005: delete+re-write should be deterministic"
       end)
     end
@@ -226,7 +232,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
       # Set key with TTL on all nodes (same absolute expiry)
       Enum.each(nodes, fn node ->
         :ok =
-          :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+          remote_router(node.name, :put, [
             "ap006:ttl",
             "ttl_val",
             expire_at_ms
@@ -236,7 +242,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
       # Verify all nodes have the value and consistent expiry
       Enum.each(nodes, fn node ->
         meta =
-          :rpc.call(node.name, Ferricstore.Store.Router, :get_meta, ["ap006:ttl"])
+          remote_router(node.name, :get_meta, ["ap006:ttl"])
 
         assert meta != nil, "AP-006: key should exist on #{node.name}"
 
@@ -257,7 +263,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
 
       Enum.each(nodes, fn node ->
         :ok =
-          :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+          remote_router(node.name, :put, [
             "ap006:expired:#{node.index}",
             "gone",
             past_expire
@@ -267,7 +273,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
       # All nodes should return nil (expired)
       Enum.each(nodes, fn node ->
         val =
-          :rpc.call(node.name, Ferricstore.Store.Router, :get, [
+          remote_router(node.name, :get, [
             "ap006:expired:#{node.index}"
           ])
 
@@ -466,6 +472,12 @@ defmodule Ferricstore.Cluster.SnapshotJoinTest do
 
   @moduletag :cluster
 
+  # Helper: execute a Router function on a remote peer node with ctx.
+  defp remote_router(node_name, fun, args) do
+    ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
+    :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
+  end
+
   # ---------------------------------------------------------------------------
   # SN-002: New node joins and catches up
   # (Section 6.3)
@@ -486,7 +498,7 @@ defmodule Ferricstore.Cluster.SnapshotJoinTest do
       Enum.each(nodes, fn node ->
         for i <- 1..10 do
           :ok =
-            :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+            remote_router(node.name, :put, [
               "sn002:pre:#{node.index}:#{i}",
               "v#{i}",
               0
@@ -506,19 +518,19 @@ defmodule Ferricstore.Cluster.SnapshotJoinTest do
 
         # New node can serve write operations
         :ok =
-          :rpc.call(new_node.name, Ferricstore.Store.Router, :put, [
+          remote_router(new_node.name, :put, [
             "sn002:new_node",
             "hello",
             0
           ])
 
-        val = :rpc.call(new_node.name, Ferricstore.Store.Router, :get, ["sn002:new_node"])
+        val = remote_router(new_node.name, :get, ["sn002:new_node"])
         assert val == "hello", "SN-002: new node should serve reads/writes"
 
         # New node can serve multiple operations
         for i <- 1..20 do
           :ok =
-            :rpc.call(new_node.name, Ferricstore.Store.Router, :put, [
+            remote_router(new_node.name, :put, [
               "sn002:new:#{i}",
               "new_v#{i}",
               0
@@ -526,14 +538,14 @@ defmodule Ferricstore.Cluster.SnapshotJoinTest do
         end
 
         for i <- 1..20 do
-          val = :rpc.call(new_node.name, Ferricstore.Store.Router, :get, ["sn002:new:#{i}"])
+          val = remote_router(new_node.name, :get, ["sn002:new:#{i}"])
           assert val == "new_v#{i}", "SN-002: new node key sn002:new:#{i} should have value"
         end
 
         # In single-node mode, the new node does NOT have data from old nodes
         # (no replication). When multi-node Raft is added, this assertion changes.
         old_key_on_new =
-          :rpc.call(new_node.name, Ferricstore.Store.Router, :get, ["sn002:pre:1:1"])
+          remote_router(new_node.name, :get, ["sn002:pre:1:1"])
 
         assert old_key_on_new == nil,
                "SN-002: in single-node mode, new node should not have old node data"

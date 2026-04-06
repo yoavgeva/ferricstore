@@ -27,6 +27,14 @@ defmodule Ferricstore.Cluster.TopologyTest do
     %{nodes: nodes}
   end
 
+  # Helper: execute a Router function on a remote peer node with ctx.
+  # Uses two MFA-form :erpc calls to avoid sending anonymous functions
+  # (which would fail with :undef on peer nodes that lack test module code).
+  defp remote_router(node_name, fun, args) do
+    ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
+    :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
+  end
+
   # ---------------------------------------------------------------------------
   # Section 5.2: Three-Node Cluster -- Normal Operation
   # ---------------------------------------------------------------------------
@@ -52,10 +60,10 @@ defmodule Ferricstore.Cluster.TopologyTest do
       key = "topo:rw:#{node.index}"
       value = "value_#{node.index}"
 
-      result = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, value, 0])
+      result = remote_router(node.name, :put, [key, value, 0])
       assert result == :ok, "PUT on #{node.name} should succeed"
 
-      read = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+      read = remote_router(node.name, :get, [key])
       assert read == value, "GET on #{node.name} should return #{value}"
     end)
   end
@@ -75,12 +83,12 @@ defmodule Ferricstore.Cluster.TopologyTest do
       for i <- 1..20 do
         key = "topo:multi:#{node.index}:#{i}"
         val = "v#{i}"
-        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, val, 0])
+        :ok = remote_router(node.name, :put, [key, val, 0])
       end
 
       for i <- 1..20 do
         key = "topo:multi:#{node.index}:#{i}"
-        val = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+        val = remote_router(node.name, :get, [key])
         assert val == "v#{i}", "key #{key} on #{node.name} should have value v#{i}"
       end
     end)
@@ -101,24 +109,24 @@ defmodule Ferricstore.Cluster.TopologyTest do
     [n1, n2, n3] = nodes
 
     # Write distinct values on each node
-    :ok = :rpc.call(n1.name, Ferricstore.Store.Router, :put, ["ct007:n1", "from_n1", 0])
-    :ok = :rpc.call(n2.name, Ferricstore.Store.Router, :put, ["ct007:n2", "from_n2", 0])
+    :ok = remote_router(n1.name, :put, ["ct007:n1", "from_n1", 0])
+    :ok = remote_router(n2.name, :put, ["ct007:n2", "from_n2", 0])
 
     # Each node reads back its own value (independent single-node Raft)
-    assert :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["ct007:n1"]) == "from_n1"
-    assert :rpc.call(n2.name, Ferricstore.Store.Router, :get, ["ct007:n2"]) == "from_n2"
+    assert remote_router(n1.name, :get, ["ct007:n1"]) == "from_n1"
+    assert remote_router(n2.name, :get, ["ct007:n2"]) == "from_n2"
 
     # Cross-node reads: in single-node mode, n2 does NOT see n1's data
     # (each node is an independent Raft cluster). When multi-node Raft is
     # added, this will change to assert equality instead.
-    n2_reads_n1 = :rpc.call(n2.name, Ferricstore.Store.Router, :get, ["ct007:n1"])
+    n2_reads_n1 = remote_router(n2.name, :get, ["ct007:n1"])
     assert n2_reads_n1 == nil,
            "in single-node mode, n2 should not see n1's key (no replication yet)"
 
     # Verify n3 also operates independently
-    :ok = :rpc.call(n3.name, Ferricstore.Store.Router, :put, ["ct007:n3", "from_n3", 0])
-    assert :rpc.call(n3.name, Ferricstore.Store.Router, :get, ["ct007:n3"]) == "from_n3"
-    assert :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["ct007:n3"]) == nil
+    :ok = remote_router(n3.name, :put, ["ct007:n3", "from_n3", 0])
+    assert remote_router(n3.name, :get, ["ct007:n3"]) == "from_n3"
+    assert remote_router(n1.name, :get, ["ct007:n3"]) == nil
   end
 end
 
@@ -150,11 +158,17 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
     %{nodes: nodes}
   end
 
+  # Helper: execute a Router function on a remote peer node with ctx.
+  defp remote_router(node_name, fun, args) do
+    ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
+    :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
+  end
+
   @tag :cluster
   test "remaining nodes continue operating after one node is killed", %{nodes: nodes} do
     # Write to all nodes first
     Enum.each(nodes, fn node ->
-      :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+      remote_router(node.name, :put, [
         "topo:kill:before:#{node.index}",
         "safe",
         0
@@ -179,7 +193,7 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
     # Remaining nodes should still work
     Enum.each(remaining, fn node ->
       result =
-        :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+        remote_router(node.name, :put, [
           "topo:kill:after:#{node.index}",
           "still_working",
           0
@@ -189,7 +203,7 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
              "node #{node.name} should still serve writes after sibling killed"
 
       val =
-        :rpc.call(node.name, Ferricstore.Store.Router, :get, [
+        remote_router(node.name, :get, [
           "topo:kill:after:#{node.index}"
         ])
 
@@ -260,19 +274,33 @@ defmodule Ferricstore.Cluster.FailoverTest do
     %{nodes: nodes}
   end
 
-  # Calls an RPC function on a remote node with retries. Returns the result
-  # on success, or the last {:badrpc, reason} on persistent failure. Retries
-  # on {:badrpc, _} to handle transient distribution hiccups after cluster
-  # stop/start cycles.
-  defp rpc_with_retry(node_name, mod, fun, args, retries \\ 20) do
-    case :rpc.call(node_name, mod, fun, args) do
-      {:badrpc, _reason} when retries > 0 ->
-        Process.sleep(500)
-        rpc_with_retry(node_name, mod, fun, args, retries - 1)
+  # Helper: execute a Router function on a remote peer node with ctx.
+  defp remote_router(node_name, fun, args) do
+    ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
+    :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
+  end
 
-      result ->
-        result
-    end
+  # Calls a Router function on a remote node with retries. Returns the result
+  # on success, or re-raises on persistent failure. Retries on :erpc errors
+  # to handle transient distribution hiccups after cluster stop/start cycles.
+  defp rpc_with_retry(node_name, fun, args, retries \\ 20) do
+    remote_router(node_name, fun, args)
+  rescue
+    e ->
+      if retries > 0 do
+        Process.sleep(500)
+        rpc_with_retry(node_name, fun, args, retries - 1)
+      else
+        reraise e, __STACKTRACE__
+      end
+  catch
+    :exit, reason ->
+      if retries > 0 do
+        Process.sleep(500)
+        rpc_with_retry(node_name, fun, args, retries - 1)
+      else
+        exit(reason)
+      end
   end
 
   # ---------------------------------------------------------------------------
@@ -291,7 +319,7 @@ defmodule Ferricstore.Cluster.FailoverTest do
     # Write a value on n1 before kill (with retry to handle transient
     # distribution issues from previous module's cluster teardown)
     result_pre =
-      rpc_with_retry(n1.name, Ferricstore.Store.Router, :put, [
+      rpc_with_retry(n1.name, :put, [
         "ct005:pre_kill",
         "before",
         0
@@ -307,7 +335,7 @@ defmodule Ferricstore.Cluster.FailoverTest do
 
     # n1 and n2 should still serve writes
     result1 =
-      rpc_with_retry(n1.name, Ferricstore.Store.Router, :put, [
+      rpc_with_retry(n1.name, :put, [
         "ct005:post_kill:n1",
         "after_failover_n1",
         0
@@ -317,7 +345,7 @@ defmodule Ferricstore.Cluster.FailoverTest do
            "CT-005: write on n1 should succeed after n3 killed"
 
     result2 =
-      rpc_with_retry(n2.name, Ferricstore.Store.Router, :put, [
+      rpc_with_retry(n2.name, :put, [
         "ct005:post_kill:n2",
         "after_failover_n2",
         0
@@ -327,10 +355,10 @@ defmodule Ferricstore.Cluster.FailoverTest do
            "CT-005: write on n2 should succeed after n3 killed"
 
     # Verify reads work too
-    assert rpc_with_retry(n1.name, Ferricstore.Store.Router, :get, ["ct005:post_kill:n1"]) ==
+    assert rpc_with_retry(n1.name, :get, ["ct005:post_kill:n1"]) ==
              "after_failover_n1"
 
-    assert rpc_with_retry(n2.name, Ferricstore.Store.Router, :get, ["ct005:post_kill:n2"]) ==
+    assert rpc_with_retry(n2.name, :get, ["ct005:post_kill:n2"]) ==
              "after_failover_n2"
   end
 
@@ -359,7 +387,7 @@ defmodule Ferricstore.Cluster.FailoverTest do
 
     # Write data to all alive nodes
     Enum.each(alive_nodes, fn node ->
-      :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+      remote_router(node.name, :put, [
         "ct006:durable:#{node.index}",
         "must_survive_#{node.index}",
         0
@@ -376,7 +404,7 @@ defmodule Ferricstore.Cluster.FailoverTest do
     # Verify all surviving nodes still have their own data
     Enum.each(survivors, fn node ->
       val =
-        :rpc.call(node.name, Ferricstore.Store.Router, :get, [
+        remote_router(node.name, :get, [
           "ct006:durable:#{node.index}"
         ])
 
@@ -416,6 +444,12 @@ defmodule Ferricstore.Cluster.PartitionTest do
     %{nodes: nodes}
   end
 
+  # Helper: execute a Router function on a remote peer node with ctx.
+  defp remote_router(node_name, fun, args) do
+    ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
+    :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
+  end
+
   @tag :cluster
   test "partitioned node loses connectivity to peers", %{nodes: nodes} do
     [n1, _n2, n3] = nodes
@@ -436,7 +470,7 @@ defmodule Ferricstore.Cluster.PartitionTest do
 
     # Each node can still operate independently (single-node Raft)
     result =
-      :rpc.call(n3.name, Ferricstore.Store.Router, :put, [
+      remote_router(n3.name, :put, [
         "topo:part:isolated",
         "works",
         0
@@ -446,7 +480,7 @@ defmodule Ferricstore.Cluster.PartitionTest do
            "partitioned node should still operate in single-node mode"
 
     result2 =
-      :rpc.call(n1.name, Ferricstore.Store.Router, :put, [
+      remote_router(n1.name, :put, [
         "topo:part:majority",
         "also_works",
         0
@@ -468,29 +502,29 @@ defmodule Ferricstore.Cluster.PartitionTest do
     [n1, _n2, n3] = nodes
 
     # Write before partition
-    :rpc.call(n1.name, Ferricstore.Store.Router, :put, ["topo:heal:pre", "before", 0])
+    remote_router(n1.name, :put, ["topo:heal:pre", "before", 0])
 
     # Partition n3
     ClusterHelper.partition_node(n3, nodes)
     Process.sleep(300)
 
     # Write on n1 during partition
-    :rpc.call(n1.name, Ferricstore.Store.Router, :put, ["topo:heal:during", "during", 0])
+    remote_router(n1.name, :put, ["topo:heal:during", "during", 0])
 
     # Heal partition
     ClusterHelper.heal_partition(n3, nodes)
     Process.sleep(300)
 
     # n1 should still have its data
-    n1_val = :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["topo:heal:pre"])
+    n1_val = remote_router(n1.name, :get, ["topo:heal:pre"])
     assert n1_val == "before"
 
-    n1_during = :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["topo:heal:during"])
+    n1_during = remote_router(n1.name, :get, ["topo:heal:during"])
     assert n1_during == "during"
 
     # n3 can still operate after reconnect
     n3_result =
-      :rpc.call(n3.name, Ferricstore.Store.Router, :put, ["topo:heal:post", "after", 0])
+      remote_router(n3.name, :put, ["topo:heal:post", "after", 0])
 
     assert n3_result == :ok
   end
@@ -522,7 +556,7 @@ defmodule Ferricstore.Cluster.PartitionTest do
     # Write 50 keys on n1 during partition
     for i <- 1..50 do
       :ok =
-        :rpc.call(n1.name, Ferricstore.Store.Router, :put, [
+        remote_router(n1.name, :put, [
           "ct009:majority:#{i}",
           "val_#{i}",
           0
@@ -532,7 +566,7 @@ defmodule Ferricstore.Cluster.PartitionTest do
     # Write 10 keys on isolated n3 during partition
     for i <- 1..10 do
       :ok =
-        :rpc.call(n3.name, Ferricstore.Store.Router, :put, [
+        remote_router(n3.name, :put, [
           "ct009:isolated:#{i}",
           "iso_#{i}",
           0
@@ -545,24 +579,24 @@ defmodule Ferricstore.Cluster.PartitionTest do
 
     # Verify n1 still has its data
     for i <- 1..50 do
-      val = :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["ct009:majority:#{i}"])
+      val = remote_router(n1.name, :get, ["ct009:majority:#{i}"])
       assert val == "val_#{i}", "n1 should retain majority-side writes after heal"
     end
 
     # Verify n3 still has its isolated writes
     for i <- 1..10 do
-      val = :rpc.call(n3.name, Ferricstore.Store.Router, :get, ["ct009:isolated:#{i}"])
+      val = remote_router(n3.name, :get, ["ct009:isolated:#{i}"])
       assert val == "iso_#{i}", "n3 should retain isolated writes after heal"
     end
 
     # Both sides can write new data after heal
-    :ok = :rpc.call(n1.name, Ferricstore.Store.Router, :put, ["ct009:post_heal:n1", "ok", 0])
-    :ok = :rpc.call(n2.name, Ferricstore.Store.Router, :put, ["ct009:post_heal:n2", "ok", 0])
-    :ok = :rpc.call(n3.name, Ferricstore.Store.Router, :put, ["ct009:post_heal:n3", "ok", 0])
+    :ok = remote_router(n1.name, :put, ["ct009:post_heal:n1", "ok", 0])
+    :ok = remote_router(n2.name, :put, ["ct009:post_heal:n2", "ok", 0])
+    :ok = remote_router(n3.name, :put, ["ct009:post_heal:n3", "ok", 0])
 
-    assert :rpc.call(n1.name, Ferricstore.Store.Router, :get, ["ct009:post_heal:n1"]) == "ok"
-    assert :rpc.call(n2.name, Ferricstore.Store.Router, :get, ["ct009:post_heal:n2"]) == "ok"
-    assert :rpc.call(n3.name, Ferricstore.Store.Router, :get, ["ct009:post_heal:n3"]) == "ok"
+    assert remote_router(n1.name, :get, ["ct009:post_heal:n1"]) == "ok"
+    assert remote_router(n2.name, :get, ["ct009:post_heal:n2"]) == "ok"
+    assert remote_router(n3.name, :get, ["ct009:post_heal:n3"]) == "ok"
 
     # Verify Erlang distribution fully restored
     n1_peers = :rpc.call(n1.name, Node, :list, [])
