@@ -35,25 +35,57 @@ defmodule Ferricstore.Cluster.DataSync do
     * `:wal_bridgeable` -- local node can catch up from WAL replay alone
     * `:needs_resync` -- a full data directory copy is required
   """
-  @spec needs_resync?(non_neg_integer(), node()) :: :wal_bridgeable | :needs_resync
-  def needs_resync?(shard_index, leader_node) do
-    local_server_id = RaftCluster.shard_server_id(shard_index)
+  @spec needs_resync?(non_neg_integer(), node(), node()) :: :wal_bridgeable | :needs_resync
+  def needs_resync?(shard_index, target_node, leader_node) do
+    # Check if the TARGET node has data files for this shard.
+    # A node with an empty/missing data dir always needs a full resync.
+    target_has_data =
+      try do
+        target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default])
+        target_shard_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_index)
 
-    local_index =
-      case :ra.member_overview(local_server_id) do
-        {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
-        _ -> 0
+        case :erpc.call(target_node, File, :ls, [target_shard_path]) do
+          {:ok, files} -> Enum.any?(files, &String.ends_with?(&1, ".log"))
+          _ -> false
+        end
+      catch
+        _, _ -> false
       end
 
-    leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
+    unless target_has_data do
+      Logger.info("Shard #{shard_index}: target #{target_node} has no data, needs full resync")
+      :needs_resync
+    else
+      # Target has data — check if its WAL can bridge to the leader
+      target_server_id = RaftCluster.shard_server_id_on(shard_index, target_node)
 
-    case :erpc.call(leader_node, :ra, :member_overview, [leader_server_id]) do
-      {:ok, overview, _} ->
-        first_index = Map.get(overview, :first_index, 0)
-        if local_index >= first_index, do: :wal_bridgeable, else: :needs_resync
+      target_index =
+        try do
+          case :erpc.call(target_node, :ra, :member_overview, [target_server_id]) do
+            {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
+            _ -> 0
+          end
+        catch
+          _, _ -> 0
+        end
 
-      _ ->
-        :needs_resync
+      leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
+
+      case :erpc.call(leader_node, :ra, :member_overview, [leader_server_id]) do
+        {:ok, overview, _} ->
+          first_index = Map.get(overview, :first_index, 0)
+
+          if target_index >= first_index do
+            Logger.info("Shard #{shard_index}: WAL bridgeable (target=#{target_index} >= first=#{first_index})")
+            :wal_bridgeable
+          else
+            Logger.info("Shard #{shard_index}: WAL gap (target=#{target_index} < first=#{first_index}), needs resync")
+            :needs_resync
+          end
+
+        _ ->
+          :needs_resync
+      end
     end
   end
 
@@ -84,9 +116,8 @@ defmodule Ferricstore.Cluster.DataSync do
   def sync_shard(shard_index, target_node, ctx) do
     leader_node = find_leader(shard_index)
 
-    case needs_resync?(shard_index, leader_node) do
+    case needs_resync?(shard_index, target_node, leader_node) do
       :wal_bridgeable ->
-        Logger.info("Shard #{shard_index}: WAL bridgeable, no data copy needed")
         {:ok, :wal_bridgeable}
 
       :needs_resync ->
@@ -147,6 +178,8 @@ defmodule Ferricstore.Cluster.DataSync do
   """
   @spec sync_all_shards(node(), FerricStore.Instance.t()) :: {:ok, map()} | {:error, term()}
   def sync_all_shards(target_node, ctx) do
+    Logger.info("DataSync: starting sync of #{ctx.shard_count} shards to #{target_node}")
+
     results =
       for shard_idx <- 0..(ctx.shard_count - 1), into: %{} do
         case sync_shard(shard_idx, target_node, ctx) do
@@ -185,10 +218,11 @@ defmodule Ferricstore.Cluster.DataSync do
   defp do_sync_shard(shard_index, target_node, leader_node, ctx) do
     shard_name = :"Ferricstore.Store.Shard.#{shard_index}"
     leader_data_dir = get_leader_data_dir(leader_node, ctx)
+    target_data_dir = get_target_data_dir(target_node)
     leader_shard_data = Ferricstore.DataDir.shard_data_path(leader_data_dir, shard_index)
-    target_shard_data = Ferricstore.DataDir.shard_data_path(leader_data_dir, shard_index)
+    target_shard_data = Ferricstore.DataDir.shard_data_path(target_data_dir, shard_index)
 
-    Logger.info("Shard #{shard_index}: syncing from #{leader_node} to #{target_node}")
+    Logger.info("Shard #{shard_index}: syncing #{leader_node}:#{leader_shard_data} → #{target_node}:#{target_shard_data}")
 
     # 1. Pause writes on the LEADER's shard (not local)
     pause_shard(leader_node, shard_name)
@@ -209,7 +243,8 @@ defmodule Ferricstore.Cluster.DataSync do
       ra_exists = file_exists_on?(leader_node, leader_ra_shard_dir)
 
       if ra_exists do
-        target_ra_dir = Path.join(leader_data_dir, "ra/#{ra_shard_name}")
+        target_ra_dir = Path.join(target_data_dir, "ra/#{ra_shard_name}")
+        Logger.info("Shard #{shard_index}: copying ra dir → #{target_node}:#{target_ra_dir}")
         copy_directory_from(leader_node, leader_ra_shard_dir, target_node, target_ra_dir)
       end
 
@@ -243,13 +278,17 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
+  defp get_target_data_dir(target_node) do
+    ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default])
+    ctx.data_dir
+  end
+
   defp get_leader_data_dir(leader_node, ctx) do
     if leader_node == node() do
       ctx.data_dir
     else
-      :erpc.call(leader_node, fn ->
-        FerricStore.Instance.get(:default).data_dir
-      end, [])
+      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default])
+      remote_ctx.data_dir
     end
   end
 
@@ -257,12 +296,10 @@ defmodule Ferricstore.Cluster.DataSync do
     if leader_node == node() do
       get_raft_index(server_id)
     else
-      :erpc.call(leader_node, fn ->
-        case :ra.member_overview(server_id) do
-          {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
-          _ -> 0
-        end
-      end, [])
+      case :erpc.call(leader_node, :ra, :member_overview, [server_id]) do
+        {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
+        _ -> 0
+      end
     end
   end
 
