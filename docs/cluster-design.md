@@ -83,6 +83,91 @@ A new `Ferricstore.Cluster.Manager` GenServer on each node. Responsibilities:
 
 ---
 
+## Read Replicas (Non-Voting Members)
+
+ra supports `promotable` membership — a server that receives all log replication
+but doesn't vote in elections or count toward quorum. Perfect for read replicas.
+
+```
+Quorum (3 voters):              Read replicas (N, non-voters):
+┌──────────┐                    ┌──────────┐
+│ Node A   │◄── Raft ──────────►│ Replica 1│  receives replication
+│ (voter)  │                    │ (promotable)  reads from local ETS
+├──────────┤                    ├──────────┤
+│ Node B   │◄── Raft ──────────►│ Replica 2│  writes forward to leader
+│ (voter)  │                    │ (promotable)
+├──────────┤                    └──────────┘
+│ Node C   │
+│ (voter)  │    Replicas can go down without affecting quorum.
+└──────────┘    Add replicas in other regions for low-latency reads.
+```
+
+### How it works (mostly ra config)
+
+ra handles replication to non-voters automatically. The code changes are minimal:
+
+```elixir
+# 1. Server config: start shard with promotable membership on replica nodes
+server_config = %{
+  id: server_id,
+  ...
+  membership: :promotable   # instead of :voter (default)
+}
+
+# 2. Add replica to existing cluster:
+:ra.add_member(leader_id, %{id: {shard_name, replica_node}, membership: :promotable})
+
+# 3. ra replicates all entries to the replica — ETS stays current
+# 4. Replica serves reads from local ETS — no code change needed
+```
+
+### What needs code
+
+| Change | Why |
+|---|---|
+| Pass `membership: :promotable` in ra server config when `role == :replica` | ra needs to know this node doesn't vote |
+| Write forwarding on replicas | `ra:pipeline_command` from a non-voter fails — need to resolve leader and forward |
+| ClusterManager awareness | Use correct `add_member` call based on role |
+| CLUSTER.STATUS | Show voter vs replica per node |
+
+### Write forwarding on replicas
+
+When a client sends SET to a replica, the replica can't propose to Raft (non-voter).
+Instead, it forwards the write to the shard's leader:
+
+```elixir
+# In Batcher or Router, when local node is a replica:
+def write(shard_index, command) do
+  if replica_mode?() do
+    # Forward to leader — ra knows who the leader is
+    leader = ra_leaderboard:lookup_leader(shard_cluster_name(shard_index))
+    :ra.pipeline_command(leader, command)
+  else
+    # Normal voter path
+    :ra.pipeline_command(shard_server_id(shard_index), command)
+  end
+end
+```
+
+### Configuration
+
+```bash
+FERRICSTORE_CLUSTER_ROLE=voter     # default — participates in quorum
+FERRICSTORE_CLUSTER_ROLE=replica   # non-voter — read replica, writes forward to leader
+```
+
+### Promotion
+
+A replica can be promoted to voter at runtime (e.g., to replace a failed voter):
+
+```
+CLUSTER.PROMOTE <node>   → changes membership from promotable to voter
+```
+
+ra handles this via a membership change command through Raft consensus.
+
+---
+
 ## Node Join Flow
 
 ### Case 1: Bootstrap — first node starts the cluster
@@ -871,4 +956,6 @@ config :ferricstore, :snapshot_store,
   prefix: "cluster-prod"
 ```
 
-5. **Sequential shard sync for direct copy** — copy one shard at a time. Each shard requires a brief write pause on the leader; parallel copy would pause ALL shards simultaneously (full write outage). Sequential keeps 75% of writes flowing. Object storage handles the "fast bootstrap" case — new node downloads all shards in parallel from S3 with zero leader impact, then catches up via WAL replay.
+5. **Read replicas via ra's `promotable` membership** — ra natively supports non-voting members (`ra_membership() :: voter | promotable | non_voter`). A replica receives all Raft replication (ETS stays current) but doesn't vote in elections or count toward quorum. Reads from local ETS, writes forward to the leader. Adding a replica is just config — no new replication protocol needed.
+
+6. **Sequential shard sync for direct copy** — copy one shard at a time. Each shard requires a brief write pause on the leader; parallel copy would pause ALL shards simultaneously (full write outage). Sequential keeps 75% of writes flowing. Object storage handles the "fast bootstrap" case — new node downloads all shards in parallel from S3 with zero leader impact, then catches up via WAL replay.
