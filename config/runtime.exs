@@ -135,6 +135,8 @@ if config_env() == :prod do
     #   "gossip"  — multicast UDP (default, good for Docker Compose / LAN)
     #   "dns"     — DNS A-record polling (good for Kubernetes headless services)
     #   "epmd"    — static node list from FERRICSTORE_CLUSTER_NODES
+    #   "consul"  — Consul service discovery (requires libcluster_consul dep)
+    #   "etcd"    — etcd service discovery (requires libcluster_etcd dep)
     #   "none"    — disable libcluster (manual CLUSTER.JOIN only)
     discovery = System.get_env("FERRICSTORE_DISCOVERY", "gossip")
 
@@ -175,6 +177,32 @@ if config_env() == :prod do
             ferricstore: [
               strategy: Cluster.Strategy.Epmd,
               config: [hosts: nodes]
+            ]
+          ]
+
+      "consul" ->
+        config :libcluster,
+          topologies: [
+            ferricstore: [
+              strategy: ClusterConsul.Strategy,
+              config: [
+                agent_url: System.get_env("FERRICSTORE_CONSUL_URL", "http://localhost:8500"),
+                service_name: System.get_env("FERRICSTORE_CONSUL_SERVICE", "ferricstore"),
+                polling_interval: 5_000
+              ]
+            ]
+          ]
+
+      "etcd" ->
+        config :libcluster,
+          topologies: [
+            ferricstore: [
+              strategy: Cluster.Strategy.Etcd,
+              config: [
+                endpoints: System.get_env("FERRICSTORE_ETCD_ENDPOINTS", "http://localhost:2379"),
+                prefix: System.get_env("FERRICSTORE_ETCD_PREFIX", "/ferricstore/nodes"),
+                node_basename: node_name |> to_string() |> String.split("@") |> hd()
+              ]
             ]
           ]
 

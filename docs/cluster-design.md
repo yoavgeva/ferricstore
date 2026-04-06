@@ -830,9 +830,13 @@ FERRICSTORE_COOKIE=my_secret_cookie          # Erlang cookie (must match all nod
 FERRICSTORE_CLUSTER_ROLE=voter               # voter | replica | readonly (default: voter)
 
 # --- Node discovery ---
-FERRICSTORE_DISCOVERY=gossip                 # gossip | dns | epmd | none (default: gossip)
+FERRICSTORE_DISCOVERY=gossip                 # gossip | dns | epmd | consul | etcd | none
 FERRICSTORE_DNS_NAME=ferricstore-headless    # for discovery=dns (Kubernetes headless service)
 FERRICSTORE_CLUSTER_NODES=n1@h1,n2@h2,n3@h3 # for discovery=epmd (static list)
+FERRICSTORE_CONSUL_URL=http://localhost:8500 # for discovery=consul
+FERRICSTORE_CONSUL_SERVICE=ferricstore       # Consul service name
+FERRICSTORE_ETCD_ENDPOINTS=http://localhost:2379  # for discovery=etcd
+FERRICSTORE_ETCD_PREFIX=/ferricstore/nodes   # etcd key prefix
 
 # --- Cluster tuning ---
 FERRICSTORE_CLUSTER_REMOVE_DELAY_MS=60000    # delay before removing crashed node (default: 60s)
