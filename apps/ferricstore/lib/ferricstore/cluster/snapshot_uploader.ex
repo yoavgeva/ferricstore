@@ -195,34 +195,34 @@ defmodule Ferricstore.Cluster.SnapshotUploader do
     tar_path = Path.join(tmp_base, "shard_#{shard_index}.tar.gz")
 
     try do
-      # 1. Pause writes (brief — flush + fsync)
+      # 1. Block compaction — prevent merge from modifying files during copy.
+      #    pause_writes also blocks compaction (run_compaction checks writes_paused).
+      # 2. Pause writes (flush + fsync — all pending data on disk)
       :ok = GenServer.call(shard_name, {:pause_writes}, 30_000)
 
       try do
-        # 2. Get active file ID so we know which file to copy (not hardlink)
-        {active_file_id, _active_path} = GenServer.call(shard_name, :get_active_file)
+        # 3. Copy entire shard dir. After compaction, this is typically 2-3 files.
+        #    Simple and correct — no hardlink complexity needed.
+        File.cp_r!(shard_data_path, snapshot_dir)
 
-        # 3. Snapshot: hardlink sealed files, copy active/mutable files
-        create_snapshot_copy(shard_data_path, snapshot_dir, active_file_id)
-
-        # 4. Record raft index
+        # 4. Record raft index at this exact point
         server_id = Ferricstore.Raft.Cluster.shard_server_id(shard_index)
         raft_index = get_raft_index(server_id)
 
-        # 5. Resume writes (before upload)
+        # 5. Resume writes + unblock compaction
         GenServer.call(shard_name, {:resume_writes}, 5_000)
 
-        # 5. Tar the hardlink dir
+        # 6. Tar the copy (background — writes already flowing)
         create_tar(snapshot_dir, tar_path)
 
-        # 6. Compute file checksums
+        # 7. Compute file checksums
         files = list_snapshot_files(snapshot_dir)
 
-        # 7. Upload via adapter
+        # 8. Upload via adapter
         tar_key = Path.join(snapshot_prefix, "shard_#{shard_index}.tar.gz")
         :ok = adapter.upload(tar_path, tar_key, adapter_opts)
 
-        # 8. Cleanup
+        # 9. Cleanup
         File.rm_rf(snapshot_dir)
         File.rm(tar_path)
 
@@ -235,7 +235,6 @@ defmodule Ferricstore.Cluster.SnapshotUploader do
          }}
       rescue
         e ->
-          # Make sure writes are resumed even on error
           try do
             GenServer.call(shard_name, {:resume_writes}, 5_000)
           catch
@@ -251,88 +250,6 @@ defmodule Ferricstore.Cluster.SnapshotUploader do
         )
 
         {:error, {shard_index, Exception.message(e)}}
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Hardlink snapshot
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Creates a snapshot copy of a shard's data directory.
-
-  Sealed files (old .log files, .hint files) are hardlinked — they are never
-  modified after rotation so hardlinks are safe and use zero extra disk space.
-
-  Active/mutable files are real copies because they may be appended to after
-  writes resume. These include:
-    - The active .log file (highest numbered, appended on every write)
-    - Prob files (.bloom, .cms, .cuckoo, .topk — mmap-written)
-    - Any file in a subdirectory that could be active
-
-  This ensures the snapshot is a frozen point-in-time view even after writes
-  resume.
-  """
-  @spec create_snapshot_copy(binary(), binary(), non_neg_integer()) :: :ok
-  def create_snapshot_copy(shard_data_path, snapshot_dir, active_file_id) do
-    File.mkdir_p!(snapshot_dir)
-    active_file_name = "#{String.pad_leading(Integer.to_string(active_file_id), 5, "0")}.log"
-
-    case File.ls(shard_data_path) do
-      {:ok, files} ->
-        Enum.each(files, fn file ->
-          source = Path.join(shard_data_path, file)
-          dest = Path.join(snapshot_dir, file)
-
-          cond do
-            File.dir?(source) ->
-              # Subdirectories (promoted/, prob/) — copy entirely
-              # since they may contain active files
-              copy_directory(source, dest)
-
-            active_file?(file, active_file_name) ->
-              # Active/mutable file — real copy
-              File.cp!(source, dest)
-
-            true ->
-              # Sealed file — hardlink (zero disk space)
-              File.ln!(source, dest)
-          end
-        end)
-
-      {:error, :enoent} ->
-        :ok
-    end
-  end
-
-  # The active .log file and prob structure files are mutable
-  defp active_file?(file, active_file_name) do
-    file == active_file_name or
-      String.ends_with?(file, ".bloom") or
-      String.ends_with?(file, ".cms") or
-      String.ends_with?(file, ".cuckoo") or
-      String.ends_with?(file, ".topk")
-  end
-
-  # Full recursive copy for subdirectories (promoted collections, prob dirs)
-  defp copy_directory(source, dest) do
-    File.mkdir_p!(dest)
-
-    case File.ls(source) do
-      {:ok, files} ->
-        Enum.each(files, fn file ->
-          src = Path.join(source, file)
-          dst = Path.join(dest, file)
-
-          if File.dir?(src) do
-            copy_directory(src, dst)
-          else
-            File.cp!(src, dst)
-          end
-        end)
-
-      {:error, :enoent} ->
-        :ok
     end
   end
 
