@@ -86,9 +86,13 @@ defmodule Ferricstore.Cluster.Manager do
 
     mode = if cluster_nodes == [], do: :standalone, else: :cluster
 
-    if mode == :cluster do
-      # Subscribe to nodeup/nodedown events
+    # Always subscribe to nodeup/nodedown — even standalone nodes need to
+    # detect when a new node wants to join them (auto-discovery).
+    if Node.alive?() do
       :net_kernel.monitor_nodes(true, node_type: :visible)
+    end
+
+    if mode == :cluster do
       Logger.info("ClusterManager started in cluster mode, role=#{role}, nodes=#{inspect(cluster_nodes)}")
     else
       Logger.info("ClusterManager started in standalone mode")
@@ -165,25 +169,36 @@ defmodule Ferricstore.Cluster.Manager do
   # ---------------------------------------------------------------------------
 
   @impl true
-  def handle_info({:nodeup, node, _info}, %{mode: :standalone} = state) do
-    Logger.debug("ClusterManager: ignoring nodeup for #{node} (standalone mode)")
-    {:noreply, state}
-  end
-
   def handle_info({:nodeup, node, _info}, state) do
     Logger.info("ClusterManager: node connected: #{node}")
 
-    # Cancel any pending removal timer for this node
     state = cancel_remove_timer(state, node)
 
-    # Check if this node is in our cluster config — auto-join if so
-    if node in state.cluster_nodes do
-      new_known = MapSet.put(state.known_nodes, node)
-      # Auto-join: add to Raft groups + sync data (same path as CLUSTER.JOIN)
-      spawn(fn -> do_auto_join(node, state.role) end)
-      {:noreply, %{state | known_nodes: new_known}}
-    else
-      {:noreply, state}
+    cond do
+      # Case 1: We know this node — it's in our cluster_nodes config
+      node in state.cluster_nodes ->
+        new_known = MapSet.put(state.known_nodes, node)
+        spawn(fn -> do_auto_join(node, state.role) end)
+        {:noreply, %{state | known_nodes: new_known, mode: :cluster}}
+
+      # Case 2: We're standalone but the remote node wants to join us.
+      # Check if the remote node's cluster_nodes includes us.
+      state.mode == :standalone ->
+        spawn(fn ->
+          try do
+            remote_nodes = :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_nodes, []], 5_000)
+            if node() in remote_nodes do
+              Logger.info("ClusterManager: #{node} wants to join us, initiating auto-join")
+              GenServer.call(__MODULE__, {:add_node, node, :voter}, 120_000)
+            end
+          catch
+            _, _ -> :ok
+          end
+        end)
+        {:noreply, state}
+
+      true ->
+        {:noreply, state}
     end
   end
 

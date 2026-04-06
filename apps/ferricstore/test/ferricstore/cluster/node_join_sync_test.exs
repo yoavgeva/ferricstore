@@ -243,14 +243,11 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     end
   end
 
-  describe "standalone to cluster" do
+  describe "standalone to cluster (manual join)" do
     @tag timeout: 120_000
-    test "single node with data → two nodes join → all data synced" do
-      # Node A starts as standalone (single-node Raft groups, the default)
+    test "single node with data → two nodes join via CLUSTER.JOIN → all data synced" do
       node_a = ClusterHelper.start_node()
       on_exit(fn -> ClusterHelper.stop_node(node_a) end)
-
-      # Wait for single-node Raft leaders before writing
       ClusterHelper.wait_for_node_leaders(node_name(node_a), 4, timeout: 10_000)
 
       keys = write_keys(node_a, "standalone", 1..200)
@@ -259,13 +256,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       node_c = ClusterHelper.start_node()
       on_exit(fn -> ClusterHelper.stop_node(node_b); ClusterHelper.stop_node(node_c) end)
 
-      # Connect + join
       n_a = node_name(node_a)
       :erpc.call(n_a, Node, :connect, [node_name(node_b)])
       :erpc.call(n_a, Node, :connect, [node_name(node_c)])
 
-      # join_cluster may fail with :cluster_change_not_permitted if Raft
-      # hasn't fully settled. Retry with eventually.
       eventually(fn ->
         assert :ok == join_cluster(node_b, node_a)
       end, "node_b join failed", 10, 1000)
@@ -282,6 +276,48 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         assert Enum.all?(all_keys, fn k -> read_key(node_c, k) != nil end), "keys missing on c"
       end, "replication incomplete", 60, 500)
 
+      eventually(fn ->
+        assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_b), "keydir a↔b mismatch"
+        assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_c), "keydir a↔c mismatch"
+      end, "keydirs not converged", 20, 500)
+    end
+  end
+
+  describe "auto-discovery: one node with data, two nodes join via cluster_nodes config" do
+    @tag timeout: 120_000
+    test "new nodes auto-discover, sync data, keydirs identical" do
+      # 1. Start node_a as standalone with data
+      node_a = ClusterHelper.start_node()
+      on_exit(fn -> ClusterHelper.stop_node(node_a) end)
+      ClusterHelper.wait_for_node_leaders(node_name(node_a), 4, timeout: 10_000)
+
+      keys = write_keys(node_a, "existing", 1..200)
+
+      # 2. Start node_b and node_c with cluster_nodes pointing to node_a
+      #    Simulates: FERRICSTORE_CLUSTER_NODES=a,b,c → libcluster connects → :nodeup → auto-join
+      n_a = node_name(node_a)
+      node_b = ClusterHelper.start_node(cluster_nodes: [n_a])
+      node_c = ClusterHelper.start_node(cluster_nodes: [n_a])
+      on_exit(fn -> ClusterHelper.stop_node(node_b); ClusterHelper.stop_node(node_c) end)
+
+      # 3. Connect nodes (simulates libcluster discovery)
+      #    :nodeup fires on all nodes → ClusterManager auto-joins
+      :erpc.call(n_a, Node, :connect, [node_name(node_b)])
+      :erpc.call(n_a, Node, :connect, [node_name(node_c)])
+
+      # 4. No manual CLUSTER.JOIN — auto-join handles everything
+
+      # 5. Write more data after connection
+      post_keys = write_keys(node_a, "post", 1..50)
+      all_keys = keys ++ post_keys
+
+      # 6. Wait for all data to replicate
+      eventually(fn ->
+        assert Enum.all?(all_keys, fn k -> read_key(node_b, k) != nil end), "keys missing on b"
+        assert Enum.all?(all_keys, fn k -> read_key(node_c, k) != nil end), "keys missing on c"
+      end, "replication incomplete", 60, 500)
+
+      # 7. Keydirs must be identical
       eventually(fn ->
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_b), "keydir a↔b mismatch"
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_c), "keydir a↔c mismatch"
