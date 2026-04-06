@@ -256,8 +256,8 @@ defmodule Ferricstore.Cluster.Manager do
     # Step 1: Stop ra servers on the target node.
     stop_raft_on_target(target_node, state.shard_count)
 
-    # Step 2: Try object storage first, fall through to direct copy.
-    sync_result = try_snapshot_then_direct(target_node, ctx)
+    # Step 2: Sync data — direct shard-by-shard copy from leader.
+    sync_result = direct_sync(target_node, ctx)
 
     case sync_result do
       {:ok, sync_indices} ->
@@ -281,89 +281,6 @@ defmodule Ferricstore.Cluster.Manager do
       {:error, reason} ->
         Logger.error("ClusterManager: data sync failed for #{target_node}: #{inspect(reason)}")
         {:error, {:sync_failed, reason}}
-    end
-  end
-
-  # Try object storage snapshot first. If available and WAL is bridgeable,
-  # use it. Otherwise fall through to direct shard-by-shard copy.
-  defp try_snapshot_then_direct(target_node, ctx) do
-    snapshot_config = Application.get_env(:ferricstore, :snapshot_store)
-
-    if snapshot_config do
-      Logger.info("ClusterManager: trying object storage snapshot for #{target_node}")
-
-      _adapter = Keyword.fetch!(snapshot_config, :adapter)
-      target_data_dir = :erpc.call(target_node, FerricStore.Instance, :get, [:default]).data_dir
-      download_opts = Keyword.merge(snapshot_config, [dest_dir: target_data_dir])
-      download_opts = Keyword.drop(download_opts, [:interval_ms])
-
-      case :erpc.call(target_node,
-             Ferricstore.Cluster.SnapshotDownloader, :download_latest,
-             [download_opts], 120_000) do
-        {:ok, manifest} ->
-          Logger.info("ClusterManager: snapshot downloaded to #{target_node}")
-
-          # Rebuild keydirs from downloaded data
-          Ferricstore.Cluster.DataSync.rebuild_keydirs_on_target(target_node, ctx.shard_count)
-
-          # Check each shard: can the leader's WAL bridge from the snapshot
-          # point to current? If not, that shard needs direct copy.
-          check_snapshot_wal_gaps(manifest, target_node, ctx)
-
-        {:error, reason} ->
-          Logger.warning("ClusterManager: snapshot download failed (#{inspect(reason)}), falling through to direct copy")
-          direct_sync(target_node, ctx)
-      end
-    else
-      direct_sync(target_node, ctx)
-    end
-  end
-
-  # After snapshot download, check each shard's WAL gap using the manifest's
-  # raft_index (what the snapshot contains) vs the leader's first_index
-  # (oldest WAL entry). If the WAL can bridge, no direct copy needed.
-  # If stale, do direct copy for that shard.
-  defp check_snapshot_wal_gaps(manifest, target_node, ctx) do
-    shards = Map.get(manifest, "shards", [])
-
-    results =
-      for shard_info <- shards do
-        shard_idx = shard_info["index"]
-        snapshot_raft_index = shard_info["raft_index"] || 0
-
-        leader_node = Ferricstore.Cluster.DataSync.find_leader_for(shard_idx)
-        leader_server_id = Ferricstore.Raft.Cluster.shard_server_id_on(shard_idx, leader_node)
-
-        leader_first_index =
-          try do
-            case :erpc.call(leader_node, :ra, :member_overview, [leader_server_id]) do
-              {:ok, overview, _} -> Map.get(overview, :first_index, 0)
-              _ -> 0
-            end
-          catch
-            _, _ -> 0
-          end
-
-        case Ferricstore.Cluster.DataSync.wal_bridgeable?(snapshot_raft_index, leader_first_index) do
-          :wal_bridgeable ->
-            Logger.info("Shard #{shard_idx}: snapshot at index #{snapshot_raft_index}, leader WAL from #{leader_first_index} — bridgeable")
-            {shard_idx, snapshot_raft_index}
-
-          :needs_resync ->
-            Logger.warning("Shard #{shard_idx}: snapshot STALE at index #{snapshot_raft_index}, leader WAL starts at #{leader_first_index} — direct copy needed")
-            case Ferricstore.Cluster.DataSync.sync_shard(shard_idx, target_node, ctx) do
-              {:ok, raft_idx} -> {shard_idx, raft_idx}
-              _ -> {shard_idx, 0}
-            end
-        end
-      end
-
-    sync_indices = for {idx, raft_idx} <- results, into: %{}, do: {idx, raft_idx}
-
-    if Enum.all?(results, fn {_, idx} -> idx > 0 end) do
-      {:ok, sync_indices}
-    else
-      {:error, {:partial_sync, results}}
     end
   end
 

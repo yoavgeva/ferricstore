@@ -299,7 +299,7 @@ Network heals:
 
 ## Universal Sync Decision
 
-Every scenario — new node, reconnect, partition heal, S3 bootstrap — uses the
+Every scenario — new node, reconnect, partition heal, disk snapshot bootstrap — uses the
 same per-shard check. This is the single decision point for "can this node catch
 up, or does it need a fresh copy?"
 
@@ -342,8 +342,8 @@ For each shard i on the joining/reconnecting node:
 | New node (empty disk) | 0 | WAL gap → full shard copy |
 | Reconnect after brief crash (seconds) | recent | WAL bridgeable → ra replays |
 | Reconnect after long downtime (days) | old | WAL gap → shard resync |
-| S3 snapshot (1 hour old) | snapshot_index | Depends on WAL retention |
-| S3 snapshot (1 week old) | very old | WAL gap → shard resync (S3 was pointless) |
+| Cloud disk snapshot (1 hour old) | snapshot_index | Depends on WAL retention |
+| Cloud disk snapshot (1 week old) | very old | WAL gap → shard resync (snapshot was pointless) |
 | Partition heals (minutes) | slightly behind | WAL bridgeable → ra replays |
 | Partition heals (hours) | behind | Depends on WAL retention |
 
@@ -366,14 +366,7 @@ When a new node joins with an empty data dir, it needs a full copy of each shard
 data. The principle: **copy the directory, rebuild the keydir from disk** — the exact
 same code path as a normal node restart. No special snapshot format needed.
 
-Two sync sources, chosen based on situation:
-
-| Source | When to use | Speed | Leader impact |
-|---|---|---|---|
-| **Direct copy from leader** | Live cluster, fast network | Fast (LAN speed) | Brief per-shard write pause |
-| **Object storage snapshot** | Cold start, disaster recovery, slow network | Varies (S3 throughput) | Zero — reads from a periodic upload |
-
-### Strategy 1: Direct shard-by-shard copy
+### Direct shard-by-shard copy
 
 Shards sync one at a time. While shard N is syncing, all other shards continue
 serving reads and writes normally.
@@ -431,278 +424,60 @@ Total time: ~12s for 4GB dataset
 Other shards serve traffic throughout
 ```
 
-### Strategy 2: Object storage snapshots
+### Alternative for large datasets: cloud disk snapshots
 
-The cluster periodically uploads a consistent snapshot of each shard's data directory
-to object storage. New nodes bootstrap from these snapshots instead of copying from
-the leader.
+For shards larger than a few GB, the direct copy pause can be significant (~2s per GB
+on NVMe). For production deployments with large datasets, we recommend using cloud
+disk snapshots instead of FerricStore's built-in direct copy:
 
-#### Coordination: who uploads what?
+**AWS EBS snapshots:**
+```bash
+# On the leader node:
+aws ec2 create-snapshot --volume-id vol-xxx --description "ferricstore-snap"
+# Returns snap-123 instantly (copy-on-write at block level)
 
-Shard leaders may be on different nodes. Each leader snapshots and uploads its own
-shards. A single coordinator orchestrates the cycle and writes the manifest.
-
-```
-Snapshot coordinator (one node, elected by lowest Node.name in cluster):
-
-  ┌─ Periodic timer fires (every interval_ms)
-  │
-  ├─ Step 1: Broadcast {:snapshot_cycle, timestamp} to all nodes
-  │    Each node checks: which shards am I leader for?
-  │    Each leader independently:
-  │      → Pause shard, hardlink, record raft_index, resume
-  │      → Tar the hardlink dir
-  │      → Upload tar directly to S3 (each leader uploads its own shard)
-  │      → Report back to coordinator: {:shard_done, i, raft_index}
-  │
-  ├─ Step 2: Collect reports (with timeout)
-  │    Wait for all shard_count reports
-  │    If any shard fails → log warning, abort cycle (no partial manifest)
-  │    If all succeed → continue
-  │
-  ├─ Step 3: Write manifest + update latest pointer
-  │    Upload manifest.json with all shard raft_indices
-  │    Update latest.json → points to this manifest
-  │
-  └─ Step 4: Cleanup old manifests beyond retention_count
-
-Coordinator election:
-  → :global.register_name({:ferricstore, :snapshot_coordinator}, self())
-  → If coordinator node dies, another node registers on next timer tick
-  → Lightweight — coordinator only broadcasts and collects, doesn't transfer data
-
-No cross-node data transfer:
-  Each shard leader uploads directly to S3 from its own disk.
-  Coordinator never touches shard data — just writes the manifest.
+# For the new node:
+aws ec2 create-volume --snapshot-id snap-123 --availability-zone us-east-1a
+# Mount the new volume → start FerricStore → recover_keydir → join Raft
 ```
 
-#### How to snapshot without blocking writes
-
-Bitcask's append-only property is the key. Old .log files are **never modified** —
-only the active file gets appended to. We exploit this with hardlinks:
-
-```
-For each shard i (sequentially, same as direct copy):
-
-Step 1: Pause writes (milliseconds)
-  └─ Flush pending writes to disk (fsync)
-  └─ Record Raft log index as snapshot_index
-
-Step 2: Hardlink all files to a snapshot dir (instant)
-  └─ mkdir /tmp/snapshot_shard_i/
-  └─ For each file in data/shard_i/:
-     File.ln!(source, dest)              ← hardlink, not copy
-  └─ Same for promoted/, prob/ subdirs
-  └─ Hardlinks are metadata-only — takes microseconds regardless of file size
-
-Step 3: Resume writes (immediate)
-  └─ New writes go to the active file (or a new rotated file)
-  └─ The hardlinked files are a frozen point-in-time copy
-  └─ Reads from the live dir are unaffected — hardlinks share inodes
-
-Step 4: Tar + upload in background (minutes, zero impact)
-  └─ tar czf /tmp/shard_i_snapshot.tar.gz -C /tmp/snapshot_shard_i/ .
-  └─ SnapshotStore.upload(tar_path, "shard_i/snapshot_{timestamp}.tar.gz")
-  └─ rm -rf /tmp/snapshot_shard_i/       ← cleanup hardlinks
-
-Write pause duration: <10ms (flush + fsync + hardlink creation)
-Upload duration: minutes (but writes already resumed, zero impact)
+**GCP persistent disk snapshots:**
+```bash
+gcloud compute disks snapshot ferricstore-disk --snapshot-names=ferricstore-snap
+gcloud compute disks create new-disk --source-snapshot=ferricstore-snap
 ```
 
-**Why hardlinks work:** Bitcask is append-only. Once a record is written to a
-.log file, that file region is never modified. Compaction creates NEW files and
-deletes old ones — but hardlinks prevent the old inode from being freed until
-the snapshot dir is cleaned up. The snapshot sees a consistent point-in-time view
-of all files, even if the live dir compacts or rotates during upload.
+The new node boots with a byte-for-byte clone of the leader's disk. `recover_keydir`
+rebuilds ETS from the Bitcask files (same code path as a normal restart). Then the
+node joins the Raft group and ra replays the delta since the snapshot point.
 
-#### Incremental uploads
+**Advantages over file-level copy:**
+- Zero pause on the leader (cloud provider handles CoW at block level)
+- No extra disk space (snapshot is a block-level diff)
+- No network transfer between nodes (snapshot lives in cloud storage)
+- Works for any dataset size (100GB+ is instant)
 
-Most .log files don't change between upload cycles (only the active file is
-appended to, and maybe compaction created/deleted files). Track file checksums
-in the manifest to upload only changed/new files:
-
-```
-Manifest structure:
-{
-  "timestamp": "2026-04-06T12:00:00Z",
-  "shard_count": 4,
-  "shards": [
-    {
-      "index": 0,
-      "raft_index": 45892,
-      "files": [
-        {"name": "00000.log", "size": 67108864, "sha256": "abc123...", "key": "shard_0/00000.log"},
-        {"name": "00001.log", "size": 52428800, "sha256": "def456...", "key": "shard_0/00001.log"},
-        {"name": "00000.hint", "size": 1048576, "sha256": "ghi789...", "key": "shard_0/00000.hint"},
-        ...
-      ]
-    },
-    ...
-  ]
-}
-```
-
-```
-Upload cycle:
-  1. Create hardlink snapshot (as above)
-  2. Compute SHA256 of each file in snapshot dir
-  3. Compare with previous manifest:
-     → File exists with same sha256 → skip upload (already in S3)
-     → File exists with different sha256 → re-upload (compaction rewrote it)
-     → New file → upload
-     → File in old manifest but not in snapshot → mark for deletion in S3
-  4. Upload only changed/new files
-  5. Write new manifest (atomically — see below)
-  6. Delete orphaned files from S3 (from previous manifests)
-
-First upload: full upload of all files (~100% of data)
-Subsequent uploads: only active file + any compacted files (~1-5% of data)
-```
-
-#### Upload atomicity
-
-The manifest is the commit point. Partial uploads are invisible to downloaders.
-
-```
-Upload flow:
-  1. Upload shard files to: s3://bucket/prefix/pending/{timestamp}/shard_i/...
-  2. After ALL shard files uploaded successfully:
-     → Write manifest to: s3://bucket/prefix/manifests/{timestamp}.json
-  3. Update "latest" pointer: s3://bucket/prefix/latest.json → points to timestamp
-  4. Clean up old manifests beyond retention_count
-
-Download flow:
-  1. Read s3://bucket/prefix/latest.json → get timestamp
-  2. Read s3://bucket/prefix/manifests/{timestamp}.json → get file list
-  3. Download all files listed in manifest
-  4. Verify SHA256 checksums
-
-If upload crashes midway:
-  → No manifest written → pending files are invisible
-  → Next upload cycle overwrites pending dir
-  → No corruption, no partial state
-```
-
-#### Compression
-
-Optional, configurable. Bitcask values are arbitrary binaries — compression ratio
-varies. For text-heavy workloads (JSON, strings), gzip saves 50-70%. For binary
-data (images, protobuf), minimal savings.
-
-```elixir
-config :ferricstore, :cluster_snapshots,
-  compression: :gzip,    # :gzip | :zstd | :none
-```
-
-Recommend `:zstd` — faster than gzip at similar ratios. Falls back to `:none` if
-zstd isn't available.
-
-#### Upload parallelism
-
-Upload multiple shard snapshots simultaneously to S3. Each shard's files are
-independent — no ordering constraint. Use S3 multipart upload for files >100MB.
-
-```
-Shard snapshots created sequentially (each needs a brief write pause)
-Shard uploads run in parallel (Task.async_stream, max_concurrency: shard_count)
-Per-file: S3 multipart upload for files > 100MB (5MB parts)
-```
-
-#### Raft WAL: include it in the snapshot
-
-The ra WAL directory IS included in the snapshot alongside the Bitcask files.
-Both are captured at the same consistent point (during the write pause).
-
-```
-Snapshot contents per shard:
-  data/shard_i/*.log          (Bitcask data files)
-  data/shard_i/*.hint         (hint files)
-  data/shard_i/promoted/      (dedicated collection stores)
-  data/shard_i/prob/          (probabilistic structure files)
-  ra/shard_i/                 (Raft WAL segments + ra snapshots)
-```
-
-**Why include it:** Without the WAL, the new node starts ra from index 0. The
-leader would replay entries from its earliest available index — but entries
-before `snapshot_index` are already in the Bitcask files. This causes:
-- Duplicate Bitcask writes (garbage until compaction)
-- Wasted replay time (re-applying thousands of already-applied entries)
-
-With the WAL included, the new node's ra server starts from `snapshot_index`.
-It only needs to replay the delta (entries since the snapshot was taken). Clean,
-no duplicates, minimal replay time.
-
-**Consistency:** The write pause ensures both the Bitcask files and the ra WAL
-are captured at the exact same Raft index. The hardlink snapshot captures both
-directories atomically — they represent the same point-in-time state.
-
-**Universal sync check still applies:** The new node starts ra from the
-snapshot's WAL state. ra checks if the leader's current WAL can bridge from
-`snapshot_index` to `current_index`. If yes → WAL replay. If the gap is too
-large (leader truncated entries) → falls through to direct copy.
-
-### Object storage configuration
-
-```elixir
-# config/prod.exs
-config :ferricstore, :snapshot_store,
-  adapter: Ferricstore.Cluster.SnapshotStore.S3,
-  bucket: "ferricstore-snapshots",
-  prefix: "cluster-prod",
-  interval_ms: 3_600_000,                    # 1 hour
-  retention_count: 24,                        # keep last 24 manifests
-  compression: :zstd,                         # :gzip | :zstd | :none
-  multipart_threshold: 104_857_600,           # 100MB — use multipart above this
-  upload_concurrency: 4                       # parallel shard uploads
-```
-
-### Which strategy is chosen?
-
-Uses the universal sync decision (above). Object storage is an optimization —
-it provides a head start so the node has *some* data before running the check.
-
-```
-New node starts → ClusterManager:
-
-1. Is object storage configured AND has a snapshot?
-   → YES: download and extract all shard dirs from S3
-   → Each shard now has a local_index = snapshot_raft_index
-   → Fall through to step 2
-
-2. Are other cluster nodes reachable?
-   → YES: run universal sync check per shard:
-     → If local_index >= leader's first_index → WAL bridgeable (S3 saved us a full copy!)
-     → If local_index < leader's first_index → WAL gap → direct copy for that shard
-   → NO: this is the first node, bootstrap as standalone
-```
-
-**Object storage value:** Even if the S3 snapshot is slightly stale, it saves
-copying most of the data. If 90% of the data hasn't changed since the snapshot,
-only the delta needs WAL replay. If the snapshot IS too stale (WAL gap), the
-universal sync check catches it and falls through to direct copy — no harm done
-except wasted download time.
-
-**Preventing staleness:** The snapshot uploader should run frequently enough that
-the WAL never truncates past the snapshot point. Rule of thumb:
-- ra keeps WAL segments based on `wal_max_size_bytes` config
-- Upload interval (1 hour) should be shorter than the WAL retention window
-- Monitor: if `snapshot_raft_index < leader first_index`, upload more frequently
+This is the recommended approach for production. FerricStore's built-in direct copy
+is best for development, testing, and small datasets.
 
 ### Why this design is clean
 
-1. **Same recovery path everywhere** — whether data comes from direct copy, object
-   storage, or a normal restart, the node always does `recover_keydir` from disk
-   files. One code path, well tested.
+1. **Same recovery path everywhere** — whether data comes from direct copy or
+   a cloud disk snapshot, the node always does `recover_keydir` from disk files.
+   One code path, well tested.
 
-2. **No special snapshot format** — just tar the data directory. No ETS
+2. **No special snapshot format** — just copy the data directory. No ETS
    serialization, no custom binary format. `ls data/shard_0/` on any node shows
    the same files.
 
-3. **No ra snapshot complexity** — we don't need to implement `ra_snapshot` callbacks
-   for ETS. ra handles its own WAL/snapshot lifecycle. We handle ours (Bitcask files).
+3. **No ra snapshot complexity** — ra's release_cursor snapshot only contains
+   state machine metadata (atom names, counters), NOT the actual key-value data.
+   All user data lives in Bitcask files and ETS. The Bitcask file copy is a
+   correctness requirement, not an optimization.
 
-4. **Incremental catch-up** — after the bulk copy (either source), Raft WAL replay
-   handles the delta. Writes that happened during the copy are automatically applied.
+4. **Incremental catch-up** — after the bulk copy, Raft WAL replay handles the
+   delta. The state machine's `skip_below_index` skips entries already present
+   in the copied data, avoiding redundant ETS/Bitcask writes.
 
 ---
 
@@ -752,16 +527,7 @@ original file list.
 forces pending data to disk. No new writes means no file rotation. The file list
 at copy start is the complete and final set.
 
-### 6. Object storage upload interrupted
-
-Leader uploads shard 0 and 1 snapshots, then crashes before writing the manifest.
-
-**Handling:** Write per-shard snapshot files first, manifest last. The manifest is
-the atomic commit point — it either lists all shards or doesn't exist. Downloader
-checks manifest integrity (all shards present, checksums valid) before proceeding.
-Incomplete uploads without a manifest are cleaned up on the next upload cycle.
-
-### 7. Two nodes try to join simultaneously
+### 6. Two nodes try to join simultaneously
 
 Node B and Node C both start and try to join Node A at the same time.
 
@@ -771,7 +537,7 @@ in a queue. Both nodes can join the Raft group immediately (`ra:add_member`), bu
 data sync is serialized. Alternatively, once B finishes syncing, C could copy from
 B instead of A — spreading the load.
 
-### 8. WAL grows during long sync
+### 7. WAL grows during long sync
 
 100GB dataset takes 10 minutes to copy. Writes accumulate in WAL during that time.
 
@@ -840,13 +606,6 @@ FERRICSTORE_ETCD_PREFIX=/ferricstore/nodes   # etcd key prefix
 
 # --- Cluster tuning ---
 FERRICSTORE_CLUSTER_REMOVE_DELAY_MS=60000    # delay before removing crashed node (default: 60s)
-
-# --- Object storage snapshots (optional) ---
-FERRICSTORE_SNAPSHOT_BUCKET=my-bucket        # enables S3 snapshots when set
-FERRICSTORE_SNAPSHOT_PREFIX=ferricstore      # S3 key prefix (default: ferricstore)
-FERRICSTORE_SNAPSHOT_INTERVAL_MS=3600000     # upload interval (default: 1 hour)
-FERRICSTORE_SNAPSHOT_RETENTION=24            # keep last N manifests (default: 24)
-FERRICSTORE_SNAPSHOT_COMPRESSION=zstd        # zstd | gzip | none (default: zstd)
 ```
 
 ### Docker Compose — 3-node cluster
@@ -1025,15 +784,12 @@ CLUSTER.FAILOVER     → trigger manual leadership transfer
 |---|---|
 | `lib/ferricstore/cluster/manager.ex` | **NEW** — ClusterManager GenServer: nodeup/nodedown, join/leave orchestration |
 | `lib/ferricstore/cluster/data_sync.ex` | **NEW** — shard-by-shard directory copy via Erlang distribution |
-| `lib/ferricstore/cluster/snapshot_uploader.ex` | **NEW** — periodic upload of shard dirs to object storage |
-| `lib/ferricstore/cluster/snapshot_downloader.ex` | **NEW** — download + extract snapshots from object storage |
 | `lib/ferricstore/raft/cluster.ex` | Modify `start_shard_server` to use multi-node initial_members |
 | `lib/ferricstore/store/shard.ex` | Add `:pause_writes` / `:resume_writes` handle_call |
 | `lib/ferricstore/store/router.ex` | No changes needed — reads already local, writes already go through Raft |
 | `lib/ferricstore/application.ex` | Add ClusterManager to supervision tree |
 | `lib/ferricstore/commands/cluster.ex` | Add CLUSTER.JOIN, CLUSTER.LEAVE, CLUSTER.FAILOVER, CLUSTER.STATUS |
 | `config/runtime.exs` | Cluster env var config (already restored) |
-| `config/prod.exs` | Object storage snapshot config |
 
 ---
 
@@ -1045,10 +801,9 @@ CLUSTER.FAILOVER     → trigger manual leadership transfer
 | 2 of 3 nodes crash | Writes fail (1/3 no quorum). Reads serve stale. | Restart crashed nodes. |
 | Network partition (2\|1) | Majority side continues. Minority rejects writes. | Partition heals, ra reconciles. |
 | Leader crashes | Followers elect new leader (~100ms). Brief write pause. | Old leader rejoins as follower. |
-| New node joins (direct) | Brief per-shard write pause (~100ms each). | Sync completes shard-by-shard. |
-| New node joins (S3) | Zero leader impact. | Download + Raft WAL catch-up. |
+| New node joins (direct copy) | Brief per-shard write pause (~100ms each). | Sync completes shard-by-shard. |
+| New node joins (disk snapshot) | Zero leader impact. | Cloud disk snapshot + Raft WAL catch-up. |
 | Node disk full | Raft WAL writes fail on that node. Others continue. | Free disk space, node re-syncs. |
-| Object storage unavailable | Snapshot uploads fail (logged). | Direct copy still works. Retry on next cycle. |
 
 ---
 
@@ -1072,12 +827,6 @@ CLUSTER.FAILOVER     → trigger manual leadership transfer
 - CLUSTER.FAILOVER — manual leadership transfer
 - CLUSTER.HEALTH — detailed per-shard health
 
-### Phase 4: Object storage snapshots
-- Periodic snapshot uploader (S3/GCS/MinIO via ExAws or similar)
-- Snapshot downloader for cold bootstrap
-- Manifest management (retention, cleanup)
-- Prefer object storage when available for new node join
-
 ---
 
 ## Design Decisions
@@ -1089,27 +838,10 @@ CLUSTER.FAILOVER     → trigger manual leadership transfer
 
 3. **Let ra elect leaders naturally** — no forced leadership distribution. ra's random election timeouts spread leaders across nodes well enough. Forced rebalancing fights Raft's election logic and adds complexity for minimal gain. Can add `CLUSTER.REBALANCE` later if needed.
 
-4. **Pluggable object storage** — define a `Ferricstore.Cluster.SnapshotStore` behaviour with `upload/3`, `download/2`, `list/1`, `delete/1`. Ship S3 adapter as default. Others implement their own (GCS, Azure, MinIO, local filesystem). Same pattern as Ecto adapters.
-
-```elixir
-defmodule Ferricstore.Cluster.SnapshotStore do
-  @callback upload(path :: binary(), key :: binary(), opts :: keyword()) :: :ok | {:error, term()}
-  @callback download(key :: binary(), dest_path :: binary()) :: :ok | {:error, term()}
-  @callback list(prefix :: binary()) :: {:ok, [binary()]} | {:error, term()}
-  @callback delete(key :: binary()) :: :ok | {:error, term()}
-end
-```
-
-```elixir
-# config/prod.exs
-config :ferricstore, :snapshot_store,
-  adapter: Ferricstore.Cluster.SnapshotStore.S3,
-  bucket: "ferricstore-snapshots",
-  prefix: "cluster-prod"
-```
+4. **Cloud disk snapshots for large datasets** — for production deployments with large datasets (10GB+), use cloud provider disk snapshots (EBS snapshots on AWS, persistent disk snapshots on GCP) to bootstrap new nodes. The snapshot captures the entire data directory at the block level with zero leader impact. The new node boots from the snapshot, runs `recover_keydir`, and catches up via Raft WAL replay. No custom snapshot format, no upload/download machinery — just the cloud provider's native tooling.
 
 5. **Read replicas via ra's `promotable` membership** — ra natively supports non-voting members (`ra_membership() :: voter | promotable | non_voter`). A replica receives all Raft replication (ETS stays current) but doesn't vote in elections or count toward quorum. Reads from local ETS, writes forward to the leader. Adding a replica is just config — no new replication protocol needed.
 
-6. **Ra's snapshot does NOT include ETS/Bitcask data** — ra's snapshot is just the state machine metadata (atom names, counters). All key-value data lives in Bitcask files and ETS. A new follower receiving only ra's snapshot has ZERO user data. The Bitcask file copy (direct or from object storage) is a **correctness requirement**, not an optimization. The `wal_bridgeable?` check ensures we never use an object storage snapshot that leaves a gap between the Bitcask data point and the leader's WAL start.
+6. **Ra's snapshot does NOT include ETS/Bitcask data** — ra's snapshot is just the state machine metadata (atom names, counters). All key-value data lives in Bitcask files and ETS. A new follower receiving only ra's snapshot has ZERO user data. The Bitcask file copy (direct copy or cloud disk snapshot) is a **correctness requirement**, not an optimization. The `wal_bridgeable?` check ensures we never skip a required data sync.
 
-7. **Sequential shard sync for direct copy** — copy one shard at a time. Each shard requires a brief write pause on the leader; parallel copy would pause ALL shards simultaneously (full write outage). Sequential keeps 75% of writes flowing. Object storage handles the "fast bootstrap" case — new node downloads all shards in parallel from S3 with zero leader impact, then catches up via WAL replay.
+7. **Sequential shard sync for direct copy** — copy one shard at a time. Each shard requires a brief write pause on the leader; parallel copy would pause ALL shards simultaneously (full write outage). Sequential keeps 75% of writes flowing. For large datasets, cloud disk snapshots handle the "fast bootstrap" case — new node boots from a block-level snapshot with zero leader impact, then catches up via WAL replay.

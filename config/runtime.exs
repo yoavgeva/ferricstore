@@ -211,19 +211,4 @@ if config_env() == :prod do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Object Storage Snapshots (optional)
-  # ---------------------------------------------------------------------------
-
-  snapshot_bucket = System.get_env("FERRICSTORE_SNAPSHOT_BUCKET")
-
-  if snapshot_bucket do
-    config :ferricstore, :snapshot_store,
-      adapter: Ferricstore.Cluster.SnapshotStore.S3,
-      bucket: snapshot_bucket,
-      prefix: System.get_env("FERRICSTORE_SNAPSHOT_PREFIX", "ferricstore"),
-      interval_ms: String.to_integer(System.get_env("FERRICSTORE_SNAPSHOT_INTERVAL_MS", "3600000")),
-      retention_count: String.to_integer(System.get_env("FERRICSTORE_SNAPSHOT_RETENTION", "24")),
-      compression: String.to_atom(System.get_env("FERRICSTORE_SNAPSHOT_COMPRESSION", "zstd"))
-  end
 end
