@@ -126,28 +126,20 @@ server_config = %{
 | Change | Why |
 |---|---|
 | Pass `membership: :promotable` in ra server config when `role == :replica` | ra needs to know this node doesn't vote |
-| Write forwarding on replicas | `ra:pipeline_command` from a non-voter fails — need to resolve leader and forward |
 | ClusterManager awareness | Use correct `add_member` call based on role |
 | CLUSTER.STATUS | Show voter vs replica per node |
 
-### Write forwarding on replicas
+That's it. No write forwarding code needed — `ra:pipeline_command` from a
+non-voter automatically forwards to the leader. Both quorum and async writes
+work with zero code changes:
 
-When a client sends SET to a replica, the replica can't propose to Raft (non-voter).
-Instead, it forwards the write to the shard's leader:
+- **Quorum write on replica:** `ra:pipeline_command` → ra forwards to leader →
+  leader gets majority ack from voters → applied → replicated back to replica
+- **Async write on replica:** write locally to ETS + Bitcask (fast) →
+  `AsyncApplyWorker.replicate` submits to Raft → leader receives → replicates
+  to all nodes
 
-```elixir
-# In Batcher or Router, when local node is a replica:
-def write(shard_index, command) do
-  if replica_mode?() do
-    # Forward to leader — ra knows who the leader is
-    leader = ra_leaderboard:lookup_leader(shard_cluster_name(shard_index))
-    :ra.pipeline_command(leader, command)
-  else
-    # Normal voter path
-    :ra.pipeline_command(shard_server_id(shard_index), command)
-  end
-end
-```
+The replica just can't be elected leader and doesn't count toward quorum.
 
 ### Configuration
 
