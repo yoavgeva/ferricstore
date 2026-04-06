@@ -102,6 +102,7 @@ defmodule Ferricstore.Cluster.Manager do
       known_nodes: MapSet.new(),
       remove_timers: %{},
       sync_status: if(mode == :cluster, do: :synced, else: :not_started),
+      shard_sync_status: %{},
       shard_count: Application.get_env(:ferricstore, :shard_count, 4)
     }
 
@@ -136,15 +137,17 @@ defmodule Ferricstore.Cluster.Manager do
       connected_nodes: Node.list(),
       known_nodes: MapSet.to_list(state.known_nodes),
       sync_status: state.sync_status,
+      shard_sync_status: state.shard_sync_status,
       shards: status
     }, state}
   end
 
   def handle_call({:add_node, target_node, role}, _from, state) do
     membership = role_to_membership(role)
-    result = do_add_node(target_node, membership, state)
+    {result, shard_sync} = do_add_node(target_node, membership, state)
     new_known = MapSet.put(state.known_nodes, target_node)
-    {:reply, result, %{state | known_nodes: new_known}}
+    merged_sync = Map.merge(state.shard_sync_status, %{target_node => shard_sync})
+    {:reply, result, %{state | known_nodes: new_known, shard_sync_status: merged_sync}}
   end
 
   def handle_call({:remove_node, target_node}, _from, state) do
@@ -219,23 +222,28 @@ defmodule Ferricstore.Cluster.Manager do
   defp do_add_node(target_node, membership, state) do
     Logger.info("ClusterManager: adding #{target_node} as #{membership} to all #{state.shard_count} shards")
 
-    results =
-      for shard_idx <- 0..(state.shard_count - 1) do
+    shard_results =
+      for shard_idx <- 0..(state.shard_count - 1), into: %{} do
         case RaftCluster.add_member(shard_idx, target_node, membership) do
           :ok ->
             Logger.debug("ClusterManager: added #{target_node} to shard #{shard_idx}")
-            :ok
+            {shard_idx, :ok}
 
-          {:error, reason} = err ->
-            Logger.error("ClusterManager: failed to add #{target_node} to shard #{shard_idx}: #{inspect(reason)}")
-            err
+          {:error, reason} ->
+            Logger.error(
+              "ClusterManager: failed to add #{target_node} to shard #{shard_idx}: #{inspect(reason)}"
+            )
+
+            {shard_idx, {:error, reason}}
         end
       end
 
-    if Enum.all?(results, &(&1 == :ok)) do
-      :ok
+    failed = Enum.filter(shard_results, fn {_, v} -> v != :ok end)
+
+    if failed != [] do
+      {{:error, {:partial_add, shard_results}}, shard_results}
     else
-      {:error, {:partial_add, results}}
+      {:ok, shard_results}
     end
   end
 

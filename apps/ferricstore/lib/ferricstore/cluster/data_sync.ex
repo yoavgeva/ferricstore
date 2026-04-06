@@ -1,19 +1,188 @@
 defmodule Ferricstore.Cluster.DataSync do
-  @moduledoc "Shard-by-shard data directory copy for new node sync."
+  @moduledoc """
+  Shard-by-shard data directory copy for new node sync.
+
+  Provides WAL gap detection to avoid unnecessary full copies, per-shard
+  sync status tracking, leader-aware copy source resolution, and automatic
+  retry with partial cleanup on failure.
+  """
 
   require Logger
 
-  @doc """
-  Copies a single shard's data from the leader to a target node.
+  alias Ferricstore.Raft.Cluster, as: RaftCluster
 
-  1. Pause writes on the shard
-  2. Record Raft log index
-  3. Copy all files in shard data dir + ra dir to target node
-  4. Resume writes
+  @default_max_retries 3
+
+  # ---------------------------------------------------------------------------
+  # WAL gap detection
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Checks if a shard needs a full data copy or can catch up via WAL replay.
+
+  Compares the local node's last committed Raft index against the leader's
+  first available WAL index. If the local index is at or past the leader's
+  first index, the WAL contains all entries needed to catch up. Otherwise
+  a full resync (data directory copy) is required.
+
+  ## Parameters
+
+    * `shard_index` -- zero-based shard index
+    * `leader_node` -- the node currently leading this shard's Raft group
+
+  ## Returns
+
+    * `:wal_bridgeable` -- local node can catch up from WAL replay alone
+    * `:needs_resync` -- a full data directory copy is required
+  """
+  @spec needs_resync?(non_neg_integer(), node()) :: :wal_bridgeable | :needs_resync
+  def needs_resync?(shard_index, leader_node) do
+    local_server_id = RaftCluster.shard_server_id(shard_index)
+
+    local_index =
+      case :ra.member_overview(local_server_id) do
+        {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
+        _ -> 0
+      end
+
+    leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
+
+    case :erpc.call(leader_node, :ra, :member_overview, [leader_server_id]) do
+      {:ok, overview, _} ->
+        first_index = Map.get(overview, :first_index, 0)
+        if local_index >= first_index, do: :wal_bridgeable, else: :needs_resync
+
+      _ ->
+        :needs_resync
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Single-shard sync (leader-aware)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Syncs a single shard's data to a target node.
+
+  Resolves the current leader for the shard and copies data FROM the leader
+  (not from the local node). Before copying, checks whether the target can
+  catch up via WAL replay alone -- if so, the expensive data copy is skipped.
+
+  1. Find leader for the shard
+  2. Check WAL bridgeability
+  3. If resync needed: pause writes, copy data + ra dir, resume writes
+  4. Return `{:ok, detail}` with `:wal_bridgeable` or the Raft index at copy time
+
+  ## Parameters
+
+    * `shard_index` -- zero-based shard index
+    * `target_node` -- the node to sync data to
+    * `ctx` -- the FerricStore instance context
   """
   @spec sync_shard(non_neg_integer(), node(), FerricStore.Instance.t()) ::
-          {:ok, non_neg_integer()} | {:error, term()}
+          {:ok, :wal_bridgeable | non_neg_integer()} | {:error, term()}
   def sync_shard(shard_index, target_node, ctx) do
+    leader_node = find_leader(shard_index)
+
+    case needs_resync?(shard_index, leader_node) do
+      :wal_bridgeable ->
+        Logger.info("Shard #{shard_index}: WAL bridgeable, no data copy needed")
+        {:ok, :wal_bridgeable}
+
+      :needs_resync ->
+        do_sync_shard(shard_index, target_node, leader_node, ctx)
+    end
+  end
+
+  @doc """
+  Retries `sync_shard/3` up to `max_retries` times, cleaning up partial data
+  on the target node between attempts.
+
+  ## Parameters
+
+    * `shard_index` -- zero-based shard index
+    * `target_node` -- the node to sync data to
+    * `ctx` -- the FerricStore instance context
+    * `max_retries` -- maximum number of attempts (default: #{@default_max_retries})
+  """
+  @spec retry_sync_shard(non_neg_integer(), node(), FerricStore.Instance.t(), non_neg_integer()) ::
+          {:ok, :wal_bridgeable | non_neg_integer()} | {:error, term()}
+  def retry_sync_shard(shard_index, target_node, ctx, max_retries \\ @default_max_retries) do
+    Enum.reduce_while(1..max_retries, {:error, :not_attempted}, fn attempt, _acc ->
+      case sync_shard(shard_index, target_node, ctx) do
+        {:ok, _} = ok ->
+          {:halt, ok}
+
+        {:error, reason} ->
+          Logger.warning(
+            "Shard #{shard_index} sync attempt #{attempt}/#{max_retries} failed: #{inspect(reason)}"
+          )
+
+          cleanup_partial_sync(shard_index, target_node, ctx)
+
+          if attempt < max_retries do
+            {:cont, {:error, reason}}
+          else
+            {:halt, {:error, reason}}
+          end
+      end
+    end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # All-shards sync with per-shard status
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Copies all shards sequentially, tracking per-shard sync status.
+
+  Returns `{:ok, results}` when every shard succeeds, where `results` is a
+  map of `shard_index => {:synced, detail}`. On partial failure returns
+  `{:error, {:partial_sync, results}}` with per-shard success/failure info.
+
+  ## Parameters
+
+    * `target_node` -- the node to sync data to
+    * `ctx` -- the FerricStore instance context
+  """
+  @spec sync_all_shards(node(), FerricStore.Instance.t()) :: {:ok, map()} | {:error, term()}
+  def sync_all_shards(target_node, ctx) do
+    results =
+      for shard_idx <- 0..(ctx.shard_count - 1), into: %{} do
+        case sync_shard(shard_idx, target_node, ctx) do
+          {:ok, detail} -> {shard_idx, {:synced, detail}}
+          {:error, reason} -> {shard_idx, {:failed, reason}}
+        end
+      end
+
+    failed = Enum.filter(results, fn {_, {status, _}} -> status == :failed end)
+
+    if failed == [] do
+      {:ok, results}
+    else
+      {:error, {:partial_sync, results}}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: leader resolution
+  # ---------------------------------------------------------------------------
+
+  @spec find_leader(non_neg_integer()) :: node()
+  defp find_leader(shard_index) do
+    case RaftCluster.members(shard_index) do
+      {:ok, _members, {_name, leader_node}} -> leader_node
+      _ -> node()
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: single-shard data copy (runs on the leader)
+  # ---------------------------------------------------------------------------
+
+  @spec do_sync_shard(non_neg_integer(), node(), node(), FerricStore.Instance.t()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  defp do_sync_shard(shard_index, target_node, leader_node, ctx) do
     shard = elem(ctx.shard_names, shard_index)
     shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
     ra_path = Path.join(ctx.data_dir, "ra")
@@ -22,67 +191,103 @@ defmodule Ferricstore.Cluster.DataSync do
     :ok = GenServer.call(shard, {:pause_writes}, 30_000)
 
     try do
-      # 2. Get current Raft index
-      server_id = Ferricstore.Raft.Cluster.shard_server_id(shard_index)
-      raft_index = get_raft_index(server_id)
+      # 2. Get current Raft index from the leader
+      leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
+      raft_index = get_raft_index(leader_server_id)
 
-      # 3. Copy files
-      copy_directory(shard_data_path, target_node, shard_data_path)
+      # 3. Copy shard data directory from leader to target
+      leader_shard_data =
+        if leader_node == node() do
+          shard_data_path
+        else
+          :erpc.call(leader_node, Ferricstore.DataDir, :shard_data_path, [ctx.data_dir, shard_index])
+        end
 
-      # Also copy the ra WAL dir for this shard
-      ra_shard_dir = Path.join(ra_path, "ferricstore_shard_#{shard_index}")
+      copy_directory_from(leader_node, leader_shard_data, target_node, shard_data_path)
 
-      if File.exists?(ra_shard_dir) do
+      # 4. Copy the ra WAL dir for this shard
+      leader_ra_shard_dir = Path.join(ra_path, "ferricstore_shard_#{shard_index}")
+
+      leader_ra_exists =
+        if leader_node == node() do
+          File.exists?(leader_ra_shard_dir)
+        else
+          :erpc.call(leader_node, File, :exists?, [leader_ra_shard_dir])
+        end
+
+      if leader_ra_exists do
         target_ra_dir =
           Path.join(Path.dirname(shard_data_path), "ra/ferricstore_shard_#{shard_index}")
 
-        copy_directory(ra_shard_dir, target_node, target_ra_dir)
+        copy_directory_from(leader_node, leader_ra_shard_dir, target_node, target_ra_dir)
       end
 
       {:ok, raft_index}
     rescue
       e -> {:error, Exception.message(e)}
     after
-      # 4. Always resume writes
+      # 5. Always resume writes
       GenServer.call(shard, {:resume_writes}, 5_000)
     end
   end
 
-  @doc """
-  Copies all shards sequentially.
-  """
-  @spec sync_all_shards(node(), FerricStore.Instance.t()) :: :ok | {:error, term()}
-  def sync_all_shards(target_node, ctx) do
-    for shard_idx <- 0..(ctx.shard_count - 1) do
-      case sync_shard(shard_idx, target_node, ctx) do
-        {:ok, _index} -> :ok
-        {:error, reason} -> throw({:sync_failed, shard_idx, reason})
-      end
+  # ---------------------------------------------------------------------------
+  # Private: partial cleanup
+  # ---------------------------------------------------------------------------
+
+  @spec cleanup_partial_sync(non_neg_integer(), node(), FerricStore.Instance.t()) :: :ok
+  defp cleanup_partial_sync(shard_index, target_node, ctx) do
+    shard_data_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index)
+
+    try do
+      :erpc.call(target_node, File, :rm_rf!, [shard_data_path])
+    catch
+      _, _ -> :ok
     end
 
     :ok
-  catch
-    {:sync_failed, shard_idx, reason} ->
-      {:error, {:shard_sync_failed, shard_idx, reason}}
   end
 
-  # Copy a local directory to a remote node via :erpc
-  @spec copy_directory(binary(), node(), binary()) :: :ok
-  defp copy_directory(local_path, target_node, remote_path) do
-    # Ensure remote dir exists
-    :erpc.call(target_node, File, :mkdir_p!, [remote_path])
+  # ---------------------------------------------------------------------------
+  # Private: directory copy (source_node -> target_node)
+  # ---------------------------------------------------------------------------
 
-    # Copy each file
-    {:ok, files} = File.ls(local_path)
+  # Reads files from `source_node` and writes them to `target_node`.
+  # When source_node == node(), reads are local.
+  @spec copy_directory_from(node(), binary(), node(), binary()) :: :ok
+  defp copy_directory_from(source_node, source_path, target_node, target_path) do
+    :erpc.call(target_node, File, :mkdir_p!, [target_path])
+
+    files =
+      if source_node == node() do
+        {:ok, f} = File.ls(source_path)
+        f
+      else
+        {:ok, f} = :erpc.call(source_node, File, :ls, [source_path])
+        f
+      end
 
     Enum.each(files, fn file ->
-      source = Path.join(local_path, file)
-      dest = Path.join(remote_path, file)
+      src = Path.join(source_path, file)
+      dest = Path.join(target_path, file)
 
-      if File.dir?(source) do
-        copy_directory(source, target_node, dest)
+      is_dir =
+        if source_node == node() do
+          File.dir?(src)
+        else
+          :erpc.call(source_node, File, :dir?, [src])
+        end
+
+      if is_dir do
+        copy_directory_from(source_node, src, target_node, dest)
       else
-        content = File.read!(source)
+        content =
+          if source_node == node() do
+            File.read!(src)
+          else
+            :erpc.call(source_node, File, :read!, [src])
+          end
+
         :erpc.call(target_node, File, :write!, [dest, content])
       end
     end)

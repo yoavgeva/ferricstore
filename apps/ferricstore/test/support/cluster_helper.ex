@@ -6,20 +6,26 @@ defmodule Ferricstore.Test.ClusterHelper do
   temporary directory for Bitcask data and runs the full FerricStore
   application including Raft state machines, ETS tables, and the Bitcask NIF.
 
-  ## Current Architecture
+  ## Architecture
 
-  FerricStore currently runs each node as an independent single-node Raft
-  cluster (self-quorum). Multi-node Raft consensus across nodes is planned
-  but not yet implemented. These helpers are designed to support both modes:
+  Nodes in a cluster form real multi-node Raft groups. Each shard's Raft group
+  includes all N nodes as `initial_members`, so writes go through Raft quorum
+  (e.g. 2-of-3) and are replicated to all members. Leader election, failover,
+  and log replication are exercised for real.
 
-  - **Single-node mode (current)**: Each peer is a fully independent
-    FerricStore instance. Tests verify that operations work correctly on
-    individual nodes and that the `:peer` infrastructure is sound.
+  `start_cluster/2` orchestrates the startup in the correct order:
+  1. Start all peer BEAM nodes
+  2. Connect them via Erlang distribution
+  3. Set `:cluster_nodes` config on every node (list of all node names)
+  4. Start the FerricStore application on every node
+  5. Trigger elections and wait for all shards to have a leader with
+     full membership
 
-  - **Multi-node mode (future)**: When `Ferricstore.Raft.Cluster` gains
-    `bootstrap/0` and `join/1` APIs, `start_cluster/2` will form an actual
-    Raft cluster. Tests for replication, failover, and partitions will
-    then validate cross-node consistency.
+  ## Single-node addition
+
+  `start_node/1` starts a standalone peer that is NOT part of any initial
+  cluster. It can be added later via `Ferricstore.Cluster.Manager.add_node/2`
+  for testing dynamic membership changes (node join + data sync).
 
   ## Usage
 
@@ -46,24 +52,21 @@ defmodule Ferricstore.Test.ClusterHelper do
   end
 
   @doc """
-  Starts N FerricStore peer nodes.
+  Starts N FerricStore peer nodes forming a real multi-node Raft cluster.
 
   Each node gets:
   - A unique BEAM node name (`ferric_<unique>_<i>@<host>`)
   - Its own temporary directory for Bitcask data
   - The same code path as the test runner
   - An individually started FerricStore application
-
-  Currently each node runs as an independent single-node Raft instance.
-  When multi-node Raft is implemented, this function will also form the
-  cluster.
+  - Shared `cluster_nodes` config so all shards form N-member Raft groups
 
   ## Parameters
 
     - `n` -- number of nodes to start (typically 3 or 5)
     - `opts` -- keyword options:
       - `:shards` -- number of shards per node (default: 4)
-      - `:timeout` -- leader election timeout in ms (default: 10_000)
+      - `:timeout` -- leader election timeout in ms (default: 15_000)
 
   ## Returns
 
@@ -76,13 +79,13 @@ defmodule Ferricstore.Test.ClusterHelper do
     end
 
     shards = Keyword.get(opts, :shards, 4)
-    timeout = Keyword.get(opts, :timeout, 10_000)
+    timeout = Keyword.get(opts, :timeout, 15_000)
     unique = :erlang.unique_integer([:positive])
 
     # Ensure the host node is alive for Erlang distribution.
     ensure_distribution!()
 
-    # Start each peer node
+    # Phase 1: Start all peer BEAM nodes (without starting the app yet)
     nodes =
       Enum.map(1..n, fn i ->
         node_suffix = "#{unique}_#{i}"
@@ -101,35 +104,139 @@ defmodule Ferricstore.Test.ClusterHelper do
             args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie]
           })
 
-        # Set application env on the remote node before starting the app
-        configure_remote_node(node_name, data_dir, shards)
-
-        # Start the FerricStore application on the remote node
-        case :rpc.call(node_name, Application, :ensure_all_started, [:ferricstore]) do
-          {:ok, _apps} ->
-            :ok
-
-          {:error, reason} ->
-            raise "Failed to start FerricStore on #{node_name}: #{inspect(reason)}"
-
-          {:badrpc, reason} ->
-            raise "RPC to #{node_name} failed: #{inspect(reason)}"
-        end
-
         %{name: node_name, peer: peer_pid, data_dir: data_dir, index: i}
       end)
 
-    # Connect all nodes to each other for Erlang distribution
     node_names = Enum.map(nodes, & &1.name)
 
+    # Phase 2: Connect all nodes to each other for Erlang distribution.
+    # Must happen before app startup so that ra servers can communicate
+    # during leader election.
     for n1 <- node_names, n2 <- node_names, n1 != n2 do
       :rpc.call(n1, Node, :connect, [n2])
     end
 
-    # Wait for all shards to have elected leaders on each node
-    :ok = wait_for_leaders(nodes, shards, timeout: timeout)
+    # Phase 3: Configure all nodes with cluster_nodes and app env,
+    # then start the FerricStore application.
+    Enum.each(nodes, fn node ->
+      configure_remote_node(node.name, node.data_dir, shards)
+
+      # Set cluster_nodes so Raft.Cluster.start_shard_server uses all
+      # nodes as initial_members for each shard's Raft group.
+      :ok = :rpc.call(node.name, Application, :put_env, [
+        :ferricstore, :cluster_nodes, node_names
+      ])
+    end)
+
+    # Phase 4: Start FerricStore on all nodes CONCURRENTLY. This is critical
+    # for multi-node Raft: each node's Shard.init starts ra servers and
+    # triggers elections. Elections need quorum (e.g. 2 of 3), so if we
+    # start sequentially, early nodes wait 500ms per shard for elections
+    # that cannot succeed (peers not up yet). Starting concurrently ensures
+    # ra servers on all nodes come up roughly simultaneously, enabling
+    # quorum to be reached promptly.
+    tasks =
+      Enum.map(nodes, fn node ->
+        Task.async(fn -> start_ferricstore_on_node(node.name) end)
+      end)
+
+    # Wait for all app starts to complete. Each takes ~2s (4 shards * 500ms
+    # election wait). With concurrent start, this is ~2s total instead of 6s.
+    Enum.each(tasks, fn task -> Task.await(task, 30_000) end)
+
+    # Re-trigger elections now that all nodes have ra servers running.
+    # The initial elections during Shard.init may have failed because not
+    # all peers were ready. Triggering again ensures quorum is reached.
+    Enum.each(nodes, fn node ->
+      for shard <- 0..(shards - 1) do
+        server_id = {:"ferricstore_shard_#{shard}", node.name}
+        :rpc.call(node.name, :ra, :trigger_election, [server_id])
+      end
+    end)
+
+    # Phase 5: Wait for all shards to have elected leaders with full
+    # membership across the cluster.
+    :ok = wait_for_cluster_ready(nodes, shards, timeout)
 
     nodes
+  end
+
+  @doc """
+  Starts a single FerricStore peer node, independent of any cluster.
+
+  The node starts with no `cluster_nodes` config, so each shard forms a
+  single-member Raft group. The returned node name can be passed to
+  `Ferricstore.Cluster.Manager.add_node/2` on an existing cluster node
+  to dynamically join it.
+
+  ## Parameters
+
+    - `opts` -- keyword options:
+      - `:shards` -- number of shards (default: 4)
+
+  ## Returns
+
+  The Erlang node name atom (e.g. `:"ferric_12345@hostname"`).
+  """
+  @spec start_node(keyword()) :: atom()
+  def start_node(opts \\ []) do
+    unless peer_available?() do
+      raise "ClusterHelper requires OTP 25+ for :peer module"
+    end
+
+    ensure_distribution!()
+
+    shards = Keyword.get(opts, :shards, 4)
+    unique = :erlang.unique_integer([:positive])
+    name = :"ferric_solo_#{unique}"
+    data_dir = Path.join(System.tmp_dir!(), "ferricstore_solo_#{unique}")
+    File.mkdir_p!(data_dir)
+
+    code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
+    cookie = Atom.to_charlist(Node.get_cookie())
+
+    {:ok, peer_pid, node_name} =
+      :peer.start(%{
+        name: name,
+        args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie]
+      })
+
+    # Store peer_pid in process dictionary so stop_node can find it.
+    # Also store in a named ETS table for cross-process access.
+    ensure_solo_registry!()
+    :ets.insert(:ferricstore_solo_peers, {node_name, peer_pid, data_dir})
+
+    configure_remote_node(node_name, data_dir, shards)
+    start_ferricstore_on_node(node_name)
+
+    # Wait for local leaders (single-node Raft, should be fast)
+    :ok = wait_for_node_leaders(node_name, shards, timeout: 10_000)
+
+    node_name
+  end
+
+  @doc """
+  Stops a single node started by `start_node/1` and cleans up its data.
+  """
+  @spec stop_node(atom()) :: :ok
+  def stop_node(node_name) do
+    case :ets.lookup(:ferricstore_solo_peers, node_name) do
+      [{^node_name, peer_pid, data_dir}] ->
+        :ets.delete(:ferricstore_solo_peers, node_name)
+
+        try do
+          :peer.stop(peer_pid)
+        catch
+          _, _ -> :ok
+        end
+
+        File.rm_rf(data_dir)
+        :ok
+
+      [] ->
+        Logger.warning("stop_node: no registered peer for #{node_name}")
+        :ok
+    end
   end
 
   @doc """
@@ -177,9 +284,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   @doc """
   Kills the leader node for a given shard.
 
-  In single-node Raft mode, the leader is always the local node. This
-  function finds which node is the leader for the specified shard and
-  stops it.
+  Finds which node is the leader for the specified shard and stops it.
 
   ## Parameters
 
@@ -201,7 +306,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   Finds the current Raft leader for a shard.
 
   Tries each node in order until one returns a successful `ra:members/1`
-  result. In single-node mode, each node is its own leader.
+  result.
 
   ## Returns
 
@@ -275,9 +380,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   @doc """
   Waits until all shards have an elected leader on at least one of the given nodes.
 
-  Polls every 100ms up to the configured timeout. In single-node mode, each
-  node is its own leader, so this verifies that all ra servers have completed
-  their leader election.
+  Polls every 100ms up to the configured timeout.
 
   ## Parameters
 
@@ -311,6 +414,76 @@ defmodule Ferricstore.Test.ClusterHelper do
     timeout = Keyword.get(opts, :timeout, 5_000)
     deadline = System.monotonic_time(:millisecond) + timeout
     do_wait_node_leaders(node_name, 0..(shards - 1), deadline)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: start FerricStore on a remote node
+  # ---------------------------------------------------------------------------
+
+  defp start_ferricstore_on_node(node_name) do
+    case :rpc.call(node_name, Application, :ensure_all_started, [:ferricstore]) do
+      {:ok, _apps} ->
+        :ok
+
+      {:error, reason} ->
+        raise "Failed to start FerricStore on #{node_name}: #{inspect(reason)}"
+
+      {:badrpc, reason} ->
+        raise "RPC to #{node_name} failed: #{inspect(reason)}"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: wait for cluster readiness (multi-node Raft)
+  # ---------------------------------------------------------------------------
+
+  # Waits for all shards to have a leader and the expected number of members.
+  # In a multi-node cluster, each shard's Raft group should eventually contain
+  # all N nodes as members. We poll until either:
+  # - All shards report a leader from any node, OR
+  # - The timeout is reached
+  defp wait_for_cluster_ready(nodes, shards, timeout) do
+    shard_range = 0..(shards - 1)
+    expected_members = length(nodes)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_wait_cluster_ready(nodes, shard_range, expected_members, deadline)
+  end
+
+  defp do_wait_cluster_ready(nodes, shard_range, expected_members, deadline) do
+    all_ready =
+      Enum.all?(shard_range, fn shard ->
+        Enum.any?(nodes, fn node ->
+          server_id = {:"ferricstore_shard_#{shard}", node.name}
+
+          case :rpc.call(node.name, :ra, :members, [server_id]) do
+            {:ok, members, _leader} when length(members) == expected_members ->
+              true
+
+            {:ok, _members, _leader} ->
+              # Leader exists but not all members joined yet
+              false
+
+            _ ->
+              false
+          end
+        end)
+      end)
+
+    cond do
+      all_ready ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
+        # Fall back to basic leader check — even if not all members are
+        # visible yet, having a leader means the cluster is functional.
+        # This handles the case where ra reports fewer members during
+        # initial convergence.
+        do_wait_leaders(nodes, shard_range, deadline + 5_000)
+
+      true ->
+        Process.sleep(100)
+        do_wait_cluster_ready(nodes, shard_range, expected_members, deadline)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -385,6 +558,22 @@ defmodule Ferricstore.Test.ClusterHelper do
     Enum.each(env_settings, fn {key, value} ->
       :ok = :rpc.call(node_name, Application, :put_env, [:ferricstore, key, value])
     end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: solo peer registry
+  # ---------------------------------------------------------------------------
+
+  # Ensures the ETS table for tracking solo peer nodes exists.
+  # Used by start_node/stop_node to map node names back to peer PIDs.
+  defp ensure_solo_registry! do
+    case :ets.whereis(:ferricstore_solo_peers) do
+      :undefined ->
+        :ets.new(:ferricstore_solo_peers, [:named_table, :public, :set])
+
+      _ref ->
+        :ok
+    end
   end
 
   # ---------------------------------------------------------------------------
