@@ -142,11 +142,6 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-  @spec handle_promoted(binary(), map()) :: {:reply, boolean(), map()}
-  @doc false
-  def handle_promoted(redis_key, state) do
-    {:reply, Map.has_key?(state.promoted_instances, redis_key), state}
-  end
 
   # -------------------------------------------------------------------
   # Raft / direct write helpers

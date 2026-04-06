@@ -393,10 +393,6 @@ defmodule Ferricstore.Store.Shard do
     ShardCompound.handle_compound_delete_prefix(redis_key, prefix, state)
   end
 
-  # Check if a redis_key is promoted.
-  def handle_call({:promoted?, redis_key}, _from, state) do
-    ShardCompound.handle_promoted(redis_key, state)
-  end
 
   # -------------------------------------------------------------------
   # handle_call — native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD

@@ -6,8 +6,8 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   require Logger
 
-  # Timeout for synchronous flush (blocking receive for async completion).
-  @sync_flush_timeout_ms 5_000
+  # Default timeout for synchronous flush (used when instance_ctx is not available).
+  @default_sync_flush_timeout_ms 5_000
 
   # Record header size for dead byte accounting (same as @bitcask_header_size).
   @record_header_size 26
@@ -103,6 +103,8 @@ defmodule Ferricstore.Store.Shard.Flush do
   def await_in_flight(%{flush_in_flight: nil} = state), do: state
 
   def await_in_flight(%{flush_in_flight: corr_id} = state) do
+    timeout = sync_flush_timeout(state)
+
     receive do
       {:tokio_complete, ^corr_id, :ok, :ok} ->
         %{state | flush_in_flight: nil}
@@ -111,12 +113,18 @@ defmodule Ferricstore.Store.Shard.Flush do
         # Fsync failed — log at caller site if needed. Clear in-flight.
         %{state | flush_in_flight: nil}
     after
-      @sync_flush_timeout_ms ->
+      timeout ->
         # Timeout — clear in-flight to avoid permanent blocking.
         Logger.error("Shard #{state.index}: await_in_flight timed out for corr_id #{corr_id}")
         %{state | flush_in_flight: nil}
     end
   end
+
+  defp sync_flush_timeout(%{instance_ctx: ctx}) when ctx != nil do
+    Map.get(ctx, :sync_flush_timeout_ms, @default_sync_flush_timeout_ms)
+  end
+
+  defp sync_flush_timeout(_state), do: @default_sync_flush_timeout_ms
 
   # -------------------------------------------------------------------
   # ETS location updates after flush
