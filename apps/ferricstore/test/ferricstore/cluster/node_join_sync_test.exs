@@ -372,6 +372,57 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     end
   end
 
+  describe "non-voter (readonly) node joins and gets data" do
+    @tag timeout: 120_000
+    test "readonly replica receives all data, writes forward to leader" do
+      # 1. Start 3-node cluster with data
+      nodes = ClusterHelper.start_cluster(3)
+      on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+
+      [node_a, _node_b, _node_c] = nodes
+
+      keys = write_keys(node_a, "before_replica", 1..100)
+
+      # 2. Start readonly replica with cluster_nodes + cluster_role
+      #    Simulates: FERRICSTORE_CLUSTER_ROLE=readonly FERRICSTORE_CLUSTER_NODES=a,b,c
+      all_cluster_nodes = Enum.map(nodes, &node_name/1)
+      replica = ClusterHelper.start_node(cluster_nodes: all_cluster_nodes, cluster_role: :readonly)
+      on_exit(fn -> ClusterHelper.stop_node(replica) end)
+
+      # 3. Connect — auto-discovery reads remote role and joins as non_voter
+      n_a = node_name(node_a)
+      :erpc.call(n_a, Node, :connect, [node_name(replica)])
+
+      # 4. Write more data after replica joined
+      post_keys = write_keys(node_a, "after_replica", 1..50)
+      all_keys = keys ++ post_keys
+
+      # 5. Verify replica has all data (receives replication)
+      eventually(fn ->
+        missing = Enum.count(all_keys, fn k -> read_key(replica, k) == nil end)
+        assert missing == 0, "#{missing} keys missing on replica"
+      end, "replica missing keys", 60, 500)
+
+      # 6. Verify keydirs identical
+      eventually(fn ->
+        assert dump_keydir_sorted(node_a) == dump_keydir_sorted(replica), "keydir mismatch"
+      end, "keydirs not converged", 20, 500)
+
+      # 7. Write from replica — should forward to leader and succeed
+      write_key(replica, "replica_write_test", "from_replica")
+
+      eventually(fn ->
+        assert read_key(node_a, "replica_write_test") == "from_replica"
+      end, "replica write not forwarded to leader", 20, 500)
+
+      # 8. Verify replica is NOT a voter (doesn't affect quorum)
+      #    Check ra membership on any shard
+      {:ok, members, _leader} = :erpc.call(n_a, Ferricstore.Raft.Cluster, :members, [0])
+      replica_member = Enum.find(members, fn {_name, node} -> node == node_name(replica) end)
+      assert replica_member != nil, "replica should be in member list"
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Helpers — these call into :peer nodes via :erpc
   # ---------------------------------------------------------------------------

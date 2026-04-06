@@ -216,6 +216,11 @@ defmodule Ferricstore.Test.ClusterHelper do
       :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_nodes, cluster_nodes])
     end
 
+    cluster_role = Keyword.get(opts, :cluster_role)
+    if cluster_role do
+      :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_role, cluster_role])
+    end
+
     start_ferricstore_on_node(node_name)
 
     # Wait for shards to be alive and accepting calls

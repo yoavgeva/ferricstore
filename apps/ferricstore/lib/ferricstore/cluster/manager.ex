@@ -178,7 +178,15 @@ defmodule Ferricstore.Cluster.Manager do
       # Case 1: We know this node — it's in our cluster_nodes config
       node in state.cluster_nodes ->
         new_known = MapSet.put(state.known_nodes, node)
-        spawn(fn -> do_auto_join(node, state.role) end)
+        spawn(fn ->
+          # Read the remote node's role, not ours
+          remote_role = try do
+            :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_role, :voter], 5_000)
+          catch
+            _, _ -> :voter
+          end
+          do_auto_join(node, remote_role)
+        end)
         {:noreply, %{state | known_nodes: new_known, mode: :cluster}}
 
       # Case 2: We don't know this node, but it might want to join us.
@@ -188,8 +196,10 @@ defmodule Ferricstore.Cluster.Manager do
           try do
             remote_nodes = :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_nodes, []], 5_000)
             if node() in remote_nodes do
-              Logger.info("ClusterManager: #{node} wants to join us, initiating auto-join")
-              GenServer.call(__MODULE__, {:add_node, node, :voter}, 120_000)
+              # Read the remote node's configured role (voter/replica/readonly)
+              remote_role = :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_role, :voter], 5_000)
+              Logger.info("ClusterManager: #{node} wants to join us as #{remote_role}, initiating auto-join")
+              GenServer.call(__MODULE__, {:add_node, node, remote_role}, 120_000)
             end
           catch
             _, _ -> :ok
