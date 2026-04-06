@@ -689,7 +689,25 @@ CLUSTER.FAILOVER     → trigger manual leadership transfer
 
 3. **Let ra elect leaders naturally** — no forced leadership distribution. ra's random election timeouts spread leaders across nodes well enough. Forced rebalancing fights Raft's election logic and adds complexity for minimal gain. Can add `CLUSTER.REBALANCE` later if needed.
 
+4. **Pluggable object storage** — define a `Ferricstore.Cluster.SnapshotStore` behaviour with `upload/3`, `download/2`, `list/1`, `delete/1`. Ship S3 adapter as default. Others implement their own (GCS, Azure, MinIO, local filesystem). Same pattern as Ecto adapters.
+
+```elixir
+defmodule Ferricstore.Cluster.SnapshotStore do
+  @callback upload(path :: binary(), key :: binary(), opts :: keyword()) :: :ok | {:error, term()}
+  @callback download(key :: binary(), dest_path :: binary()) :: :ok | {:error, term()}
+  @callback list(prefix :: binary()) :: {:ok, [binary()]} | {:error, term()}
+  @callback delete(key :: binary()) :: :ok | {:error, term()}
+end
+```
+
+```elixir
+# config/prod.exs
+config :ferricstore, :snapshot_store,
+  adapter: Ferricstore.Cluster.SnapshotStore.S3,
+  bucket: "ferricstore-snapshots",
+  prefix: "cluster-prod"
+```
+
 ## Open Questions
 
-1. **Object storage library** — ExAws (mature, S3/GCS), or keep it pluggable with a behaviour?
-2. **Sync parallelism** — Copy shards sequentially (simpler, predictable) or parallel (faster, more leader load)?
+1. **Sync parallelism** — Copy shards sequentially (simpler, predictable) or parallel (faster, more leader load)?
