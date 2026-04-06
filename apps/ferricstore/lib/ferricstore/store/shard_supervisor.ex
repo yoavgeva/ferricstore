@@ -28,7 +28,8 @@ defmodule Ferricstore.Store.ShardSupervisor do
 
     children =
       Enum.map(0..(shard_count - 1), fn i ->
-        shard_opts = [index: i, data_dir: data_dir]
+        raft_enabled = Application.get_env(:ferricstore, :raft_enabled, true)
+        shard_opts = [index: i, data_dir: data_dir, raft_enabled: raft_enabled]
         shard_opts = if instance_ctx, do: Keyword.put(shard_opts, :instance_ctx, instance_ctx), else: shard_opts
 
         Supervisor.child_spec(

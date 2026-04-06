@@ -207,10 +207,13 @@ defmodule Ferricstore.Test.ClusterHelper do
     :ets.insert(:ferricstore_solo_peers, {node_name, peer_pid, data_dir})
 
     configure_remote_node(node_name, data_dir, shards)
-    start_ferricstore_on_node(node_name)
 
-    # Wait for local leaders (single-node Raft, should be fast)
-    :ok = wait_for_node_leaders(node_name, shards, timeout: 10_000)
+    # New solo nodes start with raft_enabled: false so they don't create
+    # conflicting single-node Raft leaders. After the cluster syncs data
+    # and calls ra:add_member, the node joins as a follower.
+    :rpc.call(node_name, Application, :put_env, [:ferricstore, :raft_enabled, false])
+
+    start_ferricstore_on_node(node_name)
 
     node_name
   end
@@ -220,6 +223,8 @@ defmodule Ferricstore.Test.ClusterHelper do
   """
   @spec stop_node(atom()) :: :ok
   def stop_node(node_name) do
+    ensure_solo_registry!()
+
     case :ets.lookup(:ferricstore_solo_peers, node_name) do
       [{^node_name, peer_pid, data_dir}] ->
         :ets.delete(:ferricstore_solo_peers, node_name)

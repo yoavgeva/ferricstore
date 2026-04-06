@@ -45,8 +45,21 @@ defmodule Ferricstore.Cluster.DataSync do
         target_shard_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_index)
 
         case :erpc.call(target_node, File, :ls, [target_shard_path]) do
-          {:ok, files} -> Enum.any?(files, &String.ends_with?(&1, ".log"))
-          _ -> false
+          {:ok, files} ->
+            # Check if any .log file has actual data (not just the empty 00000.log
+            # created by DataDir.ensure_layout!)
+            log_files = Enum.filter(files, &String.ends_with?(&1, ".log"))
+
+            Enum.any?(log_files, fn f ->
+              path = Path.join(target_shard_path, f)
+              case :erpc.call(target_node, File, :stat, [path]) do
+                {:ok, %{size: size}} -> size > 0
+                _ -> false
+              end
+            end)
+
+          _ ->
+            false
         end
       catch
         _, _ -> false
@@ -191,9 +204,39 @@ defmodule Ferricstore.Cluster.DataSync do
     failed = Enum.filter(results, fn {_, {status, _}} -> status == :failed end)
 
     if failed == [] do
+      # After copying all shard data, tell the target to rebuild keydirs
+      # from the newly copied files. The target's shards started with empty
+      # keydirs — now the Bitcask files are in place, so re-recovery populates ETS.
+      rebuild_keydirs_on_target(target_node, ctx.shard_count)
       {:ok, results}
     else
       {:error, {:partial_sync, results}}
+    end
+  end
+
+
+  defp rebuild_keydirs_on_target(target_node, shard_count) do
+    Logger.info("DataSync: rebuilding keydirs on #{target_node}")
+
+    for shard_idx <- 0..(shard_count - 1) do
+      try do
+        # Get the shard's keydir and data path from the target
+        target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default])
+        shard_data_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_idx)
+        keydir = elem(target_ctx.keydir_refs, shard_idx)
+
+        # Clear existing (empty) keydir entries
+        :erpc.call(target_node, :ets, :delete_all_objects, [keydir])
+
+        # Re-run keydir recovery from the copied Bitcask files
+        :erpc.call(target_node, Ferricstore.Store.Shard.Lifecycle, :recover_keydir,
+          [shard_data_path, keydir, shard_idx])
+
+        Logger.info("DataSync: shard #{shard_idx} keydir rebuilt on #{target_node}")
+      catch
+        kind, reason ->
+          Logger.error("DataSync: failed to rebuild keydir for shard #{shard_idx} on #{target_node}: #{inspect({kind, reason})}")
+      end
     end
   end
 
@@ -235,18 +278,11 @@ defmodule Ferricstore.Cluster.DataSync do
       # 3. Copy shard data directory from leader to target
       copy_directory_from(leader_node, leader_shard_data, target_node, target_shard_data)
 
-      # 4. Copy the ra WAL dir for this shard
-      leader_ra_dir = Path.join(leader_data_dir, "ra")
-      ra_shard_name = "ferricstore_shard_#{shard_index}"
-      leader_ra_shard_dir = Path.join(leader_ra_dir, ra_shard_name)
-
-      ra_exists = file_exists_on?(leader_node, leader_ra_shard_dir)
-
-      if ra_exists do
-        target_ra_dir = Path.join(target_data_dir, "ra/#{ra_shard_name}")
-        Logger.info("Shard #{shard_index}: copying ra dir → #{target_node}:#{target_ra_dir}")
-        copy_directory_from(leader_node, leader_ra_shard_dir, target_node, target_ra_dir)
-      end
+      # NOTE: We do NOT copy the ra WAL dir. The WAL contains node-specific
+      # server IDs that won't work on the target. Instead, after add_member,
+      # ra will send the target a snapshot + recent entries through its own
+      # replication mechanism. The Bitcask files we just copied provide the
+      # data; ra provides the ongoing replication stream.
 
       Logger.info("Shard #{shard_index}: sync complete at raft index #{raft_index}")
       {:ok, raft_index}
@@ -303,14 +339,6 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
-  defp file_exists_on?(node, path) do
-    if node == node() do
-      File.exists?(path)
-    else
-      :erpc.call(node, File, :exists?, [path])
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # Private: partial cleanup
   # ---------------------------------------------------------------------------
@@ -336,6 +364,7 @@ defmodule Ferricstore.Cluster.DataSync do
   # When source_node == node(), reads are local.
   @spec copy_directory_from(node(), binary(), node(), binary()) :: :ok
   defp copy_directory_from(source_node, source_path, target_node, target_path) do
+    Logger.info("DataSync: copying #{source_node}:#{source_path} → #{target_node}:#{target_path}")
     :erpc.call(target_node, File, :mkdir_p!, [target_path])
 
     files =

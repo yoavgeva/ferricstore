@@ -69,6 +69,61 @@ defmodule Ferricstore.Raft.Cluster do
   end
 
   @doc """
+  Starts a ra server that joins an existing Raft group as a follower.
+
+  Unlike `start_shard_server/6` which may create a new single-node group,
+  this function configures `initial_members` with the provided cluster members
+  so ra knows to join the existing group. Used when a new node joins an
+  already-running cluster after data sync.
+  """
+  @spec join_shard_server(non_neg_integer(), binary(), non_neg_integer(), binary(), atom(), [node()], keyword()) ::
+          :ok | {:error, term()}
+  def join_shard_server(shard_index, shard_data_path, active_file_id, active_file_path, ets, cluster_members, opts \\ []) do
+    ra_sys = Keyword.get(opts, :ra_system, @ra_system)
+    membership = Keyword.get(opts, :membership, :voter)
+    server_id = shard_server_id(shard_index)
+
+    machine_config = %{
+      shard_index: shard_index,
+      shard_data_path: shard_data_path,
+      active_file_id: active_file_id,
+      active_file_path: active_file_path,
+      ets: ets,
+      data_dir: Path.dirname(shard_data_path)
+    }
+
+    initial_members =
+      Enum.map(cluster_members, fn member_node ->
+        shard_server_id_on(shard_index, member_node)
+      end)
+
+    server_config = %{
+      id: server_id,
+      uid: shard_uid(shard_index),
+      cluster_name: shard_cluster_name(shard_index),
+      initial_members: initial_members,
+      membership: membership,
+      machine: {:module, Ferricstore.Raft.StateMachine, machine_config},
+      log_init_args: %{uid: shard_uid(shard_index)},
+      system: ra_sys,
+      min_recovery_checkpoint_interval: 1
+    }
+
+    case :ra.start_server(ra_sys, server_config) do
+      :ok ->
+        Logger.info("Shard #{shard_index}: joined cluster with #{length(initial_members)} members")
+        :ok
+
+      {:error, {:already_started, _pid}} ->
+        :ok
+
+      {:error, reason} = err ->
+        Logger.error("Shard #{shard_index}: failed to join cluster: #{inspect(reason)}")
+        err
+    end
+  end
+
+  @doc """
   Returns the ra server ID for a shard on a specific node.
   """
   @spec shard_server_id_on(non_neg_integer(), node()) :: :ra.server_id()

@@ -220,31 +220,46 @@ defmodule Ferricstore.Cluster.Manager do
   # Private: join flow (add to Raft + data sync — used by both auto and manual)
   # ---------------------------------------------------------------------------
 
-  # Full join: add to Raft groups, then sync data if needed.
+  # Full join: sync data FIRST, then add to Raft groups.
+  # Order matters: if we add to Raft first, the new node's existing ra servers
+  # (started as single-node leaders) conflict with the cluster's leaders.
+  # By syncing data first, the new node receives the cluster's Bitcask files.
+  # Then when added to Raft, ra can start replicating from the sync point.
+  #
   # This is the single code path for both :nodeup auto-join and CLUSTER.JOIN.
   defp do_join_node(target_node, membership, state) do
     Logger.info("ClusterManager: joining #{target_node} (#{membership})")
+    ctx = FerricStore.Instance.get(:default)
 
-    # Step 1: Add to all Raft groups
-    {raft_result, _shard_results} = do_add_node(target_node, membership, state)
+    # Step 1: Sync data — copies shard dirs from leader to target.
+    # Target node already has FerricStore running (with its own single-node Raft).
+    # DataSync pauses writes on the leader, copies files to target, resumes.
+    case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
+      {:ok, sync_results} ->
+        Logger.info("ClusterManager: data synced to #{target_node}: #{inspect(sync_results)}")
 
-    case raft_result do
-      :ok ->
-        # Step 2: Sync data — copies shard dirs from leader to target
-        ctx = FerricStore.Instance.get(:default)
+        # Step 2: Add target to all Raft groups.
+        # Now target has the data, ra can start replicating the delta.
+        {raft_result, _shard_results} = do_add_node(target_node, membership, state)
 
-        case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
-          {:ok, sync_results} ->
-            Logger.info("ClusterManager: #{target_node} fully synced: #{inspect(sync_results)}")
+        case raft_result do
+          :ok ->
+            # Step 3: Tell target to start Raft on its shards.
+            # The shards started with raft_enabled: false. Now that data is
+            # synced and the node is added to the Raft groups, start ra servers
+            # that join as followers of the existing groups.
+            start_raft_on_target(target_node, state.shard_count)
+            Logger.info("ClusterManager: #{target_node} fully joined and synced")
             :ok
 
-          {:error, reason} ->
-            Logger.error("ClusterManager: data sync failed for #{target_node}: #{inspect(reason)}")
-            {:error, {:sync_failed, reason}}
+          {:error, _} = err ->
+            Logger.error("ClusterManager: Raft add failed for #{target_node}: #{inspect(err)}")
+            err
         end
 
-      {:error, _} = err ->
-        err
+      {:error, reason} ->
+        Logger.error("ClusterManager: data sync failed for #{target_node}: #{inspect(reason)}")
+        {:error, {:sync_failed, reason}}
     end
   end
 
@@ -380,6 +395,38 @@ defmodule Ferricstore.Cluster.Manager do
         Process.cancel_timer(timer_ref)
         Logger.info("ClusterManager: cancelled removal timer for #{node} (reconnected)")
         %{state | remove_timers: new_timers}
+    end
+  end
+
+  # Start Raft servers on the target node. Called after data sync + add_member.
+  # The target's shards are running with raft_enabled: false — they need ra
+  # servers started so they can receive Raft replication from the leaders.
+  defp start_raft_on_target(target_node, shard_count) do
+    Logger.info("ClusterManager: starting Raft on #{target_node}")
+
+    # Collect all cluster members (existing nodes + the target)
+    cluster_members = [node() | Node.list()] |> Enum.uniq()
+    cluster_members = if target_node in cluster_members, do: cluster_members, else: [target_node | cluster_members]
+
+    for shard_idx <- 0..(shard_count - 1) do
+      try do
+        target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default])
+        shard_data_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_idx)
+        keydir = elem(target_ctx.keydir_refs, shard_idx)
+
+        # Use join_shard_server which sets initial_members to the full cluster.
+        # This way ra knows to join the existing group as a follower,
+        # not create a new single-node group.
+        result = :erpc.call(target_node, Ferricstore.Raft.Cluster, :join_shard_server, [
+          shard_idx, shard_data_path, 0, Path.join(shard_data_path, "00000.log"), keydir,
+          cluster_members
+        ])
+
+        Logger.info("ClusterManager: shard #{shard_idx} Raft joined on #{target_node}: #{inspect(result)}")
+      catch
+        kind, reason ->
+          Logger.warning("ClusterManager: shard #{shard_idx} Raft join failed on #{target_node}: #{inspect({kind, reason})}")
+      end
     end
   end
 

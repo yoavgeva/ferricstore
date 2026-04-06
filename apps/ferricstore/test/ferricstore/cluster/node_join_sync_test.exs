@@ -62,11 +62,17 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       final_keys = write_keys(node_a, "post_sync", 1..50)
 
       # 7. Wait for Raft to replicate everything to node_d
-      Process.sleep(2_000)
-
-      # 8. Verify ALL keys readable on node_d
+      #    during_sync keys were written while sync was happening — they go through
+      #    Raft which replicates to node_d after it joins the group
       all_keys = initial_keys ++ during_sync_keys ++ final_keys
 
+      # Poll until all keys are readable (Raft replication may take a few seconds)
+      eventually(fn ->
+        missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
+        assert missing_count == 0, "#{missing_count} keys still missing on node_d"
+      end, "not all keys replicated to node_d", 60, 500)
+
+      # 8. Final verification
       missing = Enum.filter(all_keys, fn key -> read_key(node_d, key) == nil end)
       IO.puts("Total keys: #{length(all_keys)}, missing on node_d: #{length(missing)}")
 
