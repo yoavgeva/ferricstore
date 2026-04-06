@@ -117,6 +117,10 @@ defmodule Ferricstore.Application do
     # the ra system, so the patched module is in place when the WAL starts.
     install_patched_wal()
 
+    # Start Erlang distribution if cluster is configured.
+    # Must happen before ra system start so ra can communicate across nodes.
+    maybe_start_distribution()
+
     # Start the ra system before shards so that Shard.init can start ra servers.
     Ferricstore.Raft.Cluster.start_system(data_dir)
 
@@ -196,7 +200,8 @@ defmodule Ferricstore.Application do
           {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
           Ferricstore.PubSub,
           Ferricstore.FetchOrCompute,
-          {Ferricstore.MemoryGuard, memory_guard_opts()}
+          {Ferricstore.MemoryGuard, memory_guard_opts()},
+          Ferricstore.Cluster.Manager
         ]
 
     {max_r, max_s} = Application.get_env(:ferricstore, :supervisor_max_restarts, {20, 10})
@@ -535,6 +540,25 @@ defmodule Ferricstore.Application do
 
       topologies when is_list(topologies) ->
         [{Cluster.Supervisor, [topologies, [name: Ferricstore.ClusterSupervisor]]}]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Erlang distribution (cluster mode)
+  # ---------------------------------------------------------------------------
+
+  defp maybe_start_distribution do
+    case Application.get_env(:ferricstore, :node_name) do
+      nil ->
+        :ok
+
+      name ->
+        unless Node.alive?() do
+          {:ok, _} = Node.start(name)
+          cookie = Application.get_env(:ferricstore, :cookie, :ferricstore)
+          Node.set_cookie(cookie)
+          Logger.info("Started Erlang distribution: #{name}, cookie set")
+        end
     end
   end
 

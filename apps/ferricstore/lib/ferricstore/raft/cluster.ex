@@ -69,15 +69,90 @@ defmodule Ferricstore.Raft.Cluster do
   end
 
   @doc """
+  Returns the ra server ID for a shard on a specific node.
+  """
+  @spec shard_server_id_on(non_neg_integer(), node()) :: :ra.server_id()
+  def shard_server_id_on(shard_index, node) do
+    {:"ferricstore_shard_#{shard_index}", node}
+  end
+
+  @doc """
+  Adds a node to an existing shard's Raft group.
+
+  The membership determines the node's role:
+    * `:voter` — full quorum member (default)
+    * `:promotable` — receives replication, can be promoted to voter
+    * `:non_voter` — permanent read-only, never promoted
+
+  ## Parameters
+
+    * `shard_index` — zero-based shard index
+    * `node` — the Erlang node to add
+    * `membership` — `:voter`, `:promotable`, or `:non_voter` (default: `:voter`)
+  """
+  @spec add_member(non_neg_integer(), node(), atom()) :: :ok | {:error, term()}
+  def add_member(shard_index, node, membership \\ :voter) do
+    leader = shard_server_id(shard_index)
+    new_member = %{id: shard_server_id_on(shard_index, node), membership: membership}
+
+    case :ra.add_member(leader, new_member) do
+      {_, _, _leader} -> :ok
+      {:error, :already_member} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Removes a node from a shard's Raft group.
+  """
+  @spec remove_member(non_neg_integer(), node()) :: :ok | {:error, term()}
+  def remove_member(shard_index, node) do
+    leader = shard_server_id(shard_index)
+    member = shard_server_id_on(shard_index, node)
+
+    case :ra.remove_member(leader, member) do
+      {_, _, _leader} -> :ok
+      {:error, :not_member} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Returns the current members and leader for a shard's Raft group.
+  """
+  @spec members(non_neg_integer()) :: {:ok, list(), term()} | {:error, term()}
+  def members(shard_index) do
+    :ra.members(shard_server_id(shard_index))
+  end
+
+  @doc """
+  Transfers leadership of a shard to a specific node.
+  """
+  @spec transfer_leadership(non_neg_integer(), node()) :: :ok | {:error, term()}
+  def transfer_leadership(shard_index, target_node) do
+    server_id = shard_server_id(shard_index)
+    target_id = shard_server_id_on(shard_index, target_node)
+    :ra.transfer_leadership(server_id, target_id)
+  end
+
+  @doc """
   Starts a ra server for a single shard.
 
-  Creates a single-node Raft group (self quorum) for the shard. The state
-  machine is `Ferricstore.Raft.StateMachine`.
+  In single-node mode, creates a self-quorum Raft group. In cluster mode,
+  uses the configured cluster_nodes as initial_members so all nodes form
+  a single Raft group per shard.
+
+  The `membership` option controls this node's role in the group:
+    * `:voter` — full quorum member (default)
+    * `:promotable` — receives replication, can be promoted
+    * `:non_voter` — permanent read-only
 
   ## Parameters
 
     * `shard_index` -- zero-based shard index
-    * `store` -- Bitcask NIF reference (already opened)
+    * `shard_data_path` -- path to shard's Bitcask data directory
+    * `active_file_id` -- current active log file ID
+    * `active_file_path` -- path to current active log file
     * `ets` -- ETS table name (already created)
 
   ## Returns
@@ -89,6 +164,7 @@ defmodule Ferricstore.Raft.Cluster do
           :ok | {:error, term()}
   def start_shard_server(shard_index, shard_data_path, active_file_id, active_file_path, ets, opts \\ []) do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
+    membership = Keyword.get(opts, :membership, :voter)
     server_id = shard_server_id(shard_index)
 
     machine_config = %{
@@ -100,18 +176,28 @@ defmodule Ferricstore.Raft.Cluster do
       data_dir: Path.dirname(shard_data_path)
     }
 
+    # In cluster mode, initial_members includes all configured nodes.
+    # In single-node mode (no cluster_nodes), just self.
+    cluster_nodes = Application.get_env(:ferricstore, :cluster_nodes, [])
+
+    initial_members =
+      if cluster_nodes == [] do
+        [server_id]
+      else
+        Enum.map(cluster_nodes, fn node ->
+          shard_server_id_on(shard_index, node)
+        end)
+      end
+
     server_config = %{
       id: server_id,
       uid: shard_uid(shard_index),
       cluster_name: shard_cluster_name(shard_index),
-      initial_members: [server_id],
+      initial_members: initial_members,
+      membership: membership,
       machine: {:module, Ferricstore.Raft.StateMachine, machine_config},
       log_init_args: %{uid: shard_uid(shard_index)},
       system: ra_sys,
-      # Recovery checkpoints: written during graceful shutdown, skip WAL
-      # replay on restart. Zero cost during normal operation. Default 0
-      # (disabled) in ra — we enable with a low threshold so any ordered
-      # shutdown writes a checkpoint.
       min_recovery_checkpoint_interval: 1
     }
 
