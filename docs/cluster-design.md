@@ -144,19 +144,29 @@ The replica just can't be elected leader and doesn't count toward quorum.
 ### Configuration
 
 ```bash
-FERRICSTORE_CLUSTER_ROLE=voter     # default — participates in quorum
-FERRICSTORE_CLUSTER_ROLE=replica   # non-voter — read replica, writes forward to leader
+FERRICSTORE_CLUSTER_ROLE=voter        # default — participates in quorum
+FERRICSTORE_CLUSTER_ROLE=replica      # promotable — can become voter via CLUSTER.PROMOTE
+FERRICSTORE_CLUSTER_ROLE=readonly     # non_voter — permanent read-only, never promoted
 ```
 
-### Promotion
+| Role | ra membership | Votes? | Replication? | Promotable? | Use case |
+|---|---|---|---|---|---|
+| `voter` | `:voter` | Yes | Yes | Already voter | Quorum members (min 3) |
+| `replica` | `:promotable` | No | Yes | Yes | Same-region read replica, can replace failed voter |
+| `readonly` | `:non_voter` | No | Yes | No | Cross-region read replica, latency too high for quorum |
 
-A replica can be promoted to voter at runtime (e.g., to replace a failed voter):
+### Promotion and demotion
 
 ```
-CLUSTER.PROMOTE <node>   → changes membership from promotable to voter
+CLUSTER.PROMOTE <node>   → replica (promotable) → voter
+                           readonly (non_voter) → rejected (cannot promote)
+
+CLUSTER.DEMOTE <node>    → voter → replica (promotable)
+                           useful for planned maintenance
 ```
 
-ra handles this via a membership change command through Raft consensus.
+ra handles promotion/demotion via Raft membership change commands — the cluster
+agrees on the change through consensus, then the member's role updates atomically.
 
 ---
 
