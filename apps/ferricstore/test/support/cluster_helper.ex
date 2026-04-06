@@ -208,11 +208,13 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     configure_remote_node(node_name, data_dir, shards)
 
-    # By default, solo nodes start with raft_enabled: false to avoid
-    # conflicting leaders when joining a cluster. Set raft_enabled: true
-    # for standalone nodes that need to operate independently first.
-    raft_enabled = Keyword.get(opts, :raft_enabled, false)
-    :rpc.call(node_name, Application, :put_env, [:ferricstore, :raft_enabled, raft_enabled])
+    # If cluster_nodes are provided, set them so start_shard_server uses
+    # the full member list (joins existing group instead of creating new one).
+    # Without cluster_nodes, starts as standalone (single-node Raft groups).
+    cluster_nodes = Keyword.get(opts, :cluster_nodes, [])
+    if cluster_nodes != [] do
+      :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_nodes, cluster_nodes])
+    end
 
     start_ferricstore_on_node(node_name)
 

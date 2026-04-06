@@ -231,23 +231,26 @@ defmodule Ferricstore.Cluster.Manager do
     Logger.info("ClusterManager: joining #{target_node} (#{membership})")
     ctx = FerricStore.Instance.get(:default)
 
-    # Step 1: Sync data — copies shard dirs from leader to target.
-    # Target node already has FerricStore running (with its own single-node Raft).
-    # DataSync pauses writes on the leader, copies files to target, resumes.
+    # Step 1: Stop ra servers on the target node.
+    # The target started with its own single-node Raft groups (each shard is
+    # its own leader). We must stop these before adding the target to our
+    # cluster's Raft groups — otherwise two independent leaders for the same
+    # shard cause "leader saw append_entries_rpc for same term" errors.
+    stop_raft_on_target(target_node, state.shard_count)
+
+    # Step 2: Sync data — copies Bitcask files from leader to target.
     case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
       {:ok, sync_results} ->
         Logger.info("ClusterManager: data synced to #{target_node}: #{inspect(sync_results)}")
 
-        # Step 2: Add target to all Raft groups.
-        # Now target has the data, ra can start replicating the delta.
+        # Step 3: Add target to our Raft groups.
         {raft_result, _shard_results} = do_add_node(target_node, membership, state)
 
         case raft_result do
           :ok ->
-            # Step 3: Tell target to start Raft on its shards.
-            # The shards started with raft_enabled: false. Now that data is
-            # synced and the node is added to the Raft groups, start ra servers
-            # that join as followers of the existing groups.
+            # Step 4: Start ra servers on target that join the cluster's groups.
+            # join_shard_server uses the full cluster member list so ra knows
+            # to join as follower, not create a new group.
             start_raft_on_target(target_node, state.shard_count)
             Logger.info("ClusterManager: #{target_node} fully joined and synced")
             :ok
@@ -401,6 +404,25 @@ defmodule Ferricstore.Cluster.Manager do
   # Start Raft servers on the target node. Called after data sync + add_member.
   # The target's shards are running with raft_enabled: false — they need ra
   # servers started so they can receive Raft replication from the leaders.
+  # Stop and clean up ra servers on the target so they don't conflict
+  # with the cluster's Raft groups when we add the target as a member.
+  defp stop_raft_on_target(target_node, shard_count) do
+    Logger.info("ClusterManager: stopping Raft on #{target_node} before join")
+
+    ra_sys = Ferricstore.Raft.Cluster.system_name()
+
+    for shard_idx <- 0..(shard_count - 1) do
+      server_id = Ferricstore.Raft.Cluster.shard_server_id_on(shard_idx, target_node)
+
+      try do
+        :erpc.call(target_node, :ra, :stop_server, [ra_sys, server_id])
+        :erpc.call(target_node, :ra, :force_delete_server, [ra_sys, server_id])
+      catch
+        _, _ -> :ok
+      end
+    end
+  end
+
   defp start_raft_on_target(target_node, shard_count) do
     Logger.info("ClusterManager: starting Raft on #{target_node}")
 

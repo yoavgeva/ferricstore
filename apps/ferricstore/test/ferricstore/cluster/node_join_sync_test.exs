@@ -246,8 +246,8 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   describe "standalone to cluster" do
     @tag timeout: 120_000
     test "single node with data → two nodes join → all data synced" do
-      # Node A starts as a standalone with Raft (single-node quorum)
-      node_a = ClusterHelper.start_node(raft_enabled: true)
+      # Node A starts as standalone (single-node Raft groups, the default)
+      node_a = ClusterHelper.start_node()
       on_exit(fn -> ClusterHelper.stop_node(node_a) end)
 
       # Wait for single-node Raft leaders before writing
@@ -282,8 +282,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         assert Enum.all?(all_keys, fn k -> read_key(node_c, k) != nil end), "keys missing on c"
       end, "replication incomplete", 60, 500)
 
-      assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_b)
-      assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_c)
+      eventually(fn ->
+        assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_b), "keydir a↔b mismatch"
+        assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_c), "keydir a↔c mismatch"
+      end, "keydirs not converged", 20, 500)
     end
   end
 
