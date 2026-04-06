@@ -208,12 +208,24 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     configure_remote_node(node_name, data_dir, shards)
 
-    # New solo nodes start with raft_enabled: false so they don't create
-    # conflicting single-node Raft leaders. After the cluster syncs data
-    # and calls ra:add_member, the node joins as a follower.
-    :rpc.call(node_name, Application, :put_env, [:ferricstore, :raft_enabled, false])
+    # By default, solo nodes start with raft_enabled: false to avoid
+    # conflicting leaders when joining a cluster. Set raft_enabled: true
+    # for standalone nodes that need to operate independently first.
+    raft_enabled = Keyword.get(opts, :raft_enabled, false)
+    :rpc.call(node_name, Application, :put_env, [:ferricstore, :raft_enabled, raft_enabled])
 
     start_ferricstore_on_node(node_name)
+
+    # Wait for shards to be alive and accepting calls
+    Enum.each(0..(shards - 1), fn i ->
+      shard = :"Ferricstore.Store.Shard.#{i}"
+      Enum.each(1..50, fn _ ->
+        case :rpc.call(node_name, Process, :whereis, [shard]) do
+          pid when is_pid(pid) -> :ok
+          _ -> Process.sleep(50)
+        end
+      end)
+    end)
 
     node_name
   end

@@ -117,6 +117,16 @@ defmodule Ferricstore.Raft.Cluster do
       {:error, {:already_started, _pid}} ->
         :ok
 
+      {:error, :not_new} ->
+        # ra found existing state on disk — restart instead of start
+        Logger.info("Shard #{shard_index}: existing ra state found, restarting to join cluster")
+        case :ra.restart_server(ra_sys, server_id) do
+          :ok -> :ok
+          {:error, reason} ->
+            Logger.error("Shard #{shard_index}: restart failed: #{inspect(reason)}")
+            {:error, reason}
+        end
+
       {:error, reason} = err ->
         Logger.error("Shard #{shard_index}: failed to join cluster: #{inspect(reason)}")
         err

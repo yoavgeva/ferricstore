@@ -243,6 +243,50 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     end
   end
 
+  describe "standalone to cluster" do
+    @tag timeout: 120_000
+    test "single node with data → two nodes join → all data synced" do
+      # Node A starts as a standalone with Raft (single-node quorum)
+      node_a = ClusterHelper.start_node(raft_enabled: true)
+      on_exit(fn -> ClusterHelper.stop_node(node_a) end)
+
+      # Wait for single-node Raft leaders before writing
+      ClusterHelper.wait_for_node_leaders(node_name(node_a), 4, timeout: 10_000)
+
+      keys = write_keys(node_a, "standalone", 1..200)
+
+      node_b = ClusterHelper.start_node()
+      node_c = ClusterHelper.start_node()
+      on_exit(fn -> ClusterHelper.stop_node(node_b); ClusterHelper.stop_node(node_c) end)
+
+      # Connect + join
+      n_a = node_name(node_a)
+      :erpc.call(n_a, Node, :connect, [node_name(node_b)])
+      :erpc.call(n_a, Node, :connect, [node_name(node_c)])
+
+      # join_cluster may fail with :cluster_change_not_permitted if Raft
+      # hasn't fully settled. Retry with eventually.
+      eventually(fn ->
+        assert :ok == join_cluster(node_b, node_a)
+      end, "node_b join failed", 10, 1000)
+
+      eventually(fn ->
+        assert :ok == join_cluster(node_c, node_a)
+      end, "node_c join failed", 10, 1000)
+
+      post_keys = write_keys(node_a, "post", 1..50)
+      all_keys = keys ++ post_keys
+
+      eventually(fn ->
+        assert Enum.all?(all_keys, fn k -> read_key(node_b, k) != nil end), "keys missing on b"
+        assert Enum.all?(all_keys, fn k -> read_key(node_c, k) != nil end), "keys missing on c"
+      end, "replication incomplete", 60, 500)
+
+      assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_b)
+      assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_c)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Helpers — these call into :peer nodes via :erpc
   # ---------------------------------------------------------------------------
@@ -253,24 +297,24 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
   defp write_keys(node, prefix, range) do
     n = node_name(node)
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default], 10_000)
     Enum.map(range, fn i ->
       key = "#{prefix}_#{i}"
-      ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
-      :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{i}", 0])
+      :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{i}", 0], 10_000)
       key
     end)
   end
 
   defp write_key(node, key, value) do
     n = node_name(node)
-    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
-    :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, value, 0])
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default], 10_000)
+    :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, value, 0], 10_000)
   end
 
   defp read_key(node, key) do
     n = node_name(node)
-    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
-    :erpc.call(n, Ferricstore.Store.Router, :get, [ctx, key])
+    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default], 10_000)
+    :erpc.call(n, Ferricstore.Store.Router, :get, [ctx, key], 10_000)
   end
 
   defp write_keys_to_shard(node, shard_idx, prefix, range) do
