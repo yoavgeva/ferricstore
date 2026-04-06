@@ -221,19 +221,22 @@ defmodule Ferricstore.Cluster.DataSync do
 
     for shard_idx <- 0..(shard_count - 1) do
       try do
-        # Get the shard's keydir and data path from the target
-        target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default])
-        shard_data_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_idx)
-        keydir = elem(target_ctx.keydir_refs, shard_idx)
+        # Use the shard's GenServer to get its actual keydir ref and data path.
+        # This avoids ETS naming mismatches between Instance refs and actual tables.
+        shard_name = :"Ferricstore.Store.Shard.#{shard_idx}"
 
-        # Clear existing (empty) keydir entries
+        # Get the shard state via :sys.get_state to find the real keydir ref
+        shard_state = :erpc.call(target_node, :sys, :get_state, [shard_name])
+        keydir = shard_state.keydir
+        shard_data_path = shard_state.shard_data_path
+
+        # Clear existing entries and re-recover from copied Bitcask files
         :erpc.call(target_node, :ets, :delete_all_objects, [keydir])
-
-        # Re-run keydir recovery from the copied Bitcask files
         :erpc.call(target_node, Ferricstore.Store.Shard.Lifecycle, :recover_keydir,
           [shard_data_path, keydir, shard_idx])
 
-        Logger.info("DataSync: shard #{shard_idx} keydir rebuilt on #{target_node}")
+        ets_size = :erpc.call(target_node, :ets, :info, [keydir, :size])
+        Logger.info("DataSync: shard #{shard_idx} keydir rebuilt on #{target_node} (#{ets_size} keys)")
       catch
         kind, reason ->
           Logger.error("DataSync: failed to rebuild keydir for shard #{shard_idx} on #{target_node}: #{inspect({kind, reason})}")

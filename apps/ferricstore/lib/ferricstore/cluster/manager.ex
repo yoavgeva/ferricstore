@@ -299,13 +299,15 @@ defmodule Ferricstore.Cluster.Manager do
              Ferricstore.Cluster.SnapshotDownloader, :download_latest,
              [download_opts], 120_000) do
         {:ok, _manifest} ->
-          Logger.info("ClusterManager: snapshot downloaded to #{target_node}, checking WAL gaps")
+          Logger.info("ClusterManager: snapshot downloaded to #{target_node}")
 
           # Rebuild keydirs from downloaded data
           Ferricstore.Cluster.DataSync.rebuild_keydirs_on_target(target_node, ctx.shard_count)
 
-          # Check each shard — if WAL can't bridge, do direct copy for that shard
-          sync_remaining_shards(target_node, ctx)
+          # Snapshot just downloaded — data is current as of the snapshot point.
+          # After ra starts on the target, it will replay the delta from the
+          # leader automatically. No need for per-shard WAL gap check here.
+          :ok
 
         {:error, reason} ->
           Logger.warning("ClusterManager: snapshot download failed (#{inspect(reason)}), falling through to direct copy")
@@ -313,33 +315,6 @@ defmodule Ferricstore.Cluster.Manager do
       end
     else
       direct_sync(target_node, ctx)
-    end
-  end
-
-  # After snapshot download, check each shard for WAL gaps.
-  # Shards where WAL can bridge are fine. Shards with gaps get direct copy.
-  defp sync_remaining_shards(target_node, ctx) do
-    alias Ferricstore.Cluster.DataSync
-
-    results =
-      for shard_idx <- 0..(ctx.shard_count - 1) do
-        leader = DataSync.find_leader_for(shard_idx)
-
-        case DataSync.needs_resync?(shard_idx, target_node, leader) do
-          :wal_bridgeable ->
-            Logger.info("Shard #{shard_idx}: snapshot + WAL bridgeable on #{target_node}")
-            :ok
-
-          :needs_resync ->
-            Logger.info("Shard #{shard_idx}: snapshot stale, doing direct copy to #{target_node}")
-            DataSync.sync_shard(shard_idx, target_node, ctx)
-        end
-      end
-
-    if Enum.all?(results, fn r -> r == :ok or match?({:ok, _}, r) end) do
-      :ok
-    else
-      {:error, {:partial_sync, results}}
     end
   end
 
