@@ -105,7 +105,8 @@ defmodule Ferricstore.Store.Shard do
     raft?: true,
     # Maximum active file size before rotation. Cached from Application env
     # at init time. Updated via handle_cast(:update_max_active_file_size, n).
-    max_active_file_size: 256 * 1024 * 1024
+    max_active_file_size: 256 * 1024 * 1024,
+    writes_paused: false
   ]
 
   # -------------------------------------------------------------------
@@ -312,6 +313,10 @@ defmodule Ferricstore.Store.Shard do
     ShardWrites.handle_delete_prefix(prefix, state)
   end
 
+  def handle_call({:put, _key, _value, _expire_at_ms}, _from, %{writes_paused: true} = state) do
+    {:reply, {:error, "ERR shard writes paused for sync"}, state}
+  end
+
   def handle_call({:put, key, value, expire_at_ms}, from, state) do
     ShardWrites.handle_put(key, value, expire_at_ms, from, state)
   end
@@ -444,6 +449,20 @@ defmodule Ferricstore.Store.Shard do
   end
 
   # -------------------------------------------------------------------
+  # handle_call — pause/resume writes (cluster data sync)
+  # -------------------------------------------------------------------
+
+  def handle_call({:pause_writes}, _from, state) do
+    state = await_in_flight(state)
+    state = flush_pending_sync(state)
+    {:reply, :ok, %{state | writes_paused: true}}
+  end
+
+  def handle_call({:resume_writes}, _from, state) do
+    {:reply, :ok, %{state | writes_paused: false}}
+  end
+
+  # -------------------------------------------------------------------
   # handle_call — stats, merge, admin
   # -------------------------------------------------------------------
 
@@ -497,6 +516,10 @@ defmodule Ferricstore.Store.Shard do
       end
 
     {:reply, {:ok, sizes}, state}
+  end
+
+  def handle_call({:run_compaction, _file_ids}, _from, %{writes_paused: true} = state) do
+    {:reply, {:error, "ERR shard writes paused for sync"}, state}
   end
 
   def handle_call({:run_compaction, file_ids}, _from, state) do

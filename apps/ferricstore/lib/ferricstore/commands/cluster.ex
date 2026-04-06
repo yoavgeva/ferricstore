@@ -1,17 +1,35 @@
 defmodule Ferricstore.Commands.Cluster do
   @moduledoc """
-  Handles FerricStore cluster inspection commands.
+  Handles FerricStore cluster inspection and management commands.
 
   Provides per-shard health and statistics information by querying the ETS
-  tables owned by each shard GenServer.
+  tables owned by each shard GenServer, plus cluster membership operations.
 
   ## Supported commands
+
+  ### Inspection
 
     * `CLUSTER.HEALTH` -- returns per-shard status including role, health,
       key count, and memory usage
     * `CLUSTER.STATS` -- returns per-shard key/memory stats plus totals
+    * `CLUSTER.KEYSLOT <key>` -- returns the hash slot for a key
+    * `CLUSTER.SLOTS` -- returns slot range assignments
+    * `CLUSTER.STATUS` -- returns detailed cluster info: nodes, per-shard
+      leader/follower info, roles
+    * `CLUSTER.ROLE` -- returns this node's configured cluster role
+
+  ### Membership management
+
+    * `CLUSTER.JOIN <node>` -- adds a node to the cluster
+    * `CLUSTER.LEAVE` -- gracefully removes this node from the cluster
+    * `CLUSTER.FAILOVER <shard_index> <target_node>` -- transfers shard
+      leadership to a specific node
+    * `CLUSTER.PROMOTE <node>` -- promotes a replica to voter for all shards
+    * `CLUSTER.DEMOTE <node>` -- demotes a voter to replica for all shards
   """
 
+  alias Ferricstore.Cluster.Manager, as: ClusterManager
+  alias Ferricstore.Raft.Cluster, as: RaftCluster
   alias Ferricstore.Store.{Router, SlotMap}
 
   @doc """
@@ -102,6 +120,160 @@ defmodule Ferricstore.Commands.Cluster do
 
   def handle("CLUSTER.SLOTS", _args, _store) do
     {:error, "ERR wrong number of arguments for 'cluster.slots' command"}
+  end
+
+  # -- CLUSTER.STATUS ---------------------------------------------------------
+
+  def handle("CLUSTER.STATUS", [], _store) do
+    status = ClusterManager.node_status()
+
+    header = [
+      "mode: #{status.mode}",
+      "role: #{status.role}",
+      "node: #{status.node}",
+      "sync_status: #{status.sync_status}",
+      "connected_nodes: #{Enum.join(Enum.map(status.connected_nodes, &Atom.to_string/1), ", ")}"
+    ]
+
+    shard_lines =
+      status.shards
+      |> Enum.sort_by(fn {idx, _} -> idx end)
+      |> Enum.flat_map(fn
+        {idx, %{error: reason}} ->
+          ["shard_#{idx}:", "  error: #{inspect(reason)}"]
+
+        {idx, %{members: members, leader: leader}} ->
+          leader_node =
+            case leader do
+              {_name, n} -> Atom.to_string(n)
+              _ -> "unknown"
+            end
+
+          member_strs =
+            Enum.map(members, fn
+              {_name, n} -> Atom.to_string(n)
+              other -> inspect(other)
+            end)
+
+          [
+            "shard_#{idx}:",
+            "  leader: #{leader_node}",
+            "  members: #{Enum.join(member_strs, ", ")}"
+          ]
+      end)
+
+    Enum.join(header ++ shard_lines, "\r\n")
+  end
+
+  def handle("CLUSTER.STATUS", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.status' command"}
+  end
+
+  # -- CLUSTER.JOIN -----------------------------------------------------------
+
+  def handle("CLUSTER.JOIN", [node_str], _store) do
+    node = String.to_atom(node_str)
+
+    case ClusterManager.add_node(node) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+    end
+  end
+
+  def handle("CLUSTER.JOIN", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.join' command"}
+  end
+
+  # -- CLUSTER.LEAVE ----------------------------------------------------------
+
+  def handle("CLUSTER.LEAVE", [], _store) do
+    case ClusterManager.leave() do
+      :ok -> :ok
+      {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+    end
+  end
+
+  def handle("CLUSTER.LEAVE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.leave' command"}
+  end
+
+  # -- CLUSTER.FAILOVER -------------------------------------------------------
+
+  def handle("CLUSTER.FAILOVER", [shard_str, node_str], _store) do
+    with {shard_idx, ""} <- Integer.parse(shard_str) do
+      target = String.to_atom(node_str)
+
+      case RaftCluster.transfer_leadership(shard_idx, target) do
+        :ok -> :ok
+        {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+      end
+    else
+      _ -> {:error, "ERR shard index must be an integer"}
+    end
+  end
+
+  def handle("CLUSTER.FAILOVER", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.failover' command"}
+  end
+
+  # -- CLUSTER.PROMOTE --------------------------------------------------------
+
+  def handle("CLUSTER.PROMOTE", [node_str], _store) do
+    target = String.to_atom(node_str)
+    shard_count = FerricStore.Instance.get(:default).shard_count
+
+    results =
+      for shard_idx <- 0..(shard_count - 1) do
+        RaftCluster.add_member(shard_idx, target, :voter)
+      end
+
+    if Enum.all?(results, &(&1 == :ok)) do
+      :ok
+    else
+      {:error, "ERR partial failure: #{inspect(results)}"}
+    end
+  end
+
+  def handle("CLUSTER.PROMOTE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.promote' command"}
+  end
+
+  # -- CLUSTER.DEMOTE ---------------------------------------------------------
+
+  def handle("CLUSTER.DEMOTE", [node_str], _store) do
+    target = String.to_atom(node_str)
+    shard_count = FerricStore.Instance.get(:default).shard_count
+
+    results =
+      for shard_idx <- 0..(shard_count - 1) do
+        RaftCluster.add_member(shard_idx, target, :promotable)
+      end
+
+    if Enum.all?(results, &(&1 == :ok)) do
+      :ok
+    else
+      {:error, "ERR partial failure: #{inspect(results)}"}
+    end
+  end
+
+  def handle("CLUSTER.DEMOTE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.demote' command"}
+  end
+
+  # -- CLUSTER.ROLE -----------------------------------------------------------
+
+  def handle("CLUSTER.ROLE", [], _store) do
+    role =
+      case ClusterManager.mode() do
+        :standalone -> "standalone"
+        :cluster -> Atom.to_string(Application.get_env(:ferricstore, :cluster_role, :voter))
+      end
+
+    role
+  end
+
+  def handle("CLUSTER.ROLE", _args, _store) do
+    {:error, "ERR wrong number of arguments for 'cluster.role' command"}
   end
 
   # FERRICSTORE.HOTNESS — returns per-prefix hot/cold read statistics.
