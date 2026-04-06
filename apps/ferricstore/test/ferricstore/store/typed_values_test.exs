@@ -129,7 +129,7 @@ defmodule Ferricstore.Store.TypedValuesTest do
     end
 
     test "GETRANGE on INCR result extracts from string representation" do
-      Router.incr(FerricStore.Instance.get(:default), "typed:getrange_int", 12345)
+      Router.incr(FerricStore.Instance.get(:default), "typed:getrange_int", 12_345)
       store = build_store()
       result = Ferricstore.Commands.Strings.handle("GETRANGE", ["typed:getrange_int", "0", "2"], store)
       assert result == "123"

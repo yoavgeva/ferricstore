@@ -1085,6 +1085,7 @@ defmodule FerricstoreServer.Resp.RespEdgeCasesTest do
     end
 
     test "encodes very large float" do
+      # credo:disable-for-next-line Credo.Check.Readability.LargeNumbers
       result = to_bin(Encoder.encode(1.7976931348623157e308))
       assert String.starts_with?(result, ",")
       assert String.ends_with?(result, "\r\n")

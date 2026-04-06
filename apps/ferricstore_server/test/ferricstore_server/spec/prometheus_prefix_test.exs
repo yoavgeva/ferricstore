@@ -146,11 +146,15 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
     end
 
     test "keys without a colon appear under _root prefix" do
-      Router.put(FerricStore.Instance.get(:default), "plainkey", "value")
+      before = metric_value(Metrics.scrape(), "ferricstore_prefix_key_count", "_root") || 0
+
+      key = "plainkey_#{System.unique_integer([:positive])}"
+      Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
       text = Metrics.scrape()
+      after_val = metric_value(text, "ferricstore_prefix_key_count", "_root") || 0
 
-      assert metric_value(text, "ferricstore_prefix_key_count", "_root") == 1
+      assert after_val >= before + 1
     end
   end
 

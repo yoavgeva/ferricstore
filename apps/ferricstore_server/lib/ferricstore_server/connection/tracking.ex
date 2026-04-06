@@ -1,5 +1,5 @@
 defmodule FerricstoreServer.Connection.Tracking do
-  @moduledoc false
+  @moduledoc "Client-side key tracking registration, invalidation dispatch, and keyspace notification firing."
 
   alias Ferricstore.KeyspaceNotifications
   alias FerricstoreServer.ClientTracking
@@ -158,55 +158,51 @@ defmodule FerricstoreServer.Connection.Tracking do
   def maybe_notify_tracking(_cmd, _args, {:error, _}, _state), do: :ok
 
   def maybe_notify_tracking(cmd, args, _result, _state) do
-    # O(1) MapSet check replaces linear `when cmd in @write_cmds` guard (~55 chained ==).
     if MapSet.member?(@write_cmds_set, cmd) do
-      writer_pid = self()
-      sender = tracking_socket_sender()
-
-      case cmd do
-        c when c in ~w(MSET MSETNX) ->
-          keys =
-            args
-            |> Enum.chunk_every(2)
-            |> Enum.map(fn [key | _] -> key end)
-
-          ClientTracking.notify_keys_modified(keys, writer_pid, sender)
-
-        c when c in ~w(DEL UNLINK) ->
-          ClientTracking.notify_keys_modified(args, writer_pid, sender)
-
-        "RENAME" ->
-          # RENAME source destination -- both keys are affected
-          case args do
-            [src, dst | _] ->
-              ClientTracking.notify_keys_modified([src, dst], writer_pid, sender)
-
-            _ ->
-              :ok
-          end
-
-        "COPY" ->
-          # COPY source destination -- destination is modified
-          case args do
-            [_src, dst | _] ->
-              ClientTracking.notify_key_modified(dst, writer_pid, sender)
-
-            _ ->
-              :ok
-          end
-
-        _ ->
-          # Single-key commands: first arg is the key
-          case args do
-            [key | _] ->
-              ClientTracking.notify_key_modified(key, writer_pid, sender)
-
-            _ ->
-              :ok
-          end
-      end
+      do_notify_tracking(cmd, args)
     else
       :ok
     end
   end
+
+  defp do_notify_tracking(cmd, args) do
+    writer_pid = self()
+    sender = tracking_socket_sender()
+
+    case cmd do
+      c when c in ~w(MSET MSETNX) ->
+        keys =
+          args
+          |> Enum.chunk_every(2)
+          |> Enum.map(fn [key | _] -> key end)
+
+        ClientTracking.notify_keys_modified(keys, writer_pid, sender)
+
+      c when c in ~w(DEL UNLINK) ->
+        ClientTracking.notify_keys_modified(args, writer_pid, sender)
+
+      "RENAME" ->
+        notify_tracking_keys(args, :all, writer_pid, sender)
+
+      "COPY" ->
+        notify_tracking_keys(args, :destination, writer_pid, sender)
+
+      _ ->
+        notify_tracking_keys(args, :first, writer_pid, sender)
+    end
+  end
+
+  defp notify_tracking_keys([src, dst | _], :all, writer_pid, sender) do
+    ClientTracking.notify_keys_modified([src, dst], writer_pid, sender)
+  end
+
+  defp notify_tracking_keys([_src, dst | _], :destination, writer_pid, sender) do
+    ClientTracking.notify_key_modified(dst, writer_pid, sender)
+  end
+
+  defp notify_tracking_keys([key | _], :first, writer_pid, sender) do
+    ClientTracking.notify_key_modified(key, writer_pid, sender)
+  end
+
+  defp notify_tracking_keys(_, _, _, _), do: :ok
 end

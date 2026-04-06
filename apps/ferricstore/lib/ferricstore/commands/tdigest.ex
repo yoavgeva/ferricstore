@@ -415,13 +415,13 @@ defmodule Ferricstore.Commands.TDigest do
 
     # Load existing destination if it exists and we're not overriding
     dest_digest =
-      if not override do
+      if override do
+        nil
+      else
         case get_digest(store, dest) do
           {:ok, d} -> d
           _ -> nil
         end
-      else
-        nil
       end
 
     final_compression =
@@ -488,12 +488,7 @@ defmodule Ferricstore.Commands.TDigest do
   defp parse_float_value(str) do
     case Float.parse(str) do
       {f, ""} ->
-        if f != f do
-          # NaN check (NaN != NaN in IEEE 754, but Elixir doesn't have NaN floats)
-          {:error, "ERR TDIGEST: value is not a valid number"}
-        else
-          {:ok, f}
-        end
+        {:ok, f}
 
       :error ->
         case Integer.parse(str) do

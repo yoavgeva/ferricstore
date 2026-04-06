@@ -748,7 +748,7 @@ defmodule Ferricstore.ProbEdgeCasesTest do
     test "bloom_file_add and bloom_file_exists roundtrip" do
       dir = make_prob_dir("nif_bloom_rt")
       path = Path.join(dir, "roundtrip.bloom")
-      assert {:ok, :ok} = NIF.bloom_file_create(path, 10000, 7)
+      assert {:ok, :ok} = NIF.bloom_file_create(path, 10_000, 7)
 
       # Add an element
       assert {:ok, 1} = NIF.bloom_file_add(path, "hello")
@@ -756,14 +756,14 @@ defmodule Ferricstore.ProbEdgeCasesTest do
       # Should exist
       assert {:ok, 1} = NIF.bloom_file_exists(path, "hello")
 
-      # Should NOT exist (with high probability given 10000 bits and 1 element)
+      # Should NOT exist (with high probability given 10_000 bits and 1 element)
       assert {:ok, 0} = NIF.bloom_file_exists(path, "definitely_not_here")
     end
 
     test "bloom_file_madd adds multiple elements" do
       dir = make_prob_dir("nif_bloom_madd")
       path = Path.join(dir, "madd.bloom")
-      assert {:ok, :ok} = NIF.bloom_file_create(path, 10000, 7)
+      assert {:ok, :ok} = NIF.bloom_file_create(path, 10_000, 7)
 
       assert {:ok, results} = NIF.bloom_file_madd(path, ["a", "b", "c"])
       assert length(results) == 3
@@ -776,7 +776,7 @@ defmodule Ferricstore.ProbEdgeCasesTest do
     test "bloom_file_card returns correct count" do
       dir = make_prob_dir("nif_bloom_card")
       path = Path.join(dir, "card.bloom")
-      assert {:ok, :ok} = NIF.bloom_file_create(path, 10000, 7)
+      assert {:ok, :ok} = NIF.bloom_file_create(path, 10_000, 7)
       assert {:ok, 0} = NIF.bloom_file_card(path)
 
       NIF.bloom_file_add(path, "x")

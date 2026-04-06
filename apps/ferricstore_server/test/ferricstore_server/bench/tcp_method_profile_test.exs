@@ -67,8 +67,7 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
         top_func = funcs
           |> Enum.sort_by(fn {_mfa, c} -> -c end)
           |> Enum.take(3)
-          |> Enum.map(fn {{_m, f, a}, c} -> "#{f}/#{a}=#{c}" end)
-          |> Enum.join(", ")
+          |> Enum.map_join(", ", fn {{_m, f, a}, c} -> "#{f}/#{a}=#{c}" end)
 
         IO.puts("    #{String.pad_trailing(inspect(mod), 50)} #{String.pad_leading("#{count}", 10)}  (#{top_func})")
       end)
@@ -143,7 +142,7 @@ defmodule FerricstoreServer.Bench.TcpMethodProfileTest do
       all = :ets.tab2list(samples)
       running = Enum.filter(all, fn {status, _} -> status == :running end)
 
-      if length(running) > 0 do
+      if running != [] do
         funcs = running
         |> Enum.map(fn {_, {m, f, a}} -> "#{inspect(m)}.#{f}/#{a}" end)
         |> Enum.frequencies()

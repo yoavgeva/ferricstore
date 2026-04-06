@@ -5,7 +5,7 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesExpiryTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Expiry, Strings}
+  alias Ferricstore.Commands.Expiry
   alias Ferricstore.Test.MockStore
 
   # ===========================================================================

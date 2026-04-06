@@ -101,7 +101,7 @@ defmodule Ferricstore.Commands.SlowLogTest do
       end, "5 slowlog entries not recorded", 20, 10)
 
       assert length(SlowLog.get(2)) == 2
-      assert length(SlowLog.get(0)) == 0
+      assert SlowLog.get(0) == []
     end
 
     test "entries are returned newest first" do
@@ -320,7 +320,7 @@ defmodule Ferricstore.Commands.SlowLogTest do
     test "returns list of help strings" do
       result = Server.handle("SLOWLOG", ["HELP"], MockStore.make())
       assert is_list(result)
-      assert length(result) > 0
+      assert result != []
       assert Enum.all?(result, &is_binary/1)
     end
   end

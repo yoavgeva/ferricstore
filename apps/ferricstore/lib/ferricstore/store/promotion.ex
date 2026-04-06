@@ -116,58 +116,45 @@ defmodule Ferricstore.Store.Promotion do
         keydir
       )
 
-    case open_dedicated(data_dir, shard_index, type, redis_key) do
-      {:ok, dedicated_path} ->
-        if entries != [] do
-          batch = Enum.map(entries, fn {k, v, exp} -> {k, v, exp} end)
-          dedicated_active = find_active(dedicated_path)
-          dedicated_fid = dedicated_active |> Path.basename() |> String.trim_trailing(".log") |> String.to_integer()
+    {:ok, dedicated_path} = open_dedicated(data_dir, shard_index, type, redis_key)
 
-          case NIF.v2_append_batch(dedicated_active, batch) do
-            {:ok, locations} ->
-              # Update ETS entries with dedicated file locations so cold reads
-              # (after eviction) use the dedicated path, not the shared shard.
-              Enum.zip(entries, locations)
-              |> Enum.each(fn {{k, _v, _exp}, {offset, value_size}} ->
-                :ets.update_element(keydir, k, [{5, dedicated_fid}, {6, offset}, {7, value_size}])
-              end)
+    if entries != [] do
+      batch = Enum.map(entries, fn {k, v, exp} -> {k, v, exp} end)
+      dedicated_active = find_active(dedicated_path)
+      dedicated_fid = dedicated_active |> Path.basename() |> String.trim_trailing(".log") |> String.to_integer()
 
-            {:error, reason} ->
-              Logger.error("Promotion: v2_append_batch failed for #{inspect(redis_key)}: #{inspect(reason)}")
-          end
-        end
+      case NIF.v2_append_batch(dedicated_active, batch) do
+        {:ok, locations} ->
+          Enum.zip(entries, locations)
+          |> Enum.each(fn {{k, _v, _exp}, {offset, value_size}} ->
+            :ets.update_element(keydir, k, [{5, dedicated_fid}, {6, offset}, {7, value_size}])
+          end)
 
-        # v2: write tombstones to the shared Bitcask log for migrated keys.
-        # Entries STAY in ETS so compound_scan/compound_count/compound_get
-        # continue to work immediately after promotion.
-        active_path = find_active(shard_data_path)
-
-        Enum.each(entries, fn {key, _value, _exp} ->
-          case NIF.v2_append_tombstone(active_path, key) do
-            {:ok, _} -> :ok
-            {:error, reason} ->
-              Logger.warning("Promotion: tombstone write failed for #{inspect(key)}: #{inspect(reason)}")
-          end
-        end)
-
-        mk = marker_key(redis_key)
-        NIF.v2_append_record(active_path, mk, type_str, 0)
-        :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), 0, 0, 0})
-
-        Logger.info(
-          "Promoted #{type_label} #{inspect(redis_key)} to dedicated Bitcask " <>
-            "(#{length(entries)} entries, shard #{shard_index})"
-        )
-
-        {:ok, dedicated_path}
-
-      {:error, reason} = err ->
-        Logger.error(
-          "Failed to promote #{type_label} #{inspect(redis_key)}: #{inspect(reason)}"
-        )
-
-        err
+        {:error, reason} ->
+          Logger.error("Promotion: v2_append_batch failed for #{inspect(redis_key)}: #{inspect(reason)}")
+      end
     end
+
+    active_path = find_active(shard_data_path)
+
+    Enum.each(entries, fn {key, _value, _exp} ->
+      case NIF.v2_append_tombstone(active_path, key) do
+        {:ok, _} -> :ok
+        {:error, reason} ->
+          Logger.warning("Promotion: tombstone write failed for #{inspect(key)}: #{inspect(reason)}")
+      end
+    end)
+
+    mk = marker_key(redis_key)
+    NIF.v2_append_record(active_path, mk, type_str, 0)
+    :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), 0, 0, 0})
+
+    Logger.info(
+      "Promoted #{type_label} #{inspect(redis_key)} to dedicated Bitcask " <>
+        "(#{length(entries)} entries, shard #{shard_index})"
+    )
+
+    {:ok, dedicated_path}
   end
 
   @spec recover_promoted(binary(), atom(), binary(), non_neg_integer()) :: map()
@@ -215,82 +202,69 @@ defmodule Ferricstore.Store.Promotion do
     Enum.reduce(all_markers, %{}, fn {redis_key, type_str}, acc ->
       type = CompoundKey.decode_type(type_str)
 
-      case open_dedicated(data_dir, shard_index, type, redis_key) do
-        {:ok, dedicated_path} ->
-          # Scan ALL log files in the dedicated directory (sorted by file_id).
-          # This handles crash recovery when compaction left both old and new files:
-          # later files overwrite earlier entries (last-write-wins), same as shared shard.
-          log_files = list_log_files(dedicated_path)
+      {:ok, dedicated_path} = open_dedicated(data_dir, shard_index, type, redis_key)
 
-          final_state =
-            Enum.reduce(log_files, %{}, fn {fid, file_path}, acc ->
-              case NIF.v2_scan_file(file_path) do
-                {:ok, records} ->
-                  Enum.reduce(records, acc, fn {key, offset, value_size, expire_at_ms, is_tombstone}, inner_acc ->
-                    if is_tombstone do
-                      Map.put(inner_acc, key, :tombstone)
-                    else
-                      Map.put(inner_acc, key, {:live, fid, file_path, offset, value_size, expire_at_ms})
-                    end
-                  end)
+      log_files = list_log_files(dedicated_path)
+
+      final_state =
+        Enum.reduce(log_files, %{}, fn {fid, file_path}, acc ->
+          case NIF.v2_scan_file(file_path) do
+            {:ok, records} ->
+              Enum.reduce(records, acc, fn {key, offset, value_size, expire_at_ms, is_tombstone}, inner_acc ->
+                if is_tombstone do
+                  Map.put(inner_acc, key, :tombstone)
+                else
+                  Map.put(inner_acc, key, {:live, fid, file_path, offset, value_size, expire_at_ms})
+                end
+              end)
+
+            _ ->
+              acc
+          end
+        end)
+
+      Enum.each(final_state, fn
+        {key, :tombstone} ->
+          :ets.delete(keydir, key)
+
+        {key, {:live, fid, file_path, offset, _value_size, expire_at_ms}} ->
+          value =
+            case NIF.v2_pread_at(file_path, offset) do
+              {:ok, v} when v != nil -> v
+              _ -> nil
+            end
+
+          :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), fid, offset, 0})
+      end)
+
+      total_bytes = dir_total_size(dedicated_path)
+
+      live_bytes =
+        Enum.reduce(final_state, 0, fn {key, entry}, acc ->
+          case entry do
+            :tombstone ->
+              acc
+
+            {:live, _fid, _path, _off, _vs, _exp} ->
+              case :ets.lookup(keydir, key) do
+                [{^key, _v, _exp, _lfu, _f, _o, vsize}] when vsize > 0 ->
+                  acc + 26 + byte_size(key) + vsize
 
                 _ ->
                   acc
               end
-            end)
+          end
+        end)
 
-          Enum.each(final_state, fn
-            {key, :tombstone} ->
-              :ets.delete(keydir, key)
+      dead_bytes = max(total_bytes - live_bytes, 0)
 
-            {key, {:live, fid, file_path, offset, _value_size, expire_at_ms}} ->
-              # Read the actual value from disk so compound_scan finds it
-              value =
-                case NIF.v2_pread_at(file_path, offset) do
-                  {:ok, v} when v != nil -> v
-                  _ -> nil
-                end
-
-              :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), fid, offset, 0})
-          end)
-
-          # Compute byte stats for fragmentation-based compaction
-          total_bytes = dir_total_size(dedicated_path)
-
-          live_bytes =
-            Enum.reduce(final_state, 0, fn {key, entry}, acc ->
-              case entry do
-                :tombstone ->
-                  acc
-
-                {:live, _fid, _path, _off, _vs, _exp} ->
-                  case :ets.lookup(keydir, key) do
-                    [{^key, _v, _exp, _lfu, _f, _o, vsize}] when vsize > 0 ->
-                      acc + 26 + byte_size(key) + vsize
-
-                    _ ->
-                      acc
-                  end
-              end
-            end)
-
-          dead_bytes = max(total_bytes - live_bytes, 0)
-
-          Map.put(acc, redis_key, %{
-            path: dedicated_path,
-            writes: 0,
-            total_bytes: total_bytes,
-            dead_bytes: dead_bytes,
-            last_compacted_at: nil
-          })
-
-        {:error, reason} ->
-          Logger.error(
-            "Failed to recover promoted key #{inspect(redis_key)}: #{inspect(reason)}"
-          )
-
-          acc
-      end
+      Map.put(acc, redis_key, %{
+        path: dedicated_path,
+        writes: 0,
+        total_bytes: total_bytes,
+        dead_bytes: dead_bytes,
+        last_compacted_at: nil
+      })
     end)
   end
 

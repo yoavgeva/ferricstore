@@ -1,5 +1,5 @@
 defmodule Ferricstore.Store.Shard.Writes do
-  @moduledoc false
+  @moduledoc "Shard write-path handlers: put, delete, incr, append, getset, getdel, getex, and setrange with async flush and Raft support."
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -14,6 +14,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   # WRITE-PATH handlers (return {:reply, result, state} or {:noreply, state})
   # -------------------------------------------------------------------
 
+  @spec handle_put(binary(), term(), non_neg_integer(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
   @doc false
   def handle_put(key, value, expire_at_ms, from, state) do
     # Reject new-key writes when the keydir is at capacity (spec 2.4).
@@ -57,6 +58,7 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
+  @spec handle_delete(binary(), GenServer.from(), map()) :: {:reply, :ok, map()} | {:noreply, map()}
   @doc false
   def handle_delete(key, from, state) do
     if state.raft? do
@@ -93,6 +95,7 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
+  @spec handle_incr(binary(), integer(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_incr(key, delta, state) do
     if state.raft? do
@@ -220,6 +223,7 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
+  @spec handle_incr_float(binary(), float(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_incr_float(key, delta, state) do
     if state.raft? do
@@ -319,6 +323,7 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
+  @spec handle_append(binary(), binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_append(key, suffix, state) do
     if state.raft? do
@@ -389,6 +394,7 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
+  @spec handle_getset(binary(), binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_getset(key, new_value, state) do
     if state.raft? do
@@ -431,6 +437,7 @@ defmodule Ferricstore.Store.Shard.Writes do
     {:reply, old, new_state}
   end
 
+  @spec handle_getdel(binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_getdel(key, state) do
     if state.raft? do
@@ -485,6 +492,7 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
+  @spec handle_getex(binary(), non_neg_integer(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_getex(key, expire_at_ms, state) do
     if state.raft? do
@@ -544,6 +552,7 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
+  @spec handle_setrange(binary(), non_neg_integer(), binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_setrange(key, offset, value, state) do
     if state.raft? do
@@ -591,6 +600,7 @@ defmodule Ferricstore.Store.Shard.Writes do
     {:reply, {:ok, byte_size(new_val)}, new_state}
   end
 
+  @spec handle_delete_prefix(binary(), map()) :: {:reply, :ok, map()}
   @doc false
   def handle_delete_prefix(prefix, state) do
     keys_to_delete = ShardETS.prefix_collect_keys(state.keydir, prefix)
@@ -611,6 +621,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   # Helpers
   # -------------------------------------------------------------------
 
+  @spec apply_setrange(binary(), non_neg_integer(), binary()) :: binary()
   @doc false
   def apply_setrange(old, offset, value) do
     old_len = byte_size(old)

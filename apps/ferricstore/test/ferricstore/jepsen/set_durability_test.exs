@@ -74,7 +74,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
               end
             end)
 
-          if length(alive_siblings) > 0 do
+          if alive_siblings != [] do
             target = hd(alive_siblings)
             ClusterHelper.kill_node(nodes, target)
             Process.sleep(100)
@@ -112,7 +112,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
           end
         end)
 
-      assert length(alive) >= 1, "need at least 1 alive node"
+      assert alive != [], "need at least 1 alive node"
       node = hd(alive)
 
       key = "jepsen:set:phantom"
@@ -178,7 +178,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
           end
         end)
 
-      assert length(alive) >= 1, "need at least 1 alive node"
+      assert alive != [], "need at least 1 alive node"
       node = hd(alive)
 
       key = "jepsen:set:concurrent"

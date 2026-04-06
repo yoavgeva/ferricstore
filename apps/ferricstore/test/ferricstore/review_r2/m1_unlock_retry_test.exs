@@ -27,7 +27,7 @@ defmodule Ferricstore.ReviewR2.M1UnlockRetryTest do
 
       # Unlock via CrossShardOp (which uses parallel_unlock internally)
       # We call it through a cross-shard RENAME that acquires and releases locks
-      [key_other] = ShardHelpers.keys_on_different_shards(2) |> Enum.reject(fn k ->
+      [_key_other] = ShardHelpers.keys_on_different_shards(2) |> Enum.reject(fn k ->
         Ferricstore.Store.Router.shard_for(FerricStore.Instance.get(:default), k) == 0
       end) |> Enum.take(1)
 

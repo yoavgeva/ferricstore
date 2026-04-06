@@ -379,7 +379,7 @@ defmodule Ferricstore.Bench.RaWalDeepInstrumentTest do
     traced_batch_count = length(handle_batch_durations)
 
     avg = fn durations ->
-      if length(durations) > 0, do: Enum.sum(durations) / length(durations), else: 0
+      if durations != [], do: Enum.sum(durations) / length(durations), else: 0
     end
 
     p50 = fn durations -> percentile(durations, 50) end
@@ -605,24 +605,20 @@ defmodule Ferricstore.Bench.RaWalDeepInstrumentTest do
   defp format_queue_histogram(histogram) do
     max_count = histogram |> Enum.map(fn {_, c, _} -> c end) |> Enum.max(fn -> 1 end)
 
-    histogram
-    |> Enum.map(fn {label, count, pct} ->
+    Enum.map_join(histogram, "\n", fn {label, count, pct} ->
       bar_len = if max_count > 0, do: round(count / max_count * 40), else: 0
       bar = String.duplicate("#", bar_len)
       "        #{label}: #{String.pad_leading(Integer.to_string(count), 6)} (#{Float.round(pct, 1) |> :erlang.float_to_binary(decimals: 1)}%) |#{bar}"
     end)
-    |> Enum.join("\n")
   end
 
   defp format_frequency(freq_list) do
     total = freq_list |> Enum.map(fn {_, c} -> c end) |> Enum.sum()
 
-    freq_list
-    |> Enum.map(fn {key, count} ->
+    Enum.map_join(freq_list, "\n", fn {key, count} ->
       pct = if total > 0, do: count / total * 100, else: 0
       "        #{inspect(key)}: #{count} (#{Float.round(pct, 1)}%)"
     end)
-    |> Enum.join("\n")
   end
 
   # ---------------------------------------------------------------

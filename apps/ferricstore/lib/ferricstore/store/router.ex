@@ -114,9 +114,9 @@ defmodule Ferricstore.Store.Router do
         # Leader changed. Retry once with the suggested leader, or fall
         # back to the Shard GenServer if no leader hint is available.
         leader =
-          if maybe_leader not in [nil, :undefined],
-            do: maybe_leader,
-            else: shard_id
+          if maybe_leader in [nil, :undefined],
+            do: shard_id,
+            else: maybe_leader
 
         retry_corr = make_ref()
 

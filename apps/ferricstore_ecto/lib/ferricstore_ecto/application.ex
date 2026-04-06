@@ -1,5 +1,5 @@
 defmodule FerricstoreEcto.Application do
-  @moduledoc false
+  @moduledoc "OTP application callback for the FerricstoreEcto adapter."
 
   use Application
 

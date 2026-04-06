@@ -1213,8 +1213,7 @@ defmodule FerricstoreServer.Acl do
       @table
       |> :ets.tab2list()
       |> Enum.sort_by(fn {name, _} -> name end)
-      |> Enum.map(&format_user_for_file/1)
-      |> Enum.join("\n")
+      |> Enum.map_join("\n", &format_user_for_file/1)
 
     contents = header <> lines <> "\n"
 

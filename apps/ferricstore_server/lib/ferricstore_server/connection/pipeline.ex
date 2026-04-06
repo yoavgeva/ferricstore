@@ -1,5 +1,5 @@
 defmodule FerricstoreServer.Connection.Pipeline do
-  @moduledoc false
+  @moduledoc "Sliding-window pipeline dispatcher that groups pure commands by shard and executes them concurrently."
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher
@@ -138,12 +138,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
             quit
 
           {:continue, flushed_state} ->
-            is_read = is_read_cmd?(normalised)
+            is_read = read_cmd?(normalised)
             do_sliding_window(rest, [{cmd, normalised}], is_read, flushed_state, handle_command_fn, send_response_fn)
         end
 
       true ->
-        is_read = is_read_cmd?(normalised)
+        is_read = read_cmd?(normalised)
         do_sliding_window(rest, [{cmd, normalised} | pure_acc], all_reads? and is_read, state, handle_command_fn, send_response_fn)
     end
   end
@@ -285,8 +285,8 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   @doc false
-  def is_read_cmd?({name, _args}), do: MapSet.member?(@read_cmds_set, name)
-  def is_read_cmd?(:unknown), do: false
+  def read_cmd?({name, _args}), do: MapSet.member?(@read_cmds_set, name)
+  def read_cmd?(:unknown), do: false
 
   @doc false
   def barrier_command_normalised?(:unknown), do: false

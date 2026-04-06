@@ -322,7 +322,7 @@ defmodule FerricstoreServer.Spec.ScanFilteringTest do
       test_pid = self()
 
       # Start a writer that modifies keys concurrently
-      writer =
+      _writer =
         spawn(fn ->
           for round <- 1..100 do
             idx = rem(round, 20) + 1

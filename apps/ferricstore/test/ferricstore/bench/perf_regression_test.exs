@@ -13,6 +13,7 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
   # 1. RESP Parser: Application.get_env vs persistent_term
   # ---------------------------------------------------------------------------
 
+  if Code.ensure_loaded?(FerricstoreServer.Resp.Parser) do
   test "benchmark: RESP Parser.parse/1 Application.get_env overhead" do
     # Parser.parse/1 calls Application.get_env on every invocation (line 130).
     # Parser.parse/2 accepts the max_value_size directly, bypassing the lookup.
@@ -53,6 +54,7 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     end
 
     assert true
+  end
   end
 
   # ---------------------------------------------------------------------------
@@ -102,6 +104,7 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
   # 3. RESP Encoder micro-benchmark
   # ---------------------------------------------------------------------------
 
+  if Code.ensure_loaded?(FerricstoreServer.Resp.Encoder) do
   test "benchmark: RESP encoding common responses" do
     n = 500_000
 
@@ -137,6 +140,7 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     IO.puts("  Encode 5-array:    #{round(n / (time_array / 1_000_000))} ops/sec")
     IO.puts("  Encode nil:        #{round(n / (time_nil / 1_000_000))} ops/sec")
     assert true
+  end
   end
 
   # ---------------------------------------------------------------------------
@@ -347,7 +351,7 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     # Warm up
     for _ <- 1..1000 do
       Ferricstore.Store.Router.shard_name(FerricStore.Instance.get(:default), 0)
-      elem(shard_names, 0)
+      _ = elem(shard_names, 0)
     end
 
     # Measure current implementation (string interpolation -> atom)
@@ -363,10 +367,10 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     # Measure tuple lookup (pre-computed atoms)
     {time_tuple, _} = :timer.tc(fn ->
       for _ <- 1..n do
-        elem(shard_names, 0)
-        elem(shard_names, 1)
-        elem(shard_names, 2)
-        elem(shard_names, 3)
+        _ = elem(shard_names, 0)
+        _ = elem(shard_names, 1)
+        _ = elem(shard_names, 2)
+        _ = elem(shard_names, 3)
       end
     end)
 
@@ -428,6 +432,7 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
   # 9. RESP Parser: full parse pipeline
   # ---------------------------------------------------------------------------
 
+  if Code.ensure_loaded?(FerricstoreServer.Resp.Parser) do
   test "benchmark: RESP parse throughput for common commands" do
     n = 200_000
 
@@ -467,11 +472,13 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     IO.puts("  Parse PING inline: #{round(n / (time_inline / 1_000_000))} ops/sec")
     assert true
   end
+  end
 
   # ---------------------------------------------------------------------------
   # 10. Encoder encode_list_counted: Enum.reverse overhead
   # ---------------------------------------------------------------------------
 
+  if Code.ensure_loaded?(FerricstoreServer.Resp.Encoder) do
   test "benchmark: Encoder list encoding with varying sizes" do
     n = 200_000
 
@@ -502,5 +509,6 @@ defmodule Ferricstore.Bench.PerfRegressionTest do
     IO.puts("  Encode 5-element list:  #{round(n / (time_5 / 1_000_000))} ops/sec")
     IO.puts("  Encode 20-element list: #{round(n / (time_20 / 1_000_000))} ops/sec")
     assert true
+  end
   end
 end

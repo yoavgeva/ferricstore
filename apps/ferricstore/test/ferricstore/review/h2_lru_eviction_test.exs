@@ -62,7 +62,7 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
 
       {evicted, survived} = partition_keys()
 
-      assert length(evicted) > 0, "expected eviction to occur"
+      assert evicted != [], "expected eviction to occur"
 
       evicted_ldts = ldts_for(evicted)
       survived_ldts = ldts_for(survived)
@@ -112,7 +112,7 @@ defmodule Ferricstore.Review.H2LruEvictionTest do
 
       {evicted, survived} = partition_keys()
 
-      assert length(evicted) > 0, "expected eviction to occur"
+      assert evicted != [], "expected eviction to occur"
 
       evicted_ldts = ldts_for(evicted)
       survived_ldts = ldts_for(survived)

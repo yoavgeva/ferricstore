@@ -68,7 +68,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
         assert leader_node == node.name,
                "node should be its own leader in single-node mode"
 
-        assert length(members) >= 1, "ra group should have at least 1 member"
+        assert members != [], "ra group should have at least 1 member"
 
         # Value must be readable immediately after ACK (apply ran)
         read_val = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
@@ -156,7 +156,7 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
 
       # Verify all nodes have identical state
       expected_state =
-        Enum.map(commands, fn {key, val} ->
+        Enum.map(commands, fn {key, _val} ->
           read = :rpc.call(hd(nodes).name, Ferricstore.Store.Router, :get, [key])
           {key, read}
         end)

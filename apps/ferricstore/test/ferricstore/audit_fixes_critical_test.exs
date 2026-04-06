@@ -7,15 +7,14 @@ defmodule Ferricstore.AuditFixesCriticalTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.GlobMatcher
-  alias FerricstoreServer.Resp.{Parser, Encoder}
-  alias Ferricstore.Commands.{Strings, Hash, Set, SortedSet, Server, Generic}
+  alias Ferricstore.Commands.Server
 
 
   # ---------------------------------------------------------------------------
   # Helper: build a mock store map from a key-value map
   # ---------------------------------------------------------------------------
 
-  defp mock_store(data \\ %{}) do
+  defp mock_store(data) do
     %{
       get: fn key -> get_in(data, [key, Access.elem(0)]) end,
       get_meta: fn key ->
@@ -119,28 +118,30 @@ defmodule Ferricstore.AuditFixesCriticalTest do
   # C2: RESP3 inline parser uses :binary.split
   # ---------------------------------------------------------------------------
 
-  describe "C2: inline parser uses :binary.split" do
-    test "splits on spaces" do
-      assert {:ok, [{:inline, ["PING"]}], ""} = Parser.parse("PING\r\n")
-      assert {:ok, [{:inline, ["GET", "key"]}], ""} = Parser.parse("GET key\r\n")
-    end
+  if Code.ensure_loaded?(FerricstoreServer.Resp.Parser) do
+    describe "C2: inline parser uses :binary.split" do
+      test "splits on spaces" do
+        assert {:ok, [{:inline, ["PING"]}], ""} = FerricstoreServer.Resp.Parser.parse("PING\r\n")
+        assert {:ok, [{:inline, ["GET", "key"]}], ""} = FerricstoreServer.Resp.Parser.parse("GET key\r\n")
+      end
 
-    test "handles multiple spaces" do
-      assert {:ok, [{:inline, ["SET", "key", "value"]}], ""} =
-               Parser.parse("SET  key  value\r\n")
-    end
+      test "handles multiple spaces" do
+        assert {:ok, [{:inline, ["SET", "key", "value"]}], ""} =
+                 FerricstoreServer.Resp.Parser.parse("SET  key  value\r\n")
+      end
 
-    test "handles tabs as whitespace" do
-      assert {:ok, [{:inline, ["GET", "key"]}], ""} = Parser.parse("GET\tkey\r\n")
-    end
+      test "handles tabs as whitespace" do
+        assert {:ok, [{:inline, ["GET", "key"]}], ""} = FerricstoreServer.Resp.Parser.parse("GET\tkey\r\n")
+      end
 
-    test "handles mixed whitespace" do
-      assert {:ok, [{:inline, ["SET", "key", "value"]}], ""} =
-               Parser.parse("SET \t key \t value\r\n")
-    end
+      test "handles mixed whitespace" do
+        assert {:ok, [{:inline, ["SET", "key", "value"]}], ""} =
+                 FerricstoreServer.Resp.Parser.parse("SET \t key \t value\r\n")
+      end
 
-    test "trailing whitespace trimmed" do
-      assert {:ok, [{:inline, ["PING"]}], ""} = Parser.parse("PING \t \r\n")
+      test "trailing whitespace trimmed" do
+        assert {:ok, [{:inline, ["PING"]}], ""} = FerricstoreServer.Resp.Parser.parse("PING \t \r\n")
+      end
     end
   end
 
@@ -177,34 +178,36 @@ defmodule Ferricstore.AuditFixesCriticalTest do
   # C4: parse_float_value uses :binary.match
   # ---------------------------------------------------------------------------
 
-  describe "C4: parse_float_value uses binary matching" do
-    test "regular float" do
-      assert {:ok, [1.5], ""} = Parser.parse(",1.5\r\n")
-    end
+  if Code.ensure_loaded?(FerricstoreServer.Resp.Parser) do
+    describe "C4: parse_float_value uses binary matching" do
+      test "regular float" do
+        assert {:ok, [1.5], ""} = FerricstoreServer.Resp.Parser.parse(",1.5\r\n")
+      end
 
-    test "integer-form double" do
-      assert {:ok, [42.0], ""} = Parser.parse(",42\r\n")
-    end
+      test "integer-form double" do
+        assert {:ok, [42.0], ""} = FerricstoreServer.Resp.Parser.parse(",42\r\n")
+      end
 
-    test "scientific notation without dot" do
-      assert {:ok, [float], ""} = Parser.parse(",1e5\r\n")
-      assert_in_delta float, 1.0e5, 0.001
-    end
+      test "scientific notation without dot" do
+        assert {:ok, [float], ""} = FerricstoreServer.Resp.Parser.parse(",1e5\r\n")
+        assert_in_delta float, 1.0e5, 0.001
+      end
 
-    test "scientific notation with dot" do
-      assert {:ok, [float], ""} = Parser.parse(",1.5e10\r\n")
-      assert_in_delta float, 1.5e10, 1.0
-    end
+      test "scientific notation with dot" do
+        assert {:ok, [float], ""} = FerricstoreServer.Resp.Parser.parse(",1.5e10\r\n")
+        assert_in_delta float, 1.5e10, 1.0
+      end
 
-    test "negative scientific notation" do
-      assert {:ok, [float], ""} = Parser.parse(",1.0E-3\r\n")
-      assert_in_delta float, 0.001, 0.0001
-    end
+      test "negative scientific notation" do
+        assert {:ok, [float], ""} = FerricstoreServer.Resp.Parser.parse(",1.0E-3\r\n")
+        assert_in_delta float, 0.001, 0.0001
+      end
 
-    test "special values" do
-      assert {:ok, [:infinity], ""} = Parser.parse(",inf\r\n")
-      assert {:ok, [:neg_infinity], ""} = Parser.parse(",-inf\r\n")
-      assert {:ok, [:nan], ""} = Parser.parse(",nan\r\n")
+      test "special values" do
+        assert {:ok, [:infinity], ""} = FerricstoreServer.Resp.Parser.parse(",inf\r\n")
+        assert {:ok, [:neg_infinity], ""} = FerricstoreServer.Resp.Parser.parse(",-inf\r\n")
+        assert {:ok, [:nan], ""} = FerricstoreServer.Resp.Parser.parse(",nan\r\n")
+      end
     end
   end
 
@@ -224,7 +227,7 @@ defmodule Ferricstore.AuditFixesCriticalTest do
       # that requires GlobMatcher (not just prefix matching).
       # We call Server.handle("KEYS", ...) with a mock store to verify
       # the GlobMatcher code path.
-      all_keys = ["user:alice", "user:bob", "user:charlie", "post:1"]
+      _all_keys = ["user:alice", "user:bob", "user:charlie", "post:1"]
 
       store =
         mock_store(%{

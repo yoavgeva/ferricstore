@@ -1,5 +1,5 @@
 defmodule Ferricstore.Store.Shard.ETS do
-  @moduledoc false
+  @moduledoc "ETS keydir operations: lookup, insert, delete, cold-read warming, LFU touch, hot-cache threshold enforcement, and prefix scans."
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.{LFU, ValueCodec}
@@ -16,6 +16,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   #   {:cold, file_id, offset, value_size, expire_at_ms}  -- value evicted, disk location known
   #   :expired
   #   :miss
+  @spec ets_lookup(map(), binary()) :: {:hit, term(), non_neg_integer()} | {:cold, non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()} | :expired | :miss
   @doc false
   def ets_lookup(%{keydir: keydir}, key) do
     now = System.os_time(:millisecond)
@@ -59,6 +60,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Like ets_lookup/2, but transparently warms cold keys via v2_pread_at.
   # Returns {:hit, value, expire_at_ms}, :expired, or :miss — never {:cold, ...}.
   # Use this for read-modify-write operations that need the value in memory.
+  @spec ets_lookup_warm(map(), binary()) :: {:hit, term(), non_neg_integer()} | :expired | :miss
   @doc false
   def ets_lookup_warm(state, key) do
     case ets_lookup(state, key) do
@@ -83,6 +85,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # ETS insert / delete
   # -------------------------------------------------------------------
 
+  @spec ets_insert(map(), binary(), term(), non_neg_integer()) :: true
   @doc false
   def ets_insert(state, key, value, expire_at_ms) do
     threshold = hot_cache_threshold(state)
@@ -91,6 +94,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   end
 
   # Inserts a key/value/expiry into the keydir with known disk location (v2).
+  @spec ets_insert_with_location(map(), binary(), term(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: true
   @doc false
   def ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
     threshold = hot_cache_threshold(state)
@@ -99,6 +103,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   end
 
   # Deletes a key from the keydir table.
+  @spec ets_delete_key(map(), binary()) :: true
   @doc false
   def ets_delete_key(state, key) do
     :ets.delete(state.keydir, key)
@@ -109,6 +114,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # -------------------------------------------------------------------
 
   # Returns the hot cache max value size threshold from instance ctx.
+  @spec hot_cache_threshold(map()) :: non_neg_integer()
   @compile {:inline, hot_cache_threshold: 1}
   @doc false
   def hot_cache_threshold(%{instance_ctx: ctx}) when ctx != nil, do: ctx.hot_cache_max_value_size
@@ -117,6 +123,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Returns nil for values exceeding the hot cache max value size threshold,
   # or the value itself if it fits. This prevents large values from being
   # stored in ETS, avoiding expensive binary copies on every :ets.lookup.
+  @spec value_for_ets(term(), non_neg_integer()) :: binary() | nil
   @compile {:inline, value_for_ets: 2}
   @doc false
   def value_for_ets(nil, _threshold), do: nil
@@ -131,6 +138,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     end
   end
 
+  @spec to_disk_binary(integer() | float() | binary()) :: binary()
   @compile {:inline, to_disk_binary: 1}
   @doc false
   def to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
@@ -144,6 +152,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # 3-arity convenience: looks up the cold ETS entry to recover disk location
   # metadata, then delegates to the 7-arity version. Used by async read
   # completion handlers that only have {from, key} and the value from disk.
+  @spec cold_read_warm_ets(map(), binary(), binary()) :: :ok | true
   @doc false
   def cold_read_warm_ets(state, key, value) do
     case :ets.lookup(state.keydir, key) do
@@ -161,6 +170,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Values exceeding the hot_cache_max_value_size threshold are NOT warmed --
   # they stay cold (nil) in ETS to avoid expensive binary copies on read.
   # Under memory pressure, skip warming to prevent evict/re-promote thrashing.
+  @spec cold_read_warm_ets(map(), binary(), binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: :ok | true
   @doc false
   def cold_read_warm_ets(state, key, value, exp, fid, off, vsize) do
     v = value_for_ets(value, hot_cache_threshold(state))
@@ -179,6 +189,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
   # v2: cold read via pread_at using disk location from ETS 7-tuple.
   # Applies the hot_cache_max_value_size threshold when re-warming ETS.
+  @spec warm_from_store(map(), binary()) :: binary() | nil
   @doc false
   def warm_from_store(state, key) do
     case :ets.lookup(state.keydir, key) do
@@ -206,6 +217,7 @@ defmodule Ferricstore.Store.Shard.ETS do
 
   # v2: cold read meta via pread_at using disk location from ETS 7-tuple.
   # Applies the hot_cache_max_value_size threshold when re-warming ETS.
+  @spec warm_meta_from_store(map(), binary()) :: {binary(), non_neg_integer()} | nil
   @doc false
   def warm_meta_from_store(state, key) do
     case :ets.lookup(state.keydir, key) do
@@ -232,6 +244,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # -------------------------------------------------------------------
 
   # Returns the file path for a given file_id within the shard data directory.
+  @spec file_path(binary(), non_neg_integer()) :: binary()
   @doc false
   def file_path(shard_path, file_id) do
     Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
@@ -241,6 +254,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Prefix-based ETS helpers (replaces O(N) :ets.foldl full-table scans)
   # -------------------------------------------------------------------
 
+  @spec prefix_scan_entries(:ets.tid(), binary(), binary() | nil) :: [{binary(), binary()}]
   @doc false
   def prefix_scan_entries(keydir, prefix, shard_data_path) do
     now = System.os_time(:millisecond)
@@ -281,6 +295,7 @@ defmodule Ferricstore.Store.Shard.ETS do
     end)
   end
 
+  @spec prefix_count_entries(:ets.tid(), binary()) :: non_neg_integer()
   @doc false
   def prefix_count_entries(keydir, prefix) do
     now = System.os_time(:millisecond)
@@ -309,11 +324,13 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Integer / float coercion — delegates to shared ValueCodec
   # -------------------------------------------------------------------
 
+  @spec coerce_integer(term()) :: {:ok, integer()} | :error
   @doc false
   def coerce_integer(v) when is_integer(v), do: {:ok, v}
   def coerce_integer(v) when is_float(v), do: :error
   def coerce_integer(v) when is_binary(v), do: ValueCodec.parse_integer(v)
 
+  @spec coerce_float(term()) :: {:ok, float()} | :error
   @doc false
   def coerce_float(v) when is_float(v), do: {:ok, v}
   def coerce_float(v) when is_integer(v), do: {:ok, v * 1.0}

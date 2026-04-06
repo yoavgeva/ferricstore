@@ -330,53 +330,52 @@ defmodule Ferricstore.NamespaceConfig do
     now = System.os_time(:second)
 
     try do
-      # Single ETS lookup for both old_durability and current values.
-      {old_durability, entry} =
-        case :ets.lookup(@table, prefix) do
-          [{^prefix, window_ms, durability, _changed_at, _changed_by}] ->
-            new_entry =
-              case field do
-                :window_ms -> {prefix, value, durability, now, changed_by}
-                :durability -> {prefix, window_ms, value, now, changed_by}
-              end
-
-            {durability, new_entry}
-
-          [] ->
-            new_entry =
-              case field do
-                :window_ms -> {prefix, value, get_default_durability(), now, changed_by}
-                :durability -> {prefix, @default_window_ms, value, now, changed_by}
-              end
-
-            {get_default_durability(), new_entry}
-        end
-
+      {old_durability, entry} = build_ns_entry(prefix, field, value, now, changed_by)
       :ets.insert(@table, entry)
-
-      # Emit durability weakening telemetry when changing from quorum to async
-      if field == :durability and old_durability == :quorum and value == :async do
-        :telemetry.execute(
-          [:ferricstore, :config, :durability_weakened],
-          %{system_time: System.system_time(:millisecond)},
-          %{
-            prefix: prefix,
-            old_durability: :quorum,
-            new_durability: :async,
-            changed_by: changed_by,
-            changed_at: now
-          }
-        )
-      end
-
+      maybe_emit_durability_telemetry(field, old_durability, value, prefix, changed_by, now)
       broadcast_ns_config_changed()
-
       :ok
     rescue
       ArgumentError ->
         {:error, "ERR namespace config table not available"}
     end
   end
+
+  defp build_ns_entry(prefix, field, value, now, changed_by) do
+    case :ets.lookup(@table, prefix) do
+      [{^prefix, window_ms, durability, _changed_at, _changed_by}] ->
+        entry = build_entry_tuple(prefix, field, value, window_ms, durability, now, changed_by)
+        {durability, entry}
+
+      [] ->
+        entry = build_entry_tuple(prefix, field, value, @default_window_ms, get_default_durability(), now, changed_by)
+        {get_default_durability(), entry}
+    end
+  end
+
+  defp build_entry_tuple(prefix, :window_ms, value, _window_ms, durability, now, changed_by) do
+    {prefix, value, durability, now, changed_by}
+  end
+
+  defp build_entry_tuple(prefix, :durability, value, window_ms, _durability, now, changed_by) do
+    {prefix, window_ms, value, now, changed_by}
+  end
+
+  defp maybe_emit_durability_telemetry(:durability, :quorum, :async, prefix, changed_by, now) do
+    :telemetry.execute(
+      [:ferricstore, :config, :durability_weakened],
+      %{system_time: System.system_time(:millisecond)},
+      %{
+        prefix: prefix,
+        old_durability: :quorum,
+        new_durability: :async,
+        changed_by: changed_by,
+        changed_at: now
+      }
+    )
+  end
+
+  defp maybe_emit_durability_telemetry(_field, _old, _new, _prefix, _by, _now), do: :ok
 
   defp lookup(prefix) do
     try do
@@ -458,46 +457,44 @@ defmodule Ferricstore.NamespaceConfig do
   # when raft is disabled).
   @spec broadcast_ns_config_changed() :: :ok
   defp broadcast_ns_config_changed do
-    # Update the fast-path flag for Router.durability_for_key/1.
-    # Scan all config entries to check if any namespace uses :async durability.
-    # This runs only on config changes (rare), not on every write.
-    # Compute three-state durability mode for Router fast-path.
-    # Scans all config entries (rare operation — only on config changes).
-    {has_async, has_quorum} =
-      try do
-        :ets.foldl(
-          fn {_prefix, _window, :async, _at, _by}, {_a, q} -> {true, q}
-             {_prefix, _window, :quorum, _at, _by}, {a, _q} -> {a, true}
-             _, acc -> acc
-          end,
-          {false, false},
-          @table
-        )
-      rescue
-        ArgumentError -> {false, false}
-      end
-
-    durability_mode =
-      case {has_async, has_quorum} do
-        {false, false} ->
-          # No namespaces configured — use the global default
-          if get_default_durability() == :async, do: :all_async, else: :all_quorum
-
-        {false, true} -> :all_quorum
-        {true, false} -> :all_async
-        {true, true} -> :mixed
-      end
+    {has_async, has_quorum} = scan_durability_flags()
+    durability_mode = compute_durability_mode(has_async, has_quorum)
 
     :persistent_term.put(:ferricstore_durability_mode, durability_mode)
-    # Keep backward compat flag for any code checking the old boolean
     :persistent_term.put(:ferricstore_has_async_ns, has_async)
 
+    notify_batchers()
+
+    :ok
+  end
+
+  defp scan_durability_flags do
+    try do
+      :ets.foldl(
+        fn {_prefix, _window, :async, _at, _by}, {_a, q} -> {true, q}
+           {_prefix, _window, :quorum, _at, _by}, {a, _q} -> {a, true}
+           _, acc -> acc
+        end,
+        {false, false},
+        @table
+      )
+    rescue
+      ArgumentError -> {false, false}
+    end
+  end
+
+  defp compute_durability_mode(false, false) do
+    if get_default_durability() == :async, do: :all_async, else: :all_quorum
+  end
+
+  defp compute_durability_mode(false, true), do: :all_quorum
+  defp compute_durability_mode(true, false), do: :all_async
+  defp compute_durability_mode(true, true), do: :mixed
+
+  defp notify_batchers do
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
     for i <- 0..(shard_count - 1) do
-      # Inline the batcher name to avoid a circular dependency:
-      # NamespaceConfig -> Raft.Batcher -> NamespaceConfig.
-      # This must stay in sync with Ferricstore.Raft.Batcher.batcher_name/1.
       name = :"Ferricstore.Raft.Batcher.#{i}"
 
       case Process.whereis(name) do
@@ -505,7 +502,5 @@ defmodule Ferricstore.NamespaceConfig do
         pid -> send(pid, :ns_config_changed)
       end
     end
-
-    :ok
   end
 end

@@ -1,5 +1,5 @@
 defmodule FerricstoreServer.Connection.Store do
-  @moduledoc false
+  @moduledoc "Builds the closure-based store map that routes commands to shards, with optional namespace prefixing."
 
   alias Ferricstore.Store.Router
 

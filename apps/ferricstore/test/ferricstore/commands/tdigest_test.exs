@@ -1686,7 +1686,7 @@ defmodule Ferricstore.Commands.TDigestTest do
       compressed = Core.compress(digest)
       assert compressed.buffer == []
       assert compressed.buffer_size == 0
-      assert length(compressed.centroids) > 0
+      assert compressed.centroids != []
     end
 
     test "reset preserves compression" do

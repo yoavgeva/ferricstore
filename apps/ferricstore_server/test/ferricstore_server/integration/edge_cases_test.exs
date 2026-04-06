@@ -57,7 +57,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
     recv_one(sock, timeout)
   end
 
-  defp recv_one(sock, timeout \\ 30_000) do
+  defp recv_one(sock, timeout) do
     recv_loop(sock, "", timeout)
   end
 
@@ -675,7 +675,7 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   end
 
   # Receive raw bytes with a timeout; returns {:ok, data} | {:error, reason}.
-  defp recv_raw(sock, timeout \\ 5_000) do
+  defp recv_raw(sock, timeout) do
     :gen_tcp.recv(sock, 0, timeout)
   end
 

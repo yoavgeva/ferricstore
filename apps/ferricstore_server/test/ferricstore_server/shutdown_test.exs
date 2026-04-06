@@ -117,7 +117,7 @@ defmodule FerricstoreServer.ShutdownTest do
       assert File.dir?(shard_dir), "Shard data directory should exist: #{shard_dir}"
 
       files = File.ls!(shard_dir)
-      assert length(files) > 0, "Shard directory should contain Bitcask data files"
+      assert files != [], "Shard directory should contain Bitcask data files"
 
       # Verify the data is recoverable from disk using v2 stateless NIFs.
       {:ok, recovered_value} = read_key_from_disk(shard_dir, key)
@@ -195,7 +195,7 @@ defmodule FerricstoreServer.ShutdownTest do
         assert File.dir?(shard_dir), "Shard #{i} data directory should exist"
 
         files = File.ls!(shard_dir)
-        assert length(files) > 0, "Shard #{i} directory should have data files"
+        assert files != [], "Shard #{i} directory should have data files"
       end
     end
   end
@@ -316,7 +316,7 @@ defmodule FerricstoreServer.ShutdownTest do
       files = File.ls!(shard_dir)
       hint_files = Enum.filter(files, &String.ends_with?(&1, ".hint"))
 
-      assert length(hint_files) > 0,
+      assert hint_files != [],
              "Shard directory should contain .hint file(s) after graceful shutdown, " <>
                "got: #{inspect(files)}"
     end

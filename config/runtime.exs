@@ -110,7 +110,7 @@ if config_env() == :prod do
   # Clustering
   # ---------------------------------------------------------------------------
   node_name = System.get_env("FERRICSTORE_NODE_NAME")
-  cookie = System.get_env("FERRICSTORE_COOKIE", "ferricstore")
+  _cookie = System.get_env("FERRICSTORE_COOKIE", "ferricstore")
 
   if node_name do
     config :ferricstore, :cluster_nodes,

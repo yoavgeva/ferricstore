@@ -156,7 +156,10 @@ defmodule Ferricstore.MediumAuditFixesTest do
     test "MSETNX returns 0 if any key exists" do
       store = %{
         put: fn _, _, _ -> :ok end,
-        exists?: fn "k2" -> true; _ -> false end
+        exists?: fn
+          "k2" -> true
+          _ -> false
+        end
       }
 
       result = Ferricstore.Commands.Strings.handle("MSETNX", ["k1", "v1", "k2", "v2"], store)

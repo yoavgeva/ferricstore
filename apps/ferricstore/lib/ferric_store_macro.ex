@@ -1,5 +1,5 @@
 defmodule FerricStore.Macro do
-  @moduledoc false
+  @moduledoc "Generates the full FerricStore public API (get, set, del, hash, set, list, sorted set, probabilistic, etc.) for `use FerricStore` modules."
 
   @doc """
   Generates all FerricStore API functions for a module.
@@ -20,6 +20,7 @@ defmodule FerricStore.Macro do
   """
 
   defmacro __using__(opts) do
+    # credo:disable-for-next-line Credo.Check.Refactor.LongQuoteBlocks
     quote do
       @ferricstore_opts unquote(opts)
 

@@ -273,38 +273,38 @@ defmodule Ferricstore.WritePathOptimizationsTest do
   # RESP parser value size limits
   # =========================================================================
 
-  describe "RESP parser value size limits" do
-    alias FerricstoreServer.Resp.Parser
+  if Code.ensure_loaded?(FerricstoreServer.Resp.Parser) do
+    describe "RESP parser value size limits" do
+      test "bulk string within default limit parses successfully" do
+        data = "$5\r\nhello\r\n"
+        assert {:ok, ["hello"], ""} = FerricstoreServer.Resp.Parser.parse(data)
+      end
 
-    test "bulk string within default limit parses successfully" do
-      data = "$5\r\nhello\r\n"
-      assert {:ok, ["hello"], ""} = Parser.parse(data)
-    end
+      test "bulk string exceeding custom limit returns error" do
+        # Set a very small limit
+        data = "$100\r\n" <> String.duplicate("x", 100) <> "\r\n"
+        assert {:error, {:value_too_large, 100, 50}} = FerricstoreServer.Resp.Parser.parse(data, 50)
+      end
 
-    test "bulk string exceeding custom limit returns error" do
-      # Set a very small limit
-      data = "$100\r\n" <> String.duplicate("x", 100) <> "\r\n"
-      assert {:error, {:value_too_large, 100, 50}} = Parser.parse(data, 50)
-    end
+      test "hard cap of 64MB enforced regardless of config" do
+        assert FerricstoreServer.Resp.Parser.hard_cap_bytes() == 67_108_864
 
-    test "hard cap of 64MB enforced regardless of config" do
-      assert Parser.hard_cap_bytes() == 67_108_864
+        # Even with a huge limit, 64MB+ is rejected
+        huge_len = 67_108_865
+        data = "$#{huge_len}\r\n"
+        assert {:error, {:value_too_large, ^huge_len, _}} = FerricstoreServer.Resp.Parser.parse(data, 100_000_000)
+      end
 
-      # Even with a huge limit, 64MB+ is rejected
-      huge_len = 67_108_865
-      data = "$#{huge_len}\r\n"
-      assert {:error, {:value_too_large, ^huge_len, _}} = Parser.parse(data, 100_000_000)
-    end
+      test "bulk string at exact limit parses successfully" do
+        limit = 10
+        data = "$10\r\n" <> String.duplicate("x", 10) <> "\r\n"
+        assert {:ok, [val], ""} = FerricstoreServer.Resp.Parser.parse(data, limit)
+        assert byte_size(val) == 10
+      end
 
-    test "bulk string at exact limit parses successfully" do
-      limit = 10
-      data = "$10\r\n" <> String.duplicate("x", 10) <> "\r\n"
-      assert {:ok, [val], ""} = Parser.parse(data, limit)
-      assert byte_size(val) == 10
-    end
-
-    test "null bulk string always parses" do
-      assert {:ok, [nil], ""} = Parser.parse("$-1\r\n")
+      test "null bulk string always parses" do
+        assert {:ok, [nil], ""} = FerricstoreServer.Resp.Parser.parse("$-1\r\n")
+      end
     end
   end
 

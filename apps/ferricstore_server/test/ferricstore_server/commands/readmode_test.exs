@@ -14,7 +14,6 @@ defmodule FerricstoreServer.Commands.ReadmodeTest do
   use ExUnit.Case, async: false
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
-  alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------
   # Helpers

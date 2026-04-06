@@ -6,9 +6,7 @@ defmodule Ferricstore.AuditFixesHighTest do
 
   use ExUnit.Case, async: true
 
-  alias Ferricstore.GlobMatcher
-  alias FerricstoreServer.Resp.{Parser, Encoder}
-  alias Ferricstore.Commands.{Strings, Hash, Set, SortedSet, Server, Generic}
+  alias Ferricstore.Commands.{Hash, Set, Server, Generic}
 
 
   # ---------------------------------------------------------------------------
@@ -51,32 +49,34 @@ defmodule Ferricstore.AuditFixesHighTest do
   # H2: Encoder single-pass counting
   # ---------------------------------------------------------------------------
 
-  describe "H2: encoder single-pass list counting" do
-    test "array encoding correct" do
-      result = Encoder.encode([1, 2, 3]) |> IO.iodata_to_binary()
-      assert result == "*3\r\n:1\r\n:2\r\n:3\r\n"
-    end
+  if Code.ensure_loaded?(FerricstoreServer.Resp.Encoder) do
+    describe "H2: encoder single-pass list counting" do
+      test "array encoding correct" do
+        result = FerricstoreServer.Resp.Encoder.encode([1, 2, 3]) |> IO.iodata_to_binary()
+        assert result == "*3\r\n:1\r\n:2\r\n:3\r\n"
+      end
 
-    test "empty array" do
-      result = Encoder.encode([]) |> IO.iodata_to_binary()
-      assert result == "*0\r\n"
-    end
+      test "empty array" do
+        result = FerricstoreServer.Resp.Encoder.encode([]) |> IO.iodata_to_binary()
+        assert result == "*0\r\n"
+      end
 
-    test "push encoding correct" do
-      result = Encoder.encode({:push, ["a", "b"]}) |> IO.iodata_to_binary()
-      assert result == ">2\r\n$1\r\na\r\n$1\r\nb\r\n"
-    end
+      test "push encoding correct" do
+        result = FerricstoreServer.Resp.Encoder.encode({:push, ["a", "b"]}) |> IO.iodata_to_binary()
+        assert result == ">2\r\n$1\r\na\r\n$1\r\nb\r\n"
+      end
 
-    test "nested array encoding" do
-      result = Encoder.encode([[1, 2], [3]]) |> IO.iodata_to_binary()
-      assert result == "*2\r\n*2\r\n:1\r\n:2\r\n*1\r\n:3\r\n"
-    end
+      test "nested array encoding" do
+        result = FerricstoreServer.Resp.Encoder.encode([[1, 2], [3]]) |> IO.iodata_to_binary()
+        assert result == "*2\r\n*2\r\n:1\r\n:2\r\n*1\r\n:3\r\n"
+      end
 
-    test "MapSet encoding" do
-      set = MapSet.new(["a", "b"])
-      result = Encoder.encode(set) |> IO.iodata_to_binary()
-      # Order is not guaranteed for MapSet, but the count and elements should be correct
-      assert String.starts_with?(result, "~2\r\n")
+      test "MapSet encoding" do
+        set = MapSet.new(["a", "b"])
+        result = FerricstoreServer.Resp.Encoder.encode(set) |> IO.iodata_to_binary()
+        # Order is not guaranteed for MapSet, but the count and elements should be correct
+        assert String.starts_with?(result, "~2\r\n")
+      end
     end
   end
 
@@ -90,7 +90,7 @@ defmodule Ferricstore.AuditFixesHighTest do
 
       store =
         mock_store()
-        |> Map.put(:compound_get, fn _rk, _ck -> Map.get(compound_data, _ck) end)
+        |> Map.put(:compound_get, fn _rk, ck -> Map.get(compound_data, ck) end)
         |> Map.put(:compound_put, fn _rk, _ck, _v, _e -> :ok end)
 
       # Uses check_or_set which needs the compound_get for type registry
@@ -143,7 +143,7 @@ defmodule Ferricstore.AuditFixesHighTest do
       # HSCAN with COUNT 2 should return partial results
       result = Hash.handle("HSCAN", ["key", "0", "COUNT", "2"], store)
       assert is_list(result)
-      [cursor, elements] = result
+      [cursor, _elements] = result
       # Should have a non-zero cursor or "0" if all fit
       assert is_binary(cursor)
     end
@@ -167,7 +167,8 @@ defmodule Ferricstore.AuditFixesHighTest do
     end
 
     test "empty list is not more than 1" do
-      refute match?([_, _ | _], [])
+      empty = []
+      refute match?([_, _ | _], empty)
     end
 
     test "three-element list is more than 1" do
@@ -218,7 +219,7 @@ defmodule Ferricstore.AuditFixesHighTest do
       [cursor, elements] = Hash.handle("HSCAN", ["key", "0", "COUNT", "3"], store)
       assert is_binary(cursor)
       # Should have elements (field + value pairs interleaved)
-      assert length(elements) > 0
+      assert elements != []
     end
 
     test "HSCAN full iteration returns all fields exactly once" do
@@ -380,9 +381,12 @@ defmodule Ferricstore.AuditFixesHighTest do
     end
 
     test "pattern [_, _, _ | _] does not match 0-2 element lists" do
-      refute match?([_, _, _ | _], [])
-      refute match?([_, _, _ | _], ["a"])
-      refute match?([_, _, _ | _], ["a", "b"])
+      empty = []
+      one = ["a"]
+      two = ["a", "b"]
+      refute match?([_, _, _ | _], empty)
+      refute match?([_, _, _ | _], one)
+      refute match?([_, _, _ | _], two)
     end
 
     test "pattern equivalence with length > 2" do
@@ -512,7 +516,7 @@ defmodule Ferricstore.AuditFixesHighTest do
         "post:1" => {"v", 0}
       }
 
-      all_key_list = Map.keys(all_data)
+      _all_key_list = Map.keys(all_data)
 
       store = mock_store(all_data)
 

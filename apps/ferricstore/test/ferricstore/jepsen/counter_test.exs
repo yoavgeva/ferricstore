@@ -128,7 +128,7 @@ defmodule Ferricstore.Jepsen.CounterTest do
           end
         end)
 
-      assert length(alive) >= 1, "need at least 1 alive node"
+      assert alive != [], "need at least 1 alive node"
       node = hd(alive)
 
       key = "jepsen:counter2"
@@ -173,7 +173,7 @@ defmodule Ferricstore.Jepsen.CounterTest do
           end
         end)
 
-      assert length(alive) >= 1, "need at least 1 alive node"
+      assert alive != [], "need at least 1 alive node"
       node = hd(alive)
 
       key = "jepsen:counter3"

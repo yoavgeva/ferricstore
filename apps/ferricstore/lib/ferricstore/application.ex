@@ -255,7 +255,7 @@ defmodule Ferricstore.Application do
     shutdown_check_snapshots(shard_count)
 
     elapsed = System.monotonic_time(:millisecond) - t0
-    Logger.info("Shutdown: graceful flush complete in \#{elapsed}ms")
+    Logger.info("Shutdown: graceful flush complete in #{elapsed}ms")
 
     state
   end

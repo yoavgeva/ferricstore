@@ -1,5 +1,5 @@
 defmodule Ferricstore.Store.Shard.Lifecycle do
-  @moduledoc false
+  @moduledoc "Shard startup (log/hint recovery, keydir rebuild), expiry sweep, probabilistic-file migration, Raft init, and graceful shutdown."
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.LFU
@@ -24,6 +24,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # {highest_file_id, file_size_of_highest}. Starts at 0 if no files exist.
   # Uses a single Enum.reduce pass instead of filter + map + max to avoid
   # creating intermediate lists (perf audit L5).
+  @spec discover_active_file(binary()) :: {non_neg_integer(), non_neg_integer()}
   @doc false
   def discover_active_file(shard_path) do
     case File.ls(shard_path) do
@@ -62,6 +63,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
   # Recovers the ETS keydir from hint files or by scanning log files.
   # Uses last-writer-wins semantics (higher file_id + higher offset wins).
+  @spec recover_keydir(binary(), :ets.tid(), non_neg_integer()) :: :ok
   @doc false
   def recover_keydir(shard_path, keydir, shard_index) do
     case File.ls(shard_path) do
@@ -125,6 +127,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     Logger.debug("Shard #{shard_index}: recover_keydir done, ETS size: #{ets_size}, keys: #{inspect(sample_keys)}")
   end
 
+  @spec recover_from_log(binary(), binary(), :ets.tid(), non_neg_integer()) :: :ok
   @doc false
   def recover_from_log(shard_path, log_name, keydir, _shard_index) do
     log_path = Path.join(shard_path, log_name)
@@ -154,6 +157,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # expired entries, deletes them from ETS, and purges expired entries
   # from the Bitcask store. Tracks consecutive ceiling-hit sweeps and
   # emits telemetry when the sweep is struggling or recovers.
+  @spec do_expiry_sweep(map()) :: map()
   @doc false
   def do_expiry_sweep(state) do
     now = System.os_time(:millisecond)
@@ -215,6 +219,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     %{state | sweep_at_ceiling_count: new_ceiling_count, sweep_struggling: new_struggling}
   end
 
+  @spec scan_expired(:ets.tid(), integer(), non_neg_integer()) :: [binary()]
   @doc false
   def scan_expired(keydir, now, limit) do
     # 7-tuple format: {key, value, expire_at_ms, lfu_counter, file_id, offset, value_size}
@@ -231,12 +236,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end
   end
 
+  @spec schedule_expiry_sweep() :: reference()
   @doc false
   def schedule_expiry_sweep do
     interval = Application.get_env(:ferricstore, :expiry_sweep_interval_ms, @default_sweep_interval_ms)
     Process.send_after(self(), :expiry_sweep, interval)
   end
 
+  @spec schedule_frag_check() :: reference()
   @doc false
   def schedule_frag_check do
     interval = Application.get_env(:ferricstore, :frag_check_interval_ms, @default_frag_check_interval_ms)
@@ -247,6 +254,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Prob file migration
   # -------------------------------------------------------------------
 
+  @spec migrate_prob_files(binary(), :ets.tid(), non_neg_integer()) :: :ok
   @doc false
   def migrate_prob_files(shard_data_path, keydir, _index) do
     prob_dir = Path.join(shard_data_path, "prob")
@@ -267,6 +275,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end
   end
 
+  @spec migrate_prob_file(binary(), binary(), :ets.tid(), non_neg_integer()) :: non_neg_integer()
   @doc false
   def migrate_prob_file(prob_dir, filename, keydir, count) do
     path = Path.join(prob_dir, filename)
@@ -297,6 +306,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # The key in the filename may be Base64-encoded (new) or sanitized (old).
   # We try to decode as Base64 first; if that fails, treat the filename
   # stem as the literal key.
+  @spec migrate_if_missing(:ets.tid(), binary(), binary(), atom(), non_neg_integer()) :: non_neg_integer()
   @doc false
   def migrate_if_missing(keydir, filename_key, path, type, count) do
     key =
@@ -321,6 +331,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     ArgumentError -> count
   end
 
+  @spec build_prob_meta(atom(), binary(), binary()) :: {atom(), map()}
   @doc false
   def build_prob_meta(:bloom_meta, path, _key) do
     # Try to read bloom header for capacity/error_rate derivation
@@ -382,6 +393,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Application.start for shards 0..N-1). If so, also starts the ra server
   # for this shard. Isolated test shards with ad-hoc indices won't have a
   # Batcher and fall back to the direct write path.
+  @spec start_raft_if_available(non_neg_integer(), binary(), non_neg_integer(), binary(), :ets.tid()) :: boolean()
   @doc false
   def start_raft_if_available(index, shard_data_path, active_file_id, active_file_path, ets) do
     batcher_name = Ferricstore.Raft.Batcher.batcher_name(index)
@@ -402,6 +414,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # Terminate
   # -------------------------------------------------------------------
 
+  @spec do_terminate(term(), map()) :: :ok
   @doc false
   def do_terminate(_reason, state) do
     t0 = System.monotonic_time(:microsecond)

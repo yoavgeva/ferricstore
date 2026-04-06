@@ -563,41 +563,20 @@ defmodule FerricstoreServer.Connection do
     sandbox_mode = Ferricstore.Config.get_value("sandbox_mode")
     sandbox_enabled? = sandbox_mode in ["local", "enabled"]
 
-    case String.upcase(subcmd) do
-      "START" when sandbox_enabled? ->
-        ns = "test_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
-        {:continue, Encoder.encode(ns), %{state | sandbox_namespace: ns}}
+    case {String.upcase(subcmd), sandbox_enabled?} do
+      {"START", true} ->
+        sandbox_start(state)
 
-      "JOIN" when sandbox_enabled? ->
-        case rest do
-          [token | _] ->
-            {:continue, Encoder.encode(:ok), %{state | sandbox_namespace: token}}
+      {"JOIN", true} ->
+        sandbox_join(rest, state)
 
-          [] ->
-            {:continue, Encoder.encode({:error, "ERR SANDBOX JOIN requires a namespace token"}), state}
-        end
+      {"END", true} ->
+        sandbox_end(state)
 
-      "END" when sandbox_enabled? ->
-        if state.sandbox_namespace do
-          ns = state.sandbox_namespace
-
-          try do
-            ctx = state.instance_ctx
-            keys = Router.keys(ctx)
-            Enum.each(keys, fn k -> if String.starts_with?(k, ns), do: Router.delete(ctx, k) end)
-          catch
-            :exit, _ -> :ok
-          end
-
-          {:continue, Encoder.encode(:ok), %{state | sandbox_namespace: nil}}
-        else
-          {:continue, Encoder.encode({:error, "ERR no active sandbox session"}), state}
-        end
-
-      "TOKEN" when sandbox_enabled? ->
+      {"TOKEN", true} ->
         {:continue, Encoder.encode(state.sandbox_namespace), state}
 
-      cmd when cmd in ~w(START JOIN END TOKEN) ->
+      {cmd, false} when cmd in ~w(START JOIN END TOKEN) ->
         {:continue, Encoder.encode({:error, "ERR SANDBOX commands are not enabled on this server"}), state}
 
       _ ->
@@ -613,6 +592,37 @@ defmodule FerricstoreServer.Connection do
     else
       {:continue, Encoder.encode({:error, "ERR SANDBOX commands are not enabled on this server"}), state}
     end
+  end
+
+  defp sandbox_start(state) do
+    ns = "test_" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+    {:continue, Encoder.encode(ns), %{state | sandbox_namespace: ns}}
+  end
+
+  defp sandbox_join([token | _], state) do
+    {:continue, Encoder.encode(:ok), %{state | sandbox_namespace: token}}
+  end
+
+  defp sandbox_join([], state) do
+    {:continue, Encoder.encode({:error, "ERR SANDBOX JOIN requires a namespace token"}), state}
+  end
+
+  defp sandbox_end(%{sandbox_namespace: nil} = state) do
+    {:continue, Encoder.encode({:error, "ERR no active sandbox session"}), state}
+  end
+
+  defp sandbox_end(state) do
+    ns = state.sandbox_namespace
+
+    try do
+      ctx = state.instance_ctx
+      keys = Router.keys(ctx)
+      Enum.each(keys, fn k -> if String.starts_with?(k, ns), do: Router.delete(ctx, k) end)
+    catch
+      :exit, _ -> :ok
+    end
+
+    {:continue, Encoder.encode(:ok), %{state | sandbox_namespace: nil}}
   end
 
   defp dispatch_normal(cmd, args, state) do

@@ -29,7 +29,7 @@ defmodule Ferricstore.Commands.RedisCompatTest do
 
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Dispatcher, Generic, Hash, List, Set, SortedSet, Strings}
+  alias Ferricstore.Commands.{Dispatcher, Generic, Hash, Set, SortedSet, Strings}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Test.MockStore
 
@@ -369,7 +369,7 @@ defmodule Ferricstore.Commands.RedisCompatTest do
       store = MockStore.make()
       result = Generic.handle("OBJECT", ["HELP"], store)
       assert is_list(result)
-      assert length(result) > 0
+      assert result != []
     end
 
     test "OBJECT REFCOUNT always returns 1" do

@@ -10,7 +10,6 @@ defmodule Ferricstore.Merge.SchedulerTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Merge.Scheduler
-  alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
   setup do
@@ -78,7 +77,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
 
     test "notify_rotation is safe when scheduler is not running" do
       # Cast to non-existent scheduler should not crash
-      assert :ok = Scheduler.notify_rotation(99999, 10)
+      assert :ok = Scheduler.notify_rotation(99_999, 10)
     end
 
     test "multiple rapid rotations are handled sequentially" do
@@ -138,7 +137,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
           shard_index: 0,
           data_dir: Application.get_env(:ferricstore, :data_dir, "data"),
           merge_config: %{mode: :hot, min_files_for_merge: 100},
-          name: :"test_scheduler_hot"
+          name: :test_scheduler_hot
         )
 
       # Send file count below threshold
@@ -167,7 +166,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
           shard_index: 0,
           data_dir: Application.get_env(:ferricstore, :data_dir, "data"),
           merge_config: %{mode: :bulk, merge_window: {start, stop}, min_files_for_merge: 2},
-          name: :"test_scheduler_bulk"
+          name: :test_scheduler_bulk
         )
 
       # Send file count above threshold
@@ -206,7 +205,7 @@ defmodule Ferricstore.Merge.SchedulerTest do
           data_dir: Application.get_env(:ferricstore, :data_dir, "data"),
           merge_config: %{mode: :hot, min_files_for_merge: 2},
           semaphore: real_sem,
-          name: :"test_scheduler_busy"
+          name: :test_scheduler_busy
         )
 
       GenServer.cast(pid, {:file_rotated, 10})

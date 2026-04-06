@@ -580,7 +580,7 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
 
     test "COMMAND LIST returns list of strings", %{sock: sock} do
       result = cmd(sock, ["COMMAND", "LIST"])
-      assert is_list(result) and length(result) > 0
+      assert is_list(result) and result != []
     end
 
     test "COMMAND INFO with unknown command returns nil in list", %{sock: sock} do

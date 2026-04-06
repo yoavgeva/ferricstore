@@ -40,7 +40,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
             min_files_for_merge: 100,
             merge_cooldown_ms: 60_000
           },
-          name: :"test_frag_notify_scheduler"
+          name: :test_frag_notify_scheduler
         )
 
       # Set last_merge_completed_at so cooldown blocks merge
@@ -63,7 +63,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
     end
 
     test "notify_fragmentation is safe when scheduler is not running" do
-      assert :ok = Scheduler.notify_fragmentation(99999, [1], 1)
+      assert :ok = Scheduler.notify_fragmentation(99_999, [1], 1)
     end
 
     test "fragmentation candidates cleared after merge attempt" do
@@ -76,7 +76,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
             min_files_for_merge: 100,
             merge_cooldown_ms: 0
           },
-          name: :"test_frag_clear_scheduler"
+          name: :test_frag_clear_scheduler
         )
 
       GenServer.cast(pid, {:fragmentation, [1], 3})
@@ -108,7 +108,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
             min_files_for_merge: 2,
             merge_cooldown_ms: 60_000
           },
-          name: :"test_cooldown_scheduler"
+          name: :test_cooldown_scheduler
         )
 
       # Simulate a recently completed merge
@@ -140,7 +140,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
             min_files_for_merge: 2,
             merge_cooldown_ms: 10
           },
-          name: :"test_expired_cooldown_scheduler"
+          name: :test_expired_cooldown_scheduler
         )
 
       # Simulate a merge that completed long enough ago
@@ -172,7 +172,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
           shard_index: 0,
           data_dir: Application.get_env(:ferricstore, :data_dir, "data"),
           merge_config: %{mode: :hot, min_files_for_merge: 100},
-          name: :"test_nil_cooldown_scheduler"
+          name: :test_nil_cooldown_scheduler
         )
 
       status = GenServer.call(pid, :status)
@@ -192,7 +192,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
         Scheduler.start_link(
           shard_index: 0,
           data_dir: Application.get_env(:ferricstore, :data_dir, "data"),
-          name: :"test_defaults_scheduler"
+          name: :test_defaults_scheduler
         )
 
       status = GenServer.call(pid, :status)
@@ -221,7 +221,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
             merge_cooldown_ms: 5000,
             small_file_threshold: 512
           },
-          name: :"test_custom_config_scheduler"
+          name: :test_custom_config_scheduler
         )
 
       status = GenServer.call(pid, :status)
@@ -251,7 +251,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
             min_files_for_merge: 5,
             merge_cooldown_ms: 0
           },
-          name: :"test_single_file_frag_scheduler"
+          name: :test_single_file_frag_scheduler
         )
 
       # Send fragmentation with candidates but only 2 total files
@@ -399,7 +399,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
             merge_retry_interval_ms: 50
           },
           semaphore: real_sem,
-          name: :"test_retry_scheduler"
+          name: :test_retry_scheduler
         )
 
       # Trigger merge — should get :busy and schedule a retry
@@ -445,7 +445,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
             merge_retry_interval_ms: 200
           },
           semaphore: real_sem,
-          name: :"test_no_stack_scheduler"
+          name: :test_no_stack_scheduler
         )
 
       # Send multiple rotations while semaphore held
@@ -471,7 +471,7 @@ defmodule Ferricstore.Merge.FragmentationTest do
         Scheduler.start_link(
           shard_index: 0,
           data_dir: Application.get_env(:ferricstore, :data_dir, "data"),
-          name: :"test_retry_default_scheduler"
+          name: :test_retry_default_scheduler
         )
 
       status = GenServer.call(pid, :status)

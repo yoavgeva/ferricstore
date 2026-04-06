@@ -299,7 +299,7 @@ defmodule FerricstoreServer.Commands.AuthTest do
       response = recv_response(sock)
 
       assert is_list(response)
-      assert length(response) > 0
+      assert response != []
       assert "read" in response
       assert "write" in response
       assert "admin" in response

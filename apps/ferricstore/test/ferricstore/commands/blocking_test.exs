@@ -45,7 +45,7 @@ defmodule Ferricstore.Commands.BlockingTest do
     end
 
     test "parses multiple keys with timeout" do
-      assert {:ok, ["a", "b", "c"], 10000} = Blocking.parse_blpop_args(["a", "b", "c", "10"])
+      assert {:ok, ["a", "b", "c"], 10_000} = Blocking.parse_blpop_args(["a", "b", "c", "10"])
     end
 
     test "parses timeout 0 as block forever" do

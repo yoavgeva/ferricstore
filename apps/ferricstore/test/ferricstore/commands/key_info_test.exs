@@ -349,7 +349,10 @@ defmodule Ferricstore.Commands.KeyInfoTest do
       delete: fn k -> Router.delete(FerricStore.Instance.get(:default), k) end,
       exists?: fn k -> Router.exists?(FerricStore.Instance.get(:default), k) end,
       keys: fn -> Router.keys(FerricStore.Instance.get(:default)) end,
-      flush: fn -> Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k -> Router.delete(FerricStore.Instance.get(:default), k) end); :ok end,
+      flush: fn ->
+        Enum.each(Router.keys(FerricStore.Instance.get(:default)), fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
+        :ok
+      end,
       dbsize: fn -> Router.dbsize(FerricStore.Instance.get(:default)) end,
       incr: fn k, d -> Router.incr(FerricStore.Instance.get(:default), k, d) end,
       incr_float: fn k, d -> Router.incr_float(FerricStore.Instance.get(:default), k, d) end,

@@ -19,16 +19,11 @@ defmodule Ferricstore.Commands.BloomNifTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.Bloom
-  alias Ferricstore.Bitcask.NIF
 
   # ===========================================================================
   # Test helpers: NIF-backed mock store
   # ===========================================================================
 
-  @doc """
-  Creates a store map with a bloom_registry that stores NIF resources
-  in an Agent. The registry provides get/put/delete/path callbacks.
-  """
   defp make_nif_store(opts \\ []) do
     dir = Keyword.get(opts, :dir, make_temp_dir())
     {:ok, reg_pid} = Agent.start_link(fn -> %{} end)

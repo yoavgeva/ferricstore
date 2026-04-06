@@ -5165,7 +5165,10 @@ defmodule FerricStore do
       delete: fn k -> Router.delete(ctx, k) end,
       exists?: fn k -> Router.exists?(ctx, k) end,
       keys: fn -> Router.keys(ctx) end,
-      prob_dir: fn -> File.mkdir_p!(prob_dir); prob_dir end
+      prob_dir: fn ->
+        File.mkdir_p!(prob_dir)
+        prob_dir
+      end
     }
   end
 

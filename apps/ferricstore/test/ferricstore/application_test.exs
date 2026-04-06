@@ -121,7 +121,7 @@ defmodule Ferricstore.ApplicationTest do
         topologies = [
           ferricstore: [
             strategy: Cluster.Strategy.Gossip,
-            config: [port: 45892]
+            config: [port: 45_892]
           ]
         ]
 

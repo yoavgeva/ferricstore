@@ -37,7 +37,6 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
   @moduletag :shard_kill
 
   alias Ferricstore.Store.{LFU, Router}
-  alias Ferricstore.MemoryGuard
 
   # Drain the Raft batcher + async worker so writes propagate to ETS.
   defp drain_all do

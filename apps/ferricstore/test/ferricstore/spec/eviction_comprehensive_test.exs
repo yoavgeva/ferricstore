@@ -844,7 +844,7 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
       trigger_eviction(:volatile_ttl)
 
       # The updated key with long TTL should be more likely to survive
-      hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), "vttl_updated")}"
+      _hc = :"hot_cache_#{Router.shard_for(FerricStore.Instance.get(:default), "vttl_updated")}"
       keydir = :"keydir_#{Router.shard_for(FerricStore.Instance.get(:default), "vttl_updated")}"
 
       # Verify keydir has the new expiry
@@ -1504,14 +1504,12 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
         Router.get(FerricStore.Instance.get(:default), "stress_stable_200") != nil
       end, "stress_stable keys not written", 50, 20)
 
-      mem_samples = []
-
       mem_samples =
-        Enum.reduce(1..100, [], fn cycle, samples ->
+        Enum.reduce(1..100, [], fn _cycle, samples ->
           trigger_eviction(:volatile_lru)
 
           # Re-read some keys to re-warm (simulating real workload)
-          for i <- 1..10 do
+          for _i <- 1..10 do
             Router.get(FerricStore.Instance.get(:default), "stress_stable_#{:rand.uniform(200)}")
           end
 
@@ -1609,17 +1607,6 @@ defmodule Ferricstore.Spec.EvictionComprehensiveTest do
         :ets.lookup(hc, key) != []
       rescue
         ArgumentError -> false
-      end
-    end)
-  end
-
-  # Counts all hot_cache entries across all shards.
-  defp count_all_hot_cache_entries do
-    Enum.reduce(0..(shard_count() - 1), 0, fn i, acc ->
-      try do
-        acc + :ets.info(:"hot_cache_#{i}", :size)
-      rescue
-        ArgumentError -> acc
       end
     end)
   end

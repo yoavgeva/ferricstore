@@ -17,8 +17,11 @@ defmodule Ferricstore.Store.Ops do
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites
 
+  @typep store :: FerricStore.Instance.t() | LocalTxStore.t() | map()
+
   # --- Basic key operations ---
 
+  @spec get(store(), binary()) :: binary() | nil
   def get(%FerricStore.Instance{} = ctx, key), do: Router.get(ctx, key)
 
   def get(%LocalTxStore{} = tx, key) do
@@ -31,6 +34,7 @@ defmodule Ferricstore.Store.Ops do
 
   def get(store, key) when is_map(store), do: store.get.(key)
 
+  @spec get_meta(store(), binary()) :: {binary(), non_neg_integer()} | nil
   def get_meta(%FerricStore.Instance{} = ctx, key), do: Router.get_meta(ctx, key)
 
   def get_meta(%LocalTxStore{} = tx, key) do
@@ -43,6 +47,7 @@ defmodule Ferricstore.Store.Ops do
 
   def get_meta(store, key) when is_map(store), do: store.get_meta.(key)
 
+  @spec put(store(), binary(), binary(), non_neg_integer()) :: :ok | {:error, binary()}
   def put(%FerricStore.Instance{} = ctx, key, value, exp), do: Router.put(ctx, key, value, exp)
 
   def put(%LocalTxStore{} = tx, key, value, exp) do
@@ -58,6 +63,7 @@ defmodule Ferricstore.Store.Ops do
 
   def put(store, key, value, exp) when is_map(store), do: store.put.(key, value, exp)
 
+  @spec delete(store(), binary()) :: :ok
   def delete(%FerricStore.Instance{} = ctx, key), do: Router.delete(ctx, key)
 
   def delete(%LocalTxStore{} = tx, key) do
@@ -73,6 +79,7 @@ defmodule Ferricstore.Store.Ops do
 
   def delete(store, key) when is_map(store), do: store.delete.(key)
 
+  @spec exists?(store(), binary()) :: boolean()
   def exists?(%FerricStore.Instance{} = ctx, key), do: Router.exists?(ctx, key)
 
   def exists?(%LocalTxStore{} = tx, key) do
@@ -98,16 +105,19 @@ defmodule Ferricstore.Store.Ops do
 
   def exists?(store, key) when is_map(store), do: store.exists?.(key)
 
+  @spec keys(store()) :: [binary()]
   def keys(%FerricStore.Instance{} = ctx), do: Router.keys(ctx)
   def keys(%LocalTxStore{} = tx), do: Router.keys(tx.instance_ctx)
   def keys(store) when is_map(store), do: store.keys.()
 
+  @spec dbsize(store()) :: non_neg_integer()
   def dbsize(%FerricStore.Instance{} = ctx), do: Router.dbsize(ctx)
   def dbsize(%LocalTxStore{} = tx), do: Router.dbsize(tx.instance_ctx)
   def dbsize(store) when is_map(store), do: store.dbsize.()
 
   # --- Numeric operations ---
 
+  @spec incr(store(), binary(), integer()) :: {:ok, integer()} | {:error, binary()}
   def incr(%FerricStore.Instance{} = ctx, key, delta), do: Router.incr(ctx, key, delta)
 
   def incr(%LocalTxStore{} = tx, key, delta) do
@@ -139,6 +149,7 @@ defmodule Ferricstore.Store.Ops do
 
   def incr(store, key, delta) when is_map(store), do: store.incr.(key, delta)
 
+  @spec incr_float(store(), binary(), float()) :: {:ok, binary()} | {:error, binary()}
   def incr_float(%FerricStore.Instance{} = ctx, key, delta), do: Router.incr_float(ctx, key, delta)
 
   def incr_float(%LocalTxStore{} = tx, key, delta) do
@@ -173,6 +184,7 @@ defmodule Ferricstore.Store.Ops do
 
   # --- String mutation operations ---
 
+  @spec append(store(), binary(), binary()) :: {:ok, non_neg_integer()}
   def append(%FerricStore.Instance{} = ctx, key, suffix), do: Router.append(ctx, key, suffix)
 
   def append(%LocalTxStore{} = tx, key, suffix) do
@@ -200,6 +212,7 @@ defmodule Ferricstore.Store.Ops do
 
   def append(store, key, suffix) when is_map(store), do: store.append.(key, suffix)
 
+  @spec getset(store(), binary(), binary()) :: binary() | nil
   def getset(%FerricStore.Instance{} = ctx, key, value), do: Router.getset(ctx, key, value)
 
   def getset(%LocalTxStore{} = tx, key, new_value) do
@@ -215,6 +228,7 @@ defmodule Ferricstore.Store.Ops do
 
   def getset(store, key, value) when is_map(store), do: store.getset.(key, value)
 
+  @spec getdel(store(), binary()) :: binary() | nil
   def getdel(%FerricStore.Instance{} = ctx, key), do: Router.getdel(ctx, key)
 
   def getdel(%LocalTxStore{} = tx, key) do
@@ -234,6 +248,7 @@ defmodule Ferricstore.Store.Ops do
 
   def getdel(store, key) when is_map(store), do: store.getdel.(key)
 
+  @spec getex(store(), binary(), non_neg_integer()) :: binary() | nil
   def getex(%FerricStore.Instance{} = ctx, key, exp), do: Router.getex(ctx, key, exp)
 
   def getex(%LocalTxStore{} = tx, key, expire_at_ms) do
@@ -253,6 +268,7 @@ defmodule Ferricstore.Store.Ops do
 
   def getex(store, key, exp) when is_map(store), do: store.getex.(key, exp)
 
+  @spec setrange(store(), binary(), non_neg_integer(), binary()) :: {:ok, non_neg_integer()}
   def setrange(%FerricStore.Instance{} = ctx, key, offset, value), do: Router.setrange(ctx, key, offset, value)
 
   def setrange(%LocalTxStore{} = tx, key, offset, value) do
@@ -282,40 +298,48 @@ defmodule Ferricstore.Store.Ops do
 
   # --- Native operations ---
 
+  @spec cas(store(), binary(), binary(), binary(), non_neg_integer() | nil) :: 1 | 0 | nil
   def cas(%FerricStore.Instance{} = ctx, key, expected, new_val, ttl), do: Router.cas(ctx, key, expected, new_val, ttl)
   def cas(%LocalTxStore{} = tx, key, expected, new_val, ttl), do: Router.cas(tx.instance_ctx, key, expected, new_val, ttl)
   def cas(store, key, expected, new_val, ttl) when is_map(store), do: store.cas.(key, expected, new_val, ttl)
 
+  @spec lock(store(), binary(), binary(), pos_integer()) :: :ok | {:error, binary()}
   def lock(%FerricStore.Instance{} = ctx, key, owner, ttl), do: Router.lock(ctx, key, owner, ttl)
   def lock(%LocalTxStore{} = tx, key, owner, ttl), do: Router.lock(tx.instance_ctx, key, owner, ttl)
   def lock(store, key, owner, ttl) when is_map(store), do: store.lock.(key, owner, ttl)
 
+  @spec unlock(store(), binary(), binary()) :: 1 | {:error, binary()}
   def unlock(%FerricStore.Instance{} = ctx, key, owner), do: Router.unlock(ctx, key, owner)
   def unlock(%LocalTxStore{} = tx, key, owner), do: Router.unlock(tx.instance_ctx, key, owner)
   def unlock(store, key, owner) when is_map(store), do: store.unlock.(key, owner)
 
+  @spec extend(store(), binary(), binary(), pos_integer()) :: 1 | {:error, binary()}
   def extend(%FerricStore.Instance{} = ctx, key, owner, ttl), do: Router.extend(ctx, key, owner, ttl)
   def extend(%LocalTxStore{} = tx, key, owner, ttl), do: Router.extend(tx.instance_ctx, key, owner, ttl)
   def extend(store, key, owner, ttl) when is_map(store), do: store.extend.(key, owner, ttl)
 
+  @spec ratelimit_add(store(), binary(), pos_integer(), pos_integer(), pos_integer()) :: [term()]
   def ratelimit_add(%FerricStore.Instance{} = ctx, key, window, max, count), do: Router.ratelimit_add(ctx, key, window, max, count)
   def ratelimit_add(%LocalTxStore{} = tx, key, window, max, count), do: Router.ratelimit_add(tx.instance_ctx, key, window, max, count)
   def ratelimit_add(store, key, window, max, count) when is_map(store), do: store.ratelimit_add.(key, window, max, count)
 
   # --- List operations ---
 
+  @spec list_op(store(), binary(), term()) :: term()
   def list_op(%FerricStore.Instance{} = ctx, key, op), do: Router.list_op(ctx, key, op)
   def list_op(%LocalTxStore{} = tx, key, op), do: Router.list_op(tx.instance_ctx, key, op)
   def list_op(store, key, op) when is_map(store), do: store.list_op.(key, op)
 
   # --- Compound key capability check ---
 
+  @spec has_compound?(store()) :: boolean()
   def has_compound?(%FerricStore.Instance{}), do: true
   def has_compound?(%LocalTxStore{}), do: true
   def has_compound?(store) when is_map(store), do: is_map_key(store, :compound_get)
 
   # --- Compound key operations ---
 
+  @spec compound_get(store(), binary(), binary()) :: binary() | nil
   def compound_get(%FerricStore.Instance{} = ctx, redis_key, compound_key), do: Router.compound_get(ctx, redis_key, compound_key)
 
   def compound_get(%LocalTxStore{} = tx, redis_key, compound_key) do
@@ -329,6 +353,7 @@ defmodule Ferricstore.Store.Ops do
 
   def compound_get(store, redis_key, compound_key) when is_map(store), do: store.compound_get.(redis_key, compound_key)
 
+  @spec compound_get_meta(store(), binary(), binary()) :: {binary(), non_neg_integer()} | nil
   def compound_get_meta(%FerricStore.Instance{} = ctx, redis_key, compound_key), do: Router.compound_get_meta(ctx, redis_key, compound_key)
 
   def compound_get_meta(%LocalTxStore{} = tx, redis_key, compound_key) do
@@ -342,6 +367,7 @@ defmodule Ferricstore.Store.Ops do
 
   def compound_get_meta(store, redis_key, compound_key) when is_map(store), do: store.compound_get_meta.(redis_key, compound_key)
 
+  @spec compound_put(store(), binary(), binary(), binary(), non_neg_integer()) :: :ok
   def compound_put(%FerricStore.Instance{} = ctx, redis_key, compound_key, value, exp), do: Router.compound_put(ctx, redis_key, compound_key, value, exp)
 
   def compound_put(%LocalTxStore{} = tx, redis_key, compound_key, value, expire_at_ms) do
@@ -357,6 +383,7 @@ defmodule Ferricstore.Store.Ops do
 
   def compound_put(store, redis_key, compound_key, value, exp) when is_map(store), do: store.compound_put.(redis_key, compound_key, value, exp)
 
+  @spec compound_delete(store(), binary(), binary()) :: :ok
   def compound_delete(%FerricStore.Instance{} = ctx, redis_key, compound_key), do: Router.compound_delete(ctx, redis_key, compound_key)
 
   def compound_delete(%LocalTxStore{} = tx, redis_key, compound_key) do
@@ -372,6 +399,7 @@ defmodule Ferricstore.Store.Ops do
 
   def compound_delete(store, redis_key, compound_key) when is_map(store), do: store.compound_delete.(redis_key, compound_key)
 
+  @spec compound_scan(store(), binary(), binary()) :: [{binary(), binary()}]
   def compound_scan(%FerricStore.Instance{} = ctx, redis_key, prefix), do: Router.compound_scan(ctx, redis_key, prefix)
 
   def compound_scan(%LocalTxStore{} = tx, redis_key, prefix) do
@@ -386,6 +414,7 @@ defmodule Ferricstore.Store.Ops do
 
   def compound_scan(store, redis_key, prefix) when is_map(store), do: store.compound_scan.(redis_key, prefix)
 
+  @spec compound_count(store(), binary(), binary()) :: non_neg_integer()
   def compound_count(%FerricStore.Instance{} = ctx, redis_key, prefix), do: Router.compound_count(ctx, redis_key, prefix)
 
   def compound_count(%LocalTxStore{} = tx, redis_key, prefix) do
@@ -399,6 +428,7 @@ defmodule Ferricstore.Store.Ops do
 
   def compound_count(store, redis_key, prefix) when is_map(store), do: store.compound_count.(redis_key, prefix)
 
+  @spec compound_delete_prefix(store(), binary(), binary()) :: :ok
   def compound_delete_prefix(%FerricStore.Instance{} = ctx, redis_key, prefix), do: Router.compound_delete_prefix(ctx, redis_key, prefix)
 
   def compound_delete_prefix(%LocalTxStore{} = tx, redis_key, prefix) do
@@ -421,10 +451,12 @@ defmodule Ferricstore.Store.Ops do
 
   # --- Prob operations ---
 
+  @spec prob_write(store(), tuple()) :: term()
   def prob_write(%FerricStore.Instance{} = ctx, command), do: Router.prob_write(ctx, command)
   def prob_write(%LocalTxStore{} = tx, command), do: Router.prob_write(tx.instance_ctx, command)
   def prob_write(store, command) when is_map(store), do: store.prob_write.(command)
 
+  @spec prob_dir(store(), binary()) :: binary()
   def prob_dir(%FerricStore.Instance{} = ctx, key) do
     idx = Router.shard_for(ctx, key)
     shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
@@ -440,6 +472,7 @@ defmodule Ferricstore.Store.Ops do
 
   # --- Flush ---
 
+  @spec flush(store()) :: :ok
   def flush(%FerricStore.Instance{} = ctx) do
     Enum.each(Router.keys(ctx), fn k -> Router.delete(ctx, k) end)
     :ok
@@ -454,6 +487,7 @@ defmodule Ferricstore.Store.Ops do
 
   # --- On push callback (for Waiters notification) ---
 
+  @spec on_push(store(), binary()) :: :ok | nil
   def on_push(store, key) do
     case store do
       %FerricStore.Instance{} -> Ferricstore.Waiters.notify_push(key)

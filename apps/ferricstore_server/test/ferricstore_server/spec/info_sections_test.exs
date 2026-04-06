@@ -349,7 +349,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
         |> Map.keys()
         |> Enum.filter(&String.ends_with?(&1, "_key_count"))
 
-      assert length(prefix_key_count_keys) >= 1,
+      assert prefix_key_count_keys != [],
              "should have at least one prefix_*_key_count field"
 
       # Each key_count should be parseable and positive
@@ -368,7 +368,7 @@ defmodule FerricstoreServer.Spec.InfoSectionsTest do
         |> Map.keys()
         |> Enum.filter(&String.ends_with?(&1, "_keydir_bytes"))
 
-      assert length(prefix_bytes_keys) >= 1,
+      assert prefix_bytes_keys != [],
              "should have at least one prefix_*_keydir_bytes field"
     end
   end

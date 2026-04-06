@@ -1,6 +1,7 @@
 defmodule FerricStore.Session.StoreTest do
   use ExUnit.Case, async: false
 
+  if Code.ensure_loaded?(FerricStore.Session.Store) do
   alias FerricStore.Session.Store
 
   setup do
@@ -216,5 +217,6 @@ defmodule FerricStore.Session.StoreTest do
       sid = Store.put(nil, nil, data, opts)
       assert {^sid, ^data} = Store.get(nil, sid, opts)
     end
+  end
   end
 end

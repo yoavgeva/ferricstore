@@ -19,7 +19,6 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Batcher
   alias Ferricstore.Raft.StateMachine

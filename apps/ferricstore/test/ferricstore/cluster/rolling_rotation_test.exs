@@ -596,7 +596,7 @@ defmodule Ferricstore.Cluster.RollingRotationTest do
       {:ok, _started, []} =
         start_cluster_with_retry(@ra_system, :batch_rotation_cluster, @machine, members)
 
-      leader = wait_for_stable_leader(members)
+      _leader = wait_for_stable_leader(members)
 
       # Stop member 1, send a batch command, restart member 1
       target = hd(members)

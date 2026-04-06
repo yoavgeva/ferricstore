@@ -13,7 +13,6 @@ defmodule Ferricstore.Store.ConcurrencyTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.Shard
   alias Ferricstore.Test.IsolatedInstance
 
   @task_timeout 30_000

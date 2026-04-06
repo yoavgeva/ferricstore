@@ -49,7 +49,7 @@ defmodule Ferricstore.Store.RouterBugHuntTest do
   defp ukey(base), do: "rbh_#{base}_#{:rand.uniform(9_999_999)}"
 
   # Finds a key that hashes to the given shard index.
-  defp key_for_shard(shard_idx, prefix \\ "probe") do
+  defp key_for_shard(shard_idx, prefix) do
     Enum.reduce_while(1..100_000, nil, fn i, _acc ->
       k = "rbh_#{prefix}_#{i}_#{:rand.uniform(999_999)}"
 

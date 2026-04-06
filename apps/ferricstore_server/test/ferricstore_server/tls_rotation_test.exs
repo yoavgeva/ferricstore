@@ -36,7 +36,7 @@ defmodule FerricstoreServer.TlsRotationTest do
   # Generates a CA key + self-signed CA certificate.  Returns
   # `{ca_key, ca_cert_der, ca_cert_path, ca_key_path}`.
   defp generate_ca(dir, name) do
-    ca_key = :public_key.generate_key({:rsa, 2048, 65537})
+    ca_key = :public_key.generate_key({:rsa, 2048, 65_537})
 
     %{cert: ca_cert_der, key: ^ca_key} =
       :public_key.pkix_test_root_cert(name, key: ca_key)
@@ -56,7 +56,7 @@ defmodule FerricstoreServer.TlsRotationTest do
   # Generates a self-signed server certificate (not CA-signed).
   # Returns `{cert_der, cert_path, key_path}`.
   defp generate_self_signed(dir, suffix) do
-    key = :public_key.generate_key({:rsa, 2048, 65537})
+    key = :public_key.generate_key({:rsa, 2048, 65_537})
     %{cert: cert_der, key: ^key} = :public_key.pkix_test_root_cert("localhost", key: key)
 
     cert_pem = :public_key.pem_encode([{:Certificate, cert_der, :not_encrypted}])

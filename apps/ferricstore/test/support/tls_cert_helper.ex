@@ -40,7 +40,7 @@ defmodule Ferricstore.Test.TlsCertHelper do
 
     # Generate an RSA-2048 key explicitly -- OTP's default EC curve (sect163k1)
     # is too small for TLS 1.3 which requires at least P-256.
-    rsa_key = :public_key.generate_key({:rsa, 2048, 65537})
+    rsa_key = :public_key.generate_key({:rsa, 2048, 65_537})
 
     # pkix_test_root_cert/2 returns %{cert: der_binary, key: key_record}
     %{cert: cert_der, key: key} = :public_key.pkix_test_root_cert(cn, key: rsa_key)

@@ -82,28 +82,27 @@ defmodule Ferricstore.GlobMatcher do
   defp match_one?(subject, si, pattern, pi) do
     pc = :binary.at(pattern, pi)
     sc = :binary.at(subject, si)
+    match_char(pc, sc, pattern, pi)
+  end
 
-    cond do
-      pc == ?? ->
-        true
+  defp match_char(??, _sc, _pattern, _pi), do: true
 
-      pc == ?\\ and pi + 1 < byte_size(pattern) ->
-        :binary.at(pattern, pi + 1) == sc
+  defp match_char(?\\, sc, pattern, pi) do
+    if pi + 1 < byte_size(pattern), do: :binary.at(pattern, pi + 1) == sc, else: ?\\ == sc
+  end
 
-      pc == ?[ ->
-        case parse_char_class_at(pattern, pi + 1) do
-          {:ok, chars, negated, _end_pi} ->
-            in_class = sc in chars
-            (negated and not in_class) or (not negated and in_class)
+  defp match_char(?[, sc, pattern, pi) do
+    case parse_char_class_at(pattern, pi + 1) do
+      {:ok, chars, negated, _end_pi} ->
+        in_class = sc in chars
+        (negated and not in_class) or (not negated and in_class)
 
-          :error ->
-            pc == sc
-        end
-
-      true ->
-        pc == sc
+      :error ->
+        ?[ == sc
     end
   end
+
+  defp match_char(pc, sc, _pattern, _pi), do: pc == sc
 
   # How many pattern bytes does the current character consume?
   defp pattern_char_len(pattern, pi) do

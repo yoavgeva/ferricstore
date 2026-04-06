@@ -34,7 +34,7 @@ defmodule Ferricstore.Commands.List do
     with :ok <- TypeRegistry.check_type(key, :list, store) do
       case Integer.parse(count_str) do
         {count, ""} when count >= 0 ->
-          if count == 0, do: (if ListOps.read_meta(key, store) == nil, do: nil, else: []), else: ListOps.execute(key, store, {:lpop, count})
+          do_pop(key, store, :lpop, count)
         _ -> {:error, "ERR value is not an integer or out of range"}
       end
     end
@@ -48,7 +48,7 @@ defmodule Ferricstore.Commands.List do
     with :ok <- TypeRegistry.check_type(key, :list, store) do
       case Integer.parse(count_str) do
         {count, ""} when count >= 0 ->
-          if count == 0, do: (if ListOps.read_meta(key, store) == nil, do: nil, else: []), else: ListOps.execute(key, store, {:rpop, count})
+          do_pop(key, store, :rpop, count)
         _ -> {:error, "ERR value is not an integer or out of range"}
       end
     end
@@ -141,6 +141,14 @@ defmodule Ferricstore.Commands.List do
   def handle("RPUSHX", [key | elements], store) when elements != [], do: ListOps.execute(key, store, {:rpushx, elements})
   def handle("RPUSHX", _, _), do: {:error, "ERR wrong number of arguments for 'rpushx' command"}
 
+  defp do_pop(key, store, _direction, 0) do
+    if ListOps.read_meta(key, store) == nil, do: nil, else: []
+  end
+
+  defp do_pop(key, store, direction, count) do
+    ListOps.execute(key, store, {direction, count})
+  end
+
   defp parse_lpos_opts(opts), do: parse_lpos_opts(opts, 1, nil, 0)
   defp parse_lpos_opts([], rank, count, maxlen), do: {:ok, rank, count, maxlen}
   defp parse_lpos_opts(["RANK", val | rest], _, count, maxlen) do
@@ -151,10 +159,16 @@ defmodule Ferricstore.Commands.List do
     end
   end
   defp parse_lpos_opts(["COUNT", val | rest], rank, _, maxlen) do
-    case Integer.parse(val) do {c, ""} when c >= 0 -> parse_lpos_opts(rest, rank, c, maxlen); _ -> {:error, "ERR value is not an integer or out of range"} end
+    case Integer.parse(val) do
+      {c, ""} when c >= 0 -> parse_lpos_opts(rest, rank, c, maxlen)
+      _ -> {:error, "ERR value is not an integer or out of range"}
+    end
   end
   defp parse_lpos_opts(["MAXLEN", val | rest], rank, count, _) do
-    case Integer.parse(val) do {m, ""} when m >= 0 -> parse_lpos_opts(rest, rank, count, m); _ -> {:error, "ERR value is not an integer or out of range"} end
+    case Integer.parse(val) do
+      {m, ""} when m >= 0 -> parse_lpos_opts(rest, rank, count, m)
+      _ -> {:error, "ERR value is not an integer or out of range"}
+    end
   end
   defp parse_lpos_opts([unknown | _], _, _, _), do: {:error, "ERR syntax error, option '#{unknown}' not recognized"}
 

@@ -20,7 +20,7 @@ defmodule Ferricstore.Commands.CatalogTest do
     test "returns a non-empty list" do
       commands = Catalog.all()
       assert is_list(commands)
-      assert length(commands) > 0
+      refute Enum.empty?(commands)
     end
 
     test "every entry has a non-empty name" do

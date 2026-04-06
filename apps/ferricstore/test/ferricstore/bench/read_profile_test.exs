@@ -14,13 +14,13 @@ defmodule Ferricstore.Bench.ReadProfileTest do
     end
 
     # Profile 10000 sequential GETs - time each step
-    timings = for i <- 1..10_000 do
+    timings = for _i <- 1..10_000 do
       key = "#{prefix}:#{:rand.uniform(1000)}"
 
       t0 = :erlang.monotonic_time(:nanosecond)
 
-      # Step 1: sandbox_key
-      resolved = FerricStore.sandbox_key(key)
+      # Step 1: sandbox_key (removed; identity)
+      resolved = key
       t1 = :erlang.monotonic_time(:nanosecond)
 
       # Step 2: shard_for (hash + extract_hash_tag)
@@ -33,7 +33,7 @@ defmodule Ferricstore.Bench.ReadProfileTest do
       t3 = :erlang.monotonic_time(:nanosecond)
 
       # Step 4: pattern match + expiry check
-      value = case result do
+      _value = case result do
         [{^resolved, val, 0, _lfu, _fid, _off, _vsize}] when val != nil -> val
         [{^resolved, val, exp, _lfu, _fid, _off, _vsize}] when exp > 0 and val != nil -> val
         _ -> nil
@@ -97,7 +97,7 @@ defmodule Ferricstore.Bench.ReadProfileTest do
     # Also poll the schedulers
     sched_start = :erlang.statistics(:scheduler_wall_time)
 
-    readers = for i <- 1..50 do
+    readers = for _i <- 1..50 do
       Task.async(fn ->
         l = fn l ->
           if :atomics.get(stop, 1) == 1, do: throw(:stop)

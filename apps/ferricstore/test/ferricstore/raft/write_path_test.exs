@@ -10,8 +10,6 @@ defmodule Ferricstore.Raft.WritePathTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Bitcask.NIF
-  alias Ferricstore.Raft.Batcher
-  alias Ferricstore.Raft.Cluster
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -492,7 +490,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: LPUSH through Raft adds element" do
     test "LPUSH to a new key creates a list with the pushed elements" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, _store, _dir} = ctx
 
       {new_state, result} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["a", "b", "c"]}}, state)
@@ -660,7 +658,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_put: HSET through Raft writes field" do
     test "compound_put inserts a hash field into ETS and Bitcask" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, _store, _dir} = ctx
 
       compound_key = "myhash\x00field1"
 
@@ -724,7 +722,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_delete: HDEL through Raft removes field" do
     test "compound_delete removes a hash field from ETS and Bitcask" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, _store, _dir} = ctx
 
       compound_key = "myhash\x00field1"
 
@@ -761,7 +759,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_put: SADD through Raft adds member" do
     test "compound_put adds a set member (presence marker)" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, _store, _dir} = ctx
 
       # Sets use a presence marker as the value
       compound_key = "myset\x00member1"
@@ -805,7 +803,7 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "compound_delete_prefix: DEL on hash through Raft cleans up all fields" do
     test "deletes all compound keys matching prefix" do
       ctx = fresh_sm_state()
-      {state, ets, store, _dir} = ctx
+      {state, ets, _store, _dir} = ctx
 
       # Insert several fields for a hash "myhash"
       prefix = "myhash\x00"

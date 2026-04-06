@@ -292,7 +292,7 @@ defmodule FerricstoreEcto.Cache do
 
       pks = Enum.map(results, fn r -> to_string(primary_key_value(schema, r)) end)
 
-      if length(pks) > 0 do
+      if pks != [] do
         if QueryHash.has_order_by?(query) do
           FerricStore.rpush(pk_key, pks)
         else
@@ -486,12 +486,12 @@ defmodule FerricstoreEcto.Cache do
     # Try LIST first (ordered queries), then SET, then plain string marker
     if QueryHash.has_order_by?(query) do
       case FerricStore.lrange(pk_key, 0, -1) do
-        {:ok, pks} when is_list(pks) and length(pks) > 0 -> {:ok, pks}
+        {:ok, [_ | _] = pks} -> {:ok, pks}
         _ -> check_empty_marker(pk_key)
       end
     else
       case FerricStore.smembers(pk_key) do
-        {:ok, members} when is_list(members) and length(members) > 0 -> {:ok, members}
+        {:ok, [_ | _] = members} -> {:ok, members}
         _ -> check_empty_marker(pk_key)
       end
     end
@@ -540,9 +540,7 @@ defmodule FerricstoreEcto.Cache do
         Map.get(struct, single_pk)
 
       multi ->
-        multi
-        |> Enum.map(&Map.get(struct, &1))
-        |> Enum.join(":")
+        Enum.map_join(multi, ":", &Map.get(struct, &1))
     end
   end
 end

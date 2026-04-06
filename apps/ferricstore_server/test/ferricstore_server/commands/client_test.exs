@@ -30,7 +30,7 @@ defmodule FerricstoreServer.Commands.ClientTest do
         client_id: 42,
         client_name: nil,
         created_at: System.monotonic_time(:millisecond) - 5_000,
-        peer: {{127, 0, 0, 1}, 12345},
+        peer: {{127, 0, 0, 1}, 12_345},
         conn_pid: self(),
         tracking: ClientTracking.new_config()
       },

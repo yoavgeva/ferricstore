@@ -1,5 +1,5 @@
 defmodule Ferricstore.Store.Shard.Reads do
-  @moduledoc false
+  @moduledoc "Shard read-path handlers: ETS hot lookup, cold-key pread from Bitcask, exists check, and key enumeration."
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -11,6 +11,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   # Read-path handlers (return {:reply, result, state})
   # -------------------------------------------------------------------
 
+  @spec handle_get(binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_get(key, state) do
     # Fast path: ETS hit — no need to wait for in-flight writes.
@@ -47,6 +48,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   # or nil if the key is not found / expired / only in ETS (hot cache).
   # The offset stored in ETS is the RECORD offset (start of header).
   # For sendfile, we need the VALUE offset = record_offset + 26 (header) + key_len.
+  @spec handle_get_file_ref(binary(), map()) :: {:reply, {binary(), non_neg_integer(), non_neg_integer()} | nil, map()}
   @doc false
   def handle_get_file_ref(key, state) do
     case ShardETS.ets_lookup(state, key) do
@@ -70,6 +72,7 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
+  @spec handle_get_meta(binary(), map()) :: {:reply, {term(), non_neg_integer()} | nil, map()}
   @doc false
   def handle_get_meta(key, state) do
     case ShardETS.ets_lookup(state, key) do
@@ -99,6 +102,7 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
+  @spec handle_exists(binary(), map()) :: {:reply, boolean(), map()}
   @doc false
   def handle_exists(key, state) do
     # For ETS misses we need Bitcask to be up to date — flush first.
@@ -120,6 +124,7 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
+  @spec handle_keys(map()) :: {:reply, [binary()], map()}
   @doc false
   def handle_keys(state) do
     # Flush first so NIF.keys() sees all pending writes.
@@ -132,6 +137,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   # Internal read helpers
   # -------------------------------------------------------------------
 
+  @spec do_get(map(), binary()) :: term() | nil
   @doc false
   def do_get(state, key) do
     case ShardETS.ets_lookup(state, key) do
@@ -159,6 +165,7 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
+  @spec do_get_meta(map(), binary()) :: {term(), non_neg_integer()} | nil
   @doc false
   def do_get_meta(state, key) do
     case ShardETS.ets_lookup(state, key) do
@@ -187,6 +194,7 @@ defmodule Ferricstore.Store.Shard.Reads do
 
   # v2 local read for transaction closures. Returns {:ok, value} or {:ok, nil}.
   # Replaces NIF.get_zero_copy(state.store, key) in the 2PC local store.
+  @spec v2_local_read(map(), binary()) :: {:ok, term()} | {:error, binary()}
   @doc false
   def v2_local_read(state, key) do
     case :ets.lookup(state.keydir, key) do
@@ -208,6 +216,7 @@ defmodule Ferricstore.Store.Shard.Reads do
     end
   end
 
+  @spec live_keys(map()) :: [binary()]
   @doc false
   def live_keys(state) do
     now = System.os_time(:millisecond)

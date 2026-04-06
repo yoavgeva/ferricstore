@@ -397,16 +397,10 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       {:ok, 2} = FerricStore.sadd(set_b, ["member2", "member3"])
 
       # SINTER should return the intersection {"member2"}
-      result = FerricStore.sinter([set_a, set_b])
+      {:ok, members} = FerricStore.sinter([set_a, set_b])
 
-      case result do
-        {:ok, members} ->
-          assert "member2" in members,
-            "E9 BUG: SINTER across shards did not find 'member2'. Got: #{inspect(members)}"
-
-        {:error, _} = err ->
-          flunk("SINTER returned error: #{inspect(err)}")
-      end
+      assert "member2" in members,
+        "E9 BUG: SINTER across shards did not find 'member2'. Got: #{inspect(members)}"
     end
 
     test "SUNION with keys on different shards returns correct union" do
@@ -417,16 +411,10 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
       {:ok, 1} = FerricStore.sadd(set_a, ["only_a"])
       {:ok, 1} = FerricStore.sadd(set_b, ["only_b"])
 
-      result = FerricStore.sunion([set_a, set_b])
+      {:ok, members} = FerricStore.sunion([set_a, set_b])
 
-      case result do
-        {:ok, members} ->
-          assert "only_a" in members and "only_b" in members,
-            "E9 BUG: SUNION across shards missing members. Got: #{inspect(members)}"
-
-        {:error, _} = err ->
-          flunk("SUNION returned error: #{inspect(err)}")
-      end
+      assert "only_a" in members and "only_b" in members,
+        "E9 BUG: SUNION across shards missing members. Got: #{inspect(members)}"
     end
   end
 
@@ -739,22 +727,7 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
   # Helper: build a store map for a key that exists in the live system
   # ===========================================================================
 
-  defp build_store(key) do
-    # Use the FerricStore embedded API's internal store builder
-    # to get a store map that can access the real shard data.
-    resolved = key
-    Ferricstore.StoreBuilder.build_compound_store(resolved)
-  rescue
-    _ ->
-      # Fallback: try direct Router-based store
-      try do
-        Ferricstore.Commands.Dispatcher.build_store(key)
-      rescue
-        _ -> Ferricstore.Test.MockStore.make()
-      end
-  end
-
-  defp sandbox_key(key) do
-    key
+  defp build_store(_key) do
+    Ferricstore.Test.MockStore.make()
   end
 end

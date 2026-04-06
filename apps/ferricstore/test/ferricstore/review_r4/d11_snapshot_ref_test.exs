@@ -53,10 +53,10 @@ defmodule Ferricstore.ReviewR4.D11SnapshotRefTest do
       assert ref == deserialized
 
       # References work as map keys after deserialization
-      state = %{cross_shard_locks: %{"key1" => {ref, 12345}}}
+      state = %{cross_shard_locks: %{"key1" => {ref, 12_345}}}
       serialized_state = :erlang.term_to_binary(state)
       restored = :erlang.binary_to_term(serialized_state)
-      assert restored.cross_shard_locks["key1"] == {ref, 12345}
+      assert restored.cross_shard_locks["key1"] == {ref, 12_345}
 
       {restored_ref, _exp} = restored.cross_shard_locks["key1"]
       assert restored_ref == ref

@@ -145,7 +145,8 @@ defmodule Ferricstore.Store.ListOps do
   # LPUSH
   defp do_execute(key, store, nil, {:lpush, new_elements}), do: do_lpush_new(key, store, new_elements)
   defp do_execute(key, store, {len, left_pos, right_pos}, {:lpush, new_elements}) do
-    reversed = Enum.reverse(new_elements); count = length(reversed)
+    reversed = Enum.reverse(new_elements)
+    count = length(reversed)
     # reversed=[c,b,a]. Assign: c at left_pos-(count-1)*step, b at left_pos-(count-2)*step, a at left_pos
     Enum.with_index(reversed) |> Enum.each(fn {elem, idx} ->
       pos = left_pos - (count - 1 - idx) * @position_step
@@ -180,7 +181,11 @@ defmodule Ferricstore.Store.ListOps do
       Enum.each(to_pop, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
       if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - actual_count, remaining)
       popped_values = Enum.map(to_pop, fn {_, val} -> val end)
-      case count do 1 -> List.first(popped_values); _ -> popped_values end
+
+      case count do
+        1 -> List.first(popped_values)
+        _ -> popped_values
+      end
     end
   end
 
@@ -196,15 +201,25 @@ defmodule Ferricstore.Store.ListOps do
       Enum.each(to_pop, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
       if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - actual_count, remaining)
       popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
-      case count do 1 -> List.first(popped_values); _ -> popped_values end
+
+      case count do
+        1 -> List.first(popped_values)
+        _ -> popped_values
+      end
     end
   end
 
   # LRANGE
   defp do_execute(_key, _store, nil, {:lrange, _, _}), do: []
   defp do_execute(key, store, {len, _, _}, {:lrange, start, stop}) do
-    ns = normalize_index(start, len); ne = normalize_index(stop, len)
-    cond do ns > ne -> []; ns >= len -> []; true -> ordered_values(key, store) |> Enum.slice(ns..ne//1) end
+    ns = normalize_index(start, len)
+    ne = normalize_index(stop, len)
+
+    cond do
+      ns > ne -> []
+      ns >= len -> []
+      true -> ordered_values(key, store) |> Enum.slice(ns..ne//1)
+    end
   end
 
   # LLEN
@@ -214,7 +229,12 @@ defmodule Ferricstore.Store.ListOps do
   # LINDEX
   defp do_execute(_key, _store, nil, {:lindex, _}), do: nil
   defp do_execute(key, store, {len, _, _}, {:lindex, index}) do
-    if index < 0 and len + index < 0, do: nil, else: (norm = normalize_index(index, len); if norm >= 0 and norm < len, do: ordered_values(key, store) |> Enum.at(norm), else: nil)
+    if index < 0 and len + index < 0 do
+      nil
+    else
+      norm = normalize_index(index, len)
+      if norm >= 0 and norm < len, do: ordered_values(key, store) |> Enum.at(norm), else: nil
+    end
   end
 
   # LSET
@@ -239,27 +259,42 @@ defmodule Ferricstore.Store.ListOps do
       removed_count == 0 -> 0
       remaining == [] ->
         Enum.each(to_remove, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
-        delete_meta(key, store); removed_count
+        delete_meta(key, store)
+        removed_count
       true ->
         Enum.each(to_remove, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
-        update_meta_from_remaining(key, store, len - removed_count, remaining); removed_count
+        update_meta_from_remaining(key, store, len - removed_count, remaining)
+        removed_count
     end
   end
 
   # LTRIM
   defp do_execute(_key, _store, nil, {:ltrim, _, _}), do: :ok
   defp do_execute(key, store, {len, _, _}, {:ltrim, start, stop}) do
-    ns = normalize_index(start, len); ne = normalize_index(stop, len)
+    ns = normalize_index(start, len)
+    ne = normalize_index(stop, len)
     sorted = sorted_elements(key, store)
-    {to_keep, to_delete} = cond do
-      ns > ne -> {[], sorted}; ns >= len -> {[], sorted}
-      true -> (kept = Enum.slice(sorted, ns..ne//1); ks = MapSet.new(kept, fn {p, _} -> p end); {kept, Enum.reject(sorted, fn {p, _} -> MapSet.member?(ks, p) end)})
-    end
+
+    {to_keep, to_delete} =
+      cond do
+        ns > ne -> {[], sorted}
+        ns >= len -> {[], sorted}
+        true ->
+          kept = Enum.slice(sorted, ns..ne//1)
+          ks = MapSet.new(kept, fn {p, _} -> p end)
+          {kept, Enum.reject(sorted, fn {p, _} -> MapSet.member?(ks, p) end)}
+      end
+
     Enum.each(to_delete, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
-    if to_keep == [], do: delete_meta(key, store), else: (
-      {mp, _} = hd(to_keep); {xp, _} = List.last(to_keep)
+
+    if to_keep == [] do
+      delete_meta(key, store)
+    else
+      {mp, _} = hd(to_keep)
+      {xp, _} = List.last(to_keep)
       write_meta(key, store, {length(to_keep), mp - @position_step, xp + @position_step})
-    )
+    end
+
     :ok
   end
 
@@ -295,7 +330,10 @@ defmodule Ferricstore.Store.ListOps do
   defp do_execute(key, store, {len, _, _}, {:pop_for_move, dir}) do
     sorted = sorted_elements(key, store)
     if sorted == [] do nil else
-      {pos, element} = case dir do :left -> hd(sorted); :right -> List.last(sorted) end
+      {pos, element} = case dir do
+        :left -> hd(sorted)
+        :right -> List.last(sorted)
+      end
       Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
       remaining = Enum.reject(sorted, fn {p, _} -> p == pos end)
       if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - 1, remaining)
@@ -310,7 +348,8 @@ defmodule Ferricstore.Store.ListOps do
   defp do_execute(key, store, meta, {:rpushx, elems}), do: do_execute(key, store, meta, {:rpush, elems})
 
   defp do_lpush_new(key, store, elements) do
-    reversed = Enum.reverse(elements); count = length(reversed)
+    reversed = Enum.reverse(elements)
+    count = length(reversed)
     # reversed=[c,b,a] for LPUSH key a b c. c should be leftmost (smallest pos).
     # Assign: c at -(count-1)*step, b at -(count-2)*step, ..., a at 0.0
     Enum.with_index(reversed) |> Enum.each(fn {elem, idx} ->
@@ -360,7 +399,11 @@ defmodule Ferricstore.Store.ListOps do
     matches = Enum.take(scan_list, eff) |> Enum.with_index() |> Enum.filter(fn {e, _} -> e == element end) |> Enum.map(fn {_, idx} -> if reverse?, do: total_len - 1 - idx, else: idx end)
     from_rank = Enum.drop(matches, abs_rank - 1)
     case count do
-      nil -> case from_rank do [pos | _] -> pos; [] -> nil end
+      nil ->
+        case from_rank do
+          [pos | _] -> pos
+          [] -> nil
+        end
       0 -> from_rank
       n -> Enum.take(from_rank, n)
     end
@@ -375,50 +418,140 @@ defmodule Ferricstore.Store.ListOps do
     end
   end
 
-  defp leg_do(el, pf, _, {:lpush, ne}), do: (u = Enum.reverse(ne) ++ el; pf.(encode_list(u)); length(u))
-  defp leg_do(el, pf, _, {:rpush, ne}), do: (u = el ++ ne; pf.(encode_list(u)); length(u))
+  defp leg_do(el, pf, _, {:lpush, ne}) do
+    u = Enum.reverse(ne) ++ el
+    pf.(encode_list(u))
+    length(u)
+  end
+  defp leg_do(el, pf, _, {:rpush, ne}) do
+    u = el ++ ne
+    pf.(encode_list(u))
+    length(u)
+  end
   defp leg_do([], _, _, {:lpop, _}), do: nil
   defp leg_do(el, pf, df, {:lpop, c}) do
-    ac = min(c, length(el)); {popped, rem} = Enum.split(el, ac)
+    ac = min(c, length(el))
+    {popped, rem} = Enum.split(el, ac)
     if rem == [], do: df.(), else: pf.(encode_list(rem))
-    case c do 1 -> List.first(popped); _ -> popped end
+
+    case c do
+      1 -> List.first(popped)
+      _ -> popped
+    end
   end
   defp leg_do([], _, _, {:rpop, _}), do: nil
   defp leg_do(el, pf, df, {:rpop, c}) do
-    len = length(el); ac = min(c, len); {rem, popped} = Enum.split(el, len - ac)
+    len = length(el)
+    ac = min(c, len)
+    {rem, popped} = Enum.split(el, len - ac)
     if rem == [], do: df.(), else: pf.(encode_list(rem))
     pr = Enum.reverse(popped)
-    case c do 1 -> List.first(pr); _ -> pr end
+
+    case c do
+      1 -> List.first(pr)
+      _ -> pr
+    end
   end
-  defp leg_do(el, _, _, {:lrange, s, e}), do: (len = length(el); ns = normalize_index(s, len); ne = normalize_index(e, len); cond do ns > ne -> []; ns >= len -> []; true -> Enum.slice(el, ns..ne//1) end)
+  defp leg_do(el, _, _, {:lrange, s, e}) do
+    len = length(el)
+    ns = normalize_index(s, len)
+    ne = normalize_index(e, len)
+
+    cond do
+      ns > ne -> []
+      ns >= len -> []
+      true -> Enum.slice(el, ns..ne//1)
+    end
+  end
   defp leg_do(el, _, _, :llen), do: length(el)
-  defp leg_do(el, _, _, {:lindex, i}), do: (len = length(el); if i < 0 and len + i < 0, do: nil, else: (n = normalize_index(i, len); if n >= 0 and n < len, do: Enum.at(el, n), else: nil))
-  defp leg_do(el, pf, _, {:lset, i, e}), do: (len = length(el); n = normalize_index(i, len); if n >= 0 and n < len, do: (pf.(encode_list(List.replace_at(el, n, e))); :ok), else: {:error, "ERR index out of range"})
+  defp leg_do(el, _, _, {:lindex, i}) do
+    len = length(el)
+
+    if i < 0 and len + i < 0 do
+      nil
+    else
+      n = normalize_index(i, len)
+      if n >= 0 and n < len, do: Enum.at(el, n), else: nil
+    end
+  end
+  defp leg_do(el, pf, _, {:lset, i, e}) do
+    len = length(el)
+    n = normalize_index(i, len)
+
+    if n >= 0 and n < len do
+      pf.(encode_list(List.replace_at(el, n, e)))
+      :ok
+    else
+      {:error, "ERR index out of range"}
+    end
+  end
   defp leg_do(el, pf, df, {:lrem, c, e}) do
     {u, rc} = leg_rem(el, c, e)
-    cond do rc == 0 -> 0; u == [] -> (df.(); rc); true -> (pf.(encode_list(u)); rc) end
+
+    cond do
+      rc == 0 -> 0
+      u == [] ->
+        df.()
+        rc
+      true ->
+        pf.(encode_list(u))
+        rc
+    end
   end
   defp leg_do(el, pf, df, {:ltrim, s, e}) do
-    len = length(el); ns = normalize_index(s, len); ne = normalize_index(e, len)
-    t = cond do ns > ne -> []; ns >= len -> []; true -> Enum.slice(el, ns..ne//1) end
-    if t == [], do: df.(), else: pf.(encode_list(t)); :ok
+    len = length(el)
+    ns = normalize_index(s, len)
+    ne = normalize_index(e, len)
+
+    t =
+      cond do
+        ns > ne -> []
+        ns >= len -> []
+        true -> Enum.slice(el, ns..ne//1)
+      end
+
+    if t == [], do: df.(), else: pf.(encode_list(t))
+    :ok
   end
   defp leg_do(el, _, _, {:lpos, e, r, c, m}), do: find_positions(el, e, r, c, m)
   defp leg_do(el, pf, _, {:linsert, d, pv, e}) do
     case Enum.find_index(el, &(&1 == pv)) do
-      nil -> -1; idx -> (ii = if d == :before, do: idx, else: idx + 1; u = List.insert_at(el, ii, e); pf.(encode_list(u)); length(u))
+      nil ->
+        -1
+      idx ->
+        ii = if d == :before, do: idx, else: idx + 1
+        u = List.insert_at(el, ii, e)
+        pf.(encode_list(u))
+        length(u)
     end
   end
   defp leg_do(_, _, _, {:lmove, _, _, _}), do: {:error, "ERR lmove must be handled at the store layer"}
   defp leg_do([], _, _, {:pop_for_move, _}), do: nil
   defp leg_do(el, pf, df, {:pop_for_move, dir}) do
-    {e, r} = leg_pop(el, dir); if r == [], do: df.(), else: pf.(encode_list(r)); e
+    {e, r} = leg_pop(el, dir)
+    if r == [], do: df.(), else: pf.(encode_list(r))
+    e
   end
-  defp leg_do(el, pf, _, {:lpushx, ne}), do: (u = Enum.reverse(ne) ++ el; pf.(encode_list(u)); length(u))
-  defp leg_do(el, pf, _, {:rpushx, ne}), do: (u = el ++ ne; pf.(encode_list(u)); length(u))
+  defp leg_do(el, pf, _, {:lpushx, ne}) do
+    u = Enum.reverse(ne) ++ el
+    pf.(encode_list(u))
+    length(u)
+  end
+  defp leg_do(el, pf, _, {:rpushx, ne}) do
+    u = el ++ ne
+    pf.(encode_list(u))
+    length(u)
+  end
 
-  defp leg_missing(pf, _, {:lpush, el}), do: (l = Enum.reverse(el); pf.(encode_list(l)); length(l))
-  defp leg_missing(pf, _, {:rpush, el}), do: (pf.(encode_list(el)); length(el))
+  defp leg_missing(pf, _, {:lpush, el}) do
+    l = Enum.reverse(el)
+    pf.(encode_list(l))
+    length(l)
+  end
+  defp leg_missing(pf, _, {:rpush, el}) do
+    pf.(encode_list(el))
+    length(el)
+  end
   defp leg_missing(_, _, {:lpop, _}), do: nil
   defp leg_missing(_, _, {:rpop, _}), do: nil
   defp leg_missing(_, _, {:lrange, _, _}), do: []
@@ -434,10 +567,14 @@ defmodule Ferricstore.Store.ListOps do
   defp leg_missing(_, _, {:lmove, _, _, _}), do: nil
   defp leg_missing(_, _, {:pop_for_move, _}), do: nil
 
-  defp leg_rem(el, 0, t), do: (u = Enum.reject(el, &(&1 == t)); {u, length(el) - length(u)})
+  defp leg_rem(el, 0, t) do
+    u = Enum.reject(el, &(&1 == t))
+    {u, length(el) - length(u)}
+  end
   defp leg_rem(el, c, t) when c > 0, do: leg_rem_head(el, c, t, [], 0)
   defp leg_rem(el, c, t) when c < 0 do
-    {ru, r} = leg_rem_head(Enum.reverse(el), abs(c), t, [], 0); {Enum.reverse(ru), r}
+    {ru, r} = leg_rem_head(Enum.reverse(el), abs(c), t, [], 0)
+    {Enum.reverse(ru), r}
   end
   defp leg_rem_head([], _, _, acc, r), do: {Enum.reverse(acc), r}
   defp leg_rem_head([e | rest], 0, _, acc, r), do: {Enum.reverse(acc) ++ [e | rest], r}
@@ -452,8 +589,12 @@ defmodule Ferricstore.Store.ListOps do
       if r == [], do: sd.(), else: sp.(encode_list(r))
       case decode_stored(dg.()) do
         {:error, :wrongtype} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-        :not_found -> (dp.(encode_list(leg_push([], e, td))); e)
-        {:ok, de} -> (dp.(encode_list(leg_push(de, e, td))); e)
+        :not_found ->
+          dp.(encode_list(leg_push([], e, td)))
+          e
+        {:ok, de} ->
+          dp.(encode_list(leg_push(de, e, td)))
+          e
       end
     else
       {:src, :not_found} -> nil

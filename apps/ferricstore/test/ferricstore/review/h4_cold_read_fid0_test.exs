@@ -10,7 +10,6 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.Shard
 
   @threshold 128
 

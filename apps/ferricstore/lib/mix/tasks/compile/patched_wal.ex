@@ -1,5 +1,5 @@
 defmodule Mix.Tasks.Compile.PatchedWal do
-  @moduledoc false
+  @moduledoc "Mix compiler task that builds the patched ra_log_wal.erl to .beam for WAL write optimizations."
   @shortdoc "Compiles the patched ra_log_wal.erl to .beam"
 
   use Mix.Task.Compiler

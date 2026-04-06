@@ -54,9 +54,9 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
       for _ <- 1..@iterations, do: Router.shard_for(FerricStore.Instance.get(:default), key)
     end)
 
-    # 5. sandbox_key overhead (should be ~0 in non-sandbox)
+    # 5. sandbox_key overhead (removed; identity function as baseline)
     {sandbox_us, _} = :timer.tc(fn ->
-      for _ <- 1..@iterations, do: FerricStore.sandbox_key(key)
+      for _ <- 1..@iterations, do: key
     end)
 
     # 6. Stats overhead (incr_keyspace_hits)

@@ -8,7 +8,7 @@ defmodule Ferricstore.Store.ActiveFileTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.{ActiveFile, Router}
+  alias Ferricstore.Store.ActiveFile
   alias Ferricstore.Test.ShardHelpers
 
   setup do
@@ -44,12 +44,12 @@ defmodule Ferricstore.Store.ActiveFileTest do
       end
     end
 
-    test "publish/4 updates the value returned by get/1", %{orig_af: {orig_fid, _, orig_data_path}} do
-      new_path = Path.join(orig_data_path, "99999.log")
-      ActiveFile.publish(0, 99999, new_path, orig_data_path)
+    test "publish/4 updates the value returned by get/1", %{orig_af: {_orig_fid, _, orig_data_path}} do
+      new_path = Path.join(orig_data_path, "99_999.log")
+      ActiveFile.publish(0, 99_999, new_path, orig_data_path)
 
       {file_id, file_path, _} = ActiveFile.get(0)
-      assert file_id == 99999
+      assert file_id == 99_999
       assert file_path == new_path
     end
 
@@ -58,25 +58,25 @@ defmodule Ferricstore.Store.ActiveFileTest do
       _cached = ActiveFile.get(0)
 
       # Publish a new value
-      new_path = Path.join(data_path, "88888.log")
-      ActiveFile.publish(0, 88888, new_path, data_path)
+      new_path = Path.join(data_path, "88_888.log")
+      ActiveFile.publish(0, 88_888, new_path, data_path)
 
       # Next read should see the new value (cache invalidated)
       {fid2, path2, _} = ActiveFile.get(0)
-      assert fid2 == 88888
+      assert fid2 == 88_888
       assert path2 == new_path
     end
 
     test "get/1 from different processes sees published values", %{orig_af: {_, _, data_path}} do
-      new_path = Path.join(data_path, "77777.log")
-      ActiveFile.publish(0, 77777, new_path, data_path)
+      new_path = Path.join(data_path, "77_777.log")
+      ActiveFile.publish(0, 77_777, new_path, data_path)
 
       # Read from a different process (no cached value)
       {fid, path, _} =
         Task.async(fn -> ActiveFile.get(0) end)
         |> Task.await(5000)
 
-      assert fid == 77777
+      assert fid == 77_777
       assert path == new_path
     end
   end

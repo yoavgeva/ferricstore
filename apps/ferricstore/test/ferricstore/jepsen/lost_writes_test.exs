@@ -98,7 +98,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
           end
         end)
 
-      assert length(alive) >= 1, "at least one node should survive"
+      assert alive != [], "at least one node should survive"
       :ok = ClusterHelper.wait_for_leaders(alive, 4, timeout: 5_000)
 
       # Verify: each surviving node has all the writes it ACKed.
@@ -142,7 +142,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
         end)
 
       # Need at least 1 node; ideally 2+ so we can kill one while writing
-      assert length(alive) >= 1, "need at least 1 alive node"
+      assert alive != [], "need at least 1 alive node"
 
       writer = hd(alive)
       targets = tl(alive)

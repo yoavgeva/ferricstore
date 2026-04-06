@@ -19,7 +19,7 @@ defmodule FerricstoreEcto.CachedRepoTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  defp insert_user(attrs \\ %{}) do
+  defp insert_user(attrs) do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     defaults = %{
@@ -92,7 +92,7 @@ defmodule FerricstoreEcto.CachedRepoTest do
     end
 
     test "returns nil for non-existent entity" do
-      assert TestRepo.get(User, 99999) == nil
+      assert TestRepo.get(User, 99_999) == nil
     end
 
     test "caches all schema fields correctly" do
@@ -135,7 +135,7 @@ defmodule FerricstoreEcto.CachedRepoTest do
 
     test "raises on non-existent entity" do
       assert_raise Ecto.NoResultsError, fn ->
-        TestRepo.get!(User, 99999)
+        TestRepo.get!(User, 99_999)
       end
     end
   end

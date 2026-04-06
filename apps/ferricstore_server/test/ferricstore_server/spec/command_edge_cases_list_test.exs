@@ -58,7 +58,9 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesListTest do
 
   defp recv_response(sock, timeout \\ 10_000) do
     case Process.get(@parsed_key, []) do
-      [val | rest] -> Process.put(@parsed_key, rest); val
+      [val | rest] ->
+        Process.put(@parsed_key, rest)
+        val
       [] -> recv_loop(sock, Process.get(@binary_key, ""), timeout)
     end
   end

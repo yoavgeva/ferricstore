@@ -17,7 +17,6 @@ defmodule FerricstoreServer.Spec.ScanCursorInvalidationTest do
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
   alias FerricstoreServer.Listener
-  alias Ferricstore.Store.Router
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -103,7 +102,7 @@ defmodule FerricstoreServer.Spec.ScanCursorInvalidationTest do
       assert is_binary(cursor)
       assert is_list(first_batch)
       # Should have returned some keys
-      assert length(first_batch) > 0
+      assert first_batch != []
 
       # Now FLUSHDB
       send_cmd(sock, ["FLUSHDB"])
@@ -198,7 +197,7 @@ defmodule FerricstoreServer.Spec.ScanCursorInvalidationTest do
       # First SCAN pass — get a non-zero cursor
       send_cmd(sock, ["SCAN", "0", "COUNT", "5", "MATCH", "scan_inv_mid_*"])
       [cursor1, batch1] = recv_response(sock)
-      assert length(batch1) > 0
+      assert batch1 != []
 
       # FLUSHDB
       send_cmd(sock, ["FLUSHDB"])

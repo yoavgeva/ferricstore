@@ -50,7 +50,7 @@ defmodule Ferricstore.V2ArchitectureTest do
       assert File.stat!(path).size > 0
     end
 
-    test "2. GET hot (value in ETS) -- no NIF call needed", %{dir: dir} do
+    test "2. GET hot (value in ETS) -- no NIF call needed", %{dir: _dir} do
       # This test validates the ETS-only path: when value is in ETS, no NIF needed
       keydir = :ets.new(:v2_test_hot, [:set, :public])
       :ets.insert(keydir, {"mykey", "myvalue", 0, 5, 1, 0, 7})
@@ -243,7 +243,7 @@ defmodule Ferricstore.V2ArchitectureTest do
     test "15. Stale entries not copied during compaction", %{dir: dir} do
       source = data_file(dir, 1)
       # Write key twice -- only the second is "live"
-      {:ok, {off1, _}} = NIF.v2_append_record(source, "key", "old_val", 0)
+      {:ok, {_off1, _}} = NIF.v2_append_record(source, "key", "old_val", 0)
       {:ok, {off2, _}} = NIF.v2_append_record(source, "key", "new_val", 0)
 
       dest = data_file(dir, 10)

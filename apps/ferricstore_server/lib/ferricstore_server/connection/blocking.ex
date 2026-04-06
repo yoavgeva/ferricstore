@@ -1,5 +1,5 @@
 defmodule FerricstoreServer.Connection.Blocking do
-  @moduledoc false
+  @moduledoc "Blocking command handlers (BLPOP, BRPOP, BLMOVE, BLMPOP, XREAD BLOCK) with waiter registration and client-disconnect detection."
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.{Blocking, List}
@@ -7,16 +7,21 @@ defmodule FerricstoreServer.Connection.Blocking do
   alias Ferricstore.Waiters
   alias FerricstoreServer.Connection.Store, as: ConnStore
 
+  @type conn_result :: {:continue, iodata(), map()} | {:block, map()} | {:close, iodata(), map()}
+
+  @spec dispatch_blpop(list(), map()) :: conn_result()
   @doc false
   def dispatch_blpop(args, state) do
     dispatch_blocking(:blpop, args, state)
   end
 
+  @spec dispatch_brpop(list(), map()) :: conn_result()
   @doc false
   def dispatch_brpop(args, state) do
     dispatch_blocking(:brpop, args, state)
   end
 
+  @spec dispatch_blmove(list(), map()) :: conn_result()
   @doc false
   def dispatch_blmove(args, state) do
     case Blocking.parse_blmove_args(args) do
@@ -45,6 +50,7 @@ defmodule FerricstoreServer.Connection.Blocking do
     end
   end
 
+  @spec dispatch_blmpop(list(), map()) :: conn_result()
   @doc false
   def dispatch_blmpop(args, state) do
     case Blocking.parse_blmpop_args(args) do
@@ -87,6 +93,7 @@ defmodule FerricstoreServer.Connection.Blocking do
     end
   end
 
+  @spec dispatch_xread(list(), map()) :: conn_result()
   @doc false
   def dispatch_xread(args, state) do
     alias Ferricstore.Commands.Dispatcher

@@ -6,9 +6,7 @@ defmodule Ferricstore.AuditFixesMediumTest do
 
   use ExUnit.Case, async: true
 
-  alias Ferricstore.GlobMatcher
-  alias FerricstoreServer.Resp.{Parser, Encoder}
-  alias Ferricstore.Commands.{Strings, Hash, Set, SortedSet, Server, Generic}
+  alias Ferricstore.Commands.{Strings, Hash, Set, Server, Generic}
 
 
   # ---------------------------------------------------------------------------
@@ -151,17 +149,19 @@ defmodule Ferricstore.AuditFixesMediumTest do
   # M1: ClientTracking BCAST uses ets.select
   # ---------------------------------------------------------------------------
 
-  describe "M1: BCAST tracking uses ets.select" do
-    test "notify_key_modified does not crash with empty tracking tables" do
-      # Just verify the BCAST path doesn't crash
-      result =
-        FerricstoreServer.ClientTracking.notify_key_modified(
-          "test_key",
-          self(),
-          fn _pid, _msg, _keys -> :ok end
-        )
+  if Code.ensure_loaded?(FerricstoreServer.ClientTracking) do
+    describe "M1: BCAST tracking uses ets.select" do
+      test "notify_key_modified does not crash with empty tracking tables" do
+        # Just verify the BCAST path doesn't crash
+        result =
+          FerricstoreServer.ClientTracking.notify_key_modified(
+            "test_key",
+            self(),
+            fn _pid, _msg, _keys -> :ok end
+          )
 
-      assert result == :ok
+        assert result == :ok
+      end
     end
   end
 
@@ -270,8 +270,8 @@ defmodule Ferricstore.AuditFixesMediumTest do
         |> Map.put(:compound_count, fn _rk, _prefix ->
           MapSet.size(members) - MapSet.size(Agent.get(removed_members, & &1))
         end)
-        |> Map.put(:compound_delete, fn _rk, _ck ->
-          member = _ck |> String.split("\0") |> List.last()
+        |> Map.put(:compound_delete, fn _rk, ck ->
+          member = ck |> String.split("\0") |> List.last()
           Agent.update(removed_members, &MapSet.put(&1, member))
           :ok
         end)

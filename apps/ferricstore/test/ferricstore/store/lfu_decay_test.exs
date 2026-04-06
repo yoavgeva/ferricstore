@@ -81,8 +81,8 @@ defmodule Ferricstore.Store.LFUDecayTest do
     end
 
     test "wraparound: now < ldt" do
-      # 16-bit wrap: 0xFFFF - 65530 + 5 + 1 = 40
-      assert LFU.elapsed_minutes(5, 65530) == 0xFFFF - 65530 + 5 + 1
+      # 16-bit wrap: 0xFFFF - 65_530 + 5 + 1 = 40
+      assert LFU.elapsed_minutes(5, 65_530) == 0xFFFF - 65_530 + 5 + 1
     end
 
     test "full wrap cycle" do

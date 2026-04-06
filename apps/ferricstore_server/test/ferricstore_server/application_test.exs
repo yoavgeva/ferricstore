@@ -11,7 +11,7 @@ defmodule FerricstoreServer.ApplicationTest do
   use ExUnit.Case, async: false
 
   alias FerricstoreServer.Listener
-  alias Ferricstore.Store.{Router, ShardSupervisor}
+  alias Ferricstore.Store.ShardSupervisor
   alias Ferricstore.Test.ShardHelpers
 
   # Ensure all 4 shards are alive after every test so that the next test
@@ -262,9 +262,12 @@ defmodule FerricstoreServer.ApplicationTest do
         Enum.find_value(Stream.repeatedly(fn -> Process.sleep(20) end), fn _ ->
           pid = Process.whereis(:"Ferricstore.Store.Shard.3")
 
-          if is_pid(pid) and pid != old_shard3 and Process.alive?(pid),
-            do: pid,
-            else: (System.monotonic_time(:millisecond) > deadline && throw(:timeout); nil)
+          if is_pid(pid) and pid != old_shard3 and Process.alive?(pid) do
+            pid
+          else
+            if System.monotonic_time(:millisecond) > deadline, do: throw(:timeout)
+            nil
+          end
         end)
 
       assert is_pid(new_shard3)

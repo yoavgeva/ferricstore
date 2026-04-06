@@ -3,8 +3,6 @@ defmodule FerricstoreServer.Bench.TcpCallTraceTest do
   @moduletag :bench
   @moduletag timeout: 120_000
 
-  @resp_size_per_value 108
-
   test "call count trace: what functions are called per TCP GET" do
     port = FerricstoreServer.Listener.port()
     prefix = "cct_#{System.unique_integer([:positive])}"

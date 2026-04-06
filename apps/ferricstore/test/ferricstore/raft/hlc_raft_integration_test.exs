@@ -15,7 +15,6 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.HLC
   alias Ferricstore.Raft.StateMachine
 
@@ -165,7 +164,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
   describe "HLC merging during apply" do
     test "merges a remote HLC timestamp piggybacked on a command", %{state: state} do
       # Record the HLC before the command
-      {before_phys, _before_log} = HLC.now()
+      {_before_phys, _before_log} = HLC.now()
 
       # Create a "remote" timestamp that is 50ms ahead of current wall clock.
       # In multi-node mode, this simulates a leader that is slightly ahead.

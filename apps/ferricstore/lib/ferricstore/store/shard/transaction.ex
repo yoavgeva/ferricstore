@@ -1,5 +1,5 @@
 defmodule Ferricstore.Store.Shard.Transaction do
-  @moduledoc false
+  @moduledoc "Executes a queued MULTI/EXEC command batch inside a shard using a local transaction store."
 
   alias Ferricstore.Store.LocalTxStore
 
@@ -7,6 +7,7 @@ defmodule Ferricstore.Store.Shard.Transaction do
   # Transaction execution handler
   # -------------------------------------------------------------------
 
+  @spec handle_tx_execute([{binary(), [term()]}], binary() | nil, map()) :: {:reply, [term()], map()}
   @doc false
   def handle_tx_execute(queue, sandbox_namespace, state) do
     Process.put(:tx_deleted_keys, MapSet.new())
@@ -38,6 +39,7 @@ defmodule Ferricstore.Store.Shard.Transaction do
   # Helpers
   # -------------------------------------------------------------------
 
+  @spec namespace_args([term()], binary() | nil) :: [term()]
   @doc false
   def namespace_args(args, nil), do: args
   def namespace_args([], _ns), do: []

@@ -96,10 +96,7 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
       #
       # Note: This test requires the NIF to be loaded. If not available,
       # skip gracefully.
-      unless function_exported?(NIF, :v2_append_batch, 2) do
-        IO.puts("Skipping: NIF not loaded")
-        assert true
-      else
+      if function_exported?(NIF, :v2_append_batch, 2) do
         # Create a temporary directory for this test
         tmp_dir = Path.join(System.tmp_dir!(), "ferricstore_c2_test_#{:rand.uniform(999_999)}")
         File.mkdir_p!(tmp_dir)
@@ -206,6 +203,9 @@ defmodule Ferricstore.ReviewR4.CompactionEtsOffsetTest do
         end
 
         :ets.delete(keydir)
+      else
+        IO.puts("Skipping: NIF not loaded")
+        assert true
       end
     end
   end

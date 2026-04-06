@@ -40,7 +40,7 @@ defmodule Ferricstore.Test.ShardHelpers do
     # Fsync all active Bitcask log files. BitcaskWriter uses nosync writes
     # (data in OS page cache only). Without explicit fsync, data can be lost
     # if a shard is killed before the OS flushes to disk (especially on Linux).
-    data_dir = Application.get_env(:ferricstore, :data_dir, "data")
+    _data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     for i <- 0..(shard_count - 1) do
       try do
         active_path = :persistent_term.get({:ferricstore_active_file_path, i}, nil)
@@ -526,23 +526,4 @@ defmodule Ferricstore.Test.ShardHelpers do
     :ok
   end
 
-  # Kills all application-supervised shards and waits for the supervisor
-  # to restart them. Used by isolated data dir setup/teardown.
-  defp kill_and_restart_all_shards do
-    shard_count = shard_count()
-
-    for i <- 0..(shard_count - 1) do
-      name = Router.shard_name(FerricStore.Instance.get(:default), i)
-      pid = Process.whereis(name)
-
-      if pid && Process.alive?(pid) do
-        ref = Process.monitor(pid)
-        Process.exit(pid, :kill)
-        receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
-      end
-    end
-
-    wait_shards_alive(30_000)
-    Ferricstore.Health.set_ready(true)
-  end
 end

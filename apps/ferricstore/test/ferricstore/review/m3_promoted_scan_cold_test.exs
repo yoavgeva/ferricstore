@@ -12,7 +12,7 @@ defmodule Ferricstore.Review.M3PromotedScanColdTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.Hash
-  alias Ferricstore.Store.{Router, LFU}
+  alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
   @test_threshold 5

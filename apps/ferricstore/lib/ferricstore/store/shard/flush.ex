@@ -1,5 +1,5 @@
 defmodule Ferricstore.Store.Shard.Flush do
-  @moduledoc false
+  @moduledoc "Async and sync Bitcask batch flush, file rotation, hint-file writing, and per-file dead-byte fragmentation tracking."
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
@@ -21,6 +21,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   # periodic fsync on the flush timer. This reduces per-write latency
   # from ~50-200us (NVMe fsync) to ~1-10us (memcpy to page cache).
   # If a flush is already in-flight or pending is empty, this is a no-op.
+  @spec flush_pending(map()) :: map()
   @doc false
   def flush_pending(%{pending: []} = state), do: state
   def flush_pending(%{flush_in_flight: op_id} = state) when op_id != nil, do: state
@@ -53,6 +54,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   # Synchronous flush — used by delete, :flush, and :keys calls that need
   # durability guarantees. Uses v2_append_batch (write + fsync in one call).
   # Also ensures any previously-nosync'd data is fsynced.
+  @spec flush_pending_sync(map()) :: map()
   @doc false
   def flush_pending_sync(%{pending: []} = state) do
     # Even with empty pending, we may need to fsync previously-nosync'd data.
@@ -96,6 +98,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   # Wait for any in-flight async fsync to complete before proceeding.
   # This blocks the GenServer until the Tokio fsync result arrives.
   # Used before durability-critical operations (delete, keys, explicit flush).
+  @spec await_in_flight(map()) :: map()
   @doc false
   def await_in_flight(%{flush_in_flight: nil} = state), do: state
 
@@ -119,6 +122,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   # ETS location updates after flush
   # -------------------------------------------------------------------
 
+  @spec update_ets_locations(map(), [{binary(), binary(), non_neg_integer()}], [{non_neg_integer(), non_neg_integer()}]) :: map()
   @doc false
   def update_ets_locations(state, batch, locations) do
     fid = state.active_file_id
@@ -126,49 +130,45 @@ defmodule Ferricstore.Store.Shard.Flush do
     new_file_stats =
       Enum.zip(batch, locations)
       |> Enum.reduce(state.file_stats, fn {{key, value, _exp}, {offset, _record_size}}, fs ->
-        # Use update_element for the disk-location fields only.
-        # This preserves the LFU counter (position 4) and is a single
-        # ETS operation — no lookup+insert round-trip needed.
-        # Positions: {1=key, 2=value, 3=exp, 4=lfu, 5=fid, 6=offset, 7=vsize}
-        #
-        # vsize is computed from the original batch value (not the ETS value)
-        # because large values are stored as nil in ETS due to
-        # hot_cache_max_value_size, which would incorrectly produce vsize=0.
-        case :ets.lookup(state.keydir, key) do
-          [{^key, _ets_value, _exp, _lfu, old_fid, _old_off, old_vsize}] ->
-            vsize = byte_size(value)
-            :ets.update_element(state.keydir, key, [
-              {5, fid}, {6, offset}, {7, vsize}
-            ])
-
-            # Track dead bytes: if the old entry was on disk (not :pending/0),
-            # the overwritten data is now dead in the old file.
-            if old_fid != 0 and old_vsize > 0 do
-              dead_increment = old_vsize + @record_header_size + byte_size(key)
-              {old_total, old_dead} = Map.get(fs, old_fid, {0, 0})
-              Map.put(fs, old_fid, {old_total, old_dead + dead_increment})
-            else
-              fs
-            end
-
-          [] ->
-            fs
-        end
+        update_single_ets_location(state.keydir, key, value, fid, offset, fs)
       end)
 
     %{state | file_stats: new_file_stats}
   end
 
+  defp update_single_ets_location(keydir, key, value, fid, offset, fs) do
+    case :ets.lookup(keydir, key) do
+      [{^key, _ets_value, _exp, _lfu, old_fid, _old_off, old_vsize}] ->
+        vsize = byte_size(value)
+        :ets.update_element(keydir, key, [{5, fid}, {6, offset}, {7, vsize}])
+        track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
+
+      [] ->
+        fs
+    end
+  end
+
+  defp track_overwrite_dead_bytes(fs, key, old_fid, old_vsize)
+       when old_fid != 0 and old_vsize > 0 do
+    dead_increment = old_vsize + @record_header_size + byte_size(key)
+    {old_total, old_dead} = Map.get(fs, old_fid, {0, 0})
+    Map.put(fs, old_fid, {old_total, old_dead + dead_increment})
+  end
+
+  defp track_overwrite_dead_bytes(fs, _key, _old_fid, _old_vsize), do: fs
+
   # -------------------------------------------------------------------
   # Byte tracking / fragmentation
   # -------------------------------------------------------------------
 
+  @spec total_written([{non_neg_integer(), non_neg_integer()}]) :: non_neg_integer()
   @doc false
   def total_written(locations) do
     Enum.reduce(locations, 0, fn {_offset, size}, acc -> acc + size end)
   end
 
   # Increment total_bytes for the active file after a flush.
+  @spec track_flush_bytes(map(), non_neg_integer()) :: map()
   @doc false
   def track_flush_bytes(state, written_bytes) do
     fid = state.active_file_id
@@ -178,6 +178,7 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   # Track dead bytes when a key is deleted via tombstone (direct path only).
   # Reads the old ETS entry to determine which file contains the now-dead record.
+  @spec track_delete_dead_bytes(map(), binary()) :: map()
   @doc false
   def track_delete_dead_bytes(state, key) do
     case :ets.lookup(state.keydir, key) do
@@ -193,6 +194,7 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   # Check if any non-active file exceeds fragmentation thresholds and notify
   # the merge scheduler. Cheap: iterates a small map (typically <20 files).
+  @spec maybe_notify_fragmentation(map()) :: map()
   @doc false
   def maybe_notify_fragmentation(state) do
     frag_threshold = state.merge_config.fragmentation_threshold
@@ -222,6 +224,7 @@ defmodule Ferricstore.Store.Shard.Flush do
 
   # Compute per-file dead bytes stats from disk file sizes + ETS live data.
   # Called once during init after recover_keydir. O(file_count + key_count).
+  @spec compute_file_stats(binary(), :ets.tid()) :: %{non_neg_integer() => {non_neg_integer(), non_neg_integer()}}
   @doc false
   def compute_file_stats(shard_path, keydir) do
     case File.ls(shard_path) do
@@ -233,14 +236,7 @@ defmodule Ferricstore.Store.Shard.Flush do
           |> Enum.reject(&String.starts_with?(&1, "compact_"))
           |> Enum.reduce(%{}, fn name, acc ->
             fid = name |> String.trim_trailing(".log") |> String.to_integer()
-            full_path = Path.join(shard_path, name)
-
-            size =
-              case File.stat(full_path) do
-                {:ok, %{size: s}} -> s
-                _ -> 0
-              end
-
+            size = file_size_or_zero(Path.join(shard_path, name))
             Map.put(acc, fid, size)
           end)
 
@@ -248,12 +244,7 @@ defmodule Ferricstore.Store.Shard.Flush do
         live_per_file =
           :ets.foldl(
             fn {key, _value, _exp, _lfu, fid, _off, vsize}, acc ->
-              if fid != 0 and is_integer(fid) do
-                record_bytes = @record_header_size + byte_size(key) + vsize
-                Map.update(acc, fid, record_bytes, &(&1 + record_bytes))
-              else
-                acc
-              end
+              accumulate_live_bytes(acc, key, fid, vsize)
             end,
             %{},
             keydir
@@ -271,6 +262,21 @@ defmodule Ferricstore.Store.Shard.Flush do
     end
   end
 
+  defp accumulate_live_bytes(acc, key, fid, vsize) when fid != 0 and is_integer(fid) do
+    record_bytes = @record_header_size + byte_size(key) + vsize
+    Map.update(acc, fid, record_bytes, &(&1 + record_bytes))
+  end
+
+  defp accumulate_live_bytes(acc, _key, _fid, _vsize), do: acc
+
+  defp file_size_or_zero(path) do
+    case File.stat(path) do
+      {:ok, %{size: s}} -> s
+      _ -> 0
+    end
+  end
+
+  @spec maybe_rotate_file(map()) :: map()
   @doc false
   def maybe_rotate_file(state) do
     if state.active_file_size >= state.max_active_file_size do
@@ -295,6 +301,7 @@ defmodule Ferricstore.Store.Shard.Flush do
     end
   end
 
+  @spec write_hint_for_file(map(), non_neg_integer()) :: :ok | {:error, term()} | nil
   @doc false
   def write_hint_for_file(state, target_fid) do
     sp = state.shard_data_path
@@ -323,6 +330,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   # Schedule flush timer
   # -------------------------------------------------------------------
 
+  @spec schedule_flush(non_neg_integer()) :: reference()
   @doc false
   def schedule_flush(ms) do
     Process.send_after(self(), :flush, ms)

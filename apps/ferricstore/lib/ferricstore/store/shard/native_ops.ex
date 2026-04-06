@@ -1,5 +1,5 @@
 defmodule Ferricstore.Store.Shard.NativeOps do
-  @moduledoc false
+  @moduledoc "Shard-level CAS, distributed lock, rate-limit, and list operation handlers with Raft and direct-write paths."
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.{ValueCodec}
@@ -13,6 +13,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # CAS / LOCK / UNLOCK / EXTEND / RATELIMIT / LIST handlers
   # -------------------------------------------------------------------
 
+  @spec handle_cas(binary(), term(), binary(), non_neg_integer() | nil, map()) :: {:reply, term(), map()}
   @doc false
   def handle_cas(key, expected, new_value, ttl_ms, state) do
     if state.raft? do
@@ -52,6 +53,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
+  @spec handle_lock(binary(), binary(), non_neg_integer(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_lock(key, owner, ttl_ms, state) do
     if state.raft? do
@@ -97,6 +99,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
+  @spec handle_unlock(binary(), binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_unlock(key, owner, state) do
     if state.raft? do
@@ -142,6 +145,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
+  @spec handle_extend(binary(), binary(), non_neg_integer(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_extend(key, owner, ttl_ms, state) do
     if state.raft? do
@@ -183,6 +187,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
+  @spec handle_ratelimit_add(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_ratelimit_add(key, window_ms, max, count, state) do
     if state.raft? do
@@ -206,6 +211,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
+  @spec handle_ratelimit_add_direct(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), map()) :: {:reply, [term()], map()}
   @doc false
   def handle_ratelimit_add_direct(key, window_ms, max, count, state) do
     now = Ferricstore.HLC.now_ms()
@@ -257,6 +263,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # List operations
   # -------------------------------------------------------------------
 
+  @spec handle_list_op(binary(), term(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_list_op(key, operation, state) do
     if state.raft? do
@@ -281,6 +288,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     {:reply, result, state}
   end
 
+  @spec handle_list_op_lmove(binary(), binary(), atom(), atom(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_list_op_lmove(src_key, dst_key, from_dir, to_dir, state) do
     if state.raft? do
@@ -305,6 +313,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     {:reply, result, state}
   end
 
+  @spec build_list_compound_store_raft(binary(), map()) :: map()
   @doc false
   def build_list_compound_store_raft(_key, state) do
     %{
@@ -324,6 +333,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     }
   end
 
+  @spec build_list_compound_store_direct(binary(), map()) :: map()
   @doc false
   def build_list_compound_store_direct(_key, state) do
     %{
@@ -360,6 +370,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # Helpers
   # -------------------------------------------------------------------
 
+  @spec resolve_for_native(map(), binary()) :: {{:hit, term(), non_neg_integer()}, map()} | {:expired, map()} | {:missing, map()}
   @doc false
   def resolve_for_native(state, key) do
     case ShardETS.ets_lookup_warm(state, key) do
@@ -375,9 +386,11 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
+  @spec encode_ratelimit(non_neg_integer(), non_neg_integer(), non_neg_integer()) :: binary()
   @doc false
   def encode_ratelimit(cur, start, prev), do: ValueCodec.encode_ratelimit(cur, start, prev)
 
+  @spec decode_ratelimit(binary()) :: {non_neg_integer(), non_neg_integer(), non_neg_integer()}
   @doc false
   def decode_ratelimit(value), do: ValueCodec.decode_ratelimit(value)
 

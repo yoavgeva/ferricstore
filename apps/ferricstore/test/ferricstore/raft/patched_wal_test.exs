@@ -46,24 +46,6 @@ defmodule Ferricstore.Raft.PatchedWalTest do
     Process.whereis(wal_name())
   end
 
-  defp eventually(fun, opts) do
-    attempts = Keyword.get(opts, :attempts, 10)
-    delay = Keyword.get(opts, :delay, 100)
-
-    Enum.reduce_while(1..attempts, nil, fn i, _ ->
-      if fun.() do
-        {:halt, :ok}
-      else
-        if i < attempts, do: Process.sleep(delay)
-        {:cont, :timeout}
-      end
-    end)
-    |> case do
-      :ok -> :ok
-      :timeout -> flunk("Condition not met after #{attempts} attempts (#{attempts * delay}ms)")
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # 1. Empty/truncated WAL recovery (the original bug)
   # ---------------------------------------------------------------------------
@@ -214,7 +196,7 @@ defmodule Ferricstore.Raft.PatchedWalTest do
     end
 
     test "fill_ratio increases after writes" do
-      ratio_before = :ra_log_wal.fill_ratio(wal_name())
+      _ratio_before = :ra_log_wal.fill_ratio(wal_name())
 
       # Write enough data to change the ratio
       prefix = ukey("fill_ratio")

@@ -18,7 +18,7 @@ defmodule FerricstoreEcto.QueryCacheTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
-  defp insert_user(attrs \\ %{}) do
+  defp insert_user(attrs) do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     defaults = %{
@@ -88,7 +88,7 @@ defmodule FerricstoreEcto.QueryCacheTest do
 
       # Should get fresh results
       results2 = TestRepo.all(query)
-      assert length(results2) == 0
+      assert results2 == []
     end
 
     test "query cache invalidated on delete" do

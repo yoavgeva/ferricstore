@@ -93,6 +93,7 @@ defmodule FerricStore.Ecto.CachedRepo do
 
   @doc false
   defmacro __using__(opts) do
+    # credo:disable-for-next-line Credo.Check.Refactor.LongQuoteBlocks
     quote do
       use Ecto.Repo, unquote(opts)
 

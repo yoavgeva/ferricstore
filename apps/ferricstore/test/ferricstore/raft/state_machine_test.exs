@@ -324,13 +324,13 @@ defmodule Ferricstore.Raft.StateMachineTest do
   # ---------------------------------------------------------------------------
 
   describe "release_cursor log compaction" do
-    test "init/1 stores release_cursor_interval from config", %{store: store, ets: ets} do
+    test "init/1 stores release_cursor_interval from config", %{store: _store, ets: ets} do
       state = StateMachine.init(%{shard_index: 0, shard_data_path: System.tmp_dir!(), active_file_id: 0, active_file_path: Path.join(System.tmp_dir!(), "00000.log"), ets: ets})
       assert is_integer(state.release_cursor_interval)
       assert state.release_cursor_interval > 0
     end
 
-    test "init/1 accepts custom release_cursor_interval", %{store: store, ets: ets} do
+    test "init/1 accepts custom release_cursor_interval", %{store: _store, ets: ets} do
       state =
         StateMachine.init(%{
           shard_index: 0,
@@ -342,7 +342,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert state.release_cursor_interval == 500
     end
 
-    test "no release_cursor emitted before interval is reached", %{store: store, ets: ets} do
+    test "no release_cursor emitted before interval is reached", %{store: _store, ets: ets} do
       state =
         StateMachine.init(%{
           shard_index: 0,
@@ -369,7 +369,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert result.applied_count == 4
     end
 
-    test "release_cursor emitted exactly at interval boundary for put", %{store: store, ets: ets} do
+    test "release_cursor emitted exactly at interval boundary for put", %{store: _store, ets: ets} do
       interval = 5
 
       state =
@@ -405,7 +405,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert cursor_state.applied_count == interval
     end
 
-    test "release_cursor emitted at every interval multiple", %{store: store, ets: ets} do
+    test "release_cursor emitted at every interval multiple", %{store: _store, ets: ets} do
       interval = 3
 
       state =
@@ -434,7 +434,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       assert cursor_indices == [3, 6, 9]
     end
 
-    test "release_cursor emitted for delete at interval boundary", %{store: store, ets: ets} do
+    test "release_cursor emitted for delete at interval boundary", %{store: _store, ets: ets} do
       interval = 3
 
       state =
@@ -460,7 +460,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
     end
 
     test "release_cursor emitted for batch that crosses interval boundary", %{
-      store: store,
+      store: _store,
       ets: ets
     } do
       interval = 5
@@ -526,7 +526,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
     end
 
     test "release_cursor state snapshot contains correct machine state", %{
-      store: store,
+      store: _store,
       ets: ets
     } do
       interval = 3

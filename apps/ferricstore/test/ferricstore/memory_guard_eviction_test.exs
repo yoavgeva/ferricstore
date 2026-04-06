@@ -261,7 +261,7 @@ defmodule Ferricstore.MemoryGuardEvictionTest do
       :ets.update_element(keydir, "cold_skip", {2, nil})
 
       # Match spec for hot volatile entries should NOT find this key
-      now = System.os_time(:millisecond)
+      _now = System.os_time(:millisecond)
 
       ms = [
         {

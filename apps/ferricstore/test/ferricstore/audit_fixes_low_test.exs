@@ -7,14 +7,14 @@ defmodule Ferricstore.AuditFixesLowTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.GlobMatcher
-  alias Ferricstore.Commands.{Server, Generic}
+  alias Ferricstore.Commands.Generic
 
 
   # ---------------------------------------------------------------------------
   # Helper: build a mock store map from a key-value map
   # ---------------------------------------------------------------------------
 
-  defp mock_store(data \\ %{}) do
+  defp mock_store(data) do
     %{
       get: fn key -> get_in(data, [key, Access.elem(0)]) end,
       get_meta: fn key ->

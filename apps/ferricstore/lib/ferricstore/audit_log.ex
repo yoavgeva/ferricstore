@@ -227,8 +227,6 @@ defmodule Ferricstore.AuditLog do
   defp format_details(details) when map_size(details) == 0, do: ""
 
   defp format_details(details) do
-    details
-    |> Enum.map(fn {k, v} -> "#{k}=#{inspect(v)}" end)
-    |> Enum.join(" ")
+    Enum.map_join(details, " ", fn {k, v} -> "#{k}=#{inspect(v)}" end)
   end
 end

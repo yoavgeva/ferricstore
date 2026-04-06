@@ -14,8 +14,6 @@ defmodule Ferricstore.Raft.DataStructureWritePathTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Raft.Batcher
-  alias Ferricstore.Raft.Cluster
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 

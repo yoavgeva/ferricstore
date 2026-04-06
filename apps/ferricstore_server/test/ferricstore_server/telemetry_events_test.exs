@@ -367,7 +367,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
     end
 
     test "not emitted when CONFIG SET is rejected (read-only param)" do
-      handler_id = attach_handler([:ferricstore, :config, :changed])
+      _handler_id = attach_handler([:ferricstore, :config, :changed])
 
       result = Ferricstore.Config.set("maxmemory", "999")
       assert {:error, _} = result
@@ -426,7 +426,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       :telemetry.execute(
         [:ferricstore, :node, :shutdown_started],
-        %{uptime_ms: 12345},
+        %{uptime_ms: 12_345},
         %{}
       )
 
@@ -434,7 +434,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
                       _metadata},
                      1000
 
-      assert measurements.uptime_ms == 12345
+      assert measurements.uptime_ms == 12_345
 
       :telemetry.detach(handler_id)
     end

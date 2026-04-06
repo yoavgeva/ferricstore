@@ -110,7 +110,7 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
         # writes still work after recovery.
         {:ok, _} = FerricStore.rpush(k, ["x", "y", "z"])
         {:ok, fresh} = FerricStore.lrange(k, 0, -1)
-        assert is_list(fresh) and length(fresh) > 0,
+        assert is_list(fresh) and fresh != [],
                "writes must work after list crash recovery"
       end
     end

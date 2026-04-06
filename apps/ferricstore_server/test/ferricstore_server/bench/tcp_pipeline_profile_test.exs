@@ -147,7 +147,7 @@ defmodule FerricstoreServer.Bench.TcpPipelineProfileTest do
         |> Enum.map(fn {_key, info} -> Keyword.get(info || [], :status) end)
         |> Enum.frequencies()
 
-        IO.puts("\n  Status: #{Enum.map(statuses, fn {s, c} -> "#{s}=#{Float.round(c/total_samples*100, 1)}%" end) |> Enum.join(", ")}")
+        IO.puts("\n  Status: #{Enum.map_join(statuses, ", ", fn {s, c} -> "#{s}=#{Float.round(c/total_samples*100, 1)}%" end)}")
 
         # Message queue
         queues = Enum.map(all, fn {_key, info} -> Keyword.get(info || [], :message_queue_len, 0) end)

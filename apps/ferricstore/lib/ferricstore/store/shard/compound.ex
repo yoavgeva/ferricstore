@@ -1,5 +1,5 @@
 defmodule Ferricstore.Store.Shard.Compound do
-  @moduledoc false
+  @moduledoc "Compound-key CRUD, prefix scan/count, promoted-collection dedicated storage, and automatic compaction."
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.{LFU, Promotion}
@@ -20,6 +20,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   # Compound key handle_call handlers
   # -------------------------------------------------------------------
 
+  @spec handle_compound_get(binary(), binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_compound_get(redis_key, compound_key, state) do
     case promoted_store(state, redis_key) do
@@ -52,6 +53,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_compound_get_meta(binary(), binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_compound_get_meta(redis_key, compound_key, state) do
     case promoted_store(state, redis_key) do
@@ -84,6 +86,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_compound_put(binary(), binary(), binary(), non_neg_integer(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_compound_put(redis_key, compound_key, value, expire_at_ms, state) do
     if state.raft? do
@@ -93,6 +96,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_compound_delete(binary(), binary(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_compound_delete(redis_key, compound_key, state) do
     if state.raft? do
@@ -102,6 +106,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_compound_scan(binary(), binary(), map()) :: {:reply, [{binary(), binary()}], map()}
   @doc false
   def handle_compound_scan(redis_key, prefix, state) do
     case promoted_store(state, redis_key) do
@@ -115,6 +120,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_compound_count(binary(), binary(), map()) :: {:reply, non_neg_integer(), map()}
   @doc false
   def handle_compound_count(redis_key, prefix, state) do
     case promoted_store(state, redis_key) do
@@ -126,6 +132,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_compound_delete_prefix(binary(), binary(), map()) :: {:reply, :ok, map()}
   @doc false
   def handle_compound_delete_prefix(redis_key, prefix, state) do
     if state.raft? do
@@ -135,6 +142,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec handle_promoted(binary(), map()) :: {:reply, boolean(), map()}
   @doc false
   def handle_promoted(redis_key, state) do
     {:reply, Map.has_key?(state.promoted_instances, redis_key), state}
@@ -327,6 +335,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   # Promotion helpers
   # -------------------------------------------------------------------
 
+  @spec promoted_store(map(), binary()) :: binary() | nil
   @doc false
   def promoted_store(state, redis_key) do
     case Map.get(state.promoted_instances, redis_key) do
@@ -336,6 +345,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec promoted_read(binary(), binary(), :ets.tid()) :: {:ok, binary() | nil} | {:ok, binary(), non_neg_integer()} | {:error, term()}
   @doc false
   def promoted_read(dedicated_path, compound_key, keydir) do
     case :ets.lookup(keydir, compound_key) do
@@ -373,6 +383,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec promoted_write(binary(), binary(), binary(), non_neg_integer()) :: {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | {:error, term()}
   @doc false
   def promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
     active = Promotion.find_active(dedicated_path)
@@ -384,22 +395,26 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec promoted_tombstone(binary(), binary()) :: {:ok, non_neg_integer()} | {:error, term()}
   @doc false
   def promoted_tombstone(dedicated_path, compound_key) do
     active = Promotion.find_active(dedicated_path)
     NIF.v2_append_tombstone(active, compound_key)
   end
 
+  @spec parse_fid_from_path(binary()) :: non_neg_integer()
   @doc false
   def parse_fid_from_path(path) do
     path |> Path.basename() |> String.trim_trailing(".log") |> String.to_integer()
   end
 
+  @spec dedicated_file_path(binary(), non_neg_integer()) :: binary()
   @doc false
   def dedicated_file_path(dedicated_path, file_id) do
     Path.join(dedicated_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
   end
 
+  @spec bump_promoted_writes(map(), binary()) :: map()
   @doc false
   def bump_promoted_writes(state, redis_key) do
     case Map.get(state.promoted_instances, redis_key) do
@@ -432,6 +447,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec promoted_dir_size(binary()) :: non_neg_integer()
   @doc false
   def promoted_dir_size(dir_path) do
     case File.ls(dir_path) do
@@ -450,6 +466,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec track_promoted_dead_bytes(map(), binary(), binary(), non_neg_integer()) :: map()
   @doc false
   def track_promoted_dead_bytes(state, redis_key, compound_key, new_record_size) do
     case Map.get(state.promoted_instances, redis_key) do
@@ -475,6 +492,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec track_promoted_delete_bytes(map(), binary(), binary()) :: map()
   @doc false
   def track_promoted_delete_bytes(state, redis_key, compound_key) do
     case Map.get(state.promoted_instances, redis_key) do
@@ -496,6 +514,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec compact_dedicated(map(), binary(), binary()) :: map()
   @doc false
   def compact_dedicated(state, redis_key, dedicated_path) do
     alias Ferricstore.Store.CompoundKey
@@ -579,6 +598,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec promoted_prefix_for(map(), binary()) :: binary() | nil
   @doc false
   def promoted_prefix_for(state, redis_key) do
     mk = Promotion.marker_key(redis_key)
@@ -591,6 +611,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec maybe_promote(map(), binary(), binary()) :: map()
   @doc false
   def maybe_promote(state, redis_key, compound_key) do
     alias Ferricstore.Store.CompoundKey
@@ -625,9 +646,6 @@ defmodule Ferricstore.Store.Shard.Compound do
                   total_bytes: 0, dead_bytes: 0, last_compacted_at: nil
                 })
                 %{state | promoted_instances: new_promoted}
-
-              {:error, _reason} ->
-                state
             end
           else
             state
@@ -636,6 +654,7 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
+  @spec detect_compound_type(binary(), binary()) :: {atom(), binary()} | nil
   @doc false
   def detect_compound_type(redis_key, compound_key) do
     alias Ferricstore.Store.CompoundKey

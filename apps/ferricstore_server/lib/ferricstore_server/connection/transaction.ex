@@ -1,5 +1,5 @@
 defmodule FerricstoreServer.Connection.Transaction do
-  @moduledoc false
+  @moduledoc "MULTI/EXEC/DISCARD/WATCH transaction lifecycle for a client connection."
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher
@@ -9,6 +9,9 @@ defmodule FerricstoreServer.Connection.Transaction do
   # Maximum commands queued inside a MULTI transaction (100K).
   @max_multi_queue_size 100_000
 
+  @type conn_result :: {:continue, iodata(), map()} | {:block, map()} | {:close, iodata(), map()}
+
+  @spec dispatch_multi(list(), map()) :: conn_result()
   @doc false
   def dispatch_multi(_args, %{multi_state: :queuing} = state) do
     {:continue, Encoder.encode({:error, "ERR MULTI calls can not be nested"}), state}
@@ -19,6 +22,7 @@ defmodule FerricstoreServer.Connection.Transaction do
     {:continue, Encoder.encode(:ok), new_state}
   end
 
+  @spec dispatch_exec(list(), map()) :: conn_result()
   @doc false
   def dispatch_exec(_args, %{multi_state: :none} = state) do
     {:continue, Encoder.encode({:error, "ERR EXEC without MULTI"}), state}
@@ -30,6 +34,7 @@ defmodule FerricstoreServer.Connection.Transaction do
     {:continue, Encoder.encode(result), new_state}
   end
 
+  @spec dispatch_discard(list(), map()) :: conn_result()
   @doc false
   def dispatch_discard(_args, %{multi_state: :none} = state) do
     {:continue, Encoder.encode({:error, "ERR DISCARD without MULTI"}), state}
@@ -40,6 +45,7 @@ defmodule FerricstoreServer.Connection.Transaction do
     {:continue, Encoder.encode(:ok), new_state}
   end
 
+  @spec dispatch_watch(list(), map()) :: conn_result()
   @doc false
   def dispatch_watch(_args, %{multi_state: :queuing} = state) do
     {:continue,
@@ -67,11 +73,13 @@ defmodule FerricstoreServer.Connection.Transaction do
     end
   end
 
+  @spec dispatch_unwatch(list(), map()) :: conn_result()
   @doc false
   def dispatch_unwatch(_args, state) do
     {:continue, Encoder.encode(:ok), %{state | watched_keys: %{}}}
   end
 
+  @spec dispatch_queue(binary(), list(), map()) :: conn_result()
   @doc """
   Handles queuing of commands during MULTI mode. Called when `multi_state: :queuing`
   for commands that are not in the passthrough set (EXEC, DISCARD, MULTI, WATCH, UNWATCH).

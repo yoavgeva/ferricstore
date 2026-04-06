@@ -13,6 +13,7 @@ defmodule Ferricstore.RaFileInstrument do
   @table :ra_file_instrument
   @counters_key :ra_file_instrument_counters
 
+  @spec install() :: :ok
   @doc "Install the instrumented ra_file module (call before ra starts)"
   def install do
     # Create ETS for histogram buckets
@@ -78,6 +79,7 @@ defmodule Ferricstore.RaFileInstrument do
     :ok
   end
 
+  @spec record_sync(non_neg_integer()) :: true
   @doc "Record a sync call duration (called from the patched ra_file)"
   def record_sync(elapsed_us) do
     counters = :persistent_term.get(@counters_key)
@@ -103,6 +105,7 @@ defmodule Ferricstore.RaFileInstrument do
     Enum.find(@histogram_thresholds, :overflow, fn threshold -> elapsed_us < threshold end)
   end
 
+  @spec report() :: :ok
   @doc "Print collected fsync stats"
   def report do
     counters = :persistent_term.get(@counters_key)
@@ -147,6 +150,7 @@ defmodule Ferricstore.RaFileInstrument do
     IO.puts("")
   end
 
+  @spec reset() :: :ok
   @doc "Reset counters"
   def reset do
     counters = :persistent_term.get(@counters_key)

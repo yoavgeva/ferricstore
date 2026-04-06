@@ -139,9 +139,9 @@ defmodule Ferricstore.Transaction.Coordinator do
 
       {:ra_event, _from, {:rejected, {:not_leader, maybe_leader, ^corr}}} ->
         leader =
-          if maybe_leader not in [nil, :undefined],
-            do: maybe_leader,
-            else: shard_id
+          if maybe_leader in [nil, :undefined],
+            do: shard_id,
+            else: maybe_leader
 
         retry_corr = make_ref()
 

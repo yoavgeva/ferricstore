@@ -249,35 +249,8 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
 
       {{commands, retry_count}, new_pending} ->
         new_state = %{state | pending: new_pending}
-
-        if retry_count >= @max_retries do
-          Logger.warning(
-            "AsyncApplyWorker: shard #{state.shard_index} dropping async batch after #{@max_retries} retries"
-          )
-
-          :telemetry.execute(
-            [:ferricstore, :async_apply, :raft_dropped],
-            %{batch_size: length(commands), retries: retry_count},
-            %{shard_index: state.shard_index}
-          )
-
-          {:noreply, new_state}
-        else
-          # Resubmit to the hinted leader
-          leader =
-            if maybe_leader not in [nil, :undefined],
-              do: maybe_leader,
-              else: state.shard_id
-
-          :telemetry.execute(
-            [:ferricstore, :async_apply, :raft_retry],
-            %{pending_count: map_size(new_state.pending) + 1},
-            %{shard_index: state.shard_index, reason: :not_leader}
-          )
-
-          new_state = do_pipeline_submit(new_state, leader, commands, retry_count + 1)
-          {:noreply, new_state}
-        end
+        leader = resolve_leader(maybe_leader, state.shard_id)
+        handle_rejected_command(new_state, commands, retry_count, leader, :not_leader)
     end
   end
 
@@ -288,23 +261,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
 
       {{commands, retry_count}, new_pending} ->
         new_state = %{state | pending: new_pending}
-
-        if retry_count >= @max_retries do
-          Logger.warning(
-            "AsyncApplyWorker: shard #{state.shard_index} dropping async batch after #{@max_retries} retries (rejected)"
-          )
-
-          {:noreply, new_state}
-        else
-          :telemetry.execute(
-            [:ferricstore, :async_apply, :raft_retry],
-            %{pending_count: map_size(new_state.pending) + 1},
-            %{shard_index: state.shard_index, reason: :rejected}
-          )
-
-          new_state = do_pipeline_submit(new_state, state.shard_id, commands, retry_count + 1)
-          {:noreply, new_state}
-        end
+        handle_rejected_command(new_state, commands, retry_count, state.shard_id, :rejected)
     end
   end
 
@@ -326,7 +283,6 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
         )
       end)
 
-      # Resubmit in FIFO order (oldest first)
       new_state =
         Enum.reduce(to_retry, %{state | retry_buffer: :queue.new()}, fn {commands, retry_count}, acc ->
           do_pipeline_submit(acc, acc.shard_id, commands, retry_count + 1)
@@ -337,6 +293,36 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp resolve_leader(maybe_leader, default_id) do
+    if maybe_leader in [nil, :undefined], do: default_id, else: maybe_leader
+  end
+
+  defp handle_rejected_command(state, commands, retry_count, _target, _reason)
+       when retry_count >= @max_retries do
+    Logger.warning(
+      "AsyncApplyWorker: shard #{state.shard_index} dropping async batch after #{@max_retries} retries"
+    )
+
+    :telemetry.execute(
+      [:ferricstore, :async_apply, :raft_dropped],
+      %{batch_size: length(commands), retries: retry_count},
+      %{shard_index: state.shard_index}
+    )
+
+    {:noreply, state}
+  end
+
+  defp handle_rejected_command(state, commands, retry_count, target, reason) do
+    :telemetry.execute(
+      [:ferricstore, :async_apply, :raft_retry],
+      %{pending_count: map_size(state.pending) + 1},
+      %{shard_index: state.shard_index, reason: reason}
+    )
+
+    new_state = do_pipeline_submit(state, target, commands, retry_count + 1)
+    {:noreply, new_state}
+  end
 
   # ---------------------------------------------------------------------------
   # Private: Raft submission with correlation tracking
@@ -410,32 +396,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
 
     # Apply puts in a single batch via v2 append
     if puts != [] do
-      batch_entries =
-        Enum.map(puts, fn {:put, key, value, expire_at_ms} ->
-          {key, value, expire_at_ms}
-        end)
-
-      case NIF.v2_append_batch(active_file_path, batch_entries) do
-        {:ok, results} ->
-          # Update ETS (7-tuple) for each put.
-          # Values exceeding the hot_cache_max_value_size threshold are stored
-          # as nil (cold) to avoid expensive binary copies on :ets.lookup.
-          puts
-          |> Enum.zip(results)
-          |> Enum.each(fn {{:put, key, value, expire_at_ms}, {offset, value_size}} ->
-            value_for_ets = value_for_ets(value)
-
-            :ets.insert(
-              keydir,
-              {key, value_for_ets, expire_at_ms, LFU.initial(), active_file_id, offset, value_size}
-            )
-          end)
-
-        {:error, reason} ->
-          Logger.error(
-            "AsyncApplyWorker: v2_append_batch failed for shard #{shard_index}: #{inspect(reason)}"
-          )
-      end
+      apply_put_batch(puts, active_file_path, active_file_id, keydir, shard_index)
     end
 
     # Apply deletes individually via v2 tombstone append
@@ -462,6 +423,32 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
       {:put, _, _, _} -> true
       _ -> false
     end)
+  end
+
+  defp apply_put_batch(puts, active_file_path, active_file_id, keydir, shard_index) do
+    batch_entries =
+      Enum.map(puts, fn {:put, key, value, expire_at_ms} ->
+        {key, value, expire_at_ms}
+      end)
+
+    case NIF.v2_append_batch(active_file_path, batch_entries) do
+      {:ok, results} ->
+        puts
+        |> Enum.zip(results)
+        |> Enum.each(fn {{:put, key, value, expire_at_ms}, {offset, value_size}} ->
+          value_for_ets = value_for_ets(value)
+
+          :ets.insert(
+            keydir,
+            {key, value_for_ets, expire_at_ms, LFU.initial(), active_file_id, offset, value_size}
+          )
+        end)
+
+      {:error, reason} ->
+        Logger.error(
+          "AsyncApplyWorker: v2_append_batch failed for shard #{shard_index}: #{inspect(reason)}"
+        )
+    end
   end
 
   # Retrieves the active log file info from the Shard via a lightweight

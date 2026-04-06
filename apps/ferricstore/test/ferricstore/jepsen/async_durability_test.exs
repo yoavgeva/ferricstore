@@ -97,7 +97,7 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
           |> Enum.filter(&(&1 != nil))
         end)
 
-      assert length(acked_writes) > 0,
+      assert acked_writes != [],
              "At least some async writes should have succeeded"
 
       # Verify all ACKed writes are immediately readable on their writing node

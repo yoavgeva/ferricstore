@@ -430,7 +430,7 @@ defmodule Ferricstore.AuditLogTest do
       entries = AuditLog.get()
       config_entries = Enum.filter(entries, fn {_, _, type, _} -> type == :config_change end)
 
-      assert length(config_entries) >= 1
+      assert config_entries != []
       {_, _, :config_change, details} = List.first(config_entries)
       assert details.parameter == "hz"
       assert details.new_value == "50"
@@ -494,7 +494,7 @@ defmodule Ferricstore.AuditLogTest do
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
-      assert length(dangerous) >= 1
+      assert dangerous != []
       {_, _, :dangerous_command, details} = List.first(dangerous)
       assert details.command == "FLUSHDB"
     end
@@ -511,7 +511,7 @@ defmodule Ferricstore.AuditLogTest do
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
-      assert length(dangerous) >= 1
+      assert dangerous != []
       {_, _, :dangerous_command, details} = List.first(dangerous)
       assert details.command == "FLUSHALL"
     end
@@ -528,7 +528,7 @@ defmodule Ferricstore.AuditLogTest do
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
-      assert length(dangerous) >= 1
+      assert dangerous != []
       {_, _, :dangerous_command, details} = List.first(dangerous)
       assert details.args == ["ASYNC"]
     end
@@ -552,7 +552,7 @@ defmodule Ferricstore.AuditLogTest do
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
-      assert length(dangerous) >= 1
+      assert dangerous != []
       {_, _, :dangerous_command, details} = List.first(dangerous)
       assert details.command == "DEBUG"
       assert details.args == ["SLEEP", "0"]
@@ -566,13 +566,13 @@ defmodule Ferricstore.AuditLogTest do
       ShardHelpers.eventually(fn ->
         entries = AuditLog.get()
         dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
-        length(dangerous) >= 1
+        dangerous != []
       end, "dangerous_command audit entry not recorded", 20, 10)
 
       entries = AuditLog.get()
       dangerous = Enum.filter(entries, fn {_, _, type, _} -> type == :dangerous_command end)
       # Should log both "DEBUG FLUSHALL" and "FLUSHALL"
-      assert length(dangerous) >= 1
+      assert dangerous != []
     end
   end
 

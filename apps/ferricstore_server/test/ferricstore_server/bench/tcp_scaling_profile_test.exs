@@ -26,7 +26,7 @@ defmodule FerricstoreServer.Bench.TcpScalingProfileTest do
       sched_start = :erlang.statistics(:scheduler_wall_time)
       {red_start, _} = :erlang.statistics(:reductions)
 
-      workers = for c <- 1..num_conn do
+      workers = for _c <- 1..num_conn do
         Task.async(fn ->
           {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: :raw, buffer: 1_048_576])
           :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")

@@ -139,7 +139,7 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
       Logger.info("[5-node] Baseline complete")
 
       # Phase 3: start concurrent writers, then do rolling rotation
-      leader_ref = :atomics.new(1, [])
+      _leader_ref = :atomics.new(1, [])
       # Store leader index in atomics for the writers to read
       # We'll use an Agent instead for the mutable leader reference.
       {:ok, leader_agent} = Agent.start_link(fn -> leader end)

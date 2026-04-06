@@ -14,7 +14,7 @@ defmodule Ferricstore.Commands.CommandTest do
       result = Server.handle("COMMAND", [], MockStore.make())
 
       assert is_list(result)
-      assert length(result) > 0
+      assert result != []
 
       # Each entry should be a list of 6 elements: [name, arity, flags, first_key, last_key, step]
       Enum.each(result, fn entry ->
@@ -60,7 +60,7 @@ defmodule Ferricstore.Commands.CommandTest do
       result = Server.handle("COMMAND", ["LIST"], MockStore.make())
 
       assert is_list(result)
-      assert length(result) > 0
+      assert result != []
       assert Enum.all?(result, &is_binary/1)
     end
 

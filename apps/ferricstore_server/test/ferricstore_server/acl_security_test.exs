@@ -290,32 +290,32 @@ defmodule FerricstoreServer.AclSecurityTest do
     end
 
     test "localhost? recognizes IPv4 loopback" do
-      assert Acl.localhost?({{127, 0, 0, 1}, 12345})
+      assert Acl.localhost?({{127, 0, 0, 1}, 12_345})
     end
 
     test "localhost? recognizes IPv6 loopback" do
-      assert Acl.localhost?({{0, 0, 0, 0, 0, 0, 0, 1}, 12345})
+      assert Acl.localhost?({{0, 0, 0, 0, 0, 0, 0, 1}, 12_345})
     end
 
     test "localhost? rejects non-loopback IPv4" do
-      refute Acl.localhost?({{192, 168, 1, 1}, 12345})
-      refute Acl.localhost?({{10, 0, 0, 1}, 12345})
+      refute Acl.localhost?({{192, 168, 1, 1}, 12_345})
+      refute Acl.localhost?({{10, 0, 0, 1}, 12_345})
     end
 
     test "localhost? rejects non-loopback IPv6" do
-      refute Acl.localhost?({{0, 0, 0, 0, 0, 0, 0, 2}, 12345})
+      refute Acl.localhost?({{0, 0, 0, 0, 0, 0, 0, 2}, 12_345})
     end
 
     test "check_protected_mode allows localhost regardless of config" do
       Application.put_env(:ferricstore, :protected_mode, true)
 
-      assert :ok = Acl.check_protected_mode({{127, 0, 0, 1}, 12345})
+      assert :ok = Acl.check_protected_mode({{127, 0, 0, 1}, 12_345})
     end
 
     test "check_protected_mode rejects non-localhost when no configured users" do
       Application.put_env(:ferricstore, :protected_mode, true)
 
-      assert {:error, msg} = Acl.check_protected_mode({{192, 168, 1, 1}, 12345})
+      assert {:error, msg} = Acl.check_protected_mode({{192, 168, 1, 1}, 12_345})
       assert msg =~ "DENIED"
       assert msg =~ "protected mode"
     end
@@ -324,13 +324,13 @@ defmodule FerricstoreServer.AclSecurityTest do
       Application.put_env(:ferricstore, :protected_mode, true)
 
       assert :ok = Acl.set_user("admin", ["on", ">s3cret"])
-      assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12345})
+      assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12_345})
     end
 
     test "check_protected_mode allows everything when protected_mode is false" do
       Application.put_env(:ferricstore, :protected_mode, false)
 
-      assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12345})
+      assert :ok = Acl.check_protected_mode({{192, 168, 1, 1}, 12_345})
     end
 
     test "check_protected_mode with nil peer is treated as non-localhost" do
@@ -419,7 +419,7 @@ defmodule FerricstoreServer.AclSecurityTest do
 
       entries = AuditLog.get()
       denied_entries = Enum.filter(entries, fn {_, _, type, _} -> type == :command_denied end)
-      assert length(denied_entries) >= 1
+      assert denied_entries != []
 
       {_, _, :command_denied, details} = hd(denied_entries)
       assert details.username == "alice"

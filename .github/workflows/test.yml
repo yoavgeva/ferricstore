@@ -82,8 +82,11 @@ jobs:
           cp "$SRC" apps/ferricstore/priv/native/libferricstore_bitcask.so
           cp "$SRC" apps/ferricstore/priv/native/ferricstore_bitcask.so
 
-      - name: Compile
-        run: mix compile
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Credo (strict, zero warnings)
+        run: mix credo --strict
 
       - name: Run tests (excluding shard-kill)
         run: mix test --trace --timeout 30000

@@ -118,7 +118,7 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
         end
         |> Enum.reject(&is_nil/1)
 
-      assert length(n3_writes) > 0, "n3 should be able to write in single-node mode"
+      assert n3_writes != [], "n3 should be able to write in single-node mode"
 
       # Heal partition
       ClusterHelper.heal_partition(n3, nodes)

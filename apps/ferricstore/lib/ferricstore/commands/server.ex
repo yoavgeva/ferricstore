@@ -415,9 +415,7 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp info_string(section, store) when section in ["all", "everything"] do
-    @all_sections
-    |> Enum.map(fn s -> build_section(s, store) end)
-    |> Enum.join("\r\n")
+    Enum.map_join(@all_sections, "\r\n", fn s -> build_section(s, store) end)
   end
 
   defp info_string(section, store) when section in @all_sections do

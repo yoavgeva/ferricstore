@@ -542,7 +542,7 @@ defmodule Ferricstore.Commands.GeoTest do
 
       # Each entry should be [member, [lng, lat]]
       assert is_list(result)
-      assert length(result) >= 1
+      assert result != []
 
       [first_entry | _] = result
       assert is_list(first_entry)

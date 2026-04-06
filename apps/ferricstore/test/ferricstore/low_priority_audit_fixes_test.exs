@@ -143,7 +143,7 @@ defmodule Ferricstore.LowPriorityAuditFixesTest do
 
       # INCR three times: result should be 3, not some other value
       shard_idx = Router.shard_for(FerricStore.Instance.get(:default), "multi_order")
-      shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      _shard = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
 
       # Execute through the shard's transaction path
       commands = [

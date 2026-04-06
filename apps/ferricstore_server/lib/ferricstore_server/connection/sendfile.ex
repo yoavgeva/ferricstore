@@ -1,5 +1,5 @@
 defmodule FerricstoreServer.Connection.Sendfile do
-  @moduledoc false
+  @moduledoc "Zero-copy sendfile optimization for large GET responses over ranch_tcp."
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Store.Router
@@ -38,35 +38,32 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
     case Router.get_with_file_ref(state.instance_ctx, lookup_key) do
       {:hot, value} ->
-        result = value
-        new_state = ConnTracking.maybe_track_read("GET", [lookup_key], result, state)
-        ConnTracking.maybe_notify_keyspace("GET", [lookup_key], result)
-        ConnTracking.maybe_notify_tracking("GET", [lookup_key], result, state)
-        {:continue, Encoder.encode(result), new_state}
+        encode_get_result(value, lookup_key, state)
 
       {:cold_ref, path, offset, size} when size >= @sendfile_threshold_bytes ->
-        case do_sendfile_get(key, path, offset, size, state) do
-          {:sent, new_state} -> {:continue, "", new_state}
-          {:error_after_header, _reason} -> {:quit, "", state}
-          :fallback -> dispatch_normal_fn.("GET", [key], state)
-        end
+        handle_sendfile_result(do_sendfile_get(key, path, offset, size, state), key, state, dispatch_normal_fn)
 
       {:cold_ref, _path, _offset, _size} ->
-        # Cold but below sendfile threshold -- read from Bitcask via GenServer
         dispatch_normal_fn.("GET", [key], state)
 
       {:cold_value, value} ->
-        result = value
-        new_state = ConnTracking.maybe_track_read("GET", [lookup_key], result, state)
-        ConnTracking.maybe_notify_keyspace("GET", [lookup_key], result)
-        ConnTracking.maybe_notify_tracking("GET", [lookup_key], result, state)
-        {:continue, Encoder.encode(result), new_state}
+        encode_get_result(value, lookup_key, state)
 
       :miss ->
-        # Fall back to normal dispatch for type checking (WRONGTYPE on non-string keys)
         dispatch_normal_fn.("GET", [key], state)
     end
   end
+
+  defp encode_get_result(value, lookup_key, state) do
+    new_state = ConnTracking.maybe_track_read("GET", [lookup_key], value, state)
+    ConnTracking.maybe_notify_keyspace("GET", [lookup_key], value)
+    ConnTracking.maybe_notify_tracking("GET", [lookup_key], value, state)
+    {:continue, Encoder.encode(value), new_state}
+  end
+
+  defp handle_sendfile_result({:sent, new_state}, _key, _state, _fn), do: {:continue, "", new_state}
+  defp handle_sendfile_result({:error_after_header, _reason}, _key, state, _fn), do: {:quit, "", state}
+  defp handle_sendfile_result(:fallback, key, state, dispatch_normal_fn), do: dispatch_normal_fn.("GET", [key], state)
 
   defp do_sendfile_get(key, path, offset, size, state) do
     socket = state.socket
@@ -74,42 +71,46 @@ defmodule FerricstoreServer.Connection.Sendfile do
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
         try do
-          # RESP3 bulk string: $<len>\r\n<data>\r\n
-          header = [?$, Integer.to_string(size), "\r\n"]
-          trailer = "\r\n"
-
-          set_cork(socket, true)
-
-          case :gen_tcp.send(socket, header) do
-            :ok ->
-              case :file.sendfile(fd, socket, offset, size, []) do
-                {:ok, _sent} ->
-                  case :gen_tcp.send(socket, trailer) do
-                    :ok ->
-                      set_cork(socket, false)
-                      new_state = ConnTracking.maybe_track_read("GET", [key], :sendfile_ok, state)
-                      {:sent, new_state}
-
-                    {:error, reason} ->
-                      set_cork(socket, false)
-                      {:error_after_header, reason}
-                  end
-
-                {:error, reason} ->
-                  set_cork(socket, false)
-                  {:error_after_header, reason}
-              end
-
-            {:error, _} ->
-              set_cork(socket, false)
-              :fallback
-          end
+          send_with_cork(socket, fd, offset, size, key, state)
         after
           :file.close(fd)
         end
 
       {:error, _} ->
         :fallback
+    end
+  end
+
+  defp send_with_cork(socket, fd, offset, size, key, state) do
+    header = [?$, Integer.to_string(size), "\r\n"]
+    set_cork(socket, true)
+
+    case :gen_tcp.send(socket, header) do
+      :ok ->
+        result = send_file_and_trailer(socket, fd, offset, size, key, state)
+        set_cork(socket, false)
+        result
+
+      {:error, _} ->
+        set_cork(socket, false)
+        :fallback
+    end
+  end
+
+  defp send_file_and_trailer(socket, fd, offset, size, key, state) do
+    case :file.sendfile(fd, socket, offset, size, []) do
+      {:ok, _sent} ->
+        case :gen_tcp.send(socket, "\r\n") do
+          :ok ->
+            new_state = ConnTracking.maybe_track_read("GET", [key], :sendfile_ok, state)
+            {:sent, new_state}
+
+          {:error, reason} ->
+            {:error_after_header, reason}
+        end
+
+      {:error, reason} ->
+        {:error_after_header, reason}
     end
   end
 

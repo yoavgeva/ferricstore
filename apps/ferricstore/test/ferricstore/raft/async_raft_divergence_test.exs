@@ -17,7 +17,6 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.MemoryGuard
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

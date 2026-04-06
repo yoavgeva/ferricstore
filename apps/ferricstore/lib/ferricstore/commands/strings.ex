@@ -136,9 +136,7 @@ defmodule Ferricstore.Commands.Strings do
   end
 
   def handle("MSET", args, store) do
-    if not even_length?(args) do
-      {:error, "ERR wrong number of arguments for 'mset' command"}
-    else
+    if even_length?(args) do
       # Direct recursive processing avoids chunked enumeration intermediate lists.
       case mset_validate(args) do
         :ok ->
@@ -148,6 +146,8 @@ defmodule Ferricstore.Commands.Strings do
         {:error, _} = err ->
           err
       end
+    else
+      {:error, "ERR wrong number of arguments for 'mset' command"}
     end
   end
 
@@ -281,7 +281,12 @@ defmodule Ferricstore.Commands.Strings do
   # ---------------------------------------------------------------------------
 
   def handle("SETNX", [key, value], store) do
-    if Ops.exists?(store, key), do: 0, else: (Ops.put(store, key, value, 0); 1)
+    if Ops.exists?(store, key) do
+      0
+    else
+      Ops.put(store, key, value, 0)
+      1
+    end
   end
 
   def handle("SETNX", _args, _store),
@@ -385,9 +390,7 @@ defmodule Ferricstore.Commands.Strings do
     do: {:error, "ERR wrong number of arguments for 'msetnx' command"}
 
   def handle("MSETNX", args, store) do
-    if not even_length?(args) do
-      {:error, "ERR wrong number of arguments for 'msetnx' command"}
-    else
+    if even_length?(args) do
       # Check ALL keys first — if any exist, set none
       if msetnx_any_exists?(args, store) do
         0
@@ -395,6 +398,8 @@ defmodule Ferricstore.Commands.Strings do
         mset_exec(args, store)
         1
       end
+    else
+      {:error, "ERR wrong number of arguments for 'msetnx' command"}
     end
   end
 
@@ -510,7 +515,6 @@ defmodule Ferricstore.Commands.Strings do
             cond do
               val == :infinity -> :error
               val == :neg_infinity -> :error
-              val != val -> :error  # NaN check
               true -> {:ok, val}
             end
 

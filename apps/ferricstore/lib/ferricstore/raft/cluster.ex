@@ -117,86 +117,68 @@ defmodule Ferricstore.Raft.Cluster do
 
     case :ra.start_server(ra_sys, server_config) do
       :ok ->
-        # Trigger election so single-node becomes leader immediately
-        :ra.trigger_election(server_id)
-        wait_for_leader(server_id)
+        trigger_and_wait(server_id)
 
       {:error, {:already_started, _pid}} ->
-        # ra server already running -- this happens when a shard GenServer was
-        # killed (Process.exit :kill bypasses terminate/2) and the supervisor
-        # restarts it. The ra server process is still alive but holds stale
-        # machine_config (old ETS ref, old Bitcask path).
-        #
-        # Strategy: stop the old ra server gracefully, then restart it with
-        # the SAME UID so it replays the WAL and recovers all committed state.
-        # We must NOT force_delete -- that would destroy the WAL/snapshot data.
-        Logger.info("ra server for shard #{shard_index} already running, stopping and restarting with same UID")
-        _ = :ra.stop_server(ra_sys, server_id)
-
-        # Wait for the ra process to fully terminate before restarting.
-        Process.sleep(100)
-
-        case :ra.start_server(ra_sys, server_config) do
-          :ok ->
-            :ra.trigger_election(server_id)
-            wait_for_leader(server_id)
-
-          {:error, :not_new} ->
-            # The server data directory already exists (expected after stop).
-            # Use restart_server which re-opens existing state.
-            case :ra.restart_server(ra_sys, server_id) do
-              :ok ->
-                :ra.trigger_election(server_id)
-                wait_for_leader(server_id)
-
-              {:error, restart_reason} = err ->
-                Logger.error(
-                  "Failed to restart ra server for shard #{shard_index}: #{inspect(restart_reason)}"
-                )
-
-                err
-            end
-
-          {:error, retry_reason} = err ->
-            Logger.error(
-              "Failed to start ra server (after stop) for shard #{shard_index}: #{inspect(retry_reason)}"
-            )
-
-            err
-        end
+        handle_already_started(ra_sys, server_id, server_config, shard_index)
 
       {:error, reason} ->
-        # Any other error (e.g. :not_new, :shutdown from corrupt log,
-        # {:corrupt_log, ...}). Force-delete and start fresh with a unique
-        # UID to avoid WAL entry conflicts from previous incarnations.
-        Logger.warning(
-          "ra server for shard #{shard_index} failed with #{inspect(reason)}, " <>
-            "attempting fresh start with unique UID"
-        )
+        handle_start_error(ra_sys, server_id, server_config, shard_index, reason)
+    end
+  end
 
-        _ = :ra.stop_server(ra_sys, server_id)
-        _ = :ra.force_delete_server(ra_sys, server_id)
+  defp trigger_and_wait(server_id) do
+    :ra.trigger_election(server_id)
+    wait_for_leader(server_id)
+  end
 
-        restart_uid = shard_uid(shard_index) <> "_#{System.unique_integer([:positive])}"
+  defp handle_already_started(ra_sys, server_id, server_config, shard_index) do
+    Logger.info("ra server for shard #{shard_index} already running, stopping and restarting with same UID")
+    _ = :ra.stop_server(ra_sys, server_id)
+    Process.sleep(100)
 
-        restart_config = %{
-          server_config
-          | uid: restart_uid,
-            log_init_args: %{uid: restart_uid}
-        }
+    case :ra.start_server(ra_sys, server_config) do
+      :ok ->
+        trigger_and_wait(server_id)
 
-        case :ra.start_server(ra_sys, restart_config) do
-          :ok ->
-            :ra.trigger_election(server_id)
-            wait_for_leader(server_id)
+      {:error, :not_new} ->
+        restart_existing_server(ra_sys, server_id, shard_index)
 
-          {:error, retry_reason} = err ->
-            Logger.error(
-              "Failed to start ra server (recovery) for shard #{shard_index}: #{inspect(retry_reason)}"
-            )
+      {:error, retry_reason} = err ->
+        Logger.error("Failed to start ra server (after stop) for shard #{shard_index}: #{inspect(retry_reason)}")
+        err
+    end
+  end
 
-            err
-        end
+  defp restart_existing_server(ra_sys, server_id, shard_index) do
+    case :ra.restart_server(ra_sys, server_id) do
+      :ok ->
+        trigger_and_wait(server_id)
+
+      {:error, restart_reason} = err ->
+        Logger.error("Failed to restart ra server for shard #{shard_index}: #{inspect(restart_reason)}")
+        err
+    end
+  end
+
+  defp handle_start_error(ra_sys, server_id, server_config, shard_index, reason) do
+    Logger.warning(
+      "ra server for shard #{shard_index} failed with #{inspect(reason)}, " <>
+        "attempting fresh start with unique UID"
+    )
+    _ = :ra.stop_server(ra_sys, server_id)
+    _ = :ra.force_delete_server(ra_sys, server_id)
+
+    restart_uid = shard_uid(shard_index) <> "_#{System.unique_integer([:positive])}"
+    restart_config = %{server_config | uid: restart_uid, log_init_args: %{uid: restart_uid}}
+
+    case :ra.start_server(ra_sys, restart_config) do
+      :ok ->
+        trigger_and_wait(server_id)
+
+      {:error, retry_reason} = err ->
+        Logger.error("Failed to start ra server (recovery) for shard #{shard_index}: #{inspect(retry_reason)}")
+        err
     end
   end
 

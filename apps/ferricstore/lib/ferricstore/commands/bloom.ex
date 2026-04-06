@@ -37,25 +37,13 @@ defmodule Ferricstore.Commands.Bloom do
   def handle("BF.RESERVE", [key, error_rate_str, capacity_str], store) do
     with {:ok, error_rate} <- parse_float(error_rate_str, "error_rate"),
          {:ok, capacity} <- parse_pos_integer(capacity_str, "capacity"),
-         :ok <- validate_error_rate(error_rate) do
-      if bloom_file_exists?(key, store) do
-        {:error, "ERR item exists"}
-      else
-        {num_bits, num_hashes} = compute_params(capacity, error_rate)
-        meta = {:bloom_meta, %{path: prob_path(store, key, "bloom"),
-                                num_bits: num_bits, num_hashes: num_hashes,
-                                capacity: capacity, error_rate: error_rate}}
-        result = do_prob_write(store, {:bloom_create, key, num_bits, num_hashes, meta})
-        case result do
-          {:ok, _} -> :ok
-          :ok -> :ok
-          other -> other
-        end
-      end
+         :ok <- validate_error_rate(error_rate),
+         :ok <- check_bloom_not_exists(key, store) do
+      do_bloom_reserve(key, capacity, error_rate, store)
     end
   end
 
-  def handle("BF.RESERVE", _args, _store) do
+    def handle("BF.RESERVE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.reserve' command"}
   end
 
@@ -225,6 +213,23 @@ defmodule Ferricstore.Commands.Bloom do
   # Private helpers
   # ---------------------------------------------------------------------------
 
+  defp check_bloom_not_exists(key, store) do
+    if bloom_file_exists?(key, store), do: {:error, "ERR item exists"}, else: :ok
+  end
+
+  defp do_bloom_reserve(key, capacity, error_rate, store) do
+    {num_bits, num_hashes} = compute_params(capacity, error_rate)
+    meta = {:bloom_meta, %{path: prob_path(store, key, "bloom"),
+                            num_bits: num_bits, num_hashes: num_hashes,
+                            capacity: capacity, error_rate: error_rate}}
+    result = do_prob_write(store, {:bloom_create, key, num_bits, num_hashes, meta})
+    case result do
+      {:ok, _} -> :ok
+      :ok -> :ok
+      other -> other
+    end
+  end
+
   defp compute_params(capacity, error_rate) do
     num_bits = optimal_num_bits(capacity, error_rate)
     num_hashes = optimal_num_hashes(num_bits, capacity)
@@ -314,46 +319,44 @@ defmodule Ferricstore.Commands.Bloom do
   end
 
   defp recover_bloom_meta(key, store, num_bits, num_hashes) do
-    # Try to read metadata from Bitcask (stored during BF.RESERVE)
-    meta =
-      case Map.get(store, :get) do
-        nil -> nil
-        get_fn ->
-          case get_fn.(key) do
-            nil -> nil
-            value when is_binary(value) ->
-              try do
-                case :erlang.binary_to_term(value) do
-                  {:bloom_meta, %{capacity: c, error_rate: e}} -> {c, e}
-                  _ -> nil
-                end
-              rescue
-                _ -> nil
-              end
-            _ -> nil
-          end
-      end
-
-    case meta do
+    case fetch_stored_meta(key, store) do
       {capacity, error_rate} -> {capacity, error_rate}
-      nil ->
-        # Derive from num_bits/num_hashes (inverse formula)
-        capacity =
-          if num_hashes > 0 do
-            max(1, round(num_bits * :math.log(2) / num_hashes))
-          else
-            @default_capacity
-          end
-
-        error_rate =
-          if capacity > 0 do
-            :math.exp(-num_bits * :math.pow(:math.log(2), 2) / capacity)
-          else
-            @default_error_rate
-          end
-
-        {capacity, error_rate}
+      nil -> derive_bloom_params(num_bits, num_hashes)
     end
+  end
+
+  defp fetch_stored_meta(key, store) do
+    case Map.get(store, :get) do
+      nil -> nil
+      get_fn -> parse_stored_meta(get_fn.(key))
+    end
+  end
+
+  defp parse_stored_meta(nil), do: nil
+  defp parse_stored_meta(value) when is_binary(value) do
+    try do
+      case :erlang.binary_to_term(value) do
+        {:bloom_meta, %{capacity: c, error_rate: e}} -> {c, e}
+        _ -> nil
+      end
+    rescue
+      _ -> nil
+    end
+  end
+  defp parse_stored_meta(_), do: nil
+
+  defp derive_bloom_params(num_bits, num_hashes) do
+    capacity =
+      if num_hashes > 0,
+        do: max(1, round(num_bits * :math.log(2) / num_hashes)),
+        else: @default_capacity
+
+    error_rate =
+      if capacity > 0,
+        do: :math.exp(-num_bits * :math.pow(:math.log(2), 2) / capacity),
+        else: @default_error_rate
+
+    {capacity, error_rate}
   end
 
   # ---------------------------------------------------------------------------

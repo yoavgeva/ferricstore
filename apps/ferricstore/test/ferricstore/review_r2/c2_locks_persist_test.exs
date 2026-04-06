@@ -9,7 +9,6 @@ defmodule Ferricstore.ReviewR2.C2LocksPersistTest do
   @moduletag :shard_kill
 
   alias Ferricstore.Raft.Cluster
-  alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
   setup do

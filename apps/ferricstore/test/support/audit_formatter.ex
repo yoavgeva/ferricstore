@@ -158,10 +158,10 @@ defmodule Ferricstore.Test.AuditFormatter do
             if length(a) < max * 3, do: [k | a], else: throw(:enough)
           _, a -> a
           end, acc, :"keydir_#{i}")
-        catch
-          :throw, :enough -> acc
         rescue
           _ -> acc
+        catch
+          :throw, :enough -> acc
         end
       end)
 

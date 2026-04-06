@@ -16,7 +16,7 @@ defmodule FerricstoreServer.Bench.TcpWriteBenchTest do
     configs = [{1, 1}, {1, 10}, {5, 1}, {5, 10}, {5, 50}, {10, 10}, {10, 50}, {25, 10}, {50, 10}]
 
     for {num_conn, pipeline} <- configs do
-      batch = build_set_pipeline(prefix, pipeline)
+      _batch = build_set_pipeline(prefix, pipeline)
       stop = :atomics.new(1, [])
       counter = :counters.new(1, [:atomics])
 

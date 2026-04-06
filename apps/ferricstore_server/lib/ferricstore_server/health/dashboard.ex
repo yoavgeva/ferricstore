@@ -1450,9 +1450,7 @@ defmodule FerricstoreServer.Health.Dashboard do
           case rs.members do
             [] -> "-"
             members ->
-              members
-              |> Enum.map(fn {name, n} -> "#{name}@#{n}" end)
-              |> Enum.join(", ")
+              Enum.map_join(members, ", ", fn {name, n} -> "#{name}@#{n}" end)
           end
 
         lag = rs.commit_index - rs.last_applied

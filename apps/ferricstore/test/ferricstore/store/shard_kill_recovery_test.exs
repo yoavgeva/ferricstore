@@ -274,7 +274,7 @@ defmodule Ferricstore.Store.ShardKillRecoveryTest do
       # After wait_shards_alive, init/1 has completed and the keydir is
       # rebuilt from Bitcask. The key we wrote should be in the keydir.
       eventually(fn ->
-        info = :ets.info(:"keydir_0", :size)
+        info = :ets.info(:keydir_0, :size)
         is_integer(info) and info > 0
       end, "ETS keydir should be rebuilt with size > 0 after shard recovery")
     end

@@ -52,12 +52,12 @@ defmodule Ferricstore.Commands.Hash do
   def handle("HSET", [key, _f, _v | _] = args, store) do
     [_ | field_value_pairs] = args
 
-    if not even_length?(field_value_pairs) do
-      {:error, "ERR wrong number of arguments for 'hset' command"}
-    else
+    if even_length?(field_value_pairs) do
       with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
         hset_pairs(field_value_pairs, key, store, 0)
       end
+    else
+      {:error, "ERR wrong number of arguments for 'hset' command"}
     end
   end
 
@@ -584,13 +584,13 @@ defmodule Ferricstore.Commands.Hash do
     [_, _ | field_value_pairs] = args
 
     with {:ok, seconds} <- parse_positive_integer(seconds_str, "seconds") do
-      if not even_length?(field_value_pairs) do
-        {:error, "ERR wrong number of arguments for 'hsetex' command"}
-      else
+      if even_length?(field_value_pairs) do
         with :ok <- TypeRegistry.check_or_set(key, :hash, store) do
           expire_at_ms = System.os_time(:millisecond) + seconds * 1000
           hset_pairs_with_ttl(field_value_pairs, key, store, expire_at_ms, 0)
         end
+      else
+        {:error, "ERR wrong number of arguments for 'hsetex' command"}
       end
     end
   end

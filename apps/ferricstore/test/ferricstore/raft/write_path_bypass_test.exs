@@ -347,7 +347,10 @@ defmodule Ferricstore.Raft.WritePathBypassTest do
         end
 
       results = Task.await_many(tasks, 30_000)
-      assert Enum.all?(results, fn {:ok, _} -> true; _ -> false end)
+      assert Enum.all?(results, fn
+        {:ok, _} -> true
+        _ -> false
+      end)
 
       assert "50" == Router.get(FerricStore.Instance.get(:default), k)
     end

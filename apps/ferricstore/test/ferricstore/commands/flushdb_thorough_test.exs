@@ -125,28 +125,30 @@ defmodule Ferricstore.Commands.FlushdbThoroughTest do
     end
   end
 
-  describe "FLUSHDB via TCP" do
-    @tag :skip
-    # TCP listener (ranch) is not started in embedded mode
-    test "FLUSHDB over TCP clears all keys" do
-      port = FerricstoreServer.Listener.port()
+  if Code.ensure_loaded?(FerricstoreServer.Listener) do
+    describe "FLUSHDB via TCP" do
+      @tag :skip
+      # TCP listener (ranch) is not started in embedded mode
+      test "FLUSHDB over TCP clears all keys" do
+        port = FerricstoreServer.Listener.port()
 
-      for i <- 1..50, do: Router.put(FerricStore.Instance.get(:default), "tcp_flush:#{i}", "val", 0)
-      FerricStore.hset("tcp_flush:hash", %{"f" => "v"})
+        for i <- 1..50, do: Router.put(FerricStore.Instance.get(:default), "tcp_flush:#{i}", "val", 0)
+        FerricStore.hset("tcp_flush:hash", %{"f" => "v"})
 
-      assert ets_total_keys() > 50
+        assert ets_total_keys() > 50
 
-      {:ok, sock} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
-      :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
-      {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
+        {:ok, sock} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
+        :gen_tcp.send(sock, "*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+        {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
 
-      :gen_tcp.send(sock, "*1\r\n$7\r\nFLUSHDB\r\n")
-      {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
+        :gen_tcp.send(sock, "*1\r\n$7\r\nFLUSHDB\r\n")
+        {:ok, _} = :gen_tcp.recv(sock, 0, 5000)
 
-      :gen_tcp.close(sock)
+        :gen_tcp.close(sock)
 
-      assert ets_total_keys() == 0
-      assert Router.dbsize(FerricStore.Instance.get(:default)) == 0
+        assert ets_total_keys() == 0
+        assert Router.dbsize(FerricStore.Instance.get(:default)) == 0
+      end
     end
   end
 
