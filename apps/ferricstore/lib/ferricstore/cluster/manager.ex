@@ -260,14 +260,16 @@ defmodule Ferricstore.Cluster.Manager do
     sync_result = try_snapshot_then_direct(target_node, ctx)
 
     case sync_result do
-      :ok ->
+      {:ok, sync_indices} ->
         # Step 3: Add target to our Raft groups.
         {raft_result, _shard_results} = do_add_node(target_node, membership, state)
 
         case raft_result do
           :ok ->
             # Step 4: Start ra servers on target as followers.
-            start_raft_on_target(target_node, state.shard_count)
+            # Pass sync_indices so the state machine skips entries already
+            # present in the copied Bitcask data.
+            start_raft_on_target(target_node, state.shard_count, sync_indices)
             Logger.info("ClusterManager: #{target_node} fully joined and synced")
             :ok
 
@@ -345,16 +347,21 @@ defmodule Ferricstore.Cluster.Manager do
         case Ferricstore.Cluster.DataSync.wal_bridgeable?(snapshot_raft_index, leader_first_index) do
           :wal_bridgeable ->
             Logger.info("Shard #{shard_idx}: snapshot at index #{snapshot_raft_index}, leader WAL from #{leader_first_index} — bridgeable")
-            :ok
+            {shard_idx, snapshot_raft_index}
 
           :needs_resync ->
             Logger.warning("Shard #{shard_idx}: snapshot STALE at index #{snapshot_raft_index}, leader WAL starts at #{leader_first_index} — direct copy needed")
-            Ferricstore.Cluster.DataSync.sync_shard(shard_idx, target_node, ctx)
+            case Ferricstore.Cluster.DataSync.sync_shard(shard_idx, target_node, ctx) do
+              {:ok, raft_idx} -> {shard_idx, raft_idx}
+              _ -> {shard_idx, 0}
+            end
         end
       end
 
-    if Enum.all?(results, fn r -> r == :ok or match?({:ok, _}, r) end) do
-      :ok
+    sync_indices = for {idx, raft_idx} <- results, into: %{}, do: {idx, raft_idx}
+
+    if Enum.all?(results, fn {_, idx} -> idx > 0 end) do
+      {:ok, sync_indices}
     else
       {:error, {:partial_sync, results}}
     end
@@ -364,7 +371,16 @@ defmodule Ferricstore.Cluster.Manager do
     case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
       {:ok, sync_results} ->
         Logger.info("ClusterManager: data synced to #{target_node}: #{inspect(sync_results)}")
-        :ok
+        # Extract raft indices from sync results
+        sync_indices =
+          for {shard_idx, {:synced, detail}} <- sync_results, into: %{} do
+            case detail do
+              :wal_bridgeable -> {shard_idx, 0}
+              raft_idx when is_integer(raft_idx) -> {shard_idx, raft_idx}
+              _ -> {shard_idx, 0}
+            end
+          end
+        {:ok, sync_indices}
 
       {:error, reason} ->
         {:error, reason}
@@ -528,10 +544,9 @@ defmodule Ferricstore.Cluster.Manager do
     end
   end
 
-  defp start_raft_on_target(target_node, shard_count) do
+  defp start_raft_on_target(target_node, shard_count, sync_indices) do
     Logger.info("ClusterManager: starting Raft on #{target_node}")
 
-    # Collect all cluster members (existing nodes + the target)
     cluster_members = [node() | Node.list()] |> Enum.uniq()
     cluster_members = if target_node in cluster_members, do: cluster_members, else: [target_node | cluster_members]
 
@@ -541,15 +556,16 @@ defmodule Ferricstore.Cluster.Manager do
         shard_data_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_idx)
         keydir = elem(target_ctx.keydir_refs, shard_idx)
 
-        # Use join_shard_server which sets initial_members to the full cluster.
-        # This way ra knows to join the existing group as a follower,
-        # not create a new single-node group.
+        # skip_below_index tells the state machine to ignore entries already
+        # present in the Bitcask data copied during sync.
+        skip_idx = Map.get(sync_indices, shard_idx, 0)
+
         result = :erpc.call(target_node, Ferricstore.Raft.Cluster, :join_shard_server, [
           shard_idx, shard_data_path, 0, Path.join(shard_data_path, "00000.log"), keydir,
-          cluster_members
+          cluster_members, [skip_below_index: skip_idx]
         ])
 
-        Logger.info("ClusterManager: shard #{shard_idx} Raft joined on #{target_node}: #{inspect(result)}")
+        Logger.info("ClusterManager: shard #{shard_idx} Raft joined on #{target_node} (skip_below=#{skip_idx}): #{inspect(result)}")
       catch
         kind, reason ->
           Logger.warning("ClusterManager: shard #{shard_idx} Raft join failed on #{target_node}: #{inspect({kind, reason})}")

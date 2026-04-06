@@ -81,6 +81,7 @@ defmodule Ferricstore.Raft.Cluster do
   def join_shard_server(shard_index, shard_data_path, active_file_id, active_file_path, ets, cluster_members, opts \\ []) do
     ra_sys = Keyword.get(opts, :ra_system, @ra_system)
     membership = Keyword.get(opts, :membership, :voter)
+    skip_below_index = Keyword.get(opts, :skip_below_index, 0)
     server_id = shard_server_id(shard_index)
 
     machine_config = %{
@@ -89,7 +90,8 @@ defmodule Ferricstore.Raft.Cluster do
       active_file_id: active_file_id,
       active_file_path: active_file_path,
       ets: ets,
-      data_dir: Path.dirname(shard_data_path)
+      data_dir: Path.dirname(shard_data_path),
+      skip_below_index: skip_below_index
     }
 
     initial_members =

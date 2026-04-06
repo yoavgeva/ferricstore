@@ -119,6 +119,11 @@ defmodule Ferricstore.Raft.StateMachine do
       instance_ctx: Map.get(config, :instance_ctx),
       applied_count: 0,
       release_cursor_interval: interval,
+      # When a node joins with pre-existing Bitcask data (from direct copy or
+      # object storage snapshot), skip_below_index prevents re-applying entries
+      # that are already in Bitcask + ETS. Entries at or below this index are
+      # no-ops — the data was recovered from disk via recover_keydir.
+      skip_below_index: Map.get(config, :skip_below_index, 0),
       # Cross-shard operation locks and intents — persisted in Raft state
       # so they survive shard restarts, snapshots, and leader failovers.
       cross_shard_locks: %{},
@@ -182,6 +187,23 @@ defmodule Ferricstore.Raft.StateMachine do
 
   Returns `{new_state, result}` or `{new_state, result, effects}`.
   """
+  # Skip entries that are already in Bitcask + ETS from a data sync copy.
+  # When a node joins with pre-existing data (copied at raft_index N),
+  # entries at or below N are no-ops — avoid redundant ETS overwrites
+  # and Bitcask appends.
+  @impl true
+  def apply(%{index: idx} = meta, _command, %{skip_below_index: skip} = state)
+      when skip > 0 and idx <= skip do
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+
+    # Clear skip_below_index once we've passed it — no need to check on every apply
+    new_state =
+      if idx == skip, do: %{new_state | skip_below_index: 0}, else: new_state
+
+    maybe_release_cursor(meta, old_count, new_state, :ok)
+  end
+
   @impl true
   def apply(meta, {:put, key, value, expire_at_ms}, state) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
