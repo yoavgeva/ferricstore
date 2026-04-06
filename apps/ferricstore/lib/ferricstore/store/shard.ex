@@ -448,6 +448,11 @@ defmodule Ferricstore.Store.Shard do
     ShardTransaction.handle_tx_execute(queue, sandbox_namespace, state)
   end
 
+  # Check if a redis_key has been promoted to dedicated storage.
+  def handle_call({:promoted?, redis_key}, _from, state) do
+    {:reply, Map.has_key?(state.promoted_instances, redis_key), state}
+  end
+
   # -------------------------------------------------------------------
   # handle_call — pause/resume writes (cluster data sync)
   # -------------------------------------------------------------------

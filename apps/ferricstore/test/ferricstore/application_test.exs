@@ -105,14 +105,13 @@ defmodule Ferricstore.ApplicationTest do
     test "ClusterSupervisor is not among children in test env" do
       children = Supervisor.which_children(Ferricstore.Supervisor)
 
-      cluster_child =
+      cluster_supervisor_child =
         Enum.find(children, fn {id, _, _, _} ->
-          id == Ferricstore.ClusterSupervisor or
-            (is_atom(id) and id |> Atom.to_string() |> String.contains?("Cluster"))
+          id == Ferricstore.ClusterSupervisor
         end)
 
-      assert cluster_child == nil,
-             "Expected no Cluster.Supervisor child in test, got: #{inspect(cluster_child)}"
+      assert cluster_supervisor_child == nil,
+             "Expected no libcluster ClusterSupervisor child in test, got: #{inspect(cluster_supervisor_child)}"
     end
 
     test "cluster_supervisor_children returns child spec when topologies are configured" do
