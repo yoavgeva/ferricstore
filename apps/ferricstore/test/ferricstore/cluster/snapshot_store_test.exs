@@ -400,6 +400,46 @@ defmodule Ferricstore.Cluster.SnapshotStoreTest do
   # DataSync.needs_resync? unit tests
   # ---------------------------------------------------------------------------
 
+  describe "DataSync.wal_bridgeable? WAL gap decision" do
+    alias Ferricstore.Cluster.DataSync
+
+    test "target ahead of leader WAL start — bridgeable" do
+      assert DataSync.wal_bridgeable?(5000, 3000) == :wal_bridgeable
+    end
+
+    test "target exactly at leader WAL start — bridgeable" do
+      assert DataSync.wal_bridgeable?(3000, 3000) == :wal_bridgeable
+    end
+
+    test "target behind leader WAL start — needs resync (stale snapshot)" do
+      assert DataSync.wal_bridgeable?(1000, 3000) == :needs_resync
+    end
+
+    test "new node (index 0) with leader WAL from 0 — bridgeable" do
+      assert DataSync.wal_bridgeable?(0, 0) == :wal_bridgeable
+    end
+
+    test "new node (index 0) with leader WAL truncated — needs resync" do
+      assert DataSync.wal_bridgeable?(0, 500) == :needs_resync
+    end
+
+    test "snapshot at index 100, leader WAL from 50 — bridgeable" do
+      assert DataSync.wal_bridgeable?(100, 50) == :wal_bridgeable
+    end
+
+    test "snapshot at index 100, leader WAL from 200 — stale, needs resync" do
+      assert DataSync.wal_bridgeable?(100, 200) == :needs_resync
+    end
+
+    test "large indices — bridgeable" do
+      assert DataSync.wal_bridgeable?(1_000_000, 999_000) == :wal_bridgeable
+    end
+
+    test "large indices — stale" do
+      assert DataSync.wal_bridgeable?(999_000, 1_000_000) == :needs_resync
+    end
+  end
+
   describe "DataSync.needs_resync? file checks" do
     test "empty log file means needs resync" do
       # An empty 00000.log (created by ensure_layout) should not count as data

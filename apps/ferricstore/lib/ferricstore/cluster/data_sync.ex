@@ -18,23 +18,23 @@ defmodule Ferricstore.Cluster.DataSync do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Checks if a shard needs a full data copy or can catch up via WAL replay.
+  Pure WAL gap check: given the target's last applied index and the leader's
+  first available WAL index, determines if WAL replay can bridge the gap.
 
-  Compares the local node's last committed Raft index against the leader's
-  first available WAL index. If the local index is at or past the leader's
-  first index, the WAL contains all entries needed to catch up. Otherwise
-  a full resync (data directory copy) is required.
-
-  ## Parameters
-
-    * `shard_index` -- zero-based shard index
-    * `leader_node` -- the node currently leading this shard's Raft group
-
-  ## Returns
-
-    * `:wal_bridgeable` -- local node can catch up from WAL replay alone
-    * `:needs_resync` -- a full data directory copy is required
+  Returns `:wal_bridgeable` if `target_index >= leader_first_index`, meaning
+  the leader's WAL contains all entries the target needs to catch up.
+  Returns `:needs_resync` if the target is behind the leader's WAL start
+  (entries were truncated).
   """
+  @spec wal_bridgeable?(non_neg_integer(), non_neg_integer()) :: :wal_bridgeable | :needs_resync
+  def wal_bridgeable?(target_index, leader_first_index) do
+    if target_index >= leader_first_index do
+      :wal_bridgeable
+    else
+      :needs_resync
+    end
+  end
+
   @spec needs_resync?(non_neg_integer(), node(), node()) :: :wal_bridgeable | :needs_resync
   def needs_resync?(shard_index, target_node, leader_node) do
     # Check if the TARGET node has data files for this shard.

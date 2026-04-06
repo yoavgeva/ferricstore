@@ -298,16 +298,15 @@ defmodule Ferricstore.Cluster.Manager do
       case :erpc.call(target_node,
              Ferricstore.Cluster.SnapshotDownloader, :download_latest,
              [download_opts], 120_000) do
-        {:ok, _manifest} ->
+        {:ok, manifest} ->
           Logger.info("ClusterManager: snapshot downloaded to #{target_node}")
 
           # Rebuild keydirs from downloaded data
           Ferricstore.Cluster.DataSync.rebuild_keydirs_on_target(target_node, ctx.shard_count)
 
-          # Snapshot just downloaded — data is current as of the snapshot point.
-          # After ra starts on the target, it will replay the delta from the
-          # leader automatically. No need for per-shard WAL gap check here.
-          :ok
+          # Check each shard: can the leader's WAL bridge from the snapshot
+          # point to current? If not, that shard needs direct copy.
+          check_snapshot_wal_gaps(manifest, target_node, ctx)
 
         {:error, reason} ->
           Logger.warning("ClusterManager: snapshot download failed (#{inspect(reason)}), falling through to direct copy")
@@ -315,6 +314,49 @@ defmodule Ferricstore.Cluster.Manager do
       end
     else
       direct_sync(target_node, ctx)
+    end
+  end
+
+  # After snapshot download, check each shard's WAL gap using the manifest's
+  # raft_index (what the snapshot contains) vs the leader's first_index
+  # (oldest WAL entry). If the WAL can bridge, no direct copy needed.
+  # If stale, do direct copy for that shard.
+  defp check_snapshot_wal_gaps(manifest, target_node, ctx) do
+    shards = Map.get(manifest, "shards", [])
+
+    results =
+      for shard_info <- shards do
+        shard_idx = shard_info["index"]
+        snapshot_raft_index = shard_info["raft_index"] || 0
+
+        leader_node = Ferricstore.Cluster.DataSync.find_leader_for(shard_idx)
+        leader_server_id = Ferricstore.Raft.Cluster.shard_server_id_on(shard_idx, leader_node)
+
+        leader_first_index =
+          try do
+            case :erpc.call(leader_node, :ra, :member_overview, [leader_server_id]) do
+              {:ok, overview, _} -> Map.get(overview, :first_index, 0)
+              _ -> 0
+            end
+          catch
+            _, _ -> 0
+          end
+
+        case Ferricstore.Cluster.DataSync.wal_bridgeable?(snapshot_raft_index, leader_first_index) do
+          :wal_bridgeable ->
+            Logger.info("Shard #{shard_idx}: snapshot at index #{snapshot_raft_index}, leader WAL from #{leader_first_index} — bridgeable")
+            :ok
+
+          :needs_resync ->
+            Logger.warning("Shard #{shard_idx}: snapshot STALE at index #{snapshot_raft_index}, leader WAL starts at #{leader_first_index} — direct copy needed")
+            Ferricstore.Cluster.DataSync.sync_shard(shard_idx, target_node, ctx)
+        end
+      end
+
+    if Enum.all?(results, fn r -> r == :ok or match?({:ok, _}, r) end) do
+      :ok
+    else
+      {:error, {:partial_sync, results}}
     end
   end
 
