@@ -817,45 +817,191 @@ identically on leaders and followers.
 
 ## Configuration
 
+All cluster config is via environment variables. No config files to mount.
+
 ### Environment variables
 
 ```bash
-# Required for cluster mode
-FERRICSTORE_NODE_NAME=ferric1@10.0.0.1     # Erlang node name
-FERRICSTORE_COOKIE=my_secret_cookie          # Erlang cookie
+# --- Required for cluster mode ---
+FERRICSTORE_NODE_NAME=ferric1@ferric1       # Erlang node name (name@hostname)
+FERRICSTORE_COOKIE=my_secret_cookie          # Erlang cookie (must match all nodes)
 
-# Optional: static node list (alternative to libcluster discovery)
-FERRICSTORE_CLUSTER_NODES=ferric1@10.0.0.1,ferric2@10.0.0.2,ferric3@10.0.0.3
+# --- Cluster role ---
+FERRICSTORE_CLUSTER_ROLE=voter               # voter | replica | readonly (default: voter)
 
-# Optional: tune cluster behavior
-FERRICSTORE_CLUSTER_REMOVE_DELAY_MS=60000   # delay before removing crashed node
-FERRICSTORE_CLUSTER_SYNC_TIMEOUT_MS=300000  # max time for data sync
+# --- Node discovery ---
+FERRICSTORE_DISCOVERY=gossip                 # gossip | dns | epmd | none (default: gossip)
+FERRICSTORE_DNS_NAME=ferricstore-headless    # for discovery=dns (Kubernetes headless service)
+FERRICSTORE_CLUSTER_NODES=n1@h1,n2@h2,n3@h3 # for discovery=epmd (static list)
+
+# --- Cluster tuning ---
+FERRICSTORE_CLUSTER_REMOVE_DELAY_MS=60000    # delay before removing crashed node (default: 60s)
+
+# --- Object storage snapshots (optional) ---
+FERRICSTORE_SNAPSHOT_BUCKET=my-bucket        # enables S3 snapshots when set
+FERRICSTORE_SNAPSHOT_PREFIX=ferricstore      # S3 key prefix (default: ferricstore)
+FERRICSTORE_SNAPSHOT_INTERVAL_MS=3600000     # upload interval (default: 1 hour)
+FERRICSTORE_SNAPSHOT_RETENTION=24            # keep last N manifests (default: 24)
+FERRICSTORE_SNAPSHOT_COMPRESSION=zstd        # zstd | gzip | none (default: zstd)
 ```
 
-### libcluster config (config/prod.exs)
+### Docker Compose — 3-node cluster
 
-```elixir
-# Kubernetes
-config :libcluster,
-  topologies: [
-    ferricstore: [
-      strategy: Cluster.Strategy.Kubernetes.DNS,
-      config: [
-        service: "ferricstore-headless",
-        application_name: "ferricstore"
-      ]
-    ]
-  ]
+```yaml
+version: "3.8"
 
-# Static list
-config :libcluster,
-  topologies: [
-    ferricstore: [
-      strategy: Cluster.Strategy.Epmd,
-      config: [hosts: [:"ferric1@10.0.0.1", :"ferric2@10.0.0.2"]]
-    ]
-  ]
+services:
+  ferric1:
+    image: ferricstore:latest
+    hostname: ferric1
+    environment:
+      FERRICSTORE_NODE_NAME: ferric1@ferric1
+      FERRICSTORE_COOKIE: secret_cookie
+      FERRICSTORE_DISCOVERY: gossip
+      FERRICSTORE_DATA_DIR: /data
+    volumes:
+      - ferric1_data:/data
+    ports:
+      - "6379:6379"
+
+  ferric2:
+    image: ferricstore:latest
+    hostname: ferric2
+    environment:
+      FERRICSTORE_NODE_NAME: ferric2@ferric2
+      FERRICSTORE_COOKIE: secret_cookie
+      FERRICSTORE_DISCOVERY: gossip
+      FERRICSTORE_DATA_DIR: /data
+    volumes:
+      - ferric2_data:/data
+    ports:
+      - "6380:6379"
+
+  ferric3:
+    image: ferricstore:latest
+    hostname: ferric3
+    environment:
+      FERRICSTORE_NODE_NAME: ferric3@ferric3
+      FERRICSTORE_COOKIE: secret_cookie
+      FERRICSTORE_DISCOVERY: gossip
+      FERRICSTORE_DATA_DIR: /data
+    volumes:
+      - ferric3_data:/data
+    ports:
+      - "6381:6379"
+
+volumes:
+  ferric1_data:
+  ferric2_data:
+  ferric3_data:
 ```
+
+All three nodes auto-discover each other via UDP gossip (same Docker network).
+No static node list needed. Data persisted in Docker volumes.
+
+### Kubernetes — StatefulSet + headless service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferricstore-headless
+spec:
+  clusterIP: None
+  selector:
+    app: ferricstore
+  ports:
+    - port: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ferricstore
+spec:
+  serviceName: ferricstore-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ferricstore
+  template:
+    metadata:
+      labels:
+        app: ferricstore
+    spec:
+      containers:
+        - name: ferricstore
+          image: ferricstore:latest
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FERRICSTORE_NODE_NAME
+              value: "$(POD_NAME)@$(POD_NAME).ferricstore-headless"
+            - name: FERRICSTORE_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: ferricstore-secret
+                  key: cookie
+            - name: FERRICSTORE_DISCOVERY
+              value: dns
+            - name: FERRICSTORE_DNS_NAME
+              value: ferricstore-headless
+            - name: FERRICSTORE_DATA_DIR
+              value: /data
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+DNS discovery polls the headless service for A records. Each pod gets a stable
+hostname (`ferricstore-0.ferricstore-headless`). Persistent volumes survive
+pod restarts.
+
+### Docker Compose — with read replicas
+
+```yaml
+services:
+  # ... 3 voter nodes as above ...
+
+  replica-us-west:
+    image: ferricstore:latest
+    hostname: replica-us-west
+    environment:
+      FERRICSTORE_NODE_NAME: replica-us-west@replica-us-west
+      FERRICSTORE_COOKIE: secret_cookie
+      FERRICSTORE_CLUSTER_ROLE: replica
+      FERRICSTORE_DISCOVERY: gossip
+    volumes:
+      - replica_us_west_data:/data
+
+  replica-eu:
+    image: ferricstore:latest
+    hostname: replica-eu
+    environment:
+      FERRICSTORE_NODE_NAME: replica-eu@replica-eu
+      FERRICSTORE_COOKIE: secret_cookie
+      FERRICSTORE_CLUSTER_ROLE: readonly
+      FERRICSTORE_DISCOVERY: gossip
+    volumes:
+      - replica_eu_data:/data
+```
+
+`replica` (promotable) in same region. `readonly` (non_voter) in different region.
+
+### Standalone mode (default, no cluster)
+
+If `FERRICSTORE_NODE_NAME` is not set, FerricStore starts as a standalone
+single-node instance. No distributed Erlang, no libcluster, no Raft replication
+to other nodes. Identical to current behavior.
 
 ### Redis CLI commands
 

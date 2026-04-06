@@ -109,4 +109,93 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   # Clustering
   # ---------------------------------------------------------------------------
+
+  node_name = System.get_env("FERRICSTORE_NODE_NAME")
+  cookie = System.get_env("FERRICSTORE_COOKIE", "ferricstore")
+
+  if node_name do
+    config :ferricstore,
+      node_name: String.to_atom(node_name),
+      cookie: String.to_atom(cookie),
+      cluster_role: String.to_atom(System.get_env("FERRICSTORE_CLUSTER_ROLE", "voter")),
+      cluster_remove_delay_ms: String.to_integer(System.get_env("FERRICSTORE_CLUSTER_REMOVE_DELAY_MS", "60000"))
+
+    # Static node list (alternative to libcluster auto-discovery)
+    cluster_nodes = System.get_env("FERRICSTORE_CLUSTER_NODES", "")
+
+    if cluster_nodes != "" do
+      config :ferricstore, :cluster_nodes,
+        cluster_nodes
+        |> String.split(",", trim: true)
+        |> Enum.map(&String.to_atom/1)
+    end
+
+    # Node discovery strategy — auto-configured from env vars.
+    # Set FERRICSTORE_DISCOVERY to choose strategy:
+    #   "gossip"  — multicast UDP (default, good for Docker Compose / LAN)
+    #   "dns"     — DNS A-record polling (good for Kubernetes headless services)
+    #   "epmd"    — static node list from FERRICSTORE_CLUSTER_NODES
+    #   "none"    — disable libcluster (manual CLUSTER.JOIN only)
+    discovery = System.get_env("FERRICSTORE_DISCOVERY", "gossip")
+
+    case discovery do
+      "gossip" ->
+        config :libcluster,
+          topologies: [
+            ferricstore: [
+              strategy: Cluster.Strategy.Gossip,
+              config: [
+                secret: cookie
+              ]
+            ]
+          ]
+
+      "dns" ->
+        dns_name = System.get_env("FERRICSTORE_DNS_NAME", "ferricstore-headless")
+        config :libcluster,
+          topologies: [
+            ferricstore: [
+              strategy: Cluster.Strategy.DNSPoll,
+              config: [
+                polling_interval: 5_000,
+                query: dns_name,
+                node_basename: node_name |> to_string() |> String.split("@") |> hd()
+              ]
+            ]
+          ]
+
+      "epmd" ->
+        nodes =
+          System.get_env("FERRICSTORE_CLUSTER_NODES", "")
+          |> String.split(",", trim: true)
+          |> Enum.map(&String.to_atom/1)
+
+        config :libcluster,
+          topologies: [
+            ferricstore: [
+              strategy: Cluster.Strategy.Epmd,
+              config: [hosts: nodes]
+            ]
+          ]
+
+      "none" ->
+        config :libcluster, topologies: :disabled
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Object Storage Snapshots (optional)
+  # ---------------------------------------------------------------------------
+
+  snapshot_bucket = System.get_env("FERRICSTORE_SNAPSHOT_BUCKET")
+
+  if snapshot_bucket do
+    config :ferricstore, :snapshot_store,
+      adapter: Ferricstore.Cluster.SnapshotStore.S3,
+      bucket: snapshot_bucket,
+      prefix: System.get_env("FERRICSTORE_SNAPSHOT_PREFIX", "ferricstore"),
+      interval_ms: String.to_integer(System.get_env("FERRICSTORE_SNAPSHOT_INTERVAL_MS", "3600000")),
+      retention_count: String.to_integer(System.get_env("FERRICSTORE_SNAPSHOT_RETENTION", "24")),
+      compression: String.to_atom(System.get_env("FERRICSTORE_SNAPSHOT_COMPRESSION", "zstd"))
+  end
 end
