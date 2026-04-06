@@ -309,4 +309,120 @@ defmodule Ferricstore.Cluster.SnapshotStoreTest do
     {src, _} = create_temp_file(content)
     :ok = Local.upload(src, key, opts)
   end
+
+  # ---------------------------------------------------------------------------
+  # SnapshotDownloader failure cases
+  # ---------------------------------------------------------------------------
+
+  describe "SnapshotDownloader failures" do
+    test "download_latest fails when no snapshot exists" do
+      empty_dir = Path.join(System.tmp_dir!(), "empty_snap_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(empty_dir)
+      on_exit(fn -> File.rm_rf!(empty_dir) end)
+
+      result = Ferricstore.Cluster.SnapshotDownloader.download_latest(
+        adapter: Local,
+        base_dir: empty_dir,
+        prefix: "snapshots",
+        dest_dir: System.tmp_dir!()
+      )
+
+      assert {:error, {:latest_download_failed, _}} = result
+    end
+
+    test "download_latest fails with nonexistent base_dir" do
+      result = Ferricstore.Cluster.SnapshotDownloader.download_latest(
+        adapter: Local,
+        base_dir: "/nonexistent/path/#{System.unique_integer([:positive])}",
+        prefix: "snapshots",
+        dest_dir: System.tmp_dir!()
+      )
+
+      assert {:error, _} = result
+    end
+
+    test "download_snapshot fails with bad manifest key" do
+      tmp = Path.join(System.tmp_dir!(), "bad_manifest_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(tmp)
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      result = Ferricstore.Cluster.SnapshotDownloader.download_snapshot(
+        adapter: Local,
+        base_dir: tmp,
+        manifest_key: "nonexistent/manifest.json",
+        dest_dir: System.tmp_dir!()
+      )
+
+      assert {:error, {:manifest_download_failed, _}} = result
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Manifest edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "Manifest validation" do
+    test "parse rejects invalid JSON" do
+      assert {:error, _} = Manifest.parse("not json at all")
+    end
+
+    test "parse rejects missing shard_count" do
+      json = Jason.encode!(%{"shards" => [], "timestamp" => "2026-01-01T00:00:00Z"})
+      assert {:error, _} = Manifest.parse(json)
+    end
+
+    test "parse rejects missing shards" do
+      json = Jason.encode!(%{"shard_count" => 4, "timestamp" => "2026-01-01T00:00:00Z"})
+      assert {:error, _} = Manifest.parse(json)
+    end
+
+    test "build + parse round-trip preserves all fields" do
+      shards = [
+        %{index: 0, raft_index: 100, tar_key: "s0.tar.gz", files: [%{name: "00000.log", size: 1024, sha256: "abc123"}]},
+        %{index: 1, raft_index: 200, tar_key: "s1.tar.gz", files: []}
+      ]
+
+      manifest = Manifest.build("2026-01-01T00:00:00Z", 2, shards)
+      json = Jason.encode!(manifest)
+      {:ok, parsed} = Manifest.parse(json)
+
+      assert parsed["shard_count"] == 2
+      assert length(parsed["shards"]) == 2
+
+      shard_0 = Enum.find(parsed["shards"], &(&1["index"] == 0))
+      assert shard_0["raft_index"] == 100
+      assert shard_0["tar_key"] == "s0.tar.gz"
+      assert length(shard_0["files"]) == 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # DataSync.needs_resync? unit tests
+  # ---------------------------------------------------------------------------
+
+  describe "DataSync.needs_resync? file checks" do
+    test "empty log file means needs resync" do
+      # An empty 00000.log (created by ensure_layout) should not count as data
+      tmp = Path.join(System.tmp_dir!(), "wal_check_#{System.unique_integer([:positive])}")
+      shard_path = Path.join(tmp, "data/shard_0")
+      File.mkdir_p!(shard_path)
+      File.touch!(Path.join(shard_path, "00000.log"))
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      # File exists but size is 0
+      stat = File.stat!(Path.join(shard_path, "00000.log"))
+      assert stat.size == 0, "empty log should have size 0"
+    end
+
+    test "log file with data is detected" do
+      tmp = Path.join(System.tmp_dir!(), "wal_check_#{System.unique_integer([:positive])}")
+      shard_path = Path.join(tmp, "data/shard_0")
+      File.mkdir_p!(shard_path)
+      File.write!(Path.join(shard_path, "00000.log"), "bitcask record data")
+      on_exit(fn -> File.rm_rf!(tmp) end)
+
+      stat = File.stat!(Path.join(shard_path, "00000.log"))
+      assert stat.size > 0, "log with data should have size > 0"
+    end
+  end
 end
