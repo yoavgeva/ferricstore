@@ -708,6 +708,4 @@ config :ferricstore, :snapshot_store,
   prefix: "cluster-prod"
 ```
 
-## Open Questions
-
-1. **Sync parallelism** — Copy shards sequentially (simpler, predictable) or parallel (faster, more leader load)?
+5. **Sequential shard sync for direct copy** — copy one shard at a time. Each shard requires a brief write pause on the leader; parallel copy would pause ALL shards simultaneously (full write outage). Sequential keeps 75% of writes flowing. Object storage handles the "fast bootstrap" case — new node downloads all shards in parallel from S3 with zero leader impact, then catches up via WAL replay.
