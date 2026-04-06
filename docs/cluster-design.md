@@ -685,8 +685,11 @@ CLUSTER.FAILOVER     → trigger manual leadership transfer
 1. **Reads are always local** — every node reads from its own ETS. This is the entire point of replication. No "consistent read" mode — that would just be a proxy.
 2. **Minimum 3 nodes** — Raft requires a majority for writes. With 3 nodes, 1 can fail and writes continue (2/3 quorum). With 2 nodes, any failure blocks writes. Every serious distributed system enforces this: Redis Sentinel, etcd, CockroachDB, RabbitMQ quorum queues. ClusterManager rejects cluster formation with fewer than 3 nodes.
 
+## Design Decisions (continued)
+
+3. **Let ra elect leaders naturally** — no forced leadership distribution. ra's random election timeouts spread leaders across nodes well enough. Forced rebalancing fights Raft's election logic and adds complexity for minimal gain. Can add `CLUSTER.REBALANCE` later if needed.
+
 ## Open Questions
 
-1. **Shard leadership distribution** — Spread leaders across nodes for balanced write load, or let ra elect naturally?
-2. **Object storage library** — ExAws (mature, S3/GCS), or keep it pluggable with a behaviour?
-3. **Sync parallelism** — Copy shards sequentially (simpler, predictable) or parallel (faster, more leader load)?
+1. **Object storage library** — ExAws (mature, S3/GCS), or keep it pluggable with a behaviour?
+2. **Sync parallelism** — Copy shards sequentially (simpler, predictable) or parallel (faster, more leader load)?
