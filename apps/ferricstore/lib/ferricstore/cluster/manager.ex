@@ -254,25 +254,19 @@ defmodule Ferricstore.Cluster.Manager do
     ctx = FerricStore.Instance.get(:default)
 
     # Step 1: Stop ra servers on the target node.
-    # The target started with its own single-node Raft groups (each shard is
-    # its own leader). We must stop these before adding the target to our
-    # cluster's Raft groups — otherwise two independent leaders for the same
-    # shard cause "leader saw append_entries_rpc for same term" errors.
     stop_raft_on_target(target_node, state.shard_count)
 
-    # Step 2: Sync data — copies Bitcask files from leader to target.
-    case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
-      {:ok, sync_results} ->
-        Logger.info("ClusterManager: data synced to #{target_node}: #{inspect(sync_results)}")
+    # Step 2: Try object storage first, fall through to direct copy.
+    sync_result = try_snapshot_then_direct(target_node, ctx)
 
+    case sync_result do
+      :ok ->
         # Step 3: Add target to our Raft groups.
         {raft_result, _shard_results} = do_add_node(target_node, membership, state)
 
         case raft_result do
           :ok ->
-            # Step 4: Start ra servers on target that join the cluster's groups.
-            # join_shard_server uses the full cluster member list so ra knows
-            # to join as follower, not create a new group.
+            # Step 4: Start ra servers on target as followers.
             start_raft_on_target(target_node, state.shard_count)
             Logger.info("ClusterManager: #{target_node} fully joined and synced")
             :ok
@@ -285,6 +279,78 @@ defmodule Ferricstore.Cluster.Manager do
       {:error, reason} ->
         Logger.error("ClusterManager: data sync failed for #{target_node}: #{inspect(reason)}")
         {:error, {:sync_failed, reason}}
+    end
+  end
+
+  # Try object storage snapshot first. If available and WAL is bridgeable,
+  # use it. Otherwise fall through to direct shard-by-shard copy.
+  defp try_snapshot_then_direct(target_node, ctx) do
+    snapshot_config = Application.get_env(:ferricstore, :snapshot_store)
+
+    if snapshot_config do
+      Logger.info("ClusterManager: trying object storage snapshot for #{target_node}")
+
+      _adapter = Keyword.fetch!(snapshot_config, :adapter)
+      target_data_dir = :erpc.call(target_node, FerricStore.Instance, :get, [:default]).data_dir
+      download_opts = Keyword.merge(snapshot_config, [dest_dir: target_data_dir])
+      download_opts = Keyword.drop(download_opts, [:interval_ms])
+
+      case :erpc.call(target_node,
+             Ferricstore.Cluster.SnapshotDownloader, :download_latest,
+             [download_opts], 120_000) do
+        {:ok, _manifest} ->
+          Logger.info("ClusterManager: snapshot downloaded to #{target_node}, checking WAL gaps")
+
+          # Rebuild keydirs from downloaded data
+          Ferricstore.Cluster.DataSync.rebuild_keydirs_on_target(target_node, ctx.shard_count)
+
+          # Check each shard — if WAL can't bridge, do direct copy for that shard
+          sync_remaining_shards(target_node, ctx)
+
+        {:error, reason} ->
+          Logger.warning("ClusterManager: snapshot download failed (#{inspect(reason)}), falling through to direct copy")
+          direct_sync(target_node, ctx)
+      end
+    else
+      direct_sync(target_node, ctx)
+    end
+  end
+
+  # After snapshot download, check each shard for WAL gaps.
+  # Shards where WAL can bridge are fine. Shards with gaps get direct copy.
+  defp sync_remaining_shards(target_node, ctx) do
+    alias Ferricstore.Cluster.DataSync
+
+    results =
+      for shard_idx <- 0..(ctx.shard_count - 1) do
+        leader = DataSync.find_leader_for(shard_idx)
+
+        case DataSync.needs_resync?(shard_idx, target_node, leader) do
+          :wal_bridgeable ->
+            Logger.info("Shard #{shard_idx}: snapshot + WAL bridgeable on #{target_node}")
+            :ok
+
+          :needs_resync ->
+            Logger.info("Shard #{shard_idx}: snapshot stale, doing direct copy to #{target_node}")
+            DataSync.sync_shard(shard_idx, target_node, ctx)
+        end
+      end
+
+    if Enum.all?(results, fn r -> r == :ok or match?({:ok, _}, r) end) do
+      :ok
+    else
+      {:error, {:partial_sync, results}}
+    end
+  end
+
+  defp direct_sync(target_node, ctx) do
+    case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
+      {:ok, sync_results} ->
+        Logger.info("ClusterManager: data synced to #{target_node}: #{inspect(sync_results)}")
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

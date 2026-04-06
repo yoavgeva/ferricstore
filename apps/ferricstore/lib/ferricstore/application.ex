@@ -201,7 +201,8 @@ defmodule Ferricstore.Application do
           Ferricstore.PubSub,
           Ferricstore.FetchOrCompute,
           {Ferricstore.MemoryGuard, memory_guard_opts()},
-          Ferricstore.Cluster.Manager
+          Ferricstore.Cluster.Manager,
+          Ferricstore.Cluster.SnapshotUploader
         ]
 
     {max_r, max_s} = Application.get_env(:ferricstore, :supervisor_max_restarts, {20, 10})

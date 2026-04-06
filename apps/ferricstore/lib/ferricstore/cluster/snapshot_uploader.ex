@@ -105,13 +105,16 @@ defmodule Ferricstore.Cluster.SnapshotUploader do
   end
 
   @impl true
-  def handle_call(:trigger, _from, %{config: nil} = state) do
-    {:reply, {:error, :not_configured}, state}
-  end
-
   def handle_call(:trigger, _from, state) do
-    result = run_snapshot_cycle(state.config)
-    {:reply, result, state}
+    # Always read fresh config — it may have been set after init
+    config = state.config || Application.get_env(:ferricstore, :snapshot_store)
+
+    if config do
+      result = run_snapshot_cycle(config)
+      {:reply, result, %{state | config: config}}
+    else
+      {:reply, {:error, :not_configured}, state}
+    end
   end
 
   # ---------------------------------------------------------------------------

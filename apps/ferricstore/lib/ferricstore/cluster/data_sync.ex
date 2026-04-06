@@ -127,7 +127,7 @@ defmodule Ferricstore.Cluster.DataSync do
   @spec sync_shard(non_neg_integer(), node(), FerricStore.Instance.t()) ::
           {:ok, :wal_bridgeable | non_neg_integer()} | {:error, term()}
   def sync_shard(shard_index, target_node, ctx) do
-    leader_node = find_leader(shard_index)
+    leader_node = find_leader_for(shard_index)
 
     case needs_resync?(shard_index, target_node, leader_node) do
       :wal_bridgeable ->
@@ -215,7 +215,8 @@ defmodule Ferricstore.Cluster.DataSync do
   end
 
 
-  defp rebuild_keydirs_on_target(target_node, shard_count) do
+  @doc false
+  def rebuild_keydirs_on_target(target_node, shard_count) do
     Logger.info("DataSync: rebuilding keydirs on #{target_node}")
 
     for shard_idx <- 0..(shard_count - 1) do
@@ -244,8 +245,9 @@ defmodule Ferricstore.Cluster.DataSync do
   # Private: leader resolution
   # ---------------------------------------------------------------------------
 
-  @spec find_leader(non_neg_integer()) :: node()
-  defp find_leader(shard_index) do
+  @spec find_leader_for(non_neg_integer()) :: node()
+  @doc false
+  def find_leader_for(shard_index) do
     case RaftCluster.members(shard_index) do
       {:ok, _members, {_name, leader_node}} -> leader_node
       _ -> node()
