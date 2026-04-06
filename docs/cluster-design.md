@@ -346,9 +346,48 @@ Other shards serve traffic throughout
 
 ### Strategy 2: Object storage snapshots
 
-The leader periodically uploads a consistent snapshot of each shard's data directory
+The cluster periodically uploads a consistent snapshot of each shard's data directory
 to object storage. New nodes bootstrap from these snapshots instead of copying from
 the leader.
+
+#### Coordination: who uploads what?
+
+Shard leaders may be on different nodes. Each leader snapshots and uploads its own
+shards. A single coordinator orchestrates the cycle and writes the manifest.
+
+```
+Snapshot coordinator (one node, elected by lowest Node.name in cluster):
+
+  ┌─ Periodic timer fires (every interval_ms)
+  │
+  ├─ Step 1: Broadcast {:snapshot_cycle, timestamp} to all nodes
+  │    Each node checks: which shards am I leader for?
+  │    Each leader independently:
+  │      → Pause shard, hardlink, record raft_index, resume
+  │      → Tar the hardlink dir
+  │      → Upload tar directly to S3 (each leader uploads its own shard)
+  │      → Report back to coordinator: {:shard_done, i, raft_index}
+  │
+  ├─ Step 2: Collect reports (with timeout)
+  │    Wait for all shard_count reports
+  │    If any shard fails → log warning, abort cycle (no partial manifest)
+  │    If all succeed → continue
+  │
+  ├─ Step 3: Write manifest + update latest pointer
+  │    Upload manifest.json with all shard raft_indices
+  │    Update latest.json → points to this manifest
+  │
+  └─ Step 4: Cleanup old manifests beyond retention_count
+
+Coordinator election:
+  → :global.register_name({:ferricstore, :snapshot_coordinator}, self())
+  → If coordinator node dies, another node registers on next timer tick
+  → Lightweight — coordinator only broadcasts and collects, doesn't transfer data
+
+No cross-node data transfer:
+  Each shard leader uploads directly to S3 from its own disk.
+  Coordinator never touches shard data — just writes the manifest.
+```
 
 #### How to snapshot without blocking writes
 
