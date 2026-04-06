@@ -550,7 +550,9 @@ Client → Router.put(ctx, key, val, exp)
 
 ### Reads
 
-Current behavior: read from local ETS. This works for both leader and followers because Raft replication keeps ETS in sync (with slight lag on followers).
+Always local. Every node reads from its own ETS — this is the entire point of
+replication. No forwarding to leader, no network hop. Raft replication keeps
+ETS in sync across nodes (typical lag: 1-10ms).
 
 ```
 Client → Router.get(ctx, key)
@@ -558,28 +560,8 @@ Client → Router.get(ctx, key)
   → value or nil
 ```
 
-**Consistency options:**
-
-| Mode | Behavior | Latency | Use case |
-|---|---|---|---|
-| `CONSISTENT` (default) | Read from leader only | +1 network hop on followers | Strong consistency |
-| `STALE` | Read from local ETS | 0 extra latency | Read replicas, analytics |
-
-For `CONSISTENT` mode on a follower, we'd forward the read to the leader:
-```elixir
-def get(ctx, key) do
-  if consistent_mode?(ctx) and not leader?(ctx, shard_for(ctx, key)) do
-    # Forward to leader
-    leader = ra:leader(shard_server_id(shard_for(ctx, key)))
-    GenServer.call({Shard, leader}, {:get, key})
-  else
-    # Local ETS read (current path)
-    ets_get_full(...)
-  end
-end
-```
-
-For the initial implementation: default to `STALE` reads (local ETS). This gives the best performance and is acceptable for most Redis use cases. Strong consistency reads can be added later via `READMODE CONSISTENT`.
+No code changes needed for reads. The existing `Router.get` path works
+identically on leaders and followers.
 
 ---
 
@@ -647,7 +629,7 @@ CLUSTER.FAILOVER     → trigger manual leadership transfer
 | `lib/ferricstore/cluster/snapshot_downloader.ex` | **NEW** — download + extract snapshots from object storage |
 | `lib/ferricstore/raft/cluster.ex` | Modify `start_shard_server` to use multi-node initial_members |
 | `lib/ferricstore/store/shard.ex` | Add `:pause_writes` / `:resume_writes` handle_call |
-| `lib/ferricstore/store/router.ex` | Add leader-forwarding for consistent reads |
+| `lib/ferricstore/store/router.ex` | No changes needed — reads already local, writes already go through Raft |
 | `lib/ferricstore/application.ex` | Add ClusterManager to supervision tree |
 | `lib/ferricstore/commands/cluster.ex` | Add CLUSTER.JOIN, CLUSTER.LEAVE, CLUSTER.FAILOVER, CLUSTER.STATUS |
 | `config/runtime.exs` | Cluster env var config (already restored) |
@@ -696,17 +678,15 @@ CLUSTER.FAILOVER     → trigger manual leadership transfer
 - Manifest management (retention, cleanup)
 - Prefer object storage when available for new node join
 
-### Phase 5: Read consistency modes
-- READMODE STALE (default) — read from local ETS
-- READMODE CONSISTENT — forward reads to shard leader
-- Per-connection setting via Redis READMODE command
-
 ---
+
+## Design Decisions
+
+1. **Reads are always local** — every node reads from its own ETS. This is the entire point of replication. No "consistent read" mode — that would just be a proxy.
 
 ## Open Questions
 
-1. **Read consistency default** — STALE (fast, Redis-like) or CONSISTENT (safe)? Redis Cluster uses STALE equivalent by default.
-2. **Shard leadership distribution** — Spread leaders across nodes for balanced write load, or let ra elect naturally?
-3. **Minimum cluster size** — Enforce 3 nodes for quorum, or allow 2-node clusters (no fault tolerance)?
-4. **Object storage library** — ExAws (mature, S3/GCS), or keep it pluggable with a behaviour?
-5. **Sync parallelism** — Copy shards sequentially (simpler, predictable) or parallel (faster, more leader load)?
+1. **Shard leadership distribution** — Spread leaders across nodes for balanced write load, or let ra elect naturally?
+2. **Minimum cluster size** — Enforce 3 nodes for quorum, or allow 2-node clusters (no fault tolerance)?
+3. **Object storage library** — ExAws (mature, S3/GCS), or keep it pluggable with a behaviour?
+4. **Sync parallelism** — Copy shards sequentially (simpler, predictable) or parallel (faster, more leader load)?
