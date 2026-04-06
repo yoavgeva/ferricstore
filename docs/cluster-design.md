@@ -182,9 +182,9 @@ On Node A and B (receive :nodedown for C):
 
 If C reconnects before timer:
   1. Cancel removal timer
-  2. ra automatically syncs C from leader's WAL
-  3. C catches up and resumes as follower
-  4. No data sync needed — ra handles WAL replay
+  2. Run the universal sync check (see below) per shard
+  3. If WAL can bridge → ra replays automatically, C catches up
+  4. If WAL gap → shard resync (same as new node join for that shard)
 ```
 
 ### Case 3: Network partition
@@ -203,10 +203,73 @@ Minority side [C]:
   - C rejects writes with: "ERR CLUSTERDOWN no quorum"
 
 Network heals:
-  - ra reconciles — C's uncommitted writes (if any) are discarded
-  - C syncs from leader's WAL to catch up
-  - C resumes as follower
+  - Same as reconnect: run universal sync check per shard
+  - WAL bridgeable → ra replays, C catches up
+  - WAL gap → shard resync for affected shards only
 ```
+
+---
+
+## Universal Sync Decision
+
+Every scenario — new node, reconnect, partition heal, S3 bootstrap — uses the
+same per-shard check. This is the single decision point for "can this node catch
+up, or does it need a fresh copy?"
+
+```
+For each shard i on the joining/reconnecting node:
+
+  local_index = last Raft index this node applied for shard i
+                (0 if empty/new node, or read from ra state on disk)
+
+  Ask leader: {first_index, last_index} = ra:log_stats(shard_server_id(i))
+
+  if local_index >= first_index:
+    ┌─────────────────────────────────────────┐
+    │  WAL BRIDGEABLE                         │
+    │  ra can replay entries local→last        │
+    │  → Just join Raft group                 │
+    │  → ra handles replay automatically      │
+    │  → No data copy needed                  │
+    └─────────────────────────────────────────┘
+
+  if local_index < first_index:
+    ┌─────────────────────────────────────────┐
+    │  WAL GAP — need shard resync            │
+    │  Leader's WAL starts at first_index     │
+    │  Node's data ends at local_index        │
+    │  Gap: local_index..first_index is lost  │
+    │                                         │
+    │  → Pause writes on leader's shard i     │
+    │  → Copy shard i data dir to this node   │
+    │  → Resume writes                        │
+    │  → Node rebuilds keydir from disk       │
+    │  → Joins Raft group, replays delta      │
+    └─────────────────────────────────────────┘
+```
+
+### All scenarios mapped to this check
+
+| Scenario | local_index | Likely outcome |
+|---|---|---|
+| New node (empty disk) | 0 | WAL gap → full shard copy |
+| Reconnect after brief crash (seconds) | recent | WAL bridgeable → ra replays |
+| Reconnect after long downtime (days) | old | WAL gap → shard resync |
+| S3 snapshot (1 hour old) | snapshot_index | Depends on WAL retention |
+| S3 snapshot (1 week old) | very old | WAL gap → shard resync (S3 was pointless) |
+| Partition heals (minutes) | slightly behind | WAL bridgeable → ra replays |
+| Partition heals (hours) | behind | Depends on WAL retention |
+
+### Per-shard independence
+
+Each shard is checked independently. A reconnecting node might have:
+- Shard 0: local_index 8000, leader first_index 7500 → WAL bridgeable ✓
+- Shard 1: local_index 3000, leader first_index 6000 → WAL gap, resync
+- Shard 2: local_index 9000, leader first_index 8800 → WAL bridgeable ✓
+- Shard 3: local_index 4000, leader first_index 5500 → WAL gap, resync
+
+Only shards 1 and 3 need a data copy. Shards 0 and 2 catch up via WAL replay.
+This minimizes the amount of data transferred and the write-pause window.
 
 ---
 
@@ -345,47 +408,35 @@ config :ferricstore, :cluster_snapshots,
 
 ### Which strategy is chosen?
 
-The new node must verify that the snapshot is recent enough for WAL replay to
-bridge the gap. ra truncates WAL entries after snapshots — if the leader's WAL
-no longer contains entries from the snapshot's Raft index, the snapshot is useless.
+Uses the universal sync decision (above). Object storage is an optimization —
+it provides a head start so the node has *some* data before running the check.
 
 ```
-New node starts → ClusterManager checks:
+New node starts → ClusterManager:
 
 1. Is object storage configured AND has a snapshot?
-   → YES: download manifest, read snapshot_raft_index per shard
-   → For each shard, ask leader: ra:log_stats(shard_id)
-     → Returns {first_index, last_index}
-     → If snapshot_raft_index >= first_index:
-        WAL can bridge the gap → use object storage snapshot
-     → If snapshot_raft_index < first_index:
-        WAL has been truncated past the snapshot point
-        → snapshot is stale, FALL THROUGH to direct copy
-   → If ALL shards have valid snapshots: download from object storage
-   → If ANY shard has a stale snapshot: fall through entirely
-     (mixed strategy adds complexity for little gain)
+   → YES: download and extract all shard dirs from S3
+   → Each shard now has a local_index = snapshot_raft_index
+   → Fall through to step 2
 
 2. Are other cluster nodes reachable?
-   → YES: direct copy from leader, shard by shard
+   → YES: run universal sync check per shard:
+     → If local_index >= leader's first_index → WAL bridgeable (S3 saved us a full copy!)
+     → If local_index < leader's first_index → WAL gap → direct copy for that shard
    → NO: this is the first node, bootstrap as standalone
 ```
 
-**Why check per-shard?** Each shard's Raft group has independent WAL truncation.
-Shard 0 might have a valid snapshot while shard 2's WAL has moved past its
-snapshot point (e.g., shard 2 had heavy write traffic and snapshotted more
-aggressively). Rather than do a mixed strategy (some shards from S3, some from
-direct copy), we fall through to direct copy for all shards if any are stale.
-Simpler, and direct copy is fast anyway.
+**Object storage value:** Even if the S3 snapshot is slightly stale, it saves
+copying most of the data. If 90% of the data hasn't changed since the snapshot,
+only the delta needs WAL replay. If the snapshot IS too stale (WAL gap), the
+universal sync check catches it and falls through to direct copy — no harm done
+except wasted download time.
 
 **Preventing staleness:** The snapshot uploader should run frequently enough that
 the WAL never truncates past the snapshot point. Rule of thumb:
-- ra snapshots every ~100 Raft entries (configurable)
-- If writes average 1000/s per shard → ra snapshots every ~100ms
-- WAL entries before the snapshot are eligible for truncation
-- Upload interval (1 hour) must be shorter than the time it takes for ra to
-  truncate ALL entries since the last upload
-- In practice: ra keeps a configurable WAL segment history. Setting
-  `wal_max_size_bytes` large enough ensures entries survive between uploads.
+- ra keeps WAL segments based on `wal_max_size_bytes` config
+- Upload interval (1 hour) should be shorter than the WAL retention window
+- Monitor: if `snapshot_raft_index < leader first_index`, upload more frequently
 
 ### Why this design is clean
 
