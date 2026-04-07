@@ -166,6 +166,7 @@ defmodule Ferricstore.Raft.Cluster do
       {_, _, _leader} -> :ok
       {:error, :already_member} -> :ok
       {:error, reason} -> {:error, reason}
+      {:timeout, _} -> {:error, :timeout}
     end
   end
 
@@ -181,6 +182,7 @@ defmodule Ferricstore.Raft.Cluster do
       {_, _, _leader} -> :ok
       {:error, :not_member} -> :ok
       {:error, reason} -> {:error, reason}
+      {:timeout, _} -> {:error, :timeout}
     end
   end
 

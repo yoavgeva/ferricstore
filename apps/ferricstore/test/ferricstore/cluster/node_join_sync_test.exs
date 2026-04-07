@@ -264,25 +264,14 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
       :ok = join_cluster(node_d, node_a)
-      # join_cluster does sync synchronously — data is already on node_d
-      # Wait for Raft replication to settle
-      Process.sleep(2_000)
 
-      # Stop all writes, let Raft settle
-      Process.sleep(1000)
-
-      # Dump keydirs from all nodes — should be identical
-      dumps = Enum.map(nodes ++ [node_d], fn node ->
-        {node, dump_keydir_sorted(node)}
-      end)
-
-      [{_ref_node, ref_dump} | rest] = dumps
-
-      for {node, dump} <- rest do
-        assert dump == ref_dump,
-               "keydir mismatch on #{inspect(node)}: " <>
-                 "#{length(ref_dump)} keys on reference vs #{length(dump)} on this node"
-      end
+      # Wait for keydirs to converge across all nodes
+      eventually(fn ->
+        ref = dump_keydir_sorted(node_a)
+        for node <- [node_d | Enum.drop(nodes, 1)] do
+          assert dump_keydir_sorted(node) == ref, "keydir not converged on #{inspect(node)}"
+        end
+      end, "keydirs not converged", 30, 500)
     end
 
     @tag timeout: 120_000
@@ -301,28 +290,23 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
       :ok = join_cluster(node_d, node_a)
-      # join_cluster does sync synchronously — data is already on node_d
-      # Wait for Raft replication to settle
-      Process.sleep(2_000)
+
+      # Wait for all data to replicate before compacting
+      eventually(fn ->
+        assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_d), "pre-compact keydir mismatch"
+      end, "keydirs not converged before compaction", 30, 500)
 
       # Trigger compaction on all nodes
       for node <- nodes ++ [node_d] do
         trigger_compaction(node)
       end
 
-      Process.sleep(2000)
-
-      # After compaction, all nodes should have identical live data
-      # (file layout may differ due to compaction timing, but keydir contents must match)
-      keydir_a = dump_keydir_sorted(node_a)
-      keydir_d = dump_keydir_sorted(node_d)
-
-      assert length(keydir_a) == length(keydir_d)
-
-      for {{key_a, val_a}, {key_d, val_d}} <- Enum.zip(keydir_a, keydir_d) do
-        assert key_a == key_d, "key mismatch: #{key_a} vs #{key_d}"
-        assert val_a == val_d, "value mismatch for key #{key_a}"
-      end
+      # After compaction, keydirs should still match
+      eventually(fn ->
+        keydir_a = dump_keydir_sorted(node_a)
+        keydir_d = dump_keydir_sorted(node_d)
+        assert keydir_a == keydir_d, "post-compact keydir mismatch"
+      end, "keydirs diverged after compaction", 20, 500)
     end
   end
 
