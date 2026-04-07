@@ -461,41 +461,37 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       # 2. Start continuous writer
       writer_pid = start_continuous_writer(node_a, "during_clone")
 
-      # 3. Simulate disk clone (EBS snapshot):
-      #    - Pause writes on all shards (simulates EBS snapshot's atomic point)
-      #    - Copy the entire data dir
-      #    - Resume writes
-      #    In production, EBS snapshot does this at the block level atomically.
+      # 3. Simulate EBS snapshot: copy data dir WHILE server is running.
+      #    No pausing — EBS does block-level atomic snapshot.
+      #    The copy may have partially written files, but recover_keydir
+      #    handles this (skips corrupt records at end of log files).
       source_ctx = :erpc.call(n_a, FerricStore.Instance, :get, [:default], 10_000)
       source_data_dir = source_ctx.data_dir
-
-      # Pause all shards to get a consistent copy
-      for i <- 0..(source_ctx.shard_count - 1) do
-        shard = elem(source_ctx.shard_names, i)
-        :erpc.call(n_a, GenServer, :call, [shard, {:pause_writes}, 30_000])
-      end
 
       clone_dir = Path.join(System.tmp_dir!(), "ferricstore_clone_#{System.unique_integer([:positive])}")
       File.cp_r!(source_data_dir, clone_dir)
       on_exit(fn -> File.rm_rf!(clone_dir) end)
 
-      # Delete the ra dir from clone — it has the source node's server IDs.
-      # The new node will start fresh ra servers and join the cluster's groups.
-      # This is what a user should do after restoring from an EBS snapshot.
-      File.rm_rf!(Path.join(clone_dir, "ra"))
-
-      # Resume writes — source keeps serving
+      # Read last applied Raft index from cloned ra state BEFORE deleting.
       for i <- 0..(source_ctx.shard_count - 1) do
-        shard = elem(source_ctx.shard_names, i)
-        :erpc.call(n_a, GenServer, :call, [shard, {:resume_writes}, 5_000])
+        idx = Ferricstore.Cluster.DataSync.read_last_applied_from_disk(clone_dir, i)
+        IO.puts("Shard #{i}: cloned data at raft index #{idx}")
       end
 
-      # 4. Start new node pointing to the cloned data dir
-      node_d = ClusterHelper.start_node(cluster_nodes: [n_a], data_dir: clone_dir)
+      # Delete ra dir — has source node's server IDs, can't reuse.
+      File.rm_rf!(Path.join(clone_dir, "ra"))
+
+      # 4. Start peer node but DON'T start FerricStore yet.
+      #    Connect to cluster first so ra can reach other nodes during election.
+      all_cluster_nodes = Enum.map(nodes, &node_name/1)
+      node_d = ClusterHelper.start_node(
+        data_dir: clone_dir,
+        cluster_nodes: all_cluster_nodes
+      )
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
-      # 5. Connect — auto-discovery triggers join
-      :erpc.call(n_a, Node, :connect, [node_name(node_d)])
+      # 5. Connect is automatic via cluster_nodes in start_node
+      #    node_a's auto-join detects pre-existing data → just add_member
 
       # 6. Stop writer after join has time to complete
       Process.sleep(5_000)

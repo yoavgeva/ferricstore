@@ -221,6 +221,14 @@ defmodule Ferricstore.Test.ClusterHelper do
       :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_role, cluster_role])
     end
 
+    # Connect to cluster nodes BEFORE starting FerricStore so ra can reach
+    # other nodes during leader election (avoids election timeout hangs).
+    if cluster_nodes != [] do
+      Enum.each(cluster_nodes, fn cn ->
+        :rpc.call(node_name, Node, :connect, [cn])
+      end)
+    end
+
     start_ferricstore_on_node(node_name)
 
     # Wait for shards to be alive and accepting calls

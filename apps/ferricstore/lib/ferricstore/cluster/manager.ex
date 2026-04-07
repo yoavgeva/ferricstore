@@ -253,34 +253,78 @@ defmodule Ferricstore.Cluster.Manager do
     Logger.info("ClusterManager: joining #{target_node} (#{membership})")
     ctx = FerricStore.Instance.get(:default)
 
-    # Step 1: Stop ra servers on the target node.
-    stop_raft_on_target(target_node, state.shard_count)
+    # Check if the target already has data (disk clone / EBS snapshot scenario).
+    # If it does, skip the data sync — just add to Raft groups.
+    target_has_data = target_has_data?(target_node, state.shard_count)
 
-    # Step 2: Sync data — direct shard-by-shard copy from leader.
-    sync_result = direct_sync(target_node, ctx)
+    if target_has_data do
+      # Disk clone path: target already has Bitcask data + running shards.
+      # Just add to Raft groups — ra will reconcile.
+      Logger.info("ClusterManager: #{target_node} has pre-existing data, skipping data sync")
+      {raft_result, _} = do_add_node(target_node, membership, state)
 
-    case sync_result do
-      {:ok, sync_indices} ->
-        # Step 3: Add target to our Raft groups.
-        {raft_result, _shard_results} = do_add_node(target_node, membership, state)
+      case raft_result do
+        :ok ->
+          Logger.info("ClusterManager: #{target_node} added to Raft groups (disk clone)")
+          :ok
 
-        case raft_result do
-          :ok ->
-            # Step 4: Start ra servers on target as followers.
-            # Pass sync_indices so the state machine skips entries already
-            # present in the copied Bitcask data.
-            start_raft_on_target(target_node, state.shard_count, sync_indices)
-            Logger.info("ClusterManager: #{target_node} fully joined and synced")
-            :ok
+        {:error, _} = err ->
+          Logger.error("ClusterManager: Raft add failed for #{target_node}: #{inspect(err)}")
+          err
+      end
+    else
+      # Empty node path: needs data sync.
+      # Stop existing ra servers → sync data → add to Raft → start ra as follower.
+      stop_raft_on_target(target_node, state.shard_count)
 
-          {:error, _} = err ->
-            Logger.error("ClusterManager: Raft add failed for #{target_node}: #{inspect(err)}")
-            err
+      sync_result = direct_sync(target_node, ctx)
+
+      case sync_result do
+        {:ok, sync_indices} ->
+          {raft_result, _} = do_add_node(target_node, membership, state)
+
+          case raft_result do
+            :ok ->
+              start_raft_on_target(target_node, state.shard_count, sync_indices)
+              Logger.info("ClusterManager: #{target_node} fully joined and synced")
+              :ok
+
+            {:error, _} = err ->
+              Logger.error("ClusterManager: Raft add failed for #{target_node}: #{inspect(err)}")
+              err
+          end
+
+        {:error, reason} ->
+          Logger.error("ClusterManager: data sync failed for #{target_node}: #{inspect(reason)}")
+          {:error, {:sync_failed, reason}}
+      end
+    end
+  end
+
+  # Checks if the target node has pre-existing Bitcask data (disk clone scenario).
+  defp target_has_data?(target_node, shard_count) do
+    try do
+      target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
+
+      Enum.any?(0..(shard_count - 1), fn i ->
+        shard_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, i)
+
+        case :erpc.call(target_node, File, :ls, [shard_path]) do
+          {:ok, files} ->
+            Enum.any?(files, fn f ->
+              String.ends_with?(f, ".log") and
+                case :erpc.call(target_node, File, :stat, [Path.join(shard_path, f)]) do
+                  {:ok, %{size: size}} -> size > 0
+                  _ -> false
+                end
+            end)
+
+          _ ->
+            false
         end
-
-      {:error, reason} ->
-        Logger.error("ClusterManager: data sync failed for #{target_node}: #{inspect(reason)}")
-        {:error, {:sync_failed, reason}}
+      end)
+    catch
+      _, _ -> false
     end
   end
 
@@ -288,13 +332,30 @@ defmodule Ferricstore.Cluster.Manager do
     case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
       {:ok, sync_results} ->
         Logger.info("ClusterManager: data synced to #{target_node}: #{inspect(sync_results)}")
-        # Extract raft indices from sync results
+
+        # Extract raft indices from sync results.
+        # For :wal_bridgeable shards (already had data), read the actual
+        # last_applied index from the target's ra DETS file — this tells us
+        # what the pre-existing data covers (e.g., disk clone scenario).
         sync_indices =
           for {shard_idx, {:synced, detail}} <- sync_results, into: %{} do
             case detail do
-              :wal_bridgeable -> {shard_idx, 0}
-              raft_idx when is_integer(raft_idx) -> {shard_idx, raft_idx}
-              _ -> {shard_idx, 0}
+              :wal_bridgeable ->
+                # Target had data — read the index from its ra state on disk
+                idx = try do
+                  target_data_dir = :erpc.call(target_node, FerricStore.Instance, :get, [:default]).data_dir
+                  :erpc.call(target_node, Ferricstore.Cluster.DataSync,
+                    :read_last_applied_from_disk, [target_data_dir, shard_idx], 5_000)
+                catch
+                  _, _ -> 0
+                end
+                {shard_idx, idx}
+
+              raft_idx when is_integer(raft_idx) ->
+                {shard_idx, raft_idx}
+
+              _ ->
+                {shard_idx, 0}
             end
           end
         {:ok, sync_indices}
@@ -454,7 +515,6 @@ defmodule Ferricstore.Cluster.Manager do
 
       try do
         :erpc.call(target_node, :ra, :stop_server, [ra_sys, server_id])
-        :erpc.call(target_node, :ra, :force_delete_server, [ra_sys, server_id])
       catch
         _, _ -> :ok
       end

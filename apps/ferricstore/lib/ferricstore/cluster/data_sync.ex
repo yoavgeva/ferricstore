@@ -18,13 +18,47 @@ defmodule Ferricstore.Cluster.DataSync do
   # ---------------------------------------------------------------------------
 
   @doc """
+  Reads the last applied Raft index from a ra meta.dets file on disk.
+
+  Used when a node boots from a disk clone (EBS snapshot) — we need to know
+  the Raft index the cloned data is consistent up to, BEFORE starting ra
+  (since the WAL has the wrong node IDs and must be deleted).
+
+  Returns the last_applied index, or 0 if the file doesn't exist or can't be read.
+  """
+  @spec read_last_applied_from_disk(binary(), non_neg_integer()) :: non_neg_integer()
+  def read_last_applied_from_disk(data_dir, shard_index) do
+    meta_path = Path.join([data_dir, "ra", "meta.dets"])
+
+    try do
+      # Open the DETS file read-only
+      dets_name = :"ferricstore_meta_read_#{shard_index}_#{System.unique_integer([:positive])}"
+
+      case :dets.open_file(dets_name, [file: String.to_charlist(meta_path), access: :read]) do
+        {:ok, ref} ->
+          uid = "ferricstore_shard_#{shard_index}"
+
+          result = case :dets.lookup(ref, uid) do
+            [{^uid, _term, _voted_for, last_applied}] when is_integer(last_applied) ->
+              last_applied
+            _ ->
+              0
+          end
+
+          :dets.close(ref)
+          result
+
+        {:error, _} ->
+          0
+      end
+    catch
+      _, _ -> 0
+    end
+  end
+
+  @doc """
   Pure WAL gap check: given the target's last applied index and the leader's
   first available WAL index, determines if WAL replay can bridge the gap.
-
-  Returns `:wal_bridgeable` if `target_index >= leader_first_index`, meaning
-  the leader's WAL contains all entries the target needs to catch up.
-  Returns `:needs_resync` if the target is behind the leader's WAL start
-  (entries were truncated).
   """
   @spec wal_bridgeable?(non_neg_integer(), non_neg_integer()) :: :wal_bridgeable | :needs_resync
   def wal_bridgeable?(target_index, leader_first_index) do
