@@ -589,8 +589,8 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
   defp dump_keydir_sorted(node) do
     dump_keydir(node)
-    |> Enum.map(fn {key, value, _exp, _lfu, _fid, _off, _vsize} -> {key, value} end)
-    |> Enum.reject(fn {key, _} -> String.starts_with?(key, "PM:") end)
+    |> Enum.map(fn {key, _value, _exp, _lfu, _fid, _off, _vsize} -> key end)
+    |> Enum.reject(&String.starts_with?(&1, "PM:"))
     |> Enum.sort()
   end
 
