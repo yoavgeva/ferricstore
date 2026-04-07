@@ -189,7 +189,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     shards = Keyword.get(opts, :shards, 4)
     unique = :erlang.unique_integer([:positive])
     name = :"ferric_solo_#{unique}"
-    data_dir = Path.join(System.tmp_dir!(), "ferricstore_solo_#{unique}")
+    data_dir = Keyword.get(opts, :data_dir, Path.join(System.tmp_dir!(), "ferricstore_solo_#{unique}"))
     File.mkdir_p!(data_dir)
 
     code_paths = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)

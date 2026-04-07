@@ -446,6 +446,83 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     end
   end
 
+  describe "disk snapshot: new node boots from copied disk while writes continue" do
+    @tag timeout: 120_000
+    test "node with cloned disk joins cluster and gets all data" do
+      # 1. Start 3-node cluster, write data
+      nodes = ClusterHelper.start_cluster(3)
+      on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+
+      [node_a, _node_b, _node_c] = nodes
+      n_a = node_name(node_a)
+
+      keys = write_keys(node_a, "pre_clone", 1..200)
+
+      # 2. Start continuous writer
+      writer_pid = start_continuous_writer(node_a, "during_clone")
+
+      # 3. Simulate disk clone (EBS snapshot):
+      #    - Pause writes on all shards (simulates EBS snapshot's atomic point)
+      #    - Copy the entire data dir
+      #    - Resume writes
+      #    In production, EBS snapshot does this at the block level atomically.
+      source_ctx = :erpc.call(n_a, FerricStore.Instance, :get, [:default], 10_000)
+      source_data_dir = source_ctx.data_dir
+
+      # Pause all shards to get a consistent copy
+      for i <- 0..(source_ctx.shard_count - 1) do
+        shard = elem(source_ctx.shard_names, i)
+        :erpc.call(n_a, GenServer, :call, [shard, {:pause_writes}, 30_000])
+      end
+
+      clone_dir = Path.join(System.tmp_dir!(), "ferricstore_clone_#{System.unique_integer([:positive])}")
+      File.cp_r!(source_data_dir, clone_dir)
+      on_exit(fn -> File.rm_rf!(clone_dir) end)
+
+      # Delete the ra dir from clone — it has the source node's server IDs.
+      # The new node will start fresh ra servers and join the cluster's groups.
+      # This is what a user should do after restoring from an EBS snapshot.
+      File.rm_rf!(Path.join(clone_dir, "ra"))
+
+      # Resume writes — source keeps serving
+      for i <- 0..(source_ctx.shard_count - 1) do
+        shard = elem(source_ctx.shard_names, i)
+        :erpc.call(n_a, GenServer, :call, [shard, {:resume_writes}, 5_000])
+      end
+
+      # 4. Start new node pointing to the cloned data dir
+      node_d = ClusterHelper.start_node(cluster_nodes: [n_a], data_dir: clone_dir)
+      on_exit(fn -> ClusterHelper.stop_node(node_d) end)
+
+      # 5. Connect — auto-discovery triggers join
+      :erpc.call(n_a, Node, :connect, [node_name(node_d)])
+
+      # 6. Stop writer after join has time to complete
+      Process.sleep(5_000)
+      {during_keys, during_count} = stop_continuous_writer(writer_pid)
+      IO.puts("Writes during clone join: #{during_count}")
+
+      # 7. Write post-join data
+      post_keys = write_keys(node_a, "post_clone", 1..50)
+      all_keys = keys ++ during_keys ++ post_keys
+
+      # 8. Verify all keys on node_d
+      eventually(fn ->
+        missing = Enum.count(all_keys, fn k -> read_key(node_d, k) == nil end)
+        assert missing == 0, "#{missing} keys missing on node_d"
+      end, "keys not replicated to cloned node", 60, 500)
+
+      IO.puts("Total keys: #{length(all_keys)}, all present on cloned node")
+
+      # 9. Keydirs identical
+      eventually(fn ->
+        assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_d), "keydir mismatch"
+      end, "keydirs not converged", 30, 500)
+
+      IO.puts("SUCCESS: #{length(all_keys)} keys identical after disk clone join")
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Helpers — these call into :peer nodes via :erpc
   # ---------------------------------------------------------------------------
