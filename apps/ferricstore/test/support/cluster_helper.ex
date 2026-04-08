@@ -214,6 +214,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     cluster_nodes = Keyword.get(opts, :cluster_nodes, [])
     if cluster_nodes != [] do
       :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_nodes, cluster_nodes])
+      :rpc.call(node_name, Application, :put_env, [:ferricstore, :raft_enabled, false])
     end
 
     cluster_role = Keyword.get(opts, :cluster_role)
