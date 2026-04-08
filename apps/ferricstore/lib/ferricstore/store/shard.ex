@@ -398,7 +398,6 @@ defmodule Ferricstore.Store.Shard do
     ShardCompound.handle_compound_delete_prefix(redis_key, prefix, state)
   end
 
-
   # -------------------------------------------------------------------
   # handle_call — native commands: CAS, LOCK, UNLOCK, EXTEND, RATELIMIT.ADD
   # -------------------------------------------------------------------

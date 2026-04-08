@@ -17,10 +17,10 @@ defmodule Ferricstore.Commands.Set do
   holds a different type returns WRONGTYPE.
   """
 
+  alias Ferricstore.CrossShardOp
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
   alias Ferricstore.Store.TypeRegistry
-  alias Ferricstore.CrossShardOp
 
   @presence_marker "1"
 

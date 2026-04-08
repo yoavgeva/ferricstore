@@ -179,26 +179,22 @@ defmodule Ferricstore.Metrics do
 
   @spec safe_ets_size(atom()) :: non_neg_integer()
   defp safe_ets_size(table) do
-    try do
-      case :ets.info(table, :size) do
-        :undefined -> 0
-        n when is_integer(n) -> n
-        _ -> 0
-      end
-    rescue
-      ArgumentError -> 0
+    case :ets.info(table, :size) do
+      :undefined -> 0
+      n when is_integer(n) -> n
+      _ -> 0
     end
+  rescue
+    ArgumentError -> 0
   end
 
   @spec slowlog_len() :: non_neg_integer()
   defp slowlog_len do
-    try do
-      Ferricstore.SlowLog.len()
-    rescue
-      _ -> 0
-    catch
-      :exit, _ -> 0
-    end
+    Ferricstore.SlowLog.len()
+  rescue
+    _ -> 0
+  catch
+    :exit, _ -> 0
   end
 
   # ---------------------------------------------------------------------------
@@ -337,11 +333,9 @@ defmodule Ferricstore.Metrics do
   # the table does not exist or has no entries.
   @spec namespace_entries() :: [tuple()]
   defp namespace_entries do
-    try do
-      :ets.tab2list(:ferricstore_ns_config)
-    rescue
-      ArgumentError -> []
-    end
+    :ets.tab2list(:ferricstore_ns_config)
+  rescue
+    ArgumentError -> []
   end
 
   # Escapes label values for Prometheus text format. Backslash, double quote,

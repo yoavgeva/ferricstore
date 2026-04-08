@@ -8,19 +8,23 @@ defmodule Ferricstore.Bitcask.NIF do
   def rust_allocated_bytes, do: :erlang.nif_error(:nif_not_loaded)
 
   # -- v2 Pure stateless NIFs (no Store resource, no Mutex) --
-  @spec v2_append_record(binary(), binary(), binary(), non_neg_integer()) :: {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, term()}
+  @spec v2_append_record(binary(), binary(), binary(), non_neg_integer()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, term()}
   def v2_append_record(_path, _key, _value, _expire_at_ms), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec v2_append_tombstone(binary(), binary()) :: {:ok, non_neg_integer()} | {:error, term()}
   def v2_append_tombstone(_path, _key), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_append_batch(binary(), [{binary(), binary(), non_neg_integer()}]) :: {:ok, [{non_neg_integer(), non_neg_integer()}]} | {:error, term()}
+  @spec v2_append_batch(binary(), [{binary(), binary(), non_neg_integer()}]) ::
+          {:ok, [{non_neg_integer(), non_neg_integer()}]} | {:error, term()}
   def v2_append_batch(_path, _records), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec v2_pread_at(binary(), non_neg_integer()) :: {:ok, binary()} | {:error, term()}
   def v2_pread_at(_path, _offset), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_scan_file(binary()) :: {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}]} | {:error, term()}
+  @spec v2_scan_file(binary()) ::
+          {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), boolean()}]}
+          | {:error, term()}
   def v2_scan_file(_path), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec v2_pread_batch(binary(), [{non_neg_integer(), non_neg_integer()}]) :: {:ok, [binary()]} | {:error, term()}
@@ -29,16 +33,22 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec v2_fsync(binary()) :: :ok | {:error, term()}
   def v2_fsync(_path), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_write_hint_file(binary(), [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}]) :: :ok | {:error, term()}
+  @spec v2_write_hint_file(
+          binary(),
+          [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}]
+        ) :: :ok | {:error, term()}
   def v2_write_hint_file(_path, _entries), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_read_hint_file(binary()) :: {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}]} | {:error, term()}
+  @spec v2_read_hint_file(binary()) ::
+          {:ok, [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}]}
+          | {:error, term()}
   def v2_read_hint_file(_path), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec v2_copy_records(binary(), binary(), [non_neg_integer()]) :: :ok | {:error, term()}
   def v2_copy_records(_source_path, _dest_path, _offsets), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_append_batch_nosync(binary(), [{binary(), binary(), non_neg_integer()}]) :: {:ok, [{non_neg_integer(), non_neg_integer()}]} | {:error, term()}
+  @spec v2_append_batch_nosync(binary(), [{binary(), binary(), non_neg_integer()}]) ::
+          {:ok, [{non_neg_integer(), non_neg_integer()}]} | {:error, term()}
   def v2_append_batch_nosync(_path, _records), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- v2 Tokio async IO NIFs --
@@ -51,7 +61,8 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec v2_fsync_async(pid(), term(), binary()) :: :ok | {:error, term()}
   def v2_fsync_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
 
-  @spec v2_append_batch_async(pid(), term(), binary(), [{binary(), binary(), non_neg_integer()}]) :: :ok | {:error, term()}
+  @spec v2_append_batch_async(pid(), term(), binary(), [{binary(), binary(), non_neg_integer()}]) ::
+          :ok | {:error, term()}
   def v2_append_batch_async(_caller_pid, _correlation_id, _path, _records), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- Stateless pread/pwrite Bloom NIFs --
@@ -145,7 +156,8 @@ defmodule Ferricstore.Bitcask.NIF do
   def cuckoo_file_info_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
 
   # -- Stateless pread/pwrite TopK v2 NIFs --
-  @spec topk_file_create_v2(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), float()) :: :ok | {:error, term()}
+  @spec topk_file_create_v2(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), float()) ::
+          :ok | {:error, term()}
   def topk_file_create_v2(_path, _k, _width, _depth, _decay), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec topk_file_add_v2(binary(), [binary()]) :: {:ok, [binary() | nil]} | {:error, term()}

@@ -181,13 +181,11 @@ defmodule Ferricstore.NamespaceConfig do
   """
   @spec get_all() :: [ns_entry()]
   def get_all do
-    try do
-      :ets.tab2list(@table)
-      |> Enum.map(&tuple_to_entry/1)
-      |> Enum.sort_by(& &1.prefix)
-    rescue
-      ArgumentError -> []
-    end
+    :ets.tab2list(@table)
+    |> Enum.map(&tuple_to_entry/1)
+    |> Enum.sort_by(& &1.prefix)
+  rescue
+    ArgumentError -> []
   end
 
   @doc """
@@ -378,23 +376,21 @@ defmodule Ferricstore.NamespaceConfig do
   defp maybe_emit_durability_telemetry(_field, _old, _new, _prefix, _by, _now), do: :ok
 
   defp lookup(prefix) do
-    try do
-      case :ets.lookup(@table, prefix) do
-        [{^prefix, window_ms, durability, changed_at, changed_by}] ->
-          %{
-            prefix: prefix,
-            window_ms: window_ms,
-            durability: durability,
-            changed_at: changed_at,
-            changed_by: changed_by
-          }
+    case :ets.lookup(@table, prefix) do
+      [{^prefix, window_ms, durability, changed_at, changed_by}] ->
+        %{
+          prefix: prefix,
+          window_ms: window_ms,
+          durability: durability,
+          changed_at: changed_at,
+          changed_by: changed_by
+        }
 
-        [] ->
-          nil
-      end
-    rescue
-      ArgumentError -> nil
+      [] ->
+        nil
     end
+  rescue
+    ArgumentError -> nil
   end
 
   defp tuple_to_entry({prefix, window_ms, durability, changed_at, changed_by}) do
@@ -469,18 +465,16 @@ defmodule Ferricstore.NamespaceConfig do
   end
 
   defp scan_durability_flags do
-    try do
-      :ets.foldl(
-        fn {_prefix, _window, :async, _at, _by}, {_a, q} -> {true, q}
-           {_prefix, _window, :quorum, _at, _by}, {a, _q} -> {a, true}
-           _, acc -> acc
-        end,
-        {false, false},
-        @table
-      )
-    rescue
-      ArgumentError -> {false, false}
-    end
+    :ets.foldl(
+      fn {_prefix, _window, :async, _at, _by}, {_a, q} -> {true, q}
+         {_prefix, _window, :quorum, _at, _by}, {a, _q} -> {a, true}
+         _, acc -> acc
+      end,
+      {false, false},
+      @table
+    )
+  rescue
+    ArgumentError -> {false, false}
   end
 
   defp compute_durability_mode(false, false) do

@@ -97,7 +97,9 @@ defmodule Ferricstore.Store.Router do
   # our `corr`. Unrelated ra_events are silently skipped -- their results
   # belong to other concurrent calls in the same process, each of which
   # has its own selective receive waiting for its own correlation ref.
-  @spec wait_for_ra_applied(FerricStore.Instance.t(), reference(), :ra.server_id(), non_neg_integer(), tuple()) :: term()
+  @spec wait_for_ra_applied(
+          FerricStore.Instance.t(), reference(), :ra.server_id(), non_neg_integer(), tuple()
+        ) :: term()
   defp wait_for_ra_applied(ctx, corr, shard_id, idx, command) do
     receive do
       {:ra_event, _leader, {:applied, applied_list}} ->
@@ -382,8 +384,14 @@ defmodule Ferricstore.Store.Router do
         _ -> ""
       end
 
-    padded = if byte_size(current) < offset, do: current <> :binary.copy(<<0>>, offset - byte_size(current)), else: current
-    new_value = binary_part(padded, 0, offset) <> value <> binary_part(padded, min(offset + byte_size(value), byte_size(padded)), max(0, byte_size(padded) - offset - byte_size(value)))
+    padded =
+      if byte_size(current) < offset,
+        do: current <> :binary.copy(<<0>>, offset - byte_size(current)),
+        else: current
+
+    tail_start = min(offset + byte_size(value), byte_size(padded))
+    tail_len = max(0, byte_size(padded) - offset - byte_size(value))
+    new_value = binary_part(padded, 0, offset) <> value <> binary_part(padded, tail_start, tail_len)
     async_write(ctx, idx, {:put, key, new_value, 0})
     {:ok, byte_size(new_value)}
   end
@@ -584,7 +592,11 @@ defmodule Ferricstore.Store.Router do
     - `{:cold_value, value}` — value was on disk, GenServer fetched it
     - `:miss` — key doesn't exist
   """
-  @spec get_with_file_ref(FerricStore.Instance.t(), binary()) :: {:hot, binary()} | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()} | {:cold_value, binary()} | :miss
+  @spec get_with_file_ref(FerricStore.Instance.t(), binary()) ::
+          {:hot, binary()}
+          | {:cold_ref, binary(), non_neg_integer(), non_neg_integer()}
+          | {:cold_value, binary()}
+          | :miss
   def get_with_file_ref(ctx, key) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
@@ -639,30 +651,28 @@ defmodule Ferricstore.Store.Router do
   # Like ets_get but returns file ref info for cold entries and LFU counter for hits.
   # Single lookup provides everything needed — no second ETS read for bookkeeping.
   defp ets_get_full(keydir, key, now) do
-    try do
-      case :ets.lookup(keydir, key) do
-        [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
-          {:hit, value, lfu}
+    case :ets.lookup(keydir, key) do
+      [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
+        {:hit, value, lfu}
 
-        [{^key, nil, 0, _lfu, fid, off, vsize}] ->
-          {:cold, fid, off, vsize}
+      [{^key, nil, 0, _lfu, fid, off, vsize}] ->
+        {:cold, fid, off, vsize}
 
-        [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
-          {:hit, value, lfu}
+      [{^key, value, exp, lfu, _fid, _off, _vsize}] when exp > now and value != nil ->
+        {:hit, value, lfu}
 
-        [{^key, nil, exp, _lfu, fid, off, vsize}] when exp > now ->
-          {:cold, fid, off, vsize}
+      [{^key, nil, exp, _lfu, fid, off, vsize}] when exp > now ->
+        {:cold, fid, off, vsize}
 
-        [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
-          :ets.delete(keydir, key)
-          :expired
+      [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
+        :ets.delete(keydir, key)
+        :expired
 
-        [] ->
-          :miss
-      end
-    rescue
-      ArgumentError -> :no_table
+      [] ->
+        :miss
     end
+  rescue
+    ArgumentError -> :no_table
   end
 
   @doc """
@@ -1105,7 +1115,8 @@ defmodule Ferricstore.Store.Router do
 
   Used by sendfile zero-copy and STRLEN on cold keys.
   """
-  @spec get_keydir_file_ref(FerricStore.Instance.t(), binary()) :: {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | :miss
+  @spec get_keydir_file_ref(FerricStore.Instance.t(), binary()) ::
+          {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | :miss
   def get_keydir_file_ref(ctx, key) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)

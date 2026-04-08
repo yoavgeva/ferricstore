@@ -334,14 +334,12 @@ defmodule Ferricstore.Commands.Bloom do
 
   defp parse_stored_meta(nil), do: nil
   defp parse_stored_meta(value) when is_binary(value) do
-    try do
-      case :erlang.binary_to_term(value) do
-        {:bloom_meta, %{capacity: c, error_rate: e}} -> {c, e}
-        _ -> nil
-      end
-    rescue
+    case :erlang.binary_to_term(value) do
+      {:bloom_meta, %{capacity: c, error_rate: e}} -> {c, e}
       _ -> nil
     end
+  rescue
+    _ -> nil
   end
   defp parse_stored_meta(_), do: nil
 

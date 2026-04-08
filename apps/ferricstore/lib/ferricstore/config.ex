@@ -610,7 +610,6 @@ defmodule Ferricstore.Config do
     end
   end
 
-
   defp validate_param(_key, _value), do: :ok
 
   # -------------------------------------------------------------------
@@ -699,19 +698,15 @@ defmodule Ferricstore.Config do
   # -------------------------------------------------------------------
 
   defp sync_ets(state) do
-    try do
-      entries = Enum.map(state, fn {k, v} -> {k, v} end)
-      :ets.insert(:ferricstore_config, entries)
-    rescue
-      ArgumentError -> :ok
-    end
+    entries = Enum.map(state, fn {k, v} -> {k, v} end)
+    :ets.insert(:ferricstore_config, entries)
+  rescue
+    ArgumentError -> :ok
   end
 
   defp sync_ets_key(key, value) do
-    try do
-      :ets.insert(:ferricstore_config, {key, value})
-    rescue
-      ArgumentError -> :ok
-    end
+    :ets.insert(:ferricstore_config, {key, value})
+  rescue
+    ArgumentError -> :ok
   end
 end

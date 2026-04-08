@@ -11,8 +11,8 @@ defmodule Ferricstore.Store.Ops do
   without changing command handler logic.
   """
 
-  alias Ferricstore.Store.Router
   alias Ferricstore.Store.LocalTxStore
+  alias Ferricstore.Store.Router
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
   alias Ferricstore.Store.Shard.Writes, as: ShardWrites

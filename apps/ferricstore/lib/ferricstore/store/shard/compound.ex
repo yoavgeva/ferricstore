@@ -142,7 +142,6 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-
   # -------------------------------------------------------------------
   # Raft / direct write helpers
   # -------------------------------------------------------------------
@@ -378,7 +377,8 @@ defmodule Ferricstore.Store.Shard.Compound do
     end
   end
 
-  @spec promoted_write(binary(), binary(), binary(), non_neg_integer()) :: {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | {:error, term()}
+  @spec promoted_write(binary(), binary(), binary(), non_neg_integer()) ::
+          {:ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | {:error, term()}
   @doc false
   def promoted_write(dedicated_path, compound_key, value, expire_at_ms) do
     active = Promotion.find_active(dedicated_path)

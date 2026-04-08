@@ -1,8 +1,8 @@
 defmodule FerricStore.Impl do
   @moduledoc "Elixir-native implementation of all FerricStore data-type operations, delegating to Router and command handlers."
 
+  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TDigest, TopK}
   alias Ferricstore.Store.Router
-  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK, TDigest}
 
   # ---------------------------------------------------------------
   # Strings
@@ -410,7 +410,8 @@ defmodule FerricStore.Impl do
     {:ok, result}
   end
 
-  @spec zrange(FerricStore.Instance.t(), binary(), integer(), integer(), keyword()) :: {:ok, term()} | {:error, binary()}
+  @spec zrange(FerricStore.Instance.t(), binary(), integer(), integer(), keyword()) ::
+          {:ok, term()} | {:error, binary()}
   def zrange(ctx, key, start, stop, opts) do
     store = build_store(ctx)
     args = [key, to_string(start), to_string(stop)]
@@ -495,7 +496,8 @@ defmodule FerricStore.Impl do
     CMS.handle("CMS.INITBYPROB", [key, to_string(error), to_string(probability)], store)
   end
 
-  @spec cms_incrby(FerricStore.Instance.t(), binary(), [{binary(), pos_integer()}]) :: {:ok, term()} | {:error, binary()}
+  @spec cms_incrby(FerricStore.Instance.t(), binary(), [{binary(), pos_integer()}]) ::
+          {:ok, term()} | {:error, binary()}
   def cms_incrby(ctx, key, pairs) do
     store = build_prob_store(ctx, key)
     args = [key | Enum.flat_map(pairs, fn {elem, count} -> [elem, to_string(count)] end)]

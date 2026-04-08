@@ -111,11 +111,9 @@ defmodule Ferricstore.Store.BitcaskWriter do
   """
   @spec flush(non_neg_integer()) :: :ok
   def flush(shard_index, timeout \\ 10_000) do
-    try do
-      GenServer.call(writer_name(shard_index), :flush, timeout)
-    catch
-      :exit, _ -> :ok
-    end
+    GenServer.call(writer_name(shard_index), :flush, timeout)
+  catch
+    :exit, _ -> :ok
   end
 
   @doc """

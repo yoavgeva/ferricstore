@@ -82,15 +82,13 @@ defmodule Ferricstore.Store.ListOps do
   @spec decode_stored(binary() | nil) :: {:ok, [binary()]} | :not_found | {:error, :wrongtype}
   def decode_stored(nil), do: :not_found
   def decode_stored(binary) when is_binary(binary) do
-    try do
-      case :erlang.binary_to_term(binary) do
-        {:list, elements} when is_list(elements) -> {:ok, elements}
-        {:hash, _} -> {:error, :wrongtype}
-        _ -> {:error, :wrongtype}
-      end
-    rescue
-      ArgumentError -> {:error, :wrongtype}
+    case :erlang.binary_to_term(binary) do
+      {:list, elements} when is_list(elements) -> {:ok, elements}
+      {:hash, _} -> {:error, :wrongtype}
+      _ -> {:error, :wrongtype}
     end
+  rescue
+    ArgumentError -> {:error, :wrongtype}
   end
 
   @spec encode_list([binary()]) :: binary()
@@ -98,15 +96,13 @@ defmodule Ferricstore.Store.ListOps do
 
   @spec check_string_type(binary()) :: binary() | {:error, binary()}
   def check_string_type(value) when is_binary(value) do
-    try do
-      case :erlang.binary_to_term(value) do
-        {:list, _} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-        {:hash, _} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
-        _ -> value
-      end
-    rescue
-      ArgumentError -> value
+    case :erlang.binary_to_term(value) do
+      {:list, _} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+      {:hash, _} -> {:error, "WRONGTYPE Operation against a key holding the wrong kind of value"}
+      _ -> value
     end
+  rescue
+    ArgumentError -> value
   end
 
   @doc false
@@ -179,7 +175,9 @@ defmodule Ferricstore.Store.ListOps do
       actual_count = min(count, length(sorted))
       {to_pop, remaining} = Enum.split(sorted, actual_count)
       Enum.each(to_pop, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
-      if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - actual_count, remaining)
+      if remaining == [],
+        do: delete_meta(key, store),
+        else: update_meta_from_remaining(key, store, len - actual_count, remaining)
       popped_values = Enum.map(to_pop, fn {_, val} -> val end)
 
       case count do
@@ -199,7 +197,9 @@ defmodule Ferricstore.Store.ListOps do
       actual_count = min(count, total)
       {remaining, to_pop} = Enum.split(sorted, total - actual_count)
       Enum.each(to_pop, fn {pos, _} -> Ops.compound_delete(store, key, CompoundKey.list_element(key, pos)) end)
-      if remaining == [], do: delete_meta(key, store), else: update_meta_from_remaining(key, store, len - actual_count, remaining)
+      if remaining == [],
+        do: delete_meta(key, store),
+        else: update_meta_from_remaining(key, store, len - actual_count, remaining)
       popped_values = to_pop |> Enum.map(fn {_, val} -> val end) |> Enum.reverse()
 
       case count do
@@ -317,7 +317,9 @@ defmodule Ferricstore.Store.ListOps do
           :after -> if idx == length(sorted) - 1, do: (elem(List.last(sorted), 0) + @position_step), else: ((elem(Enum.at(sorted, idx), 0) + elem(Enum.at(sorted, idx + 1), 0)) / 2.0)
         end
         Ops.compound_put(store, key, CompoundKey.list_element(key, new_pos), element, 0)
-        write_meta(key, store, {len + 1, min(left_pos, new_pos - @position_step), max(right_pos, new_pos + @position_step)})
+        write_meta(key, store, {
+          len + 1, min(left_pos, new_pos - @position_step), max(right_pos, new_pos + @position_step)
+        })
         len + 1
     end
   end
@@ -385,9 +387,12 @@ defmodule Ferricstore.Store.ListOps do
   end
 
   defp remove_n_from_head(sorted, max_remove, target) do
-    {removed, remaining, _} = Enum.reduce(sorted, {[], [], max_remove}, fn {_, val} = entry, {rem_acc, keep_acc, budget} ->
-      if val == target and budget > 0, do: {[entry | rem_acc], keep_acc, budget - 1}, else: {rem_acc, [entry | keep_acc], budget}
-    end)
+    {removed, remaining, _} =
+      Enum.reduce(sorted, {[], [], max_remove}, fn {_, val} = entry, {rem_acc, keep_acc, budget} ->
+        if val == target and budget > 0,
+          do: {[entry | rem_acc], keep_acc, budget - 1},
+          else: {rem_acc, [entry | keep_acc], budget}
+      end)
     {Enum.reverse(removed), Enum.reverse(remaining), length(removed)}
   end
 
