@@ -58,11 +58,11 @@ defmodule FerricstoreServer.Connection do
   @behaviour :ranch_protocol
 
   alias Ferricstore.AuditLog
-  alias FerricstoreServer.ClientTracking
   alias Ferricstore.Commands.Dispatcher
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
+  alias FerricstoreServer.ClientTracking
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Blocking, as: ConnBlocking
   alias FerricstoreServer.Connection.Pipeline, as: ConnPipeline
@@ -435,7 +435,9 @@ defmodule FerricstoreServer.Connection do
   defp dispatch("QUIT", _args, state), do: {:quit, Encoder.encode(:ok), state}
   defp dispatch("AUTH", args, state), do: ConnAuth.dispatch_auth(args, state)
   defp dispatch("ACL", [subcmd | rest], state), do: ConnAuth.dispatch_acl(String.upcase(subcmd), rest, state)
-  defp dispatch("ACL", [], state), do: {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl' command"}), state}
+  defp dispatch("ACL", [], state) do
+    {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl' command"}), state}
+  end
   defp dispatch("RESET", _args, state), do: dispatch_reset(state)
   defp dispatch("READMODE", args, state), do: dispatch_readmode(args, state)
   defp dispatch("SANDBOX", args, state), do: dispatch_sandbox(args, state)
@@ -469,7 +471,10 @@ defmodule FerricstoreServer.Connection do
   defp dispatch(cmd, args, state) do
     if in_pubsub_mode?(state) and cmd not in ~w(PING) do
       {:continue,
-       Encoder.encode({:error, "ERR Can't execute '#{String.downcase(cmd)}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"}),
+       Encoder.encode(
+         {:error,
+          "ERR Can't execute '#{String.downcase(cmd)}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"}
+       ),
        state}
     else
       dispatch_normal(cmd, args, state)
@@ -481,7 +486,10 @@ defmodule FerricstoreServer.Connection do
   # ---------------------------------------------------------------------------
 
   defp dispatch_client(args, state) do
-    store = if state.sandbox_namespace, do: ConnStore.build_store(state.instance_ctx, state.sandbox_namespace), else: state.instance_ctx
+    store =
+      if state.sandbox_namespace,
+        do: ConnStore.build_store(state.instance_ctx, state.sandbox_namespace),
+        else: state.instance_ctx
 
     conn_state = %{
       client_id: state.client_id,
@@ -653,7 +661,6 @@ defmodule FerricstoreServer.Connection do
 
     {:continue, Encoder.encode(result), new_state}
   end
-
 
   # ---------------------------------------------------------------------------
   # HELLO handler

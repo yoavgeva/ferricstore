@@ -1,10 +1,10 @@
 defmodule FerricstoreServer.Connection.Pipeline do
   @moduledoc "Sliding-window pipeline dispatcher that groups pure commands by shard and executes them concurrently."
 
-  alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
+  alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Store, as: ConnStore
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
@@ -144,7 +144,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
       true ->
         is_read = read_cmd?(normalised)
-        do_sliding_window(rest, [{cmd, normalised} | pure_acc], all_reads? and is_read, state, handle_command_fn, send_response_fn)
+        do_sliding_window(
+          rest, [{cmd, normalised} | pure_acc], all_reads? and is_read,
+          state, handle_command_fn, send_response_fn
+        )
     end
   end
 

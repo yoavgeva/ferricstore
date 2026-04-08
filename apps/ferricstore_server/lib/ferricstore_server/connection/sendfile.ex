@@ -1,8 +1,8 @@
 defmodule FerricstoreServer.Connection.Sendfile do
   @moduledoc "Zero-copy sendfile optimization for large GET responses over ranch_tcp."
 
-  alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Store.Router
+  alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
   @sendfile_threshold_bytes Application.compile_env(

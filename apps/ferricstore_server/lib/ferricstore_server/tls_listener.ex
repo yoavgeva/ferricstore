@@ -43,14 +43,12 @@ defmodule FerricstoreServer.TlsListener do
   """
   @spec running?() :: boolean()
   def running? do
-    try do
-      _ = :ranch.get_port(@listener_ref)
-      true
-    rescue
-      _ -> false
-    catch
-      :exit, _ -> false
-    end
+    _ = :ranch.get_port(@listener_ref)
+    true
+  rescue
+    _ -> false
+  catch
+    :exit, _ -> false
   end
 
   @doc """
