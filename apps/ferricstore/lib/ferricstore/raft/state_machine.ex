@@ -744,6 +744,15 @@ defmodule Ferricstore.Raft.StateMachine do
     __MODULE__.apply(meta, inner_command, state)
   end
 
+  # Catch-all: unknown commands should not crash the ra state machine.
+  # Log the unrecognized command and return an error result so the caller
+  # gets a meaningful error instead of ra crashing with FunctionClauseError.
+  def apply(_meta, unknown_command, state) do
+    require Logger
+    Logger.error("StateMachine: unrecognized command: #{inspect(unknown_command)}")
+    {state, {:error, {:unknown_command, unknown_command}}}
+  end
+
   @doc """
   Lifecycle hook called when the Raft node transitions roles.
 
