@@ -205,18 +205,31 @@ defmodule Ferricstore.Cluster.Manager do
 
       # Case 2: We don't know this node, but it might want to join us.
       # Check if the remote node's cluster_nodes includes us.
+      # IMPORTANT: Only the lowest-named existing node handles the join
+      # to prevent multiple nodes racing to join the same new node.
       true ->
         spawn(fn ->
           try do
             remote_nodes = :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_nodes, []], 5_000)
             if node() in remote_nodes do
-              # Read the remote node's configured role (voter/replica/readonly)
-              remote_role = :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_role, :voter], 5_000)
-              Logger.info("ClusterManager: #{node} wants to join us as #{remote_role}, initiating auto-join")
-              GenServer.call(__MODULE__, {:add_node, node, remote_role}, 120_000)
+              # Deduplicate: only the lowest-named connected node performs the join.
+              # All nodes see :nodeup, but only one should act.
+              existing_nodes = Enum.filter(remote_nodes, fn n -> n != node and n in Node.list() end)
+              all_candidates = Enum.sort([node() | existing_nodes])
+              coordinator = hd(all_candidates)
+
+              if node() == coordinator do
+                remote_role = :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_role, :voter], 5_000)
+                Logger.info("ClusterManager: #{node} wants to join us as #{remote_role}, initiating auto-join (coordinator: #{node()})")
+                result = GenServer.call(__MODULE__, {:add_node, node, remote_role}, 120_000)
+                Logger.info("ClusterManager: auto-join result for #{node}: #{inspect(result)}")
+              else
+                Logger.debug("ClusterManager: skipping join for #{node}, coordinator is #{coordinator}")
+              end
             end
           catch
-            _, _ -> :ok
+            kind, reason ->
+              Logger.error("ClusterManager: auto-join failed for #{node}: #{inspect(kind)}: #{inspect(reason)}")
           end
         end)
         {:noreply, state}

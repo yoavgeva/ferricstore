@@ -50,7 +50,6 @@ defmodule FerricstoreServer.Integration.ProbCommandsTcpTest do
   setup do
     ShardHelpers.flush_all_keys()
     flush_prob_dirs()
-    on_exit(fn -> ShardHelpers.flush_all_keys() end)
     :ok
   end
 

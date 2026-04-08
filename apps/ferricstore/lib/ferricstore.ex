@@ -1544,7 +1544,7 @@ defmodule FerricStore do
 
   ## Examples
 
-      iex> FerricStore.fetch_or_compute_result("dashboard:stats:today", encoded_json, ttl: 30_000)
+      iex> FerricStore.fetch_or_compute_result("dashboard:stats:today", "cached_value", ttl: 30_000)
       :ok
 
   """

@@ -13,7 +13,6 @@ defmodule Ferricstore.Store.ResourceBinaryGetTest do
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
-    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
     :ok
   end
 

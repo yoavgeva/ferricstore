@@ -1640,6 +1640,9 @@ defmodule Ferricstore.Raft.StateMachine do
       value
     end
   end
+  # Catch-all for non-primitive values (e.g. tuples like {:topk_path, path}
+  # stored via Ops.put). Serialize to binary for ETS storage.
+  defp value_for_ets(value, _threshold), do: :erlang.term_to_binary(value)
 
   @compile {:inline, hot_cache_threshold: 1}
   defp hot_cache_threshold(%{instance_ctx: ctx}) when ctx != nil, do: ctx.hot_cache_max_value_size
@@ -1648,6 +1651,7 @@ defmodule Ferricstore.Raft.StateMachine do
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
   defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
   defp to_disk_binary(v) when is_binary(v), do: v
+  defp to_disk_binary(v), do: :erlang.term_to_binary(v)
 
   # ---------------------------------------------------------------------------
   # Private: string mutation operations

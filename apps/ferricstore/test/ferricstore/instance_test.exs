@@ -7,7 +7,6 @@ defmodule Ferricstore.InstanceTest do
 
   setup do
     Ferricstore.Test.ShardHelpers.flush_all_keys()
-    on_exit(fn -> Ferricstore.Test.ShardHelpers.flush_all_keys() end)
   end
 
   describe "FerricStore.Impl with default instance" do

@@ -19,7 +19,6 @@ defmodule Ferricstore.ReviewR4.CodeReviewIssuesTest do
 
   setup do
     ShardHelpers.flush_all_keys()
-    on_exit(fn -> ShardHelpers.flush_all_keys() end)
     :ok
   end
 

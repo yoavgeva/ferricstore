@@ -215,6 +215,13 @@ defmodule Ferricstore.Commands.TopK do
   defp maybe_register_topk(:ok, store, key), do: do_register_topk(store, key)
   defp maybe_register_topk(other, _store, _key), do: other
 
+  defp do_register_topk(%FerricStore.Instance{}, _key) do
+    # When using Instance struct, prob commands go through Raft and
+    # the state machine's apply clause stores metadata via do_put.
+    # No separate Ops.put needed.
+    :ok
+  end
+
   defp do_register_topk(store, key) do
     if is_nil(Map.get(store, :prob_write)) do
       path = prob_path(store, key, "topk")

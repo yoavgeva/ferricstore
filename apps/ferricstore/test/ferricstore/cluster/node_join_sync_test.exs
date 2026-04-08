@@ -41,20 +41,36 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     # Clean temp dirs
     Path.wildcard(Path.join(System.tmp_dir!(), "ferricstore_cluster_*")) |> Enum.each(&File.rm_rf/1)
     Path.wildcard(Path.join(System.tmp_dir!(), "ferricstore_solo_*")) |> Enum.each(&File.rm_rf/1)
+    Path.wildcard(Path.join(System.tmp_dir!(), "ferricstore_clone_*")) |> Enum.each(&File.rm_rf/1)
 
     # Kill any lingering peer nodes from previous runs
-    Node.list()
-    |> Enum.filter(fn n -> n |> Atom.to_string() |> String.contains?("ferric_") end)
-    |> Enum.each(fn n ->
+    ferric_nodes =
+      Node.list()
+      |> Enum.filter(fn n -> n |> Atom.to_string() |> String.contains?("ferric_") end)
+
+    Enum.each(ferric_nodes, fn n ->
       try do
-        Node.disconnect(n)
+        :erpc.call(n, System, :stop, [0], 2_000)
       catch
         _, _ -> :ok
       end
+      Node.disconnect(n)
     end)
 
-    # Brief pause to let processes terminate
-    Process.sleep(100)
+    # Wait until all ferric peer nodes are fully disconnected
+    if ferric_nodes != [] do
+      Enum.each(1..50, fn _ ->
+        remaining =
+          Node.list()
+          |> Enum.filter(fn n -> n |> Atom.to_string() |> String.contains?("ferric_") end)
+
+        if remaining == [] do
+          :ok
+        else
+          Process.sleep(100)
+        end
+      end)
+    end
   end
 
   describe "new node join with continuous writes" do
@@ -470,7 +486,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       clone_dir = Path.join(System.tmp_dir!(), "ferricstore_clone_#{System.unique_integer([:positive])}")
       File.cp_r!(source_data_dir, clone_dir)
-      on_exit(fn -> File.rm_rf!(clone_dir) end)
+      on_exit(fn -> File.rm_rf(clone_dir) end)
 
       # Read last applied Raft index from cloned ra state BEFORE deleting.
       for i <- 0..(source_ctx.shard_count - 1) do

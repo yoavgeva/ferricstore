@@ -71,12 +71,21 @@ defmodule Ferricstore.Test.ShardHelpers do
     # Use a generous timeout for test cleanup (production Batcher.flush uses 10s).
     flush_timeout = 30_000
 
+    # Ensure all ra shard processes are alive before flushing.
+    # A previous test may have crashed ra (e.g. FunctionClauseError under load),
+    # leaving the batcher blocked. Restart dead shards first.
+    ensure_ra_shards_alive(shard_count)
+
     # Flush Raft batchers first (moves any pending slot contents into
     # AsyncApplyWorker casts for async namespaces, or applies via Raft
     # for quorum namespaces), then drain async workers so their
     # fire-and-forget writes land in ETS before we snapshot keys.
     Enum.each(0..(shard_count - 1), fn i ->
-      GenServer.call(Batcher.batcher_name(i), :flush, flush_timeout)
+      try do
+        GenServer.call(Batcher.batcher_name(i), :flush, flush_timeout)
+      catch
+        :exit, _ -> :ok
+      end
       AsyncApplyWorker.drain(i)
     end)
 
@@ -98,14 +107,22 @@ defmodule Ferricstore.Test.ShardHelpers do
     # The deletes above go through the Raft batcher (async). Drain the
     # pipeline again so the tombstones are applied before we return.
     Enum.each(0..(shard_count - 1), fn i ->
-      GenServer.call(Batcher.batcher_name(i), :flush, flush_timeout)
+      try do
+        GenServer.call(Batcher.batcher_name(i), :flush, flush_timeout)
+      catch
+        :exit, _ -> :ok
+      end
       AsyncApplyWorker.drain(i)
     end)
 
     # Clear cross-shard locks and intents via Raft so tests start clean.
     Enum.each(0..(shard_count - 1), fn i ->
       shard_id = Ferricstore.Raft.Cluster.shard_server_id(i)
-      :ra.process_command(shard_id, {:clear_locks})
+      try do
+        :ra.process_command(shard_id, {:clear_locks})
+      catch
+        :exit, _ -> :ok
+      end
     end)
 
     # Safety net: clear any remaining compound key entries from ETS.
@@ -318,6 +335,53 @@ defmodule Ferricstore.Test.ShardHelpers do
   # ---------------------------------------------------------------------------
   # Internal
   # ---------------------------------------------------------------------------
+
+  # Checks that all ra shard processes are alive and have a leader.
+  # If a ra process crashed (e.g. FunctionClauseError under load),
+  # restart it so subsequent tests don't cascade-fail with batcher timeouts.
+  defp ensure_ra_shards_alive(shard_count) do
+    alias Ferricstore.Raft.Cluster
+    system = Cluster.system_name()
+
+    Enum.each(0..(shard_count - 1), fn i ->
+      server_id = Cluster.shard_server_id(i)
+      {shard_name, _node} = server_id
+
+      case Process.whereis(shard_name) do
+        nil ->
+          # ra process is dead — restart it via ra:restart_server
+          # which recovers from WAL (the data is still on disk)
+          try do
+            :ra.restart_server(system, server_id)
+          catch
+            _, _ -> :ok
+          end
+          # Wait for leader election
+          eventually(
+            fn -> {:ok, _, _} = :ra.members(server_id) end,
+            "shard #{i} ra restart",
+            20,
+            200
+          )
+
+        pid when is_pid(pid) ->
+          # Process exists but might be in a bad state — verify it responds
+          case :ra.members(server_id) do
+            {:ok, _, _} ->
+              :ok
+
+            _ ->
+              # No leader — trigger election
+              try do
+                :ra.trigger_election(server_id)
+              catch
+                _, _ -> :ok
+              end
+              Process.sleep(200)
+          end
+      end
+    end)
+  end
 
   defp shard_count do
     :persistent_term.get(:ferricstore_shard_count, Application.get_env(:ferricstore, :shard_count, 4))

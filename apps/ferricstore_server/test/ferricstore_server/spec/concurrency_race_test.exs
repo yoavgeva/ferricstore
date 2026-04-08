@@ -87,8 +87,6 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
     recv_response(sock, "", 60_000)
     :gen_tcp.close(sock)
 
-    on_exit(fn -> ShardHelpers.flush_all_keys() end)
-
     :ok
   end
 

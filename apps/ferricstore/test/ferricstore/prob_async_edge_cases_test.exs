@@ -33,7 +33,6 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
       end
     end
 
-    on_exit(fn -> ShardHelpers.flush_all_keys() end)
     :ok
   end
 
