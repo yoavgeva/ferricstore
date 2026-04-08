@@ -1515,6 +1515,10 @@ defmodule Ferricstore.Raft.StateMachine do
     ets_val = value_for_ets(value, hot_cache_threshold(state))
     disk_val = to_disk_binary(value)
 
+    # Track binary memory: subtract old entry's bytes, add new entry's bytes.
+    # This gives MemoryGuard accurate off-heap binary accounting.
+    track_keydir_binary_delta(state, key, ets_val)
+
     # Insert into ETS immediately so subsequent read-modify-write commands
     # (INCR, APPEND, etc.) in the same batch see the correct value.
     # The file_id is :pending — flush_pending_writes will update it with
@@ -1597,6 +1601,7 @@ defmodule Ferricstore.Raft.StateMachine do
     # v2: append a tombstone record to the active log file + fsync.
     case NIF.v2_append_tombstone(state.active_file_path, key) do
       {:ok, _} ->
+        track_keydir_binary_remove(state, key)
         :ets.delete(state.ets, key)
         :ok
 
@@ -2225,6 +2230,52 @@ defmodule Ferricstore.Raft.StateMachine do
   catch
     :exit, _reason -> :ok
   end
+
+  # ---------------------------------------------------------------------------
+  # Private: keydir binary memory tracking
+  # ---------------------------------------------------------------------------
+
+  # Tracks off-heap binary bytes when inserting/updating a key in ETS.
+  # Computes delta: new_bytes - old_bytes (if key existed before).
+  defp track_keydir_binary_delta(state, key, new_ets_val) do
+    ref = keydir_binary_ref(state)
+    if ref do
+      new_bytes = binary_byte_size(key) + binary_byte_size(new_ets_val)
+      old_bytes = case :ets.lookup(state.ets, key) do
+        [{^key, old_val, _, _, _, _, _}] ->
+          binary_byte_size(key) + binary_byte_size(old_val)
+        _ -> 0
+      end
+      delta = new_bytes - old_bytes
+      if delta != 0, do: :atomics.add(ref, state.shard_index + 1, delta)
+    end
+  end
+
+  # Tracks off-heap binary bytes when deleting a key from ETS.
+  defp track_keydir_binary_remove(state, key) do
+    ref = keydir_binary_ref(state)
+    if ref do
+      bytes = case :ets.lookup(state.ets, key) do
+        [{^key, val, _, _, _, _, _}] ->
+          binary_byte_size(key) + binary_byte_size(val)
+        _ -> 0
+      end
+      if bytes > 0, do: :atomics.sub(ref, state.shard_index + 1, bytes)
+    end
+  end
+
+  defp keydir_binary_ref(%{instance_ctx: %{keydir_binary_bytes: ref}}) when ref != nil, do: ref
+  defp keydir_binary_ref(_) do
+    try do
+      ctx = FerricStore.Instance.get(:default)
+      ctx && ctx.keydir_binary_bytes
+    rescue
+      _ -> nil
+    end
+  end
+
+  defp binary_byte_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
+  defp binary_byte_size(_), do: 0
 
   # ---------------------------------------------------------------------------
   # Private: probabilistic data structure helpers

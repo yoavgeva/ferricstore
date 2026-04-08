@@ -216,6 +216,7 @@ defmodule Ferricstore.Store.Router do
       {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
     else
       keydir = elem(ctx.keydir_refs, idx)
+      track_keydir_binary_delete(ctx, idx, keydir, key)
       :ets.delete(keydir, key)
 
       {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
@@ -409,6 +410,9 @@ defmodule Ferricstore.Store.Router do
     disk_value = to_disk_binary(value)
     {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
 
+    # Track off-heap binary bytes for MemoryGuard accuracy
+    track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+
     if value_for_ets == nil do
       # Large value: sync NIF write to get offset, then ETS with real location.
       # Cannot use async BitcaskWriter because ETS value is nil (too large for
@@ -438,6 +442,31 @@ defmodule Ferricstore.Store.Router do
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
   defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
   defp to_disk_binary(v) when is_binary(v), do: v
+
+  # -- Keydir binary memory tracking --
+  # Only counts binaries > 64 bytes (refc binaries, off-heap).
+  # Smaller binaries are inlined in the ETS tuple and counted by :ets.info(:memory).
+
+  defp track_keydir_binary_insert(ctx, idx, keydir, key, new_val) do
+    new_bytes = offheap_size(key) + offheap_size(new_val)
+    old_bytes = case :ets.lookup(keydir, key) do
+      [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
+      _ -> 0
+    end
+    delta = new_bytes - old_bytes
+    if delta != 0, do: :atomics.add(ctx.keydir_binary_bytes, idx + 1, delta)
+  end
+
+  defp track_keydir_binary_delete(ctx, idx, keydir, key) do
+    bytes = case :ets.lookup(keydir, key) do
+      [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
+      _ -> 0
+    end
+    if bytes > 0, do: :atomics.sub(ctx.keydir_binary_bytes, idx + 1, bytes)
+  end
+
+  defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
+  defp offheap_size(_), do: 0
 
   defp async_submit_to_raft(idx, command) do
     Ferricstore.Raft.AsyncApplyWorker.replicate(idx, [command])

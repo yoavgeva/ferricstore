@@ -39,6 +39,7 @@ defmodule FerricStore.Instance do
           max_memory_bytes: non_neg_integer(),
           keydir_max_ram: non_neg_integer(),
           memory_limit: non_neg_integer(),
+          keydir_binary_bytes: reference(),
           raft_enabled: boolean(),
           durability_mode: atom(),
           hotness_table: atom() | reference(),
@@ -75,6 +76,7 @@ defmodule FerricStore.Instance do
     :durability_mode,
     :hotness_table,
     :config_table,
+    :keydir_binary_bytes,
     raft_enabled: true,
     connected_clients_fn: nil,
     process_rss_fn: nil,
@@ -122,6 +124,18 @@ defmodule FerricStore.Instance do
           :counters.new(shard_count, [:write_concurrency]),
           :counters.new(10, [:atomics])
         }
+      end
+
+    # Per-shard counter for off-heap binary bytes in ETS keydirs.
+    # :ets.info(:memory) doesn't count refc binaries (> 64 bytes).
+    # We track insertions/deletions to give MemoryGuard accurate numbers.
+    keydir_binary_bytes =
+      if name == :default do
+        try_get_pt(:ferricstore_keydir_binary_bytes, fn ->
+          :atomics.new(shard_count, signed: true)
+        end)
+      else
+        :atomics.new(shard_count, signed: true)
       end
 
     # LFU config
@@ -176,6 +190,7 @@ defmodule FerricStore.Instance do
       max_memory_bytes: max_memory_bytes,
       keydir_max_ram: keydir_max_ram,
       memory_limit: memory_limit,
+      keydir_binary_bytes: keydir_binary_bytes,
       raft_enabled: Keyword.get(opts, :raft_enabled, true),
       durability_mode: :all_quorum,
       hotness_table: hotness_table,

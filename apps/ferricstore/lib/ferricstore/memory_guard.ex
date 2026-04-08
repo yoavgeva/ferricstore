@@ -533,9 +533,14 @@ defmodule Ferricstore.MemoryGuard do
   end
 
   defp compute_stats(state) do
+    # Off-heap binary bytes tracked by insert/delete hooks in state machine + router.
+    binary_bytes_ref = keydir_binary_bytes_ref()
+
     {keydir_bytes, shard_stats} =
       Enum.reduce(0..(state.shard_count - 1), {0, %{}}, fn i, {kd_acc, shards_acc} ->
-        kd_bytes = safe_ets_memory(:"keydir_#{i}")
+        ets_bytes = safe_ets_memory(:"keydir_#{i}")
+        bin_bytes = safe_atomics_get(binary_bytes_ref, i + 1)
+        kd_bytes = ets_bytes + bin_bytes
         per_shard_max = div(state.max_memory_bytes, max(state.shard_count, 1))
         ratio =
           cond do
@@ -613,6 +618,21 @@ defmodule Ferricstore.MemoryGuard do
     end
   rescue _ -> 0
   catch _, _ -> 0
+  end
+
+  defp keydir_binary_bytes_ref do
+    ctx = FerricStore.Instance.get(:default)
+    ctx && ctx.keydir_binary_bytes
+  rescue
+    _ -> nil
+  end
+
+  defp safe_atomics_get(nil, _slot), do: 0
+  defp safe_atomics_get(ref, slot) do
+    val = :atomics.get(ref, slot)
+    max(val, 0)
+  rescue
+    _ -> 0
   end
 
   defp classify_pressure(ratio) when ratio >= @reject_threshold, do: :reject
