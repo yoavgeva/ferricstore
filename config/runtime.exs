@@ -9,17 +9,19 @@ if config_env() == :prod do
     port: String.to_integer(System.get_env("FERRICSTORE_PORT", "6379")),
     health_port: String.to_integer(System.get_env("FERRICSTORE_HEALTH_PORT", "6380")),
     data_dir: System.get_env("FERRICSTORE_DATA_DIR", "/data"),
-    shard_count: (
-      count = System.get_env("FERRICSTORE_SHARD_COUNT", "0")
-      count = String.to_integer(count)
-      if count == 0, do: System.schedulers_online(), else: count
-    )
+    shard_count:
+      (
+        count = System.get_env("FERRICSTORE_SHARD_COUNT", "0")
+        count = String.to_integer(count)
+        if count == 0, do: System.schedulers_online(), else: count
+      )
 
   # ---------------------------------------------------------------------------
   # Durability
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    default_durability: String.to_existing_atom(System.get_env("FERRICSTORE_DURABILITY", "quorum"))
+    default_durability:
+      String.to_existing_atom(System.get_env("FERRICSTORE_DURABILITY", "quorum"))
 
   # ---------------------------------------------------------------------------
   # Memory & Eviction
@@ -28,8 +30,10 @@ if config_env() == :prod do
     max_memory_bytes: String.to_integer(System.get_env("FERRICSTORE_MAX_MEMORY", "0")),
     eviction_policy: System.get_env("FERRICSTORE_EVICTION_POLICY", "volatile_lru"),
     max_value_size: String.to_integer(System.get_env("FERRICSTORE_MAX_VALUE_SIZE", "1048576")),
-    hot_cache_max_value_size: String.to_integer(System.get_env("FERRICSTORE_HOT_CACHE_MAX_VALUE_SIZE", "65536")),
-    memory_guard_interval_ms: String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
+    hot_cache_max_value_size:
+      String.to_integer(System.get_env("FERRICSTORE_HOT_CACHE_MAX_VALUE_SIZE", "65536")),
+    memory_guard_interval_ms:
+      String.to_integer(System.get_env("FERRICSTORE_MEMORY_GUARD_INTERVAL_MS", "5000"))
 
   # ---------------------------------------------------------------------------
   # LFU Scoring
@@ -43,14 +47,17 @@ if config_env() == :prod do
   # Expiry
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    expiry_sweep_interval_ms: String.to_integer(System.get_env("FERRICSTORE_EXPIRY_SWEEP_INTERVAL_MS", "100")),
-    expiry_max_keys_per_sweep: String.to_integer(System.get_env("FERRICSTORE_EXPIRY_MAX_KEYS_PER_SWEEP", "20"))
+    expiry_sweep_interval_ms:
+      String.to_integer(System.get_env("FERRICSTORE_EXPIRY_SWEEP_INTERVAL_MS", "100")),
+    expiry_max_keys_per_sweep:
+      String.to_integer(System.get_env("FERRICSTORE_EXPIRY_MAX_KEYS_PER_SWEEP", "20"))
 
   # ---------------------------------------------------------------------------
   # Slow Log
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    slowlog_log_slower_than_us: String.to_integer(System.get_env("FERRICSTORE_SLOWLOG_SLOWER_THAN_US", "10000")),
+    slowlog_log_slower_than_us:
+      String.to_integer(System.get_env("FERRICSTORE_SLOWLOG_SLOWER_THAN_US", "10000")),
     slowlog_max_len: String.to_integer(System.get_env("FERRICSTORE_SLOWLOG_MAX_LEN", "128"))
 
   # ---------------------------------------------------------------------------
@@ -82,20 +89,21 @@ if config_env() == :prod do
   socket_mode = System.get_env("FERRICSTORE_SOCKET_ACTIVE_MODE", "true")
 
   config :ferricstore,
-    socket_active_mode: (
-      case socket_mode do
-        "true" -> true
-        "once" -> :once
-        n -> String.to_integer(n)
-      end
-    )
+    socket_active_mode:
+      (case socket_mode do
+         "true" -> true
+         "once" -> :once
+         n -> String.to_integer(n)
+       end)
 
   # ---------------------------------------------------------------------------
   # Raft / Internals
   # ---------------------------------------------------------------------------
   config :ferricstore,
-    release_cursor_interval: String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "10000")),
-    promotion_threshold: String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100"))
+    release_cursor_interval:
+      String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "10000")),
+    promotion_threshold:
+      String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100"))
 
   # ---------------------------------------------------------------------------
   # Supervisor (test-only tuning, production defaults are fine)
@@ -118,16 +126,18 @@ if config_env() == :prod do
       node_name: String.to_atom(node_name),
       cookie: String.to_atom(cookie),
       cluster_role: String.to_atom(System.get_env("FERRICSTORE_CLUSTER_ROLE", "voter")),
-      cluster_remove_delay_ms: String.to_integer(System.get_env("FERRICSTORE_CLUSTER_REMOVE_DELAY_MS", "60000"))
+      cluster_remove_delay_ms:
+        String.to_integer(System.get_env("FERRICSTORE_CLUSTER_REMOVE_DELAY_MS", "60000"))
 
     # Static node list (alternative to libcluster auto-discovery)
     cluster_nodes = System.get_env("FERRICSTORE_CLUSTER_NODES", "")
 
     if cluster_nodes != "" do
-      config :ferricstore, :cluster_nodes,
-        cluster_nodes
-        |> String.split(",", trim: true)
-        |> Enum.map(&String.to_atom/1)
+      config :ferricstore,
+             :cluster_nodes,
+             cluster_nodes
+             |> String.split(",", trim: true)
+             |> Enum.map(&String.to_atom/1)
     end
 
     # Node discovery strategy — auto-configured from env vars.
@@ -154,6 +164,7 @@ if config_env() == :prod do
 
       "dns" ->
         dns_name = System.get_env("FERRICSTORE_DNS_NAME", "ferricstore-headless")
+
         config :libcluster,
           topologies: [
             ferricstore: [
@@ -210,5 +221,4 @@ if config_env() == :prod do
         config :libcluster, topologies: :disabled
     end
   end
-
 end

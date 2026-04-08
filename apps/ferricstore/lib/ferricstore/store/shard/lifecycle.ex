@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @moduledoc "Shard startup (log/hint recovery, keydir rebuild), expiry sweep, probabilistic-file migration, Raft init, and graceful shutdown."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.HLC
   alias Ferricstore.Store.LFU
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
@@ -117,7 +118,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @spec do_expiry_sweep(map()) :: map()
   @doc false
   def do_expiry_sweep(state) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     max_keys = Application.get_env(:ferricstore, :expiry_max_keys_per_sweep, @default_max_keys_per_sweep)
     expired_keys = scan_expired(state.keydir, now, max_keys)
 

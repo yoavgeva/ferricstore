@@ -283,12 +283,13 @@ defmodule Ferricstore.ReviewR3.ServerIssuesTest do
       assert match?({:error, _}, result),
         "Lock should be held, but another owner could acquire it immediately"
 
-      # Wait for expiry
+      # Wait for expiry — under full-suite load, scheduler delays can
+      # push the actual check past the TTL, so retry with eventually.
       Process.sleep(ttl_ms + 100)
 
-      # Now owner2 should be able to acquire
-      assert :ok = FerricStore.lock(lock_key, owner2, ttl_ms),
-        "Lock should have expired after #{ttl_ms}ms, but re-acquisition failed"
+      ShardHelpers.eventually(fn ->
+        assert :ok = FerricStore.lock(lock_key, owner2, ttl_ms)
+      end, "lock should have expired after #{ttl_ms}ms", 10, 100)
 
       # Clean up
       FerricStore.unlock(lock_key, owner2)

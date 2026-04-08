@@ -18,6 +18,7 @@ defmodule Ferricstore.Store.Router do
   argument, replacing all persistent_term lookups with instance-local state.
   """
 
+  alias Ferricstore.HLC
   alias Ferricstore.Stats
   alias Ferricstore.Store.LFU
 
@@ -229,7 +230,7 @@ defmodule Ferricstore.Store.Router do
 
   defp async_write(ctx, idx, {:incr, key, delta}) do
     keydir = elem(ctx.keydir_refs, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     current =
       case :ets.lookup(keydir, key) do
@@ -265,7 +266,7 @@ defmodule Ferricstore.Store.Router do
 
   defp async_write(ctx, idx, {:incr_float, key, delta}) do
     keydir = elem(ctx.keydir_refs, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     current =
       case :ets.lookup(keydir, key) do
@@ -312,7 +313,7 @@ defmodule Ferricstore.Store.Router do
 
   defp async_write(ctx, idx, {:append, key, suffix}) do
     keydir = elem(ctx.keydir_refs, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     current =
       case :ets.lookup(keydir, key) do
@@ -334,7 +335,7 @@ defmodule Ferricstore.Store.Router do
 
   defp async_write(ctx, idx, {:getset, key, new_value}) do
     keydir = elem(ctx.keydir_refs, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     old =
       case :ets.lookup(keydir, key) do
@@ -348,7 +349,7 @@ defmodule Ferricstore.Store.Router do
 
   defp async_write(ctx, idx, {:getdel, key}) do
     keydir = elem(ctx.keydir_refs, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     old =
       case :ets.lookup(keydir, key) do
@@ -362,7 +363,7 @@ defmodule Ferricstore.Store.Router do
 
   defp async_write(ctx, idx, {:getex, key, expire_at_ms}) do
     keydir = elem(ctx.keydir_refs, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     case :ets.lookup(keydir, key) do
       [{^key, value, exp, _, _, _, _}] when value != nil and (exp == 0 or exp > now) ->
@@ -376,7 +377,7 @@ defmodule Ferricstore.Store.Router do
 
   defp async_write(ctx, idx, {:setrange, key, offset, value}) do
     keydir = elem(ctx.keydir_refs, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     current =
       case :ets.lookup(keydir, key) do
@@ -546,7 +547,7 @@ defmodule Ferricstore.Store.Router do
   def get_file_ref(ctx, key) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     case ets_get_full(keydir, key, now) do
       {:hit, _value, _lfu} ->
@@ -591,7 +592,7 @@ defmodule Ferricstore.Store.Router do
   def get_with_file_ref(ctx, key) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     case ets_get_full(keydir, key, now) do
       {:hit, value, lfu} ->
@@ -684,7 +685,7 @@ defmodule Ferricstore.Store.Router do
   def get(ctx, key) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     case ets_get_full(keydir, key, now) do
       {:hit, value, lfu} ->
@@ -756,7 +757,7 @@ defmodule Ferricstore.Store.Router do
   def get_meta(ctx, key) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     case ets_get_full(keydir, key, now) do
       {:hit, value, lfu} ->
@@ -979,7 +980,7 @@ defmodule Ferricstore.Store.Router do
   def exists_fast?(ctx, key) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     try do
       case :ets.lookup(keydir, key) do
@@ -1113,7 +1114,7 @@ defmodule Ferricstore.Store.Router do
   def get_keydir_file_ref(ctx, key) do
     idx = shard_for(ctx, key)
     keydir = resolve_keydir(ctx, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     try do
       case :ets.lookup(keydir, key) do
@@ -1140,13 +1141,13 @@ defmodule Ferricstore.Store.Router do
 
   @spec cas(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer() | nil) :: 1 | 0 | nil
   def cas(ctx, key, expected, new_value, ttl_ms) do
-    expire_at_ms = if ttl_ms, do: System.os_time(:millisecond) + ttl_ms, else: nil
+    expire_at_ms = if ttl_ms, do: HLC.now_ms() + ttl_ms, else: nil
     raft_write(ctx, shard_for(ctx, key), key, {:cas, key, expected, new_value, expire_at_ms})
   end
 
   @spec lock(FerricStore.Instance.t(), binary(), binary(), pos_integer()) :: :ok | {:error, binary()}
   def lock(ctx, key, owner, ttl_ms) do
-    expire_at_ms = System.os_time(:millisecond) + ttl_ms
+    expire_at_ms = HLC.now_ms() + ttl_ms
     raft_write(ctx, shard_for(ctx, key), key, {:lock, key, owner, expire_at_ms})
   end
 
@@ -1157,13 +1158,13 @@ defmodule Ferricstore.Store.Router do
 
   @spec extend(FerricStore.Instance.t(), binary(), binary(), pos_integer()) :: 1 | {:error, binary()}
   def extend(ctx, key, owner, ttl_ms) do
-    expire_at_ms = System.os_time(:millisecond) + ttl_ms
+    expire_at_ms = HLC.now_ms() + ttl_ms
     raft_write(ctx, shard_for(ctx, key), key, {:extend, key, owner, expire_at_ms})
   end
 
   @spec ratelimit_add(FerricStore.Instance.t(), binary(), pos_integer(), pos_integer(), pos_integer()) :: [term()]
   def ratelimit_add(ctx, key, window_ms, max, count) do
-    now_ms = System.os_time(:millisecond)
+    now_ms = HLC.now_ms()
     raft_write(ctx, shard_for(ctx, key), key, {:ratelimit_add, key, window_ms, max, count, now_ms})
   end
 

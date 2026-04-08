@@ -28,6 +28,7 @@ defmodule Ferricstore.CrossShardOp do
   handlers use, so existing command logic works unchanged.
   """
 
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Router
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Cluster
@@ -188,7 +189,7 @@ defmodule Ferricstore.CrossShardOp do
   # ---------------------------------------------------------------------------
 
   defp lock_phase(sorted_shards, lock_map, owner_ref, retry) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     expire_at = now + @lock_ttl_ms
 
     result =
@@ -313,7 +314,7 @@ defmodule Ferricstore.CrossShardOp do
   defp write_intent(coordinator_shard, owner_ref, intent_map) do
     full_intent =
       Map.merge(
-        %{status: :executing, created_at: System.os_time(:millisecond)},
+        %{status: :executing, created_at: HLC.now_ms()},
         intent_map
       )
 

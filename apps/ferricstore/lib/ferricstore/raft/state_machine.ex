@@ -1139,7 +1139,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Reads a value from a shard's keydir ETS table with cold-read fallback.
   defp cross_shard_ets_read(ctx, key) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     try do
       case :ets.lookup(ctx.keydir, key) do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
@@ -1168,7 +1168,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Reads value + expire_at_ms from a shard's keydir ETS table.
   defp cross_shard_ets_read_meta(ctx, key) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     try do
       case :ets.lookup(ctx.keydir, key) do
         [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->
@@ -1196,7 +1196,7 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   defp cross_shard_prefix_scan(ctx, prefix) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     prefix_len = byte_size(prefix)
     ms = [{{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
            [{:andalso, {:is_binary, :"$1"},
@@ -1238,7 +1238,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp cross_shard_prefix_count(keydir, prefix) do
     prefix_len = byte_size(prefix)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     ms = [{{:"$1", :_, :"$2", :_, :_, :_, :_},
            [{:andalso, {:is_binary, :"$1"},
              {:andalso, {:>=, {:byte_size, :"$1"}, prefix_len},
@@ -1921,7 +1921,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # Returns {new_state, result} — locks are persisted in Raft state.
   defp do_lock_keys(state, keys, owner_ref, expire_at_ms) do
     locks = Map.get(state, :cross_shard_locks, %{})
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     conflict =
       Enum.find(keys, fn key ->
@@ -1966,7 +1966,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # Checks whether a key is locked by someone other than owner_ref.
   defp check_key_lock(state, key, owner_ref) do
     locks = Map.get(state, :cross_shard_locks, %{})
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     case Map.get(locks, key) do
       nil -> :ok
@@ -2004,7 +2004,7 @@ defmodule Ferricstore.Raft.StateMachine do
   #
   # Replicates the exact shard.ex handle_ratelimit_add_direct logic.
   defp do_ratelimit_add(state, key, window_ms, max, count, precomputed_now_ms) do
-    now = precomputed_now_ms || System.os_time(:millisecond)
+    now = precomputed_now_ms || HLC.now_ms()
 
     {cur_count, cur_start, prv_count} =
       case ets_lookup(state, key) do
@@ -2055,7 +2055,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # Mirrors the shard's `ets_lookup/2` logic with Bitcask fallback for
   # keys that may not yet be warmed into ETS.
   defp ets_lookup(state, key) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     case :ets.lookup(state.ets, key) do
       [{^key, value, 0, _lfu, _fid, _off, _vsize}] when value != nil ->

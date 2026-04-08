@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @moduledoc "ETS keydir operations: lookup, insert, delete, cold-read warming, LFU touch, hot-cache threshold enforcement, and prefix scans."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.HLC
   alias Ferricstore.Store.{LFU, ValueCodec}
 
   # -------------------------------------------------------------------
@@ -19,7 +20,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec ets_lookup(map(), binary()) :: {:hit, term(), non_neg_integer()} | {:cold, non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()} | :expired | :miss
   @doc false
   def ets_lookup(%{keydir: keydir}, key) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     case :ets.lookup(keydir, key) do
       [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
@@ -257,7 +258,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec prefix_scan_entries(:ets.tid(), binary(), binary() | nil) :: [{binary(), binary()}]
   @doc false
   def prefix_scan_entries(keydir, prefix, shard_data_path) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     prefix_len = byte_size(prefix)
     # Select all 7-tuple fields so we can cold-read nil values
     ms = [{{:"$1", :"$2", :"$3", :_, :"$4", :"$5", :"$6"},
@@ -298,7 +299,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   @spec prefix_count_entries(:ets.tid(), binary()) :: non_neg_integer()
   @doc false
   def prefix_count_entries(keydir, prefix) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     prefix_len = byte_size(prefix)
     ms = [{{:"$1", :_, :"$3", :_, :_, :_, :_},
            [{:andalso, {:is_binary, :"$1"},

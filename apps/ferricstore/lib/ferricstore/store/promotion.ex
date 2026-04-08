@@ -43,6 +43,7 @@ defmodule Ferricstore.Store.Promotion do
   """
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.HLC
   alias Ferricstore.Store.{CompoundKey, LFU}
 
   require Logger
@@ -101,7 +102,7 @@ defmodule Ferricstore.Store.Promotion do
     prefix = compound_prefix_for(type, redis_key)
     type_str = CompoundKey.encode_type(type)
     type_label = type_label(type)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     entries =
       :ets.foldl(

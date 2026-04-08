@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   @moduledoc "Shard read-path handlers: ETS hot lookup, cold-key pread from Bitcask, exists check, and key enumeration."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
 
@@ -219,7 +220,7 @@ defmodule Ferricstore.Store.Shard.Reads do
   @spec live_keys(map()) :: [binary()]
   @doc false
   def live_keys(state) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     :ets.foldl(
       fn {key, _value, exp, _lfu, _fid, _off, _vsize}, acc ->

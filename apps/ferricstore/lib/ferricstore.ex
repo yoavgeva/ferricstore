@@ -49,6 +49,7 @@ defmodule FerricStore do
     end
   end
 
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Router
 
   # Transitional: resolve ctx from the :default instance.
@@ -269,7 +270,7 @@ defmodule FerricStore do
         keepttl? -> {0, true}
         exat != nil -> {exat * 1000, false}
         pxat != nil -> {pxat, false}
-        ttl > 0 -> {System.os_time(:millisecond) + ttl, false}
+        ttl > 0 -> {HLC.now_ms() + ttl, false}
         true -> {0, false}
       end
 
@@ -678,7 +679,7 @@ defmodule FerricStore do
           0
 
         ttl = Keyword.get(opts, :ttl) ->
-          System.os_time(:millisecond) + ttl
+          HLC.now_ms() + ttl
 
         true ->
           nil
@@ -738,7 +739,7 @@ defmodule FerricStore do
   @spec setex(key(), pos_integer(), value()) :: :ok
   def setex(key, seconds, value) do
     ctx = default_ctx()
-    expire_at_ms = System.os_time(:millisecond) + seconds * 1_000
+    expire_at_ms = HLC.now_ms() + seconds * 1_000
     Router.put(ctx, key, value, expire_at_ms)
   end
 
@@ -760,7 +761,7 @@ defmodule FerricStore do
   @spec psetex(key(), pos_integer(), value()) :: :ok
   def psetex(key, milliseconds, value) do
     ctx = default_ctx()
-    expire_at_ms = System.os_time(:millisecond) + milliseconds
+    expire_at_ms = HLC.now_ms() + milliseconds
     Router.put(ctx, key, value, expire_at_ms)
   end
 
@@ -1730,7 +1731,7 @@ defmodule FerricStore do
         {:ok, false}
 
       {value, _old_exp} ->
-        expire_at_ms = System.os_time(:millisecond) + ttl_ms
+        expire_at_ms = HLC.now_ms() + ttl_ms
         Router.put(ctx, key, value, expire_at_ms)
         {:ok, true}
     end
@@ -1766,7 +1767,7 @@ defmodule FerricStore do
     case Router.get_meta(ctx, key) do
       nil -> {:ok, nil}
       {_value, 0} -> {:ok, nil}
-      {_value, exp} -> {:ok, max(0, exp - System.os_time(:millisecond))}
+      {_value, exp} -> {:ok, max(0, exp - HLC.now_ms())}
     end
   end
 

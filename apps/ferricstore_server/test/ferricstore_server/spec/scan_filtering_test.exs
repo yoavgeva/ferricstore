@@ -386,13 +386,19 @@ defmodule FerricstoreServer.Spec.ScanFilteringTest do
 
     test "DBSIZE stays correct after deleting a hash" do
       FerricStore.hset("dbsize_del", %{"a" => "1", "b" => "2"})
-      {:ok, before_del} = FerricStore.dbsize()
-      assert before_del == 1
+
+      # Under full-suite load, Raft apply may lag — retry until visible.
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        {:ok, before_del} = FerricStore.dbsize()
+        assert before_del == 1
+      end, "dbsize should be 1 after hset", 10, 100)
 
       FerricStore.del("dbsize_del")
-      {:ok, after_del} = FerricStore.dbsize()
 
-      assert after_del == 0
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        {:ok, after_del} = FerricStore.dbsize()
+        assert after_del == 0
+      end, "dbsize should be 0 after del", 10, 100)
     end
 
     test "DBSIZE via Commands.Server excludes compound keys (MockStore)" do

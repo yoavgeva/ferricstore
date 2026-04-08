@@ -1,6 +1,7 @@
 defmodule FerricStore.Impl do
   @moduledoc "Elixir-native implementation of all FerricStore data-type operations, delegating to Router and command handlers."
 
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Router
   alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK, TDigest}
 
@@ -25,7 +26,7 @@ defmodule FerricStore.Impl do
   defp resolve_expire_at(true, _pxat, _exat, _ttl), do: :keepttl
   defp resolve_expire_at(_kttl, pxat, _exat, _ttl) when pxat != nil, do: pxat
   defp resolve_expire_at(_kttl, _pxat, exat, _ttl) when exat != nil, do: exat * 1000
-  defp resolve_expire_at(_kttl, _pxat, _exat, ttl) when ttl > 0, do: System.os_time(:millisecond) + ttl
+  defp resolve_expire_at(_kttl, _pxat, _exat, ttl) when ttl > 0, do: HLC.now_ms() + ttl
   defp resolve_expire_at(_kttl, _pxat, _exat, _ttl), do: 0
 
   defp do_set(ctx, key, value, expire_at_ms, true, nx, xx) do
@@ -129,7 +130,7 @@ defmodule FerricStore.Impl do
   @spec getex(FerricStore.Instance.t(), binary(), keyword()) :: {:ok, binary() | nil}
   def getex(ctx, key, opts) do
     ttl = Keyword.get(opts, :ttl, 0)
-    expire_at_ms = if ttl > 0, do: System.os_time(:millisecond) + ttl, else: 0
+    expire_at_ms = if ttl > 0, do: HLC.now_ms() + ttl, else: 0
     val = Router.getex(ctx, key, expire_at_ms)
     {:ok, val}
   end
@@ -146,14 +147,14 @@ defmodule FerricStore.Impl do
 
   @spec setex(FerricStore.Instance.t(), binary(), pos_integer(), binary()) :: :ok
   def setex(ctx, key, seconds, value) do
-    expire_at_ms = System.os_time(:millisecond) + seconds * 1000
+    expire_at_ms = HLC.now_ms() + seconds * 1000
     Router.put(ctx, key, value, expire_at_ms)
     :ok
   end
 
   @spec psetex(FerricStore.Instance.t(), binary(), pos_integer(), binary()) :: :ok
   def psetex(ctx, key, milliseconds, value) do
-    expire_at_ms = System.os_time(:millisecond) + milliseconds
+    expire_at_ms = HLC.now_ms() + milliseconds
     Router.put(ctx, key, value, expire_at_ms)
     :ok
   end

@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   @moduledoc "Compound-key CRUD, prefix scan/count, promoted-collection dedicated storage, and automatic compaction."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.HLC
   alias Ferricstore.Store.{LFU, Promotion}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
@@ -526,7 +527,7 @@ defmodule Ferricstore.Store.Shard.Compound do
       new_file = dedicated_file_path(dedicated_path, new_fid)
       File.touch!(new_file)
 
-      now = System.os_time(:millisecond)
+      now = HLC.now_ms()
 
       live_entries =
         :ets.foldl(

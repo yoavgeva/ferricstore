@@ -16,6 +16,7 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
   keys, and expected value hashes.
   """
 
+  alias Ferricstore.HLC
   alias Ferricstore.Raft.Cluster
   alias Ferricstore.Store.Router
 
@@ -59,7 +60,7 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
   end
 
   defp resolve_single_intent(shard_idx, owner_ref, intent) do
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     created_at = Map.get(intent, :created_at, 0)
 
     if now - created_at > @stale_threshold_ms do

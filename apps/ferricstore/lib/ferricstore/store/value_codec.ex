@@ -7,6 +7,8 @@ defmodule Ferricstore.Store.ValueCodec do
   module instead of maintaining identical private copies.
   """
 
+  alias Ferricstore.HLC
+
   # ---------------------------------------------------------------------------
   # Integer parsing
   # ---------------------------------------------------------------------------
@@ -94,7 +96,7 @@ defmodule Ferricstore.Store.ValueCodec do
         {String.to_integer(cur), String.to_integer(start), String.to_integer(prev)}
 
       _ ->
-        {0, System.os_time(:millisecond), 0}
+        {0, HLC.now_ms(), 0}
     end
   end
 end

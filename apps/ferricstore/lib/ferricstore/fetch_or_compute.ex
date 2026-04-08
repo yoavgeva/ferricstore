@@ -30,6 +30,7 @@ defmodule Ferricstore.FetchOrCompute do
 
   use GenServer
 
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Router
 
   require Logger
@@ -168,7 +169,7 @@ defmodule Ferricstore.FetchOrCompute do
     # Store the value in the Router.
     expire_at_ms =
       if ttl_ms > 0 do
-        System.os_time(:millisecond) + ttl_ms
+        HLC.now_ms() + ttl_ms
       else
         0
       end

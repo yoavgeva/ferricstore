@@ -2,6 +2,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   @moduledoc "Shard-level CAS, distributed lock, rate-limit, and list operation handlers with Raft and direct-write paths."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.HLC
   alias Ferricstore.Store.{ValueCodec}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
@@ -198,7 +199,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   end
 
   defp handle_ratelimit_add_raft(key, window_ms, max, count, state) do
-    now_ms = System.os_time(:millisecond)
+    now_ms = HLC.now_ms()
     result = Ferricstore.Raft.Batcher.write(state.index, {:ratelimit_add, key, window_ms, max, count, now_ms})
 
     case result do

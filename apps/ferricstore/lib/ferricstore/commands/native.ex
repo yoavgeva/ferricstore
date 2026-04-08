@@ -13,6 +13,7 @@ defmodule Ferricstore.Commands.Native do
     * `KEY_INFO key` -- returns diagnostic metadata about a key
   """
 
+  alias Ferricstore.HLC
   alias Ferricstore.Store.Router
 
   @spec handle(binary(), [binary()], map()) :: term()
@@ -84,7 +85,7 @@ defmodule Ferricstore.Commands.Native do
     ctx = FerricStore.Instance.get(:default)
     idx = Router.shard_for(ctx, key)
     keydir = Router.resolve_keydir(ctx, idx)
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
     shard = Router.shard_name(ctx, idx)
 
     store = %{

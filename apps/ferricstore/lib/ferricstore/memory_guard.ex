@@ -114,6 +114,8 @@ defmodule Ferricstore.MemoryGuard do
 
   use GenServer
 
+  alias Ferricstore.HLC
+
   require Logger
 
   @check_interval_ms 100
@@ -462,7 +464,7 @@ defmodule Ferricstore.MemoryGuard do
   # Cold entries are skipped without creating Erlang terms, saving CPU.
   defp evict_from_shard(shard_index, policy, sample_size, deficit) do
     keydir = :"keydir_#{shard_index}"
-    now = System.os_time(:millisecond)
+    now = HLC.now_ms()
 
     try do
       # Match spec: {key, value, exp, lfu, fid, _off, vsize}
