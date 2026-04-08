@@ -16,6 +16,7 @@ defmodule Ferricstore.Cluster.Manager do
   use GenServer
   require Logger
 
+  alias Ferricstore.Cluster.DataSync
   alias Ferricstore.Raft.Cluster, as: RaftCluster
 
   @default_remove_delay_ms 60_000
@@ -147,10 +148,16 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   def handle_call({:add_node, target_node, role}, _from, state) do
-    membership = role_to_membership(role)
-    result = do_join_node(target_node, membership, state)
-    new_known = MapSet.put(state.known_nodes, target_node)
-    {:reply, result, %{state | known_nodes: new_known}}
+    if MapSet.member?(state.known_nodes, target_node) do
+      Logger.info("ClusterManager: #{target_node} already known, skipping join")
+      {:reply, :ok, state}
+    else
+      new_known = MapSet.put(state.known_nodes, target_node)
+      state = %{state | known_nodes: new_known}
+      membership = role_to_membership(role)
+      result = do_join_node(target_node, membership, state)
+      {:reply, result, state}
+    end
   end
 
   def handle_call({:remove_node, target_node}, _from, state) do
@@ -174,7 +181,14 @@ defmodule Ferricstore.Cluster.Manager do
 
     state = cancel_remove_timer(state, node)
 
+    raft_enabled = Application.get_env(:ferricstore, :raft_enabled, true)
+
     cond do
+      # Nodes with raft_enabled: false should NOT initiate joins —
+      # they wait for the existing cluster to join them.
+      not raft_enabled ->
+        {:noreply, state}
+
       # Case 1: We know this node — it's in our cluster_nodes config
       node in state.cluster_nodes ->
         new_known = MapSet.put(state.known_nodes, node)
@@ -251,6 +265,15 @@ defmodule Ferricstore.Cluster.Manager do
   # This is the single code path for both :nodeup auto-join and CLUSTER.JOIN.
   defp do_join_node(target_node, membership, state) do
     Logger.info("ClusterManager: joining #{target_node} (#{membership})")
+
+    # Stop ra on target if it's running (standalone node)
+    try do
+      target_raft_enabled = :erpc.call(target_node, Application, :get_env, [:ferricstore, :raft_enabled, true], 5_000)
+      if target_raft_enabled, do: stop_raft_on_target(target_node, state.shard_count)
+    catch
+      _, _ -> :ok
+    end
+
     ctx = FerricStore.Instance.get(:default)
 
     # Check if the target already has data (disk clone / EBS snapshot scenario).
@@ -366,39 +389,30 @@ defmodule Ferricstore.Cluster.Manager do
   end
 
   # Auto-join: triggered by :nodeup, runs in a spawned process so
-  # handle_info returns immediately. Same code path as manual join.
+  # handle_info returns immediately. Routes through GenServer.call
+  # so the dedup guard in handle_call prevents concurrent joins.
   defp do_auto_join(target_node, role) do
-    membership = role_to_membership(role)
     Logger.info("ClusterManager: auto-joining #{target_node} as #{role}")
-
-    # Small delay to let the new node's application finish starting
-    Process.sleep(2_000)
-
-    case do_join_node_standalone(target_node, membership) do
-      :ok ->
-        Logger.info("ClusterManager: auto-join complete for #{target_node}")
-
-      {:error, reason} ->
-        Logger.error("ClusterManager: auto-join failed for #{target_node}: #{inspect(reason)}")
+    wait_for_remote_app(target_node)
+    case GenServer.call(__MODULE__, {:add_node, target_node, role}, 120_000) do
+      :ok -> Logger.info("ClusterManager: auto-join complete for #{target_node}")
+      {:error, reason} -> Logger.error("ClusterManager: auto-join failed for #{target_node}: #{inspect(reason)}")
     end
   end
 
-  # Standalone version of do_join_node that doesn't need GenServer state
-  defp do_join_node_standalone(target_node, membership) do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-
-    # Step 1: Add to all Raft groups
-    for shard_idx <- 0..(shard_count - 1) do
-      RaftCluster.add_member(shard_idx, target_node, membership)
+  defp wait_for_remote_app(target_node, attempts \\ 20) do
+    if attempts <= 0 do
+      Logger.warning("ClusterManager: timed out waiting for FerricStore on #{target_node}")
+    else
+      case :erpc.call(target_node, FerricStore.Instance, :get, [:default], 2_000) do
+        %{} -> :ok
+        _ -> wait_for_remote_app(target_node, attempts - 1)
+      end
     end
-
-    # Step 2: Sync data
-    ctx = FerricStore.Instance.get(:default)
-
-    case Ferricstore.Cluster.DataSync.sync_all_shards(target_node, ctx) do
-      {:ok, _} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
+  catch
+    _, _ ->
+      Process.sleep(200)
+      wait_for_remote_app(target_node, attempts - 1)
   end
 
   # ---------------------------------------------------------------------------
@@ -547,6 +561,27 @@ defmodule Ferricstore.Cluster.Manager do
         kind, reason ->
           Logger.warning("ClusterManager: shard #{shard_idx} Raft join failed on #{target_node}: #{inspect({kind, reason})}")
       end
+    end
+  end
+
+  defp read_target_indices(target_node, shard_count) do
+    target_data_dir =
+      try do
+        target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
+        target_ctx.data_dir
+      catch _, _ -> nil
+      end
+
+    if target_data_dir do
+      for shard_idx <- 0..(shard_count - 1), into: %{} do
+        idx = try do
+          :erpc.call(target_node, DataSync, :read_last_applied_from_disk, [target_data_dir, shard_idx], 5_000)
+        catch _, _ -> 0
+        end
+        {shard_idx, idx}
+      end
+    else
+      for shard_idx <- 0..(shard_count - 1), into: %{}, do: {shard_idx, 0}
     end
   end
 
