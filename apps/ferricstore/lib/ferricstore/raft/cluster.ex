@@ -119,13 +119,21 @@ defmodule Ferricstore.Raft.Cluster do
       {:error, {:already_started, _pid}} ->
         :ok
 
+      {:error, {:shutdown, {:failed_to_start_child, _, {:already_started, _}}}} ->
+        :ok
+
       {:error, :not_new} ->
-        # ra found existing state on disk — restart instead of start
-        Logger.info("Shard #{shard_index}: existing ra state found, restarting to join cluster")
-        case :ra.restart_server(ra_sys, server_id) do
-          :ok -> :ok
+        Logger.info("Shard #{shard_index}: existing ra state found, deleting and re-joining cluster")
+        _ = :ra.force_delete_server(ra_sys, server_id)
+        Process.sleep(50)
+        case :ra.start_server(ra_sys, server_config) do
+          :ok ->
+            Logger.info("Shard #{shard_index}: joined cluster with #{length(initial_members)} members")
+            :ok
+          {:error, {:already_started, _}} -> :ok
+          {:error, {:shutdown, {:failed_to_start_child, _, {:already_started, _}}}} -> :ok
           {:error, reason} ->
-            Logger.error("Shard #{shard_index}: restart failed: #{inspect(reason)}")
+            Logger.error("Shard #{shard_index}: re-join failed: #{inspect(reason)}")
             {:error, reason}
         end
 
@@ -159,12 +167,23 @@ defmodule Ferricstore.Raft.Cluster do
   """
   @spec add_member(non_neg_integer(), node(), atom()) :: :ok | {:error, term()}
   def add_member(shard_index, node, membership \\ :voter) do
+    add_member_with_retry(shard_index, node, membership, 10)
+  end
+
+  defp add_member_with_retry(_shard_index, _node, _membership, 0) do
+    {:error, :cluster_change_not_permitted}
+  end
+
+  defp add_member_with_retry(shard_index, node, membership, retries) do
     leader = shard_server_id(shard_index)
     new_member = %{id: shard_server_id_on(shard_index, node), membership: membership}
 
     case :ra.add_member(leader, new_member) do
       {_, _, _leader} -> :ok
       {:error, :already_member} -> :ok
+      {:error, :cluster_change_not_permitted} ->
+        Process.sleep(200)
+        add_member_with_retry(shard_index, node, membership, retries - 1)
       {:error, reason} -> {:error, reason}
       {:timeout, _} -> {:error, :timeout}
     end
