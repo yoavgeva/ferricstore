@@ -5,10 +5,10 @@ defmodule Ferricstore.InstanceCallbacksTest do
   """
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.List
-  alias Ferricstore.Store.Router
-  alias Ferricstore.Test.MockStore
   alias Ferricstore.Test.ShardHelpers
+  alias Ferricstore.Store.Router
+  alias Ferricstore.Commands.List
+  alias Ferricstore.Test.MockStore
 
   setup do
     ShardHelpers.flush_all_keys()

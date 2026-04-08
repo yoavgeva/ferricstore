@@ -40,8 +40,8 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
   use ExUnit.Case, async: true
 
   alias Ferricstore.Commands.Bloom
-  alias Ferricstore.Commands.CMS
   alias Ferricstore.Commands.Cuckoo
+  alias Ferricstore.Commands.CMS
   alias Ferricstore.Commands.TopK
   alias Ferricstore.Test.MockStore
 

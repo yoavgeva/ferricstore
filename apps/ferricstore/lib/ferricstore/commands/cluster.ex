@@ -200,17 +200,15 @@ defmodule Ferricstore.Commands.Cluster do
   # -- CLUSTER.FAILOVER -------------------------------------------------------
 
   def handle("CLUSTER.FAILOVER", [shard_str, node_str], _store) do
-    case Integer.parse(shard_str) do
-      {shard_idx, ""} ->
-        target = String.to_atom(node_str)
+    with {shard_idx, ""} <- Integer.parse(shard_str) do
+      target = String.to_atom(node_str)
 
-        case RaftCluster.transfer_leadership(shard_idx, target) do
-          :ok -> :ok
-          {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
-        end
-
-      _ ->
-        {:error, "ERR shard index must be an integer"}
+      case RaftCluster.transfer_leadership(shard_idx, target) do
+        :ok -> :ok
+        {:error, reason} -> {:error, "ERR #{inspect(reason)}"}
+      end
+    else
+      _ -> {:error, "ERR shard index must be an integer"}
     end
   end
 

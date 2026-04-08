@@ -41,9 +41,11 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
   # Safe ETS delete that doesn't raise if the table is already gone
   defp safe_ets_delete(table) do
-    :ets.delete(table)
-  rescue
-    ArgumentError -> :ok
+    try do
+      :ets.delete(table)
+    rescue
+      ArgumentError -> :ok
+    end
   end
 
   # Helper: builds a store map backed by the real Router

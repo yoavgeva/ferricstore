@@ -23,8 +23,8 @@ defmodule Ferricstore.Review.M8SmoveTypeRaceTest do
 
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.Hash
   alias Ferricstore.Commands.Set
+  alias Ferricstore.Commands.Hash
   alias Ferricstore.Test.MockStore
 
   describe "SMOVE type enforcement" do

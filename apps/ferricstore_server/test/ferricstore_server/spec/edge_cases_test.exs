@@ -16,10 +16,10 @@ defmodule FerricstoreServer.Spec.EdgeCasesTest do
 
   use ExUnit.Case, async: false
 
+  alias FerricstoreServer.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Listener
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
-  alias FerricstoreServer.Listener
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   # PubSub module used indirectly via ETS table lookups for verification.
 
   @moduletag timeout: 60_000

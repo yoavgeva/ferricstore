@@ -1,5 +1,4 @@
 defmodule Ferricstore.Test.SimpleKvMachine do
-  @moduledoc false
   @behaviour :ra_machine
 
   @impl true

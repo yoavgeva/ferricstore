@@ -33,9 +33,7 @@ defmodule Ferricstore.SlowLog do
   # -------------------------------------------------------------------------
 
   @typedoc "A single slow log entry."
-  @type entry ::
-          {id :: non_neg_integer(), timestamp_us :: integer(),
-           duration_us :: non_neg_integer(), command :: [binary()]}
+  @type entry :: {id :: non_neg_integer(), timestamp_us :: integer(), duration_us :: non_neg_integer(), command :: [binary()]}
 
   # -------------------------------------------------------------------------
   # Public API
@@ -154,6 +152,7 @@ defmodule Ferricstore.SlowLog do
     :persistent_term.put(:ferricstore_slowlog_max_len, value)
     :ok
   end
+
 
   # -------------------------------------------------------------------------
   # GenServer callbacks

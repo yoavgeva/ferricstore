@@ -10,8 +10,8 @@ defmodule FerricstoreServer.ReviewR4Test do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Listener
 
   @moduletag timeout: 30_000
 

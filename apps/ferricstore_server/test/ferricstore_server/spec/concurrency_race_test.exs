@@ -16,10 +16,10 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
   use ExUnit.Case, async: false
   @moduletag :concurrency
 
-  alias Ferricstore.Test.ShardHelpers
-  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
+  alias FerricstoreServer.Listener
+  alias Ferricstore.Test.ShardHelpers
 
   # ---------------------------------------------------------------------------
   # Helpers

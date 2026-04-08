@@ -13,12 +13,12 @@ defmodule Ferricstore.CrossShardOpTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.Generic
-  alias Ferricstore.Commands.Set
-  alias Ferricstore.CrossShardOp
-  alias Ferricstore.NamespaceConfig
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
+  alias Ferricstore.CrossShardOp
+  alias Ferricstore.NamespaceConfig
+  alias Ferricstore.Commands.Set
+  alias Ferricstore.Commands.Generic
 
   setup do
     ShardHelpers.flush_all_keys()

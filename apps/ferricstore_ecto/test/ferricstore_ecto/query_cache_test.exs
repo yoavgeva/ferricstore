@@ -1,9 +1,9 @@
 defmodule FerricstoreEcto.QueryCacheTest do
   use ExUnit.Case
 
-  alias FerricstoreEcto.Test.AuditLog
-  alias FerricstoreEcto.Test.User
   alias FerricstoreEcto.TestRepo
+  alias FerricstoreEcto.Test.User
+  alias FerricstoreEcto.Test.AuditLog
 
   import Ecto.Query
 

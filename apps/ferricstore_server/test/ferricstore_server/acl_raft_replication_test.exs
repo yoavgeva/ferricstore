@@ -2,9 +2,9 @@ defmodule FerricstoreServer.AclRaftReplicationTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Acl
-  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Listener
+  alias FerricstoreServer.Acl
 
   setup do
     Acl.reset!()

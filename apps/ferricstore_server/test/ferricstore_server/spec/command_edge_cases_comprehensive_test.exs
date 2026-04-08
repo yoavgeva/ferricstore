@@ -29,9 +29,9 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Test.ShardHelpers
-  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Listener
+  alias Ferricstore.Test.ShardHelpers
 
   @moduletag timeout: 120_000
 
@@ -147,6 +147,7 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
     assert String.contains?(msg, substring), "Expected error containing #{inspect(substring)}, got: #{inspect(msg)}"
   end
 
+
   # ===========================================================================
   # WRONGTYPE CROSS-TYPE ERRORS
   # ===========================================================================
@@ -236,6 +237,7 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesComprehensiveTest do
       assert_error_contains(result, "WRONGTYPE")
     end
   end
+
 
   # ===========================================================================
   # TTL / EXPIRY EDGE CASES

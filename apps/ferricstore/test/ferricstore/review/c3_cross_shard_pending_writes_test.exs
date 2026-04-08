@@ -8,8 +8,8 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.Router
-  alias Ferricstore.Test.ShardHelpers
   alias Ferricstore.Transaction.Coordinator
+  alias Ferricstore.Test.ShardHelpers
 
   setup do
     ShardHelpers.flush_all_keys()

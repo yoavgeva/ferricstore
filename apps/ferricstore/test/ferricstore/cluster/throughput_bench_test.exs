@@ -655,28 +655,17 @@ defmodule Ferricstore.Cluster.ThroughputBenchTest do
             Agent.update(leader_agent, fn _ -> new_leader end)
           end
 
-          bg_loop(
-            ra_system, members, leader_agent, stop_flag, writer_id,
-            counter + @batch_size, writes + @batch_size, failures
-          )
+          bg_loop(ra_system, members, leader_agent, stop_flag, writer_id, counter + @batch_size, writes + @batch_size, failures)
 
         {:error, _} ->
           maybe_find_leader(members, leader_agent, current_leader)
           Process.sleep(5)
-
-          bg_loop(
-            ra_system, members, leader_agent, stop_flag, writer_id,
-            counter + @batch_size, writes, failures + @batch_size
-          )
+          bg_loop(ra_system, members, leader_agent, stop_flag, writer_id, counter + @batch_size, writes, failures + @batch_size)
 
         :timeout ->
           maybe_find_leader(members, leader_agent, current_leader)
           Process.sleep(5)
-
-          bg_loop(
-            ra_system, members, leader_agent, stop_flag, writer_id,
-            counter + @batch_size, writes, failures + @batch_size
-          )
+          bg_loop(ra_system, members, leader_agent, stop_flag, writer_id, counter + @batch_size, writes, failures + @batch_size)
       end
     end
   end
@@ -778,37 +767,43 @@ defmodule Ferricstore.Cluster.ThroughputBenchTest do
   # ===========================================================================
 
   defp safe_process_command(leader, cmd) do
-    case :ra.process_command(leader, cmd, 5_000) do
-      {:ok, reply, new_leader} -> {:ok, reply, new_leader}
-      {:error, reason} -> {:error, reason}
-      {:timeout, _} -> :timeout
+    try do
+      case :ra.process_command(leader, cmd, 5_000) do
+        {:ok, reply, new_leader} -> {:ok, reply, new_leader}
+        {:error, reason} -> {:error, reason}
+        {:timeout, _} -> :timeout
+      end
+    catch
+      :exit, _reason -> {:error, :exit}
     end
-  catch
-    :exit, _reason -> {:error, :exit}
   end
 
   defp safe_local_query(member, key) do
-    case :ra.local_query(member, fn state -> Map.get(state, key) end, 5_000) do
-      {:ok, {_, value}, _} -> {:ok, value}
-      {:ok, value, _} -> {:ok, value}
-      _ -> :error
+    try do
+      case :ra.local_query(member, fn state -> Map.get(state, key) end, 5_000) do
+        {:ok, {_, value}, _} -> {:ok, value}
+        {:ok, value, _} -> {:ok, value}
+        _ -> :error
+      end
+    catch
+      :exit, _ -> :error
     end
-  catch
-    :exit, _ -> :error
   end
 
   defp safe_local_query_batch(member, keys) do
-    query_fn = fn state ->
-      Enum.map(keys, fn k -> Map.get(state, k) end)
-    end
+    try do
+      query_fn = fn state ->
+        Enum.map(keys, fn k -> Map.get(state, k) end)
+      end
 
-    case :ra.local_query(member, query_fn, 5_000) do
-      {:ok, {_, values}, _} -> {:ok, values}
-      {:ok, values, _} when is_list(values) -> {:ok, values}
-      _ -> :error
+      case :ra.local_query(member, query_fn, 5_000) do
+        {:ok, {_, values}, _} -> {:ok, values}
+        {:ok, values, _} when is_list(values) -> {:ok, values}
+        _ -> :error
+      end
+    catch
+      :exit, _ -> :error
     end
-  catch
-    :exit, _ -> :error
   end
 
   defp maybe_find_leader(members, leader_agent, old_leader) do

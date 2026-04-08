@@ -9,11 +9,11 @@ defmodule Ferricstore.ReviewR2.CrossShardOpIssuesTest do
 
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Store.Router
+  alias Ferricstore.Raft.Cluster
+  alias Ferricstore.Test.ShardHelpers
   alias Ferricstore.CrossShardOp
   alias Ferricstore.NamespaceConfig
-  alias Ferricstore.Raft.Cluster
-  alias Ferricstore.Store.Router
-  alias Ferricstore.Test.ShardHelpers
 
   setup do
     ShardHelpers.flush_all_keys()

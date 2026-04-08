@@ -1087,9 +1087,7 @@ defmodule Ferricstore.Raft.StateMachine do
       lock: fn key, owner, ttl_ms -> Router.lock(instance_ctx, key, owner, ttl_ms) end,
       unlock: fn key, owner -> Router.unlock(instance_ctx, key, owner) end,
       extend: fn key, owner, ttl_ms -> Router.extend(instance_ctx, key, owner, ttl_ms) end,
-      ratelimit_add: fn key, window_ms, max, count ->
-        Router.ratelimit_add(instance_ctx, key, window_ms, max, count)
-      end,
+      ratelimit_add: fn key, window_ms, max, count -> Router.ratelimit_add(instance_ctx, key, window_ms, max, count) end,
       list_op: fn key, op -> Router.list_op(instance_ctx, key, op) end,
       compound_get: fn _redis_key, compound_key ->
         cross_shard_ets_read(ctx, compound_key)

@@ -64,10 +64,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       File.rm_rf!(dir)
     end)
 
-    %{
-      state: state, ets: keydir_name, store: nil, dir: dir,
-      active_file_path: active_file_path, shard_index: shard_index
-    }
+    %{state: state, ets: keydir_name, store: nil, dir: dir, active_file_path: active_file_path, shard_index: shard_index}
   end
 
   # ---------------------------------------------------------------------------

@@ -1,10 +1,10 @@
 defmodule FerricstoreEcto.CachedRepoTest do
   use ExUnit.Case
 
+  alias FerricstoreEcto.TestRepo
+  alias FerricstoreEcto.Test.User
   alias FerricstoreEcto.Test.AuditLog
   alias FerricstoreEcto.Test.ReadOnlyCountry
-  alias FerricstoreEcto.Test.User
-  alias FerricstoreEcto.TestRepo
 
   import Ecto.Query
 

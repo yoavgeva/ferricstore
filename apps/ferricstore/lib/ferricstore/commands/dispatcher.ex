@@ -20,11 +20,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   Unknown commands return `{:error, "ERR unknown command ..."}`.
   """
 
-  alias Ferricstore.Commands.{
-    Bitmap, Bloom, Cluster, Cuckoo, Expiry, Generic, Geo, Hash,
-    HyperLogLog, Json, List, Memory, Namespace, Native, PubSub,
-    Server, Set, SortedSet, Stream, Strings
-  }
+  alias Ferricstore.Commands.{Bitmap, Bloom, Cluster, Cuckoo, Expiry, Generic, Geo, Hash, HyperLogLog, Json, List, Memory, Namespace, Native, PubSub, Server, Set, SortedSet, Stream, Strings}
   alias Ferricstore.Commands.CMS
   alias Ferricstore.Commands.TDigest
   alias Ferricstore.Commands.TopK

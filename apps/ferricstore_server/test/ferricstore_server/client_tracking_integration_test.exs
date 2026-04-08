@@ -13,9 +13,9 @@ defmodule FerricstoreServer.ClientTrackingIntegrationTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Test.ShardHelpers
-  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Listener
+  alias Ferricstore.Test.ShardHelpers
 
   # ---------------------------------------------------------------------------
   # Helpers

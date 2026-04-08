@@ -5,7 +5,7 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesWrongtypeTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Hash, Set, SortedSet, Strings}
+  alias Ferricstore.Commands.{Strings, Hash, Set, SortedSet}
   alias Ferricstore.Test.MockStore
 
   # ===========================================================================

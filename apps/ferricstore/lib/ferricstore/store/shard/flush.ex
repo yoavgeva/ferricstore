@@ -130,11 +130,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   # ETS location updates after flush
   # -------------------------------------------------------------------
 
-  @spec update_ets_locations(
-          map(),
-          [{binary(), binary(), non_neg_integer()}],
-          [{non_neg_integer(), non_neg_integer()}]
-        ) :: map()
+  @spec update_ets_locations(map(), [{binary(), binary(), non_neg_integer()}], [{non_neg_integer(), non_neg_integer()}]) :: map()
   @doc false
   def update_ets_locations(state, batch, locations) do
     fid = state.active_file_id

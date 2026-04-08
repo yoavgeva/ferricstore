@@ -329,27 +329,29 @@ defmodule Ferricstore.Cluster.Manager do
 
   # Checks if the target node has pre-existing Bitcask data (disk clone scenario).
   defp target_has_data?(target_node, shard_count) do
-    target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
+    try do
+      target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
 
-    Enum.any?(0..(shard_count - 1), fn i ->
-      shard_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, i)
+      Enum.any?(0..(shard_count - 1), fn i ->
+        shard_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, i)
 
-      case :erpc.call(target_node, File, :ls, [shard_path]) do
-        {:ok, files} ->
-          Enum.any?(files, fn f ->
-            String.ends_with?(f, ".log") and
-              case :erpc.call(target_node, File, :stat, [Path.join(shard_path, f)]) do
-                {:ok, %{size: size}} -> size > 0
-                _ -> false
-              end
-          end)
+        case :erpc.call(target_node, File, :ls, [shard_path]) do
+          {:ok, files} ->
+            Enum.any?(files, fn f ->
+              String.ends_with?(f, ".log") and
+                case :erpc.call(target_node, File, :stat, [Path.join(shard_path, f)]) do
+                  {:ok, %{size: size}} -> size > 0
+                  _ -> false
+                end
+            end)
 
-        _ ->
-          false
-      end
-    end)
-  catch
-    _, _ -> false
+          _ ->
+            false
+        end
+      end)
+    catch
+      _, _ -> false
+    end
   end
 
   defp direct_sync(target_node, ctx) do

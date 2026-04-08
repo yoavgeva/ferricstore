@@ -121,9 +121,11 @@ defmodule Ferricstore.Stats do
   @doc "Returns the current number of active connections."
   @spec active_connections() :: non_neg_integer()
   def active_connections do
-    max(0, :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_active_connections))
-  rescue
-    ArgumentError -> 0
+    try do
+      max(0, :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_active_connections))
+    rescue
+      ArgumentError -> 0
+    end
   end
 
   @doc "Increments the total commands processed counter by 1."
@@ -144,6 +146,7 @@ defmodule Ferricstore.Stats do
   def total_commands do
     :counters.get(FerricStore.Instance.get(:default).stats_counter, @counter_commands)
   end
+
 
   @doc "Increments the keyspace_hits counter by 1."
   @spec incr_keyspace_hits() :: :ok
@@ -363,16 +366,18 @@ defmodule Ferricstore.Stats do
   """
   @spec hotness_top(pos_integer()) :: [hotness_entry()]
   def hotness_top(n \\ 10) do
-    :ets.tab2list(@hotness_table)
-    |> Enum.map(fn {prefix, hot, cold} ->
-      total = hot + cold
-      pct = if total == 0, do: 0.0, else: Float.round(cold / total * 100.0, 2)
-      {prefix, hot, cold, pct}
-    end)
-    |> Enum.sort_by(fn {_prefix, _hot, cold, _pct} -> cold end, :desc)
-    |> Enum.take(n)
-  rescue
-    ArgumentError -> []
+    try do
+      :ets.tab2list(@hotness_table)
+      |> Enum.map(fn {prefix, hot, cold} ->
+        total = hot + cold
+        pct = if total == 0, do: 0.0, else: Float.round(cold / total * 100.0, 2)
+        {prefix, hot, cold, pct}
+      end)
+      |> Enum.sort_by(fn {_prefix, _hot, cold, _pct} -> cold end, :desc)
+      |> Enum.take(n)
+    rescue
+      ArgumentError -> []
+    end
   end
 
   @doc """
@@ -502,27 +507,30 @@ defmodule Ferricstore.Stats do
   # Private
   # ---------------------------------------------------------------------------
 
+
   # Resolves the prefix to track: if the hotness table already has this prefix
   # or the table has room, use the prefix as-is. Otherwise bucket into "_other".
   @spec resolve_prefix(binary()) :: binary()
   defp resolve_prefix(prefix) do
-    case :ets.lookup(@hotness_table, prefix) do
-      [{^prefix, _, _}] ->
-        # Already tracked — use it directly.
-        prefix
-
-      [] ->
-        # New prefix. Check if we have room.
-        size = :ets.info(@hotness_table, :size)
-
-        if size < @max_tracked_prefixes do
+    try do
+      case :ets.lookup(@hotness_table, prefix) do
+        [{^prefix, _, _}] ->
+          # Already tracked — use it directly.
           prefix
-        else
-          "_other"
-        end
+
+        [] ->
+          # New prefix. Check if we have room.
+          size = :ets.info(@hotness_table, :size)
+
+          if size < @max_tracked_prefixes do
+            prefix
+          else
+            "_other"
+          end
+      end
+    rescue
+      ArgumentError -> "_other"
     end
-  rescue
-    ArgumentError -> "_other"
   end
 
   # Atomically increments either the hot or cold counter for a prefix.

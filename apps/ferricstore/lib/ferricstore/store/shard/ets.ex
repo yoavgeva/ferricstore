@@ -16,11 +16,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   #   {:cold, file_id, offset, value_size, expire_at_ms}  -- value evicted, disk location known
   #   :expired
   #   :miss
-  @spec ets_lookup(map(), binary()) ::
-          {:hit, term(), non_neg_integer()}
-          | {:cold, non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}
-          | :expired
-          | :miss
+  @spec ets_lookup(map(), binary()) :: {:hit, term(), non_neg_integer()} | {:cold, non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()} | :expired | :miss
   @doc false
   def ets_lookup(%{keydir: keydir}, key) do
     now = System.os_time(:millisecond)
@@ -94,16 +90,11 @@ defmodule Ferricstore.Store.Shard.ETS do
   def ets_insert(state, key, value, expire_at_ms) do
     threshold = hot_cache_threshold(state)
     v = value_for_ets(value, threshold)
-    :ets.insert(
-      state.keydir, {key, v, expire_at_ms, LFU.initial(), :pending, 0, 0}
-    )
+    :ets.insert(state.keydir, {key, v, expire_at_ms, LFU.initial(), :pending, 0, 0})
   end
 
   # Inserts a key/value/expiry into the keydir with known disk location (v2).
-  @spec ets_insert_with_location(
-          map(), binary(), term(), non_neg_integer(),
-          non_neg_integer(), non_neg_integer(), non_neg_integer()
-        ) :: true
+  @spec ets_insert_with_location(map(), binary(), term(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: true
   @doc false
   def ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
     threshold = hot_cache_threshold(state)
@@ -179,10 +170,7 @@ defmodule Ferricstore.Store.Shard.ETS do
   # Values exceeding the hot_cache_max_value_size threshold are NOT warmed --
   # they stay cold (nil) in ETS to avoid expensive binary copies on read.
   # Under memory pressure, skip warming to prevent evict/re-promote thrashing.
-  @spec cold_read_warm_ets(
-          map(), binary(), binary(), non_neg_integer(),
-          non_neg_integer(), non_neg_integer(), non_neg_integer()
-        ) :: :ok | true
+  @spec cold_read_warm_ets(map(), binary(), binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: :ok | true
   @doc false
   def cold_read_warm_ets(state, key, value, exp, fid, off, vsize) do
     v = value_for_ets(value, hot_cache_threshold(state))

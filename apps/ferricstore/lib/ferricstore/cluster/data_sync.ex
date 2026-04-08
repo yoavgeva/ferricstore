@@ -248,6 +248,7 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
+
   @doc false
   def rebuild_keydirs_on_target(target_node, shard_count) do
     Logger.info("DataSync: rebuilding keydirs on #{target_node}")

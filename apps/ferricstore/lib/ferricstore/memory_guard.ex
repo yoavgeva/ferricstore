@@ -721,15 +721,15 @@ defmodule Ferricstore.MemoryGuard do
   end
 
   defp host_total_memory do
-    data = apply(:memsup, :get_system_memory_data, [])
-    case data do
-      list when is_list(list) -> Keyword.get(list, :total_memory)
-      _ -> nil
+    try do
+      data = apply(:memsup, :get_system_memory_data, [])
+      case data do
+        list when is_list(list) -> Keyword.get(list, :total_memory)
+        _ -> nil
+      end
+    rescue _ -> nil
+    catch _, _ -> nil
     end
-  rescue
-    _ -> nil
-  catch
-    _, _ -> nil
   end
 
   # Returns the current process RSS (Resident Set Size) in bytes.
@@ -759,11 +759,11 @@ defmodule Ferricstore.MemoryGuard do
   end
 
   defp erlang_total_memory do
-    :erlang.memory(:total)
-  rescue
-    _ -> nil
-  catch
-    _, _ -> nil
+    try do
+      :erlang.memory(:total)
+    rescue _ -> nil
+    catch _, _ -> nil
+    end
   end
 
   defp default_eviction_policy, do: Application.get_env(:ferricstore, :eviction_policy, :volatile_lru)

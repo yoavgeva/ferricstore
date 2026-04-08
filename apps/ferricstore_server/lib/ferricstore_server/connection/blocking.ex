@@ -1,11 +1,11 @@
 defmodule FerricstoreServer.Connection.Blocking do
   @moduledoc "Blocking command handlers (BLPOP, BRPOP, BLMOVE, BLMPOP, XREAD BLOCK) with waiter registration and client-disconnect detection."
 
+  alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.{Blocking, List}
   alias Ferricstore.Commands.Stream, as: StreamCmd
   alias Ferricstore.Waiters
   alias FerricstoreServer.Connection.Store, as: ConnStore
-  alias FerricstoreServer.Resp.Encoder
 
   @type conn_result :: {:continue, iodata(), map()} | {:block, map()} | {:close, iodata(), map()}
 

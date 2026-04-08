@@ -443,9 +443,11 @@ defmodule Ferricstore.Raft.Batcher do
 
   # Replies to a caller, catching errors if the caller already exited.
   defp safe_reply(from, msg) do
-    GenServer.reply(from, msg)
-  catch
-    _, _ -> :ok
+    try do
+      GenServer.reply(from, msg)
+    catch
+      _, _ -> :ok
+    end
   end
 
   # ---------------------------------------------------------------------------

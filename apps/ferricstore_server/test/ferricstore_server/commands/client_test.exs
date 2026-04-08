@@ -2,9 +2,9 @@ defmodule FerricstoreServer.Commands.ClientTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Test.MockStore
-  alias FerricstoreServer.ClientTracking
   alias FerricstoreServer.Commands.Client
+  alias FerricstoreServer.ClientTracking
+  alias Ferricstore.Test.MockStore
 
   setup do
     # Ensure tracking ETS tables exist for TRACKING tests

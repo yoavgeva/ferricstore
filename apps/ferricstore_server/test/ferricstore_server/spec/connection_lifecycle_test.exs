@@ -12,9 +12,9 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
   @moduletag :conn_lifecycle
 
   alias Ferricstore.Config
+  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias Ferricstore.Test.ShardHelpers
   alias FerricstoreServer.Listener
-  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   # ---------------------------------------------------------------------------
   # Helpers — raw TCP (misbehaving client)

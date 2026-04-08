@@ -344,8 +344,7 @@ defmodule FerricstoreServer.Health.Dashboard do
   @doc """
   Collects data for the storage sub-page.
   """
-  @spec collect_storage_page() ::
-          %{shards: [map()], total_disk_bytes: non_neg_integer(), total_files: non_neg_integer()}
+  @spec collect_storage_page() :: %{shards: [map()], total_disk_bytes: non_neg_integer(), total_files: non_neg_integer()}
   def collect_storage_page do
     data_dir = Application.get_env(:ferricstore, :data_dir, "/tmp/ferricstore")
 
@@ -542,26 +541,28 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @spec collect_memory() :: memory_data()
   defp collect_memory do
-    stats = MemoryGuard.stats()
+    try do
+      stats = MemoryGuard.stats()
 
-    %{
-      total_bytes: stats.total_bytes,
-      max_bytes: stats.max_bytes,
-      ratio: stats.ratio,
-      pressure_level: stats.pressure_level,
-      eviction_policy: stats.eviction_policy,
-      shards: stats.shards
-    }
-  catch
-    :exit, _ ->
       %{
-        total_bytes: 0,
-        max_bytes: 0,
-        ratio: 0.0,
-        pressure_level: :ok,
-        eviction_policy: :volatile_lru,
-        shards: %{}
+        total_bytes: stats.total_bytes,
+        max_bytes: stats.max_bytes,
+        ratio: stats.ratio,
+        pressure_level: stats.pressure_level,
+        eviction_policy: stats.eviction_policy,
+        shards: stats.shards
       }
+    catch
+      :exit, _ ->
+        %{
+          total_bytes: 0,
+          max_bytes: 0,
+          ratio: 0.0,
+          pressure_level: :ok,
+          eviction_policy: :volatile_lru,
+          shards: %{}
+        }
+    end
   end
 
   @spec collect_connections() :: connections_data()
@@ -575,19 +576,21 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @spec collect_slowlog() :: [slowlog_entry()]
   defp collect_slowlog do
-    SlowLog.get(128)
-    |> Enum.map(fn {id, timestamp_us, duration_us, command} ->
-      %{
-        id: id,
-        timestamp_us: timestamp_us,
-        duration_us: duration_us,
-        command: command
-      }
-    end)
-  rescue
-    _ -> []
-  catch
-    :exit, _ -> []
+    try do
+      SlowLog.get(128)
+      |> Enum.map(fn {id, timestamp_us, duration_us, command} ->
+        %{
+          id: id,
+          timestamp_us: timestamp_us,
+          duration_us: duration_us,
+          command: command
+        }
+      end)
+    rescue
+      _ -> []
+    catch
+      :exit, _ -> []
+    end
   end
 
   @spec collect_merge() :: [merge_status()]
@@ -683,28 +686,30 @@ defmodule FerricstoreServer.Health.Dashboard do
   # Returns {total_bytes, data_file_count, hint_file_count}.
   @spec scan_shard_dir(binary()) :: {non_neg_integer(), non_neg_integer(), non_neg_integer()}
   defp scan_shard_dir(shard_dir) do
-    files = File.ls!(shard_dir)
+    try do
+      files = File.ls!(shard_dir)
 
-    Enum.reduce(files, {0, 0, 0}, fn file, {bytes, data, hints} ->
-      full_path = Path.join(shard_dir, file)
+      Enum.reduce(files, {0, 0, 0}, fn file, {bytes, data, hints} ->
+        full_path = Path.join(shard_dir, file)
 
-      file_size =
-        case File.stat(full_path) do
-          {:ok, %{size: size}} -> size
-          _ -> 0
-        end
+        file_size =
+          case File.stat(full_path) do
+            {:ok, %{size: size}} -> size
+            _ -> 0
+          end
 
-      is_data = String.ends_with?(file, ".log")
-      is_hint = String.ends_with?(file, ".hint")
+        is_data = String.ends_with?(file, ".log")
+        is_hint = String.ends_with?(file, ".hint")
 
-      {
-        bytes + file_size,
-        if(is_data, do: data + 1, else: data),
-        if(is_hint, do: hints + 1, else: hints)
-      }
-    end)
-  rescue
-    _ -> {0, 0, 0}
+        {
+          bytes + file_size,
+          if(is_data, do: data + 1, else: data),
+          if(is_hint, do: hints + 1, else: hints)
+        }
+      end)
+    rescue
+      _ -> {0, 0, 0}
+    end
   end
 
   # Samples keys from keydir ETS tables to count per-prefix distribution.
@@ -792,55 +797,53 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @spec collect_client_list() :: [client_data()]
   defp collect_client_list do
-    pids = :ranch.procs(FerricstoreServer.Listener, :connections)
-    now = System.monotonic_time(:millisecond)
+    try do
+      pids = :ranch.procs(FerricstoreServer.Listener, :connections)
+      now = System.monotonic_time(:millisecond)
 
-    Enum.map(pids, fn pid ->
-      info = Process.info(pid, [:dictionary, :current_function])
+      Enum.map(pids, fn pid ->
+        info = Process.info(pid, [:dictionary, :current_function])
 
-      {peer, age, flags} =
-        case info do
-          nil ->
-            {"unknown:0", 0, ""}
+        {peer, age, flags} =
+          case info do
+            nil ->
+              {"unknown:0", 0, ""}
 
-          kw ->
-            dict = Keyword.get(kw, :dictionary, [])
-            state = Keyword.get(dict, :"$conn_state", nil)
+            kw ->
+              dict = Keyword.get(kw, :dictionary, [])
+              state = Keyword.get(dict, :"$conn_state", nil)
 
-            peer_str =
-              case state do
-                %{peer: {ip, port}} ->
-                  ip_str = :inet.ntoa(ip) |> to_string()
-                  "#{ip_str}:#{port}"
-                _ ->
-                  "unknown:0"
-              end
+              peer_str =
+                case state do
+                  %{peer: {ip, port}} ->
+                    ip_str = :inet.ntoa(ip) |> to_string()
+                    "#{ip_str}:#{port}"
+                  _ ->
+                    "unknown:0"
+                end
 
-            created =
-              case state do
-                %{created_at: ts} when is_integer(ts) -> ts
-                _ -> now
-              end
+              created =
+                case state do
+                  %{created_at: ts} when is_integer(ts) -> ts
+                  _ -> now
+                end
 
-            age_s = max(0, div(now - created, 1000))
+              age_s = max(0, div(now - created, 1000))
 
-            flag_list =
-              []
-              |> then(fn f -> if state && Map.get(state, :multi_state) == :queuing, do: ["M" | f], else: f end)
-              |> then(fn f -> if state && Map.get(state, :pubsub_channels), do: ["S" | f], else: f end)
-              |> then(fn f ->
-                if state && Map.get(state, :tracking) && Map.get(state.tracking, :enabled),
-                  do: ["T" | f],
-                  else: f
-              end)
+              flag_list =
+                []
+                |> then(fn f -> if state && Map.get(state, :multi_state) == :queuing, do: ["M" | f], else: f end)
+                |> then(fn f -> if state && Map.get(state, :pubsub_channels), do: ["S" | f], else: f end)
+                |> then(fn f -> if state && Map.get(state, :tracking) && Map.get(state.tracking, :enabled), do: ["T" | f], else: f end)
 
-            {peer_str, age_s, Enum.join(flag_list)}
-        end
+              {peer_str, age_s, Enum.join(flag_list)}
+          end
 
-      %{pid: pid, peer: peer, age_seconds: age, flags: flags}
-    end)
-  catch
-    _, _ -> []
+        %{pid: pid, peer: peer, age_seconds: age, flags: flags}
+      end)
+    catch
+      _, _ -> []
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1976,12 +1979,14 @@ defmodule FerricstoreServer.Health.Dashboard do
 
   @spec safe_ets_size(atom()) :: non_neg_integer()
   defp safe_ets_size(table) do
-    case :ets.info(table, :size) do
-      :undefined -> 0
-      n when is_integer(n) -> n
-      _ -> 0
+    try do
+      case :ets.info(table, :size) do
+        :undefined -> 0
+        n when is_integer(n) -> n
+        _ -> 0
+      end
+    rescue
+      ArgumentError -> 0
     end
-  rescue
-    ArgumentError -> 0
   end
 end

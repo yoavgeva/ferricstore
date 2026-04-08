@@ -117,9 +117,7 @@ defmodule Ferricstore.Bench.FullProfileTest do
     end
 
     # Analyze each process
-    writer_list = if writer_samples, do: [{"BitcaskWriter", writer_samples}], else: []
-
-    for {label, ets_table} <- [{"ra_server", ra_samples}, {"WAL", wal_samples}] ++ writer_list do
+    for {label, ets_table} <- [{"ra_server", ra_samples}, {"WAL", wal_samples}] ++ (if writer_samples, do: [{"BitcaskWriter", writer_samples}], else: []) do
       all = :ets.tab2list(ets_table)
       total = length(all)
       if total > 0 do

@@ -2,10 +2,10 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   @moduledoc "Shard-level CAS, distributed lock, rate-limit, and list operation handlers with Raft and direct-write paths."
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.{ValueCodec}
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
-  alias Ferricstore.Store.ValueCodec
 
   require Logger
 
@@ -187,9 +187,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  @spec handle_ratelimit_add(
-          binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), map()
-        ) :: {:reply, term(), map()}
+  @spec handle_ratelimit_add(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), map()) :: {:reply, term(), map()}
   @doc false
   def handle_ratelimit_add(key, window_ms, max, count, state) do
     if state.raft? do
@@ -213,9 +211,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  @spec handle_ratelimit_add_direct(
-          binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), map()
-        ) :: {:reply, [term()], map()}
+  @spec handle_ratelimit_add_direct(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), map()) :: {:reply, [term()], map()}
   @doc false
   def handle_ratelimit_add_direct(key, window_ms, max, count, state) do
     now = Ferricstore.HLC.now_ms()
@@ -347,9 +343,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
         case NIF.v2_append_batch(state.active_file_path, [{compound_key, value, expire_at_ms}]) do
           {:ok, [{offset, _value_size}]} ->
-            ShardETS.ets_insert_with_location(
-              state, compound_key, value, expire_at_ms, state.active_file_id, offset, byte_size(value)
-            )
+            ShardETS.ets_insert_with_location(state, compound_key, value, expire_at_ms, state.active_file_id, offset, byte_size(value))
           _ ->
             ShardETS.ets_insert(state, compound_key, value, expire_at_ms)
         end
@@ -376,8 +370,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   # Helpers
   # -------------------------------------------------------------------
 
-  @spec resolve_for_native(map(), binary()) ::
-          {{:hit, term(), non_neg_integer()}, map()} | {:expired, map()} | {:missing, map()}
+  @spec resolve_for_native(map(), binary()) :: {{:hit, term(), non_neg_integer()}, map()} | {:expired, map()} | {:missing, map()}
   @doc false
   def resolve_for_native(state, key) do
     case ShardETS.ets_lookup_warm(state, key) do

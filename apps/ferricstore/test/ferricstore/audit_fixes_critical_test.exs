@@ -6,8 +6,9 @@ defmodule Ferricstore.AuditFixesCriticalTest do
 
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.Server
   alias Ferricstore.GlobMatcher
+  alias Ferricstore.Commands.Server
+
 
   # ---------------------------------------------------------------------------
   # Helper: build a mock store map from a key-value map
@@ -171,6 +172,7 @@ defmodule Ferricstore.AuditFixesCriticalTest do
       end
     end
   end
+
 
   # ---------------------------------------------------------------------------
   # C4: parse_float_value uses :binary.match

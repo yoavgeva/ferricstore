@@ -9,8 +9,8 @@ defmodule FerricstoreServer.Resp.RespEdgeCasesTest do
   """
   use ExUnit.Case, async: true
 
-  alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
+  alias FerricstoreServer.Resp.Encoder
 
   # Helper to flatten iodata for assertion
   defp to_bin(iodata), do: IO.iodata_to_binary(iodata)

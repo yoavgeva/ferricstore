@@ -85,7 +85,7 @@ defmodule FerricstoreServer.Spec.HttpEndpointsTest do
   # ---------------------------------------------------------------------------
 
   describe "GET /health/ready" do
-    test ~s(returns 200 with JSON {"status":"ok"} when ready) do
+    test "returns 200 with JSON {\"status\":\"ok\"} when ready" do
       # Ensure readiness is true (should be the default after app start)
       Ferricstore.Health.set_ready(true)
 

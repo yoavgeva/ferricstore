@@ -9,7 +9,7 @@ defmodule Ferricstore.Commands.RedisCompatStringsTest do
 
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.Strings
+  alias Ferricstore.Commands.{Strings}
   alias Ferricstore.Test.MockStore
 
   # ===========================================================================

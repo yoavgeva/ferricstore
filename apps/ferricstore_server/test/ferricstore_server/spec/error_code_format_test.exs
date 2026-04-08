@@ -17,10 +17,10 @@ defmodule FerricstoreServer.Spec.ErrorCodeFormatTest do
 
   alias Ferricstore.Commands.{Dispatcher, Generic, Strings}
   alias Ferricstore.Config
+  alias FerricstoreServer.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Listener
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.MockStore
-  alias FerricstoreServer.Listener
-  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   # ---------------------------------------------------------------------------
   # Helpers

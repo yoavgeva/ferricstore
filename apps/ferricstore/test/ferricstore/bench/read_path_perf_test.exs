@@ -9,8 +9,8 @@ defmodule Ferricstore.Bench.ReadPathPerfTest do
   @moduletag :bench
   @moduletag timeout: 120_000
 
+  alias Ferricstore.Store.{Router, LFU}
   alias Ferricstore.Stats
-  alias Ferricstore.Store.{LFU, Router}
 
   @iterations 200_000
 

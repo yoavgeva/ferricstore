@@ -15,10 +15,10 @@ defmodule FerricstoreServer.Spec.ConsistencyModelTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Store.Router
-  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
+  alias FerricstoreServer.Listener
+  alias Ferricstore.Store.Router
 
   # ---------------------------------------------------------------------------
   # Helpers

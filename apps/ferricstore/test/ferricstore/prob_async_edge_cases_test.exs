@@ -12,8 +12,8 @@ defmodule Ferricstore.ProbAsyncEdgeCasesTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK}
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Test.ShardHelpers
 
   setup do

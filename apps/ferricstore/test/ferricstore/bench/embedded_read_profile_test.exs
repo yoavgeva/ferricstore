@@ -13,7 +13,7 @@ defmodule Ferricstore.Bench.EmbeddedReadProfileTest do
   end
 
   test "profile embedded GET - every layer timed" do
-    alias Ferricstore.Store.{LFU, Router}
+    alias Ferricstore.Store.{Router, LFU}
 
     prefix = "emb_prof_#{System.unique_integer([:positive])}"
 

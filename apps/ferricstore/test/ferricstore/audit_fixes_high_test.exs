@@ -6,7 +6,8 @@ defmodule Ferricstore.AuditFixesHighTest do
 
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Generic, Hash, Server, Set}
+  alias Ferricstore.Commands.{Hash, Set, Server, Generic}
+
 
   # ---------------------------------------------------------------------------
   # Helper: build a mock store map from a key-value map

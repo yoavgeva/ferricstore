@@ -264,9 +264,11 @@ defmodule FerricStore.Instance do
 
   # Try to get an existing persistent_term ref, fall back to creating a new one.
   defp try_get_pt(key, fallback_fn) do
-    :persistent_term.get(key)
-  rescue
-    ArgumentError -> fallback_fn.()
+    try do
+      :persistent_term.get(key)
+    rescue
+      ArgumentError -> fallback_fn.()
+    end
   end
 
   defp detect_memory_limit do
@@ -297,14 +299,16 @@ defmodule FerricStore.Instance do
   end
 
   defp host_total_memory do
-    data = apply(:memsup, :get_system_memory_data, [])
-    case data do
-      list when is_list(list) -> Keyword.get(list, :total_memory)
+    try do
+      data = apply(:memsup, :get_system_memory_data, [])
+      case data do
+        list when is_list(list) -> Keyword.get(list, :total_memory)
+        _ -> nil
+      end
+    rescue
       _ -> nil
+    catch
+      _, _ -> nil
     end
-  rescue
-    _ -> nil
-  catch
-    _, _ -> nil
   end
 end

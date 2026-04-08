@@ -106,12 +106,14 @@ defmodule Ferricstore.Store.TypeRegistry do
   end
 
   defp detect_serialized_type(value) do
-    case :erlang.binary_to_term(value) do
-      {:list, _} -> "list"
-      _ -> "string"
+    try do
+      case :erlang.binary_to_term(value) do
+        {:list, _} -> "list"
+        _ -> "string"
+      end
+    rescue
+      ArgumentError -> "string"
     end
-  rescue
-    ArgumentError -> "string"
   end
 
   @doc """

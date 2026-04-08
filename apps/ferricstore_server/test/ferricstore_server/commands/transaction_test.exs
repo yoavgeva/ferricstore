@@ -9,9 +9,9 @@ defmodule FerricstoreServer.Commands.TransactionTest do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
+  alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------
   # Helpers

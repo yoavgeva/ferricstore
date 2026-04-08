@@ -28,9 +28,9 @@ defmodule Ferricstore.CrossShardOp do
   handlers use, so existing command logic works unchanged.
   """
 
+  alias Ferricstore.Store.Router
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Raft.Cluster
-  alias Ferricstore.Store.Router
 
   require Logger
 

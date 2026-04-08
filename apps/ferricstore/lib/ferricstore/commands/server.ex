@@ -406,10 +406,12 @@ defmodule Ferricstore.Commands.Server do
   # Read shard_count from persistent_term (set by application.ex) with
   # Application.get_env fallback for early startup / test environments.
   defp shard_count do
-    FerricStore.Instance.get(:default).shard_count
-  rescue
-    ArgumentError ->
-      Application.get_env(:ferricstore, :shard_count, 4)
+    try do
+      FerricStore.Instance.get(:default).shard_count
+    rescue
+      ArgumentError ->
+        Application.get_env(:ferricstore, :shard_count, 4)
+    end
   end
 
   defp info_string(section, store) when section in ["all", "everything"] do

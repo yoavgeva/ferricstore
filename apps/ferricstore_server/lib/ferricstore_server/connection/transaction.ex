@@ -1,10 +1,10 @@
 defmodule FerricstoreServer.Connection.Transaction do
   @moduledoc "MULTI/EXEC/DISCARD/WATCH transaction lifecycle for a client connection."
 
+  alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Connection.Store, as: ConnStore
-  alias FerricstoreServer.Resp.Encoder
 
   # Maximum commands queued inside a MULTI transaction (100K).
   @max_multi_queue_size 100_000
@@ -58,17 +58,19 @@ defmodule FerricstoreServer.Connection.Transaction do
   end
 
   def dispatch_watch(keys, state) do
-    new_watched =
-      Enum.reduce(keys, state.watched_keys, fn key, acc ->
-        hash = :erlang.phash2(Router.get(state.instance_ctx, key))
-        Map.put(acc, key, hash)
-      end)
+    try do
+      new_watched =
+        Enum.reduce(keys, state.watched_keys, fn key, acc ->
+          hash = :erlang.phash2(Router.get(state.instance_ctx, key))
+          Map.put(acc, key, hash)
+        end)
 
-    {:continue, Encoder.encode(:ok), %{state | watched_keys: new_watched}}
-  catch
-    :exit, {reason, _} ->
-      {:continue,
-       Encoder.encode({:error, "ERR server not ready: #{inspect(reason)}"}), state}
+      {:continue, Encoder.encode(:ok), %{state | watched_keys: new_watched}}
+    catch
+      :exit, {reason, _} ->
+        {:continue,
+         Encoder.encode({:error, "ERR server not ready: #{inspect(reason)}"}), state}
+    end
   end
 
   @spec dispatch_unwatch(list(), map()) :: conn_result()

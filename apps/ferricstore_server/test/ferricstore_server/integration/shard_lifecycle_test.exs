@@ -18,11 +18,11 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
   # Must be excluded from umbrella runs to avoid polluting other apps.
   @moduletag :cluster
 
-  alias Ferricstore.Commands.Expiry
   alias Ferricstore.Store.Router
-  alias Ferricstore.Test.ShardHelpers
-  alias FerricstoreServer.Listener
+  alias Ferricstore.Commands.Expiry
   alias FerricstoreServer.Resp.{Encoder, Parser}
+  alias FerricstoreServer.Listener
+  alias Ferricstore.Test.ShardHelpers
 
   # Wait for all shards to be alive before running any test in this module
   # (a previous module may have killed shards and they might still be restarting).
@@ -132,6 +132,7 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
   # ---------------------------------------------------------------------------
   # TCP helpers (adapted from ConnectionTest / CommandsTcpTest)
   # ---------------------------------------------------------------------------
+
 
   defp connect_and_hello(port) do
     {:ok, sock} =
