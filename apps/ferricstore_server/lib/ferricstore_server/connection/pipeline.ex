@@ -4,10 +4,10 @@ defmodule FerricstoreServer.Connection.Pipeline do
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
-  alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Store, as: ConnStore
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
+  alias FerricstoreServer.Resp.Encoder
 
   # Commands that must be executed synchronously because they read or mutate
   # connection-level state (transaction mode, pub/sub subscriptions, auth,

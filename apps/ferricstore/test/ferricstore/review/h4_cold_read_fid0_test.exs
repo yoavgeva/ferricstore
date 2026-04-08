@@ -10,7 +10,6 @@ defmodule Ferricstore.Review.H4ColdReadFid0Test do
 
   use ExUnit.Case, async: false
 
-
   @threshold 128
 
   setup do

@@ -3,9 +3,9 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.Shard.ETS, as: ShardETS
-  alias Ferricstore.Store.ValueCodec
   alias Ferricstore.Store.Shard.Flush, as: ShardFlush
   alias Ferricstore.Store.Shard.Reads, as: ShardReads
+  alias Ferricstore.Store.ValueCodec
 
   require Logger
 

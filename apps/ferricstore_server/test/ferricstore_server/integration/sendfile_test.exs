@@ -15,9 +15,9 @@ defmodule FerricstoreServer.Integration.SendfileTest do
 
   use ExUnit.Case, async: false
 
+  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
-  alias FerricstoreServer.Listener
 
   # Sendfile threshold matches the one in connection.ex
   @sendfile_threshold 65_536

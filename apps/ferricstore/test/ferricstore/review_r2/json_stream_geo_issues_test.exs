@@ -9,9 +9,9 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
   """
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Commands.Geo
   alias Ferricstore.Commands.Json
   alias Ferricstore.Commands.Stream
-  alias Ferricstore.Commands.Geo
   alias Ferricstore.Test.MockStore
 
   # Unique key helper to avoid collisions
@@ -100,7 +100,8 @@ defmodule Ferricstore.ReviewR2.JsonStreamGeoIssuesTest do
       # Create a box centered at Helsinki, 60 km wide x 1200 km tall.
       # Width 60 km => half-width 30 km.
       # At center_lat (60N), the dx for point B is haversine(60.17, 24.94, 60.17, 25.44) ~ 27.9 km < 30 km => inside.
-      # At point B's actual latitude (55.17N), the real dx is haversine(55.17, 24.94, 55.17, 25.44) ~ 31.8 km > 30 km => should be outside.
+      # At point B's actual latitude (55.17N), the real dx is
+      # haversine(55.17, 24.94, 55.17, 25.44) ~ 31.8 km > 30 km => should be outside.
       #
       # The buggy code will INCLUDE point B because it measures dx at center_lat.
       # A correct implementation would measure dx at the member's actual latitude

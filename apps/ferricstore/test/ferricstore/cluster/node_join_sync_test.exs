@@ -321,7 +321,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       node_b = ClusterHelper.start_node()
       node_c = ClusterHelper.start_node()
-      on_exit(fn -> ClusterHelper.stop_node(node_b); ClusterHelper.stop_node(node_c) end)
+      on_exit(fn ->
+        ClusterHelper.stop_node(node_b)
+        ClusterHelper.stop_node(node_c)
+      end)
 
       n_a = node_name(node_a)
       :erpc.call(n_a, Node, :connect, [node_name(node_b)])
@@ -365,7 +368,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       n_a = node_name(node_a)
       node_b = ClusterHelper.start_node(cluster_nodes: [n_a])
       node_c = ClusterHelper.start_node(cluster_nodes: [n_a])
-      on_exit(fn -> ClusterHelper.stop_node(node_b); ClusterHelper.stop_node(node_c) end)
+      on_exit(fn ->
+        ClusterHelper.stop_node(node_b)
+        ClusterHelper.stop_node(node_c)
+      end)
 
       # 3. Connect nodes (simulates libcluster discovery)
       #    :nodeup fires on all nodes → ClusterManager auto-joins
@@ -728,7 +734,6 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   defp join_cluster(new_node, existing_node) do
     :erpc.call(node_name(existing_node), Ferricstore.Cluster.Manager, :add_node, [node_name(new_node)])
   end
-
 
   defp get_shard_count(node) do
     n = node_name(node)

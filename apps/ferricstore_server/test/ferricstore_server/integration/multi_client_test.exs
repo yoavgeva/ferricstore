@@ -2,13 +2,12 @@ defmodule FerricstoreServer.Integration.MultiClientTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
-
 
   defp connect(port) do
     {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, packet: :raw])

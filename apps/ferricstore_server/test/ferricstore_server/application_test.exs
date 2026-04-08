@@ -10,9 +10,9 @@ defmodule FerricstoreServer.ApplicationTest do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Listener
   alias Ferricstore.Store.ShardSupervisor
   alias Ferricstore.Test.ShardHelpers
+  alias FerricstoreServer.Listener
 
   # Ensure all 4 shards are alive after every test so that the next test
   # module (which may also manipulate shards) starts from a clean state.

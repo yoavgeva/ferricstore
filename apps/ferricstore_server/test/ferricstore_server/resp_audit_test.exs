@@ -6,7 +6,7 @@ defmodule FerricstoreServer.RespAuditTest do
 
   use ExUnit.Case, async: true
 
-  alias FerricstoreServer.Resp.{Parser, Encoder}
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   # H2: Encoder single-pass counting
   describe "H2: encoder single-pass list counting" do

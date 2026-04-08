@@ -35,10 +35,10 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Commands.{Blocking, List}
-  alias FerricstoreServer.Resp.{Encoder, Parser}
-  alias FerricstoreServer.Listener
   alias Ferricstore.Test.MockStore
   alias Ferricstore.Waiters
+  alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   # ===========================================================================
   # Setup

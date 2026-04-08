@@ -36,7 +36,11 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     ])
     Ferricstore.DataDir.ensure_layout!(dir, 1)
 
-    {:ok, pid} = Shard.start_link(index: 0, data_dir: dir, flush_interval_ms: flush_ms, instance_ctx: ctx, raft_enabled: false)
+    {:ok, pid} =
+      Shard.start_link(
+        index: 0, data_dir: dir, flush_interval_ms: flush_ms,
+        instance_ctx: ctx, raft_enabled: false
+      )
     {pid, 0, dir, ctx}
   end
 

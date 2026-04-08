@@ -13,10 +13,10 @@ defmodule FerricstoreServer.Health.DashboardTest do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Health.Dashboard
-  alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
   alias Ferricstore.NamespaceConfig
   alias Ferricstore.Test.ShardHelpers
+  alias FerricstoreServer.Health.Dashboard
+  alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
 
   setup do
     ShardHelpers.flush_all_keys()

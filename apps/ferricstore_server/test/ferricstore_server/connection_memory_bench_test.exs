@@ -26,8 +26,8 @@ defmodule FerricstoreServer.ConnectionMemoryBenchTest do
 
   @moduletag :bench
 
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   # -------------------------------------------------------------------------
   # Helpers
@@ -98,13 +98,11 @@ defmodule FerricstoreServer.ConnectionMemoryBenchTest do
   defp uprefix, do: "bench_#{:erlang.unique_integer([:positive])}"
 
   defp alive?(sock) do
-    try do
-      :ok = :gen_tcp.send(sock, encode_command(["PING"]))
-      resp = drain_responses(sock, 1, 5_000)
-      match?([{:simple, "PONG"}], resp) or match?([{:simple, "PONG"} | _], resp)
-    catch
-      _, _ -> false
-    end
+    :ok = :gen_tcp.send(sock, encode_command(["PING"]))
+    resp = drain_responses(sock, 1, 5_000)
+    match?([{:simple, "PONG"}], resp) or match?([{:simple, "PONG"} | _], resp)
+  catch
+    _, _ -> false
   end
 
   defp send_chunked(sock, data, chunk_size) do
@@ -557,26 +555,24 @@ defmodule FerricstoreServer.ConnectionMemoryBenchTest do
   end
 
   defp run_client_ping_pipeline(num_commands) do
-    try do
-      sock = connect()
+    sock = connect()
 
-      :ok = :gen_tcp.send(sock, encode_command(["PING"]))
-      _pong = drain_responses(sock, 1)
+    :ok = :gen_tcp.send(sock, encode_command(["PING"]))
+    _pong = drain_responses(sock, 1)
 
-      ping_cmd = encode_command(["PING"])
-      raw = :binary.copy(ping_cmd, num_commands)
+    ping_cmd = encode_command(["PING"])
+    raw = :binary.copy(ping_cmd, num_commands)
 
-      :ok = :gen_tcp.send(sock, raw)
-      _responses = drain_responses(sock, num_commands, 60_000)
+    :ok = :gen_tcp.send(sock, raw)
+    _responses = drain_responses(sock, num_commands, 60_000)
 
-      :ok = :gen_tcp.send(sock, encode_command(["PING"]))
-      _pong = drain_responses(sock, 1, 5_000)
+    :ok = :gen_tcp.send(sock, encode_command(["PING"]))
+    _pong = drain_responses(sock, 1, 5_000)
 
-      :gen_tcp.close(sock)
-      :ok
-    catch
-      _, _ -> :error
-    end
+    :gen_tcp.close(sock)
+    :ok
+  catch
+    _, _ -> :error
   end
 
   # -------------------------------------------------------------------------

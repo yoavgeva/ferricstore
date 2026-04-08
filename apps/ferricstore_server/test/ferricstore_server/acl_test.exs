@@ -429,7 +429,8 @@ defmodule FerricstoreServer.AclTest do
       info = Acl.get_user_info("default")
       assert is_list(info)
 
-      # The format is: ["flags", [flags], "passwords", [passwords], "commands", cmd_str, "keys", keys_str, "channels", "&*"]
+      # The format is: ["flags", [flags], "passwords", [passwords],
+      #   "commands", cmd_str, "keys", keys_str, "channels", "&*"]
       assert "flags" in info
       assert "passwords" in info
       assert "commands" in info

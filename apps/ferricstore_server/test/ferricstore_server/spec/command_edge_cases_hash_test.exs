@@ -6,9 +6,9 @@ defmodule FerricstoreServer.Spec.CommandEdgeCasesHashTest do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Resp.{Encoder, Parser}
-  alias FerricstoreServer.Listener
   alias Ferricstore.Test.ShardHelpers
+  alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   @moduletag timeout: 120_000
 

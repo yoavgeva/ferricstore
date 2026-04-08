@@ -24,9 +24,9 @@ defmodule FerricstoreServer.Integration.ActiveOnceTest do
 
   use ExUnit.Case, async: false
 
+  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
-  alias FerricstoreServer.Listener
 
   @moduletag timeout: 60_000
 

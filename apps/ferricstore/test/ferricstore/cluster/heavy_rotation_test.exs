@@ -737,15 +737,13 @@ defmodule Ferricstore.Cluster.HeavyRotationTest do
 
   # Wraps ra.process_command with error handling to avoid crashing the writer task.
   defp safe_process_command(leader, cmd) do
-    try do
-      case :ra.process_command(leader, cmd, 5_000) do
-        {:ok, reply, new_leader} -> {:ok, reply, new_leader}
-        {:error, reason} -> {:error, reason}
-        {:timeout, _} -> :timeout
-      end
-    catch
-      :exit, _reason -> {:error, :exit}
+    case :ra.process_command(leader, cmd, 5_000) do
+      {:ok, reply, new_leader} -> {:ok, reply, new_leader}
+      {:error, reason} -> {:error, reason}
+      {:timeout, _} -> :timeout
     end
+  catch
+    :exit, _reason -> {:error, :exit}
   end
 
   # Attempts to find and update the leader. Returns 1 if a new leader was found, 0 otherwise.

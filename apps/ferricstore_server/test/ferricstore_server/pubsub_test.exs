@@ -10,8 +10,8 @@ defmodule FerricstoreServer.PubSubTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.PubSub
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   # ---------------------------------------------------------------------------
   # TCP helpers (shared with integration tests)

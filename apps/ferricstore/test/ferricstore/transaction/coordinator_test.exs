@@ -12,8 +12,8 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
-  alias Ferricstore.Transaction.Coordinator
   alias Ferricstore.Test.ShardHelpers
+  alias Ferricstore.Transaction.Coordinator
 
   setup do
     ShardHelpers.flush_all_keys()

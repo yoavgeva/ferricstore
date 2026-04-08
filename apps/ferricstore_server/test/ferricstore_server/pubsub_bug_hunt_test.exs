@@ -15,9 +15,9 @@ defmodule FerricstoreServer.PubSubBugHuntTest do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Resp.{Encoder, Parser}
-  alias FerricstoreServer.Listener
   alias Ferricstore.PubSub
+  alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   @moduletag timeout: 60_000
 

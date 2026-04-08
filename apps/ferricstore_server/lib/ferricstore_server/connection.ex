@@ -62,7 +62,6 @@ defmodule FerricstoreServer.Connection do
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
   alias FerricstoreServer.ClientTracking
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Blocking, as: ConnBlocking
   alias FerricstoreServer.Connection.Pipeline, as: ConnPipeline
@@ -71,6 +70,7 @@ defmodule FerricstoreServer.Connection do
   alias FerricstoreServer.Connection.Store, as: ConnStore
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
   alias FerricstoreServer.Connection.Transaction, as: ConnTransaction
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   alias Ferricstore.PubSub, as: PS
 

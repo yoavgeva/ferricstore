@@ -5,8 +5,8 @@ defmodule FerricstoreServer.ConnectionLimitsTest do
   """
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   # ---------------------------------------------------------------------------
   # Helpers

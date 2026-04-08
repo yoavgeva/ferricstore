@@ -17,12 +17,12 @@ defmodule FerricstoreServer.NodeLifecycleTest do
   use ExUnit.Case, async: false
   @moduletag :shard_kill
 
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.DataDir
   alias Ferricstore.Store.{Router, ShardSupervisor}
-  alias FerricstoreServer.Resp.{Encoder, Parser}
-  alias Ferricstore.Bitcask.NIF
-  alias FerricstoreServer.Listener
   alias Ferricstore.Test.ShardHelpers
+  alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   setup_all do
     ShardHelpers.wait_shards_alive()

@@ -669,7 +669,9 @@ defmodule FerricstoreServer.AclPersistenceTest do
       Application.put_env(:ferricstore, :data_dir, dir)
 
       on_exit(fn ->
-        if prev_auto, do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto), else: Application.delete_env(:ferricstore, :acl_auto_save)
+        if prev_auto,
+          do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto),
+          else: Application.delete_env(:ferricstore, :acl_auto_save)
         if prev_dir, do: Application.put_env(:ferricstore, :data_dir, prev_dir)
       end)
 
@@ -691,7 +693,9 @@ defmodule FerricstoreServer.AclPersistenceTest do
       Application.put_env(:ferricstore, :data_dir, dir)
 
       on_exit(fn ->
-        if prev_auto, do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto), else: Application.delete_env(:ferricstore, :acl_auto_save)
+        if prev_auto,
+          do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto),
+          else: Application.delete_env(:ferricstore, :acl_auto_save)
         if prev_dir, do: Application.put_env(:ferricstore, :data_dir, prev_dir)
       end)
 
@@ -719,7 +723,9 @@ defmodule FerricstoreServer.AclPersistenceTest do
       Application.put_env(:ferricstore, :data_dir, dir)
 
       on_exit(fn ->
-        if prev_auto, do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto), else: Application.delete_env(:ferricstore, :acl_auto_save)
+        if prev_auto,
+          do: Application.put_env(:ferricstore, :acl_auto_save, prev_auto),
+          else: Application.delete_env(:ferricstore, :acl_auto_save)
         if prev_dir, do: Application.put_env(:ferricstore, :data_dir, prev_dir)
       end)
 

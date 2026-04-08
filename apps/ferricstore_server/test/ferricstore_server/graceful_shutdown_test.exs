@@ -8,9 +8,9 @@ defmodule FerricstoreServer.GracefulShutdownTest do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias Ferricstore.Test.ShardHelpers
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   setup do
     ctx = ShardHelpers.setup_isolated_data_dir()

@@ -13,8 +13,8 @@ defmodule Ferricstore.ProbEdgeCasesTest do
 
   use ExUnit.Case, async: false
 
-  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK}
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Commands.{Bloom, CMS, Cuckoo, TopK}
   alias Ferricstore.MemoryGuard
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers

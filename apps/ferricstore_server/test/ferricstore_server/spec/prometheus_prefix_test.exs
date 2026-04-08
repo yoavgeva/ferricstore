@@ -16,11 +16,11 @@ defmodule FerricstoreServer.Spec.PrometheusPrefixTest do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
   alias Ferricstore.Metrics
   alias Ferricstore.Stats
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
+  alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint
 
   # ---------------------------------------------------------------------------
   # Setup

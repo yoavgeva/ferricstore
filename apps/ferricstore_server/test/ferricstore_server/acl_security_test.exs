@@ -15,8 +15,8 @@ defmodule FerricstoreServer.AclSecurityTest do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Acl
   alias Ferricstore.AuditLog
+  alias FerricstoreServer.Acl
 
   setup do
     Acl.reset!()

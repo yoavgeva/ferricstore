@@ -18,10 +18,10 @@ defmodule FerricstoreServer.Integration.CrossShardAtomicTcpTest do
   use ExUnit.Case, async: false
   @moduletag timeout: 60_000
 
+  alias Ferricstore.Test.ShardHelpers
+  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
-  alias FerricstoreServer.Listener
-  alias Ferricstore.Test.ShardHelpers
 
   # ---------------------------------------------------------------------------
   # Helpers

@@ -21,8 +21,8 @@ defmodule FerricstoreServer.Spec.AclPermissionsTest do
   use ExUnit.Case, async: false
 
   alias FerricstoreServer.Acl
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   # ---------------------------------------------------------------------------
   # Helpers

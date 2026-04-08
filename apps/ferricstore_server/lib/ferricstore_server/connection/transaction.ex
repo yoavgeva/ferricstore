@@ -3,8 +3,8 @@ defmodule FerricstoreServer.Connection.Transaction do
 
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.Store.Router
-  alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Connection.Store, as: ConnStore
+  alias FerricstoreServer.Resp.Encoder
 
   # Maximum commands queued inside a MULTI transaction (100K).
   @max_multi_queue_size 100_000

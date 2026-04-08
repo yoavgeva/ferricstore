@@ -9,8 +9,8 @@ defmodule FerricstoreServer.Integration.EdgeCasesTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   @moduletag timeout: 60_000
 

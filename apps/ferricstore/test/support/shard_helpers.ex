@@ -62,8 +62,8 @@ defmodule Ferricstore.Test.ShardHelpers do
   """
   @spec flush_all_keys() :: :ok
   def flush_all_keys do
-    alias Ferricstore.Store.Router
     alias Ferricstore.Raft.{AsyncApplyWorker, Batcher}
+    alias Ferricstore.Store.Router
 
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 

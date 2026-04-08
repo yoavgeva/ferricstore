@@ -349,7 +349,12 @@ defmodule Ferricstore.Bench.MultiNodeWriteBenchTest do
     IO.puts("  Followers: #{inspect(followers)}\n")
 
     # Test with different value sizes
-    for {value_size, num_writes} <- [{100, 100_000}, {1_000, 50_000}, {10_000, 10_000}, {50_000, 5_000}, {100_000, 2_000}, {500_000, 500}] do
+    size_configs = [
+      {100, 100_000}, {1_000, 50_000}, {10_000, 10_000},
+      {50_000, 5_000}, {100_000, 2_000}, {500_000, 500}
+    ]
+
+    for {value_size, num_writes} <- size_configs do
       test_value_size(leader, followers, prefix, value_size, num_writes)
     end
 

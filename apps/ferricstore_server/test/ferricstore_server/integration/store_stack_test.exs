@@ -5,8 +5,8 @@ defmodule FerricstoreServer.Integration.StoreStackTest do
   @moduletag :shard_kill
   @moduletag :cluster
 
-  alias Ferricstore.Store.Router
   alias Ferricstore.Commands.{Dispatcher, Expiry, Server, Strings}
+  alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do

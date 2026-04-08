@@ -14,8 +14,8 @@ defmodule FerricstoreServer.StartupTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.{Router, ShardSupervisor}
-  alias FerricstoreServer.Listener
   alias Ferricstore.Test.ShardHelpers
+  alias FerricstoreServer.Listener
 
   setup do
     ShardHelpers.flush_all_keys()

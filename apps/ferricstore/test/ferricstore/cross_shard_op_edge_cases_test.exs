@@ -5,11 +5,11 @@ defmodule Ferricstore.CrossShardOpEdgeCasesTest do
 
   use ExUnit.Case, async: false
 
+  alias Ferricstore.Commands.Set
+  alias Ferricstore.NamespaceConfig
+  alias Ferricstore.Raft.Cluster
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
-  alias Ferricstore.NamespaceConfig
-  alias Ferricstore.Commands.Set
-  alias Ferricstore.Raft.Cluster
 
   setup do
     ShardHelpers.flush_all_keys()

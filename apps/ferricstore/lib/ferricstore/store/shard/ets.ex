@@ -100,7 +100,10 @@ defmodule Ferricstore.Store.Shard.ETS do
   end
 
   # Inserts a key/value/expiry into the keydir with known disk location (v2).
-  @spec ets_insert_with_location(map(), binary(), term(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: true
+  @spec ets_insert_with_location(
+          map(), binary(), term(), non_neg_integer(),
+          non_neg_integer(), non_neg_integer(), non_neg_integer()
+        ) :: true
   @doc false
   def ets_insert_with_location(state, key, value, expire_at_ms, file_id, offset, value_size) do
     threshold = hot_cache_threshold(state)

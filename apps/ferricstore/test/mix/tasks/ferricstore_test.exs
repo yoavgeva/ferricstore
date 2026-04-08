@@ -14,8 +14,8 @@ defmodule Mix.Tasks.FerricstoreTest do
 
   import ExUnit.CaptureIO
 
-  alias Ferricstore.Store.Router
   alias Ferricstore.NamespaceConfig
+  alias Ferricstore.Store.Router
 
   setup do
     # Ensure a clean slate before each test: flush all keys, reset

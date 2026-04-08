@@ -6,9 +6,8 @@ defmodule Ferricstore.AuditFixesLowTest do
 
   use ExUnit.Case, async: true
 
-  alias Ferricstore.GlobMatcher
   alias Ferricstore.Commands.Generic
-
+  alias Ferricstore.GlobMatcher
 
   # ---------------------------------------------------------------------------
   # Helper: build a mock store map from a key-value map

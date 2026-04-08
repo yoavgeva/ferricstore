@@ -15,14 +15,13 @@ defmodule FerricstoreServer.Integration.CommandsTcpTest do
 
   use ExUnit.Case, async: false
 
+  alias FerricstoreServer.Listener
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
-  alias FerricstoreServer.Listener
 
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
-
 
   defp send_cmd(sock, cmd) do
     data = IO.iodata_to_binary(Encoder.encode(cmd))

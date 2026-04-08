@@ -14,8 +14,8 @@ defmodule FerricstoreServer.Integration.SlidingWindowTest do
 
   use ExUnit.Case, async: false
 
-  alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   @moduletag timeout: 30_000
 

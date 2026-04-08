@@ -18,9 +18,9 @@ defmodule FerricstoreServer.Integration.PerformanceTest do
 
   @moduletag :bench
 
-  alias FerricstoreServer.Resp.{Encoder, Parser}
-  alias FerricstoreServer.Listener
   alias Ferricstore.Store.Router
+  alias FerricstoreServer.Listener
+  alias FerricstoreServer.Resp.{Encoder, Parser}
 
   @shard_count 4
 
