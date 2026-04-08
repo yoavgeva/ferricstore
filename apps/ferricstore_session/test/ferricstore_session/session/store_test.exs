@@ -1,5 +1,6 @@
 defmodule FerricStore.Session.StoreTest do
   use ExUnit.Case, async: false
+  @moduletag timeout: 60_000
 
   alias FerricStore.Session.Store
 

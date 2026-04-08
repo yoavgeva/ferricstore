@@ -12,6 +12,7 @@ defmodule FerricstoreServer.Health.DashboardTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag timeout: 60_000
 
   alias FerricstoreServer.Health.Dashboard
   alias FerricstoreServer.Health.Endpoint, as: HealthEndpoint

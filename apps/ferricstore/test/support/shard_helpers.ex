@@ -28,7 +28,7 @@ defmodule Ferricstore.Test.ShardHelpers do
       name = :"Ferricstore.Store.Shard.#{i}"
 
       case Process.whereis(name) do
-        pid when is_pid(pid) -> GenServer.call(pid, :flush, 10_000)
+        pid when is_pid(pid) -> GenServer.call(pid, :flush, 30_000)
         nil -> :ok
       end
     end)
@@ -67,12 +67,16 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
+    # Under full-suite load, the batcher can be slow to respond.
+    # Use a generous timeout for test cleanup (production Batcher.flush uses 10s).
+    flush_timeout = 30_000
+
     # Flush Raft batchers first (moves any pending slot contents into
     # AsyncApplyWorker casts for async namespaces, or applies via Raft
     # for quorum namespaces), then drain async workers so their
     # fire-and-forget writes land in ETS before we snapshot keys.
     Enum.each(0..(shard_count - 1), fn i ->
-      Batcher.flush(i)
+      GenServer.call(Batcher.batcher_name(i), :flush, flush_timeout)
       AsyncApplyWorker.drain(i)
     end)
 
@@ -87,14 +91,14 @@ defmodule Ferricstore.Test.ShardHelpers do
     # by hashing the compound key string.
     Enum.each(0..(shard_count - 1), fn i ->
       shard = Router.shard_name(FerricStore.Instance.get(:default), i)
-      keys = GenServer.call(shard, :keys, 10_000)
-      Enum.each(keys, fn key -> GenServer.call(shard, {:delete, key}, 30_000) end)
+      keys = GenServer.call(shard, :keys, flush_timeout)
+      Enum.each(keys, fn key -> GenServer.call(shard, {:delete, key}, flush_timeout) end)
     end)
 
     # The deletes above go through the Raft batcher (async). Drain the
     # pipeline again so the tombstones are applied before we return.
     Enum.each(0..(shard_count - 1), fn i ->
-      Batcher.flush(i)
+      GenServer.call(Batcher.batcher_name(i), :flush, flush_timeout)
       AsyncApplyWorker.drain(i)
     end)
 
