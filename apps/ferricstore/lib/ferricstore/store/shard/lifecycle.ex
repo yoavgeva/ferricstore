@@ -32,21 +32,16 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         # Clean up leftover compaction temp files from a previous crash.
         # These are always incomplete — if compaction had finished, the
         # rename would have replaced the original and the temp is gone.
-        Enum.each(files, fn name ->
-          if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
-            File.rm(Path.join(shard_path, name))
-            Logger.warning("Shard: removed leftover compaction temp file #{name}")
-          end
-        end)
+        cleanup_compact_temps(shard_path, files)
 
         max_id =
-          Enum.reduce(files, -1, fn name, best ->
-            if String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_") do
-              id = name |> String.trim_trailing(".log") |> String.to_integer()
-              max(id, best)
-            else
-              best
-            end
+          files
+          |> Enum.filter(fn name ->
+            String.ends_with?(name, ".log") and not String.starts_with?(name, "compact_")
+          end)
+          |> Enum.reduce(-1, fn name, best ->
+            id = name |> String.trim_trailing(".log") |> String.to_integer()
+            max(id, best)
           end)
 
         if max_id < 0 do
@@ -81,41 +76,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           |> Enum.filter(&String.ends_with?(&1, ".hint"))
           |> Enum.sort()
 
-        if hint_files != [] do
-          # Recover from hint files
-          Enum.each(hint_files, fn hint_name ->
-            hint_path = Path.join(shard_path, hint_name)
-            fid = hint_name |> String.trim_trailing(".hint") |> String.to_integer()
-
-            case NIF.v2_read_hint_file(hint_path) do
-              {:ok, entries} ->
-                # NIF returns: {key, file_id, offset, value_size, expire_at_ms}
-                Enum.each(entries, fn {key, _file_id, offset, value_size, expire_at_ms} ->
-                  :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
-                end)
-              _ -> :ok
-            end
-          end)
-
-          # Scan any log files that don't have corresponding hints (e.g. the active file)
-          hinted_ids = MapSet.new(hint_files, fn name ->
-            name |> String.trim_trailing(".hint") |> String.to_integer()
-          end)
-
-          unhinted_logs = Enum.reject(log_files, fn name ->
-            fid = name |> String.trim_trailing(".log") |> String.to_integer()
-            MapSet.member?(hinted_ids, fid)
-          end)
-
-          Enum.each(unhinted_logs, fn log_name ->
-            recover_from_log(shard_path, log_name, keydir, shard_index)
-          end)
-        else
-          # No hint files -- full scan of all log files
-          Enum.each(log_files, fn log_name ->
-            recover_from_log(shard_path, log_name, keydir, shard_index)
-          end)
-        end
+        recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, hint_files)
 
       {:error, reason} ->
         Logger.warning("Shard #{shard_index}: recover_keydir failed to list #{shard_path}: #{inspect(reason)}")
@@ -136,12 +97,8 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     # v2_scan_file returns {:ok, [{key, offset, value_size, expire_at_ms, is_tombstone}, ...]}
     case NIF.v2_scan_file(log_path) do
       {:ok, records} ->
-        Enum.each(records, fn {key, offset, value_size, expire_at_ms, is_tombstone} ->
-          if is_tombstone do
-            :ets.delete(keydir, key)
-          else
-            :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
-          end
+        Enum.each(records, fn record ->
+          recover_record(keydir, fid, record)
         end)
 
       _ ->
@@ -167,54 +124,13 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     count = length(expired_keys)
 
     if count > 0 do
-      # v2: write tombstones for expired keys and remove from ETS
-      Enum.each(expired_keys, fn key ->
-        case NIF.v2_append_tombstone(state.active_file_path, key) do
-          {:ok, _} ->
-            ShardETS.ets_delete_key(state, key)
-
-          {:error, reason} ->
-            Logger.warning("Shard #{state.index}: tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}")
-        end
-      end)
-      if state.instance_ctx do
-        Ferricstore.Stats.incr_expired_keys(state.instance_ctx, count)
-      else
-        Ferricstore.Stats.incr_expired_keys(count)
-      end
-
+      expire_keys(state, expired_keys)
+      incr_expired_stats(state, count)
       Logger.debug("Shard #{state.index}: expiry sweep removed #{count} key(s)")
     end
 
-    # Track whether the sweep hit the ceiling (removed exactly max_keys).
     hit_ceiling = count >= max_keys and count > 0
-
-    {new_ceiling_count, new_struggling} =
-      if hit_ceiling do
-        new_count = state.sweep_at_ceiling_count + 1
-
-        if new_count >= @struggling_threshold and not state.sweep_struggling do
-          :telemetry.execute(
-            [:ferricstore, :expiry, :struggling],
-            %{shard_index: state.index, consecutive_ceiling_sweeps: new_count, max_keys_per_sweep: max_keys},
-            %{}
-          )
-
-          {new_count, true}
-        else
-          {new_count, state.sweep_struggling}
-        end
-      else
-        if state.sweep_struggling do
-          :telemetry.execute(
-            [:ferricstore, :expiry, :recovered],
-            %{shard_index: state.index, previous_ceiling_sweeps: state.sweep_at_ceiling_count},
-            %{}
-          )
-        end
-
-        {0, false}
-      end
+    {new_ceiling_count, new_struggling} = update_sweep_ceiling(state, hit_ceiling, max_keys)
 
     %{state | sweep_at_ceiling_count: new_ceiling_count, sweep_struggling: new_struggling}
   end
@@ -450,5 +366,116 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     )
 
     :ok
+  end
+  defp cleanup_compact_temps(shard_path, files) do
+    Enum.each(files, fn name ->
+      if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
+        File.rm(Path.join(shard_path, name))
+        Logger.warning("Shard: removed leftover compaction temp file #{name}")
+      end
+    end)
+  end
+
+  defp recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, []) do
+    Enum.each(log_files, fn log_name ->
+      recover_from_log(shard_path, log_name, keydir, shard_index)
+    end)
+  end
+
+  defp recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, hint_files) do
+    Enum.each(hint_files, fn hint_name ->
+      recover_from_hint(shard_path, hint_name, keydir)
+    end)
+
+    unhinted_logs = unhinted_log_files(log_files, hint_files)
+
+    Enum.each(unhinted_logs, fn log_name ->
+      recover_from_log(shard_path, log_name, keydir, shard_index)
+    end)
+  end
+
+  defp recover_from_hint(shard_path, hint_name, keydir) do
+    hint_path = Path.join(shard_path, hint_name)
+    fid = hint_name |> String.trim_trailing(".hint") |> String.to_integer()
+
+    case NIF.v2_read_hint_file(hint_path) do
+      {:ok, entries} ->
+        Enum.each(entries, fn {key, _file_id, offset, value_size, expire_at_ms} ->
+          :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
+        end)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp unhinted_log_files(log_files, hint_files) do
+    hinted_ids =
+      MapSet.new(hint_files, fn name ->
+        name |> String.trim_trailing(".hint") |> String.to_integer()
+      end)
+
+    Enum.reject(log_files, fn name ->
+      fid = name |> String.trim_trailing(".log") |> String.to_integer()
+      MapSet.member?(hinted_ids, fid)
+    end)
+  end
+
+  defp recover_record(keydir, _fid, {key, _offset, _value_size, _expire_at_ms, true}) do
+    :ets.delete(keydir, key)
+  end
+
+  defp recover_record(keydir, fid, {key, offset, value_size, expire_at_ms, false}) do
+    :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
+  end
+
+  defp expire_keys(state, expired_keys) do
+    Enum.each(expired_keys, fn key ->
+      case NIF.v2_append_tombstone(state.active_file_path, key) do
+        {:ok, _} ->
+          ShardETS.ets_delete_key(state, key)
+
+        {:error, reason} ->
+          Logger.warning(
+            "Shard #{state.index}: tombstone write failed during expiry sweep for #{inspect(key)}: #{inspect(reason)}"
+          )
+      end
+    end)
+  end
+
+  defp incr_expired_stats(%{instance_ctx: nil}, count) do
+    Ferricstore.Stats.incr_expired_keys(count)
+  end
+
+  defp incr_expired_stats(%{instance_ctx: ctx}, count) do
+    Ferricstore.Stats.incr_expired_keys(ctx, count)
+  end
+
+  defp update_sweep_ceiling(state, true = _hit_ceiling, max_keys) do
+    new_count = state.sweep_at_ceiling_count + 1
+
+    if new_count >= @struggling_threshold and not state.sweep_struggling do
+      :telemetry.execute(
+        [:ferricstore, :expiry, :struggling],
+        %{shard_index: state.index, consecutive_ceiling_sweeps: new_count, max_keys_per_sweep: max_keys},
+        %{}
+      )
+
+      {new_count, true}
+    else
+      {new_count, state.sweep_struggling}
+    end
+  end
+
+  defp update_sweep_ceiling(state, false, _max_keys) do
+    if state.sweep_struggling do
+      :telemetry.execute(
+        [:ferricstore, :expiry, :recovered],
+        %{shard_index: state.index, previous_ceiling_sweeps: state.sweep_at_ceiling_count},
+        %{}
+      )
+    end
+
+    {0, false}
   end
 end
