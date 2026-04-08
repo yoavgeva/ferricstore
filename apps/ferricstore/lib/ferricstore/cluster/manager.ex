@@ -564,7 +564,8 @@ defmodule Ferricstore.Cluster.Manager do
     end
   end
 
-  defp read_target_indices(target_node, shard_count) do
+  @doc false
+  def read_target_indices(target_node, shard_count) do
     target_data_dir =
       try do
         target_ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default], 5_000)
