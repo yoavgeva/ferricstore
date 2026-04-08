@@ -519,6 +519,94 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     end
   end
 
+  describe "rejoin after removal" do
+    @tag timeout: 120_000
+    test "removed node can rejoin and gets all data" do
+      nodes = ClusterHelper.start_cluster(3)
+      on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+      [node_a, _node_b, _node_c] = nodes
+      n_a = node_name(node_a)
+      keys_v1 = write_keys(node_a, "before_remove", 1..100)
+      node_d = ClusterHelper.start_node()
+      on_exit(fn -> ClusterHelper.stop_node(node_d) end)
+      :ok = join_cluster(node_d, node_a)
+      eventually(fn ->
+        assert Enum.all?(keys_v1, fn k -> read_key(node_d, k) != nil end), "v1 keys missing"
+      end, "v1 keys not replicated", 30, 500)
+      :ok = :erpc.call(n_a, Ferricstore.Cluster.Manager, :remove_node, [node_name(node_d)])
+      keys_v2 = write_keys(node_a, "during_removed", 1..100)
+      :ok = join_cluster(node_d, node_a)
+      all_keys = keys_v1 ++ keys_v2
+      eventually(fn ->
+        missing = Enum.count(all_keys, fn k -> read_key(node_d, k) == nil end)
+        assert missing == 0, "#{missing} keys missing after rejoin"
+      end, "keys not replicated after rejoin", 60, 500)
+      eventually(fn ->
+        assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_d), "keydir mismatch after rejoin"
+      end, "keydirs not converged after rejoin", 20, 500)
+    end
+  end
+
+  describe "duplicate join is idempotent" do
+    @tag timeout: 120_000
+    test "concurrent add_node calls for same target converge" do
+      nodes = ClusterHelper.start_cluster(3)
+      on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+      [node_a, node_b, _node_c] = nodes
+      n_a = node_name(node_a)
+      n_b = node_name(node_b)
+      keys = write_keys(node_a, "dedup", 1..200)
+      node_d = ClusterHelper.start_node()
+      on_exit(fn -> ClusterHelper.stop_node(node_d) end)
+      task_a = Task.async(fn -> :erpc.call(n_a, Ferricstore.Cluster.Manager, :add_node, [node_name(node_d)], 60_000) end)
+      task_b = Task.async(fn -> :erpc.call(n_b, Ferricstore.Cluster.Manager, :add_node, [node_name(node_d)], 60_000) end)
+      result_a = Task.await(task_a, 60_000)
+      result_b = Task.await(task_b, 60_000)
+      assert result_a == :ok
+      assert result_b == :ok
+      eventually(fn ->
+        missing = Enum.count(keys, fn k -> read_key(node_d, k) == nil end)
+        assert missing == 0, "#{missing} keys missing after concurrent join"
+      end, "keys not replicated after concurrent join", 60, 500)
+      shard_count = get_shard_count(node_a)
+      for shard_idx <- 0..(shard_count - 1) do
+        {:ok, members, _leader} = :erpc.call(n_a, Ferricstore.Raft.Cluster, :members, [shard_idx])
+        node_d_members = Enum.filter(members, fn {_name, n} -> n == node_name(node_d) end)
+        assert length(node_d_members) == 1
+      end
+    end
+  end
+
+  describe "leader failover during sync" do
+    @tag timeout: 120_000
+    test "sync recovers after leader dies mid-join" do
+      nodes = ClusterHelper.start_cluster(3)
+      on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
+      [node_a, node_b, node_c] = nodes
+      keys = write_keys(node_a, "pre_failover", 1..200)
+      eventually(fn ->
+        assert Enum.all?(keys, fn k -> read_key(node_b, k) != nil end), "keys missing on b"
+      end, "pre-replication incomplete", 30, 500)
+      leader_name = ClusterHelper.find_leader(nodes, 0)
+      leader_node = Enum.find(nodes, &(&1.name == leader_name))
+      {_killed, remaining} = ClusterHelper.kill_node(nodes, leader_node)
+      ClusterHelper.wait_for_leaders(remaining, 4, timeout: 15_000)
+      surviving = hd(remaining)
+      node_d = ClusterHelper.start_node()
+      on_exit(fn -> ClusterHelper.stop_node(node_d) end)
+      :ok = join_cluster(node_d, surviving)
+      post_keys = write_keys(surviving, "post_failover", 1..50)
+      all_keys = keys ++ post_keys
+      eventually(fn ->
+        missing = Enum.count(all_keys, fn k -> read_key(node_d, k) == nil end)
+        assert missing == 0, "#{missing} keys missing after leader failover join"
+      end, "keys not replicated after failover join", 60, 500)
+      eventually(fn ->
+        assert dump_keydir_sorted(surviving) == dump_keydir_sorted(node_d), "keydir mismatch after failover join"
+      end, "keydirs not converged after failover", 20, 500)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Helpers — these call into :peer nodes via :erpc
   # ---------------------------------------------------------------------------
