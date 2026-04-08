@@ -136,7 +136,7 @@ defmodule Ferricstore.Commands.ClusterCommandsTest do
     test "returns a list of slot ranges", %{store: store} do
       result = Cluster.handle("CLUSTER.SLOTS", [], store)
       assert is_list(result)
-      assert length(result) > 0
+      assert result != []
 
       # Each range should be [start, end, shard_index]
       Enum.each(result, fn range ->

@@ -75,7 +75,7 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
     test "returns members for shard 0" do
       {:ok, members, leader} = Cluster.members(0)
       assert is_list(members)
-      assert length(members) >= 1
+      assert members != []
       assert leader != nil
     end
 
@@ -90,7 +90,7 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
       for i <- 0..(shard_count - 1) do
         {:ok, members, _leader} = Cluster.members(i)
         assert is_list(members), "shard #{i} should return a member list"
-        assert length(members) >= 1, "shard #{i} should have at least 1 member"
+        assert members != [], "shard #{i} should have at least 1 member"
       end
     end
   end

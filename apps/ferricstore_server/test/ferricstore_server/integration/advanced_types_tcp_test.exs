@@ -349,7 +349,7 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       result = recv_response(sock)
       assert is_list(result)
       # Result is [[stream_key, [[id, fields], ...]]]
-      assert length(result) >= 1
+      assert result != []
 
       :gen_tcp.close(sock)
     end
@@ -437,7 +437,7 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       send_cmd(sock, ["XREADGROUP", "GROUP", "grp", "consumer1", "STREAMS", k, ">"])
       result = recv_response(sock)
       assert is_list(result)
-      assert length(result) >= 1
+      assert result != []
 
       :gen_tcp.close(sock)
     end
