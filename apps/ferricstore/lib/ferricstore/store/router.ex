@@ -465,6 +465,11 @@ defmodule Ferricstore.Store.Router do
     if bytes > 0, do: :atomics.sub(ctx.keydir_binary_bytes, idx + 1, bytes)
   end
 
+  defp track_keydir_binary_delete_known(ctx, idx, key, value) do
+    bytes = offheap_size(key) + offheap_size(value)
+    if bytes > 0, do: :atomics.sub(ctx.keydir_binary_bytes, idx + 1, bytes)
+  end
+
   defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
   defp offheap_size(_), do: 0
 
@@ -578,7 +583,7 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
-    case ets_get_full(keydir, key, now) do
+    case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, _value, _lfu} ->
         # Hot key — value is in ETS, sendfile not applicable.
         nil
@@ -623,7 +628,7 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
-    case ets_get_full(keydir, key, now) do
+    case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, value, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
         {:hot, value}
@@ -671,7 +676,7 @@ defmodule Ferricstore.Store.Router do
 
   # Like ets_get but returns file ref info for cold entries and LFU counter for hits.
   # Single lookup provides everything needed — no second ETS read for bookkeeping.
-  defp ets_get_full(keydir, key, now) do
+  defp ets_get_full(ctx, idx, keydir, key, now) do
     try do
       case :ets.lookup(keydir, key) do
         [{^key, value, 0, lfu, _fid, _off, _vsize}] when value != nil ->
@@ -686,7 +691,8 @@ defmodule Ferricstore.Store.Router do
         [{^key, nil, exp, _lfu, fid, off, vsize}] when exp > now ->
           {:cold, fid, off, vsize}
 
-        [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
+        [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+          track_keydir_binary_delete_known(ctx, idx, key, value)
           :ets.delete(keydir, key)
           :expired
 
@@ -716,7 +722,7 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
-    case ets_get_full(keydir, key, now) do
+    case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, value, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
         value
@@ -788,7 +794,7 @@ defmodule Ferricstore.Store.Router do
     keydir = resolve_keydir(ctx, idx)
     now = HLC.now_ms()
 
-    case ets_get_full(keydir, key, now) do
+    case ets_get_full(ctx, idx, keydir, key, now) do
       {:hit, value, lfu} ->
         sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
         # Recover expire_at_ms from ETS (ets_get_full returns lfu, not exp).

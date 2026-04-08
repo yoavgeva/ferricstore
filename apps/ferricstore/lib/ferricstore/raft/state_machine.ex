@@ -931,9 +931,20 @@ defmodule Ferricstore.Raft.StateMachine do
         }
       end
 
+    tx_binary_ref = keydir_binary_ref(anchor_state)
+
     local_put = fn key, value, expire_at_ms ->
       value_for = value_for_ets(value, hot_cache_threshold(anchor_state))
       disk_val = to_disk_binary(value)
+      if tx_binary_ref do
+        new_bytes = binary_byte_size(key) + binary_byte_size(value_for)
+        old_bytes = case :ets.lookup(ctx.keydir, key) do
+          [{^key, old_val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(old_val)
+          _ -> 0
+        end
+        delta = new_bytes - old_bytes
+        if delta != 0, do: :atomics.add(tx_binary_ref, ctx.index + 1, delta)
+      end
       :ets.insert(ctx.keydir, {key, value_for, expire_at_ms, LFU.initial(), 0, 0, 0})
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
       if MapSet.member?(deleted, key) do
@@ -952,6 +963,13 @@ defmodule Ferricstore.Raft.StateMachine do
     end
 
     local_delete = fn key ->
+      if tx_binary_ref do
+        bytes = case :ets.lookup(ctx.keydir, key) do
+          [{^key, val, _, _, _, _, _}] -> binary_byte_size(key) + binary_byte_size(val)
+          _ -> 0
+        end
+        if bytes > 0, do: :atomics.sub(tx_binary_ref, ctx.index + 1, bytes)
+      end
       :ets.delete(ctx.keydir, key)
       deleted = Process.get(:tx_deleted_keys, MapSet.new())
       Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
@@ -2077,7 +2095,8 @@ defmodule Ferricstore.Raft.StateMachine do
         # Cold key with valid TTL -- try Bitcask
         warm_from_bitcask_with_exp(state, key, exp)
 
-      [{^key, _value, _exp, _lfu, _fid, _off, _vsize}] ->
+      [{^key, value, _exp, _lfu, _fid, _off, _vsize}] ->
+        track_keydir_binary_remove_known(state, key, value)
         :ets.delete(state.ets, key)
         :expired
 
@@ -2122,6 +2141,8 @@ defmodule Ferricstore.Raft.StateMachine do
     case NIF.v2_pread_at(path, off) do
       {:ok, value} when is_binary(value) ->
         v = value_for_ets(value, hot_cache_threshold(state))
+        # Cold -> warm: previous ETS value was nil, only new value bytes matter
+        track_keydir_binary_warm(state, v)
         :ets.insert(state.ets, {key, v, expire_at_ms, LFU.initial(), fid, off, byte_size(value)})
         {:hit, value, expire_at_ms}
 
@@ -2261,6 +2282,24 @@ defmodule Ferricstore.Raft.StateMachine do
         _ -> 0
       end
       if bytes > 0, do: :atomics.sub(ref, state.shard_index + 1, bytes)
+    end
+  end
+
+  # Tracks off-heap binary bytes when deleting a key whose value is already known.
+  defp track_keydir_binary_remove_known(state, key, value) do
+    ref = keydir_binary_ref(state)
+    if ref do
+      bytes = binary_byte_size(key) + binary_byte_size(value)
+      if bytes > 0, do: :atomics.sub(ref, state.shard_index + 1, bytes)
+    end
+  end
+
+  # Tracks off-heap binary bytes when warming a cold key (nil -> value).
+  defp track_keydir_binary_warm(state, new_ets_val) do
+    ref = keydir_binary_ref(state)
+    if ref do
+      new_bytes = binary_byte_size(new_ets_val)
+      if new_bytes > 0, do: :atomics.add(ref, state.shard_index + 1, new_bytes)
     end
   end
 

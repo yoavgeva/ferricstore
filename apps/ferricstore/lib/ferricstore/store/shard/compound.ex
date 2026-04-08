@@ -551,10 +551,13 @@ defmodule Ferricstore.Store.Shard.Compound do
 
         case NIF.v2_append_batch(new_file, batch) do
           {:ok, results} ->
+            ref = keydir_binary_ref(state)
+
             live_entries
             |> Enum.zip(results)
             |> Enum.each(fn {{key, value, expire_at_ms}, {offset, value_size}} ->
               value_for_ets = ShardETS.value_for_ets(value, ShardETS.hot_cache_threshold(state))
+              track_binary_insert(ref, state, key, value_for_ets)
               :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), new_fid, offset, value_size})
             end)
 
@@ -669,4 +672,30 @@ defmodule Ferricstore.Store.Shard.Compound do
         nil
     end
   end
+
+  # -- Off-heap binary byte tracking --
+
+  defp keydir_binary_ref(%{instance_ctx: %{keydir_binary_bytes: ref}}) when ref != nil, do: ref
+  defp keydir_binary_ref(_) do
+    try do
+      ctx = FerricStore.Instance.get(:default)
+      ctx && ctx.keydir_binary_bytes
+    rescue
+      _ -> nil
+    end
+  end
+
+  defp track_binary_insert(nil, _, _, _), do: :ok
+  defp track_binary_insert(ref, state, key, new_val) do
+    new_bytes = offheap_size(key) + offheap_size(new_val)
+    old_bytes = case :ets.lookup(state.keydir, key) do
+      [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
+      _ -> 0
+    end
+    delta = new_bytes - old_bytes
+    if delta != 0, do: :atomics.add(ref, state.index + 1, delta)
+  end
+
+  defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
+  defp offheap_size(_), do: 0
 end

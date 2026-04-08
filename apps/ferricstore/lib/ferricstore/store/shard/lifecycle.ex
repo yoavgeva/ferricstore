@@ -91,7 +91,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
   @spec recover_from_log(binary(), binary(), :ets.tid(), non_neg_integer()) :: :ok
   @doc false
-  def recover_from_log(shard_path, log_name, keydir, _shard_index) do
+  def recover_from_log(shard_path, log_name, keydir, shard_index) do
     log_path = Path.join(shard_path, log_name)
     fid = log_name |> String.trim_trailing(".log") |> String.to_integer()
 
@@ -99,7 +99,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     case NIF.v2_scan_file(log_path) do
       {:ok, records} ->
         Enum.each(records, fn record ->
-          recover_record(keydir, fid, record)
+          recover_record(keydir, shard_index, fid, record)
         end)
 
       _ ->
@@ -173,14 +173,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
   @spec migrate_prob_files(binary(), :ets.tid(), non_neg_integer()) :: :ok
   @doc false
-  def migrate_prob_files(shard_data_path, keydir, _index) do
+  def migrate_prob_files(shard_data_path, keydir, index) do
     prob_dir = Path.join(shard_data_path, "prob")
 
     case File.ls(prob_dir) do
       {:ok, files} ->
         migrated =
           Enum.reduce(files, 0, fn filename, count ->
-            migrate_prob_file(prob_dir, filename, keydir, count)
+            migrate_prob_file(prob_dir, filename, keydir, index, count)
           end)
 
         if migrated > 0 do
@@ -192,27 +192,27 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end
   end
 
-  @spec migrate_prob_file(binary(), binary(), :ets.tid(), non_neg_integer()) :: non_neg_integer()
+  @spec migrate_prob_file(binary(), binary(), :ets.tid(), non_neg_integer(), non_neg_integer()) :: non_neg_integer()
   @doc false
-  def migrate_prob_file(prob_dir, filename, keydir, count) do
+  def migrate_prob_file(prob_dir, filename, keydir, shard_index, count) do
     path = Path.join(prob_dir, filename)
 
     cond do
       String.ends_with?(filename, ".bloom") ->
         key = filename |> String.trim_trailing(".bloom")
-        migrate_if_missing(keydir, key, path, :bloom_meta, count)
+        migrate_if_missing(keydir, shard_index, key, path, :bloom_meta, count)
 
       String.ends_with?(filename, ".cms") ->
         key = filename |> String.trim_trailing(".cms")
-        migrate_if_missing(keydir, key, path, :cms_meta, count)
+        migrate_if_missing(keydir, shard_index, key, path, :cms_meta, count)
 
       String.ends_with?(filename, ".cuckoo") ->
         key = filename |> String.trim_trailing(".cuckoo")
-        migrate_if_missing(keydir, key, path, :cuckoo_meta, count)
+        migrate_if_missing(keydir, shard_index, key, path, :cuckoo_meta, count)
 
       String.ends_with?(filename, ".topk") ->
         key = filename |> String.trim_trailing(".topk")
-        migrate_if_missing(keydir, key, path, :topk_meta, count)
+        migrate_if_missing(keydir, shard_index, key, path, :topk_meta, count)
 
       true ->
         count
@@ -223,9 +223,9 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   # The key in the filename may be Base64-encoded (new) or sanitized (old).
   # We try to decode as Base64 first; if that fails, treat the filename
   # stem as the literal key.
-  @spec migrate_if_missing(:ets.tid(), binary(), binary(), atom(), non_neg_integer()) :: non_neg_integer()
+  @spec migrate_if_missing(:ets.tid(), non_neg_integer(), binary(), binary(), atom(), non_neg_integer()) :: non_neg_integer()
   @doc false
-  def migrate_if_missing(keydir, filename_key, path, type, count) do
+  def migrate_if_missing(keydir, shard_index, filename_key, path, type, count) do
     key =
       case Base.url_decode64(filename_key, padding: false) do
         {:ok, decoded} -> decoded
@@ -241,6 +241,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
         # No ETS entry — write a metadata marker
         meta = build_prob_meta(type, path, key)
         meta_bin = :erlang.term_to_binary(meta)
+        track_binary_add(shard_index, key, meta_bin)
         :ets.insert(keydir, {key, meta_bin, 0, 0, 0, 0, byte_size(meta_bin)})
         count + 1
     end
@@ -385,7 +386,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
   defp recover_from_hints_or_logs(shard_path, keydir, shard_index, log_files, hint_files) do
     Enum.each(hint_files, fn hint_name ->
-      recover_from_hint(shard_path, hint_name, keydir)
+      recover_from_hint(shard_path, hint_name, keydir, shard_index)
     end)
 
     unhinted_logs = unhinted_log_files(log_files, hint_files)
@@ -395,13 +396,15 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end)
   end
 
-  defp recover_from_hint(shard_path, hint_name, keydir) do
+  defp recover_from_hint(shard_path, hint_name, keydir, shard_index) do
     hint_path = Path.join(shard_path, hint_name)
     fid = hint_name |> String.trim_trailing(".hint") |> String.to_integer()
 
     case NIF.v2_read_hint_file(hint_path) do
       {:ok, entries} ->
         Enum.each(entries, fn {key, _file_id, offset, value_size, expire_at_ms} ->
+          # Cold insert (value=nil): only key bytes matter for off-heap tracking
+          track_binary_add(shard_index, key, nil)
           :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
         end)
 
@@ -422,11 +425,14 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
     end)
   end
 
-  defp recover_record(keydir, _fid, {key, _offset, _value_size, _expire_at_ms, true}) do
+  defp recover_record(keydir, shard_index, _fid, {key, _offset, _value_size, _expire_at_ms, true}) do
+    track_binary_remove(keydir, shard_index, key)
     :ets.delete(keydir, key)
   end
 
-  defp recover_record(keydir, fid, {key, offset, value_size, expire_at_ms, false}) do
+  defp recover_record(keydir, shard_index, fid, {key, offset, value_size, expire_at_ms, false}) do
+    # Cold insert (value=nil): only key bytes matter for off-heap tracking
+    track_binary_add(shard_index, key, nil)
     :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), fid, offset, value_size})
   end
 
@@ -479,4 +485,39 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
     {0, false}
   end
+
+  # -- Off-heap binary byte tracking --
+
+  defp keydir_binary_ref do
+    try do
+      ctx = FerricStore.Instance.get(:default)
+      ctx && ctx.keydir_binary_bytes
+    rescue
+      _ -> nil
+    end
+  end
+
+  # Tracks bytes added for a fresh insert (no existing entry expected, or replaces).
+  defp track_binary_add(shard_index, key, value) do
+    ref = keydir_binary_ref()
+    if ref do
+      bytes = offheap_size(key) + offheap_size(value)
+      if bytes > 0, do: :atomics.add(ref, shard_index + 1, bytes)
+    end
+  end
+
+  # Tracks bytes removed for a delete (lookup existing entry first).
+  defp track_binary_remove(keydir, shard_index, key) do
+    ref = keydir_binary_ref()
+    if ref do
+      bytes = case :ets.lookup(keydir, key) do
+        [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
+        _ -> 0
+      end
+      if bytes > 0, do: :atomics.sub(ref, shard_index + 1, bytes)
+    end
+  end
+
+  defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
+  defp offheap_size(_), do: 0
 end

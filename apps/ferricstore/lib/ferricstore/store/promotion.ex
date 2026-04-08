@@ -148,6 +148,7 @@ defmodule Ferricstore.Store.Promotion do
 
     mk = marker_key(redis_key)
     NIF.v2_append_record(active_path, mk, type_str, 0)
+    track_binary_insert(keydir, shard_index, mk, type_str)
     :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), 0, 0, 0})
 
     Logger.info(
@@ -226,6 +227,7 @@ defmodule Ferricstore.Store.Promotion do
 
       Enum.each(final_state, fn
         {key, :tombstone} ->
+          track_binary_delete(keydir, shard_index, key)
           :ets.delete(keydir, key)
 
         {key, {:live, fid, file_path, offset, _value_size, expire_at_ms}} ->
@@ -235,6 +237,7 @@ defmodule Ferricstore.Store.Promotion do
               _ -> nil
             end
 
+          track_binary_insert(keydir, shard_index, key, value)
           :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), fid, offset, 0})
       end)
 
@@ -293,6 +296,7 @@ defmodule Ferricstore.Store.Promotion do
         Logger.warning("Promotion cleanup: tombstone write failed for marker #{inspect(mk)}: #{inspect(reason)}")
     end
 
+    track_binary_delete(keydir, shard_index, mk)
     :ets.delete(keydir, mk)
 
     path = dedicated_path(data_dir, shard_index, type, redis_key)
@@ -373,4 +377,42 @@ defmodule Ferricstore.Store.Promotion do
         []
     end
   end
+
+  # -- Off-heap binary byte tracking --
+
+  defp keydir_binary_ref do
+    try do
+      ctx = FerricStore.Instance.get(:default)
+      ctx && ctx.keydir_binary_bytes
+    rescue
+      _ -> nil
+    end
+  end
+
+  defp track_binary_insert(keydir, shard_index, key, new_val) do
+    ref = keydir_binary_ref()
+    if ref do
+      new_bytes = offheap_size(key) + offheap_size(new_val)
+      old_bytes = case :ets.lookup(keydir, key) do
+        [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
+        _ -> 0
+      end
+      delta = new_bytes - old_bytes
+      if delta != 0, do: :atomics.add(ref, shard_index + 1, delta)
+    end
+  end
+
+  defp track_binary_delete(keydir, shard_index, key) do
+    ref = keydir_binary_ref()
+    if ref do
+      bytes = case :ets.lookup(keydir, key) do
+        [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
+        _ -> 0
+      end
+      if bytes > 0, do: :atomics.sub(ref, shard_index + 1, bytes)
+    end
+  end
+
+  defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
+  defp offheap_size(_), do: 0
 end

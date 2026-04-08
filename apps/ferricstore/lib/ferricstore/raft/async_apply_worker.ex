@@ -400,10 +400,13 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
     end
 
     # Apply deletes individually via v2 tombstone append
+    ref = keydir_binary_ref()
+
     Enum.each(others, fn
       {:delete, key} ->
         case NIF.v2_append_tombstone(active_file_path, key) do
           {:ok, _} ->
+            track_binary_delete(ref, shard_index, keydir, key)
             :ets.delete(keydir, key)
 
           {:error, reason} ->
@@ -433,10 +436,13 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
 
     case NIF.v2_append_batch(active_file_path, batch_entries) do
       {:ok, results} ->
+        ref = keydir_binary_ref()
+
         puts
         |> Enum.zip(results)
         |> Enum.each(fn {{:put, key, value, expire_at_ms}, {offset, value_size}} ->
           value_for_ets = value_for_ets(value)
+          track_binary_insert(ref, shard_index, keydir, key, value_for_ets)
 
           :ets.insert(
             keydir,
@@ -475,4 +481,38 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
       value
     end
   end
+
+  # -- Off-heap binary byte tracking --
+
+  defp keydir_binary_ref do
+    try do
+      ctx = FerricStore.Instance.get(:default)
+      ctx && ctx.keydir_binary_bytes
+    rescue
+      _ -> nil
+    end
+  end
+
+  defp track_binary_insert(nil, _, _, _, _), do: :ok
+  defp track_binary_insert(ref, shard_index, keydir, key, new_val) do
+    new_bytes = offheap_size(key) + offheap_size(new_val)
+    old_bytes = case :ets.lookup(keydir, key) do
+      [{^key, old_val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(old_val)
+      _ -> 0
+    end
+    delta = new_bytes - old_bytes
+    if delta != 0, do: :atomics.add(ref, shard_index + 1, delta)
+  end
+
+  defp track_binary_delete(nil, _, _, _), do: :ok
+  defp track_binary_delete(ref, shard_index, keydir, key) do
+    bytes = case :ets.lookup(keydir, key) do
+      [{^key, val, _, _, _, _, _}] -> offheap_size(key) + offheap_size(val)
+      _ -> 0
+    end
+    if bytes > 0, do: :atomics.sub(ref, shard_index + 1, bytes)
+  end
+
+  defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
+  defp offheap_size(_), do: 0
 end

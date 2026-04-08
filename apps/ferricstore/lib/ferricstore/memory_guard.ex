@@ -513,11 +513,22 @@ defmodule Ferricstore.MemoryGuard do
           end
 
         # Evict until we've freed enough bytes or run out of candidates.
+        binary_ref = keydir_binary_bytes_ref()
+
         {evict_count, bytes_freed} =
           Enum.reduce_while(sorted, {0, 0}, fn {key, _exp, _lfu, vsize}, {cnt, freed} ->
             if freed >= deficit do
               {:halt, {cnt, freed}}
             else
+              # Track off-heap binary bytes removed by eviction (value -> nil)
+              if binary_ref do
+                case :ets.lookup(keydir, key) do
+                  [{^key, val, _, _, _, _, _}] when val != nil ->
+                    val_bytes = evict_offheap_size(val)
+                    if val_bytes > 0, do: :atomics.sub(binary_ref, shard_index + 1, val_bytes)
+                  _ -> :ok
+                end
+              end
               :ets.update_element(keydir, key, {2, nil})
               {:cont, {cnt + 1, freed + vsize}}
             end
@@ -626,6 +637,9 @@ defmodule Ferricstore.MemoryGuard do
   rescue
     _ -> nil
   end
+
+  defp evict_offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
+  defp evict_offheap_size(_), do: 0
 
   defp safe_atomics_get(nil, _slot), do: 0
   defp safe_atomics_get(ref, slot) do

@@ -166,6 +166,10 @@ defmodule Ferricstore.Store.Shard do
 
         _ref ->
           :ets.delete_all_objects(keydir_name)
+          # Reset off-heap binary byte counter for this shard
+          if ctx != nil and ctx.keydir_binary_bytes != nil do
+            :atomics.put(ctx.keydir_binary_bytes, index + 1, 0)
+          end
           keydir_name
       end
 
