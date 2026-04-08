@@ -281,13 +281,16 @@ defmodule Ferricstore.Cluster.Manager do
     target_has_data = target_has_data?(target_node, state.shard_count)
 
     if target_has_data do
-      # Disk clone path: target already has Bitcask data + running shards.
-      # Just add to Raft groups — ra will reconcile.
+      # Disk clone / rejoin path: target already has Bitcask data.
+      # Skip data sync — just add to Raft groups and start ra servers.
       Logger.info("ClusterManager: #{target_node} has pre-existing data, skipping data sync")
+      stop_raft_on_target(target_node, state.shard_count)
       {raft_result, _} = do_add_node(target_node, membership, state)
 
       case raft_result do
         :ok ->
+          sync_indices = read_target_indices(target_node, state.shard_count)
+          start_raft_on_target(target_node, state.shard_count, sync_indices)
           Logger.info("ClusterManager: #{target_node} added to Raft groups (disk clone)")
           :ok
 
