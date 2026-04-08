@@ -275,8 +275,10 @@ defmodule Ferricstore.Commands.Bloom do
   defp normalize_add_result(:ok), do: :ok
   defp normalize_add_result(other), do: other
 
-  # Routes a prob write command through Raft (production) or directly via
-  # NIF (test mode when store lacks prob_write).
+  defp do_prob_write(%FerricStore.Instance{} = ctx, command) do
+    Ferricstore.Store.Router.prob_write(ctx, command)
+  end
+
   defp do_prob_write(store, command) do
     case Map.get(store, :prob_write) do
       nil -> apply_prob_locally(store, command)

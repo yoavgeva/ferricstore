@@ -627,7 +627,7 @@ defmodule FerricstoreServer.Connection do
 
   defp dispatch_normal(cmd, args, state) do
     # Hot path: pass ctx directly (no closure allocation).
-    # Ops dispatches Instance structs to Router.
+    # Ops and Router handle Instance structs natively.
     # Namespace path: closure map for key prefixing.
     store =
       if state.sandbox_namespace do

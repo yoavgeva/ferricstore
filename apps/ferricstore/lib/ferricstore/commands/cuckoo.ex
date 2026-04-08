@@ -230,6 +230,10 @@ defmodule Ferricstore.Commands.Cuckoo do
     Path.join(shard_path, "prob")
   end
 
+  defp do_prob_write(%FerricStore.Instance{} = ctx, command) do
+    Ferricstore.Store.Router.prob_write(ctx, command)
+  end
+
   defp do_prob_write(store, command) do
     case Map.get(store, :prob_write) do
       nil -> apply_prob_locally(store, command)
