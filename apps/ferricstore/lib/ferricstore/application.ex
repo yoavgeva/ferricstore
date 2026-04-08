@@ -45,6 +45,7 @@ defmodule Ferricstore.Application do
   @default_large_value_warning_bytes 512 * 1024
 
   @impl true
+  @spec start(Application.start_type(), term()) :: {:ok, pid()} | {:error, term()}
   def start(_type, _args) do
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     shard_count =

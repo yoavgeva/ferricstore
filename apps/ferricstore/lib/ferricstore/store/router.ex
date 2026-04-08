@@ -29,10 +29,13 @@ defmodule Ferricstore.Store.Router do
   # Shard resolution helpers
   # ---------------------------------------------------------------------------
 
+  @spec resolve_shard(FerricStore.Instance.t(), non_neg_integer()) :: atom()
   @doc false
   def resolve_shard(ctx, idx), do: elem(ctx.shard_names, idx)
+  @spec resolve_keydir(FerricStore.Instance.t(), non_neg_integer()) :: atom() | reference()
   @doc false
   def resolve_keydir(ctx, idx), do: elem(ctx.keydir_refs, idx)
+  @spec effective_shard_count(FerricStore.Instance.t()) :: non_neg_integer()
   @doc false
   def effective_shard_count(ctx), do: ctx.shard_count
 
@@ -853,6 +856,7 @@ defmodule Ferricstore.Store.Router do
   @max_key_size 65_535
   @max_value_size 512 * 1024 * 1024
 
+  @spec max_value_size() :: pos_integer()
   @doc "Returns the maximum allowed value size in bytes."
   def max_value_size, do: @max_value_size
 
@@ -1167,36 +1171,43 @@ defmodule Ferricstore.Store.Router do
   # Compound key operations
   # -------------------------------------------------------------------
 
+  @spec compound_get(FerricStore.Instance.t(), binary(), binary()) :: binary() | nil
   def compound_get(ctx, redis_key, compound_key) do
     shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
     GenServer.call(shard, {:compound_get, redis_key, compound_key})
   end
 
+  @spec compound_get_meta(FerricStore.Instance.t(), binary(), binary()) :: {binary(), non_neg_integer()} | nil
   def compound_get_meta(ctx, redis_key, compound_key) do
     shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
     GenServer.call(shard, {:compound_get_meta, redis_key, compound_key})
   end
 
+  @spec compound_put(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
   def compound_put(ctx, redis_key, compound_key, value, expire_at_ms) do
     shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
     GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
   end
 
+  @spec compound_delete(FerricStore.Instance.t(), binary(), binary()) :: :ok | {:error, term()}
   def compound_delete(ctx, redis_key, compound_key) do
     shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
     GenServer.call(shard, {:compound_delete, redis_key, compound_key})
   end
 
+  @spec compound_scan(FerricStore.Instance.t(), binary(), binary()) :: [{binary(), binary()}]
   def compound_scan(ctx, redis_key, prefix) do
     shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
     GenServer.call(shard, {:compound_scan, redis_key, prefix})
   end
 
+  @spec compound_count(FerricStore.Instance.t(), binary(), binary()) :: non_neg_integer()
   def compound_count(ctx, redis_key, prefix) do
     shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
     GenServer.call(shard, {:compound_count, redis_key, prefix})
   end
 
+  @spec compound_delete_prefix(FerricStore.Instance.t(), binary(), binary()) :: :ok
   def compound_delete_prefix(ctx, redis_key, prefix) do
     shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
     GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
