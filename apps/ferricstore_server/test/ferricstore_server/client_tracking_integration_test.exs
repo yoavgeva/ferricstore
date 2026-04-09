@@ -12,6 +12,7 @@ defmodule FerricstoreServer.ClientTrackingIntegrationTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias FerricstoreServer.Listener

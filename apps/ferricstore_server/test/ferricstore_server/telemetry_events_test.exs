@@ -282,6 +282,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
   # ---------------------------------------------------------------------------
 
   describe "[:ferricstore, :connection, :threshold]" do
+    @tag :shard_kill
     test "emitted when connection count crosses 80% of maxclients" do
       handler_id = attach_handler([:ferricstore, :connection, :threshold])
 

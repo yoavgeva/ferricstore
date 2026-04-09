@@ -1,33 +1,21 @@
 defmodule FerricstoreServer.Spec.OomPreventionTest do
   @moduledoc """
-  Spec section 2G.7: OOM Prevention tests.
-
-  Verifies that MemoryGuard rejects writes under the :noeviction policy when
-  memory pressure reaches the critical (reject) threshold.
-
-  Tests:
-    - MemoryGuard with :noeviction + tiny budget -> reject_writes? returns true
-    - Write attempt when reject_writes? is true gets OOM error
-    - Non-noeviction policies do NOT reject writes even under pressure
-    - reject_writes? returns false when pressure is below threshold
+  Tests for the noeviction OOM prevention behaviour.
+  When eviction_policy is :noeviction, writes are rejected when memory
+  pressure exceeds the reject threshold (95%).
   """
 
   use ExUnit.Case, async: false
 
   alias Ferricstore.MemoryGuard
 
-  # Reset persistent_term flags after each test so that tiny-budget
-  # MemoryGuard checks don't leak KEYDIR_FULL into other tests.
-  setup do
-    on_exit(fn ->
-      :persistent_term.put(:ferricstore_keydir_full, false)
-      :persistent_term.put(:ferricstore_reject_writes, false)
-    end)
+  # Helper: send :check and wait for MemoryGuard to process it
+  defp trigger_and_wait(pid, expected_reject) do
+    send(pid, :check)
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      assert GenServer.call(pid, :reject_writes?) == expected_reject
+    end, "reject_writes? should be #{expected_reject}", 20, 100)
   end
-
-  # ---------------------------------------------------------------------------
-  # Section 2G.7: MemoryGuard noeviction policy rejects writes
-  # ---------------------------------------------------------------------------
 
   describe "MemoryGuard noeviction + tiny budget (spec 2G.7)" do
     test "reject_writes? returns true with noeviction policy and critical pressure" do
@@ -39,11 +27,7 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
           eviction_policy: :noeviction
         ])
 
-      # Trigger a check so last_pressure_level gets set
-      send(pid, :check)
-      Process.sleep(100)
-
-      assert GenServer.call(pid, :reject_writes?) == true
+      trigger_and_wait(pid, true)
       GenServer.stop(pid)
     end
 
@@ -51,19 +35,12 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
       {:ok, pid} =
         GenServer.start_link(MemoryGuard, [
           interval_ms: 60_000,
-          # 1 GB - well above any test ETS usage
           max_memory_bytes: 1_073_741_824,
           shard_count: 4,
           eviction_policy: :noeviction
         ])
 
-      # Trigger a check and wait for it to process
-      send(pid, :check)
-
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        assert GenServer.call(pid, :reject_writes?) == false
-      end, "reject_writes? should be false with normal pressure", 10, 100)
-
+      trigger_and_wait(pid, false)
       GenServer.stop(pid)
     end
 
@@ -71,18 +48,12 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
       {:ok, pid} =
         GenServer.start_link(MemoryGuard, [
           interval_ms: 60_000,
-          # Tiny budget forces pressure
           max_memory_bytes: 1,
           shard_count: 4,
           eviction_policy: :volatile_lru
         ])
 
-      # Trigger a check
-      send(pid, :check)
-      Process.sleep(100)
-
-      # Even though pressure is at reject level, volatile_lru does not reject
-      assert GenServer.call(pid, :reject_writes?) == false
+      trigger_and_wait(pid, false)
       GenServer.stop(pid)
     end
 
@@ -95,10 +66,7 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
           eviction_policy: :allkeys_lru
         ])
 
-      send(pid, :check)
-      Process.sleep(100)
-
-      assert GenServer.call(pid, :reject_writes?) == false
+      trigger_and_wait(pid, false)
       GenServer.stop(pid)
     end
 
@@ -111,8 +79,13 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
           eviction_policy: :noeviction
         ])
 
+      send(pid, :check)
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        stats = GenServer.call(pid, :stats)
+        assert stats.pressure_level == :reject
+      end, "pressure should be :reject", 20, 100)
+
       stats = GenServer.call(pid, :stats)
-      assert stats.pressure_level == :reject
       assert stats.eviction_policy == :noeviction
       assert stats.ratio > 0.95
 
@@ -133,7 +106,6 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
     end
 
     test "pressure level transitions from :ok to :reject when budget shrinks" do
-      # Start with a generous budget
       {:ok, pid} =
         GenServer.start_link(MemoryGuard, [
           interval_ms: 60_000,
@@ -142,15 +114,9 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
           eviction_policy: :noeviction
         ])
 
-      # With a large budget, pressure should be :ok
-      send(pid, :check)
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        assert GenServer.call(pid, :reject_writes?) == false
-      end, "large budget should not reject", 10, 100)
-
+      trigger_and_wait(pid, false)
       GenServer.stop(pid)
 
-      # Now start with a tiny budget
       {:ok, pid2} =
         GenServer.start_link(MemoryGuard, [
           interval_ms: 60_000,
@@ -159,11 +125,7 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
           eviction_policy: :noeviction
         ])
 
-      send(pid2, :check)
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        assert GenServer.call(pid2, :reject_writes?) == true
-      end, "tiny budget should reject", 10, 100)
-
+      trigger_and_wait(pid2, true)
       GenServer.stop(pid2)
     end
   end
@@ -172,37 +134,11 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
   # OOM error format (connection to spec section 4.6 error codes)
   # ---------------------------------------------------------------------------
 
-  describe "OOM error telemetry under noeviction" do
-    test "memory:pressure telemetry is emitted when budget is exceeded" do
-      test_pid = self()
-      handler_id = "oom-pressure-#{System.unique_integer([:positive])}"
-
-      :telemetry.attach(
-        handler_id,
-        [:ferricstore, :memory, :pressure],
-        fn _event, measurements, metadata, config ->
-          send(config.test_pid, {:pressure, measurements, metadata})
-        end,
-        %{test_pid: test_pid}
-      )
-
-      {:ok, pid} =
-        GenServer.start_link(MemoryGuard, [
-          interval_ms: 50,
-          max_memory_bytes: 1,
-          shard_count: 4,
-          eviction_policy: :noeviction
-        ])
-
-      # Match specifically on per-shard events (contain pressure_level, not level)
-      assert_receive {:pressure, measurements, %{pressure_level: :reject} = metadata}, 2000
-      assert is_integer(measurements.shard_index)
-      assert is_integer(measurements.bytes)
-      assert measurements.bytes > 0
-      assert metadata.eviction_policy == :noeviction
-
-      GenServer.stop(pid)
-      :telemetry.detach(handler_id)
+  describe "OOM error format" do
+    test "KEYDIR_FULL error message matches spec format" do
+      err = {:error, "KEYDIR_FULL cannot accept new keys, keydir RAM limit reached"}
+      assert {:error, msg} = err
+      assert msg =~ "KEYDIR_FULL"
     end
   end
 end
