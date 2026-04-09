@@ -559,12 +559,10 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       Ferricstore.Store.BitcaskWriter.flush_all()
 
       # Verify the key is readable AND has a real file_id (not :pending)
-      # before evicting from hot cache. Under full-suite load, the Raft apply
-      # and BitcaskWriter may be slow. Flush aggressively and retry.
-      Ferricstore.Store.BitcaskWriter.flush_all()
-      Process.sleep(100)
-
+      # before evicting from hot cache. Eventually handles all timing —
+      # Raft apply, BitcaskWriter flush, ETS update.
       Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Ferricstore.Store.BitcaskWriter.flush_all()
         assert Router.get(ctx, key) == "cold_value"
         [{^key, _, _, _, fid, _, _}] = :ets.lookup(:"keydir_#{shard_idx}", key)
         assert is_integer(fid) and fid > 0, "file_id should be real, got #{inspect(fid)}"
