@@ -34,29 +34,41 @@ defmodule Ferricstore.Commands.Expiry do
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
 
-  def handle("EXPIRE", [key, secs_str], store), do: set_expiry_seconds(key, secs_str, store)
-
-  def handle("EXPIRE", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'expire' command"}
+  def handle("EXPIRE", [key, secs_str], store), do: set_expiry_seconds(key, secs_str, :none, store)
+  def handle("EXPIRE", [key, secs_str, flag], store) do
+    case parse_flag(flag) do
+      {:ok, f} -> set_expiry_seconds(key, secs_str, f, store)
+      :error -> {:error, "ERR Unsupported option #{flag}"}
+    end
   end
+  def handle("EXPIRE", _args, _store), do: {:error, "ERR wrong number of arguments for 'expire' command"}
 
-  def handle("PEXPIRE", [key, ms_str], store), do: set_expiry_ms(key, ms_str, store)
-
-  def handle("PEXPIRE", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'pexpire' command"}
+  def handle("PEXPIRE", [key, ms_str], store), do: set_expiry_ms(key, ms_str, :none, store)
+  def handle("PEXPIRE", [key, ms_str, flag], store) do
+    case parse_flag(flag) do
+      {:ok, f} -> set_expiry_ms(key, ms_str, f, store)
+      :error -> {:error, "ERR Unsupported option #{flag}"}
+    end
   end
+  def handle("PEXPIRE", _args, _store), do: {:error, "ERR wrong number of arguments for 'pexpire' command"}
 
-  def handle("EXPIREAT", [key, ts_str], store), do: set_expiry_at_seconds(key, ts_str, store)
-
-  def handle("EXPIREAT", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'expireat' command"}
+  def handle("EXPIREAT", [key, ts_str], store), do: set_expiry_at_seconds(key, ts_str, :none, store)
+  def handle("EXPIREAT", [key, ts_str, flag], store) do
+    case parse_flag(flag) do
+      {:ok, f} -> set_expiry_at_seconds(key, ts_str, f, store)
+      :error -> {:error, "ERR Unsupported option #{flag}"}
+    end
   end
+  def handle("EXPIREAT", _args, _store), do: {:error, "ERR wrong number of arguments for 'expireat' command"}
 
-  def handle("PEXPIREAT", [key, ts_str], store), do: set_expiry_at_ms(key, ts_str, store)
-
-  def handle("PEXPIREAT", _args, _store) do
-    {:error, "ERR wrong number of arguments for 'pexpireat' command"}
+  def handle("PEXPIREAT", [key, ts_str], store), do: set_expiry_at_ms(key, ts_str, :none, store)
+  def handle("PEXPIREAT", [key, ts_str, flag], store) do
+    case parse_flag(flag) do
+      {:ok, f} -> set_expiry_at_ms(key, ts_str, f, store)
+      :error -> {:error, "ERR Unsupported option #{flag}"}
+    end
   end
+  def handle("PEXPIREAT", _args, _store), do: {:error, "ERR wrong number of arguments for 'pexpireat' command"}
 
   def handle("TTL", [key], store), do: get_ttl_seconds(key, store)
 
@@ -80,28 +92,26 @@ defmodule Ferricstore.Commands.Expiry do
   # Private — EXPIRE / PEXPIRE (relative)
   # ---------------------------------------------------------------------------
 
-  defp set_expiry_seconds(key, secs_str, store) do
+  defp set_expiry_seconds(key, secs_str, flag, store) do
     case Integer.parse(secs_str) do
       {secs, ""} when secs <= 0 ->
-        # Redis 7+: negative or zero EXPIRE deletes the key
         delete_if_exists(key, store)
 
       {secs, ""} ->
-        apply_expiry(key, Ferricstore.HLC.now_ms() + secs * 1_000, store)
+        apply_expiry(key, Ferricstore.HLC.now_ms() + secs * 1_000, flag, store)
 
       _ ->
         {:error, "ERR value is not an integer or out of range"}
     end
   end
 
-  defp set_expiry_ms(key, ms_str, store) do
+  defp set_expiry_ms(key, ms_str, flag, store) do
     case Integer.parse(ms_str) do
       {ms, ""} when ms <= 0 ->
-        # Redis 7+: negative or zero PEXPIRE deletes the key
         delete_if_exists(key, store)
 
       {ms, ""} ->
-        apply_expiry(key, Ferricstore.HLC.now_ms() + ms, store)
+        apply_expiry(key, Ferricstore.HLC.now_ms() + ms, flag, store)
 
       _ ->
         {:error, "ERR value is not an integer or out of range"}
@@ -112,27 +122,27 @@ defmodule Ferricstore.Commands.Expiry do
   # Private — EXPIREAT / PEXPIREAT (absolute)
   # ---------------------------------------------------------------------------
 
-  defp set_expiry_at_seconds(key, ts_str, store) do
+  defp set_expiry_at_seconds(key, ts_str, flag, store) do
     case Integer.parse(ts_str) do
       {ts, ""} ->
         expire_at_ms = ts * 1_000
         if expire_at_ms <= Ferricstore.HLC.now_ms() do
           delete_if_exists(key, store)
         else
-          apply_expiry(key, expire_at_ms, store)
+          apply_expiry(key, expire_at_ms, flag, store)
         end
 
       _ -> {:error, "ERR value is not an integer or out of range"}
     end
   end
 
-  defp set_expiry_at_ms(key, ts_str, store) do
+  defp set_expiry_at_ms(key, ts_str, flag, store) do
     case Integer.parse(ts_str) do
       {ts, ""} ->
         if ts <= Ferricstore.HLC.now_ms() do
           delete_if_exists(key, store)
         else
-          apply_expiry(key, ts, store)
+          apply_expiry(key, ts, flag, store)
         end
 
       _ -> {:error, "ERR value is not an integer or out of range"}
@@ -152,14 +162,40 @@ defmodule Ferricstore.Commands.Expiry do
     end
   end
 
-  defp apply_expiry(key, expire_at_ms, store) do
+  defp apply_expiry(key, expire_at_ms, flag, store) do
     case Ops.get_meta(store, key) do
       nil ->
         0
 
-      {value, _old_exp} ->
-        Ops.put(store, key, value, expire_at_ms)
-        1
+      {value, old_exp} ->
+        if flag_allows?(flag, old_exp, expire_at_ms) do
+          Ops.put(store, key, value, expire_at_ms)
+          1
+        else
+          0
+        end
+    end
+  end
+
+  # Flag checks: NX (only if no expiry), XX (only if has expiry),
+  # GT (only if new > current), LT (only if new < current).
+  defp flag_allows?(:none, _old, _new), do: true
+  defp flag_allows?(:nx, 0, _new), do: true
+  defp flag_allows?(:nx, _old, _new), do: false
+  defp flag_allows?(:xx, 0, _new), do: false
+  defp flag_allows?(:xx, _old, _new), do: true
+  defp flag_allows?(:gt, 0, _new), do: true
+  defp flag_allows?(:gt, old, new), do: new > old
+  defp flag_allows?(:lt, 0, _new), do: true
+  defp flag_allows?(:lt, old, new), do: new < old
+
+  defp parse_flag(str) do
+    case String.upcase(str) do
+      "NX" -> {:ok, :nx}
+      "XX" -> {:ok, :xx}
+      "GT" -> {:ok, :gt}
+      "LT" -> {:ok, :lt}
+      _ -> :error
     end
   end
 
