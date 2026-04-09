@@ -13,33 +13,18 @@ env:
 
 jobs:
   # ===========================================================================
-  # Build: compile + NIF + cache — shared by all test jobs
+  # Build (Ubuntu)
   # ===========================================================================
-  build:
-    name: "Build (${{ matrix.os }})"
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            elixir: "1.19"
-            otp: "28"
-          - os: macos-latest
-            elixir: "1.19"
-            otp: "28"
-
+  build-ubuntu:
+    name: "Build (ubuntu)"
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Elixir
-        uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@v1
         with:
-          elixir-version: ${{ matrix.elixir }}
-          otp-version: ${{ matrix.otp }}
-
-      - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+          elixir-version: "1.19"
+          otp-version: "28"
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
@@ -47,8 +32,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: deps
-          key: mix-deps-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
-          restore-keys: mix-deps-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-
+          key: mix-deps-Linux-1.19-28-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-deps-Linux-1.19-28-
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -57,8 +42,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             apps/ferricstore/native/ferricstore_bitcask/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          key: cargo-Linux-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock') }}
+          restore-keys: cargo-Linux-
 
       - name: Install dependencies
         run: mix deps.get
@@ -76,13 +61,8 @@ jobs:
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
           mkdir -p apps/ferricstore/priv/native
-          if [ -f apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib ]; then
-            SRC=apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib
-          else
-            SRC=apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so
-          fi
-          cp "$SRC" apps/ferricstore/priv/native/libferricstore_bitcask.so
-          cp "$SRC" apps/ferricstore/priv/native/ferricstore_bitcask.so
+          cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/libferricstore_bitcask.so
+          cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/ferricstore_bitcask.so
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
@@ -90,7 +70,6 @@ jobs:
       - name: Credo
         run: mix credo --min-priority high
 
-      # Cache the entire _build and priv/native for downstream jobs
       - name: Cache build artifacts
         uses: actions/cache/save@v4
         with:
@@ -98,134 +77,198 @@ jobs:
             _build
             deps
             apps/ferricstore/priv/native
-          key: build-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ github.sha }}
+          key: build-Linux-${{ github.sha }}
 
   # ===========================================================================
-  # Core tests: ferricstore app
+  # Build (macOS)
   # ===========================================================================
-  test-core:
-    name: "Core tests (${{ matrix.os }})"
-    needs: build
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            elixir: "1.19"
-            otp: "28"
-          - os: macos-latest
-            elixir: "1.19"
-            otp: "28"
-
+  build-macos:
+    name: "Build (macos)"
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: ${{ matrix.elixir }}
-          otp-version: ${{ matrix.otp }}
+          elixir-version: "1.19"
+          otp-version: "28"
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
-      - name: Restore build artifacts
-        uses: actions/cache/restore@v4
+      - name: Cache Mix deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: mix-deps-macOS-1.19-28-${{ hashFiles('mix.lock') }}
+          restore-keys: mix-deps-macOS-1.19-28-
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/ferricstore/native/ferricstore_bitcask/target
+          key: cargo-macOS-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock') }}
+          restore-keys: cargo-macOS-
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Build NIF (release)
+        run: |
+          cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+          mkdir -p apps/ferricstore/priv/native
+          cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib apps/ferricstore/priv/native/libferricstore_bitcask.so
+          cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib apps/ferricstore/priv/native/ferricstore_bitcask.so
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Cache build artifacts
+        uses: actions/cache/save@v4
         with:
           path: |
             _build
             deps
             apps/ferricstore/priv/native
-          key: build-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ github.sha }}
+          key: build-macOS-${{ github.sha }}
 
+  # ===========================================================================
+  # Core tests (parallel per OS, independent)
+  # ===========================================================================
+  test-core-ubuntu:
+    name: "Core tests (ubuntu)"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            _build
+            deps
+            apps/ferricstore/priv/native
+          key: build-Linux-${{ github.sha }}
       - name: Run ferricstore tests
         run: mix test apps/ferricstore/test --timeout 30000
-
-      - name: Upload test results
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: test-results-core-${{ matrix.os }}
+          name: test-results-core-ubuntu
           path: test-results/
           retention-days: 14
 
-  # ===========================================================================
-  # Server tests: ferricstore_server app
-  # ===========================================================================
-  test-server:
-    name: "Server tests (${{ matrix.os }})"
-    needs: build
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            elixir: "1.19"
-            otp: "28"
-          - os: macos-latest
-            elixir: "1.19"
-            otp: "28"
-
+  test-core-macos:
+    name: "Core tests (macos)"
+    needs: build-macos
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: ${{ matrix.elixir }}
-          otp-version: ${{ matrix.otp }}
+          elixir-version: "1.19"
+          otp-version: "28"
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Restore build artifacts
-        uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v4
         with:
           path: |
             _build
             deps
             apps/ferricstore/priv/native
-          key: build-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ github.sha }}
+          key: build-macOS-${{ github.sha }}
+      - name: Run ferricstore tests
+        run: mix test apps/ferricstore/test --timeout 30000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-core-macos
+          path: test-results/
+          retention-days: 14
 
+  # ===========================================================================
+  # Server tests (parallel per OS, independent)
+  # ===========================================================================
+  test-server-ubuntu:
+    name: "Server tests (ubuntu)"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            _build
+            deps
+            apps/ferricstore/priv/native
+          key: build-Linux-${{ github.sha }}
       - name: Run ferricstore_server tests
         run: mix test apps/ferricstore_server/test --timeout 30000
-
-      - name: Upload test results
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: test-results-server-${{ matrix.os }}
+          name: test-results-server-ubuntu
           path: test-results/
           retention-days: 14
 
-  # ===========================================================================
-  # Durability tests: shard-kill, jepsen, large alloc (isolated)
-  # ===========================================================================
-  test-durability:
-    name: "Durability tests (${{ matrix.os }})"
-    needs: build
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            elixir: "1.19"
-            otp: "28"
-          - os: macos-latest
-            elixir: "1.19"
-            otp: "28"
-
+  test-server-macos:
+    name: "Server tests (macos)"
+    needs: build-macos
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: ${{ matrix.elixir }}
-          otp-version: ${{ matrix.otp }}
+          elixir-version: "1.19"
+          otp-version: "28"
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Restore build artifacts
-        uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v4
         with:
           path: |
             _build
             deps
             apps/ferricstore/priv/native
-          key: build-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ github.sha }}
+          key: build-macOS-${{ github.sha }}
+      - name: Run ferricstore_server tests
+        run: mix test apps/ferricstore_server/test --timeout 30000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-server-macos
+          path: test-results/
+          retention-days: 14
+
+  # ===========================================================================
+  # Durability tests (ubuntu only — shard-kill, jepsen, large alloc)
+  # ===========================================================================
+  test-durability:
+    name: "Durability tests"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            _build
+            deps
+            apps/ferricstore/priv/native
+          key: build-Linux-${{ github.sha }}
 
       - name: Shard-kill durability tests
         run: mix test --only shard_kill --timeout 120000
@@ -241,48 +284,34 @@ jobs:
         run: mix test apps/ferricstore/test --only large_alloc --timeout 120000
         continue-on-error: true
 
-      - name: Upload test results
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: test-results-durability-${{ matrix.os }}
+          name: test-results-durability
           path: test-results/
           retention-days: 14
 
   # ===========================================================================
-  # Cluster tests: multi-node via :peer
+  # Cluster tests (ubuntu only — multi-node via :peer)
   # ===========================================================================
   test-cluster:
-    name: "Cluster tests (${{ matrix.os }})"
-    needs: build
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            elixir: "1.19"
-            otp: "28"
-          - os: macos-latest
-            elixir: "1.19"
-            otp: "28"
-
+    name: "Cluster tests"
+    needs: build-ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          elixir-version: ${{ matrix.elixir }}
-          otp-version: ${{ matrix.otp }}
+          elixir-version: "1.19"
+          otp-version: "28"
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Restore build artifacts
-        uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v4
         with:
           path: |
             _build
             deps
             apps/ferricstore/priv/native
-          key: build-${{ runner.os }}-${{ matrix.elixir }}-${{ matrix.otp }}-${{ github.sha }}
+          key: build-Linux-${{ github.sha }}
 
       - name: Cluster tests
         run: |
@@ -290,10 +319,9 @@ jobs:
           elixir --sname ci_cluster --cookie ferricstore_test -S mix test --include cluster --timeout 60000
         continue-on-error: true
 
-      - name: Upload test results
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: test-results-cluster-${{ matrix.os }}
+          name: test-results-cluster
           path: test-results/
           retention-days: 14
