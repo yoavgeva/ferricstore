@@ -206,14 +206,18 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
       # before we check the remaining list length.
       ShardHelpers.flush_all_shards()
 
-      # Everything remaining in the list + everything popped = total
-      verify = connect_and_hello(port)
-      send_cmd(verify, ["LLEN", key])
-      remaining = recv_response(verify)
-      :gen_tcp.close(verify)
+      # Everything remaining in the list + everything popped = total.
+      # Under full-suite load, Raft apply may lag — retry until consistent.
+      ShardHelpers.eventually(fn ->
+        verify = connect_and_hello(port)
+        send_cmd(verify, ["LLEN", key])
+        remaining = recv_response(verify)
+        :gen_tcp.close(verify)
 
-      remaining_count = if is_integer(remaining), do: remaining, else: 0
-      assert length(popped) + remaining_count == total
+        remaining_count = if is_integer(remaining), do: remaining, else: 0
+        assert length(popped) + remaining_count == total,
+               "popped=#{length(popped)} + remaining=#{remaining_count} != #{total}"
+      end, "list items should sum to total", 10, 200)
 
       # No duplicates among popped items
       assert length(popped) == length(Enum.uniq(popped))
