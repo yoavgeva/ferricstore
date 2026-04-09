@@ -16,8 +16,11 @@ defmodule Ferricstore.Store.ListOps do
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
 
-  @initial_position 0.0
-  @position_step 1.0
+  # Integer positions with large gaps. LPUSH/RPUSH decrement/increment by @position_step.
+  # LINSERT picks the integer midpoint. When no room (adjacent positions differ by 1),
+  # rebalance redistributes all positions with even spacing.
+  @initial_position 0
+  @position_step 1_000_000_000
 
   @spec execute(binary(), map(), term()) :: term()
   def execute(key, store, operation) do
@@ -134,6 +137,39 @@ defmodule Ferricstore.Store.ListOps do
 
   defp ordered_values(key, store) do
     sorted_elements(key, store) |> Enum.map(fn {_pos, value} -> value end)
+  end
+
+  # Converts a position (float from old data or integer from new) to integer.
+  defp pos_to_int(pos) when is_integer(pos), do: pos
+  defp pos_to_int(pos) when is_float(pos), do: round(pos * 1_000_000_000)
+
+  # Rebalances all positions with even spacing. Called when LINSERT runs out
+  # of room between two adjacent positions. Deletes old compound keys and
+  # re-inserts with evenly spaced integer positions.
+  defp rebalance_positions(key, store, sorted) do
+    count = length(sorted)
+    values = Enum.map(sorted, fn {_pos, val} -> val end)
+
+    # Delete all old entries
+    Enum.each(sorted, fn {pos, _val} ->
+      Ops.compound_delete(store, key, CompoundKey.list_element(key, pos))
+    end)
+
+    # Re-insert with evenly spaced positions
+    new_sorted =
+      Enum.with_index(values)
+      |> Enum.map(fn {val, idx} ->
+        new_pos = idx * @position_step
+        Ops.compound_put(store, key, CompoundKey.list_element(key, new_pos), val, 0)
+        {new_pos, val}
+      end)
+
+    # Update metadata
+    {min_pos, _} = hd(new_sorted)
+    {max_pos, _} = List.last(new_sorted)
+    write_meta(key, store, {count, min_pos - @position_step, max_pos + @position_step})
+
+    new_sorted
   end
 
   defp update_meta_from_remaining(key, store, new_len, remaining) do
@@ -313,8 +349,38 @@ defmodule Ferricstore.Store.ListOps do
       nil -> -1
       idx ->
         new_pos = case direction do
-          :before -> if idx == 0, do: (elem(hd(sorted), 0) - @position_step), else: ((elem(Enum.at(sorted, idx - 1), 0) + elem(Enum.at(sorted, idx), 0)) / 2.0)
-          :after -> if idx == length(sorted) - 1, do: (elem(List.last(sorted), 0) + @position_step), else: ((elem(Enum.at(sorted, idx), 0) + elem(Enum.at(sorted, idx + 1), 0)) / 2.0)
+          :before ->
+            if idx == 0 do
+              pos_to_int(elem(hd(sorted), 0)) - @position_step
+            else
+              a = pos_to_int(elem(Enum.at(sorted, idx - 1), 0))
+              b = pos_to_int(elem(Enum.at(sorted, idx), 0))
+              mid = div(a + b, 2)
+              if mid == a or mid == b do
+                rebalanced = rebalance_positions(key, store, sorted)
+                a2 = pos_to_int(elem(Enum.at(rebalanced, idx - 1), 0))
+                b2 = pos_to_int(elem(Enum.at(rebalanced, idx), 0))
+                div(a2 + b2, 2)
+              else
+                mid
+              end
+            end
+          :after ->
+            if idx == length(sorted) - 1 do
+              pos_to_int(elem(List.last(sorted), 0)) + @position_step
+            else
+              a = pos_to_int(elem(Enum.at(sorted, idx), 0))
+              b = pos_to_int(elem(Enum.at(sorted, idx + 1), 0))
+              mid = div(a + b, 2)
+              if mid == a or mid == b do
+                rebalanced = rebalance_positions(key, store, sorted)
+                a2 = pos_to_int(elem(Enum.at(rebalanced, idx), 0))
+                b2 = pos_to_int(elem(Enum.at(rebalanced, idx + 1), 0))
+                div(a2 + b2, 2)
+              else
+                mid
+              end
+            end
         end
         Ops.compound_put(store, key, CompoundKey.list_element(key, new_pos), element, 0)
         write_meta(key, store, {len + 1, min(left_pos, new_pos - @position_step), max(right_pos, new_pos + @position_step)})

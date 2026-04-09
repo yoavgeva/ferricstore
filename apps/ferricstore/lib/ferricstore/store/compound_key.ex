@@ -148,7 +148,7 @@ defmodule Ferricstore.Store.CompoundKey do
 
   """
   @spec list_element(binary(), float()) :: binary()
-  def list_element(redis_key, position) when is_float(position) do
+  def list_element(redis_key, position) when is_number(position) do
     "L:" <> redis_key <> @separator <> encode_position(position)
   end
 
@@ -181,7 +181,18 @@ defmodule Ferricstore.Store.CompoundKey do
       true
 
   """
-  @spec encode_position(float()) :: binary()
+  @spec encode_position(number()) :: binary()
+  def encode_position(position) when is_integer(position) and position >= 0 do
+    "P" <> String.pad_leading(Integer.to_string(position), 20, "0") <>
+      ".00000000000000000"
+  end
+
+  def encode_position(position) when is_integer(position) and position < 0 do
+    comp_int = 99_999_999_999_999_999_999 - abs(position)
+    "N" <> String.pad_leading(Integer.to_string(comp_int), 20, "0") <>
+      ".99999999999999999"
+  end
+
   def encode_position(position) when is_float(position) and position >= 0.0 do
     # Positive: "P" prefix + zero-padded representation
     int_part = trunc(position)
@@ -219,12 +230,12 @@ defmodule Ferricstore.Store.CompoundKey do
       1000.5
 
   """
-  @spec decode_position(binary()) :: float()
+  @spec decode_position(binary()) :: number()
   def decode_position("P" <> rest) do
     [int_str, frac_str] = String.split(rest, ".", parts: 2)
     int_part = String.to_integer(int_str)
     frac_part = String.to_integer(frac_str)
-    int_part + frac_part / 100_000_000_000_000_000
+    if frac_part == 0, do: int_part, else: int_part + frac_part / 100_000_000_000_000_000
   end
 
   def decode_position("N" <> rest) do
@@ -233,7 +244,7 @@ defmodule Ferricstore.Store.CompoundKey do
     comp_frac = String.to_integer(frac_str)
     int_part = 99_999_999_999_999_999_999 - comp_int
     frac_part = 99_999_999_999_999_999 - comp_frac
-    -(int_part + frac_part / 100_000_000_000_000_000)
+    if frac_part == 0, do: -int_part, else: -(int_part + frac_part / 100_000_000_000_000_000)
   end
 
   # -------------------------------------------------------------------
