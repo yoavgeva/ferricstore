@@ -16,6 +16,7 @@ defmodule Ferricstore.Raft.PatchedWalTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias Ferricstore.Raft.Cluster
   alias Ferricstore.Store.Router

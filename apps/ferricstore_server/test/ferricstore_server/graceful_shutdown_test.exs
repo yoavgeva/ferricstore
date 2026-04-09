@@ -7,6 +7,7 @@ defmodule FerricstoreServer.GracefulShutdownTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias FerricstoreServer.Resp.{Encoder, Parser}
   alias Ferricstore.Test.ShardHelpers
