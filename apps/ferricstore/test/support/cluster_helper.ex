@@ -363,11 +363,30 @@ defmodule Ferricstore.Test.ClusterHelper do
   @spec partition_node(map(), [map()]) :: :ok
   def partition_node(node, all_nodes) do
     others = Enum.reject(all_nodes, &(&1.name == node.name))
+    other_names = Enum.map(others, & &1.name)
 
+    # Block the partitioned node from connecting to others
+    # by setting allowed nodes to only itself
+    :rpc.call(node.name, :net_kernel, :allow, [[node.name]])
+
+    # On each other node, block connections from the partitioned node
+    Enum.each(others, fn other ->
+      allowed = Enum.map(others, & &1.name)
+      :rpc.call(other.name, :net_kernel, :allow, [allowed])
+    end)
+
+    # Now disconnect — they can't reconnect because allow blocks it
     Enum.each(others, fn other ->
       :rpc.call(node.name, :erlang, :disconnect_node, [other.name])
       :rpc.call(other.name, :erlang, :disconnect_node, [node.name])
     end)
+
+    # Wait until the partitioned node is actually disconnected from all others
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      peers = :rpc.call(node.name, Node, :list, [])
+      assert Enum.all?(other_names, fn n -> n not in peers end),
+             "#{node.name} still connected to #{inspect(peers -- [node.name])}"
+    end, "partition should disconnect #{node.name}", 20, 100)
 
     :ok
   end
@@ -379,12 +398,28 @@ defmodule Ferricstore.Test.ClusterHelper do
   """
   @spec heal_partition(map(), [map()]) :: :ok
   def heal_partition(node, all_nodes) do
+    all_names = Enum.map(all_nodes, & &1.name)
+
+    # Re-allow all nodes on every node
+    Enum.each(all_nodes, fn n ->
+      :rpc.call(n.name, :net_kernel, :allow, [all_names])
+    end)
+
+    # Reconnect
     others = Enum.reject(all_nodes, &(&1.name == node.name))
 
     Enum.each(others, fn other ->
       :rpc.call(node.name, Node, :connect, [other.name])
       :rpc.call(other.name, Node, :connect, [node.name])
     end)
+
+    # Wait until the healed node sees all others
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      peers = :rpc.call(node.name, Node, :list, [])
+      other_names = Enum.map(others, & &1.name)
+      assert Enum.all?(other_names, fn n -> n in peers end),
+             "#{node.name} not reconnected to all peers yet"
+    end, "heal should reconnect #{node.name}", 20, 200)
 
     :ok
   end

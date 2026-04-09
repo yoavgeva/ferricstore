@@ -40,6 +40,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
 
   describe "19.2 quorum writes survive leader kill" do
     @tag :jepsen
+    @tag timeout: 300_000
     test "100 ACKed writes survive sibling node kills", %{nodes: nodes} do
       {:ok, history} = HistoryRecorder.new()
 
@@ -127,6 +128,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
     end
 
     @tag :jepsen
+    @tag timeout: 300_000
     test "writes to surviving node unaffected by sibling crash", %{nodes: nodes} do
       {:ok, history} = HistoryRecorder.new()
 

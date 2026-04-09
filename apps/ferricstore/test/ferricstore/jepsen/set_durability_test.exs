@@ -44,6 +44,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
 
   describe "19.5 set members never disappear" do
     @tag :jepsen
+    @tag timeout: 300_000
     test "set: no ACKed member missing after sibling node kills", %{nodes: nodes} do
       [n1, n2, n3] = nodes
       key = "jepsen:set"
@@ -102,6 +103,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
     end
 
     @tag :jepsen
+    @tag timeout: 300_000
     test "set: no phantom member appears that was never ACKed", %{nodes: nodes} do
       # Find an alive node
       alive =
@@ -169,6 +171,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
     end
 
     @tag :jepsen
+    @tag timeout: 300_000
     test "set: concurrent SADD operations produce correct membership", %{nodes: nodes} do
       alive =
         Enum.filter(nodes, fn n ->
