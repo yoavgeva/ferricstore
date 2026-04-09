@@ -82,15 +82,10 @@ defmodule Ferricstore.Store.Shard.Writes do
           {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
 
         {:error, reason} ->
+          # Do NOT delete from ETS if the tombstone write failed —
+          # the key would resurrect on restart (no tombstone on disk).
           Logger.error("Shard #{state.index}: tombstone write failed for DELETE: #{inspect(reason)}")
-          ShardETS.ets_delete_key(state, key)
-          new_pending =
-            case state.pending do
-              [] -> []
-              pending -> Enum.reject(pending, fn {k, _, _} -> k == key end)
-            end
-          new_version = state.write_version + 1
-          {:reply, :ok, %{state | pending: new_pending, write_version: new_version}}
+          {:reply, {:error, "ERR disk write failed: #{inspect(reason)}"}, state}
       end
     end
   end
