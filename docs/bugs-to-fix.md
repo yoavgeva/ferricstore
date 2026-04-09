@@ -1,27 +1,28 @@
 # Bugs To Fix
 
-Found by codebase audit. Sorted by severity.
+Found by codebase audit. Verified with failing tests.
 
 ## Fixed
 
-| Bug | Severity | Status |
+| Bug | Severity | Commit |
 |-----|----------|--------|
-| BLMOVE/BLMPOP/XREAD BLOCK socket deadlock — active:once never restored | CRITICAL | FIXED (c7e4652) |
+| BLMOVE/BLMPOP/XREAD BLOCK socket deadlock — active:once never restored | CRITICAL | c7e4652 |
 
-## To Investigate
+## Verified Bugs (failing tests exist)
 
-### 1. LINSERT Negative Index — Wrong Position Calculation
+### 1. LINSERT Position Collisions After Many Insertions
 
 **Severity: HIGH**
 **File:** `apps/ferricstore/lib/ferricstore/store/list_ops.ex:316`
+**Test:** `apps/ferricstore/test/ferricstore/bugs/linsert_negative_index_test.exs`
 
-LINSERT BEFORE on the first element (idx=0) does `Enum.at(sorted, idx - 1)`
-which is `Enum.at(sorted, -1)` — Elixir negative indexing returns the LAST
-element. For a 3-element list [A, B, C], LINSERT BEFORE A calculates the
-new position using C's position instead of erroring, corrupting the list
-order metadata.
+The midpoint position calculation breaks down after ~53 LINSERT BEFORE
+operations at the same spot. Float precision runs out, positions collide,
+and elements are lost. Test: 55 LINSERT operations produce 54 elements
+instead of 57.
 
-**Trigger:** `RPUSH mylist a b c` then `LINSERT mylist BEFORE a newelem`
+Note: The original `Enum.at(sorted, -1)` negative index bug is prevented
+by the `if idx == 0` guard. The real bug is precision exhaustion.
 
 ---
 
@@ -29,61 +30,46 @@ order metadata.
 
 **Severity: HIGH**
 **File:** `apps/ferricstore_server/lib/ferricstore_server/connection/pubsub.ex:50-56`
+**Test:** `apps/ferricstore_server/test/ferricstore_server/bugs/pubsub_unsubscribe_leak_test.exs`
 
-`UNSUBSCRIBE` with no arguments only unsubscribes from `pubsub_channels`,
-not `pubsub_patterns`. Connection stays in pubsub mode permanently.
-Same bug in reverse: `PUNSUBSCRIBE` with no args doesn't clear channels.
+`UNSUBSCRIBE` with no arguments only clears `pubsub_channels`, not
+`pubsub_patterns`. Connection stays in pubsub mode permanently. Same
+in reverse: `PUNSUBSCRIBE` with no args doesn't clear channels.
 
-**Trigger:** `SUBSCRIBE foo` → `PSUBSCRIBE bar*` → `UNSUBSCRIBE` → `PING`
-returns error (still in pubsub mode).
+Test: SUBSCRIBE + PSUBSCRIBE + UNSUBSCRIBE (no args) → GET returns
+"ERR Can't execute" instead of working.
 
 ---
 
-### 3. READMODE and SANDBOX Bypass ACL Checks
+### 3. READMODE/SANDBOX Execute in PubSub Mode
 
 **Severity: HIGH**
-**File:** `apps/ferricstore_server/lib/ferricstore_server/connection.ex:382`
+**File:** `apps/ferricstore_server/lib/ferricstore_server/connection.ex:440-441`
+**Test:** `apps/ferricstore_server/test/ferricstore_server/bugs/acl_bypass_test.exs`
 
-READMODE and SANDBOX are not in `@acl_bypass_cmds` but they're also not
-handled by the ACL check branch. They fall through to the `true` catch-all
-which executes without permission checks. A restricted user can switch to
-stale reads or create sandboxes.
-
----
-
-### 4. Pipeline Tasks Not Awaited on QUIT
-
-**Severity: MEDIUM**
-**File:** `apps/ferricstore_server/lib/ferricstore_server/connection/pipeline.ex:216`
-
-If a pipeline contains QUIT, `sliding_window_collect` returns `{:quit, state}`
-and the function returns without awaiting lane tasks. Orphaned Task processes
-keep running and sending messages to a dead connection process.
-
-**Trigger:** Pipeline with `[GET foo, QUIT, GET bar, ... 1000 more GETs]`
+READMODE and SANDBOX have specific `dispatch/3` clauses that match BEFORE
+the pubsub mode check, allowing them to execute while in pubsub mode when
+they should be blocked. (The original ACL bypass hypothesis was wrong —
+ACL checks work correctly.)
 
 ---
 
-### 5. Position Encoding Float Precision Loss
+### 4. Position Encoding Float Precision Loss
 
 **Severity: MEDIUM**
 **File:** `apps/ferricstore/lib/ferricstore/store/compound_key.ex:189`
+**Test:** `apps/ferricstore/test/ferricstore/bugs/position_encoding_precision_test.exs`
 
-`encode_position` multiplies float by 10^17 and truncates. For positions near
-machine epsilon, different positions can collapse to the same encoded value
-after serialize/deserialize, causing list elements to have duplicate positions.
-
-**Trigger:** Many rapid LINSERT operations that generate fractional positions
-near float precision boundary.
+`encode_position` multiplies float by 10^17 and truncates. After 55
+successive midpoint subdivisions, distinct float positions collapse to
+the same encoded string. Elements get duplicate positions → data loss.
 
 ---
 
-### 6. parse_id! Crashes on Corrupted Stream Data
+## Not A Bug
 
-**Severity: LOW (only on storage corruption)**
-**File:** `apps/ferricstore/lib/ferricstore/commands/stream.ex:964`
+### Pipeline Tasks Not Awaited on QUIT
 
-`parse_id!` uses `String.to_integer` which raises on invalid input. Used in
-disk recovery paths (XRANGE, XREVRANGE). If a stream entry ID is corrupted
-on disk, the entire shard crashes on read. Not a bug under normal operation
-— only triggers on storage corruption.
+QUIT is a stateful command — pure-group lane tasks are always flushed
+and awaited before QUIT executes. The `:quit` branch in
+`sliding_window_collect` is unreachable. Tests confirm correct behavior.
