@@ -851,4 +851,115 @@ defmodule FerricstoreServer.Integration.BlockingTcpTest do
       :gen_tcp.close(sock)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Regression: connection must stay alive after blocking command completes
+  # ---------------------------------------------------------------------------
+
+  describe "connection stays alive after blocking timeout" do
+    test "BLPOP timeout does not deadlock subsequent commands", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("blpop_alive")
+
+      # BLPOP on empty key — will timeout after 1s
+      send_cmd(sock, ["BLPOP", k, "1"])
+      result = recv_response(sock, 5_000)
+      assert result == nil
+
+      # First command after timeout — should work
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock, 2_000) == {:simple, "PONG"}
+
+      # Second command — this is the one that would deadlock if socket
+      # is stuck in active: :once (the first command consumed the one
+      # message, now socket is passive with no re-arm)
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock, 2_000) == {:simple, "PONG"}
+
+      # Third command — confirms connection is fully operational
+      send_cmd(sock, ["SET", k, "alive"])
+      assert recv_response(sock, 2_000) == {:simple, "OK"}
+
+      send_cmd(sock, ["GET", k])
+      assert recv_response(sock, 2_000) == "alive"
+
+      :gen_tcp.close(sock)
+    end
+
+    test "BRPOP timeout does not deadlock subsequent commands", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("brpop_alive")
+
+      send_cmd(sock, ["BRPOP", k, "1"])
+      result = recv_response(sock, 5_000)
+      assert result == nil
+
+      # Multiple commands after timeout must all work
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock, 2_000) == {:simple, "PONG"}
+
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock, 2_000) == {:simple, "PONG"}
+
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock, 2_000) == {:simple, "PONG"}
+
+      :gen_tcp.close(sock)
+    end
+
+    test "BLMOVE timeout does not deadlock subsequent commands", %{port: port} do
+      sock = connect_and_hello(port)
+      src = ukey("blmove_alive_src")
+      dst = ukey("blmove_alive_dst")
+
+      # BLMOVE on empty source — will timeout after 1s
+      send_cmd(sock, ["BLMOVE", src, dst, "LEFT", "RIGHT", "1"])
+      result = recv_response(sock, 5_000)
+      assert result == nil
+
+      # First command after timeout
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock, 2_000) == {:simple, "PONG"}
+
+      # Second command — this would deadlock if socket stuck in active: :once
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock, 2_000) == {:simple, "PONG"}
+
+      # Third command
+      send_cmd(sock, ["SET", src, "still_alive"])
+      assert recv_response(sock, 2_000) == {:simple, "OK"}
+
+      send_cmd(sock, ["GET", src])
+      assert recv_response(sock, 2_000) == "still_alive"
+
+      :gen_tcp.close(sock)
+    end
+
+    test "BLPOP with wake does not deadlock subsequent commands", %{port: port} do
+      sock = connect_and_hello(port)
+      k = ukey("blpop_wake_alive")
+
+      # Start BLPOP in background — will block
+      send_cmd(sock, ["BLPOP", k, "5"])
+
+      # Push from another connection to wake the blocker
+      sock2 = connect_and_hello(port)
+      send_cmd(sock2, ["RPUSH", k, "wakeup"])
+      recv_response(sock2)
+      :gen_tcp.close(sock2)
+
+      # BLPOP should return the pushed value
+      result = recv_response(sock, 5_000)
+      assert result == [k, "wakeup"]
+
+      # Connection must still work after wake
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock, 2_000) == {:simple, "PONG"}
+
+      send_cmd(sock, ["PING"])
+      assert recv_response(sock, 2_000) == {:simple, "PONG"}
+
+      :gen_tcp.close(sock)
+    end
+  end
 end

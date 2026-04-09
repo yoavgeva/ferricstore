@@ -228,28 +228,15 @@ defmodule FerricstoreServer.Connection.Blocking do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
 
-    # Re-arm active: :once so we can detect client disconnect during the block.
-    state.transport.setopts(state.socket, active: :once)
-
-    result =
-      receive do
-        {:waiter_notify, _notified_key} ->
-          # Source got a push -- try LMOVE
-          case List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store) do
-            nil -> nil
-            {:error, _} -> nil
-            value -> {:ok, value}
-          end
-
-        {:tcp_closed, _socket} ->
-          :client_closed
-
-        {:tcp_error, _socket, _reason} ->
-          :client_closed
-      after
-        timeout_ms ->
-          nil
+    notify_fn = fn _notified_key ->
+      case List.handle("LMOVE", [source, destination, to_string(from_dir), to_string(to_dir)], store) do
+        nil -> nil
+        {:error, _} -> nil
+        value -> {:ok, value}
       end
+    end
+
+    result = generic_wait_loop(state, deadline, timeout_ms, notify_fn)
 
     Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
 
@@ -271,29 +258,17 @@ defmodule FerricstoreServer.Connection.Blocking do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     Enum.each(keys, fn key -> Waiters.register(key, self(), deadline) end)
 
-    # Re-arm active: :once so we can detect client disconnect during the block.
-    state.transport.setopts(state.socket, active: :once)
-
-    result =
-      receive do
-        {:waiter_notify, notified_key} ->
-          case List.handle(pop_cmd, pop_args_fn.(notified_key), store) do
-            nil -> nil
-            {:error, _} -> nil
-            value ->
-              elements = if is_list(value), do: value, else: [value]
-              {:ok, [notified_key, elements]}
-          end
-
-        {:tcp_closed, _socket} ->
-          :client_closed
-
-        {:tcp_error, _socket, _reason} ->
-          :client_closed
-      after
-        timeout_ms ->
-          nil
+    notify_fn = fn notified_key ->
+      case List.handle(pop_cmd, pop_args_fn.(notified_key), store) do
+        nil -> nil
+        {:error, _} -> nil
+        value ->
+          elements = if is_list(value), do: value, else: [value]
+          {:ok, [notified_key, elements]}
       end
+    end
+
+    result = generic_wait_loop(state, deadline, timeout_ms, notify_fn)
 
     Enum.each(keys, fn key -> Waiters.unregister(key, self()) end)
 
@@ -313,6 +288,8 @@ defmodule FerricstoreServer.Connection.Blocking do
 
   defp dispatch_xread_block(timeout_ms, stream_ids, count, store, state) do
     keys = Enum.map(stream_ids, fn {key, _id} -> key end)
+    effective_timeout = if timeout_ms == 0, do: 300_000, else: timeout_ms
+    deadline = System.monotonic_time(:millisecond) + effective_timeout
 
     # Register as waiter for all watched stream keys.
     Enum.each(stream_ids, fn {key, id_str} ->
@@ -322,35 +299,23 @@ defmodule FerricstoreServer.Connection.Blocking do
     # Cap timeout=0 (block forever) at 5 minutes.
     effective_timeout = if timeout_ms == 0, do: 300_000, else: timeout_ms
 
-    # Re-arm active: :once so we can detect client disconnect during the block.
-    state.transport.setopts(state.socket, active: :once)
+    notify_fn = fn _notified_key ->
+      read_result =
+        try do
+          StreamCmd.handle("XREAD", build_xread_args(stream_ids, count), store)
+        catch
+          _, _ -> []
+        end
 
-    result =
-      receive do
-        {:stream_waiter_notify, _notified_key} ->
-          # A new entry was added to one of our watched streams -- re-read.
-          read_result =
-            try do
-              StreamCmd.handle("XREAD", build_xread_args(stream_ids, count), store)
-            catch
-              _, _ -> []
-            end
-
-          case read_result do
-            {:block, _, _, _} -> nil
-            other when is_list(other) and other != [] -> {:ok, other}
-            _ -> nil
-          end
-
-        {:tcp_closed, _socket} ->
-          :client_closed
-
-        {:tcp_error, _socket, _reason} ->
-          :client_closed
-      after
-        effective_timeout ->
-          nil
+      case read_result do
+        {:block, _, _, _} -> nil
+        other when is_list(other) and other != [] -> {:ok, other}
+        _ -> nil
       end
+    end
+
+    result = generic_wait_loop(state, deadline, effective_timeout, notify_fn,
+                               waiter_msg: :stream_waiter_notify)
 
     # Cleanup: unregister from all stream keys.
     Enum.each(keys, fn key -> StreamCmd.unregister_stream_waiter(key, self()) end)
@@ -366,6 +331,48 @@ defmodule FerricstoreServer.Connection.Blocking do
 
       nil ->
         {:continue, Encoder.encode(nil), state}
+    end
+  end
+
+  # Generalized wait loop — keeps the socket in its configured active_mode,
+  # handles TCP events inline, and calls notify_fn when the waiter is notified.
+  # This avoids the active: :once deadlock bug.
+  defp generic_wait_loop(state, deadline, _timeout_ms, notify_fn, opts \\ []) do
+    remaining = max(0, deadline - System.monotonic_time(:millisecond))
+    waiter_msg = Keyword.get(opts, :waiter_msg, :waiter_notify)
+
+    receive do
+      {^waiter_msg, notified_key} ->
+        notify_fn.(notified_key)
+
+      {:tcp, _socket, _data} ->
+        generic_wait_loop(state, deadline, 0, notify_fn, opts)
+
+      {:ssl, _socket, _data} ->
+        generic_wait_loop(state, deadline, 0, notify_fn, opts)
+
+      {:tcp_passive, _socket} ->
+        state.transport.setopts(state.socket, active: state.active_mode)
+        generic_wait_loop(state, deadline, 0, notify_fn, opts)
+
+      {:ssl_passive, _socket} ->
+        state.transport.setopts(state.socket, active: state.active_mode)
+        generic_wait_loop(state, deadline, 0, notify_fn, opts)
+
+      {:tcp_closed, _socket} ->
+        :client_closed
+
+      {:tcp_error, _socket, _reason} ->
+        :client_closed
+
+      {:ssl_closed, _socket} ->
+        :client_closed
+
+      {:ssl_error, _socket, _reason} ->
+        :client_closed
+    after
+      remaining ->
+        nil
     end
   end
 
