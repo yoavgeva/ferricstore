@@ -384,8 +384,9 @@ defmodule Ferricstore.Test.ClusterHelper do
     # Wait until the partitioned node is actually disconnected from all others
     Ferricstore.Test.ShardHelpers.eventually(fn ->
       peers = :rpc.call(node.name, Node, :list, [])
-      assert Enum.all?(other_names, fn n -> n not in peers end),
-             "#{node.name} still connected to #{inspect(peers -- [node.name])}"
+      unless Enum.all?(other_names, fn n -> n not in peers end) do
+        raise "#{node.name} still connected to #{inspect(peers -- [node.name])}"
+      end
     end, "partition should disconnect #{node.name}", 20, 100)
 
     :ok
@@ -417,8 +418,9 @@ defmodule Ferricstore.Test.ClusterHelper do
     Ferricstore.Test.ShardHelpers.eventually(fn ->
       peers = :rpc.call(node.name, Node, :list, [])
       other_names = Enum.map(others, & &1.name)
-      assert Enum.all?(other_names, fn n -> n in peers end),
-             "#{node.name} not reconnected to all peers yet"
+      unless Enum.all?(other_names, fn n -> n in peers end) do
+        raise "#{node.name} not reconnected to all peers yet"
+      end
     end, "heal should reconnect #{node.name}", 20, 200)
 
     :ok
