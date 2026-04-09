@@ -596,7 +596,14 @@ defmodule Ferricstore.Commands.Stream do
 
   defp apply_trim(key, {:minid, _approx, min_id_str}, store) do
     prefix = "X:#{key}" <> @sep
-    {:ok, min_id} = parse_full_id(min_id_str)
+
+    case parse_full_id(min_id_str) do
+      {:error, _} = err -> err
+      {:ok, min_id} -> do_apply_trim_minid(key, prefix, min_id, store)
+    end
+  end
+
+  defp do_apply_trim_minid(key, prefix, min_id, store) do
 
     all_ids =
       store
