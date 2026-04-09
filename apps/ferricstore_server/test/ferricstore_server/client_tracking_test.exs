@@ -7,6 +7,7 @@ defmodule FerricstoreServer.ClientTrackingTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias FerricstoreServer.ClientTracking
 
