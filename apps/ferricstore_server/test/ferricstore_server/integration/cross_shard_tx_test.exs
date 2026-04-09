@@ -15,6 +15,7 @@ defmodule FerricstoreServer.Integration.CrossShardTxTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
