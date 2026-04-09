@@ -59,7 +59,7 @@ defmodule FerricstoreServer.Commands.Client do
   end
 
   def handle("SETNAME", [name], conn_state, _store) do
-    if String.contains?(name, " ") do
+    if has_invalid_name_chars?(name) do
       {{:error, "ERR Client names cannot contain spaces, newlines or special characters."},
        conn_state}
     else
@@ -97,8 +97,8 @@ defmodule FerricstoreServer.Commands.Client do
     {"", conn_state}
   end
 
-  def handle("LIST", ["TYPE", _bad], conn_state, _store) do
-    {{:error, "ERR Unknown client type 'unknown'"}, conn_state}
+  def handle("LIST", ["TYPE", bad], conn_state, _store) do
+    {{:error, "ERR Unknown client type '#{bad}'"}, conn_state}
   end
 
   def handle("LIST", _args, conn_state, _store) do
@@ -300,5 +300,13 @@ defmodule FerricstoreServer.Commands.Client do
     :erlang.list_to_pid(raw)
   rescue
     _ -> nil
+  end
+
+  # Redis rejects client names containing spaces or any byte < 0x20
+  # (control characters: newlines, tabs, null bytes, etc.)
+  defp has_invalid_name_chars?(name) do
+    name
+    |> :binary.bin_to_list()
+    |> Enum.any?(fn byte -> byte <= 0x20 end)
   end
 end
