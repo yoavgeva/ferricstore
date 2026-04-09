@@ -64,25 +64,33 @@ defmodule Ferricstore.Store.Router do
   @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
   defp quorum_write(ctx, idx, command) do
     shard_id = Ferricstore.Raft.Cluster.shard_server_id(idx)
-    corr = make_ref()
 
+    # Use ra:process_command with reply_from: :local to guarantee
+    # read-your-writes. This waits until the LOCAL node has applied
+    # the entry to its state machine (ETS), not just until the leader
+    # commits. Without this, a follower returns :ok but its ETS hasn't
+    # been updated yet — reads return stale data.
     result =
       try do
-        case :ra.pipeline_command(shard_id, command, corr, :normal) do
-          :ok ->
-            wait_for_ra_applied(ctx, corr, shard_id, idx, command)
+        case :ra.process_command(shard_id, command, %{reply_from: :local, timeout: 10_000}) do
+          {:ok, reply, _leader} ->
+            reply
 
           {:error, :noproc} ->
-            # Ra server not alive (shard restarting). Fall back to Shard
-            # GenServer which re-initialises ra during its init.
             GenServer.call(elem(ctx.shard_names, idx), command)
 
           {:error, _reason} ->
             GenServer.call(elem(ctx.shard_names, idx), command)
+
+          {:timeout, _server} ->
+            {:error, "ERR write timeout"}
         end
       catch
         :exit, {:noproc, _} ->
           GenServer.call(elem(ctx.shard_names, idx), command)
+
+        :exit, {:timeout, _} ->
+          {:error, "ERR write timeout"}
       end
 
     case result do
@@ -95,51 +103,6 @@ defmodule Ferricstore.Store.Router do
     result
   end
 
-  # Waits for the `ra_event` containing our correlation ref. The `applied`
-  # list may contain results for OTHER concurrent commands (from the same
-  # process submitting multiple pipeline_commands). We loop until we find
-  # our `corr`. Unrelated ra_events are silently skipped -- their results
-  # belong to other concurrent calls in the same process, each of which
-  # has its own selective receive waiting for its own correlation ref.
-  @spec wait_for_ra_applied(FerricStore.Instance.t(), reference(), :ra.server_id(), non_neg_integer(), tuple()) :: term()
-  defp wait_for_ra_applied(ctx, corr, shard_id, idx, command) do
-    receive do
-      {:ra_event, _leader, {:applied, applied_list}} ->
-        case List.keyfind(applied_list, corr, 0) do
-          {^corr, result} ->
-            result
-
-          nil ->
-            # Our command wasn't in this batch -- keep waiting.
-            wait_for_ra_applied(ctx, corr, shard_id, idx, command)
-        end
-
-      {:ra_event, _from, {:rejected, {:not_leader, maybe_leader, ^corr}}} ->
-        # Leader changed. Retry once with the suggested leader, or fall
-        # back to the Shard GenServer if no leader hint is available.
-        leader =
-          if maybe_leader in [nil, :undefined],
-            do: shard_id,
-            else: maybe_leader
-
-        retry_corr = make_ref()
-
-        case :ra.pipeline_command(leader, command, retry_corr, :normal) do
-          :ok ->
-            wait_for_ra_applied(ctx, retry_corr, leader, idx, command)
-
-          _err ->
-            GenServer.call(elem(ctx.shard_names, idx), command)
-        end
-
-      {:ra_event, _from, {:rejected, {_reason, _hint, ^corr}}} ->
-        # Other rejection (e.g. cluster change). Fall back to Shard.
-        GenServer.call(elem(ctx.shard_names, idx), command)
-    after
-      10_000 ->
-        {:error, "ERR write timeout"}
-    end
-  end
 
   # Determines the durability mode for a key by extracting its namespace
   # prefix and looking up the namespace config. Returns `:quorum` or `:async`.
