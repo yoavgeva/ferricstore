@@ -115,6 +115,15 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
 
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+
       - name: Build NIF (release)
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
@@ -124,6 +133,9 @@ jobs:
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
+
+      - name: Credo
+        run: mix credo --min-priority high
 
       - name: Cache build artifacts
         uses: actions/cache/save@v4
@@ -282,6 +294,20 @@ jobs:
 
       - name: Large allocation tests
         run: mix test apps/ferricstore/test --only large_alloc --timeout 120000
+        continue-on-error: true
+
+      - name: Check io_uring availability
+        id: uring
+        run: |
+          if cat /proc/sys/kernel/io_uring_disabled 2>/dev/null | grep -q "^0$"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run io_uring tests
+        if: steps.uring.outputs.available == 'true'
+        run: mix test apps/ferricstore/test --only linux_io_uring
         continue-on-error: true
 
       - uses: actions/upload-artifact@v4
