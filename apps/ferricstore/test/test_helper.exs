@@ -14,14 +14,10 @@
 # :jepsen — Jepsen-style durability and consistency tests that spin up multi-node
 #   `:peer` clusters and inject faults. Excluded by default; run with
 #   `mix test test/ferricstore/jepsen/ --include jepsen`.
-# :legacy_hot_cache — tests that verify the old two-table (keydir + hot_cache)
-#   eviction model. The codebase migrated to a single-table LFU format.
-#   The replacement suite is spec/single_table_lfu_test.exs.
-#   Run with `mix test --include legacy_hot_cache`.
 # :bench — long-running throughput benchmarks (30s+ per test). Excluded by default.
 #   Run with `mix test test/ferricstore/cluster/throughput_bench_test.exs --include bench`.
 ExUnit.start(
-  exclude: [:bench, :linux_io_uring, :large_alloc, :cluster, :jepsen, :legacy_hot_cache, :shard_kill, :compaction, :conn_lifecycle, :concurrency],
+  exclude: [:bench, :linux_io_uring, :large_alloc, :cluster, :jepsen, :shard_kill, :compaction, :conn_lifecycle, :concurrency],
   formatters: [ExUnit.CLIFormatter, JUnitFormatter, Ferricstore.Test.AuditFormatter]
 )
 
