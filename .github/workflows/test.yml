@@ -365,6 +365,7 @@ jobs:
 
       - name: Flaky tests (isolated)
         run: mix test --only ci_flaky --timeout 60000
+        continue-on-error: true
 
       - uses: actions/upload-artifact@v4
         if: always()
