@@ -79,41 +79,51 @@ defmodule Ferricstore.Commands.List do
   def handle("LINDEX", _, _), do: {:error, "ERR wrong number of arguments for 'lindex' command"}
 
   def handle("LSET", [key, index_str, element], store) do
-    case Integer.parse(index_str) do
-      {index, ""} -> ListOps.execute(key, store, {:lset, index, element})
-      _ -> {:error, "ERR value is not an integer or out of range"}
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      case Integer.parse(index_str) do
+        {index, ""} -> ListOps.execute(key, store, {:lset, index, element})
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
     end
   end
   def handle("LSET", _, _), do: {:error, "ERR wrong number of arguments for 'lset' command"}
 
   def handle("LREM", [key, count_str, element], store) do
-    case Integer.parse(count_str) do
-      {count, ""} -> ListOps.execute(key, store, {:lrem, count, element})
-      _ -> {:error, "ERR value is not an integer or out of range"}
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      case Integer.parse(count_str) do
+        {count, ""} -> ListOps.execute(key, store, {:lrem, count, element})
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
     end
   end
   def handle("LREM", _, _), do: {:error, "ERR wrong number of arguments for 'lrem' command"}
 
   def handle("LTRIM", [key, start_str, stop_str], store) do
-    case {Integer.parse(start_str), Integer.parse(stop_str)} do
-      {{start, ""}, {stop, ""}} -> ListOps.execute(key, store, {:ltrim, start, stop})
-      _ -> {:error, "ERR value is not an integer or out of range"}
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      case {Integer.parse(start_str), Integer.parse(stop_str)} do
+        {{start, ""}, {stop, ""}} -> ListOps.execute(key, store, {:ltrim, start, stop})
+        _ -> {:error, "ERR value is not an integer or out of range"}
+      end
     end
   end
   def handle("LTRIM", _, _), do: {:error, "ERR wrong number of arguments for 'ltrim' command"}
 
   def handle("LPOS", [key, element | opts], store) do
-    case parse_lpos_opts(opts) do
-      {:ok, rank, count, maxlen} -> ListOps.execute(key, store, {:lpos, element, rank, count, maxlen})
-      {:error, _} = error -> error
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      case parse_lpos_opts(opts) do
+        {:ok, rank, count, maxlen} -> ListOps.execute(key, store, {:lpos, element, rank, count, maxlen})
+        {:error, _} = error -> error
+      end
     end
   end
   def handle("LPOS", _, _), do: {:error, "ERR wrong number of arguments for 'lpos' command"}
 
   def handle("LINSERT", [key, direction_str, pivot, element], store) do
-    case parse_direction(direction_str) do
-      {:ok, direction} -> ListOps.execute(key, store, {:linsert, direction, pivot, element})
-      :error -> {:error, "ERR syntax error"}
+    with :ok <- TypeRegistry.check_type(key, :list, store) do
+      case parse_direction(direction_str) do
+        {:ok, direction} -> ListOps.execute(key, store, {:linsert, direction, pivot, element})
+        :error -> {:error, "ERR syntax error"}
+      end
     end
   end
   def handle("LINSERT", _, _), do: {:error, "ERR wrong number of arguments for 'linsert' command"}
@@ -135,10 +145,14 @@ defmodule Ferricstore.Commands.List do
   def handle("RPOPLPUSH", [source, destination], store), do: handle("LMOVE", [source, destination, "RIGHT", "LEFT"], store)
   def handle("RPOPLPUSH", _, _), do: {:error, "ERR wrong number of arguments for 'rpoplpush' command"}
 
-  def handle("LPUSHX", [key | elements], store) when elements != [], do: ListOps.execute(key, store, {:lpushx, elements})
+  def handle("LPUSHX", [key | elements], store) when elements != [] do
+    with :ok <- TypeRegistry.check_type(key, :list, store), do: ListOps.execute(key, store, {:lpushx, elements})
+  end
   def handle("LPUSHX", _, _), do: {:error, "ERR wrong number of arguments for 'lpushx' command"}
 
-  def handle("RPUSHX", [key | elements], store) when elements != [], do: ListOps.execute(key, store, {:rpushx, elements})
+  def handle("RPUSHX", [key | elements], store) when elements != [] do
+    with :ok <- TypeRegistry.check_type(key, :list, store), do: ListOps.execute(key, store, {:rpushx, elements})
+  end
   def handle("RPUSHX", _, _), do: {:error, "ERR wrong number of arguments for 'rpushx' command"}
 
   defp do_pop(key, store, _direction, 0) do

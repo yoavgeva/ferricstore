@@ -2762,10 +2762,11 @@ defmodule FerricStore do
   @spec lrem(key(), integer(), binary()) :: {:ok, non_neg_integer()}
   def lrem(key, count, element) do
     ctx = default_ctx()
-    result =
-      Router.list_op(ctx, key, {:lrem, count, element})
 
-    {:ok, result}
+    case Router.list_op(ctx, key, {:lrem, count, element}) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   @doc """
@@ -2790,10 +2791,11 @@ defmodule FerricStore do
   @spec linsert(key(), :before | :after, binary(), binary()) :: {:ok, integer()}
   def linsert(key, direction, pivot, element) when direction in [:before, :after] do
     ctx = default_ctx()
-    result =
-      Router.list_op(ctx, key, {:linsert, direction, pivot, element})
 
-    {:ok, result}
+    case Router.list_op(ctx, key, {:linsert, direction, pivot, element}) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   @doc """
@@ -2854,9 +2856,10 @@ defmodule FerricStore do
     count = Keyword.get(opts, :count)
     maxlen = Keyword.get(opts, :maxlen, 0)
 
-    result = Router.list_op(ctx, key, {:lpos, element, rank, count, maxlen})
-
-    {:ok, result}
+    case Router.list_op(ctx, key, {:lpos, element, rank, count, maxlen}) do
+      {:error, _} = err -> err
+      result -> {:ok, result}
+    end
   end
 
   # ---------------------------------------------------------------------------

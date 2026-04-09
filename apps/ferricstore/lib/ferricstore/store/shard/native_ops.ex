@@ -276,17 +276,46 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   defp handle_list_op_raft(key, operation, state) do
     store = build_list_compound_store_raft(key, state)
-    result = Ferricstore.Store.ListOps.execute(key, store, operation)
-    new_version = state.write_version + 1
-    {:reply, result, %{state | write_version: new_version}}
+    type_store = type_check_store(store, state)
+
+    case Ferricstore.Store.TypeRegistry.check_type(key, :list, type_store) do
+      :ok ->
+        result = Ferricstore.Store.ListOps.execute(key, store, operation)
+        new_version = state.write_version + 1
+        {:reply, result, %{state | write_version: new_version}}
+
+      {:error, _} = err ->
+        {:reply, err, state}
+    end
   end
 
   defp handle_list_op_direct(key, operation, state) do
     state = ShardFlush.await_in_flight(state)
     state = ShardFlush.flush_pending_sync(state)
     store = build_list_compound_store_direct(key, state)
-    result = Ferricstore.Store.ListOps.execute(key, store, operation)
-    {:reply, result, state}
+
+    type_store = type_check_store(store, state)
+
+    case Ferricstore.Store.TypeRegistry.check_type(key, :list, type_store) do
+      :ok ->
+        result = Ferricstore.Store.ListOps.execute(key, store, operation)
+        {:reply, result, state}
+
+      {:error, _} = err ->
+        {:reply, err, state}
+    end
+  end
+
+  # Builds a store suitable for TypeRegistry.check_type by adding exists?
+  # to the compound store. The compound store lacks exists? which TypeRegistry
+  # needs to detect string keys masquerading as lists.
+  defp type_check_store(compound_store, state) do
+    Map.put(compound_store, :exists?, fn key ->
+      case :ets.lookup(state.keydir, key) do
+        [{^key, _, _, _, _, _, _}] -> true
+        _ -> false
+      end
+    end)
   end
 
   @spec handle_list_op_lmove(binary(), binary(), atom(), atom(), map()) :: {:reply, term(), map()}
