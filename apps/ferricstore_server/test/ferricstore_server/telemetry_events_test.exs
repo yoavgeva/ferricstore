@@ -549,13 +549,19 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
     test "cold read is recorded when key is not in ETS cache" do
       key = "hotcold_cold_#{System.unique_integer([:positive])}"
-      Router.put(FerricStore.Instance.get(:default), key, "cold_value", 0)
+      ctx = FerricStore.Instance.get(:default)
+      Router.put(ctx, key, "cold_value", 0)
 
-      # Flush to disk so Bitcask has the data.
-      shard_idx = Router.shard_for(FerricStore.Instance.get(:default), key)
-      shard_name = Router.shard_name(FerricStore.Instance.get(:default), shard_idx)
+      # Ensure the value is readable (Raft applied + disk flushed) before evicting.
+      shard_idx = Router.shard_for(ctx, key)
+      shard_name = Router.shard_name(ctx, shard_idx)
       :ok = GenServer.call(shard_name, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
+
+      # Verify the key is readable before evicting from hot cache.
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        assert Router.get(ctx, key) == "cold_value"
+      end, "key should be readable before eviction", 10, 50)
 
       # Evict the value from the hot cache (set value to nil) to force a
       # cold read. This mirrors the MemoryGuard eviction mechanism: the keydir
@@ -565,7 +571,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
 
       before_cold = Ferricstore.Stats.total_cold_reads()
 
-      assert Router.get(FerricStore.Instance.get(:default), key) == "cold_value"
+      assert Router.get(ctx, key) == "cold_value"
 
       assert Ferricstore.Stats.total_cold_reads() >= before_cold + 1
     end
