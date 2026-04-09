@@ -878,7 +878,7 @@ defmodule Ferricstore.Commands.SortedSet do
         selected = Enum.take_random(pairs, count)
 
         if with_scores do
-          Enum.flat_map(selected, fn {member, score} -> [member, score] end)
+          Enum.flat_map(selected, fn {member, score} -> [member, format_score_str(score)] end)
         else
           Enum.map(selected, fn {member, _score} -> member end)
         end
@@ -892,7 +892,7 @@ defmodule Ferricstore.Commands.SortedSet do
           selected = for _ <- 1..abs_count, do: Enum.random(pairs)
 
           if with_scores do
-            Enum.flat_map(selected, fn {member, score} -> [member, score] end)
+            Enum.flat_map(selected, fn {member, score} -> [member, format_score_str(score)] end)
           else
             Enum.map(selected, fn {member, _score} -> member end)
           end
