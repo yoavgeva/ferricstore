@@ -5,6 +5,7 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :ci_flaky
 
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Store.Router

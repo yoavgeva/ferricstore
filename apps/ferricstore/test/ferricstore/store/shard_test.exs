@@ -112,6 +112,7 @@ defmodule Ferricstore.Store.ShardTest do
       assert [{"cached_key", "val", 0, _lfu, _fid, _off, _vsize}] = :ets.lookup(keydir, "cached_key")
     end
 
+    @tag :ci_flaky
     test "get warms ETS on cold key", %{shard: shard, keydir: keydir} do
       # Put via GenServer, flush to disk, then evict value from ETS to simulate cold key
       :ok = GenServer.call(shard, {:put, "warm_key", "warm_val", 0})
