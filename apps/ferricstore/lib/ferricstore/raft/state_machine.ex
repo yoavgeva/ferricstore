@@ -296,7 +296,20 @@ defmodule Ferricstore.Raft.StateMachine do
   # and individual {:put}/{:delete} entries. This handler remains for WAL
   # replay of entries written before the compound-key migration.
   def apply(meta, {:list_op, key, operation}, state) do
-    result = with_pending_writes(state, fn -> do_list_op(state, key, operation) end)
+    store = build_compound_store(state)
+    type_store = Map.put(store, :exists?, fn k ->
+      case :ets.lookup(state.ets, k) do
+        [{^k, _, _, _, _, _, _}] -> true
+        _ -> false
+      end
+    end)
+
+    result =
+      case Ferricstore.Store.TypeRegistry.check_type(key, :list, type_store) do
+        :ok -> with_pending_writes(state, fn -> do_list_op(state, key, operation) end)
+        {:error, _} = err -> err
+      end
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)

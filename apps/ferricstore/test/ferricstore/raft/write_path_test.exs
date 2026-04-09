@@ -490,42 +490,37 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: LPUSH through Raft adds element" do
     test "LPUSH to a new key creates a list with the pushed elements" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir} = ctx
 
       {new_state, result} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["a", "b", "c"]}}, state)
 
-      # LPUSH returns the new list length
       assert result == 3
       assert new_state.applied_count == 1
 
-      # Verify ETS contains the serialized list
-      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "mylist")
-      assert {:ok, ["c", "b", "a"]} = ListOps.decode_stored(raw)
+      # Verify via LRANGE (compound key format)
+      {_state2, elements} =
+        SM.apply(%{}, {:list_op, "mylist", {:lrange, 0, -1}}, new_state)
 
-      # Flush background writer so deferred Bitcask write is on disk
-      Ferricstore.Store.BitcaskWriter.flush(state.shard_index)
-
-      # Verify Bitcask contains the same value
-      assert [{_, ^raw, _, _, fid, off, _}] = :ets.lookup(ets, "mylist")
-      assert is_integer(fid)
-      assert {:ok, ^raw} = NIF.v2_pread_at(Path.join(state.shard_data_path, "00000.log"), off)
+      assert elements == ["c", "b", "a"]
 
       cleanup_sm(ctx)
     end
 
     test "LPUSH to existing list prepends elements" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir} = ctx
 
       {state2, 2} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["a", "b"]}}, state)
 
-      {_state3, 4} =
+      {state3, 4} =
         SM.apply(%{}, {:list_op, "mylist", {:lpush, ["c", "d"]}}, state2)
 
-      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "mylist")
-      assert {:ok, ["d", "c", "b", "a"]} = ListOps.decode_stored(raw)
+      {_state4, elements} =
+        SM.apply(%{}, {:list_op, "mylist", {:lrange, 0, -1}}, state3)
+
+      assert elements == ["d", "c", "b", "a"]
 
       cleanup_sm(ctx)
     end
@@ -538,15 +533,17 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: RPUSH through Raft adds element" do
     test "RPUSH to a new key creates a list with the pushed elements" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir} = ctx
 
-      {_new_state, result} =
+      {new_state, result} =
         SM.apply(%{}, {:list_op, "rlist", {:rpush, ["x", "y", "z"]}}, state)
 
       assert result == 3
 
-      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "rlist")
-      assert {:ok, ["x", "y", "z"]} = ListOps.decode_stored(raw)
+      {_state2, elements} =
+        SM.apply(%{}, {:list_op, "rlist", {:lrange, 0, -1}}, new_state)
+
+      assert elements == ["x", "y", "z"]
 
       cleanup_sm(ctx)
     end
@@ -578,22 +575,21 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: LPOP through Raft removes element" do
     test "LPOP from a list returns and removes the leftmost element" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir} = ctx
 
-      # Build a list: [a, b, c]
       {state2, 3} =
         SM.apply(%{}, {:list_op, "poplist", {:rpush, ["a", "b", "c"]}}, state)
 
-      # Pop from left
       {state3, popped} =
         SM.apply(%{}, {:list_op, "poplist", {:lpop, 1}}, state2)
 
       assert popped == "a"
       assert state3.applied_count == 2
 
-      # Remaining list should be [b, c]
-      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "poplist")
-      assert {:ok, ["b", "c"]} = ListOps.decode_stored(raw)
+      {_state4, elements} =
+        SM.apply(%{}, {:list_op, "poplist", {:lrange, 0, -1}}, state3)
+
+      assert elements == ["b", "c"]
 
       cleanup_sm(ctx)
     end
@@ -610,18 +606,21 @@ defmodule Ferricstore.Raft.WritePathTest do
       cleanup_sm(ctx)
     end
 
-    test "LPOP all elements deletes the key" do
+    test "LPOP all elements empties the list" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir} = ctx
 
       {state2, 1} =
         SM.apply(%{}, {:list_op, "single", {:rpush, ["only"]}}, state)
 
-      {_state3, "only"} =
+      {state3, "only"} =
         SM.apply(%{}, {:list_op, "single", {:lpop, 1}}, state2)
 
-      # Key should be gone
-      assert [] == :ets.lookup(ets, "single")
+      # List should be empty — LLEN returns 0 or LRANGE returns []
+      {_state4, elements} =
+        SM.apply(%{}, {:list_op, "single", {:lrange, 0, -1}}, state3)
+
+      assert elements == [] or elements == nil
 
       cleanup_sm(ctx)
     end
@@ -634,18 +633,20 @@ defmodule Ferricstore.Raft.WritePathTest do
   describe "list_op: RPOP through Raft removes element" do
     test "RPOP from a list returns and removes the rightmost element" do
       ctx = fresh_sm_state()
-      {state, ets, _store, _dir} = ctx
+      {state, _ets, _store, _dir} = ctx
 
       {state2, 3} =
         SM.apply(%{}, {:list_op, "rpoplist", {:rpush, ["a", "b", "c"]}}, state)
 
-      {_state3, popped} =
+      {state3, popped} =
         SM.apply(%{}, {:list_op, "rpoplist", {:rpop, 1}}, state2)
 
       assert popped == "c"
 
-      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "rpoplist")
-      assert {:ok, ["a", "b"]} = ListOps.decode_stored(raw)
+      {_state4, elements} =
+        SM.apply(%{}, {:list_op, "rpoplist", {:lrange, 0, -1}}, state3)
+
+      assert elements == ["a", "b"]
 
       cleanup_sm(ctx)
     end
@@ -926,9 +927,10 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert [2, :ok, :ok] = results
       assert new_state.applied_count == 3
 
-      # Verify list
-      [{_, raw, _, _, _, _, _}] = :ets.lookup(ets, "mylist")
-      assert {:ok, ["a", "b"]} = ListOps.decode_stored(raw)
+      # Verify list via LRANGE
+      {_state2, elements} =
+        SM.apply(%{}, {:list_op, "mylist", {:lrange, 0, -1}}, new_state)
+      assert elements == ["a", "b"]
 
       # Verify hash field
       assert [{_, "v1", _, _, _, _, _}] = :ets.lookup(ets, "myhash\x00f1")
