@@ -2177,17 +2177,40 @@ defmodule Ferricstore.Raft.StateMachine do
   # (the same stores available to the state machine) so the entire operation is
   # atomic from the Raft log's perspective.
   defp do_list_op(state, key, operation) do
-    get_fn = fn -> do_get(state, key) end
+    store = build_compound_store(state)
+    ListOps.execute(key, store, operation)
+  end
 
-    put_fn = fn encoded_binary ->
-      do_put(state, key, encoded_binary, 0)
-    end
-
-    delete_fn = fn ->
-      do_delete(state, key)
-    end
-
-    ListOps.execute(get_fn, put_fn, delete_fn, operation)
+  # Builds a compound store for list/hash/set operations inside the state
+  # machine. Uses do_put/do_delete/do_get directly (already inside apply context,
+  # writes accumulate in pending_writes buffer for batch NIF flush).
+  defp build_compound_store(state) do
+    %{
+      compound_get: fn _redis_key, compound_key ->
+        do_get(state, compound_key)
+      end,
+      compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
+        do_put(state, compound_key, value, expire_at_ms)
+      end,
+      compound_delete: fn _redis_key, compound_key ->
+        do_delete(state, compound_key)
+      end,
+      compound_scan: fn _redis_key, prefix ->
+        Ferricstore.Store.Shard.ETS.prefix_scan_entries(
+          state.ets, prefix, state.shard_data_path
+        )
+        |> Enum.sort_by(fn {field, _} -> field end)
+      end,
+      compound_count: fn _redis_key, prefix ->
+        Ferricstore.Store.Shard.ETS.prefix_count_entries(state.ets, prefix)
+      end,
+      exists?: fn key ->
+        case :ets.lookup(state.ets, key) do
+          [{^key, _, _, _, _, _, _}] -> true
+          _ -> false
+        end
+      end
+    }
   end
 
   # ---------------------------------------------------------------------------

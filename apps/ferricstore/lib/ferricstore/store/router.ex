@@ -1275,6 +1275,7 @@ defmodule Ferricstore.Store.Router do
   end
 
   def list_op(ctx, key, operation) do
-    GenServer.call(resolve_shard(ctx, shard_for(ctx, key)), {:list_op, key, operation})
+    idx = shard_for(ctx, key)
+    raft_write(ctx, idx, key, {:list_op, key, operation})
   end
 end
