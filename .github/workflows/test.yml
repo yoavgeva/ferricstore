@@ -296,19 +296,8 @@ jobs:
         run: mix test apps/ferricstore/test --only large_alloc --timeout 120000
         continue-on-error: true
 
-      - name: Check io_uring availability
-        id: uring
-        run: |
-          if cat /proc/sys/kernel/io_uring_disabled 2>/dev/null | grep -q "^0$"; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run io_uring tests
-        if: steps.uring.outputs.available == 'true'
-        run: mix test apps/ferricstore/test --only linux_io_uring
-        continue-on-error: true
+      # io_uring tests run via cargo test in the build step (Rust-level).
+      # No Elixir tests are tagged :linux_io_uring.
 
       - uses: actions/upload-artifact@v4
         if: always()
