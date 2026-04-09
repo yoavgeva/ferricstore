@@ -86,7 +86,7 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
             value = "v#{i}"
 
             result =
-              :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, value, 0])
+              :rpc.call(node.name, FerricStore, :set, [key, value])
 
             if result == :ok do
               {node, key, value}
@@ -103,7 +103,7 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
       # Verify all ACKed writes are immediately readable on their writing node
       violations =
         Enum.flat_map(acked_writes, fn {node, key, expected_value} ->
-          actual = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+          {:ok, actual} = :rpc.call(node.name, FerricStore, :get, [key])
 
           if actual == expected_value do
             []
@@ -139,7 +139,7 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
           key = "async:flush:#{i}"
           value = "flush_v#{i}"
 
-          case :rpc.call(n1.name, Ferricstore.Store.Router, :put, [key, value, 0]) do
+          case :rpc.call(n1.name, FerricStore, :set, [key, value]) do
             :ok -> {key, value}
             _ -> nil
           end
@@ -152,7 +152,7 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
       # Verify all ACKed writes are still readable
       missing =
         Enum.filter(acked, fn {key, value} ->
-          actual = :rpc.call(n1.name, Ferricstore.Store.Router, :get, [key])
+          {:ok, actual} = :rpc.call(n1.name, FerricStore, :get, [key])
           actual != value
         end)
 
@@ -193,7 +193,7 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
       key = "async:race:lossy"
 
       _result =
-        :rpc.call(target.name, Ferricstore.Store.Router, :put, [key, "maybe_lost", 0])
+        :rpc.call(target.name, FerricStore, :set, [key, "maybe_lost"])
 
       # Kill the target node immediately after write
       {_killed, _remaining} = ClusterHelper.kill_node(nodes, target)
@@ -201,7 +201,7 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
       # In single-node mode, the reader node is independent and never had this data.
       # This documents the expected behavior: async writes on a killed node are
       # lost from the cluster perspective when that node doesn't come back.
-      result_on_reader = :rpc.call(reader.name, Ferricstore.Store.Router, :get, [key])
+      {:ok, result_on_reader} = :rpc.call(reader.name, FerricStore, :get, [key])
 
       # Both outcomes are correct:
       # - nil: reader never had the data (single-node mode, no replication)
@@ -224,9 +224,9 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
         key = "quorum:contrast:#{node.index}"
         value = "durable_value"
 
-        :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, value, 0])
+        :ok = :rpc.call(node.name, FerricStore, :set, [key, value])
 
-        read = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+        {:ok, read} = :rpc.call(node.name, FerricStore, :get, [key])
 
         assert read == value,
                "Quorum write should be immediately durable on #{node.name}"

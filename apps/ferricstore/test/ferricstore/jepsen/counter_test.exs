@@ -55,7 +55,7 @@ defmodule Ferricstore.Jepsen.CounterTest do
       on_exit(fn -> if Process.alive?(history), do: HistoryRecorder.stop(history) end)
 
       # Initialize counter to 0 on n1
-      :ok = :rpc.call(n1.name, Ferricstore.Store.Router, :put, [key, "0", 0])
+      :ok = :rpc.call(n1.name, FerricStore, :set, [key, "0"])
 
       # 50 concurrent workers increment the counter on n1.
       # Simultaneously, kill n3 to introduce disruption.
@@ -69,7 +69,8 @@ defmodule Ferricstore.Jepsen.CounterTest do
       worker_tasks =
         for _w <- 1..50 do
           Task.async(fn ->
-            case :rpc.call(n1.name, Ferricstore.Store.Router, :incr, [key, 1]) do
+            # Use atomic Raft-based incr via Router on the remote node
+            case remote_incr(n1.name, key, 1) do
               {:ok, n} ->
                 HistoryRecorder.record_ok(
                   history,
@@ -104,7 +105,7 @@ defmodule Ferricstore.Jepsen.CounterTest do
                HistoryRecorder.format_violations(violations)
 
       # Final value must equal number of successful increments
-      final_val = :rpc.call(n1.name, Ferricstore.Store.Router, :get, [key])
+      {:ok, final_val} = :rpc.call(n1.name, FerricStore, :get, [key])
       assert final_val != nil, "counter key should exist"
       final_int = String.to_integer(final_val)
 
@@ -134,13 +135,13 @@ defmodule Ferricstore.Jepsen.CounterTest do
       key = "jepsen:counter2"
 
       # Initialize
-      :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, "0", 0])
+      :ok = :rpc.call(node.name, FerricStore, :set, [key, "0"])
 
-      # 100 sequential increments on a single node
+      # 100 concurrent increments on a single node
       tasks =
         for _i <- 1..100 do
           Task.async(fn ->
-            :rpc.call(node.name, Ferricstore.Store.Router, :incr, [key, 1])
+            remote_incr(node.name, key, 1)
           end)
         end
 
@@ -151,7 +152,7 @@ defmodule Ferricstore.Jepsen.CounterTest do
       Process.sleep(100)
 
       # Final value must equal number of successful increments
-      final_val = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+      {:ok, final_val} = :rpc.call(node.name, FerricStore, :get, [key])
       assert final_val != nil, "counter key should exist"
       final_int = String.to_integer(final_val)
 
@@ -177,12 +178,12 @@ defmodule Ferricstore.Jepsen.CounterTest do
       node = hd(alive)
 
       key = "jepsen:counter3"
-      :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, "0", 0])
+      :ok = :rpc.call(node.name, FerricStore, :set, [key, "0"])
 
       # Sequentially increment and record each observed value
       observed_values =
         for _i <- 1..100 do
-          case :rpc.call(node.name, Ferricstore.Store.Router, :incr, [key, 1]) do
+          case remote_incr(node.name, key, 1) do
             {:ok, n} -> n
             _ -> nil
           end
@@ -204,5 +205,17 @@ defmodule Ferricstore.Jepsen.CounterTest do
         "  #{length(observed_values)} increments observed, all monotonically increasing"
       )
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  # Atomically increments a counter on the remote node using the Raft-based
+  # Router.incr, which guarantees linearizability for concurrent increments.
+  # Gets ctx from the remote node, then calls Router.incr with it.
+  defp remote_incr(node_name, key, delta) do
+    ctx = :rpc.call(node_name, FerricStore.Instance, :get, [:default])
+    :rpc.call(node_name, Ferricstore.Store.Router, :incr, [ctx, key, delta])
   end
 end

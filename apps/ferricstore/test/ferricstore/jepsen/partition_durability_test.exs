@@ -67,7 +67,7 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
         key = "partition:key:#{i}"
         value = "majority_v#{i}"
 
-        result = :rpc.call(n1.name, Ferricstore.Store.Router, :put, [key, value, 0])
+        result = :rpc.call(n1.name, FerricStore, :set, [key, value])
 
         if result == :ok do
           HistoryRecorder.record_ok(history, key, value, n1.name)
@@ -85,7 +85,7 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
         |> Enum.filter(fn {:ok, _k, _v, node, _ts} -> node == n1.name end)
 
       Enum.each(n1_entries, fn {:ok, key, value, _node, _ts} ->
-        read = :rpc.call(n1.name, Ferricstore.Store.Router, :get, [key])
+        {:ok, read} = :rpc.call(n1.name, FerricStore, :get, [key])
 
         assert read == value,
                "Lost write after partition heal: key=#{key} expected=#{value} " <>
@@ -113,7 +113,7 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
         for i <- 1..20 do
           key = "minority:#{i}"
           value = "iso_v#{i}"
-          result = :rpc.call(n3.name, Ferricstore.Store.Router, :put, [key, value, 0])
+          result = :rpc.call(n3.name, FerricStore, :set, [key, value])
           if result == :ok, do: {key, value}, else: nil
         end
         |> Enum.reject(&is_nil/1)
@@ -126,13 +126,13 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
 
       # n3 retains its own writes after heal
       Enum.each(n3_writes, fn {key, value} ->
-        read = :rpc.call(n3.name, Ferricstore.Store.Router, :get, [key])
+        {:ok, read} = :rpc.call(n3.name, FerricStore, :get, [key])
         assert read == value, "n3 lost its own write after heal: #{key}"
       end)
 
       # n1 does NOT have n3's writes (single-node mode: no replication)
       Enum.each(n3_writes, fn {key, _value} ->
-        read = :rpc.call(n1.name, Ferricstore.Store.Router, :get, [key])
+        {:ok, read} = :rpc.call(n1.name, FerricStore, :get, [key])
 
         assert read == nil,
                "n1 should not see n3's write in single-node mode: #{key}"
@@ -158,7 +158,7 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
         key = "nobogus:#{i}"
         value = "v#{i}"
 
-        case :rpc.call(n1.name, Ferricstore.Store.Router, :put, [key, value, 0]) do
+        case :rpc.call(n1.name, FerricStore, :set, [key, value]) do
           :ok -> HistoryRecorder.record_ok(majority_history, key, value, n1.name)
           _ -> :ok
         end
@@ -177,7 +177,7 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
 
       # Verify n1 still has exactly the keys it wrote -- no phantom additions
       Enum.each(pre_heal_keys, fn key ->
-        read = :rpc.call(n1.name, Ferricstore.Store.Router, :get, [key])
+        {:ok, read} = :rpc.call(n1.name, FerricStore, :get, [key])
         assert read != nil, "n1 should still have key #{key} after heal"
       end)
 

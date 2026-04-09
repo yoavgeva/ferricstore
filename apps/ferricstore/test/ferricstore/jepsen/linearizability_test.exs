@@ -60,13 +60,13 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
           value = "v#{i}"
 
           result =
-            :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, value, 0])
+            :rpc.call(node.name, FerricStore, :set, [key, value])
 
           assert result == :ok,
                  "PUT v#{i} should succeed on #{node.name}, got: #{inspect(result)}"
 
           # Immediately read from the same node -- must see >= value written.
-          read_val = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+          {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
 
           assert read_val != nil,
                  "Read after write should not be nil on #{node.name} for iteration #{i}"
@@ -88,9 +88,9 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
 
         for i <- 1..100 do
           value = "v#{i}"
-          :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, value, 0])
+          :ok = :rpc.call(node.name, FerricStore, :set, [key, value])
 
-          read_val = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+          {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
 
           assert read_val == value,
                  "Read-your-writes violated on #{node.name}: " <>
@@ -119,7 +119,7 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
         committed_values =
           for i <- 1..50 do
             v = "committed:#{i}"
-            :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, v, 0])
+            :ok = :rpc.call(node.name, FerricStore, :set, [key, v])
             v
           end
 
@@ -128,7 +128,7 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
         # Read 200 times -- only committed values are allowed
         phantoms =
           for _ <- 1..200 do
-            v = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+            {:ok, v} = :rpc.call(node.name, FerricStore, :get, [key])
 
             if MapSet.member?(committed_set, v) do
               nil
@@ -149,7 +149,7 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
       key = "jepsen:phantom:concurrent"
 
       # Pre-populate with known value
-      :ok = :rpc.call(n1.name, Ferricstore.Store.Router, :put, [key, "initial", 0])
+      :ok = :rpc.call(n1.name, FerricStore, :set, [key, "initial"])
 
       # Track all committed values
       committed_values = Agent.start_link(fn -> MapSet.new(["initial", nil]) end) |> elem(1)
@@ -162,7 +162,7 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
           for i <- 1..100 do
             v = "write:#{i}"
             Agent.update(committed_values, &MapSet.put(&1, v))
-            :ok = :rpc.call(n1.name, Ferricstore.Store.Router, :put, [key, v, 0])
+            :ok = :rpc.call(n1.name, FerricStore, :set, [key, v])
           end
         end)
 
@@ -171,7 +171,7 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
         for _ <- 1..5 do
           Task.async(fn ->
             for _ <- 1..200 do
-              v = :rpc.call(n1.name, Ferricstore.Store.Router, :get, [key])
+              {:ok, v} = :rpc.call(n1.name, FerricStore, :get, [key])
               committed = Agent.get(committed_values, & &1)
               # Allow nil since the key may not yet exist or may be between writes.
               # Also allow any committed value.
@@ -212,9 +212,9 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
         final_max =
           Enum.reduce(1..100, max_seen, fn i, acc ->
             value = "v#{i}"
-            :ok = :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, value, 0])
+            :ok = :rpc.call(node.name, FerricStore, :set, [key, value])
 
-            read_val = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+            {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
             read_version = extract_version(read_val)
 
             assert read_version >= acc,
@@ -236,15 +236,14 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
 
         for i <- 1..100 do
           :ok =
-            :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+            :rpc.call(node.name, FerricStore, :set, [
               key,
-              "version:#{i}",
-              0
+              "version:#{i}"
             ])
         end
 
         # Final read must be the last written value
-        final = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+        {:ok, final} = :rpc.call(node.name, FerricStore, :get, [key])
         assert final == "version:100", "Last-write-wins violated on #{node.name}: got #{inspect(final)}"
       end)
     end

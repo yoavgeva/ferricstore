@@ -105,14 +105,14 @@ defmodule Ferricstore.Test.HistoryRecorder do
     violations =
       Enum.flat_map(history, fn {:ok, key, value, _write_node, _ts} ->
         Enum.flat_map(nodes, fn node ->
-          case :rpc.call(node.name, Ferricstore.Store.Router, :get, [key]) do
-            ^value ->
+          case :rpc.call(node.name, FerricStore, :get, [key]) do
+            {:ok, ^value} ->
               []
 
-            nil ->
+            {:ok, nil} ->
               [{:lost_write, key, value: value, node: node.name}]
 
-            other when is_binary(other) ->
+            {:ok, other} when is_binary(other) ->
               [{:wrong_value, key, expected: value, got: other, node: node.name}]
 
             {:badrpc, reason} ->
@@ -163,8 +163,8 @@ defmodule Ferricstore.Test.HistoryRecorder do
       |> Enum.max(fn -> 0 end)
 
     Enum.flat_map(nodes, fn node ->
-      case :rpc.call(node.name, Ferricstore.Store.Router, :get, [key]) do
-        final when is_binary(final) ->
+      case :rpc.call(node.name, FerricStore, :get, [key]) do
+        {:ok, final} when is_binary(final) ->
           final_int = String.to_integer(final)
 
           if final_int >= max_acked do
@@ -174,7 +174,7 @@ defmodule Ferricstore.Test.HistoryRecorder do
               expected_min: max_acked, got: final_int, node: node.name}]
           end
 
-        nil ->
+        {:ok, nil} ->
           [{:counter_missing, key, expected_min: max_acked, got: nil, node: node.name}]
 
         {:badrpc, reason} ->

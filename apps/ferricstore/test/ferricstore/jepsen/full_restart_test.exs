@@ -62,7 +62,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
             value = "v#{i}"
 
             result =
-              :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, value, 0])
+              :rpc.call(node.name, FerricStore, :set, [key, value])
 
             if result == :ok do
               {node.name, node.data_dir, key, value}
@@ -79,7 +79,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
       # Verify all writes are readable before restart
       pre_restart_missing =
         Enum.filter(acked_writes, fn {node_name, _data_dir, key, value} ->
-          actual = :rpc.call(node_name, Ferricstore.Store.Router, :get, [key])
+          {:ok, actual} = :rpc.call(node_name, FerricStore, :get, [key])
           actual != value
         end)
 
@@ -159,7 +159,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
           if restarted == nil do
             [{:no_restarted_node, key, original: original_name}]
           else
-            actual = :rpc.call(restarted.name, Ferricstore.Store.Router, :get, [key])
+            {:ok, actual} = :rpc.call(restarted.name, FerricStore, :get, [key])
 
             if actual == value do
               []
@@ -207,10 +207,9 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
         for i <- 1..50 do
           key = "restart:incr:#{node.index}"
 
-          :rpc.call(node.name, Ferricstore.Store.Router, :put, [
+          :rpc.call(node.name, FerricStore, :set, [
             key,
-            Integer.to_string(i),
-            0
+            Integer.to_string(i)
           ])
         end
       end)
@@ -219,7 +218,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
       pre_values =
         Map.new(nodes, fn node ->
           key = "restart:incr:#{node.index}"
-          val = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+          {:ok, val} = :rpc.call(node.name, FerricStore, :get, [key])
           {node.data_dir, {key, val}}
         end)
 
@@ -276,7 +275,7 @@ defmodule Ferricstore.Jepsen.FullRestartTest do
               []
 
             {key, expected_val} ->
-              actual = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+              {:ok, actual} = :rpc.call(node.name, FerricStore, :get, [key])
 
               if actual == expected_val do
                 []

@@ -5,7 +5,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
   Tests the fundamental durability guarantee: when FerricStore acknowledges a
   write, that write must survive node crashes. In single-node Raft mode (current
   architecture), each node is its own independent Raft cluster with self-quorum.
-  The durability guarantee is: if `Router.put/3` returns `:ok`, the data was
+  The durability guarantee is: if `FerricStore.set/2` returns `:ok`, the data was
   committed to the local Raft log and applied to Bitcask. It must survive:
 
     1. Sibling node crashes (trivial -- independent nodes)
@@ -63,7 +63,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
             value = "v#{i}"
 
             result =
-              :rpc.call(node.name, Ferricstore.Store.Router, :put, [key, value, 0])
+              :rpc.call(node.name, FerricStore, :set, [key, value])
 
             if result == :ok do
               HistoryRecorder.record_ok(history, key, value, node.name)
@@ -113,7 +113,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
         node_entries = Map.get(per_node_entries, node.name, [])
 
         Enum.each(node_entries, fn {:ok, key, value, _node, _ts} ->
-          read = :rpc.call(node.name, Ferricstore.Store.Router, :get, [key])
+          {:ok, read} = :rpc.call(node.name, FerricStore, :get, [key])
 
           assert read == value,
                  "Lost write: key=#{key} expected=#{value} got=#{inspect(read)} " <>
@@ -152,7 +152,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
         key = "jepsen:survive:#{i}"
         value = "survive_v#{i}"
 
-        :ok = :rpc.call(writer.name, Ferricstore.Store.Router, :put, [key, value, 0])
+        :ok = :rpc.call(writer.name, FerricStore, :set, [key, value])
         HistoryRecorder.record_ok(history, key, value, writer.name)
       end
 
