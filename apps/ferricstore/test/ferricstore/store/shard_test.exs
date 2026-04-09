@@ -116,6 +116,14 @@ defmodule Ferricstore.Store.ShardTest do
       # Put via GenServer, flush to disk, then evict value from ETS to simulate cold key
       :ok = GenServer.call(shard, {:put, "warm_key", "warm_val", 0})
       GenServer.call(shard, :flush)
+      Ferricstore.Store.BitcaskWriter.flush_all()
+
+      # Wait for real file_id (not :pending) before evicting
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        [{_, _, _, _, fid, _, _}] = :ets.lookup(keydir, "warm_key")
+        assert is_integer(fid) and fid > 0
+      end, "file_id should be real", 20, 100)
+
       # Simulate cold key: set value to nil, preserve disk location
       [{_, _val, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, "warm_key")
       :ets.insert(keydir, {"warm_key", nil, exp, lfu, fid, off, vsize})

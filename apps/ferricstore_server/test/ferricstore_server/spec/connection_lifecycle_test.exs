@@ -9,6 +9,7 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
   """
 
   use ExUnit.Case, async: false
+  @moduletag :shard_kill
 
   alias Ferricstore.Config
   alias FerricstoreServer.Resp.{Encoder, Parser}

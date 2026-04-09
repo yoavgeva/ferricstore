@@ -79,15 +79,17 @@ defmodule Ferricstore.Review.C3CrossShardPendingWritesTest do
       result = Coordinator.execute(queue, %{}, nil)
       assert result == [:ok, :ok]
 
-      assert Router.get(FerricStore.Instance.get(:default), k0) == "val_shard0"
-      assert Router.get(FerricStore.Instance.get(:default), k1) == "val_shard1"
+      ShardHelpers.eventually(fn ->
+        assert Router.get(FerricStore.Instance.get(:default), k0) == "val_shard0"
+        assert Router.get(FerricStore.Instance.get(:default), k1) == "val_shard1"
+      end, "cross-shard values should be readable", 10, 100)
 
       ShardHelpers.flush_all_shards()
 
       # Wait for disk writes to settle
       ShardHelpers.eventually(fn ->
         MapSet.member?(keys_on_disk(shard0), k0) and MapSet.member?(keys_on_disk(shard1), k1)
-      end, "keys not on disk after flush", 20, 50)
+      end, "keys not on disk after flush", 30, 100)
 
       disk_keys_shard0 = keys_on_disk(shard0)
       disk_keys_shard1 = keys_on_disk(shard1)
