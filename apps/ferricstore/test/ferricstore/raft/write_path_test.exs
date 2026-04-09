@@ -1533,14 +1533,15 @@ defmodule Ferricstore.Raft.WritePathTest do
       assert "not_a_number" == Router.get(FerricStore.Instance.get(:default), k)
     end
 
-    test "INCR on max int64 — handles overflow (bignum)" do
+    test "INCR on max int64 — returns overflow error" do
       k = ukey("incr_overflow")
       max_int64 = 9_223_372_036_854_775_807
-      expected = max_int64 + 1
 
       :ok = Router.put(FerricStore.Instance.get(:default), k, Integer.to_string(max_int64), 0)
-      assert {:ok, ^expected} = Router.incr(FerricStore.Instance.get(:default), k, 1)
-      assert Integer.to_string(expected) == Router.get(FerricStore.Instance.get(:default), k)
+      assert {:error, "ERR increment or decrement would overflow"} =
+               Router.incr(FerricStore.Instance.get(:default), k, 1)
+      # Value should remain unchanged
+      assert Integer.to_string(max_int64) == Router.get(FerricStore.Instance.get(:default), k)
     end
 
     test "DECRBY with negative delta through Raft — effectively increments" do
