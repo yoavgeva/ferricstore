@@ -1,0 +1,90 @@
+#cloud-config
+
+# Benchmark client node — installs memtier_benchmark + Elixir for erpc benchmarks
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - build-essential
+  - git
+  - curl
+  - unzip
+  - libssl-dev
+  - automake
+  - autoconf
+  - libncurses5-dev
+  - libevent-dev
+  - pkg-config
+
+write_files:
+  - path: /home/${admin_username}/setup-client.sh
+    permissions: "0755"
+    owner: "${admin_username}:${admin_username}"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      echo "=== Benchmark Client Setup ==="
+
+      # Install asdf
+      if [ ! -d "$HOME/.asdf" ]; then
+        git clone https://github.com/asdf-vm/asdf.git ~/.asdf --branch v0.14.0
+        echo '. "$HOME/.asdf/asdf.sh"' >> ~/.bashrc
+        echo '. "$HOME/.asdf/completions/asdf.bash"' >> ~/.bashrc
+      fi
+      source "$HOME/.asdf/asdf.sh"
+
+      # Install Erlang (for erpc benchmarks)
+      asdf plugin add erlang || true
+      asdf install erlang ${otp_version}
+      asdf global erlang ${otp_version}
+
+      # Install Elixir
+      asdf plugin add elixir || true
+      asdf install elixir ${elixir_version}-otp-28
+      asdf global elixir ${elixir_version}-otp-28
+
+      # Install Rust (for NIF compilation)
+      if ! command -v cargo &> /dev/null; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env"
+      fi
+
+      # Install memtier_benchmark
+      if ! command -v memtier_benchmark &> /dev/null; then
+        cd /tmp
+        git clone https://github.com/RedisLabs/memtier_benchmark.git
+        cd memtier_benchmark
+        autoreconf -ivf
+        ./configure
+        make -j$(nproc)
+        sudo make install
+        cd ~
+      fi
+
+      # Clone FerricStore (for bench scripts + erpc client)
+      if [ ! -d "$HOME/ferricstore" ]; then
+        git clone https://github.com/yoavgeva/ferricstore.git "$HOME/ferricstore"
+      fi
+      cd "$HOME/ferricstore"
+      git pull
+      export FERRICSTORE_BUILD_NIF=1
+      mix local.hex --force
+      mix local.rebar --force
+      mix deps.get
+      mix compile
+
+      echo "=== Client setup complete ==="
+      echo ""
+      echo "Run TCP benchmark:"
+      echo "  bash bench/tcp_throughput.sh <server_private_ip> 6379"
+      echo ""
+      echo "Run erpc benchmark:"
+      echo "  elixir --sname bench --cookie ferricstore_bench -S mix run bench/erpc_throughput.exs --remote ferricstore@ferricstore-0"
+      echo ""
+      echo "Run cluster benchmark:"
+      echo "  elixir --sname bench --cookie ferricstore_bench -S mix run bench/cluster_throughput.exs --node ferricstore@ferricstore-0 --node ferricstore@ferricstore-1 --node ferricstore@ferricstore-2"
+
+runcmd:
+  - su - ${admin_username} -c "/home/${admin_username}/setup-client.sh"

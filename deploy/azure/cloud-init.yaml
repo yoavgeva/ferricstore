@@ -1,0 +1,187 @@
+#cloud-config
+
+# FerricStore server node setup
+# Installs OTP ${otp_version}, Elixir ${elixir_version}, Rust, configures OS
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - build-essential
+  - git
+  - curl
+  - unzip
+  - libssl-dev
+  - automake
+  - autoconf
+  - libncurses5-dev
+  - cpufrequtils
+  - nvme-cli
+
+write_files:
+  # OS tuning for FerricStore
+  - path: /etc/sysctl.d/99-ferricstore.conf
+    content: |
+      # Huge pages for ETS
+      vm.nr_hugepages = 512
+      # Never swap
+      vm.swappiness = 1
+      # TCP tuning
+      net.core.somaxconn = 65535
+      net.core.netdev_max_backlog = 65535
+      net.ipv4.tcp_max_syn_backlog = 65535
+      net.ipv4.tcp_tw_reuse = 1
+      net.ipv4.tcp_fin_timeout = 10
+      # Memory overcommit (for fork-based operations)
+      vm.overcommit_memory = 1
+
+  # Disable THP
+  - path: /etc/systemd/system/disable-thp.service
+    content: |
+      [Unit]
+      Description=Disable Transparent Huge Pages
+      DefaultDependencies=no
+      After=sysinit.target local-fs.target
+      Before=basic.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
+      ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+
+      [Install]
+      WantedBy=basic.target
+
+  # File limits
+  - path: /etc/security/limits.d/99-ferricstore.conf
+    content: |
+      * soft nofile 1048576
+      * hard nofile 1048576
+      * soft nproc 1048576
+      * hard nproc 1048576
+
+  # BEAM VM flags
+  - path: /home/${admin_username}/vm.args
+    content: |
+      +sbt db
+      +sbwt very_short
+      +swt very_low
+      +K true
+      +P 5000000
+      +Q 65536
+      +A 128
+      +MHas aoffcbf
+      +MBas aoffcbf
+    owner: "${admin_username}:${admin_username}"
+
+  # FerricStore systemd service
+  - path: /etc/systemd/system/ferricstore.service
+    content: |
+      [Unit]
+      Description=FerricStore
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=${admin_username}
+      WorkingDirectory=/home/${admin_username}/ferricstore
+      Environment=MIX_ENV=prod
+      Environment=FERRICSTORE_PORT=${ferricstore_port}
+      Environment=FERRICSTORE_DATA_DIR=/data/ferricstore
+      Environment=FERRICSTORE_SHARD_COUNT=${shard_count}
+      Environment=ERL_FLAGS="+sbt db +sbwt very_short +swt very_low +K true +A 128 +P 5000000 +Q 65536 +MHas aoffcbf +MBas aoffcbf"
+      ExecStart=/home/${admin_username}/.asdf/shims/elixir --sname ferricstore --cookie ferricstore_bench -S mix run --no-halt
+      Restart=on-failure
+      RestartSec=5
+      LimitNOFILE=1048576
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Setup script
+  - path: /home/${admin_username}/setup.sh
+    permissions: "0755"
+    owner: "${admin_username}:${admin_username}"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      echo "=== FerricStore Node Setup ==="
+
+      # Install asdf
+      if [ ! -d "$HOME/.asdf" ]; then
+        git clone https://github.com/asdf-vm/asdf.git ~/.asdf --branch v0.14.0
+        echo '. "$HOME/.asdf/asdf.sh"' >> ~/.bashrc
+        echo '. "$HOME/.asdf/completions/asdf.bash"' >> ~/.bashrc
+      fi
+      source "$HOME/.asdf/asdf.sh"
+
+      # Install Erlang
+      asdf plugin add erlang || true
+      asdf install erlang ${otp_version}
+      asdf global erlang ${otp_version}
+
+      # Install Elixir
+      asdf plugin add elixir || true
+      asdf install elixir ${elixir_version}-otp-28
+      asdf global elixir ${elixir_version}-otp-28
+
+      # Install Rust
+      if ! command -v cargo &> /dev/null; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env"
+      fi
+
+      # Clone and build FerricStore
+      if [ ! -d "$HOME/ferricstore" ]; then
+        git clone https://github.com/yoavgeva/ferricstore.git "$HOME/ferricstore"
+      fi
+      cd "$HOME/ferricstore"
+      git pull
+      export FERRICSTORE_BUILD_NIF=1
+      mix local.hex --force
+      mix local.rebar --force
+      mix deps.get
+      MIX_ENV=prod mix compile
+
+      echo "=== Setup complete ==="
+      echo "Start with: sudo systemctl start ferricstore"
+
+runcmd:
+  # Apply sysctl
+  - sysctl -p /etc/sysctl.d/99-ferricstore.conf
+
+  # Disable THP
+  - systemctl daemon-reload
+  - systemctl enable disable-thp
+  - systemctl start disable-thp
+
+  # CPU governor
+  - cpufreq-set -g performance 2>/dev/null || true
+
+  # Format and mount local NVMe (L-series VMs)
+  - |
+    NVME_DEV=$(ls /dev/nvme*n1 2>/dev/null | head -1)
+    if [ -n "$NVME_DEV" ]; then
+      mkfs.ext4 -F "$NVME_DEV"
+      mkdir -p /data
+      mount "$NVME_DEV" /data
+      echo "$NVME_DEV /data ext4 defaults,noatime,nodiratime 0 0" >> /etc/fstab
+      mkdir -p /data/ferricstore
+      chown ${admin_username}:${admin_username} /data/ferricstore
+
+      # NVMe scheduler
+      NVME_NAME=$(basename "$NVME_DEV" | sed 's/n1//')
+      echo none > "/sys/block/$NVME_NAME/queue/scheduler" 2>/dev/null || true
+      echo 1024 > "/sys/block/$NVME_NAME/queue/nr_requests" 2>/dev/null || true
+    else
+      mkdir -p /data/ferricstore
+      chown ${admin_username}:${admin_username} /data/ferricstore
+    fi
+
+  # Run setup as the admin user
+  - su - ${admin_username} -c "/home/${admin_username}/setup.sh"
+
+  # Enable service (don't start — user starts manually after verifying)
+  - systemctl daemon-reload
+  - systemctl enable ferricstore
