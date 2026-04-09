@@ -138,32 +138,20 @@ defmodule Ferricstore.MediumAuditFixesTest do
       assert {:error, _} = result
     end
 
-    test "MSETNX works correctly without Enum.chunk_every" do
-      put_fn = fn k, v, _exp ->
-        send(self(), {:put, k, v})
-        :ok
-      end
-
-      store = %{put: put_fn, exists?: fn _key -> false end}
-
-      result = Ferricstore.Commands.Strings.handle("MSETNX", ["k1", "v1", "k2", "v2"], store)
-      assert result == 1
-
-      assert_received {:put, "k1", "v1"}
-      assert_received {:put, "k2", "v2"}
+    test "MSETNX works correctly (atomic via CrossShardOp)" do
+      # MSETNX now uses CrossShardOp for atomicity — test via embedded API
+      Ferricstore.Test.ShardHelpers.flush_all_keys()
+      assert {:ok, true} = FerricStore.msetnx(%{"msetnx_m7_k1" => "v1", "msetnx_m7_k2" => "v2"})
+      assert FerricStore.get("msetnx_m7_k1") == {:ok, "v1"}
+      assert FerricStore.get("msetnx_m7_k2") == {:ok, "v2"}
     end
 
-    test "MSETNX returns 0 if any key exists" do
-      store = %{
-        put: fn _, _, _ -> :ok end,
-        exists?: fn
-          "k2" -> true
-          _ -> false
-        end
-      }
-
-      result = Ferricstore.Commands.Strings.handle("MSETNX", ["k1", "v1", "k2", "v2"], store)
-      assert result == 0
+    test "MSETNX returns false if any key exists" do
+      Ferricstore.Test.ShardHelpers.flush_all_keys()
+      FerricStore.set("msetnx_m7_k2", "existing")
+      assert {:ok, false} = FerricStore.msetnx(%{"msetnx_m7_k1" => "v1", "msetnx_m7_k2" => "v2"})
+      # k1 should NOT be set
+      assert FerricStore.get("msetnx_m7_k1") == {:ok, nil}
     end
 
     test "source does not use Enum.chunk_every" do

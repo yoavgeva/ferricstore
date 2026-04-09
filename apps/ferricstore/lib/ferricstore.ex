@@ -860,15 +860,29 @@ defmodule FerricStore do
   """
   @spec msetnx(%{key() => value()}) :: {:ok, boolean()}
   def msetnx(pairs) when is_map(pairs) do
-    ctx = default_ctx()
+    keys = Map.keys(pairs)
+    store = default_ctx()
 
-    any_exists = Enum.any?(pairs, fn {k, _v} -> Router.exists?(ctx, k) end)
+    result =
+      Ferricstore.CrossShardOp.execute(
+        Enum.map(keys, &{&1, :write}),
+        fn unified_store ->
+          any_exists = Enum.any?(keys, fn k -> Ferricstore.Store.Ops.exists?(unified_store, k) end)
 
-    if any_exists do
-      {:ok, false}
-    else
-      Enum.each(pairs, fn {k, v} -> Router.put(ctx, k, v, 0) end)
-      {:ok, true}
+          if any_exists do
+            false
+          else
+            Enum.each(pairs, fn {k, v} -> Ferricstore.Store.Ops.put(unified_store, k, v, 0) end)
+            true
+          end
+        end,
+        intent: %{command: :msetnx, keys: %{targets: keys}},
+        store: store
+      )
+
+    case result do
+      {:error, _} = err -> err
+      val -> {:ok, val}
     end
   end
 

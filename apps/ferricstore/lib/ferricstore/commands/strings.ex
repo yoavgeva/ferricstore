@@ -1,6 +1,7 @@
 # Suppress function clause grouping warnings (clauses added by different agents)
 defmodule Ferricstore.Commands.Strings do
   alias Ferricstore.Store.Ops
+  alias Ferricstore.CrossShardOp
   @moduledoc """
   Handles Redis string commands.
 
@@ -391,13 +392,21 @@ defmodule Ferricstore.Commands.Strings do
 
   def handle("MSETNX", args, store) do
     if even_length?(args) do
-      # Check ALL keys first — if any exist, set none
-      if msetnx_any_exists?(args, store) do
-        0
-      else
-        mset_exec(args, store)
-        1
-      end
+      keys = extract_keys(args)
+
+      CrossShardOp.execute(
+        Enum.map(keys, &{&1, :write}),
+        fn unified_store ->
+          if msetnx_any_exists?(args, unified_store) do
+            0
+          else
+            mset_exec(args, unified_store)
+            1
+          end
+        end,
+        intent: %{command: :msetnx, keys: %{targets: keys}},
+        store: store
+      )
     else
       {:error, "ERR wrong number of arguments for 'msetnx' command"}
     end
@@ -691,6 +700,10 @@ defmodule Ferricstore.Commands.Strings do
   defp msetnx_any_exists?([k, _v | rest], store) do
     if Ops.exists?(store, k), do: true, else: msetnx_any_exists?(rest, store)
   end
+
+  # Extracts keys from a flat [k, v, k, v, ...] list.
+  defp extract_keys([]), do: []
+  defp extract_keys([k, _v | rest]), do: [k | extract_keys(rest)]
 
   # O(n/2) parity check without computing full length.
   defp even_length?([]), do: true
