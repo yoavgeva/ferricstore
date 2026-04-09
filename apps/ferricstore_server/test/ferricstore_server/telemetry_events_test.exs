@@ -547,7 +547,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       assert Ferricstore.Stats.total_hot_reads() >= before_hot + 1
     end
 
-    @tag :ci_flaky
+    @tag :shard_kill
     test "cold read is recorded when key is not in ETS cache" do
       key = "hotcold_cold_#{System.unique_integer([:positive])}"
       ctx = FerricStore.Instance.get(:default)

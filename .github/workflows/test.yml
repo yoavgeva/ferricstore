@@ -341,35 +341,3 @@ jobs:
           path: test-results/
           retention-days: 14
 
-  # ===========================================================================
-  # Flaky tests (run in isolation — pass alone, fail under load)
-  # ===========================================================================
-  test-flaky:
-    name: "Flaky tests (isolated)"
-    needs: build-ubuntu
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.19"
-          otp-version: "28"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache/restore@v4
-        with:
-          path: |
-            _build
-            deps
-            apps/ferricstore/priv/native
-          key: build-Linux-${{ github.sha }}
-
-      - name: Flaky tests (isolated)
-        run: mix test --only ci_flaky --timeout 60000
-        continue-on-error: true
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results-flaky
-          path: test-results/
-          retention-days: 14
