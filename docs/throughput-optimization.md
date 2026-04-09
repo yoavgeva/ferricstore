@@ -6,37 +6,51 @@ Each section has: current default, what to benchmark, expected tradeoff.
 
 ## Tunable Parameters (need benchmarking)
 
-### 1. WAL Batch Window (ra gen_batch_server)
+### 1. WAL Batch Window (automatic, driven by fdatasync latency)
 
-**Current:** ra's `gen_batch_server` accumulates messages until the process
-mailbox is empty, then processes them all as a batch. Our async fdatasync
-patch adds another layer — writes queue until fdatasync completes, then the
-next batch starts.
+**Current:** Quorum writes go directly from the caller process to ra via
+`pipeline_command` (non-blocking cast). No Batcher, no GenServer serialization.
+
+Batching happens at two levels, both automatic:
+
+1. **ra gen_batch_server** — accumulates `pipeline_command` casts until
+   the ra leader's mailbox is empty, then writes them all to the WAL file
+   buffer in one batch.
+2. **Async fdatasync** — after the WAL buffer write, our patch queues
+   writers and spawns `fdatasync`. While fdatasync is in flight (~1-20ms
+   depending on storage), new writes accumulate. When fdatasync completes,
+   ALL accumulated writers are notified at once, then another fdatasync
+   starts if more arrived.
+
+The "batch window" IS the fdatasync latency. No explicit window_ms to tune —
+the faster the disk, the smaller the batch, the lower the latency. Slow disk =
+bigger batches = higher throughput but higher tail latency.
 
 **What to benchmark:**
 - Throughput at different concurrent writer counts (1, 10, 50, 100, 500)
 - p50/p95/p99 latency per write at each concurrency level
-- How many writes per fdatasync cycle (the "natural batch size")
+- How many writes accumulate per fdatasync cycle (log this in the WAL patch)
+- Compare NVMe vs SSD vs spinning disk (fdatasync latency is the variable)
 
-**Tradeoff:** More writes per fsync = higher throughput but higher tail latency.
-The current design auto-batches based on load — no explicit window_ms to tune.
+**Tradeoff:** This is self-tuning. Under low load: small batches, low latency.
+Under high load: large batches, high throughput. The only tunable is the
+storage medium.
 
-### 2. Batcher max_batch_size
+### 2. Batcher max_batch_size (fallback path only)
 
 **Current:** `1000` commands per slot before forced flush.
 
-**What to benchmark:**
-- Lower values (100, 500) — does it reduce latency without hurting throughput?
-- Higher values (2000, 5000) — does it improve throughput for bulk loads?
-- Measure both the embedded API path (bypasses Batcher) and TCP path
+**Important:** The Batcher is NOT in the quorum write hot path. Quorum writes
+go directly: `Router.quorum_write` → `ra.pipeline_command` → WAL. The Batcher
+is only used by:
+- Shard GenServer fallback (when ra is down)
+- Async durability namespace writes
 
-**Tradeoff:** Larger batches = fewer Raft proposals = higher throughput, but
-each proposal is bigger and takes longer to apply.
+For the hot path (quorum writes), this setting has zero effect.
 
-**Note:** The quorum write path (`Router.quorum_write`) bypasses the Batcher
-entirely — it goes directly to `ra.pipeline_command`. The Batcher is only used
-by the Shard GenServer fallback path. So this setting mainly affects the
-fallback and async paths.
+**What to benchmark (async mode only):**
+- Lower values (100, 500) — does it reduce async replication lag?
+- Higher values (2000, 5000) — does it reduce overhead for bulk async?
 
 ### 3. Shard Count
 
