@@ -171,6 +171,7 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
   # ===========================================================================
 
   describe "LPUSH/RPOP concurrent" do
+    @tag :shard_kill
     test "producer pushes items, consumer pops concurrently — total matches", %{port: port} do
       key = ukey("list_race")
       total = 200
