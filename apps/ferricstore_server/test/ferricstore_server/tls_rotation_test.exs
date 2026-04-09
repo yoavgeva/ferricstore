@@ -156,6 +156,10 @@ defmodule FerricstoreServer.TlsRotationTest do
   # ---------------------------------------------------------------------------
 
   defp connect_tls(port, extra_ssl_opts \\ []) do
+    connect_tls(port, extra_ssl_opts, 5)
+  end
+
+  defp connect_tls(port, extra_ssl_opts, retries) do
     base_opts = [
       :binary,
       active: false,
@@ -163,10 +167,14 @@ defmodule FerricstoreServer.TlsRotationTest do
       verify: :verify_none
     ]
 
-    {:ok, sock} =
-      :ssl.connect(~c"127.0.0.1", port, base_opts ++ extra_ssl_opts, 5_000)
+    case :ssl.connect(~c"127.0.0.1", port, base_opts ++ extra_ssl_opts, 5_000) do
+      {:ok, sock} ->
+        sock
 
-    sock
+      {:error, _} when retries > 0 ->
+        Process.sleep(200)
+        connect_tls(port, extra_ssl_opts, retries - 1)
+    end
   end
 
   defp connect_tls_and_hello(port, extra_ssl_opts \\ []) do

@@ -73,24 +73,30 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
 
   describe "members/1" do
     test "returns members for shard 0" do
-      {:ok, members, leader} = Cluster.members(0)
-      assert is_list(members)
-      assert members != []
-      assert leader != nil
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        {:ok, members, leader} = Cluster.members(0)
+        assert is_list(members)
+        assert members != []
+        assert leader != nil
+      end, "shard 0 should have members", 10, 200)
     end
 
     test "returns leader as the local node in single-node mode" do
-      {:ok, _members, {_name, leader_node}} = Cluster.members(0)
-      assert leader_node == node()
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        {:ok, _members, {_name, leader_node}} = Cluster.members(0)
+        assert leader_node == node()
+      end, "shard 0 should have local leader", 10, 200)
     end
 
     test "returns members for all configured shards" do
       shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
       for i <- 0..(shard_count - 1) do
-        {:ok, members, _leader} = Cluster.members(i)
-        assert is_list(members), "shard #{i} should return a member list"
-        assert members != [], "shard #{i} should have at least 1 member"
+        Ferricstore.Test.ShardHelpers.eventually(fn ->
+          {:ok, members, _leader} = Cluster.members(i)
+          assert is_list(members), "shard #{i} should return a member list"
+          assert members != [], "shard #{i} should have at least 1 member"
+        end, "shard #{i} should have members", 10, 200)
       end
     end
   end

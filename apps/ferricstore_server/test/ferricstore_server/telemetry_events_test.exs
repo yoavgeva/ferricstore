@@ -558,10 +558,14 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       :ok = GenServer.call(shard_name, :flush)
       Ferricstore.Store.BitcaskWriter.flush_all()
 
-      # Verify the key is readable before evicting from hot cache.
+      # Verify the key is readable AND has a real file_id (not :pending)
+      # before evicting from hot cache. Under load, the BitcaskWriter may
+      # not have flushed yet.
       Ferricstore.Test.ShardHelpers.eventually(fn ->
         assert Router.get(ctx, key) == "cold_value"
-      end, "key should be readable before eviction", 10, 50)
+        [{^key, _, _, _, fid, _, _}] = :ets.lookup(:"keydir_#{shard_idx}", key)
+        assert is_integer(fid) and fid > 0, "file_id should be real, got #{inspect(fid)}"
+      end, "key should be readable with real file_id", 20, 100)
 
       # Evict the value from the hot cache (set value to nil) to force a
       # cold read. This mirrors the MemoryGuard eviction mechanism: the keydir
