@@ -1259,14 +1259,15 @@ defmodule Ferricstore.Store.Router do
     dst_idx = shard_for(ctx, destination)
 
     if src_idx == dst_idx do
-      GenServer.call(resolve_shard(ctx, src_idx), {:list_op_lmove, key, destination, from_dir, to_dir})
+      raft_write(ctx, src_idx, key, {:list_op_lmove, key, destination, from_dir, to_dir})
     else
-      case GenServer.call(resolve_shard(ctx, src_idx), {:list_op, key, {:pop_for_move, from_dir}}) do
+      # Cross-shard: pop from source, push to destination
+      case raft_write(ctx, src_idx, key, {:list_op, key, {:pop_for_move, from_dir}}) do
         nil -> nil
         {:error, _} = err -> err
         element ->
           push_op = if to_dir == :left, do: {:lpush, [element]}, else: {:rpush, [element]}
-          case GenServer.call(resolve_shard(ctx, dst_idx), {:list_op, destination, push_op}) do
+          case raft_write(ctx, dst_idx, destination, {:list_op, destination, push_op}) do
             {:error, _} = err -> err
             _length -> element
           end

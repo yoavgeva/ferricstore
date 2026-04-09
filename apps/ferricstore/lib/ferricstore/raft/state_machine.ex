@@ -302,6 +302,16 @@ defmodule Ferricstore.Raft.StateMachine do
     maybe_release_cursor(meta, old_count, new_state, result)
   end
 
+  def apply(meta, {:list_op_lmove, src_key, dst_key, from_dir, to_dir}, state) do
+    store = build_compound_store(state)
+    result = with_pending_writes(state, fn ->
+      Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
+    end)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
   def apply(meta, {:compound_put, compound_key, value, expire_at_ms}, state) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(compound_key)
 
