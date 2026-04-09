@@ -443,15 +443,18 @@ defmodule FerricstoreServer.Connection do
   defp dispatch("DISCARD", args, state), do: ConnTransaction.dispatch_discard(args, state)
   defp dispatch("WATCH", args, state), do: ConnTransaction.dispatch_watch(args, state)
   defp dispatch("UNWATCH", args, state), do: ConnTransaction.dispatch_unwatch(args, state)
-  defp dispatch("SUBSCRIBE", args, state), do: ConnPubSub.dispatch_subscribe(args, state)
-  defp dispatch("UNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_unsubscribe(args, state)
-  defp dispatch("PSUBSCRIBE", args, state), do: ConnPubSub.dispatch_psubscribe(args, state)
-  defp dispatch("PUNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_punsubscribe(args, state)
-
+  # MULTI queuing guard — must be BEFORE pubsub and blocking commands.
+  # EXEC, DISCARD, MULTI, WATCH, UNWATCH are passthrough (handled above).
+  # Everything else gets queued.
   defp dispatch(cmd, args, %{multi_state: :queuing} = state)
        when cmd not in @multi_passthrough_cmds do
     ConnTransaction.dispatch_queue(cmd, args, state)
   end
+
+  defp dispatch("SUBSCRIBE", args, state), do: ConnPubSub.dispatch_subscribe(args, state)
+  defp dispatch("UNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_unsubscribe(args, state)
+  defp dispatch("PSUBSCRIBE", args, state), do: ConnPubSub.dispatch_psubscribe(args, state)
+  defp dispatch("PUNSUBSCRIBE", args, state), do: ConnPubSub.dispatch_punsubscribe(args, state)
 
   defp dispatch("BLPOP", args, state), do: ConnBlocking.dispatch_blpop(args, state)
   defp dispatch("BRPOP", args, state), do: ConnBlocking.dispatch_brpop(args, state)
