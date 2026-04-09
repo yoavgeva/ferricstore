@@ -13,8 +13,8 @@
 alias Ferricstore.Store.Router
 alias Ferricstore.Bitcask.NIF
 
-rate = 100
-duration_sec = 120
+rate = String.to_integer(System.get_env("RATE", "100"))
+duration_sec = String.to_integer(System.get_env("DURATION", "120"))
 total = rate * duration_sec
 payload = String.duplicate("x", 256)
 
