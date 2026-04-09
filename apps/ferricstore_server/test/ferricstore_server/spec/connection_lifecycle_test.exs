@@ -9,7 +9,6 @@ defmodule FerricstoreServer.Spec.ConnectionLifecycleTest do
   """
 
   use ExUnit.Case, async: false
-  @moduletag :conn_lifecycle
 
   alias Ferricstore.Config
   alias FerricstoreServer.Resp.{Encoder, Parser}

@@ -14,7 +14,6 @@ defmodule FerricstoreServer.Spec.ConcurrencyRaceTest do
   """
 
   use ExUnit.Case, async: false
-  @moduletag :concurrency
 
   alias FerricstoreServer.Resp.Encoder
   alias FerricstoreServer.Resp.Parser
