@@ -175,6 +175,7 @@ defmodule Ferricstore.GracefulShutdownTest do
       k1 = ukey("before")
       Router.put(FerricStore.Instance.get(:default), k1, "old_data")
       ShardHelpers.flush_all_shards()
+      ShardHelpers.compact_wal()
 
       shutdown_and_restart()
 

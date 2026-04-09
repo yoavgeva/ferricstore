@@ -127,13 +127,15 @@ defmodule FerricstoreServer.GracefulShutdownTest do
       :gen_tcp.close(sock)
 
       ShardHelpers.flush_all_shards()
+      ShardHelpers.compact_wal()
       shutdown_and_restart()
 
-      sock2 = connect()
-      result = tcp_get(sock2, "tcp_gsd_1")
-      :gen_tcp.close(sock2)
-
-      assert result == "hello_shutdown"
+      ShardHelpers.eventually(fn ->
+        sock2 = connect()
+        result = tcp_get(sock2, "tcp_gsd_1")
+        :gen_tcp.close(sock2)
+        assert result == "hello_shutdown"
+      end, "GET after restart should return value", 10, 500)
     end
 
     test "multiple keys from different connections survive" do

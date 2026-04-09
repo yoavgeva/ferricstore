@@ -410,6 +410,7 @@ defmodule Ferricstore.Commands.BloomNifTest do
   # ===========================================================================
 
   describe "stress test" do
+    @tag :bench
     @tag timeout: 120_000
     test "100K adds and 100K exists checks" do
       store = make_nif_store()

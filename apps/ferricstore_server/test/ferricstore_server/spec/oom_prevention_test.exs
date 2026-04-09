@@ -57,11 +57,13 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
           eviction_policy: :noeviction
         ])
 
-      # Trigger a check
+      # Trigger a check and wait for it to process
       send(pid, :check)
-      Process.sleep(100)
 
-      assert GenServer.call(pid, :reject_writes?) == false
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        assert GenServer.call(pid, :reject_writes?) == false
+      end, "reject_writes? should be false with normal pressure", 10, 100)
+
       GenServer.stop(pid)
     end
 
@@ -142,8 +144,9 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
 
       # With a large budget, pressure should be :ok
       send(pid, :check)
-      Process.sleep(50)
-      assert GenServer.call(pid, :reject_writes?) == false
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        assert GenServer.call(pid, :reject_writes?) == false
+      end, "large budget should not reject", 10, 100)
 
       GenServer.stop(pid)
 
@@ -157,8 +160,9 @@ defmodule FerricstoreServer.Spec.OomPreventionTest do
         ])
 
       send(pid2, :check)
-      Process.sleep(50)
-      assert GenServer.call(pid2, :reject_writes?) == true
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        assert GenServer.call(pid2, :reject_writes?) == true
+      end, "tiny budget should reject", 10, 100)
 
       GenServer.stop(pid2)
     end
