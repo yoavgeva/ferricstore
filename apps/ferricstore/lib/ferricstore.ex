@@ -453,6 +453,9 @@ defmodule FerricStore do
 
   """
   @spec incr_by(key(), integer()) :: {:ok, integer()} | {:error, binary()}
+  @int64_max 9_223_372_036_854_775_807
+  @int64_min -9_223_372_036_854_775_808
+
   def incr_by(key, amount) when is_integer(amount) do
     ctx = default_ctx()
 
@@ -461,8 +464,13 @@ defmodule FerricStore do
     case parse_int_value(current) do
       {:ok, int_val} ->
         new_val = int_val + amount
-        Router.put(ctx, key, Integer.to_string(new_val), 0)
-        {:ok, new_val}
+
+        if new_val > @int64_max or new_val < @int64_min do
+          {:error, "ERR increment or decrement would overflow"}
+        else
+          Router.put(ctx, key, Integer.to_string(new_val), 0)
+          {:ok, new_val}
+        end
 
       {:error, _} = err ->
         err

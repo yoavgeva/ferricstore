@@ -1683,18 +1683,30 @@ defmodule Ferricstore.Raft.StateMachine do
   # Atomic INCR/DECR/INCRBY/DECRBY: reads current value, parses as integer,
   # adds delta, writes back. Preserves existing expire_at_ms.
   # Returns {:ok, new_integer} or {:error, reason}.
+  # Enforces int64 bounds [-2^63, 2^63-1] to match Redis behavior.
+  @int64_max 9_223_372_036_854_775_807
+  @int64_min -9_223_372_036_854_775_808
+
   defp do_incr(state, key, delta) do
     case do_get_meta(state, key) do
       nil ->
-        do_put(state, key, delta, 0)
-        {:ok, delta}
+        if delta > @int64_max or delta < @int64_min do
+          {:error, "ERR increment or decrement would overflow"}
+        else
+          do_put(state, key, delta, 0)
+          {:ok, delta}
+        end
 
       {value, expire_at_ms} ->
         case coerce_integer(value) do
           {:ok, int_val} ->
             new_val = int_val + delta
-            do_put(state, key, new_val, expire_at_ms)
-            {:ok, new_val}
+            if new_val > @int64_max or new_val < @int64_min do
+              {:error, "ERR increment or decrement would overflow"}
+            else
+              do_put(state, key, new_val, expire_at_ms)
+              {:ok, new_val}
+            end
 
           :error ->
             {:error, "ERR value is not an integer or out of range"}
