@@ -146,7 +146,7 @@ for i <- 1..total do
   keydir = Router.resolve_keydir(ctx, idx)
 
   case :ets.lookup(keydir, key) do
-    [{^key, _val, _exp, _lfu, fid, offset, _vsize}] when is_integer(fid) and fid > 0 ->
+    [{^key, _val, _exp, _lfu, fid, offset, _vsize}] when is_integer(fid) and fid >= 0 ->
       shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
       file_path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(fid), 5, "0")}.log")
 
