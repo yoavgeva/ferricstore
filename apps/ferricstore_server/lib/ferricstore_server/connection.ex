@@ -98,13 +98,11 @@ defmodule FerricstoreServer.Connection do
     pubsub_channels: nil,
     pubsub_patterns: nil,
     tracking: nil,
-    read_mode: :consistent,
     acl_cache: nil,
     active_mode: 100
   ]
 
   @type multi_state :: :none | :queuing
-  @type read_mode :: :consistent | :stale
 
   @typedoc """
   Cached ACL permissions for the current user. Populated on AUTH and connection
@@ -132,7 +130,6 @@ defmodule FerricstoreServer.Connection do
           multi_queue_count: non_neg_integer(),
           watched_keys: %{binary() => non_neg_integer()},
           tracking: ClientTracking.tracking_config() | nil,
-          read_mode: read_mode(),
           acl_cache: acl_cache()
         }
 
@@ -437,7 +434,9 @@ defmodule FerricstoreServer.Connection do
   defp dispatch("ACL", [subcmd | rest], state), do: ConnAuth.dispatch_acl(String.upcase(subcmd), rest, state)
   defp dispatch("ACL", [], state), do: {:continue, Encoder.encode({:error, "ERR wrong number of arguments for 'acl' command"}), state}
   defp dispatch("RESET", _args, state), do: dispatch_reset(state)
-  defp dispatch("READMODE", args, state), do: dispatch_readmode(args, state)
+  defp dispatch("READMODE", _args, state) do
+    {:continue, Encoder.encode({:error, "ERR unknown command 'READMODE'"}), state}
+  end
   defp dispatch("SANDBOX", args, state), do: dispatch_sandbox(args, state)
   defp dispatch("MULTI", args, state), do: ConnTransaction.dispatch_multi(args, state)
   defp dispatch("EXEC", args, state), do: ConnTransaction.dispatch_exec(args, state)
@@ -528,7 +527,6 @@ defmodule FerricstoreServer.Connection do
       watched_keys: %{},
       sandbox_namespace: nil,
       tracking: ClientTracking.new_config(),
-      read_mode: :consistent,
       authenticated: false,
       username: "default",
       pubsub_channels: nil,
@@ -538,26 +536,6 @@ defmodule FerricstoreServer.Connection do
     {:continue, Encoder.encode({:simple, "RESET"}), new_state}
   end
 
-  defp dispatch_readmode([mode], state) do
-    case String.upcase(mode) do
-      "STALE" ->
-        {:continue, Encoder.encode(:ok), %{state | read_mode: :stale}}
-
-      "CONSISTENT" ->
-        {:continue, Encoder.encode(:ok), %{state | read_mode: :consistent}}
-
-      other ->
-        {:continue,
-         Encoder.encode({:error, "ERR unknown read mode '#{other}', use STALE or CONSISTENT"}),
-         state}
-    end
-  end
-
-  defp dispatch_readmode(_args, state) do
-    {:continue,
-     Encoder.encode({:error, "ERR wrong number of arguments for 'readmode' command"}),
-     state}
-  end
 
   defp dispatch_sandbox([subcmd | rest], state) do
     sandbox_mode = Ferricstore.Config.get_value("sandbox_mode")

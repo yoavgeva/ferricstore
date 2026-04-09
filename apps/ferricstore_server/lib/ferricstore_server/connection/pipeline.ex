@@ -13,7 +13,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # connection-level state (transaction mode, pub/sub subscriptions, auth,
   # sandbox, blocking ops, etc.).
   @stateful_cmds ~w(
-    HELLO CLIENT QUIT AUTH ACL RESET READMODE SANDBOX
+    HELLO CLIENT QUIT AUTH ACL RESET SANDBOX
     MULTI EXEC DISCARD WATCH UNWATCH
     SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
     BLPOP BRPOP BLMOVE BLMPOP
