@@ -216,12 +216,10 @@ defmodule FerricstoreServer.ReviewR4Test do
   end
 
   # ---------------------------------------------------------------------------
-  # B11. CLIENT SETNAME allows newlines — CONFIRMED BUG
+  # B11. CLIENT SETNAME validation — FIXED
   # ---------------------------------------------------------------------------
 
   describe "B11: CLIENT SETNAME validation" do
-    # client.ex:61-67: only checks String.contains?(name, " ")
-
     test "CLIENT SETNAME rejects spaces" do
       sock = connect()
       result = cmd(sock, ["CLIENT", "SETNAME", "hello world"])
@@ -229,17 +227,17 @@ defmodule FerricstoreServer.ReviewR4Test do
       :gen_tcp.close(sock)
     end
 
-    test "CLIENT SETNAME accepts newlines (bug - should reject)" do
+    test "CLIENT SETNAME rejects newlines" do
       sock = connect()
-      result = unwrap(cmd(sock, ["CLIENT", "SETNAME", "hello\nworld"]))
-      assert result == "OK"
+      result = cmd(sock, ["CLIENT", "SETNAME", "hello\nworld"])
+      assert match?({:error, "ERR Client names cannot contain" <> _}, result)
       :gen_tcp.close(sock)
     end
 
-    test "CLIENT SETNAME accepts carriage returns (bug - should reject)" do
+    test "CLIENT SETNAME rejects carriage returns" do
       sock = connect()
-      result = unwrap(cmd(sock, ["CLIENT", "SETNAME", "hello\rworld"]))
-      assert result == "OK"
+      result = cmd(sock, ["CLIENT", "SETNAME", "hello\rworld"])
+      assert match?({:error, "ERR Client names cannot contain" <> _}, result)
       :gen_tcp.close(sock)
     end
 
