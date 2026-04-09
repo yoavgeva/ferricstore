@@ -282,19 +282,26 @@ jobs:
             apps/ferricstore/priv/native
           key: build-Linux-${{ github.sha }}
 
-      - name: Shard-kill durability tests
-        run: mix test --only shard_kill --timeout 120000
-        continue-on-error: true
-
-      - name: Jepsen-style durability tests
+      - name: Shard-kill + Jepsen + large alloc tests (threshold: max 5 failures)
         run: |
           epmd -daemon
-          elixir --sname ci_jepsen --cookie ferricstore_test -S mix test --include jepsen --timeout 120000
-        continue-on-error: true
+          set +e
 
-      - name: Large allocation tests
-        run: mix test apps/ferricstore/test --only large_alloc --timeout 120000
-        continue-on-error: true
+          # Run all durability tests, capture exit codes
+          mix test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_shard_kill.log
+          elixir --sname ci_jepsen --cookie ferricstore_test -S mix test --include jepsen --timeout 120000 2>&1 | tee /tmp/durability_jepsen.log
+          mix test apps/ferricstore/test --only large_alloc --timeout 120000 2>&1 | tee /tmp/durability_large_alloc.log
+
+          # Count total failures across all runs
+          FAILURES=$(grep -h "failures" /tmp/durability_*.log | grep -oP '\d+ failure' | awk '{s+=$1} END {print s+0}')
+          echo "Total durability failures: $FAILURES"
+
+          if [ "$FAILURES" -gt 5 ]; then
+            echo "FAIL: $FAILURES failures exceeds threshold of 5"
+            exit 1
+          else
+            echo "PASS: $FAILURES failures within threshold of 5"
+          fi
 
       # io_uring tests run via cargo test in the build step (Rust-level).
       # No Elixir tests are tagged :linux_io_uring.
@@ -328,11 +335,21 @@ jobs:
             apps/ferricstore/priv/native
           key: build-Linux-${{ github.sha }}
 
-      - name: Cluster tests
+      - name: Cluster tests (threshold: max 5 failures)
         run: |
           epmd -daemon
-          elixir --sname ci_cluster --cookie ferricstore_test -S mix test --include cluster --timeout 60000
-        continue-on-error: true
+          set +e
+          elixir --sname ci_cluster --cookie ferricstore_test -S mix test --include cluster --timeout 60000 2>&1 | tee /tmp/cluster.log
+
+          FAILURES=$(grep -oP '\d+ failure' /tmp/cluster.log | awk '{s+=$1} END {print s+0}')
+          echo "Total cluster failures: $FAILURES"
+
+          if [ "$FAILURES" -gt 5 ]; then
+            echo "FAIL: $FAILURES failures exceeds threshold of 5"
+            exit 1
+          else
+            echo "PASS: $FAILURES failures within threshold of 5"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
