@@ -132,7 +132,7 @@ defmodule Ferricstore.Commands.Cluster do
       "role: #{status.role}",
       "node: #{status.node}",
       "sync_status: #{status.sync_status}",
-      "connected_nodes: #{Enum.join(Enum.map(status.connected_nodes, &Atom.to_string/1), ", ")}"
+      "connected_nodes: #{Enum.map_join(status.connected_nodes, ", ", &Atom.to_string/1)}"
     ]
 
     shard_lines =

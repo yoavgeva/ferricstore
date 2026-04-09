@@ -99,10 +99,7 @@ defmodule Ferricstore.Cluster.DataSync do
         _, _ -> false
       end
 
-    unless target_has_data do
-      Logger.info("Shard #{shard_index}: target #{target_node} has no data, needs full resync")
-      :needs_resync
-    else
+    if target_has_data do
       # Target has data — check if its WAL can bridge to the leader
       target_server_id = RaftCluster.shard_server_id_on(shard_index, target_node)
 
@@ -133,6 +130,9 @@ defmodule Ferricstore.Cluster.DataSync do
         _ ->
           :needs_resync
       end
+    else
+      Logger.info("Shard #{shard_index}: target #{target_node} has no data, needs full resync")
+      :needs_resync
     end
   end
 

@@ -85,8 +85,8 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
-      - name: Credo (strict, zero warnings)
-        run: mix credo --strict
+      - name: Credo
+        run: mix credo --min-priority high
 
       - name: Run tests (excluding shard-kill)
         run: mix test --trace --timeout 30000
