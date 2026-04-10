@@ -675,7 +675,10 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
       # Add a slow log entry and wait for it to be processed
       Ferricstore.SlowLog.maybe_log(["SET", "key", "val"], 999_999_999)
       GenServer.call(Ferricstore.SlowLog, :ping)
-      assert Ferricstore.SlowLog.len() > 0
+
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        Ferricstore.SlowLog.len() > 0
+      end, "slowlog entry should be recorded", 10, 50)
 
       Server.handle("CONFIG", ["RESETSTAT"], store)
       assert Ferricstore.SlowLog.len() == 0

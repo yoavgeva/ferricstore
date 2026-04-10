@@ -490,6 +490,9 @@ defmodule FerricstoreServer.Commands.TransactionBugHuntTest do
       sock2 = connect_and_hello(port)
       send_cmd(sock2, ["SET", k, "modified_after_discard"])
       assert recv_response(sock2) == {:simple, "OK"}
+      # Verify the SET landed before proceeding
+      send_cmd(sock2, ["GET", k])
+      assert recv_response(sock2) == "modified_after_discard"
       :gen_tcp.close(sock2)
 
       # Start a new MULTI/EXEC without re-watching.
