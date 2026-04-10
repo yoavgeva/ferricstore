@@ -364,28 +364,30 @@ defmodule Ferricstore.Test.ClusterHelper do
   def partition_node(node, all_nodes) do
     others = Enum.reject(all_nodes, &(&1.name == node.name))
     other_names = Enum.map(others, & &1.name)
+    test_node = Node.self()
 
-    # Block the partitioned node from connecting to others
-    # by setting allowed nodes to only itself
-    :rpc.call(node.name, :net_kernel, :allow, [[node.name]])
-
-    # On each other node, block connections from the partitioned node
-    Enum.each(others, fn other ->
-      allowed = Enum.map(others, & &1.name)
-      :rpc.call(other.name, :net_kernel, :allow, [allowed])
-    end)
-
-    # Now disconnect — they can't reconnect because allow blocks it
+    # Step 1: Disconnect the partitioned node from others FIRST
+    # (while we still have RPC access to all nodes)
     Enum.each(others, fn other ->
       :rpc.call(node.name, :erlang, :disconnect_node, [other.name])
       :rpc.call(other.name, :erlang, :disconnect_node, [node.name])
     end)
 
-    # Wait until the partitioned node is actually disconnected from all others
+    # Step 2: Set net_kernel:allow to prevent auto-reconnection.
+    # Include test_node in allow list so we can still RPC for assertions.
+    :rpc.call(node.name, :net_kernel, :allow, [[node.name, test_node]])
+
+    Enum.each(others, fn other ->
+      # Allow other cluster nodes + test node, but NOT the partitioned node
+      allowed = [test_node | Enum.map(others, & &1.name)]
+      :rpc.call(other.name, :net_kernel, :allow, [allowed])
+    end)
+
+    # Step 3: Wait until the partitioned node is actually disconnected
     Ferricstore.Test.ShardHelpers.eventually(fn ->
-      peers = :rpc.call(node.name, Node, :list, [])
-      unless Enum.all?(other_names, fn n -> n not in peers end) do
-        raise "#{node.name} still connected to #{inspect(peers -- [node.name])}"
+      peers = :rpc.call(node.name, :erlang, :nodes, [])
+      unless is_list(peers) and Enum.all?(other_names, fn n -> n not in peers end) do
+        raise "#{node.name} still connected to #{inspect(peers)}"
       end
     end, "partition should disconnect #{node.name}", 20, 100)
 
@@ -399,9 +401,9 @@ defmodule Ferricstore.Test.ClusterHelper do
   """
   @spec heal_partition(map(), [map()]) :: :ok
   def heal_partition(node, all_nodes) do
-    all_names = Enum.map(all_nodes, & &1.name)
+    all_names = [Node.self() | Enum.map(all_nodes, & &1.name)]
 
-    # Re-allow all nodes on every node
+    # Re-allow all nodes (including test node) on every node
     Enum.each(all_nodes, fn n ->
       :rpc.call(n.name, :net_kernel, :allow, [all_names])
     end)
@@ -416,9 +418,9 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     # Wait until the healed node sees all others
     Ferricstore.Test.ShardHelpers.eventually(fn ->
-      peers = :rpc.call(node.name, Node, :list, [])
+      peers = :rpc.call(node.name, :erlang, :nodes, [])
       other_names = Enum.map(others, & &1.name)
-      unless Enum.all?(other_names, fn n -> n in peers end) do
+      unless is_list(peers) and Enum.all?(other_names, fn n -> n in peers end) do
         raise "#{node.name} not reconnected to all peers yet"
       end
     end, "heal should reconnect #{node.name}", 20, 200)
