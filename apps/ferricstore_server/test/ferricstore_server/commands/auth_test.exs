@@ -8,7 +8,11 @@ defmodule FerricstoreServer.Commands.AuthTest do
 
   # Reset requirepass after each test to avoid contaminating other tests.
   setup do
-    on_exit(fn -> Config.set("requirepass", "") end)
+    FerricstoreServer.Acl.reset!()
+    on_exit(fn ->
+      Config.set("requirepass", "")
+      FerricstoreServer.Acl.reset!()
+    end)
     %{port: Listener.port()}
   end
 
