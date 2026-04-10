@@ -364,32 +364,40 @@ defmodule Ferricstore.Test.ClusterHelper do
   def partition_node(node, all_nodes) do
     others = Enum.reject(all_nodes, &(&1.name == node.name))
     other_names = Enum.map(others, & &1.name)
-    test_node = Node.self()
+    shards = :rpc.call(node.name, Application, :get_env, [:ferricstore, :shard_count, 4])
 
-    # Step 1: Disconnect the partitioned node from others FIRST
-    # (while we still have RPC access to all nodes)
+    # Suspend ClusterManager on ALL nodes to prevent auto-reconnect
+    Enum.each(all_nodes, fn n ->
+      cm_pid = :rpc.call(n.name, Process, :whereis, [Ferricstore.Cluster.Manager])
+      if is_pid(cm_pid), do: :rpc.call(n.name, :sys, :suspend, [cm_pid])
+    end)
+
+    # Stop ra servers on the partitioned node — ra monitors remote processes
+    # which triggers automatic Erlang distribution reconnection
+    ra_system = :rpc.call(node.name, Ferricstore.Raft.Cluster, :system_name, [])
+
+    for i <- 0..(shards - 1) do
+      server_id = :rpc.call(node.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+      try do
+        :rpc.call(node.name, :ra, :stop_server, [ra_system, server_id])
+      catch
+        _, _ -> :ok
+      end
+    end
+
+    # Disconnect
     Enum.each(others, fn other ->
       :rpc.call(node.name, :erlang, :disconnect_node, [other.name])
       :rpc.call(other.name, :erlang, :disconnect_node, [node.name])
     end)
 
-    # Step 2: Set net_kernel:allow to prevent auto-reconnection.
-    # Include test_node in allow list so we can still RPC for assertions.
-    :rpc.call(node.name, :net_kernel, :allow, [[node.name, test_node]])
-
-    Enum.each(others, fn other ->
-      # Allow other cluster nodes + test node, but NOT the partitioned node
-      allowed = [test_node | Enum.map(others, & &1.name)]
-      :rpc.call(other.name, :net_kernel, :allow, [allowed])
-    end)
-
-    # Step 3: Wait until the partitioned node is actually disconnected
+    # Wait until disconnected
     Ferricstore.Test.ShardHelpers.eventually(fn ->
       peers = :rpc.call(node.name, :erlang, :nodes, [])
       unless is_list(peers) and Enum.all?(other_names, fn n -> n not in peers end) do
         raise "#{node.name} still connected to #{inspect(peers)}"
       end
-    end, "partition should disconnect #{node.name}", 20, 100)
+    end, "partition should disconnect #{node.name}", 20, 200)
 
     :ok
   end
@@ -401,19 +409,31 @@ defmodule Ferricstore.Test.ClusterHelper do
   """
   @spec heal_partition(map(), [map()]) :: :ok
   def heal_partition(node, all_nodes) do
-    all_names = [Node.self() | Enum.map(all_nodes, & &1.name)]
-
-    # Re-allow all nodes (including test node) on every node
-    Enum.each(all_nodes, fn n ->
-      :rpc.call(n.name, :net_kernel, :allow, [all_names])
-    end)
-
-    # Reconnect
     others = Enum.reject(all_nodes, &(&1.name == node.name))
+    shards = :rpc.call(node.name, Application, :get_env, [:ferricstore, :shard_count, 4])
 
+    # Reconnect first
     Enum.each(others, fn other ->
       :rpc.call(node.name, Node, :connect, [other.name])
       :rpc.call(other.name, Node, :connect, [node.name])
+    end)
+
+    # Restart ra servers on the partitioned node
+    ra_system = :rpc.call(node.name, Ferricstore.Raft.Cluster, :system_name, [])
+
+    for i <- 0..(shards - 1) do
+      server_id = :rpc.call(node.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+      try do
+        :rpc.call(node.name, :ra, :restart_server, [ra_system, server_id])
+      catch
+        _, _ -> :ok
+      end
+    end
+
+    # Resume ClusterManager on ALL nodes
+    Enum.each(all_nodes, fn n ->
+      cm_pid = :rpc.call(n.name, Process, :whereis, [Ferricstore.Cluster.Manager])
+      if is_pid(cm_pid), do: :rpc.call(n.name, :sys, :resume, [cm_pid])
     end)
 
     # Wait until the healed node sees all others
@@ -423,7 +443,7 @@ defmodule Ferricstore.Test.ClusterHelper do
       unless is_list(peers) and Enum.all?(other_names, fn n -> n in peers end) do
         raise "#{node.name} not reconnected to all peers yet"
       end
-    end, "heal should reconnect #{node.name}", 20, 200)
+    end, "heal should reconnect #{node.name}", 30, 200)
 
     :ok
   end
