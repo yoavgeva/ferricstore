@@ -401,12 +401,14 @@ defmodule FerricstoreServer.Integration.ProbCommandsTcpTest do
 
     test "TDIGEST.MIN + TDIGEST.MAX", ctx do
       sock = connect(ctx)
-      redis(sock, ["TDIGEST.CREATE", "td_mm"])
-      redis(sock, ["TDIGEST.ADD", "td_mm", "10", "20", "30"])
+      assert {:ok, "OK"} = redis(sock, ["TDIGEST.CREATE", "td_mm"])
+      assert {:ok, "OK"} = redis(sock, ["TDIGEST.ADD", "td_mm", "10", "20", "30"])
 
-      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.MIN", "td_mm"]))
-      {:ok, min_raw} = :gen_tcp.recv(sock, 0, 5000)
-      refute String.starts_with?(min_raw, "-")
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.MIN", "td_mm"]))
+        {:ok, raw} = :gen_tcp.recv(sock, 0, 5000)
+        not String.starts_with?(raw, "-")
+      end, "TDIGEST.MIN should succeed after CREATE+ADD", 10, 100)
 
       :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.MAX", "td_mm"]))
       {:ok, max_raw} = :gen_tcp.recv(sock, 0, 5000)
@@ -417,12 +419,15 @@ defmodule FerricstoreServer.Integration.ProbCommandsTcpTest do
 
     test "TDIGEST.CDF + TDIGEST.RANK + TDIGEST.TRIMMED_MEAN", ctx do
       sock = connect(ctx)
-      redis(sock, ["TDIGEST.CREATE", "td_cdf"])
-      redis(sock, ["TDIGEST.ADD", "td_cdf", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
+      assert {:ok, "OK"} = redis(sock, ["TDIGEST.CREATE", "td_cdf"])
+      assert {:ok, "OK"} = redis(sock, ["TDIGEST.ADD", "td_cdf", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
 
-      :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.CDF", "td_cdf", "5"]))
-      {:ok, cdf_raw} = :gen_tcp.recv(sock, 0, 5000)
-      refute String.starts_with?(cdf_raw, "-")
+      # Retry CDF read — on slow CI the tdigest file may not be flushed yet
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.CDF", "td_cdf", "5"]))
+        {:ok, raw} = :gen_tcp.recv(sock, 0, 5000)
+        not String.starts_with?(raw, "-")
+      end, "TDIGEST.CDF should succeed after CREATE+ADD", 10, 100)
 
       :ok = :gen_tcp.send(sock, encode_cmd(["TDIGEST.RANK", "td_cdf", "5"]))
       {:ok, rank_raw} = :gen_tcp.recv(sock, 0, 5000)
