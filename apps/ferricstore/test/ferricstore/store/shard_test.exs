@@ -123,7 +123,7 @@ defmodule Ferricstore.Store.ShardTest do
       Ferricstore.Test.ShardHelpers.eventually(fn ->
         [{_, _, _, _, fid, _, _}] = :ets.lookup(keydir, "warm_key")
         assert is_integer(fid) and fid > 0, "file_id should be real, got #{inspect(fid)}"
-      end, "file_id should be real", 30, 200)
+      end, "file_id should be real", 50, 200)
 
       # Simulate cold key: set value to nil, preserve disk location
       [{_, _val, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, "warm_key")

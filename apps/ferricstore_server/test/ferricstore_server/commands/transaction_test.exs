@@ -513,6 +513,10 @@ defmodule FerricstoreServer.Commands.TransactionTest do
       sock2 = connect_and_hello(port)
       send_cmd(sock2, ["SET", k, "created"])
       assert recv_response(sock2) == {:simple, "OK"}
+
+      # Verify the key exists before proceeding — ensures ETS is updated
+      send_cmd(sock2, ["GET", k])
+      assert recv_response(sock2) == {:bulk, "created"}
       :gen_tcp.close(sock2)
 
       send_cmd(sock, ["MULTI"])
@@ -523,7 +527,7 @@ defmodule FerricstoreServer.Commands.TransactionTest do
 
       send_cmd(sock, ["EXEC"])
       result = recv_response(sock)
-      # Should abort because the shard version changed when the key was created
+      # Should abort because the watched key's value changed (nil → "created")
       assert result == nil
 
       :gen_tcp.close(sock)

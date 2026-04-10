@@ -27,9 +27,10 @@ defmodule Ferricstore.HLC do
   ## Architecture
 
   The hot-path functions `now/0` and `now_ms/0` are **lock-free**: they use
-  `:atomics` (stored in `:persistent_term`) instead of a `GenServer.call`.
-  This eliminates the single-process serialization bottleneck that was limiting
-  write throughput at high concurrency.
+  a single `:atomics` slot (stored in `:persistent_term`) instead of a
+  `GenServer.call`. Physical ms and logical counter are packed into one
+  64-bit integer, eliminating the two-slot race that broke monotonicity
+  under contention.
 
   The GenServer is retained only for:
 
@@ -38,10 +39,13 @@ defmodule Ferricstore.HLC do
     * Process supervision -- the `init/1` callback creates the atomics ref and
       stores it in `:persistent_term`.
 
-  Slot layout in the `:atomics` ref (both are unsigned 64-bit):
+  Packed layout in a single unsigned 64-bit atomic:
 
-    * Slot 1: `last_physical_ms` -- the most recent physical millisecond.
-    * Slot 2: `logical_counter` -- the logical counter within that millisecond.
+      |-- physical_ms (48 bits) --|-- logical (16 bits) --|
+
+  48 bits covers ~8,920 years of milliseconds. 16 bits allows 65,535
+  increments per millisecond. If logical overflows, it spills into the
+  physical bits — effectively advancing the clock by 1 ms, which is safe.
 
   ## Usage
 
@@ -74,6 +78,7 @@ defmodule Ferricstore.HLC do
   """
 
   use GenServer
+  import Bitwise
 
   require Logger
 
@@ -91,9 +96,12 @@ defmodule Ferricstore.HLC do
   # :persistent_term key for the atomics ref.
   @atomics_key :ferricstore_hlc_ref
 
-  # Atomics slot indices.
-  @slot_physical 1
-  @slot_logical 2
+  # Single packed slot.
+  @slot 1
+
+  # Bit layout: 48-bit physical | 16-bit logical.
+  @logical_bits 16
+  @logical_mask Bitwise.bsl(1, 16) - 1
 
   # ---------------------------------------------------------------------------
   # Client API
@@ -120,11 +128,14 @@ defmodule Ferricstore.HLC do
   @doc """
   Returns the current HLC timestamp as `{physical_ms, logical}`.
 
-  This function is **lock-free** -- it reads and updates an `:atomics` ref
-  directly, bypassing the GenServer. At high concurrency, concurrent callers
-  may read the same `last_physical_ms` and race on the logical counter
-  increment; `:atomics.add_get/3` is atomic so each caller gets a unique
-  logical value.
+  This function is **lock-free** -- it reads and updates a single packed
+  `:atomics` slot directly, bypassing the GenServer. Physical ms and logical
+  counter are packed into one 64-bit integer, so updates are truly atomic
+  with no torn-read races.
+
+  On the common path (same millisecond), uses `add_get(ref, 1, 1)` which
+  atomically increments the logical counter with zero contention. CAS is
+  only used at millisecond boundaries.
 
   Falls back to `{System.os_time(:millisecond), 0}` when the HLC GenServer
   has not been started.
@@ -140,30 +151,12 @@ defmodule Ferricstore.HLC do
   """
   @spec now() :: timestamp()
   def now do
-    ref = atomics_ref()
-
-    case ref do
+    case atomics_ref() do
       nil ->
         {System.os_time(:millisecond), 0}
 
       ref ->
-        wall = System.os_time(:millisecond)
-        last = :atomics.get(ref, @slot_physical)
-
-        if wall > last do
-          # Wall clock advanced -- try to update physical and reset logical.
-          # Another process may race us here. That is acceptable: the worst
-          # case is two processes both see wall > last and both write the same
-          # wall value (idempotent put) then both get logical 0 or 1 via
-          # add_get. Monotonicity is preserved because wall > last.
-          :atomics.put(ref, @slot_physical, wall)
-          :atomics.put(ref, @slot_logical, 0)
-          {wall, 0}
-        else
-          # Same ms or clock went backward -- increment logical counter.
-          logical = :atomics.add_get(ref, @slot_logical, 1)
-          {last, logical}
-        end
+        hlc_now_packed(ref)
     end
   end
 
@@ -272,7 +265,7 @@ defmodule Ferricstore.HLC do
         0
 
       ref ->
-        phys = :atomics.get(ref, @slot_physical)
+        {phys, _logical} = unpack(:atomics.get(ref, @slot))
         wall = System.os_time(:millisecond)
         abs(wall - phys)
     end
@@ -367,17 +360,9 @@ defmodule Ferricstore.HLC do
 
   @impl true
   def init(_opts) do
-    # Create an atomics ref with 2 slots (signed 64-bit by default).
-    # Slot 1: last_physical_ms, Slot 2: logical_counter.
-    ref = :atomics.new(2, signed: true)
-
-    # Initialize slots to zero.
-    :atomics.put(ref, @slot_physical, 0)
-    :atomics.put(ref, @slot_logical, 0)
-
-    # Store in :persistent_term so any process can access it lock-free.
+    ref = :atomics.new(1, signed: false)
+    :atomics.put(ref, @slot, 0)
     :persistent_term.put(@atomics_key, ref)
-
     {:ok, %{}}
   end
 
@@ -385,16 +370,15 @@ defmodule Ferricstore.HLC do
   def handle_call({:update, {remote_phys, remote_log}}, _from, state) do
     ref = :persistent_term.get(@atomics_key)
     wall = System.os_time(:millisecond)
-    local_phys = :atomics.get(ref, @slot_physical)
-    local_logical = :atomics.get(ref, @slot_logical)
+    {local_phys, local_logical} = unpack(:atomics.get(ref, @slot))
 
     {new_physical, new_logical} =
       merge_timestamps(wall, local_phys, local_logical, remote_phys, remote_log)
 
-    :atomics.put(ref, @slot_physical, new_physical)
-    :atomics.put(ref, @slot_logical, new_logical)
+    # CAS loop to safely write the merged value without clobbering
+    # concurrent now() callers.
+    write_packed_cas(ref, pack(new_physical, new_logical))
 
-    # Check drift and emit telemetry if warranted.
     maybe_emit_drift_warning(new_physical, wall)
 
     {:reply, :ok, state}
@@ -402,8 +386,6 @@ defmodule Ferricstore.HLC do
 
   @impl true
   def terminate(_reason, _state) do
-    # Clean up the persistent_term entry so tests that restart the
-    # GenServer get a fresh atomics ref.
     :persistent_term.erase(@atomics_key)
     :ok
   rescue
@@ -441,6 +423,64 @@ defmodule Ferricstore.HLC do
 
   # Fallback.
   defp merge_by_max(max_phys, _wall, _lp, _ll, _rp, _rl), do: {max_phys, 0}
+
+  # Pack {physical_ms, logical} into a single unsigned 64-bit integer.
+  # Physical occupies the upper 48 bits, logical the lower 16 bits.
+  defp pack(physical_ms, logical) do
+    bsl(physical_ms, @logical_bits) + logical
+  end
+
+  # Unpack a single unsigned 64-bit integer into {physical_ms, logical}.
+  defp unpack(packed) do
+    physical = bsr(packed, @logical_bits)
+    logical = band(packed, @logical_mask)
+    {physical, logical}
+  end
+
+  # Lock-free HLC now() using a single packed 64-bit atomic.
+  #
+  # Common path (same millisecond): add_get(ref, 1, 1) — atomically
+  # increments the logical counter with zero contention.
+  #
+  # Millisecond boundary: CAS to jump the packed value forward.
+  # If CAS fails, another process already advanced — just add_get.
+  #
+  # Logical overflow (>65535 per ms): spills into physical bits,
+  # effectively advancing the clock by 1ms. This is correct behavior.
+  defp hlc_now_packed(ref) do
+    wall_packed = pack(System.os_time(:millisecond), 0)
+    current = :atomics.get(ref, @slot)
+
+    if wall_packed > current do
+      # Wall clock is ahead — try to jump forward via CAS.
+      case :atomics.compare_exchange(ref, @slot, current, wall_packed) do
+        :ok ->
+          unpack(wall_packed)
+
+        _actual ->
+          # Another process already advanced. Increment by 1.
+          unpack(:atomics.add_get(ref, @slot, 1))
+      end
+    else
+      # Same or earlier wall clock — just increment logical by 1.
+      unpack(:atomics.add_get(ref, @slot, 1))
+    end
+  end
+
+  # CAS loop for update/1 — write a packed value that is at least as
+  # large as `target`. If current is already >= target, leave it.
+  defp write_packed_cas(ref, target) do
+    current = :atomics.get(ref, @slot)
+
+    if target > current do
+      case :atomics.compare_exchange(ref, @slot, current, target) do
+        :ok -> :ok
+        _actual -> write_packed_cas(ref, target)
+      end
+    else
+      :ok
+    end
+  end
 
   # Returns the atomics ref from :persistent_term, or nil if not yet created.
   @spec atomics_ref() :: reference() | nil
