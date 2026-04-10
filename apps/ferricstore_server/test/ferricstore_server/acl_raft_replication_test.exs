@@ -212,14 +212,15 @@ defmodule FerricstoreServer.AclRaftReplicationTest do
   describe "SET/GET regression via TCP" do
     test "SET and GET roundtrip works after all callback changes", %{port: port} do
       sock = connect_and_hello(port)
+      key = "regression_key_#{System.unique_integer([:positive])}"
 
-      send_cmd(sock, ["SET", "regression_key", "regression_value"])
+      send_cmd(sock, ["SET", key, "regression_value"])
       assert {:simple, "OK"} = recv_response(sock)
 
-      send_cmd(sock, ["GET", "regression_key"])
+      send_cmd(sock, ["GET", key])
       assert "regression_value" = recv_response(sock)
 
-      send_cmd(sock, ["DEL", "regression_key"])
+      send_cmd(sock, ["DEL", key])
       recv_response(sock)
 
       :gen_tcp.close(sock)
