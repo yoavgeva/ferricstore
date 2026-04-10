@@ -267,13 +267,16 @@ defmodule FerricstoreServer.ReviewR4Test do
       set_results = recv_n(sock, length(keys))
       assert Enum.all?(set_results, &(unwrap(&1) == "OK"))
 
+      # Use a fresh socket for GETs to avoid any buffering issues
+      sock2 = connect()
+
       pipeline_get =
         keys
         |> Enum.map(fn k -> Encoder.encode(["GET", k]) end)
         |> IO.iodata_to_binary()
 
-      :ok = :gen_tcp.send(sock, pipeline_get)
-      get_results = recv_n(sock, length(keys))
+      :ok = :gen_tcp.send(sock2, pipeline_get)
+      get_results = recv_n(sock2, length(keys))
 
       Enum.zip(keys, get_results)
       |> Enum.each(fn {k, v} ->
@@ -281,6 +284,7 @@ defmodule FerricstoreServer.ReviewR4Test do
       end)
 
       :gen_tcp.close(sock)
+      :gen_tcp.close(sock2)
     end
   end
 
