@@ -103,7 +103,7 @@ defmodule Ferricstore.MemoryGuardBinaryTrackingTest do
 
       # Write a key with a 500 byte value
       Router.put(ctx, "update_test", String.duplicate("a", 500), 0)
-      after_first = total_binary_bytes(ref, ctx.shard_count)
+      _after_first = total_binary_bytes(ref, ctx.shard_count)
 
       # Update the same key with a 1000 byte value
       Router.put(ctx, "update_test", String.duplicate("b", 1000), 0)

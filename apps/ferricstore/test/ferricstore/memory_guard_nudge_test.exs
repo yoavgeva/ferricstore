@@ -22,6 +22,13 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
     orig_keydir = MemoryGuard.keydir_full?()
 
     on_exit(fn ->
+      # Resume first in case a test suspended MemoryGuard
+      try do
+        :sys.resume(MemoryGuard)
+      catch
+        :exit, _ -> :ok
+      end
+
       :sys.replace_state(MemoryGuard, fn _current -> original_state end)
       MemoryGuard.set_reject_writes(orig_reject)
       MemoryGuard.set_keydir_full(orig_keydir)
@@ -173,12 +180,11 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
 
       force_reject_mode()
 
-      # Drain the periodic check events and nudge from force_reject
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        flush_messages()
-        Process.info(self(), :message_queue_len) |> elem(1) == 0
-      end, "messages not drained", 20, 10)
-      flush_messages()
+      # Suspend MemoryGuard to stop its periodic timer from emitting
+      # telemetry that would confuse our refute_receive assertion.
+      # The atomics flags are already set by force_reject_mode — they
+      # don't require the GenServer to be running.
+      :sys.suspend(MemoryGuard)
 
       :telemetry.attach(
         handler_id,
@@ -192,12 +198,13 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
       # Update existing key — should succeed, no nudge
       assert :ok = Router.put(FerricStore.Instance.get(:default), "pre_existing", "new", 0)
 
-      # Should NOT receive a nudge-triggered check within a short window.
-      # (The periodic timer fires every 100ms, so we only wait 50ms to
-      # distinguish nudge from periodic.)
-      refute_receive :unexpected_nudge, 50
+      # Should NOT receive a nudge-triggered check. MemoryGuard is
+      # suspended so periodic timer can't fire — any message here
+      # would prove the Router path incorrectly nudges on existing keys.
+      refute_receive :unexpected_nudge, 100
 
       :telemetry.detach(handler_id)
+      :sys.resume(MemoryGuard)
     end
 
     test "after nudge + eviction, next write may succeed" do
