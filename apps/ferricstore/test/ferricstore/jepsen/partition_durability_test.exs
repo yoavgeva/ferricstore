@@ -35,7 +35,6 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
 
   alias Ferricstore.Test.ClusterHelper
   alias Ferricstore.Test.HistoryRecorder
-  @moduletag :cluster
 
   setup_all do
     unless ClusterHelper.peer_available?() do
@@ -51,7 +50,6 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
   end
 
   describe "19.3 majority-partition writes durable after heal" do
-    @tag :jepsen
     test "writes during partition survive heal on writing nodes", %{nodes: nodes} do
       [n1, _n2, n3] = nodes
       {:ok, history} = HistoryRecorder.new()
@@ -101,7 +99,6 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
       )
     end
 
-    @tag :jepsen
     test "minority node retains its own writes after heal (single-node mode)", %{
       nodes: nodes
     } do
@@ -143,7 +140,6 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
       end)
     end
 
-    @tag :jepsen
     test "no phantom writes appear on majority node after heal", %{nodes: nodes} do
       [n1, _n2, n3] = nodes
 
