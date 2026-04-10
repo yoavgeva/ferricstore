@@ -180,7 +180,6 @@ jobs:
     name: "Core tests (macos)"
     needs: build-macos
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
@@ -238,7 +237,6 @@ jobs:
     name: "Server tests (macos)"
     needs: build-macos
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
