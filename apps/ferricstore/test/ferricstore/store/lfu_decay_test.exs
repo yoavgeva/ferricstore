@@ -487,9 +487,17 @@ defmodule Ferricstore.Store.LFUDecayTest do
       # Evict
       :ets.update_element(keydir, "rewarm_lfu", {2, nil})
 
+      # Ensure skip_promotion is off so re-warm actually caches in ETS
+      Ferricstore.MemoryGuard.set_skip_promotion(false)
+
       # Re-warm by reading
       Router.get(FerricStore.Instance.get(:default), "rewarm_lfu")
-      drain_all()
+
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        packed = get_packed_lfu("rewarm_lfu")
+        {_ldt, counter} = LFU.unpack(packed)
+        counter == 5
+      end, "re-warmed key should reset to counter=5", 20, 50)
 
       packed = get_packed_lfu("rewarm_lfu")
       {ldt, counter} = LFU.unpack(packed)
