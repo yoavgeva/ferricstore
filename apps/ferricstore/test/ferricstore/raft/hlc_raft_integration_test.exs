@@ -45,7 +45,6 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
     # Reset the HLC atomics to a clean slate so tests don't interfere.
     ref = :persistent_term.get(:ferricstore_hlc_ref)
     :atomics.put(ref, 1, 0)
-    :atomics.put(ref, 2, 0)
 
     on_exit(fn ->
       try do
@@ -284,8 +283,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       # Reset HLC to zero
       ref = :persistent_term.get(:ferricstore_hlc_ref)
       :atomics.put(ref, 1, 0)
-      :atomics.put(ref, 2, 0)
-
+  
       # Becoming leader should advance the HLC
       effects = StateMachine.state_enter(:leader, state)
 
