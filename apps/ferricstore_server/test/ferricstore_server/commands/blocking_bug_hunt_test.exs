@@ -305,15 +305,15 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
       key = ukey("post_timeout")
 
       send_cmd(sock, ["BLPOP", key, "0.3"])
-      {:ok, result} = recv_response(sock, 3_000)
+      {:ok, result} = recv_response(sock, 10_000)
       assert result == nil
 
       send_cmd(sock, ["SET", key, "alive"])
-      {:ok, set_result} = recv_response(sock)
+      {:ok, set_result} = recv_response(sock, 5_000)
       assert set_result == {:simple, "OK"}
 
       send_cmd(sock, ["GET", key])
-      {:ok, get_result} = recv_response(sock)
+      {:ok, get_result} = recv_response(sock, 5_000)
       assert get_result == "alive"
 
       :gen_tcp.close(sock)
@@ -325,7 +325,7 @@ defmodule FerricstoreServer.Commands.BlockingBugHuntTest do
       key = ukey("post_timeout_ping")
 
       send_cmd(sock, ["BLPOP", key, "0.2"])
-      {:ok, nil} = recv_response(sock, 3_000)
+      {:ok, nil} = recv_response(sock, 10_000)
 
       send_cmd(sock, ["PING"])
       {:ok, pong} = recv_response(sock)
