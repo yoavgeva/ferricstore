@@ -282,7 +282,7 @@ jobs:
             apps/ferricstore/priv/native
           key: build-Linux-${{ github.sha }}
 
-      - name: Shard-kill + Jepsen + large alloc tests (threshold: max 5 failures)
+      - name: "Shard-kill + Jepsen + large alloc tests (max 5 failures allowed)"
         run: |
           epmd -daemon
           set +e
@@ -335,7 +335,7 @@ jobs:
             apps/ferricstore/priv/native
           key: build-Linux-${{ github.sha }}
 
-      - name: Cluster tests (threshold: max 5 failures)
+      - name: "Cluster tests (max 5 failures allowed)"
         run: |
           epmd -daemon
           set +e
