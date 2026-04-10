@@ -100,8 +100,21 @@ defmodule Ferricstore.Test.ShardHelpers do
     # by hashing the compound key string.
     Enum.each(0..(shard_count - 1), fn i ->
       shard = Router.shard_name(FerricStore.Instance.get(:default), i)
-      keys = GenServer.call(shard, :keys, flush_timeout)
-      Enum.each(keys, fn key -> GenServer.call(shard, {:delete, key}, flush_timeout) end)
+
+      keys =
+        try do
+          GenServer.call(shard, :keys, flush_timeout)
+        catch
+          :exit, _ -> []
+        end
+
+      Enum.each(keys, fn key ->
+        try do
+          GenServer.call(shard, {:delete, key}, flush_timeout)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
     end)
 
     # The deletes above go through the Raft batcher (async). Drain the
