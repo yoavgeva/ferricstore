@@ -153,17 +153,17 @@ defmodule Ferricstore.MemoryGuardNudgeTest do
 
       force_reject_mode()
 
-      # Drain any pending check events from MemoryGuard's periodic timer
-      receive do
-        :nudge_check_fired -> :ok
-      after
-        200 -> :ok
-      end
+      # Suspend MemoryGuard to prevent the periodic timer from clearing
+      # the reject flags before Router.put checks them.
+      :sys.suspend(MemoryGuard)
 
       # This put should be rejected AND trigger a nudge
       result = Router.put(FerricStore.Instance.get(:default), "nudge_test_new_key", "value", 0)
       assert {:error, msg} = result
       assert msg =~ "KEYDIR_FULL"
+
+      # Resume so the nudge (async cast) can be processed
+      :sys.resume(MemoryGuard)
 
       # The nudge should have triggered a check cycle
       assert_receive :nudge_check_fired, 1000
