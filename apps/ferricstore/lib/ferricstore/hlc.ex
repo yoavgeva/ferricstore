@@ -70,6 +70,47 @@ defmodule Ferricstore.HLC do
 
   Timestamps are ordered lexicographically: physical first, then logical.
 
+  ## Cross-node synchronization
+
+  HLC sync across nodes currently happens via Raft heartbeats (~6/sec), giving
+  ~150ms max drift. This is sufficient for all current use cases:
+
+    * **Read-your-writes** on the writing node: guaranteed by
+      `ra:process_command(reply_from: :local)`.
+    * **Cross-node reads** after quorum write: guaranteed by Raft consensus —
+      all quorum nodes applied the command before the write returns.
+    * **TTL expiry**: second-granularity TTLs are unaffected by 150ms drift.
+    * **Cross-shard WATCH**: uses value hashing, not timestamps.
+
+  ### Per-command HLC stamping (not wired up)
+
+  The state machine can handle commands wrapped as
+  `{inner_command, %{hlc_ts: {physical_ms, logical}}}`. When `apply/3`
+  processes a wrapped command, it calls `update/1` to merge the leader's
+  clock into the follower's HLC. This gives per-command causal sync (~0ms
+  drift) instead of heartbeat-level sync (~150ms drift).
+
+  **Nothing sends wrapped commands today.** Enable if any of these arise:
+
+    1. **Sub-second TTLs with cross-node reads** — a key with `PX 100`
+       (100ms TTL) could appear alive on one node and expired on another
+       within the 150ms drift window.
+    2. **Cross-node causal ordering** — if a feature needs "write A
+       happened-before write B" guarantees across nodes beyond Raft log
+       ordering (e.g., conflict resolution in multi-leader setups).
+    3. **Observed drift exceeding 500ms** — if heartbeat intervals increase
+       due to network issues or overloaded nodes.
+
+  To enable, stamp commands in `Router.raft_write/4` before submitting:
+
+      stamped = {command, %{hlc_ts: HLC.now()}}
+      :ra.process_command(shard_id, stamped, opts)
+
+  Cost: ~50ns per write (`now/0` on leader) + one `update/1` GenServer
+  call per follower during `apply/3`. CockroachDB and YugabyteDB stamp
+  every RPC and consider the cost negligible. Redis and Kvrocks do not
+  have cross-node transactions or HLC.
+
   ## Graceful fallback
 
   When the HLC GenServer has not been started (e.g. in unit tests that exercise
@@ -209,8 +250,17 @@ defmodule Ferricstore.HLC do
   end
 
   @doc """
-  Merges a remote HLC timestamp received from another node (e.g. via a Raft
-  heartbeat).
+  Merges a remote HLC timestamp received from another node.
+
+  Called in two contexts:
+
+    * **Raft heartbeats** (~6 calls/sec) -- the leader's HLC timestamp is
+      piggybacked on heartbeat RPCs. This is the current sync mechanism,
+      giving ~150ms max drift between nodes.
+    * **Per-command stamping** (not wired up) -- if commands are wrapped as
+      `{inner_command, %{hlc_ts: ts}}`, the state machine calls `update/1`
+      during `apply/3` on each follower, giving per-command causal sync.
+      See the module doc for when to enable this.
 
   This is a `GenServer.call` because remote timestamp merges must be
   serialized to avoid lost-update races. This is acceptable because merges

@@ -730,54 +730,9 @@ defmodule Ferricstore.Raft.StateMachine do
   # ---------------------------------------------------------------------------
   # HLC-wrapped commands (spec 2G.6)
   #
-  # When a command is wrapped as `{inner_command, %{hlc_ts: {phys, logical}}}`,
-  # this clause merges the remote HLC timestamp into the local HLC and then
-  # delegates to the matching `apply/3` clause for the inner command.
-  #
-  # ## Current status: NOT WIRED UP
-  #
-  # Nothing in the codebase currently wraps commands with `hlc_ts`. HLC sync
-  # across nodes happens via Raft heartbeats (~6/sec), giving ~150ms max drift.
-  # This is sufficient for all current use cases:
-  #
-  #   - Read-your-writes on the writing node: guaranteed by
-  #     `ra:process_command(reply_from: :local)` — the value is in local ETS
-  #     before the write returns.
-  #   - Cross-node reads after quorum write: guaranteed by Raft consensus —
-  #     all quorum nodes applied the command before the write returns.
-  #   - TTL expiry: second-granularity TTLs are unaffected by 150ms drift.
-  #   - Cross-shard WATCH (coordinator): uses value hashing, not timestamps.
-  #     The 150ms drift only matters if a TTL-expiring key is checked across
-  #     nodes within that window — extremely unlikely with second-granularity.
-  #
-  # ## When to wire this up
-  #
-  # Enable per-command HLC stamping if any of these arise:
-  #
-  #   1. Sub-second TTLs with cross-node reads — a key with PX 100 (100ms TTL)
-  #      could appear alive on one node and expired on another within the 150ms
-  #      drift window.
-  #   2. Cross-node causal ordering — if a feature needs "write A happened
-  #      before write B" guarantees across nodes beyond Raft log ordering
-  #      (e.g., conflict resolution in multi-leader setups).
-  #   3. Observed drift exceeding 500ms — if Raft heartbeat intervals increase
-  #      (network partitions, overloaded nodes), the 150ms assumption breaks.
-  #
-  # ## How to wire it up
-  #
-  # The state machine already handles wrapped commands (the clause below).
-  # To enable, stamp commands in the Router before submitting to Raft:
-  #
-  #     # In Router.raft_write/4, before ra:process_command:
-  #     stamped = {command, %{hlc_ts: HLC.now()}}
-  #     :ra.process_command(shard_id, stamped, opts)
-  #
-  # Cost: ~50ns per write (one HLC.now() on leader) + one HLC.update/1 call
-  # per follower during apply/3. CockroachDB and YugabyteDB stamp every RPC
-  # and consider the cost negligible.
-  #
-  # Redis and Kvrocks do not have cross-node transactions or HLC — this is
-  # beyond Redis compatibility and only needed if we hit the gaps above.
+  # NOT WIRED UP — nothing sends wrapped commands today. Heartbeat sync
+  # (~150ms drift) is sufficient. See `Ferricstore.HLC` module doc for
+  # full rationale, when to enable, and how to wire it up.
   # ---------------------------------------------------------------------------
 
   # Generic server command hook — allows server apps to replicate their own
