@@ -29,12 +29,12 @@ defmodule Ferricstore.Jepsen.PartitionDurabilityTest do
   # Skip: Erlang distribution auto-reconnects via ra monitors and transitive
   # connectivity. True partition simulation needs iptables (Linux + root) or
   # separate VMs. Will test on Azure benchmark infrastructure.
-  @moduletag :skip
+  # Skipped: Erlang distribution auto-reconnects via ra monitors.
+  # True partition needs iptables/VMs. Remove :jepsen tag so --include jepsen doesn't run these.
+  @moduletag :partition_test
 
   alias Ferricstore.Test.ClusterHelper
   alias Ferricstore.Test.HistoryRecorder
-
-  @moduletag :jepsen
   @moduletag :cluster
 
   setup_all do
