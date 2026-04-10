@@ -360,9 +360,10 @@ defmodule FerricstoreServer.Integration.AdvancedTypesTcpTest do
       sock = connect_and_hello(port)
       k = ukey("xtrim")
 
-      for _ <- 1..5 do
+      for i <- 1..5 do
         send_cmd(sock, ["XADD", k, "*", "f", "v"])
-        _id = recv_response(sock)
+        id = recv_response(sock)
+        assert is_binary(id), "XADD #{i} should return stream ID, got #{inspect(id)}"
       end
 
       send_cmd(sock, ["XTRIM", k, "MAXLEN", "2"])
