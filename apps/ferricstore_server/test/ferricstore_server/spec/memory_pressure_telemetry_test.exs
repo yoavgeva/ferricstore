@@ -58,6 +58,27 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
     Process.sleep(100)
   end
 
+  # Trigger check repeatedly until we receive a telemetry event with the
+  # expected level. ETS memory fluctuates between measurement and check,
+  # so the ratio may land in a different band on the first try.
+  defp trigger_until_level(pid, expected_level, retries \\ 5) do
+    drain_pressure_messages()
+    trigger_check(pid)
+
+    receive do
+      {:telemetry, [:ferricstore, :memory, :pressure], measurements,
+       %{level: ^expected_level}} ->
+        measurements
+    after
+      500 ->
+        if retries > 0 do
+          trigger_until_level(pid, expected_level, retries - 1)
+        else
+          nil
+        end
+    end
+  end
+
   # Drains all messages matching the given pattern from the mailbox.
   # Used to discard events from the application-wide MemoryGuard or leftover
   # per-shard pressure events before asserting on the next expected event.
@@ -143,12 +164,8 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
 
       {:ok, pid} = start_guard(max_memory_bytes: max_bytes)
 
-      trigger_check(pid)
-
-      assert_receive {:telemetry, [:ferricstore, :memory, :pressure], measurements,
-                      %{level: :pressure}},
-                     2000
-
+      measurements = trigger_until_level(pid, :pressure)
+      assert measurements != nil, "expected :pressure level telemetry"
       assert measurements.ratio >= 0.85
       assert measurements.ratio < 0.95
 
@@ -178,12 +195,8 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
 
       {:ok, pid} = start_guard(max_memory_bytes: max_bytes)
 
-      trigger_check(pid)
-
-      assert_receive {:telemetry, [:ferricstore, :memory, :pressure], measurements,
-                      %{level: :warn}},
-                     2000
-
+      measurements = trigger_until_level(pid, :warn)
+      assert measurements != nil, "expected :warn level telemetry"
       assert measurements.ratio >= 0.70
       assert measurements.ratio < 0.85
 
@@ -371,18 +384,12 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
       ]
 
       for {budget, expected_level} <- budgets do
-        # Drain any leftover per-shard events from previous iteration
-        drain_pressure_messages()
-
         :sys.replace_state(pid, fn state ->
           %{state | max_memory_bytes: budget}
         end)
 
-        trigger_check(pid)
-
-        assert_receive {:telemetry, [:ferricstore, :memory, :pressure], _measurements,
-                        %{level: ^expected_level}},
-                       2000
+        measurements = trigger_until_level(pid, expected_level)
+        assert measurements != nil, "expected #{inspect(expected_level)} level telemetry"
       end
 
       GenServer.stop(pid)
