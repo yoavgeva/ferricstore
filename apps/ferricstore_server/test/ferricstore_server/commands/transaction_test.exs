@@ -516,7 +516,7 @@ defmodule FerricstoreServer.Commands.TransactionTest do
 
       # Verify the key exists before proceeding — ensures ETS is updated
       send_cmd(sock2, ["GET", k])
-      assert recv_response(sock2) == {:bulk, "created"}
+      assert recv_response(sock2) == "created"
       :gen_tcp.close(sock2)
 
       send_cmd(sock, ["MULTI"])
