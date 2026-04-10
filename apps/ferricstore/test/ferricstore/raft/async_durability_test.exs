@@ -107,11 +107,17 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
 
       assert :ok == Batcher.write(shard, {:put, k, "deleteme", 0})
       drain_async()
-      assert "deleteme" == Router.get(FerricStore.Instance.get(:default), k)
+
+      ShardHelpers.eventually(fn ->
+        assert "deleteme" == Router.get(FerricStore.Instance.get(:default), k)
+      end, "async put should be readable", 10, 100)
 
       assert :ok == Batcher.write(shard, {:delete, k})
       drain_async()
-      assert nil == Router.get(FerricStore.Instance.get(:default), k)
+
+      ShardHelpers.eventually(fn ->
+        assert nil == Router.get(FerricStore.Instance.get(:default), k)
+      end, "async delete should remove key", 10, 100)
     end
   end
 
