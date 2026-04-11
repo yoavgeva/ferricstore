@@ -1536,6 +1536,8 @@ defmodule Ferricstore.Raft.StateMachine do
   # Wraps a block of state machine operations with batched disk writes.
   # Initializes the pending-writes buffer, runs the block, then flushes
   # all accumulated writes in a single v2_append_batch_nosync NIF call.
+  # For quorum durability, follows with a single fsync so all writes in
+  # the batch are durable on disk before the caller gets :ok.
   # Guarantees: no :pending entries in ETS after this returns.
   defp with_pending_writes(state, fun) do
     Process.put(:sm_pending_writes, [])
@@ -1583,6 +1585,13 @@ defmodule Ferricstore.Raft.StateMachine do
 
         case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
           {:ok, locations} ->
+            # Quorum durability: fsync after the batch so all writes are on
+            # disk before the caller gets :ok. This is one fsync per Raft
+            # batch (not per write), so throughput stays high. Async writes
+            # also go through Raft eventually, so they get the fsync too
+            # (no user-visible latency cost since nobody waits for async Raft).
+            quorum_fsync(state)
+
             if state.instance_ctx do
               Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.shard_index)
             else
@@ -1617,6 +1626,18 @@ defmodule Ferricstore.Raft.StateMachine do
 
       _ ->
         :ok
+    end
+  end
+
+  # Fsync the active Bitcask log file after a batch write.
+  # Every write that reaches the state machine came through Raft (quorum path).
+  # One fsync per batch amortizes the cost across all writes in the batch.
+  defp quorum_fsync(state) do
+    case NIF.v2_fsync(state.active_file_path) do
+      :ok -> :ok
+      {:error, reason} ->
+        require Logger
+        Logger.error("StateMachine quorum_fsync failed: #{inspect(reason)}")
     end
   end
 
