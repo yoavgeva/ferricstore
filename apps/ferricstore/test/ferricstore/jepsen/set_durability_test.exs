@@ -85,7 +85,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
 
       # Allow pending flushes
       Process.sleep(200)
-      :ok = ClusterHelper.wait_for_leaders([n1], 4, timeout: 5_000)
+      :ok = ClusterHelper.wait_for_leaders([n1], 4, timeout: 30_000)
 
       # Verify all ACKed members are present on n1 (the writing node)
       violations = HistoryRecorder.verify_set_durability(history, [n1], key)

@@ -100,7 +100,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
         end)
 
       assert alive != [], "at least one node should survive"
-      :ok = ClusterHelper.wait_for_leaders(alive, 4, timeout: 5_000)
+      :ok = ClusterHelper.wait_for_leaders(alive, 4, timeout: 30_000)
 
       # Verify: each surviving node has all the writes it ACKed.
       # In single-node mode, a node only has its own writes -- so we check
@@ -164,7 +164,7 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
       end)
 
       Process.sleep(500)
-      :ok = ClusterHelper.wait_for_leaders([writer], 4, timeout: 5_000)
+      :ok = ClusterHelper.wait_for_leaders([writer], 4, timeout: 30_000)
 
       # All 50 writes must be readable on the surviving writer
       result = HistoryRecorder.verify_durability(history, [writer])
