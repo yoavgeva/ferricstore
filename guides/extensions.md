@@ -17,7 +17,7 @@ FerricStore ships with extension packages that integrate with the Elixir ecosyst
 
 ```elixir
 # mix.exs
-{:ferricstore_session, "~> 0.1.0"}
+{:ferricstore_session, "~> 0.2.0"}
 
 # In your Phoenix endpoint:
 plug Plug.Session,

@@ -1,6 +1,6 @@
 # Commands Reference
 
-FerricStore implements 240+ commands covering standard Redis data types, probabilistic structures, and FerricStore-native operations. This guide documents each command with its exact syntax, return values, embedded API equivalent, and Redis compatibility notes.
+FerricStore implements 250+ commands covering standard Redis data types, probabilistic structures, and FerricStore-native operations. This guide documents each command with its exact syntax, return values, embedded API equivalent, and Redis compatibility notes.
 
 ## Redis Compatibility Summary
 

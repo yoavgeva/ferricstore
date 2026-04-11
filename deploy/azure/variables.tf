@@ -1,7 +1,7 @@
 variable "location" {
   description = "Azure region"
   type        = string
-  default     = "eastus2"
+  default     = "northcentralus"
 }
 
 variable "resource_group_name" {
@@ -11,9 +11,15 @@ variable "resource_group_name" {
 }
 
 variable "vm_size" {
-  description = "VM size — L4s_v3 has local NVMe"
+  description = "VM size — L4as_v4 has local NVMe (4 vCPU, 32GB, 600GB NVMe)"
   type        = string
-  default     = "Standard_L4s_v3"
+  default     = "Standard_L4as_v4"
+}
+
+variable "client_vm_size" {
+  description = "Client VM size for benchmark runner"
+  type        = string
+  default     = "Standard_D2as_v5"
 }
 
 variable "node_count" {

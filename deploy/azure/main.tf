@@ -207,7 +207,7 @@ resource "azurerm_linux_virtual_machine" "client" {
   name                = "ferricstore-client"
   location            = azurerm_resource_group.bench.location
   resource_group_name = azurerm_resource_group.bench.name
-  size                = "Standard_D2s_v5"
+  size                = var.client_vm_size
   admin_username      = var.admin_username
 
   network_interface_ids = [

@@ -22,7 +22,7 @@ Add `ferricstore` to your dependencies:
 # mix.exs
 def deps do
   [
-    {:ferricstore, "~> 0.1.0"}
+    {:ferricstore, "~> 0.2.0"}
   ]
 end
 ```
@@ -41,8 +41,8 @@ For standalone mode, you also need `ferricstore_server` which includes the TCP/T
 # mix.exs
 def deps do
   [
-    {:ferricstore, "~> 0.1.0"},
-    {:ferricstore_server, "~> 0.1.0"}
+    {:ferricstore, "~> 0.2.0"},
+    {:ferricstore_server, "~> 0.2.0"}
   ]
 end
 ```
