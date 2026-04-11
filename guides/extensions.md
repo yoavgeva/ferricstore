@@ -123,4 +123,4 @@ The extension packages depend on `ferricstore` (the core engine). You must have 
 
 | Package | FerricStore | Ecto | Elixir |
 |---------|-------------|------|--------|
-| `ferricstore_ecto 0.1.x` | `~> 0.1.0` | `~> 3.11` | `~> 1.19` |
+| `ferricstore_ecto 0.2.x` | `~> 0.2.0` | `~> 3.11` | `~> 1.19` |

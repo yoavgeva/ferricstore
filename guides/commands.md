@@ -1114,7 +1114,7 @@ Returns server information. Supports sections: `server`, `clients`, `memory`, `k
 | **RESP3 syntax** | `INFO [section]` |
 | **FerricStore sections** | `raft` (per-shard role/term/commit), `bitcask` (per-shard file counts/sizes), `ferricstore` (raft committed, hot cache evictions), `keydir_analysis` (per-prefix key breakdown), `namespace_config` (group-commit settings) |
 
-The `server` section reports `redis_version: 7.4.0` for client compatibility along with `ferricstore_version: 0.1.0`.
+The `server` section reports `redis_version: 7.4.0` for client compatibility along with `ferricstore_version: 0.2.0`.
 
 ### CONFIG
 
@@ -1231,10 +1231,9 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 3. **No Lua scripting** -- `EVAL`/`EVALSHA` are not implemented. Use CAS, LOCK, and FETCH_OR_COMPUTE for atomic operations.
 4. **No blocking commands in embedded mode** -- `BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`, `XREAD BLOCK` require a TCP connection.
 5. **Probabilistic structures are built-in** -- no separate Redis Stack module needed. BF, CF, CMS, TopK, TDigest are all native.
-6. **Vector search is built-in** -- no separate RediSearch module needed.
-7. **CAS is a native command** -- no need for Lua scripts for compare-and-swap. WATCH/MULTI/EXEC is also supported.
+6. **CAS is a native command** -- no need for Lua scripts for compare-and-swap. WATCH/MULTI/EXEC is also supported.
 8. **FETCH_OR_COMPUTE** -- built-in cache stampede protection that Redis lacks.
-9. **Group commit** -- writes are batched for higher throughput. Individual write latency includes the batch window (default 1ms).
+9. **Group commit** -- writes are batched for higher throughput. Individual write latency includes the batch window (default 1ms). Use hash tags `{tag}` to colocate related keys on the same shard for maximum batching -- see [Best Practices](best-practices.md).
 10. **HLC timestamps** -- expiry uses Hybrid Logical Clock timestamps instead of wall-clock time. Monotonic even during clock skew.
 11. **Compound key storage** -- hash fields, set members, and zset members are stored as individual Bitcask entries with structured key prefixes, enabling O(1) field-level access without deserializing the entire data structure.
 12. **SCAN cursor** -- uses alphabetic key position, not Redis's opaque hash-table cursor. Functionally equivalent but cursor values differ.

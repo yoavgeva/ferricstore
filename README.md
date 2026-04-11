@@ -84,22 +84,10 @@ OK
 
 Drop-in Redis replacement. 250+ commands. Use your existing Redis client libraries.
 
-### Test Sandbox
-
-Every test gets an isolated store — no state leaks, full `async: true` support:
-
-```elixir
-use FerricStore.Sandbox.Case
-
-test "my cache test" do
-  :ok = FerricStore.set("key", "value")
-  {:ok, "value"} = FerricStore.get("key")
-end
-```
-
 ## Guides
 
 - [Getting Started](guides/getting-started.md) — installation, configuration, first commands
+- [Best Practices](guides/best-practices.md) — hash tags, durability, pipelining, key design
 - [Architecture](guides/architecture.md) — write path, read path, three-tier storage, Raft consensus
 - [Commands Reference](guides/commands.md) — all 250+ commands with syntax and compatibility notes
 - [Embedded Mode](guides/embedded-mode.md) — using FerricStore inside your Elixir app
@@ -108,6 +96,7 @@ end
 - [Deployment](guides/deployment.md) — Docker, Kubernetes, bare metal, clustering
 - [Security](guides/security.md) — ACL, TLS, protected mode
 - [Extensions](guides/extensions.md) — Plug sessions, Ecto L2 cache
+- [Comparison](guides/comparison.md) — vs Redis, Valkey, Dragonfly, Garnet, Kvrocks, Cachex, Nebulex
 
 ## Requirements
 

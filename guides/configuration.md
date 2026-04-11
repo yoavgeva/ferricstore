@@ -688,7 +688,6 @@ config :ferricstore, :memory_guard_interval_ms, 5_000
 config :ferricstore, :merge, check_interval_ms: 600_000, fragmentation_threshold: 0.99
 config :ferricstore, :expiry_sweep_interval_ms, 600_000
 config :ferricstore, :read_sample_rate, 1
-config :ferricstore, :sandbox_enabled, true
 
 # Generous supervisor budget for shard-kill tests
 config :ferricstore, :supervisor_max_restarts, {1000, 60}
