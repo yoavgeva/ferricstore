@@ -101,7 +101,7 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   config :ferricstore,
     release_cursor_interval:
-      String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "10000")),
+      String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "100000")),
     promotion_threshold:
       String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100"))
 

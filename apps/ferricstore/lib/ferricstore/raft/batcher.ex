@@ -90,7 +90,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   alias Ferricstore.NamespaceConfig
 
-  @default_max_batch_size 1_000
+  @default_max_batch_size 50_000
 
   @type command ::
           {:put, binary(), binary(), non_neg_integer()}
