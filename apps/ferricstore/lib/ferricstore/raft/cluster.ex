@@ -51,7 +51,10 @@ defmodule Ferricstore.Raft.Cluster do
       names: names,
       data_dir: ra_data_dir,
       wal_data_dir: ra_data_dir,
-      segment_max_entries: 32_768
+      segment_max_entries: 32_768,
+      wal_max_batch_size: 32_768,
+      wal_compute_checksums: false,
+      wal_pre_allocate: true
     }
 
     case :ra_system.start(config) do

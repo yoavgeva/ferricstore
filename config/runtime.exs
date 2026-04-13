@@ -21,7 +21,7 @@ if config_env() == :prod do
   # ---------------------------------------------------------------------------
   config :ferricstore,
     default_durability:
-      String.to_existing_atom(System.get_env("FERRICSTORE_DURABILITY", "quorum"))
+      String.to_atom(System.get_env("FERRICSTORE_DURABILITY", "quorum"))
 
   # ---------------------------------------------------------------------------
   # Memory & Eviction

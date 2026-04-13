@@ -465,10 +465,16 @@ defmodule Ferricstore.Raft.Batcher do
 
     slot = Map.get(state.slots, slot_key, new_slot(window_ms))
 
+    # For async durability: reply immediately, do not wait for flush timer.
+    # The caller gets :ok now; the write is batched and flushed in background.
+    if durability == :async do
+      GenServer.reply(from, :ok)
+    end
+
     updated_slot = %{
       slot
       | cmds: [command | slot.cmds],
-        froms: [from | slot.froms],
+        froms: if(durability == :async, do: slot.froms, else: [from | slot.froms]),
         window_ms: window_ms,
         count: Map.get(slot, :count, 0) + 1
     }
@@ -553,13 +559,17 @@ defmodule Ferricstore.Raft.Batcher do
   @spec pipeline_submit(%__MODULE__{}, [command()], [GenServer.from()]) :: %__MODULE__{}
   defp pipeline_submit(state, [single_cmd], froms) do
     corr = make_ref()
-    :ra.pipeline_command(state.shard_id, single_cmd, corr, :normal)
+    # Pre-serialize to refc binary so the WAL process receives a pointer,
+    # not a deep copy. Parallelizes serialization across BEAM schedulers.
+    serialized = {:ttb, :erlang.term_to_binary(single_cmd)}
+    :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
     %{state | pending: Map.put(state.pending, corr, {froms, :single})}
   end
 
   defp pipeline_submit(state, batch, froms) do
     corr = make_ref()
-    :ra.pipeline_command(state.shard_id, {:batch, batch}, corr, :normal)
+    serialized = {:ttb, :erlang.term_to_binary({:batch, batch})}
+    :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
     %{state | pending: Map.put(state.pending, corr, {froms, :batch})}
   end
 

@@ -434,7 +434,7 @@ defmodule Ferricstore.Raft.AsyncApplyWorker do
         {key, value, expire_at_ms}
       end)
 
-    case NIF.v2_append_batch(active_file_path, batch_entries) do
+    case NIF.v2_append_batch_nosync(active_file_path, batch_entries) do
       {:ok, results} ->
         ref = keydir_binary_ref()
 
