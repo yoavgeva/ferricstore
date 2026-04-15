@@ -116,7 +116,14 @@ defmodule Ferricstore.Application do
     Ferricstore.Commands.Stream.init_tables()
     # Load the patched ra_log_wal with async fdatasync BEFORE starting
     # the ra system, so the patched module is in place when the WAL starts.
-    install_patched_wal()
+    # NOTE: When using the local ra fork (path dep), the fork already includes
+    # the async fdatasync changes directly in source. Skip hot-load to avoid
+    # overriding the fork's beam with a potentially stale patched version.
+    if ra_is_path_dep?() do
+      Logger.info("Using local ra fork — skipping patched WAL hot-load")
+    else
+      install_patched_wal()
+    end
 
     # Start Erlang distribution if cluster is configured.
     # Must happen before ra system start so ra can communicate across nodes.
@@ -604,6 +611,17 @@ defmodule Ferricstore.Application do
   #
   # This must be called BEFORE ra_system:start/1 so the patched module is
   # loaded before the WAL process starts.
+  # Check if ra is a local path dependency (fork) vs hex package.
+  defp ra_is_path_dep? do
+    case :code.which(:ra_log_wal) do
+      path when is_list(path) ->
+        not String.contains?(List.to_string(path), "/deps/ra/")
+
+      _ ->
+        false
+    end
+  end
+
   @spec install_patched_wal() :: :ok | :error
   defp install_patched_wal do
     priv_dir = :code.priv_dir(:ferricstore)

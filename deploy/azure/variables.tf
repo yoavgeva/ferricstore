@@ -19,7 +19,7 @@ variable "vm_size" {
 variable "client_vm_size" {
   description = "Client VM size for benchmark runner"
   type        = string
-  default     = "Standard_D2as_v5"
+  default     = "Standard_D2as_v4"
 }
 
 variable "node_count" {
