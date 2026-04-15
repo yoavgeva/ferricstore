@@ -103,6 +103,35 @@ fn position(handle: ResourceArc<WalHandle>) -> NifResult<(Atom, u64)> {
     Ok((atoms::ok(), handle.file_size()))
 }
 
+/// Returns profiling counters as a list of {key, value} tuples.
+/// Keys: flush_count, callers_per_flush_avg, bytes_written, sync_latency_us_avg,
+///       sync_latency_us_max, write_calls, sync_calls
+#[rustler::nif]
+fn stats(handle: ResourceArc<WalHandle>) -> Vec<(String, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = &handle.stats;
+    let flush_count = s.flush_count.load(Relaxed);
+    let callers = s.callers_notified.load(Relaxed);
+    let bytes = s.bytes_written.load(Relaxed);
+    let sync_total = s.sync_latency_us_total.load(Relaxed);
+    let sync_max = s.sync_latency_us_max.load(Relaxed);
+    let writes = s.write_calls.load(Relaxed);
+    let syncs = s.sync_calls.load(Relaxed);
+
+    let avg_callers = if flush_count > 0 { callers / flush_count } else { 0 };
+    let avg_sync_us = if flush_count > 0 { sync_total / flush_count } else { 0 };
+
+    vec![
+        ("flush_count".to_string(), flush_count),
+        ("callers_per_flush_avg".to_string(), avg_callers),
+        ("bytes_written".to_string(), bytes),
+        ("sync_latency_us_avg".to_string(), avg_sync_us),
+        ("sync_latency_us_max".to_string(), sync_max),
+        ("write_calls".to_string(), writes),
+        ("sync_calls".to_string(), syncs),
+    ]
+}
+
 /// Read bytes from WAL at offset. Used during recovery.
 #[rustler::nif]
 fn pread<'a>(env: Env<'a>, handle: ResourceArc<WalHandle>, offset: u64, len: u64) -> NifResult<(Atom, Binary<'a>)> {

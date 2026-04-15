@@ -45,6 +45,7 @@ pub struct ThreadConfig {
     pub rx: Receiver<ThreadMsg>,
     pub alive: Arc<AtomicBool>,
     pub file_size: Arc<AtomicU64>,
+    pub stats: Arc<crate::wal_handle::WalStats>,
     pub commit_delay: Duration,
     pub use_o_direct: bool,
 }
@@ -54,7 +55,7 @@ pub struct ThreadConfig {
 pub fn thread_loop(config: ThreadConfig) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         thread_loop_inner(config.file, config.buffer, config.rx,
-                         config.file_size, config.commit_delay);
+                         config.file_size, config.stats.clone(), config.commit_delay);
     }));
 
     // On panic or normal exit, mark thread as dead
@@ -73,6 +74,7 @@ fn thread_loop_inner(
     buffer: Arc<Mutex<AlignedBuffer>>,
     rx: Receiver<ThreadMsg>,
     file_size: Arc<AtomicU64>,
+    stats: Arc<crate::wal_handle::WalStats>,
     commit_delay: Duration,
 ) {
     loop {
@@ -103,14 +105,14 @@ fn thread_loop_inner(
                             Ok(ThreadMsg::Flush(c)) => callers.push(c),
                             Ok(ThreadMsg::Close) => {
                                 // Close during commit delay — flush and exit
-                                do_flush(&mut file, &buffer, &file_size, &mut callers);
+                                do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
                                 let _ = do_final_flush(&mut file, &buffer, &file_size);
                                 return;
                             }
                             Err(RecvTimeoutError::Timeout) => break,
                             Err(RecvTimeoutError::Disconnected) => {
                                 // Best-effort flush before exit
-                                do_flush(&mut file, &buffer, &file_size, &mut callers);
+                                do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
                                 return;
                             }
                         }
@@ -118,7 +120,7 @@ fn thread_loop_inner(
                 }
 
                 // Perform I/O: take buffer → write → fdatasync → notify callers
-                do_flush(&mut file, &buffer, &file_size, &mut callers);
+                do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
             }
         }
     }
@@ -129,6 +131,7 @@ fn do_flush(
     file: &mut File,
     buffer: &Mutex<AlignedBuffer>,
     file_size: &AtomicU64,
+    stats: &crate::wal_handle::WalStats,
     callers: &mut Vec<FlushCaller>,
 ) {
     // Take ownership of buffered data (nanoseconds under lock)
@@ -137,12 +140,15 @@ fn do_flush(
         buf.take()
     };
 
+    let bytes_this_flush = taken.logical_len as u64;
+    let num_callers = callers.len() as u64;
+
     // Write to disk if there's data
     if !taken.is_empty() {
         let write_slice = taken.as_padded_slice();
         match write_all_retry(file, write_slice) {
             Ok(()) => {
-                file_size.fetch_add(taken.logical_len as u64, Ordering::Release);
+                file_size.fetch_add(bytes_this_flush, Ordering::Release);
             }
             Err(e) => {
                 notify_callers_error(callers, &e);
@@ -151,9 +157,16 @@ fn do_flush(
         }
     }
 
-    // fdatasync
+    // fdatasync with timing
+    let sync_start = Instant::now();
     match file.sync_data() {
         Ok(()) => {
+            let sync_us = sync_start.elapsed().as_micros() as u64;
+            stats.flush_count.fetch_add(1, Ordering::Relaxed);
+            stats.callers_notified.fetch_add(num_callers, Ordering::Relaxed);
+            stats.bytes_written.fetch_add(bytes_this_flush, Ordering::Relaxed);
+            stats.sync_latency_us_total.fetch_add(sync_us, Ordering::Relaxed);
+            stats.sync_latency_us_max.fetch_max(sync_us, Ordering::Relaxed);
             notify_callers_success(callers);
         }
         Err(e) => {
@@ -313,12 +326,14 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let alive = Arc::new(AtomicBool::new(true));
         let file_size = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(crate::wal_handle::WalStats::new());
         let config = ThreadConfig {
             file,
             buffer: buffer.clone(),
             rx,
             alive: alive.clone(),
             file_size: file_size.clone(),
+            stats: stats.clone(),
             commit_delay: Duration::from_micros(commit_delay_us),
             use_o_direct: false,
         };
@@ -401,6 +416,7 @@ mod tests {
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(crate::wal_handle::WalStats::new());
 
         // Write some data into the buffer
         {
@@ -410,7 +426,7 @@ mod tests {
 
         // Flush (no callers to notify in pure Rust test)
         let mut callers = Vec::new();
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
+        do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
 
         // Verify file_size was updated
         assert_eq!(file_size.load(Ordering::Acquire), 15);
@@ -430,9 +446,10 @@ mod tests {
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(crate::wal_handle::WalStats::new());
 
         let mut callers = Vec::new();
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
+        do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
 
         // No data should have been written
         assert_eq!(file_size.load(Ordering::Acquire), 0);
@@ -447,6 +464,7 @@ mod tests {
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(crate::wal_handle::WalStats::new());
 
         // First write
         {
@@ -454,7 +472,7 @@ mod tests {
             buf.extend(b"first ");
         }
         let mut callers = Vec::new();
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
+        do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
         assert_eq!(file_size.load(Ordering::Acquire), 6);
 
         // Second write (appends to file)
@@ -462,7 +480,7 @@ mod tests {
             let mut buf = buffer.lock().unwrap();
             buf.extend(b"second");
         }
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
+        do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
         assert_eq!(file_size.load(Ordering::Acquire), 12);
     }
 
@@ -475,6 +493,7 @@ mod tests {
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(crate::wal_handle::WalStats::new());
 
         {
             let mut buf = buffer.lock().unwrap();
@@ -495,6 +514,7 @@ mod tests {
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let file_size = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(crate::wal_handle::WalStats::new());
         let (tx, rx) = crossbeam_channel::unbounded();
 
         let buf_clone = buffer.clone();
@@ -510,6 +530,7 @@ mod tests {
                     rx,
                     alive: alive_clone,
                     file_size: fs_clone,
+                    stats: stats.clone(),
                     commit_delay: Duration::ZERO,
                     use_o_direct: false,
                 });
@@ -546,6 +567,7 @@ mod tests {
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let file_size = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(crate::wal_handle::WalStats::new());
         let (tx, rx) = crossbeam_channel::unbounded();
 
         let buf_clone = buffer.clone();
@@ -561,6 +583,7 @@ mod tests {
                     rx,
                     alive: alive_clone,
                     file_size: fs_clone,
+                    stats: stats.clone(),
                     commit_delay: Duration::ZERO,
                     use_o_direct: false,
                 });
@@ -587,6 +610,7 @@ mod tests {
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let file_size = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(crate::wal_handle::WalStats::new());
         let (tx, rx) = crossbeam_channel::unbounded();
 
         let buf_clone = buffer.clone();
@@ -602,6 +626,7 @@ mod tests {
                     rx,
                     alive: alive_clone,
                     file_size: fs_clone,
+                    stats: stats.clone(),
                     commit_delay: Duration::from_millis(50), // 50ms delay
                     use_o_direct: false,
                 });
@@ -633,6 +658,7 @@ mod tests {
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(crate::wal_handle::WalStats::new());
 
         // 10 MB of data
         let data = vec![0xABu8; 10 * 1024 * 1024];
@@ -642,7 +668,7 @@ mod tests {
         }
 
         let mut callers = Vec::new();
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
+        do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
 
         assert_eq!(file_size.load(Ordering::Acquire), 10 * 1024 * 1024);
         let contents = std::fs::read(&path).unwrap();

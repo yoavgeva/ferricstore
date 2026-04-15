@@ -30,6 +30,9 @@ defmodule :ferricstore_wal_nif do
   @doc "Returns current logical file size in bytes."
   def position(_handle), do: :erlang.nif_error(:nif_not_loaded)
 
+  @doc "Returns profiling counters as a map."
+  def stats(_handle), do: :erlang.nif_error(:nif_not_loaded)
+
   @doc "Read bytes from WAL at offset. Used during recovery."
   def pread(_handle, _offset, _len), do: :erlang.nif_error(:nif_not_loaded)
 end
