@@ -204,6 +204,14 @@ defmodule Ferricstore.Raft.StateMachine do
     maybe_release_cursor(meta, old_count, new_state, :ok)
   end
 
+  # Unwrap pre-serialized commands. ra stores {ttb, binary} in mem tables
+  # when commands are pre-serialized in the Batcher. Deserialize back to
+  # the original command tuple before dispatch.
+  @impl true
+  def apply(meta, {:ttb, binary}, state) when is_binary(binary) do
+    __MODULE__.apply(meta, :erlang.binary_to_term(binary), state)
+  end
+
   @impl true
   def apply(meta, {:put, key, value, expire_at_ms}, state) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)

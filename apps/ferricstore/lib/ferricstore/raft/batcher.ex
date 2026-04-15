@@ -559,8 +559,8 @@ defmodule Ferricstore.Raft.Batcher do
   @spec pipeline_submit(%__MODULE__{}, [command()], [GenServer.from()]) :: %__MODULE__{}
   defp pipeline_submit(state, [single_cmd], froms) do
     corr = make_ref()
-    # Pre-serialize to refc binary so the WAL process receives a pointer,
-    # not a deep copy. Parallelizes serialization across BEAM schedulers.
+    # Pre-serialize to refc binary — ra_log.erl passes {ttb, _} through
+    # without re-serializing. Only a pointer (~8 bytes) crosses the mailbox.
     serialized = {:ttb, :erlang.term_to_binary(single_cmd)}
     :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
     %{state | pending: Map.put(state.pending, corr, {froms, :single})}
