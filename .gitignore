@@ -45,3 +45,4 @@ test-results/
 *.tfstate
 *.tfstate.backup
 .terraform.lock.hcl
+apps/ferricstore/native/ferricstore_wal_nif/target/
