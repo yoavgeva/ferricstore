@@ -24,6 +24,74 @@ defmodule Ferricstore.WalStats do
     }
   end
 
+  @doc """
+  Snapshot process reductions. Call before benchmark, then after,
+  and diff to see who did the most work.
+  """
+  def snapshot_reductions do
+    all_named()
+    |> Enum.map(fn {name, pid} ->
+      case Process.info(pid, :reductions) do
+        {:reductions, r} -> {name, r}
+        _ -> {name, 0}
+      end
+    end)
+    |> Map.new()
+  end
+
+  @doc "Diff two reduction snapshots. Returns top N by work done."
+  def diff_reductions(before, after_snap, top \\ 15) do
+    after_snap
+    |> Enum.map(fn {name, after_r} ->
+      before_r = Map.get(before, name, 0)
+      {name, after_r - before_r}
+    end)
+    |> Enum.sort_by(fn {_, diff} -> -diff end)
+    |> Enum.take(top)
+  end
+
+  @doc "Print reduction diff as a table."
+  def print_reductions_diff(diff) do
+    IO.puts("\n=== Top Processes by Reductions ===")
+    Enum.each(diff, fn {name, reds} ->
+      IO.puts("  #{String.pad_trailing(to_string(name), 50)} #{reds}")
+    end)
+  end
+
+  @doc "Collect scheduler utilization via :msacc (1 second sample)."
+  def scheduler_utilization do
+    :msacc.start(1000)
+    stats = :msacc.stats()
+    :msacc.stop()
+
+    # Summarize by type
+    stats
+    |> Enum.group_by(fn %{type: t} -> t end)
+    |> Enum.map(fn {type, entries} ->
+      total = Enum.reduce(entries, 0, fn %{counters: c}, acc ->
+        acc + Map.values(c) |> Enum.sum()
+      end)
+      busy = Enum.reduce(entries, 0, fn %{counters: c}, acc ->
+        idle = Map.get(c, :sleep, 0) + Map.get(c, :gc, 0)
+        acc + (Map.values(c) |> Enum.sum()) - idle
+      end)
+      pct = if total > 0, do: Float.round(busy / total * 100, 1), else: 0.0
+      {type, pct}
+    end)
+  end
+
+  defp all_named do
+    Process.registered()
+    |> Enum.filter(fn name ->
+      s = Atom.to_string(name)
+      String.contains?(s, "Ferricstore") or
+      String.contains?(s, "ferricstore") or
+      String.contains?(s, "ra_ferricstore")
+    end)
+    |> Enum.map(fn name -> {name, Process.whereis(name)} end)
+    |> Enum.filter(fn {_, pid} -> pid != nil end)
+  end
+
   @doc "Pretty-print stats to stdout."
   def print do
     stats = collect()
