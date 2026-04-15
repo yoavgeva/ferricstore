@@ -63,34 +63,21 @@ defmodule Ferricstore.Store.Router do
   # WATCH failure, which the client retries.
   @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
   defp quorum_write(ctx, idx, command) do
-    shard_id = Ferricstore.Raft.Cluster.shard_server_id(idx)
-
-    # Use ra:process_command with reply_from: :local to guarantee
-    # read-your-writes. This waits until the LOCAL node has applied
-    # the entry to its state machine (ETS), not just until the leader
-    # commits. Without this, a follower returns :ok but its ETS hasn't
-    # been updated yet — reads return stale data.
+    # Route through Shard → Batcher for group commit batching.
+    # The Batcher uses ra:pipeline_command which batches multiple writes
+    # into one Raft entry, amortizing WAL fsync across all writes in the batch.
+    # The caller blocks until ra_event {applied, ...} confirms the entry
+    # was applied to the state machine (ETS updated) — same read-your-writes
+    # guarantee as ra:process_command(reply_from: :local).
     result =
       try do
-        case :ra.process_command(shard_id, command, %{reply_from: :local, timeout: 10_000}) do
-          {:ok, reply, _leader} ->
-            reply
-
-          {:error, :noproc} ->
-            GenServer.call(elem(ctx.shard_names, idx), command)
-
-          {:error, _reason} ->
-            GenServer.call(elem(ctx.shard_names, idx), command)
-
-          {:timeout, _server} ->
-            {:error, "ERR write timeout"}
-        end
+        GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
       catch
-        :exit, {:noproc, _} ->
-          GenServer.call(elem(ctx.shard_names, idx), command)
-
         :exit, {:timeout, _} ->
           {:error, "ERR write timeout"}
+
+        :exit, {:noproc, _} ->
+          {:error, "ERR shard not available"}
       end
 
     case result do
