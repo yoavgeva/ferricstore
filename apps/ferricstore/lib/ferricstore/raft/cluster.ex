@@ -46,6 +46,9 @@ defmodule Ferricstore.Raft.Cluster do
 
     names = :ra_system.derive_names(@ra_system)
 
+    commit_delay_us =
+      Application.get_env(:ferricstore, :wal_commit_delay_us, 200)
+
     config = %{
       name: @ra_system,
       names: names,
@@ -55,7 +58,8 @@ defmodule Ferricstore.Raft.Cluster do
       wal_max_batch_size: 32_768,
       wal_compute_checksums: false,
       wal_pre_allocate: true,
-      wal_io_module: :ferricstore_wal_nif
+      wal_io_module: :ferricstore_wal_nif,
+      wal_commit_delay_us: commit_delay_us
     }
 
     case :ra_system.start(config) do
