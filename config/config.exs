@@ -4,6 +4,10 @@ config :ferricstore, Ferricstore.Bitcask.NIF,
   skip_compilation?: true,
   load_from: {:ferricstore, "priv/native/ferricstore_bitcask"}
 
+config :ferricstore, :ferricstore_wal_nif,
+  skip_compilation?: true,
+  load_from: {:ferricstore, "priv/native/ferricstore_wal_nif"}
+
 # TCP server port (default: 6379, matches Redis)
 config :ferricstore, :port, 6379
 

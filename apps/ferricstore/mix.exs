@@ -61,6 +61,8 @@ defmodule Ferricstore.MixProject do
         "native/ferricstore_bitcask/.cargo",
         "native/ferricstore_bitcask/src",
         "native/ferricstore_bitcask/Cargo*",
+        "native/ferricstore_wal_nif/src",
+        "native/ferricstore_wal_nif/Cargo*",
         "checksum-*.exs",
         "mix.exs"
       ],
@@ -75,7 +77,7 @@ defmodule Ferricstore.MixProject do
     [
       {:rustler_precompiled, "~> 0.8"},
       {:rustler, "~> 0.37", optional: true},
-      {:ra, "~> 3.1"},
+      {:ra, path: "../../../ra"},
       {:libcluster, "3.3.3"},
       {:libcluster_consul, "1.3.0", optional: true},
       {:libcluster_etcd, "1.1.2", optional: true},

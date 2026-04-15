@@ -54,7 +54,8 @@ defmodule Ferricstore.Raft.Cluster do
       segment_max_entries: 32_768,
       wal_max_batch_size: 32_768,
       wal_compute_checksums: false,
-      wal_pre_allocate: true
+      wal_pre_allocate: true,
+      wal_io_module: :ferricstore_wal_nif
     }
 
     case :ra_system.start(config) do

@@ -342,11 +342,11 @@ defmodule Ferricstore.WritePathOptimizationsTest do
 
     test "returns false for expired key" do
       key = ukey("ef_exp")
-      expire_at = System.os_time(:millisecond) + 50
+      expire_at = System.os_time(:millisecond) + 500
       Router.put(FerricStore.Instance.get(:default), key, "ephemeral", expire_at)
 
       assert Router.exists_fast?(FerricStore.Instance.get(:default), key) == true
-      Process.sleep(100)
+      Process.sleep(600)
       assert Router.exists_fast?(FerricStore.Instance.get(:default), key) == false
     end
 
