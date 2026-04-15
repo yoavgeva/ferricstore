@@ -77,8 +77,12 @@ fn thread_loop_inner(
     stats: Arc<crate::wal_handle::WalStats>,
     commit_delay: Duration,
 ) {
+    let mut callers: Vec<FlushCaller> = Vec::new();
+
     loop {
-        // Block until a message arrives
+        // =====================================================================
+        // Phase 1: IDLE — block until first Flush arrives (zero CPU when idle)
+        // =====================================================================
         let msg = match rx.recv() {
             Ok(msg) => msg,
             Err(_) => return, // Channel closed — handle dropped
@@ -86,42 +90,83 @@ fn thread_loop_inner(
 
         match msg {
             ThreadMsg::Close => {
-                // Final flush and exit
                 let _ = do_final_flush(&mut file, &buffer, &file_size);
                 return;
             }
             ThreadMsg::Flush(caller) => {
-                let mut callers = vec![caller];
+                callers.push(caller);
+            }
+        }
 
-                // Commit delay: collect more flush requests
-                if !commit_delay.is_zero() {
-                    let deadline = Instant::now() + commit_delay;
-                    loop {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            break;
-                        }
-                        match rx.recv_timeout(remaining) {
-                            Ok(ThreadMsg::Flush(c)) => callers.push(c),
-                            Ok(ThreadMsg::Close) => {
-                                // Close during commit delay — flush and exit
-                                do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
-                                let _ = do_final_flush(&mut file, &buffer, &file_size);
-                                return;
-                            }
-                            Err(RecvTimeoutError::Timeout) => break,
-                            Err(RecvTimeoutError::Disconnected) => {
-                                // Best-effort flush before exit
-                                do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
-                                return;
-                            }
-                        }
+        // =====================================================================
+        // Phase 2: COMMIT DELAY — wait briefly to batch more (first cycle only)
+        // =====================================================================
+        if !commit_delay.is_zero() {
+            let deadline = Instant::now() + commit_delay;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(ThreadMsg::Flush(c)) => callers.push(c),
+                    Ok(ThreadMsg::Close) => {
+                        do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
+                        let _ = do_final_flush(&mut file, &buffer, &file_size);
+                        return;
+                    }
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
+                        return;
                     }
                 }
-
-                // Perform I/O: take buffer → write → fdatasync → notify callers
-                do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
             }
+        }
+
+        // =====================================================================
+        // Phase 3: SELF-DRIVING LOOP — keep flushing while buffer has data
+        // =====================================================================
+        loop {
+            // Flush: take buffer → write → fdatasync → notify callers
+            do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
+
+            // Collect any Flush messages that arrived during I/O (non-blocking)
+            loop {
+                match rx.try_recv() {
+                    Ok(ThreadMsg::Flush(c)) => callers.push(c),
+                    Ok(ThreadMsg::Close) => {
+                        let _ = do_final_flush(&mut file, &buffer, &file_size);
+                        return;
+                    }
+                    Err(_) => break, // No more messages
+                }
+            }
+
+            // Check: is there more data in the buffer?
+            let has_data = {
+                let buf = buffer.lock().expect("buffer mutex poisoned");
+                !buf.is_empty()
+            };
+
+            if has_data {
+                // More data arrived during I/O — loop immediately (no delay).
+                // If we have no callers yet, that's fine — they'll arrive by
+                // the time we finish the next flush, and we'll collect them.
+                continue;
+            }
+
+            // Buffer empty. If we have pending callers (Flush messages arrived
+            // but no data), they need to be notified after a sync.
+            if !callers.is_empty() {
+                // Sync for the callers (even if buffer was empty, they expect
+                // {wal_sync_complete} which guarantees prior writes are durable).
+                do_flush(&mut file, &buffer, &file_size, &stats, &mut callers);
+                continue;
+            }
+
+            // Truly idle: no data, no callers. Return to Phase 1.
+            break;
         }
     }
 }
