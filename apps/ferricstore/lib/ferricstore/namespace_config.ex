@@ -463,6 +463,19 @@ defmodule Ferricstore.NamespaceConfig do
     :persistent_term.put(:ferricstore_durability_mode, durability_mode)
     :persistent_term.put(:ferricstore_has_async_ns, has_async)
 
+    # Update Instance ctx so Router.durability_for_key sees the new mode.
+    # Without this, the fast path in durability_for_key would use the stale
+    # :all_quorum from Instance init and never reach the ETS lookup.
+    try do
+      ctx = :persistent_term.get({FerricStore.Instance, :default})
+      if ctx.durability_mode != durability_mode do
+        :persistent_term.put({FerricStore.Instance, :default},
+          %{ctx | durability_mode: durability_mode})
+      end
+    catch
+      _, _ -> :ok
+    end
+
     notify_batchers()
 
     :ok

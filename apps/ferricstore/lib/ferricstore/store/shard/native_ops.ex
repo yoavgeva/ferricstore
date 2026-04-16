@@ -24,8 +24,8 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  defp handle_cas_raft(key, expected, new_value, ttl_ms, state) do
-    expire_at_ms = if ttl_ms, do: Ferricstore.HLC.now_ms() + ttl_ms, else: nil
+  defp handle_cas_raft(key, expected, new_value, expire_at_ms, state) do
+    # expire_at_ms is already absolute (converted by Router.cas)
     result = Ferricstore.Raft.Batcher.write(state.index, {:cas, key, expected, new_value, expire_at_ms})
 
     case result do
@@ -64,8 +64,8 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  defp handle_lock_raft(key, owner, ttl_ms, state) do
-    expire_at_ms = Ferricstore.HLC.now_ms() + ttl_ms
+  defp handle_lock_raft(key, owner, expire_at_ms, state) do
+    # expire_at_ms is already absolute (converted by Router.lock)
     result = Ferricstore.Raft.Batcher.write(state.index, {:lock, key, owner, expire_at_ms})
 
     case result do
@@ -156,8 +156,8 @@ defmodule Ferricstore.Store.Shard.NativeOps do
     end
   end
 
-  defp handle_extend_raft(key, owner, ttl_ms, state) do
-    expire_at_ms = Ferricstore.HLC.now_ms() + ttl_ms
+  defp handle_extend_raft(key, owner, expire_at_ms, state) do
+    # expire_at_ms is already absolute (converted by Router.extend)
     result = Ferricstore.Raft.Batcher.write(state.index, {:extend, key, owner, expire_at_ms})
 
     case result do

@@ -643,33 +643,39 @@ defmodule Ferricstore.Store.Shard do
   end
 
   # -------------------------------------------------------------------
-  # handle_call — catch-all (non-Raft state machine fallback)
+  # handle_call — catch-all for unhandled commands
   #
   # MUST be the LAST handle_call clause.
   # -------------------------------------------------------------------
 
-  # Catch-all for commands not handled above (prob commands, etc.).
-  # When Raft is disabled (e.g., isolated test instances), these commands
-  # arrive via GenServer.call instead of Raft apply/3. Delegate to the
-  # state machine's apply logic directly.
-  def handle_call(command, _from, state) when is_tuple(command) and not state.raft? do
-    sm_state = %{
-      shard_index: state.index,
-      shard_data_path: state.shard_data_path,
-      active_file_id: state.active_file_id,
-      active_file_path: state.active_file_path,
-      ets: state.ets,
-      data_dir: state.data_dir,
-      applied_count: 0,
-      release_cursor_interval: 20_000,
-      cross_shard_locks: %{},
-      cross_shard_intents: %{},
-      instance_ctx: state.instance_ctx
-    }
+  # Catch-all for commands not handled above (prob commands, server_command,
+  # raft_apply_hook, etc.). Routes through Batcher → Raft when Raft is
+  # enabled, or directly to state machine when Raft is disabled.
+  def handle_call(command, from, state) when is_tuple(command) do
+    if state.raft? do
+      # Forward through Batcher for Raft consensus, same as put/delete.
+      Ferricstore.Raft.Batcher.write_async(state.index, command, from)
+      {:noreply, state}
+    else
+      # No Raft — apply directly via state machine.
+      sm_state = %{
+        shard_index: state.index,
+        shard_data_path: state.shard_data_path,
+        active_file_id: state.active_file_id,
+        active_file_path: state.active_file_path,
+        ets: state.ets,
+        data_dir: state.data_dir,
+        applied_count: 0,
+        release_cursor_interval: 20_000,
+        cross_shard_locks: %{},
+        cross_shard_intents: %{},
+        instance_ctx: state.instance_ctx
+      }
 
-    case Ferricstore.Raft.StateMachine.apply(%{}, command, sm_state) do
-      {_new_state, result} -> {:reply, result, state}
-      {_new_state, result, _effects} -> {:reply, result, state}
+      case Ferricstore.Raft.StateMachine.apply(%{}, command, sm_state) do
+        {_new_state, result} -> {:reply, result, state}
+        {_new_state, result, _effects} -> {:reply, result, state}
+      end
     end
   end
 

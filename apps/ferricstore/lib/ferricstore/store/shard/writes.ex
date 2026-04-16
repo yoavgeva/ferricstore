@@ -122,12 +122,17 @@ defmodule Ferricstore.Store.Shard.Writes do
         case ShardETS.coerce_integer(value) do
           {:ok, int_val} ->
             new_val = int_val + delta
-            result = Ferricstore.Raft.Batcher.write(state.index, {:put, key, new_val, expire_at_ms})
-            new_version = state.write_version + 1
 
-            case result do
-              :ok -> {:reply, {:ok, new_val}, %{state | write_version: new_version}}
-              {:error, _} = err -> {:reply, err, state}
+            if new_val > 9_223_372_036_854_775_807 or new_val < -9_223_372_036_854_775_808 do
+              {:reply, {:error, "ERR increment or decrement would overflow"}, state}
+            else
+              result = Ferricstore.Raft.Batcher.write(state.index, {:put, key, new_val, expire_at_ms})
+              new_version = state.write_version + 1
+
+              case result do
+                :ok -> {:reply, {:ok, new_val}, %{state | write_version: new_version}}
+                {:error, _} = err -> {:reply, err, state}
+              end
             end
 
           :error ->

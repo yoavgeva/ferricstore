@@ -63,12 +63,6 @@ defmodule Ferricstore.Store.Router do
   # WATCH failure, which the client retries.
   @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
   defp quorum_write(ctx, idx, command) do
-    # Route through Shard → Batcher for group commit batching.
-    # The Batcher uses ra:pipeline_command which batches multiple writes
-    # into one Raft entry, amortizing WAL fsync across all writes in the batch.
-    # The caller blocks until ra_event {applied, ...} confirms the entry
-    # was applied to the state machine (ETS updated) — same read-your-writes
-    # guarantee as ra:process_command(reply_from: :local).
     result =
       try do
         GenServer.call(elem(ctx.shard_names, idx), command, 10_000)

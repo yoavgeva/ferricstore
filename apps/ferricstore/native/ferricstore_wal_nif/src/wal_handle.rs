@@ -17,38 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Counters for profiling WAL behavior.
-pub struct WalStats {
-    /// Number of flush+fdatasync cycles completed.
-    pub flush_count: AtomicU64,
-    /// Total number of callers notified across all flushes.
-    pub callers_notified: AtomicU64,
-    /// Total bytes written across all flushes.
-    pub bytes_written: AtomicU64,
-    /// Sum of fdatasync latency in microseconds (for avg calculation).
-    pub sync_latency_us_total: AtomicU64,
-    /// Max fdatasync latency in microseconds.
-    pub sync_latency_us_max: AtomicU64,
-    /// Number of write NIF calls received.
-    pub write_calls: AtomicU64,
-    /// Number of sync NIF calls received.
-    pub sync_calls: AtomicU64,
-}
-
-impl WalStats {
-    pub fn new() -> Self {
-        WalStats {
-            flush_count: AtomicU64::new(0),
-            callers_notified: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
-            sync_latency_us_total: AtomicU64::new(0),
-            sync_latency_us_max: AtomicU64::new(0),
-            write_calls: AtomicU64::new(0),
-            sync_calls: AtomicU64::new(0),
-        }
-    }
-}
-
 pub struct WalHandle {
     /// Shared write buffer. NIF write() appends here, background thread takes.
     buffer: Arc<Mutex<AlignedBuffer>>,
@@ -61,9 +29,6 @@ pub struct WalHandle {
 
     /// Logical file size (updated by background thread after each write).
     file_size_counter: Arc<AtomicU64>,
-
-    /// Profiling counters.
-    pub stats: Arc<WalStats>,
 
     /// Maximum buffer size before backpressure.
     max_buffer_bytes: u64,
@@ -92,15 +57,12 @@ impl WalHandle {
         let (flush_tx, flush_rx) = crossbeam_channel::bounded(1024);
         let alive = Arc::new(AtomicBool::new(true));
         let file_size = Arc::new(AtomicU64::new(0));
-        let stats = Arc::new(WalStats::new());
-
         let config = ThreadConfig {
             file,
             buffer: buffer.clone(),
             rx: flush_rx,
             alive: alive.clone(),
             file_size: file_size.clone(),
-            stats: stats.clone(),
             commit_delay: Duration::from_micros(commit_delay_us),
             use_o_direct: _o_direct,
         };
@@ -114,7 +76,6 @@ impl WalHandle {
             flush_tx,
             alive,
             file_size_counter: file_size,
-            stats,
             max_buffer_bytes,
             thread_handle: Mutex::new(Some(thread_handle)),
             read_file: Mutex::new(read_file),
@@ -144,7 +105,6 @@ impl WalHandle {
         }
 
         buf.extend(data);
-        self.stats.write_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -161,7 +121,6 @@ impl WalHandle {
             saved_ref,
         };
 
-        self.stats.sync_calls.fetch_add(1, Ordering::Relaxed);
         self.flush_tx
             .send(ThreadMsg::Flush(caller))
             .map_err(|_| rustler::Error::Term(Box::new("wal_thread_dead")))

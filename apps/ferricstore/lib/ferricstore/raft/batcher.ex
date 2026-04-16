@@ -255,9 +255,13 @@ defmodule Ferricstore.Raft.Batcher do
   def extract_prefix(command) when is_tuple(command) do
     key = elem(command, 1)
 
-    case :binary.split(key, ":") do
-      [^key] -> "_root"
-      [prefix | _rest] -> prefix
+    if is_binary(key) do
+      case :binary.split(key, ":") do
+        [^key] -> "_root"
+        [prefix | _rest] -> prefix
+      end
+    else
+      "_root"
     end
   end
 
@@ -327,8 +331,6 @@ defmodule Ferricstore.Raft.Batcher do
   # Handle ra_event notifications from pipeline_command.
   # Applied commands: {ra_event, Leader, {applied, [{correlation, result}]}}
   def handle_info({:ra_event, _leader, {:applied, applied_list}}, state) do
-    Ferricstore.WritePathProfiler.incr(
-      Ferricstore.WritePathProfiler.c_ra_applied(), length(applied_list))
     new_state =
       Enum.reduce(applied_list, state, fn {corr, result}, acc ->
         case Map.pop(acc.pending, corr) do
@@ -461,8 +463,6 @@ defmodule Ferricstore.Raft.Batcher do
   # batch is flushed and committed.
   @spec enqueue_write(command(), GenServer.from(), %__MODULE__{}) :: {:noreply, %__MODULE__{}}
   defp enqueue_write(command, from, state) do
-    alias Ferricstore.WritePathProfiler, as: P
-    P.incr(P.c_batcher_enqueue())
     prefix = extract_prefix(command)
     {{window_ms, durability}, state} = lookup_ns_config(prefix, state)
     slot_key = {prefix, durability}
@@ -527,18 +527,12 @@ defmodule Ferricstore.Raft.Batcher do
         {:noreply, %{state | slots: new_slots}}
 
       slot ->
-        alias Ferricstore.WritePathProfiler, as: P
         cancel_timer(slot.timer_ref)
 
         batch = Enum.reverse(slot.cmds)
         froms = Enum.reverse(slot.froms)
 
-        P.incr(P.c_batcher_flush())
-        P.incr(P.c_batcher_flush_size(), length(batch))
-
         {_prefix, durability} = slot_key
-
-        t1 = System.monotonic_time(:microsecond)
 
         new_state =
           case durability do
@@ -549,9 +543,6 @@ defmodule Ferricstore.Raft.Batcher do
             :quorum ->
               pipeline_submit(state, batch, froms)
           end
-
-        t2 = System.monotonic_time(:microsecond)
-        P.incr(P.c_time_batcher_flush_us(), t2 - t1)
 
         # Remove the slot entirely once flushed (clean up empty slots)
         new_slots = Map.delete(new_state.slots, slot_key)
@@ -565,26 +556,16 @@ defmodule Ferricstore.Raft.Batcher do
   # Returns updated state with the correlation tracked in `pending`.
   @spec pipeline_submit(%__MODULE__{}, [command()], [GenServer.from()]) :: %__MODULE__{}
   defp pipeline_submit(state, [single_cmd], froms) do
-    alias Ferricstore.WritePathProfiler, as: P
-    P.incr(P.c_ra_pipeline())
-    t1 = System.monotonic_time(:microsecond)
     corr = make_ref()
     serialized = {:ttb, :erlang.term_to_binary(single_cmd)}
     :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
-    t2 = System.monotonic_time(:microsecond)
-    P.incr(P.c_time_ra_pipeline_us(), t2 - t1)
     %{state | pending: Map.put(state.pending, corr, {froms, :single})}
   end
 
   defp pipeline_submit(state, batch, froms) do
-    alias Ferricstore.WritePathProfiler, as: P
-    P.incr(P.c_ra_pipeline())
-    t1 = System.monotonic_time(:microsecond)
     corr = make_ref()
     serialized = {:ttb, :erlang.term_to_binary({:batch, batch})}
     :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
-    t2 = System.monotonic_time(:microsecond)
-    P.incr(P.c_time_ra_pipeline_us(), t2 - t1)
     %{state | pending: Map.put(state.pending, corr, {froms, :batch})}
   end
 
