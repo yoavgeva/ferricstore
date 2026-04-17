@@ -1309,14 +1309,80 @@ defmodule Ferricstore.Store.Router do
 
   @spec compound_put(FerricStore.Instance.t(), binary(), binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
   def compound_put(ctx, redis_key, compound_key, value, expire_at_ms) do
-    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
-    GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+    idx = shard_for(ctx, redis_key)
+
+    case durability_for_key(ctx, redis_key) do
+      :quorum ->
+        shard = elem(ctx.shard_names, idx)
+        GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+
+      :async ->
+        async_compound_put(ctx, idx, redis_key, compound_key, value, expire_at_ms)
+    end
   end
 
   @spec compound_delete(FerricStore.Instance.t(), binary(), binary()) :: :ok | {:error, term()}
   def compound_delete(ctx, redis_key, compound_key) do
-    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
-    GenServer.call(shard, {:compound_delete, redis_key, compound_key})
+    idx = shard_for(ctx, redis_key)
+
+    case durability_for_key(ctx, redis_key) do
+      :quorum ->
+        shard = elem(ctx.shard_names, idx)
+        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
+
+      :async ->
+        async_compound_delete(ctx, idx, compound_key)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Async compound implementations (Group A in async-compound-list-prob-design.md)
+  #
+  # Structurally identical to async_write_put/delete — the only difference is
+  # that the key is a compound_key (e.g. "H:user:1:name") built from a
+  # redis_key + field. Durability was already decided by the caller (compound_put/
+  # compound_delete) based on the PARENT redis_key's namespace, so the user-
+  # facing abstraction "HSET is in the `user` namespace" holds.
+  #
+  # Promotion check is intentionally skipped on the async path. Hashes that
+  # grow large in an async namespace stay in the shared Bitcask log instead
+  # of being promoted to a dedicated file. Acceptable trade-off; users who
+  # want promotion can configure the namespace as quorum.
+  # ---------------------------------------------------------------------------
+
+  defp async_compound_put(ctx, idx, _redis_key, compound_key, value, expire_at_ms) do
+    size = :atomics.info(ctx.disk_pressure).size
+    under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
+
+    if under_pressure do
+      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
+    else
+      install_rmw_value(ctx, idx, compound_key, value, expire_at_ms)
+      async_submit_to_raft(idx, {:put, compound_key, value, expire_at_ms})
+      :ok
+    end
+  end
+
+  defp async_compound_delete(ctx, idx, compound_key) do
+    size = :atomics.info(ctx.disk_pressure).size
+    under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
+
+    if under_pressure do
+      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
+    else
+      keydir = elem(ctx.keydir_refs, idx)
+      track_keydir_binary_delete(ctx, idx, keydir, compound_key)
+      :ets.delete(keydir, compound_key)
+
+      {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+      Ferricstore.Store.BitcaskWriter.delete(idx, file_path, compound_key)
+
+      wv_size = :counters.info(ctx.write_version).size
+      if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+
+      async_submit_to_raft(idx, {:delete, compound_key})
+      :ok
+    end
   end
 
   @spec compound_scan(FerricStore.Instance.t(), binary(), binary()) :: [{binary(), binary()}]
