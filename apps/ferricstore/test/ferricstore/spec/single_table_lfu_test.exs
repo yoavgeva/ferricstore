@@ -44,7 +44,6 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
 
     Enum.each(0..(shard_count - 1), fn i ->
       Ferricstore.Raft.Batcher.flush(i)
-      Ferricstore.Raft.AsyncApplyWorker.drain(i)
     end)
 
     # Flush background Bitcask writers so deferred writes are on disk.
@@ -791,10 +790,11 @@ defmodule Ferricstore.Spec.SingleTableLfuTest do
              "keydir entry should be 7-element tuple, got #{inspect(entries)}"
     end
 
-    # Test 39: AsyncApplyWorker writes to single table
-    test "39. async apply worker writes to single table" do
-      # AsyncApplyWorker is used for async durability namespaces.
-      # Test that after async batch apply, the keydir has 7-element tuples.
+    # Test 39: async path writes to single table
+    test "39. async write applies to single table" do
+      # Async durability writes go through Router → Batcher.async_submit →
+      # Raft. Verify that after the batch applies, the keydir has the
+      # 7-element tuple shape shared with the quorum path.
       Router.put(FerricStore.Instance.get(:default), "async_key", "async_val")
       drain_all()
 

@@ -13,7 +13,7 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.NamespaceConfig
-  alias Ferricstore.Raft.{AsyncApplyWorker, Batcher}
+  alias Ferricstore.Raft.Batcher
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
@@ -34,12 +34,13 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
   # Helper to generate unique keys with a specific prefix
   defp pkey(prefix, base), do: "#{prefix}:async_dur_#{base}_#{:rand.uniform(9_999_999)}"
 
-  # Drains both Batcher and AsyncApplyWorker for all shards to ensure
-  # async writes are fully applied before assertions.
+  # Flushes the Batcher for all shards. Since Batcher.flush now waits for
+  # in-flight async ra_events via the `:async_no_reply` pending tracking,
+  # this is sufficient to guarantee all pending async writes have applied
+  # before assertions.
   defp drain_async do
     for i <- 0..3 do
       Batcher.flush(i)
-      AsyncApplyWorker.drain(i)
     end
   end
 
@@ -305,7 +306,6 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
 
   describe "async durability telemetry" do
     test "async writes emit batch flush telemetry" do
-      # Post-redesign: async writes no longer go through AsyncApplyWorker.
       # The Batcher emits [:ferricstore, :batcher, :async_flush] when it
       # flushes an async batch to Raft.
       ref =

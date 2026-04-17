@@ -41,11 +41,10 @@ defmodule Ferricstore.Commands.KeyInfoTest do
     |> Map.new(fn [k, v] -> {k, v} end)
   end
 
-  # Flushes Raft batchers and async workers so compound key writes land in ETS.
+  # Flushes Raft batchers so compound key writes land in ETS.
   defp flush_raft do
     Enum.each(0..3, fn i ->
       Ferricstore.Raft.Batcher.flush(i)
-      Ferricstore.Raft.AsyncApplyWorker.drain(i)
     end)
   end
 

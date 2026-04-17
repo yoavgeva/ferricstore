@@ -59,10 +59,10 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       assert Router.get(FerricStore.Instance.get(:default), key) == "local_value"
 
       # Now verify the Raft state machine has it too — query via quorum read.
-      # First, drain async workers to ensure the Raft submission had time to process.
+      # Flush the Batcher so any pending async commands submit to Raft and
+      # their :applied ra_events arrive before we assert on replica state.
       shard_count = Application.get_env(:ferricstore, :shard_count, 4)
       for i <- 0..(shard_count - 1) do
-        Ferricstore.Raft.AsyncApplyWorker.drain(i)
         Ferricstore.Raft.Batcher.flush(i)
       end
       Process.sleep(100)
@@ -79,17 +79,17 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       assert :ok = NamespaceConfig.set("asynctest", "durability", "async")
 
       test_pid = self()
-      handler_id = "async-raft-monitor-#{System.unique_integer([:positive])}"
+      handler_id = "async-batcher-monitor-#{System.unique_integer([:positive])}"
 
-      # Attach telemetry to detect async apply worker batch processing.
-      # If the command goes through AsyncApplyWorker, it means the Batcher
-      # routed it via the async path (which then calls async_submit_to_raft
-      # with the fire-and-forget pipeline_command/2).
+      # Attach telemetry to confirm the async path goes through Batcher's
+      # batched submission (Batcher.async_submit → ra.pipeline_command per
+      # docs/async-write-redesign.md). Observing an :async_flush event
+      # proves the write took the async path, not quorum.
       :telemetry.attach(
         handler_id,
-        [:ferricstore, :async_apply, :batch],
+        [:ferricstore, :batcher, :async_flush],
         fn _event, measurements, metadata, config ->
-          send(config.test_pid, {:async_batch, measurements, metadata})
+          send(config.test_pid, {:async_flush, measurements, metadata})
         end,
         %{test_pid: test_pid}
       )
@@ -97,10 +97,11 @@ defmodule Ferricstore.Raft.AsyncRaftDivergenceTest do
       key = "asynctest:fire_forget_check"
       assert :ok = Router.put(FerricStore.Instance.get(:default), key, "value", 0)
 
-      # Drain to ensure async processing completes
+      # Flush the Batcher so pending async commands submit and the
+      # :async_flush telemetry fires before we assert.
       shard_count = Application.get_env(:ferricstore, :shard_count, 4)
       for i <- 0..(shard_count - 1) do
-        Ferricstore.Raft.AsyncApplyWorker.drain(i)
+        Ferricstore.Raft.Batcher.flush(i)
       end
 
       :telemetry.detach(handler_id)

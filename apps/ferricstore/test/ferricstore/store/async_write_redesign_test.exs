@@ -3,8 +3,8 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   TDD tests for the async write redesign (docs/async-write-redesign.md).
 
   Behavior under test:
-  - Async writes go through the Batcher (not AsyncApplyWorker) and are
-    submitted to Raft as batched ra.pipeline_command({:batch, [...]}) calls.
+  - Async writes go through the Batcher and are submitted to Raft as
+    batched ra.pipeline_command({:batch, [...]}) calls.
   - Async commands are wrapped as `{:async, inner_cmd}` before reaching the
     state machine so apply/3 can distinguish them.
   - State machine on origin (ETS has entry) skips Bitcask + ETS writes to
@@ -12,7 +12,6 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   - State machine on replica (ETS empty) applies inner_cmd normally.
   - Read-your-writes holds for both small and large values on the origin.
   - Concurrent writes to the same key land in correct order via BitcaskWriter.
-  - AsyncApplyWorker is no longer part of the async hot path (or is absent).
   """
   use ExUnit.Case, async: false
 
@@ -40,34 +39,6 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   # ---------------------------------------------------------------------------
 
   describe "async routing" do
-    test "async writes do NOT route through AsyncApplyWorker hot path" do
-      # Subscribe to both telemetry sources. If the redesign is in place,
-      # async writes land as Batcher batches, not as AsyncApplyWorker batches.
-      handler_id = {:redesign_test, :async_apply}
-
-      _ =
-        :telemetry.attach(
-          handler_id,
-          [:ferricstore, :async_apply, :batch],
-          fn _event, _meas, _meta, test_pid ->
-            send(test_pid, :async_apply_batch_event)
-          end,
-          self()
-        )
-
-      try do
-        for i <- 1..5 do
-          :ok = Router.put(ctx(), "#{@ns}:noworker_#{i}", "v#{i}", 0)
-        end
-
-        # After the redesign, AsyncApplyWorker should not be invoked on the
-        # hot path. Allow the async plumbing time to flush.
-        refute_receive :async_apply_batch_event, 200
-      after
-        :telemetry.detach(handler_id)
-      end
-    end
-
     test "async writes produce batched ra.pipeline_command submissions" do
       # Batcher already emits telemetry on its async flush path. Verify the
       # telemetry fires with multiple commands batched together.

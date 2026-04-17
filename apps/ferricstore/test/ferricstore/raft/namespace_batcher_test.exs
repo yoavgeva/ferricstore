@@ -226,9 +226,10 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
       k = pkey("ephemeral", "async_test")
       shard = Router.shard_for(FerricStore.Instance.get(:default), k)
 
-      # Async durability bypasses Raft consensus and writes via
-      # AsyncApplyWorker. The write returns immediately; the data
-      # becomes visible after the worker processes the batch.
+      # Async durability: the Batcher replies :ok to the caller immediately
+      # when the slot is flushed and submits the batch to Raft in the
+      # background. The data becomes visible once the state machine
+      # applies the replicated batch.
       assert :ok == Batcher.write(shard, {:put, k, "async_val", 0})
       ShardHelpers.eventually(fn ->
         Router.get(FerricStore.Instance.get(:default), k) == "async_val"
@@ -616,7 +617,7 @@ defmodule Ferricstore.Raft.NamespaceBatcherTest do
         |> then(fn i -> "indep_y:ic_#{i}" end)
 
       assert :ok == Batcher.write(shard, {:put, k_x, "vx", 0})
-      # Async needs a small wait for AsyncApplyWorker
+      # Async needs a small wait for the Raft state machine to apply
       assert :ok == Batcher.write(shard, {:put, k_y, "vy", 0})
 
       ShardHelpers.eventually(fn ->

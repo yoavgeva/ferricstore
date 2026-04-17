@@ -19,8 +19,9 @@ defmodule Ferricstore.Application do
   ├── (ACL moved to ferricstore_server)
   ├── Ferricstore.HLC                     (Hybrid Logical Clock)
   ├── Ferricstore.Raft.Batcher (x N)     (group-commit batchers)
+  ├── Ferricstore.Store.BitcaskWriter (x N) (background Bitcask flushers)
+  ├── Ferricstore.Store.RmwCoordinator (x N) (async RMW contention fallback)
   ├── Ferricstore.Store.ShardSupervisor   (one_for_one over N Shard GenServers)
-  ├── Ferricstore.Raft.AsyncApplyWorker (x N)
   ├── Ferricstore.Merge.Supervisor        (Semaphore + N Scheduler GenServers)
   ├── Ferricstore.PubSub
   ├── Ferricstore.FetchOrCompute
@@ -162,14 +163,6 @@ defmodule Ferricstore.Application do
         )
       end)
 
-    async_worker_children =
-      Enum.map(0..(shard_count - 1), fn i ->
-        Supervisor.child_spec(
-          {Ferricstore.Raft.AsyncApplyWorker, shard_index: i},
-          id: :"async_apply_worker_#{i}"
-        )
-      end)
-
     # Background Bitcask writers — one per shard. Must start BEFORE the
     # ShardSupervisor because StateMachine.apply sends casts to these
     # processes during shard init/recovery when replaying the Raft log.
@@ -215,7 +208,6 @@ defmodule Ferricstore.Application do
         [
         {Ferricstore.Store.ShardSupervisor, data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}
       ] ++
-        async_worker_children ++
         [
           {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
           Ferricstore.PubSub,

@@ -16,9 +16,11 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
   ## Architecture note
 
   In single-node Raft mode, each node is its own independent cluster with
-  self-quorum. Async durability bypasses Raft consensus and writes directly
-  to Bitcask + ETS via the AsyncApplyWorker. After a node restart, the
-  Bitcask WAL (which was fsynced) ensures the data survives.
+  self-quorum. Async durability writes locally (ETS + BitcaskWriter) in the
+  Router before returning :ok to the caller, then submits the batch to
+  Raft via `Batcher.async_submit` for replication. After a node restart,
+  the Bitcask log ensures the data survives (Raft WAL replays anything
+  that hadn't been persisted yet).
 
   ## Running
 

@@ -285,8 +285,9 @@ defmodule Ferricstore.Store.Shard do
 
   def handle_call(:keys, _from, state), do: ShardReads.handle_keys(state)
 
-  # Returns the active file info for the AsyncApplyWorker.
-  # Avoids :sys.get_state which copies the entire GenServer state.
+  # Returns the active file info (file_id + path). Used by callers that
+  # need to reach the shard's current Bitcask file without copying the
+  # entire Shard state via :sys.get_state.
   def handle_call(:get_active_file, _from, state) do
     {:reply, {state.active_file_id, state.active_file_path}, state}
   end

@@ -20,7 +20,6 @@ defmodule Ferricstore.Store.LFUDecayTest do
 
     Enum.each(0..(shard_count - 1), fn i ->
       Ferricstore.Raft.Batcher.flush(i)
-      Ferricstore.Raft.AsyncApplyWorker.drain(i)
     end)
 
     Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
