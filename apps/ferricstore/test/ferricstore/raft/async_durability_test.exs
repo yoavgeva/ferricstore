@@ -304,10 +304,13 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
   # ---------------------------------------------------------------------------
 
   describe "async durability telemetry" do
-    test "async writes emit batch telemetry" do
+    test "async writes emit batch flush telemetry" do
+      # Post-redesign: async writes no longer go through AsyncApplyWorker.
+      # The Batcher emits [:ferricstore, :batcher, :async_flush] when it
+      # flushes an async batch to Raft.
       ref =
         :telemetry_test.attach_event_handlers(self(), [
-          [:ferricstore, :async_apply, :batch]
+          [:ferricstore, :batcher, :async_flush]
         ])
 
       NamespaceConfig.set("telem_async", "durability", "async")
@@ -317,10 +320,9 @@ defmodule Ferricstore.Raft.AsyncDurabilityTest do
 
       assert :ok == Batcher.write(shard, {:put, k, "telem_val", 0})
 
-      assert_receive {[:ferricstore, :async_apply, :batch], ^ref, measurements, metadata},
+      assert_receive {[:ferricstore, :batcher, :async_flush], ^ref, measurements, metadata},
                      2_000
 
-      assert is_integer(measurements.duration_us)
       assert is_integer(measurements.batch_size)
       assert measurements.batch_size >= 1
       assert is_integer(metadata.shard_index)

@@ -212,6 +212,27 @@ defmodule Ferricstore.Raft.StateMachine do
     __MODULE__.apply(meta, :erlang.binary_to_term(binary), state)
   end
 
+  # Async commands. Router on the origin node has already persisted the write
+  # locally (ETS for small values; ETS + Bitcask for big values) before calling
+  # Batcher.async_submit. When this apply/3 runs on the origin, the key is
+  # already in ETS — skip to avoid redundant ETS/Bitcask writes and potential
+  # races with concurrent writes to the same key. On replicas (which never ran
+  # Router for this write), ETS is empty — apply the inner command normally.
+  @impl true
+  def apply(meta, {:async, inner_cmd}, state) do
+    case async_key_present?(state, inner_cmd) do
+      true ->
+        # Origin: skip. Data already durable locally.
+        old_count = state.applied_count
+        new_state = %{state | applied_count: old_count + 1}
+        maybe_release_cursor(meta, old_count, new_state, :ok)
+
+      false ->
+        # Replica: apply inner normally.
+        __MODULE__.apply(meta, inner_cmd, state)
+    end
+  end
+
   @impl true
   def apply(meta, {:put, key, value, expire_at_ms}, state) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)
@@ -1314,8 +1335,47 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   # ---------------------------------------------------------------------------
+  # Private: async origin-skip detection
+  # ---------------------------------------------------------------------------
+
+  # Returns true when the local ETS already contains an entry for the key
+  # targeted by the inner async command. This is how each node decides
+  # whether it was the origin (Router already wrote) or a replica (empty
+  # ETS, needs to apply). Deterministic per-node because it reads the
+  # node's own local ETS state.
+  defp async_key_present?(state, {:put, key, _value, _exp}), do: ets_has?(state.ets, key)
+  defp async_key_present?(state, {:delete, key}), do: ets_has?(state.ets, key)
+  defp async_key_present?(state, {:incr, key, _delta}), do: ets_has?(state.ets, key)
+  defp async_key_present?(state, {:incr_float, key, _delta}), do: ets_has?(state.ets, key)
+  defp async_key_present?(state, {:append, key, _suffix}), do: ets_has?(state.ets, key)
+  defp async_key_present?(state, {:getset, key, _v}), do: ets_has?(state.ets, key)
+  defp async_key_present?(state, {:getdel, key}), do: ets_has?(state.ets, key)
+  defp async_key_present?(state, {:getex, key, _exp}), do: ets_has?(state.ets, key)
+  defp async_key_present?(state, {:setrange, key, _off, _v}), do: ets_has?(state.ets, key)
+  # Unknown inner command shape — conservative fallback: apply it (treat as replica).
+  defp async_key_present?(_state, _other), do: false
+
+  defp ets_has?(ets, key) do
+    case :ets.lookup(ets, key) do
+      [] -> false
+      _ -> true
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Private: command execution
   # ---------------------------------------------------------------------------
+
+  # Inside a batch, async commands obey the same origin-skip rule. If this
+  # node has the key → it was the origin (Router wrote it), skip. Otherwise
+  # apply the inner command normally.
+  defp apply_single(state, {:async, inner_cmd}) do
+    if async_key_present?(state, inner_cmd) do
+      :ok
+    else
+      apply_single(state, inner_cmd)
+    end
+  end
 
   defp apply_single(state, {:put, key, value, expire_at_ms}) do
     redis_key = Ferricstore.Store.CompoundKey.extract_redis_key(key)

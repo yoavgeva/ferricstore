@@ -101,12 +101,10 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_incr_raft(key, delta, from, state) do
-    # Send {:incr, key, delta} async so Shard GenServer doesn't block on the
-    # Batcher → Ra round-trip. Multiple concurrent callers can queue writes
-    # through a single Shard without serializing. Batcher replies directly
-    # to the original caller when the state machine applies the command.
-    # Atomicity is guaranteed by the state machine's apply/3 running serially.
-    Ferricstore.Raft.Batcher.write_async(state.index, {:incr, key, delta}, from)
+    # RMW: force quorum regardless of namespace durability. The state machine's
+    # serial apply/3 guarantees atomicity; routing through the async slot
+    # would make the caller see :ok without the actual computed value.
+    Ferricstore.Raft.Batcher.write_async_quorum(state.index, {:incr, key, delta}, from)
     {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
@@ -203,7 +201,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_incr_float_raft(key, delta, from, state) do
-    Ferricstore.Raft.Batcher.write_async(state.index, {:incr_float, key, delta}, from)
+    Ferricstore.Raft.Batcher.write_async_quorum(state.index, {:incr_float, key, delta}, from)
     {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
@@ -298,7 +296,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_append_raft(key, suffix, from, state) do
-    Ferricstore.Raft.Batcher.write_async(state.index, {:append, key, suffix}, from)
+    Ferricstore.Raft.Batcher.write_async_quorum(state.index, {:append, key, suffix}, from)
     {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
@@ -364,7 +362,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_getset_raft(key, new_value, from, state) do
-    Ferricstore.Raft.Batcher.write_async(state.index, {:getset, key, new_value}, from)
+    Ferricstore.Raft.Batcher.write_async_quorum(state.index, {:getset, key, new_value}, from)
     {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
@@ -402,7 +400,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_getdel_raft(key, from, state) do
-    Ferricstore.Raft.Batcher.write_async(state.index, {:getdel, key}, from)
+    Ferricstore.Raft.Batcher.write_async_quorum(state.index, {:getdel, key}, from)
     {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
@@ -452,7 +450,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_getex_raft(key, expire_at_ms, from, state) do
-    Ferricstore.Raft.Batcher.write_async(state.index, {:getex, key, expire_at_ms}, from)
+    Ferricstore.Raft.Batcher.write_async_quorum(state.index, {:getex, key, expire_at_ms}, from)
     {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
@@ -507,7 +505,7 @@ defmodule Ferricstore.Store.Shard.Writes do
   end
 
   defp handle_setrange_raft(key, offset, value, from, state) do
-    Ferricstore.Raft.Batcher.write_async(state.index, {:setrange, key, offset, value}, from)
+    Ferricstore.Raft.Batcher.write_async_quorum(state.index, {:setrange, key, offset, value}, from)
     {:noreply, %{state | write_version: state.write_version + 1}}
   end
 

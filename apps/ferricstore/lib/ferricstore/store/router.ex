@@ -177,169 +177,26 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp async_write(ctx, idx, {:incr, key, delta}) do
-    keydir = elem(ctx.keydir_refs, idx)
-    now = HLC.now_ms()
-
-    current =
-      case :ets.lookup(keydir, key) do
-        [{^key, value, exp, _, _, _, _}] when value != nil and (exp == 0 or exp > now) -> value
-        _ -> nil
-      end
-
-    case current do
-      nil ->
-        async_write(ctx, idx, {:put, key, delta, 0})
-        {:ok, delta}
-
-      value when is_integer(value) ->
-        new_val = value + delta
-        async_write(ctx, idx, {:put, key, new_val, 0})
-        {:ok, new_val}
-
-      value when is_binary(value) ->
-        case Integer.parse(value) do
-          {int_val, ""} ->
-            new_val = int_val + delta
-            async_write(ctx, idx, {:put, key, new_val, 0})
-            {:ok, new_val}
-
-          _ ->
-            {:error, "ERR value is not an integer or out of range"}
-        end
-
-      _other ->
-        {:error, "ERR value is not an integer or out of range"}
-    end
+  # INCR is a read-modify-write. Doing the read+compute in the caller's
+  # process under concurrent load loses updates (two callers read the same
+  # value, both compute +1, both write the same new value → one update lost).
+  # Route through quorum so the state machine's atomic do_incr handles it.
+  # Atomicity matters more than latency for counters.
+  defp async_write(ctx, idx, {:incr, _key, _delta} = command) do
+    quorum_write(ctx, idx, command)
   end
 
-  defp async_write(ctx, idx, {:incr_float, key, delta}) do
-    keydir = elem(ctx.keydir_refs, idx)
-    now = HLC.now_ms()
-
-    current =
-      case :ets.lookup(keydir, key) do
-        [{^key, value, exp, _, _, _, _}] when value != nil and (exp == 0 or exp > now) -> value
-        _ -> nil
-      end
-
-    case current do
-      nil ->
-        new_val = delta * 1.0
-        async_write(ctx, idx, {:put, key, new_val, 0})
-        {:ok, new_val}
-
-      value when is_float(value) ->
-        new_val = value + delta
-        async_write(ctx, idx, {:put, key, new_val, 0})
-        {:ok, new_val}
-
-      value when is_integer(value) ->
-        new_val = value * 1.0 + delta
-        async_write(ctx, idx, {:put, key, new_val, 0})
-        {:ok, new_val}
-
-      value when is_binary(value) ->
-        case Float.parse(value) do
-          {float_val, _} ->
-            new_val = float_val + delta
-            async_write(ctx, idx, {:put, key, new_val, 0})
-            {:ok, new_val}
-
-          :error ->
-            case Integer.parse(value) do
-              {int_val, ""} ->
-                new_val = int_val * 1.0 + delta
-                async_write(ctx, idx, {:put, key, new_val, 0})
-                {:ok, new_val}
-
-              _ ->
-                {:error, "ERR value is not a valid float"}
-            end
-        end
-    end
-  end
-
-  defp async_write(ctx, idx, {:append, key, suffix}) do
-    keydir = elem(ctx.keydir_refs, idx)
-    now = HLC.now_ms()
-
-    current =
-      case :ets.lookup(keydir, key) do
-        [{^key, value, exp, _, _, _, _}] when value != nil and (exp == 0 or exp > now) -> value
-        _ -> nil
-      end
-
-    current_str = case current do
-      nil -> ""
-      v when is_integer(v) -> Integer.to_string(v)
-      v when is_float(v) -> Float.to_string(v)
-      v when is_binary(v) -> v
-    end
-
-    new_value = current_str <> suffix
-    async_write(ctx, idx, {:put, key, new_value, 0})
-    {:ok, byte_size(new_value)}
-  end
-
-  defp async_write(ctx, idx, {:getset, key, new_value}) do
-    keydir = elem(ctx.keydir_refs, idx)
-    now = HLC.now_ms()
-
-    old =
-      case :ets.lookup(keydir, key) do
-        [{^key, value, exp, _, _, _, _}] when value != nil and (exp == 0 or exp > now) -> value
-        _ -> nil
-      end
-
-    async_write(ctx, idx, {:put, key, new_value, 0})
-    old
-  end
-
-  defp async_write(ctx, idx, {:getdel, key}) do
-    keydir = elem(ctx.keydir_refs, idx)
-    now = HLC.now_ms()
-
-    old =
-      case :ets.lookup(keydir, key) do
-        [{^key, value, exp, _, _, _, _}] when value != nil and (exp == 0 or exp > now) -> value
-        _ -> nil
-      end
-
-    if old, do: async_write(ctx, idx, {:delete, key})
-    old
-  end
-
-  defp async_write(ctx, idx, {:getex, key, expire_at_ms}) do
-    keydir = elem(ctx.keydir_refs, idx)
-    now = HLC.now_ms()
-
-    case :ets.lookup(keydir, key) do
-      [{^key, value, exp, _, _, _, _}] when value != nil and (exp == 0 or exp > now) ->
-        async_write(ctx, idx, {:put, key, value, expire_at_ms})
-        value
-
-      _ ->
-        nil
-    end
-  end
-
-  defp async_write(ctx, idx, {:setrange, key, offset, value}) do
-    keydir = elem(ctx.keydir_refs, idx)
-    now = HLC.now_ms()
-
-    current =
-      case :ets.lookup(keydir, key) do
-        [{^key, v, exp, _, _, _, _}] when v != nil and (exp == 0 or exp > now) ->
-          to_disk_binary(v)
-        _ -> ""
-      end
-
-    padded = if byte_size(current) < offset, do: current <> :binary.copy(<<0>>, offset - byte_size(current)), else: current
-    new_value = binary_part(padded, 0, offset) <> value <> binary_part(padded, min(offset + byte_size(value), byte_size(padded)), max(0, byte_size(padded) - offset - byte_size(value)))
-    async_write(ctx, idx, {:put, key, new_value, 0})
-    {:ok, byte_size(new_value)}
-  end
+  # Read-modify-write operations route through quorum for atomicity.
+  # The state machine's apply/3 handlers are the atomic execution path;
+  # doing the read+compute in the caller's process would lose updates under
+  # concurrent load. The latency cost is acceptable because RMW commands are
+  # rare relative to plain SET/GET.
+  defp async_write(ctx, idx, {:incr_float, _key, _delta} = command), do: quorum_write(ctx, idx, command)
+  defp async_write(ctx, idx, {:append, _key, _suffix} = command), do: quorum_write(ctx, idx, command)
+  defp async_write(ctx, idx, {:getset, _key, _new_value} = command), do: quorum_write(ctx, idx, command)
+  defp async_write(ctx, idx, {:getdel, _key} = command), do: quorum_write(ctx, idx, command)
+  defp async_write(ctx, idx, {:getex, _key, _exp} = command), do: quorum_write(ctx, idx, command)
+  defp async_write(ctx, idx, {:setrange, _key, _off, _value} = command), do: quorum_write(ctx, idx, command)
 
   # Commands that are complex or rarely used in async namespaces
   # fall back to quorum (CAS, LOCK, UNLOCK, EXTEND, RATELIMIT, LIST_OP).
@@ -421,8 +278,13 @@ defmodule Ferricstore.Store.Router do
   defp offheap_size(v) when is_binary(v) and byte_size(v) > 64, do: byte_size(v)
   defp offheap_size(_), do: 0
 
+  # Submit an async write to the shard's Batcher, which batches many async
+  # commands into a single `ra.pipeline_command({:batch, [{:async, cmd}, ...]})`
+  # call. Router has already persisted locally (ETS + Bitcask for big values)
+  # by the time this is called — the Raft submission is for replication only.
+  # Fire-and-forget: Router has already returned :ok to the caller.
   defp async_submit_to_raft(idx, command) do
-    Ferricstore.Raft.AsyncApplyWorker.replicate(idx, [command])
+    Ferricstore.Raft.Batcher.async_submit(idx, command)
   end
 
   # -------------------------------------------------------------------

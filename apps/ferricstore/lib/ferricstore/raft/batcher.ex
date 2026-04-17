@@ -209,6 +209,38 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
+  Like `write_async/3` but forces quorum durability regardless of namespace
+  config. Used by RMW operations (INCR, APPEND, GETSET, etc.) that need
+  consensus for atomicity even when the namespace is configured async.
+  """
+  @spec write_async_quorum(non_neg_integer(), command(), GenServer.from()) :: :ok
+  def write_async_quorum(shard_index, command, reply_to) do
+    GenServer.cast(batcher_name(shard_index), {:write_quorum, command, reply_to})
+  end
+
+  @doc """
+  Submits an async-durability write. Fire-and-forget.
+
+  Called by Router on the origin node AFTER it has already written the value
+  locally to ETS (and Bitcask for large values). The Batcher accumulates async
+  commands in a slot and flushes them as a single batched `ra.pipeline_command`
+  for replication. The caller already has `:ok` from Router — no reply needed.
+
+  Commands are wrapped as `{:async, inner_cmd}` before submission so the
+  state machine can distinguish them: on the origin node (which has the entry
+  in ETS) apply/3 will skip; on replicas the inner command is applied normally.
+
+  ## Parameters
+
+    * `shard_index` -- zero-based shard index
+    * `inner_command` -- the raw write command (e.g. `{:put, k, v, exp}`)
+  """
+  @spec async_submit(non_neg_integer(), command()) :: :ok
+  def async_submit(shard_index, inner_command) do
+    GenServer.cast(batcher_name(shard_index), {:async_submit, inner_command})
+  end
+
+  @doc """
   Returns the registered process name for the batcher at `shard_index`.
 
   ## Examples
@@ -311,6 +343,14 @@ defmodule Ferricstore.Raft.Batcher do
     enqueue_write(command, reply_to, state)
   end
 
+  def handle_cast({:async_submit, inner_command}, state) do
+    enqueue_async_submit(inner_command, state)
+  end
+
+  def handle_cast({:write_quorum, command, reply_to}, state) do
+    enqueue_write_forced_quorum(command, reply_to, state)
+  end
+
   @impl true
   def handle_info({:flush_slot, slot_key}, state) do
     case Map.get(state.slots, slot_key) do
@@ -337,6 +377,12 @@ defmodule Ferricstore.Raft.Batcher do
           {nil, _pending} ->
             # Unknown correlation -- ignore (could be stale after leader change)
             acc
+
+          {{_froms, :async_no_reply}, new_pending} ->
+            # Async batch — no callers to reply to (Router/async_ns already
+            # replied :ok). Just remove from pending so flush waiters can
+            # observe completion.
+            %{acc | pending: new_pending}
 
           {{froms, :single}, new_pending} ->
             # Single command: result is the direct apply result
@@ -536,9 +582,19 @@ defmodule Ferricstore.Raft.Batcher do
 
         new_state =
           case durability do
+            :async_origin ->
+              # Commands came via Batcher.async_submit (Router wrote locally).
+              # Wrap each command as {:async, inner} so state machine can
+              # origin-skip on the node that already has the ETS entry.
+              submit_async_origin(state, batch)
+
             :async ->
-              submit_async(state.shard_index, batch, froms)
-              state
+              # Commands came via Batcher.write on an :async namespace
+              # (blocking callers, e.g. RMW ops via Shard). Router did NOT
+              # write locally — state machine must apply the inner command.
+              # Reply :ok to the blocked callers, then submit as a regular
+              # batch (no {:async, ...} wrapper).
+              submit_async_ns(state, batch, froms)
 
             :quorum ->
               pipeline_submit(state, batch, froms)
@@ -569,18 +625,126 @@ defmodule Ferricstore.Raft.Batcher do
     %{state | pending: Map.put(state.pending, corr, {froms, :batch})}
   end
 
-  # Async durability path: sends commands to the AsyncApplyWorker (fire-and-forget)
-  # and replies to all callers immediately with :ok. The AsyncApplyWorker
-  # processes the batch in the background.
-  defp submit_async(shard_index, batch, froms) do
-    alias Ferricstore.Raft.AsyncApplyWorker
+  # Flush path for commands accumulated via Batcher.async_submit (called by
+  # Router.async_write_*). Router has already persisted locally (ETS + Bitcask
+  # for big values) before calling async_submit. Commands are wrapped as
+  # `{:async, inner}` so the state machine can origin-skip on the node that
+  # already has the ETS entry. No callers to reply to — Router already got :ok.
+  #
+  # Tracks the correlation in `pending` with `:async_no_reply` so that
+  # Batcher.flush waiters can observe when all in-flight async commands have
+  # applied to the state machine (important for tests + shutdown drain).
+  defp submit_async_origin(state, batch) do
+    :telemetry.execute(
+      [:ferricstore, :batcher, :async_flush],
+      %{batch_size: length(batch)},
+      %{shard_index: state.shard_index, origin: true}
+    )
 
-    AsyncApplyWorker.apply_batch(shard_index, batch)
+    wrapped = Enum.map(batch, fn cmd -> {:async, cmd} end)
 
-    # Reply immediately to all callers with :ok
-    Enum.each(froms, fn from ->
-      GenServer.reply(from, :ok)
-    end)
+    corr = make_ref()
+    serialized = {:ttb, :erlang.term_to_binary({:batch, wrapped})}
+    :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
+    %{state | pending: Map.put(state.pending, corr, {[], :async_no_reply})}
+  end
+
+  # Flush path for commands accumulated via Batcher.write (blocking) on an
+  # :async-durability namespace. Router did NOT write locally — the state
+  # machine must apply the inner command. Reply :ok to blocked callers, then
+  # submit commands as a regular batch (unwrapped) via ra.pipeline_command.
+  # Tracks the correlation in `pending` so flush waiters observe completion.
+  defp submit_async_ns(state, batch, froms) do
+    :telemetry.execute(
+      [:ferricstore, :batcher, :async_flush],
+      %{batch_size: length(batch)},
+      %{shard_index: state.shard_index, origin: false}
+    )
+
+    Enum.each(froms, fn from -> GenServer.reply(from, :ok) end)
+
+    corr = make_ref()
+    serialized = {:ttb, :erlang.term_to_binary({:batch, batch})}
+    :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
+    %{state | pending: Map.put(state.pending, corr, {[], :async_no_reply})}
+  end
+
+  # Enqueue a write that MUST go through quorum (RMW ops where the caller
+  # needs atomicity). Bypasses namespace-config durability lookup and uses
+  # the quorum slot regardless of how the namespace is configured.
+  defp enqueue_write_forced_quorum(command, from, state) do
+    prefix = extract_prefix(command)
+    # Still need window_ms from config, but force durability to quorum.
+    {{window_ms, _durability}, state} = lookup_ns_config(prefix, state)
+    slot_key = {prefix, :quorum}
+
+    slot = Map.get(state.slots, slot_key, new_slot(window_ms))
+
+    updated_slot = %{
+      slot
+      | cmds: [command | slot.cmds],
+        froms: [from | slot.froms],
+        window_ms: window_ms,
+        count: Map.get(slot, :count, 0) + 1
+    }
+
+    updated_slot =
+      if updated_slot.timer_ref == nil do
+        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
+        %{updated_slot | timer_ref: ref}
+      else
+        updated_slot
+      end
+
+    new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+
+    if updated_slot.count >= state.max_batch_size do
+      do_flush_slot(new_state, slot_key)
+    else
+      {:noreply, new_state}
+    end
+  end
+
+  # Enqueue an async_submit cast (from Router.async_write_*). No `from` to
+  # track — Router already returned :ok to its caller.
+  defp enqueue_async_submit(command, state) do
+    prefix = extract_prefix(command)
+    {{window_ms, _durability}, state} = lookup_ns_config(prefix, state)
+    # Dedicated slot: commands here will be wrapped as {:async, inner} during
+    # flush so the state machine knows Router has already persisted locally
+    # on the origin (origin-skip optimization in state_machine.ex). This
+    # differs from {prefix, :async} slots where commands came through
+    # Batcher.write on an :async namespace — those go to the state machine
+    # unwrapped because Router did NOT write locally (it was a blocking call
+    # through Shard, e.g. for RMW ops routed to quorum).
+    slot_key = {prefix, :async_origin}
+
+    slot = Map.get(state.slots, slot_key, new_slot(window_ms))
+
+    updated_slot = %{
+      slot
+      | cmds: [command | slot.cmds],
+        # No froms for async_submit — Router already replied.
+        froms: slot.froms,
+        window_ms: window_ms,
+        count: Map.get(slot, :count, 0) + 1
+    }
+
+    updated_slot =
+      if updated_slot.timer_ref == nil do
+        ref = Process.send_after(self(), {:flush_slot, slot_key}, window_ms)
+        %{updated_slot | timer_ref: ref}
+      else
+        updated_slot
+      end
+
+    new_state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+
+    if updated_slot.count >= state.max_batch_size do
+      do_flush_slot(new_state, slot_key)
+    else
+      {:noreply, new_state}
+    end
   end
 
   # Reply to flush waiters when all in-flight pipelined commands have completed.

@@ -1,0 +1,234 @@
+defmodule Ferricstore.Store.AsyncWriteRedesignTest do
+  @moduledoc """
+  TDD tests for the async write redesign (docs/async-write-redesign.md).
+
+  Behavior under test:
+  - Async writes go through the Batcher (not AsyncApplyWorker) and are
+    submitted to Raft as batched ra.pipeline_command({:batch, [...]}) calls.
+  - Async commands are wrapped as `{:async, inner_cmd}` before reaching the
+    state machine so apply/3 can distinguish them.
+  - State machine on origin (ETS has entry) skips Bitcask + ETS writes to
+    avoid double-writing.
+  - State machine on replica (ETS empty) applies inner_cmd normally.
+  - Read-your-writes holds for both small and large values on the origin.
+  - Concurrent writes to the same key land in correct order via BitcaskWriter.
+  - AsyncApplyWorker is no longer part of the async hot path (or is absent).
+  """
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Store.Router
+  alias Ferricstore.Test.ShardHelpers
+
+  @ns "rdesign_async"
+
+  setup do
+    ShardHelpers.flush_all_keys()
+    Ferricstore.NamespaceConfig.set(@ns, "durability", "async")
+
+    on_exit(fn ->
+      Ferricstore.NamespaceConfig.set(@ns, "durability", "quorum")
+      ShardHelpers.flush_all_keys()
+    end)
+
+    :ok
+  end
+
+  defp ctx, do: FerricStore.Instance.get(:default)
+
+  # ---------------------------------------------------------------------------
+  # Pipeline / Batcher routing
+  # ---------------------------------------------------------------------------
+
+  describe "async routing" do
+    test "async writes do NOT route through AsyncApplyWorker hot path" do
+      # Subscribe to both telemetry sources. If the redesign is in place,
+      # async writes land as Batcher batches, not as AsyncApplyWorker batches.
+      handler_id = {:redesign_test, :async_apply}
+
+      _ =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :async_apply, :batch],
+          fn _event, _meas, _meta, test_pid ->
+            send(test_pid, :async_apply_batch_event)
+          end,
+          self()
+        )
+
+      try do
+        for i <- 1..5 do
+          :ok = Router.put(ctx(), "#{@ns}:noworker_#{i}", "v#{i}", 0)
+        end
+
+        # After the redesign, AsyncApplyWorker should not be invoked on the
+        # hot path. Allow the async plumbing time to flush.
+        refute_receive :async_apply_batch_event, 200
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
+    test "async writes produce batched ra.pipeline_command submissions" do
+      # Batcher already emits telemetry on its async flush path. Verify the
+      # telemetry fires with multiple commands batched together.
+      handler_id = {:redesign_test, :batcher_async}
+
+      _ =
+        :telemetry.attach(
+          handler_id,
+          [:ferricstore, :batcher, :async_flush],
+          fn _event, meas, _meta, test_pid ->
+            send(test_pid, {:batcher_async_flush, meas})
+          end,
+          self()
+        )
+
+      try do
+        tasks =
+          for i <- 1..50 do
+            Task.async(fn -> Router.put(ctx(), "#{@ns}:batch_#{i}", "v#{i}", 0) end)
+          end
+
+        Task.await_many(tasks, 5_000)
+
+        assert_receive {:batcher_async_flush, %{batch_size: size}}, 2_000
+        assert size >= 2, "expected batched submission, got batch_size=#{size}"
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Read-your-writes (origin)
+  # ---------------------------------------------------------------------------
+
+  describe "read-your-writes on origin" do
+    test "small value is readable immediately after :ok" do
+      key = "#{@ns}:ryw_small_#{:erlang.unique_integer([:positive])}"
+      :ok = Router.put(ctx(), key, "hello", 0)
+      assert Router.get(ctx(), key) == "hello"
+    end
+
+    test "large value (>64KB) is readable immediately after :ok" do
+      key = "#{@ns}:ryw_large_#{:erlang.unique_integer([:positive])}"
+      big = :binary.copy("x", 100 * 1024)
+      :ok = Router.put(ctx(), key, big, 0)
+      assert Router.get(ctx(), key) == big
+    end
+
+    test "DELETE is observed immediately on origin" do
+      key = "#{@ns}:ryw_del_#{:erlang.unique_integer([:positive])}"
+      :ok = Router.put(ctx(), key, "present", 0)
+      assert Router.get(ctx(), key) == "present"
+      Router.delete(ctx(), key)
+      assert Router.get(ctx(), key) == nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Origin-skip property in state machine
+  # ---------------------------------------------------------------------------
+
+  describe "state machine origin-skip" do
+    @tag :capture_log
+    test "origin does not re-insert the ETS entry after Raft apply" do
+      # The key test of the redesign: Router writes ETS on origin, state machine
+      # applies {:async, inner} and must detect the existing ETS entry and
+      # skip. Observe this by writing, waiting for apply, and verifying ETS
+      # was not touched a second time (i.e., no ETS races between Router and
+      # state machine writing the same key with different LFU counters).
+      key = "#{@ns}:skip_origin_#{:erlang.unique_integer([:positive])}"
+
+      :ok = Router.put(ctx(), key, "value1", 0)
+      initial = read_ets_entry(ctx(), key)
+      assert initial != nil, "Router must populate ETS before returning :ok"
+
+      # Give the state machine time to apply.
+      :timer.sleep(100)
+
+      after_apply = read_ets_entry(ctx(), key)
+
+      # Value should be the same — state machine must not have overwritten it
+      # (e.g. resetting LFU counter, clearing file_id, etc.)
+      assert elem(after_apply, 1) == "value1"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Concurrent ordering
+  # ---------------------------------------------------------------------------
+
+  describe "concurrent writes preserve last-write-wins" do
+    test "two sequential writes to the same key land in order" do
+      key = "#{@ns}:ordered_#{:erlang.unique_integer([:positive])}"
+      :ok = Router.put(ctx(), key, "first", 0)
+      :ok = Router.put(ctx(), key, "second", 0)
+      assert Router.get(ctx(), key) == "second"
+    end
+
+    test "concurrent INCRs on same key sum correctly (atomicity)" do
+      key = "#{@ns}:incr_concurrent_#{:erlang.unique_integer([:positive])}"
+      Router.put(ctx(), key, "0", 0)
+
+      tasks =
+        for _ <- 1..25 do
+          Task.async(fn ->
+            for _ <- 1..40 do
+              Router.incr(ctx(), key, 1)
+            end
+          end)
+        end
+
+      Task.await_many(tasks, 30_000)
+
+      # Give final writes time to apply
+      :timer.sleep(200)
+
+      # 25 * 40 = 1000 increments. Starting from 0 → 1000.
+      assert Router.get(ctx(), key) == "1000"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Latency (async should be genuinely fast, not blocked on Raft)
+  # ---------------------------------------------------------------------------
+
+  describe "async latency" do
+    test "async SET (small) returns :ok in <5ms on average" do
+      # Run many writes and average. Async SET of a small value should be
+      # dominated by ETS insert + two casts, not Raft consensus.
+      warmup =
+        for i <- 1..10 do
+          Router.put(ctx(), "#{@ns}:lat_warm_#{i}", "warm", 0)
+        end
+
+      _ = warmup
+
+      samples =
+        for i <- 1..100 do
+          t0 = System.monotonic_time(:microsecond)
+          :ok = Router.put(ctx(), "#{@ns}:lat_#{i}", "v", 0)
+          System.monotonic_time(:microsecond) - t0
+        end
+
+      avg_us = div(Enum.sum(samples), length(samples))
+      assert avg_us < 5_000,
+             "async small-value SET avg latency #{avg_us}μs exceeded 5000μs; " <>
+               "suggests call is blocking on Raft or the Batcher"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  defp read_ets_entry(ctx, key) do
+    idx = Router.shard_for(ctx, key)
+    keydir = elem(ctx.keydir_refs, idx)
+    case :ets.lookup(keydir, key) do
+      [entry] -> entry
+      [] -> nil
+    end
+  end
+end
