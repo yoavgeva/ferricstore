@@ -111,6 +111,11 @@ defmodule Ferricstore.Raft.Batcher do
   # window are dropped by the periodic sweep. Guards against lost ra_event
   # messages (shouldn't happen, but bounded memory beats unbounded leak).
   @async_pending_ttl_ms 30_000
+  # Quorum callers (blocked on :single/:batch) get a longer TTL — their
+  # `GenServer.call` default timeout is 5s, but Router's quorum_write uses
+  # 10s. Use 30s as a safety net: anything pending longer than 30s means
+  # ra lost the ack entirely and the caller's own call has already errored.
+  @quorum_pending_ttl_ms 30_000
 
   # Periodic sweep interval. Tight enough to catch stalls quickly, loose
   # enough not to burn CPU scanning an empty pending map.
@@ -288,6 +293,26 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   @doc """
+  Force-resets the Batcher's pending correlations and flush waiters.
+
+  Intended for test setup/teardown when a prior test left the Batcher in a
+  stuck state (ra leader crash, disk errors, orphan correlations). Callers
+  blocked on `:single`/`:batch` pending entries receive `{:error, :reset}`;
+  flush waiters receive `:ok`.
+
+  Do not call this from production code — it silently drops replication
+  acks.
+  """
+  @spec reset_pending(non_neg_integer()) :: :ok
+  def reset_pending(shard_index) do
+    try do
+      GenServer.call(batcher_name(shard_index), :__reset_pending__, 5_000)
+    catch
+      :exit, _ -> :ok
+    end
+  end
+
+  @doc """
   Extracts the namespace prefix from a command's key.
 
   The prefix is the portion of the key before the first colon (`:`).
@@ -395,6 +420,26 @@ defmodule Ferricstore.Raft.Batcher do
     {:reply, :ok, sweep_async_pending(state)}
   end
 
+  # Test-only: force-clear all pending correlations and flush waiters.
+  # Used by test cleanup to unstick a Batcher whose ra shard lost
+  # correlations after a leader crash or disk error. Replies to blocked
+  # callers (`:single`/`:batch` froms) with `{:error, :reset}` so they
+  # don't hang forever.
+  def handle_call(:__reset_pending__, _from, state) do
+    # Drain callers so they unblock instead of timing out in 60s tests.
+    Enum.each(state.pending, fn
+      {_corr, {froms, :single, _mono}} -> Enum.each(froms, &GenServer.reply(&1, {:error, :reset}))
+      {_corr, {froms, :batch, _mono}} -> Enum.each(froms, &GenServer.reply(&1, {:error, :reset}))
+      {_corr, {froms, :single}} -> Enum.each(froms, &GenServer.reply(&1, {:error, :reset}))
+      {_corr, {froms, :batch}} -> Enum.each(froms, &GenServer.reply(&1, {:error, :reset}))
+      _ -> :ok
+    end)
+
+    Enum.each(state.flush_waiters, &GenServer.reply(&1, :ok))
+
+    {:reply, :ok, %{state | pending: %{}, flush_waiters: []}}
+  end
+
   @impl true
   def handle_cast({:write, command, reply_to}, state) do
     enqueue_write(command, reply_to, state)
@@ -445,13 +490,13 @@ defmodule Ferricstore.Raft.Batcher do
           {{_froms, :async_no_reply, _batch, _retry, _mono}, new_pending} ->
             %{acc | pending: new_pending}
 
-          {{froms, :single}, new_pending} ->
+          {{froms, :single, _mono}, new_pending} ->
             # Single command: result is the direct apply result
             [from] = froms
             GenServer.reply(from, result)
             %{acc | pending: new_pending}
 
-          {{froms, :batch}, new_pending} ->
+          {{froms, :batch, _mono}, new_pending} ->
             reply_batch(froms, result)
             %{acc | pending: new_pending}
         end
@@ -507,7 +552,12 @@ defmodule Ferricstore.Raft.Batcher do
         {:noreply, maybe_reply_flush_waiters(%{state | pending: new_pending})}
 
       # Quorum entry — reply to the blocked caller(s) with error.
-      {{froms, _kind}, new_pending} ->
+      # Matches both the 3-tuple shape ({froms, :single|:batch, mono}) used
+      # by pipeline_submit and the legacy 2-tuple shape still present in
+      # other code paths.
+      {pending_entry, new_pending}
+      when is_tuple(pending_entry) and elem(pending_entry, 1) in [:single, :batch] ->
+        froms = elem(pending_entry, 0)
         new_state = %{state | pending: new_pending}
 
         leader =
@@ -728,14 +778,16 @@ defmodule Ferricstore.Raft.Batcher do
     corr = make_ref()
     serialized = {:ttb, :erlang.term_to_binary(single_cmd)}
     :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
-    %{state | pending: Map.put(state.pending, corr, {froms, :single})}
+    mono = System.monotonic_time()
+    %{state | pending: Map.put(state.pending, corr, {froms, :single, mono})}
   end
 
   defp pipeline_submit(state, batch, froms) do
     corr = make_ref()
     serialized = {:ttb, :erlang.term_to_binary({:batch, batch})}
     :ra.pipeline_command(state.shard_id, serialized, corr, :normal)
-    %{state | pending: Map.put(state.pending, corr, {froms, :batch})}
+    mono = System.monotonic_time()
+    %{state | pending: Map.put(state.pending, corr, {froms, :batch, mono})}
   end
 
   # Flush path for commands accumulated via Batcher.async_submit (called by
@@ -882,34 +934,70 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  # Drop retry-aware async pending entries whose submission timestamp is
-  # older than the TTL. Called on a timer and via the test hook. Emits
-  # [:ferricstore, :batcher, :async_dropped] telemetry with reason :ttl
-  # for each entry dropped. Non-async entries are never swept here.
+  # Drop pending entries whose submission timestamp is older than the TTL.
+  #
+  # Two classes of entries expire:
+  #
+  #   * `:async_no_reply` (retry-aware) — silently drop; caller already
+  #     got `:ok` when the command was enqueued. Emits
+  #     `[:ferricstore, :batcher, :async_dropped]` telemetry.
+  #
+  #   * `:single` / `:batch` (quorum callers) — reply `{:error, :timeout}`
+  #     to every blocked `from` so they unblock, then drop. Emits
+  #     `[:ferricstore, :batcher, :quorum_timeout]` telemetry. This is
+  #     the production safety net for lost ra_events after a leader
+  #     crash: without it, a caller blocked on `GenServer.call(..., :flush)`
+  #     or on a `Batcher.write/2` would hang until its own `GenServer.call`
+  #     timeout, and flush_waiters could hang indefinitely.
   @spec sweep_async_pending(%__MODULE__{}) :: %__MODULE__{}
   defp sweep_async_pending(state) do
     ttl_native = System.convert_time_unit(@async_pending_ttl_ms, :millisecond, :native)
-    cutoff = System.monotonic_time() - ttl_native
+    quorum_ttl_native = System.convert_time_unit(@quorum_pending_ttl_ms, :millisecond, :native)
+    now = System.monotonic_time()
+    async_cutoff = now - ttl_native
+    quorum_cutoff = now - quorum_ttl_native
 
     {expired, kept} =
       Enum.split_with(state.pending, fn
-        {_corr, {_froms, :async_no_reply, _batch, _retry, mono}} -> mono < cutoff
+        {_corr, {_froms, :async_no_reply, _batch, _retry, mono}} -> mono < async_cutoff
+        {_corr, {_froms, :single, mono}} -> mono < quorum_cutoff
+        {_corr, {_froms, :batch, mono}} -> mono < quorum_cutoff
         _ -> false
       end)
 
-    Enum.each(expired, fn {_corr, {_froms, :async_no_reply, batch, _retry, _mono}} ->
-      :telemetry.execute(
-        [:ferricstore, :batcher, :async_dropped],
-        %{batch_size: length(batch)},
-        %{shard_index: state.shard_index, reason: :ttl}
-      )
+    Enum.each(expired, fn
+      {_corr, {_froms, :async_no_reply, batch, _retry, _mono}} ->
+        :telemetry.execute(
+          [:ferricstore, :batcher, :async_dropped],
+          %{batch_size: length(batch)},
+          %{shard_index: state.shard_index, reason: :ttl}
+        )
 
-      Logger.warning(
-        "Batcher shard=#{state.shard_index}: async batch of #{length(batch)} commands dropped after #{@async_pending_ttl_ms}ms TTL (ra_event lost)"
-      )
+        Logger.warning(
+          "Batcher shard=#{state.shard_index}: async batch of #{length(batch)} commands dropped after #{@async_pending_ttl_ms}ms TTL (ra_event lost)"
+        )
+
+      {_corr, {froms, kind, _mono}} when kind in [:single, :batch] ->
+        Enum.each(froms, fn from ->
+          GenServer.reply(from, {:error, :timeout})
+        end)
+
+        :telemetry.execute(
+          [:ferricstore, :batcher, :quorum_timeout],
+          %{caller_count: length(froms), kind: kind},
+          %{shard_index: state.shard_index, reason: :ttl}
+        )
+
+        Logger.warning(
+          "Batcher shard=#{state.shard_index}: #{kind} pending entry with #{length(froms)} caller(s) timed out after #{@quorum_pending_ttl_ms}ms (ra_event lost after leader crash or disk error)"
+        )
     end)
 
-    %{state | pending: Map.new(kept)}
+    new_state = %{state | pending: Map.new(kept)}
+
+    # Swept quorum entries could unblock flush waiters whose pending ref
+    # count drops to zero.
+    maybe_reply_flush_waiters(new_state)
   end
 
   # ---------------------------------------------------------------------------

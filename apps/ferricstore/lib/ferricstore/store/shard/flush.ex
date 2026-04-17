@@ -220,7 +220,19 @@ defmodule Ferricstore.Store.Shard.Flush do
 
     if candidates != [] do
       file_count = map_size(state.file_stats)
-      Ferricstore.Merge.Scheduler.notify_fragmentation(state.index, candidates, file_count)
+      # Direct GenServer.cast avoids the compile-time cycle
+      # Merge.Scheduler → Store.Router → Store.ListOps → Store.Ops →
+      # Store.Shard.Writes → Store.Shard.Reads → Store.Shard.Flush →
+      # Merge.Scheduler. Fire-and-forget; unknown-name catches are handled
+      # by `try/catch :exit` around the cast.
+      try do
+        GenServer.cast(
+          :"Ferricstore.Merge.Scheduler.#{state.index}",
+          {:fragmentation, candidates, file_count}
+        )
+      catch
+        :exit, _ -> :ok
+      end
     end
 
     state
@@ -299,8 +311,16 @@ defmodule Ferricstore.Store.Shard.Flush do
       new_file_stats = Map.put(state.file_stats, new_id, {0, 0})
 
       # Notify the merge scheduler that a rotation happened.
-      # file_count = new_id + 1 (files are 0-indexed: 0, 1, ..., new_id)
-      Ferricstore.Merge.Scheduler.notify_rotation(state.index, new_id + 1)
+      # file_count = new_id + 1 (files are 0-indexed: 0, 1, ..., new_id).
+      # Direct cast avoids the Merge.Scheduler → ... → Shard.Flush cycle.
+      try do
+        GenServer.cast(
+          :"Ferricstore.Merge.Scheduler.#{state.index}",
+          {:file_rotated, new_id + 1}
+        )
+      catch
+        :exit, _ -> :ok
+      end
 
       %{state | active_file_id: new_id, active_file_path: new_path, active_file_size: 0,
         file_stats: new_file_stats}

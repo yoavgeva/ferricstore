@@ -164,8 +164,11 @@ defmodule Ferricstore.Store.RmwCoordinator do
               :erlang.yield()
               wait_for_latch(tab, key)
             else
-              # Orphaned latch — take over.
-              :ets.delete(tab, key)
+              # Orphaned latch — take over, but only delete THIS specific
+              # dead holder's entry. Using `:ets.delete/2` unconditionally
+              # here would race with a fresh legitimate acquirer and corrupt
+              # the latch. select_delete matches on holder atomically.
+              :ets.select_delete(tab, [{{key, holder}, [], [true]}])
               wait_for_latch(tab, key)
             end
 

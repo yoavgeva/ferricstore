@@ -76,6 +76,14 @@ defmodule Ferricstore.Test.ShardHelpers do
     # leaving the batcher blocked. Restart dead shards first.
     ensure_ra_shards_alive(shard_count)
 
+    # Before flushing, unstick any Batcher whose pending queue is blocked on
+    # orphan correlations from a prior test (ra leader crash, lost acks, etc).
+    # Without this, :flush can wait forever for replies that will never
+    # arrive, causing 60s setup timeouts that cascade through the suite.
+    Enum.each(0..(shard_count - 1), fn i ->
+      Batcher.reset_pending(i)
+    end)
+
     # Batcher.flush now waits for all in-flight async commands (tracked in
     # `pending` with :async_no_reply) to apply via ra_event before replying.
     # AsyncApplyWorker is deprecated — no drain needed.
@@ -145,8 +153,25 @@ defmodule Ferricstore.Test.ShardHelpers do
       rescue
         ArgumentError -> :ok
       end
-
     end)
+
+    # Clear disk pressure flags. A previous test may have hit a transient
+    # NIF flush error (e.g. a rotation race) and set the pressure atomic.
+    # The production code only clears pressure on a subsequent successful
+    # Shard flush, which may not happen between tests — so the async write
+    # path rejects new writes with "ERR disk pressure on shard N".
+    ctx = FerricStore.Instance.get(:default)
+    Enum.each(0..(shard_count - 1), fn i ->
+      Ferricstore.Store.DiskPressure.clear(ctx, i)
+    end)
+
+    # Fully reset namespace config overrides. Tests that set a namespace
+    # to :async and on_exit it back to :quorum leave a lingering entry,
+    # which flips the :ferricstore_durability_mode persistent_term from
+    # :all_quorum to :mixed. :mixed mode takes a different (slower) code
+    # path in Router.durability_for_key, which can make subsequent tests
+    # flaky by altering relative timings.
+    Ferricstore.NamespaceConfig.reset_all()
   end
 
   @doc """
