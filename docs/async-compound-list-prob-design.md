@@ -53,20 +53,26 @@ fast are surprised when HSET/LPUSH/BF.ADD take milliseconds.
 - `list_op_lmove` (may cross shards; only single-shard case is in scope;
   cross-shard stays quorum)
 
-**Group E — RMW probabilistic structures**
-- `bloom_add`, `bloom_madd`, `bloom_create`
-- `cms_incrby`, `cms_create`, `cms_merge`
-- `cuckoo_add`, `cuckoo_addnx`, `cuckoo_del`, `cuckoo_create`
-- `topk_add`, `topk_incrby`, `topk_create`
-
 ### Always quorum regardless of namespace config (Group C)
 
 - `cas`, `lock`, `unlock`, `extend`, `ratelimit_add`
-- Rationale: these are distributed-coordination primitives. Their
-  contract is linearizability / strict consistency. A user who wants
-  them to be faster than quorum is asking for correctness violations.
-  They stay on the current `quorum_write` path and ignore namespace
-  durability config.
+- `bloom_*`, `cuckoo_*`, `cms_*`, `topk_*` (all 13 prob commands)
+- Rationale: two reasons combined.
+  1. **Distributed coordination** (cas/lock/extend/ratelimit): contract is
+     linearizability. A user who wants them faster than quorum is asking
+     for correctness violations.
+  2. **Return computed results** (prob commands): every prob command
+     returns a value computed by the state machine (bits newly set,
+     evicted items, counter deltas). They cannot be fire-and-forget;
+     the caller must wait for the state machine's reply. The NIF itself
+     does 14-15 file syscalls per call (~15-50μs) — Raft adds ~2-5ms,
+     but the NIF is syscall-bound, not Raft-bound. A latch + inline
+     path would save some Raft overhead but require careful per-NIF
+     concurrency handling (the NIFs do non-atomic read-modify-write
+     on bit positions). Not worth the complexity for the modest win.
+
+  All of these stay on the forced-quorum path (`write_async_quorum`)
+  which ignores namespace durability config.
 
 ### Always quorum for now (Group D)
 
@@ -74,6 +80,18 @@ fast are surprised when HSET/LPUSH/BF.ADD take milliseconds.
 - Rationale: O(n) scan + delete of all fields. The latency is dominated
   by the scan, not the Raft round-trip. Not worth the complexity of an
   async path that would still do an O(n) scan in the caller's process.
+
+### Originally proposed but deferred (Group E)
+
+- Latch + inline path for prob commands. Would reduce latency from
+  ~2–5ms to ~50–100μs, but requires:
+  - Porting 13 prob command handlers to run in caller's process
+  - Per-key latch to serialize concurrent NIF bit-write races
+  - Auto-create edge cases + metadata ETS coordination
+  - ~600–800 lines of inline executors + tests
+
+  Deferred pending a benchmark that demonstrates prob latency is a
+  hot-path bottleneck.
 
 ## Durability Decision
 
@@ -293,78 +311,43 @@ machinery — the coordinator is command-agnostic.
 shards requires a cross-shard transaction. Keep this on quorum — same
 reasoning as compound_delete_prefix (complex, rare).
 
-### Group E — Async probabilistic structures
+### Group E — Probabilistic commands (stays quorum)
 
-Probabilistic structures are single-key RMW:
+Originally this group was going to follow the same latch + inline
+pattern as plain RMW and list_op. After implementing the rest and
+looking at the NIFs more carefully, the decision changed: **prob
+commands stay on forced-quorum regardless of namespace config.**
 
-- `BF.ADD key element` reads the bloom filter's bit array, sets some
-  bits, writes back.
-- `CMS.INCRBY key pairs` reads the count-min sketch's counter matrix,
-  increments counters, writes back.
-- `CF.ADD key element` reads the cuckoo filter, sets a fingerprint,
-  handles eviction, writes back.
-- `TOPK.ADD key item` reads the top-K structure, merges the item,
-  writes back.
+Reasoning:
 
-All are one-key, bounded-size, RMW. Same pattern as `incr`:
+1. **Every prob command returns a computed value** the caller needs
+   (`{:ok, 0|1}` for add, `{:ok, [counts]}` for query, list of evicted
+   items for topk_add). The state machine computes them. An "async
+   fire-and-forget" semantic doesn't fit.
 
-```elixir
-# Router.prob_write — NEW dispatch
-def prob_write(ctx, command) do
-  key = extract_prob_key(command)
-  idx = shard_for(ctx, key)
+2. **The Bloom/Cuckoo/CMS/TopK NIFs do 14-15 file syscalls per call**
+   (pread/pwrite on individual bits in a flat file, not mmap). Total
+   work is 15-50μs of NIF I/O. Raft adds ~2-5ms on top, but the NIF
+   itself isn't trivially cheap — a latch + inline path would save
+   the Raft overhead but not much else.
 
-  case durability_for_key(ctx, key) do
-    :quorum ->
-      # existing raft_write path
-      raft_write(ctx, idx, key, command)
+3. **The NIFs are not safe for concurrent same-key access** — the
+   bit read-modify-write loop has no lock. Today the state machine
+   serializes via its mailbox. Moving to a latch + inline path
+   requires adding that discipline in the caller's process — doable
+   but 13 command variants, each with auto-create edge cases.
 
-    :async ->
-      async_prob_write(ctx, idx, key, command)
-  end
-end
+4. **The namespace config still does something useful** for prob
+   keys: it affects how the state machine's `{:async, inner}`
+   wrapper tries origin-skip. But since prob commands always want
+   quorum semantics (wait for computed result), we bypass the
+   durability-based slot selection entirely.
 
-defp async_prob_write(ctx, idx, key, command) do
-  latch_tab = elem(ctx.latch_refs, idx)
-
-  case :ets.insert_new(latch_tab, {key, self()}) do
-    true ->
-      try do
-        :telemetry.execute([:ferricstore, :prob, :latch], %{}, %{shard_index: idx})
-        execute_prob_inline(ctx, idx, key, command)
-      after
-        :ets.take(latch_tab, key)
-      end
-
-    false ->
-      try do
-        Ferricstore.Store.RmwCoordinator.execute(idx, command)
-      catch
-        :exit, _ -> {:error, "ERR prob RMW failed"}
-      end
-  end
-end
-
-# execute_prob_inline has one clause per prob command. The per-command
-# logic is: read current bits/counters from ETS (via the NIF that
-# understands bloom/cms/cuckoo/topk memory layout), compute updated
-# state, write ETS, cast BitcaskWriter. Mirrors state_machine.ex clauses
-# for the same commands but running in the caller's process.
-```
-
-**Prob structure bookkeeping**: bloom/cuckoo/cms/topk each have their own
-metadata row (`{:bloom_meta, %{...}}`) tracking the structure's
-parameters (bit count, hash functions, etc.). The async path must read
-this metadata under the latch along with the bit array — so the
-`latch_tab` key must cover both the data rows AND the metadata. Since
-they all live under the same user key, a single latch on `key` suffices.
-
-**Auto-create on add**: `BF.ADD` with auto-create params creates a new
-bloom filter if `key` doesn't exist. This is a compound side-effect of
-the add. In the async path, the auto-create happens inline under the
-latch. Replicas see `{:async, {:bloom_add, key, element, auto_create_params}}`
-and the state machine's `apply/3` handles auto-create deterministically
-against the replica's own (initially empty) state.
+**Current behavior**: `async_write` catch-all routes ALL remaining
+commands (prob, cas, lock, extend, ratelimit) through
+`Batcher.write_async_quorum`, which forces the quorum slot regardless
+of namespace durability. The caller blocks on the state machine reply
+and gets the computed result.
 
 ## State Machine — No Changes
 
@@ -386,26 +369,16 @@ defp async_key_for({:incr, k, _}), do: k
 # ... etc.
 ```
 
-**We need to add more clauses to `async_key_for/1`**:
+**Only list_op needs clauses in `async_key_for/1`**:
 
 ```elixir
 defp async_key_for({:list_op, k, _}), do: k
 defp async_key_for({:list_op_lmove, src, _dst, _, _}), do: src
-
-defp async_key_for({:bloom_create, k, _, _, _}), do: k
-defp async_key_for({:bloom_add, k, _, _}), do: k
-defp async_key_for({:bloom_madd, k, _, _}), do: k
-defp async_key_for({:cms_create, k, _, _}), do: k
-defp async_key_for({:cms_incrby, k, _}), do: k
-defp async_key_for({:cms_merge, dst_k, _, _, _}), do: dst_k
-defp async_key_for({:cuckoo_create, k, _, _}), do: k
-defp async_key_for({:cuckoo_add, k, _, _}), do: k
-defp async_key_for({:cuckoo_addnx, k, _, _}), do: k
-defp async_key_for({:cuckoo_del, k, _}), do: k
-defp async_key_for({:topk_create, k, _, _, _, _}), do: k
-defp async_key_for({:topk_add, k, _}), do: k
-defp async_key_for({:topk_incrby, k, _}), do: k
 ```
+
+Prob commands never reach the `{:async, inner}` clause because they
+route through forced-quorum (`write_async_quorum`), not `async_submit`.
+Their results come back via the `ra_event :applied` → reply path.
 
 For compound_put/compound_delete the async path wraps the command as
 `{:put, compound_key, ...}` / `{:delete, compound_key, ...}` which are

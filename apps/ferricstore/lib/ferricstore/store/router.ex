@@ -202,29 +202,44 @@ defmodule Ferricstore.Store.Router do
     async_list_op(ctx, idx, src_key, cmd)
   end
 
-  # Probabilistic structures (bloom, cuckoo, cms, topk). RMW on a single
-  # key — latch + worker pattern, same as plain RMW. Each prob command
-  # needs its computed result returned to the caller, so we can NOT fall
-  # back to the catch-all quorum_write (which replies :ok for async
-  # namespaces, losing the result).
-  defp async_write(ctx, idx, {:bloom_create, key, _, _, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:bloom_add, key, _, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:bloom_madd, key, _, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:cms_create, key, _, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:cms_incrby, key, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:cms_merge, dst_key, _, _, _} = cmd), do: async_prob(ctx, idx, dst_key, cmd)
-  defp async_write(ctx, idx, {:cuckoo_create, key, _, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:cuckoo_add, key, _, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:cuckoo_addnx, key, _, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:cuckoo_del, key, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:topk_create, key, _, _, _, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:topk_add, key, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-  defp async_write(ctx, idx, {:topk_incrby, key, _} = cmd), do: async_prob(ctx, idx, key, cmd)
-
-  # Commands that are complex or rarely used in async namespaces
-  # fall back to quorum (CAS, LOCK, UNLOCK, EXTEND, RATELIMIT, LIST_OP).
+  # Any other command in an async namespace — CAS, LOCK, UNLOCK, EXTEND,
+  # RATELIMIT, and all prob commands (bloom/cuckoo/cms/topk) — needs its
+  # computed result returned to the caller and must serialize via Raft
+  # for correctness:
+  #
+  #   * CAS/LOCK/EXTEND/RATELIMIT are distributed-coordination primitives
+  #     — their whole contract is linearizability.
+  #   * Prob commands return values (count of bits newly set, list of
+  #     evicted items, per-element counter deltas) computed by the state
+  #     machine; they can't be fire-and-forget.
+  #
+  # We could not use `quorum_write` directly because it routes through
+  # Shard → Batcher, and Batcher.enqueue_write replies `:ok` prematurely
+  # when the namespace's durability is `:async` (correct for put/delete,
+  # wrong for everything else). Use the Batcher's forced-quorum path
+  # (`write_async_quorum`) which ignores namespace durability and puts
+  # the command in the quorum slot regardless.
   defp async_write(ctx, idx, command) do
-    quorum_write(ctx, idx, command)
+    ref = make_ref()
+    from = {self(), ref}
+
+    Ferricstore.Raft.Batcher.write_async_quorum(idx, command, from)
+
+    result =
+      receive do
+        {^ref, reply} -> reply
+      after
+        10_000 -> {:error, "ERR async command timeout"}
+      end
+
+    case result do
+      {:error, _} -> :ok
+      _ ->
+        size = :counters.info(ctx.write_version).size
+        if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
+    end
+
+    result
   end
 
   # ---------------------------------------------------------------------------
@@ -1380,38 +1395,6 @@ defmodule Ferricstore.Store.Router do
   # of being promoted to a dedicated file. Acceptable trade-off; users who
   # want promotion can configure the namespace as quorum.
   # ---------------------------------------------------------------------------
-
-  # Async prob_write dispatch. Prob commands (bloom/cuckoo/cms/topk) need
-  # their computed result returned to the caller. The default async namespace
-  # path replies :ok prematurely (losing the result). Route these through
-  # Batcher.write_async_quorum so the state machine's apply/3 result comes
-  # back via ra_event, regardless of namespace durability config.
-  #
-  # The latency is quorum-ish (~2-7ms) for now — correct result matters
-  # more than speed for prob commands. A true async prob path would need
-  # inline NIF execution per command (large surface area); deferred.
-  defp async_prob(ctx, idx, _key, cmd) do
-    ref = make_ref()
-    from = {self(), ref}
-
-    Ferricstore.Raft.Batcher.write_async_quorum(idx, cmd, from)
-
-    result =
-      receive do
-        {^ref, reply} -> reply
-      after
-        10_000 -> {:error, "ERR prob_write timeout"}
-      end
-
-    case result do
-      {:error, _} -> :ok
-      _ ->
-        size = :counters.info(ctx.write_version).size
-        if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-    end
-
-    result
-  end
 
   # Async list_op latch-first dispatch. On CAS win: execute inline under
   # the per-key latch. On loss: bounce to RmwCoordinator, which

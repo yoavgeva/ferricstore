@@ -1,26 +1,24 @@
 defmodule Ferricstore.Store.AsyncProbTest do
   @moduledoc """
-  TDD tests for async prob_write (Group E in
-  docs/async-compound-list-prob-design.md).
+  Correctness tests for prob commands on async-configured namespaces.
 
-  Target behavior:
+  Per the design decision in docs/async-compound-list-prob-design.md
+  (Group C expanded), probabilistic commands (bloom/cuckoo/cms/topk)
+  always take the forced-quorum path regardless of namespace config:
 
-  - Router.prob_write goes through raft_write → async_write when the key's
-    namespace is async, and through async_rmw (latch + worker) for the
-    13 prob command tuples: bloom_add/madd/create, cms_create/incrby/merge,
-    cuckoo_create/add/addnx/del, topk_create/add/incrby.
-  - RmwCoordinator accepts prob command tuples and dispatches to
-    Router.execute_rmw_inline via a new prob-aware inline executor.
-  - State machine async_key_for/1 covers all 13 prob commands.
+  - They return computed values the caller needs (`{:ok, 0|1}` for add,
+    `{:ok, [counts]}` for query, evicted items for topk_add). Async
+    "fire and forget" semantics would lose these.
+  - The NIFs do 14-15 file syscalls per call (pread/pwrite per bit),
+    not a cheap mmap write. Raft overhead isn't the dominant cost.
+  - Serialization for concurrent bit-write safety is handled by the
+    state machine's mailbox — moving it to a latch + inline path
+    requires care and has modest latency payoff.
 
-  The prob NIF implementations live in Ferricstore.Commands.{Bloom,
-  Cuckoo, CountMinSketch, TopK}; the async fast path reuses the NIF
-  work done inside the Router inline executor. This test file exercises
-  the high-level public API (FerricStore.bf_add, cf_add, cms_incrby,
-  topk_add) to verify end-to-end correctness and latency.
-
-  These tests fail until the Group E async path + state machine clauses
-  are in place.
+  The regression guard in this file is that prob commands in an async
+  namespace return the correct computed value (NOT `{:ok, :ok}`, which
+  was the pre-fix bug where the Batcher replied :ok prematurely for any
+  command on an async-durability slot).
   """
   use ExUnit.Case, async: false
 
