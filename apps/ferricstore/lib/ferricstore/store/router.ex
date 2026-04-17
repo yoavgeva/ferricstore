@@ -177,31 +177,309 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  # INCR is a read-modify-write. Doing the read+compute in the caller's
-  # process under concurrent load loses updates (two callers read the same
-  # value, both compute +1, both write the same new value → one update lost).
-  # Route through quorum so the state machine's atomic do_incr handles it.
-  # Atomicity matters more than latency for counters.
-  defp async_write(ctx, idx, {:incr, _key, _delta} = command) do
-    quorum_write(ctx, idx, command)
-  end
-
-  # Read-modify-write operations route through quorum for atomicity.
-  # The state machine's apply/3 handlers are the atomic execution path;
-  # doing the read+compute in the caller's process would lose updates under
-  # concurrent load. The latency cost is acceptable because RMW commands are
-  # rare relative to plain SET/GET.
-  defp async_write(ctx, idx, {:incr_float, _key, _delta} = command), do: quorum_write(ctx, idx, command)
-  defp async_write(ctx, idx, {:append, _key, _suffix} = command), do: quorum_write(ctx, idx, command)
-  defp async_write(ctx, idx, {:getset, _key, _new_value} = command), do: quorum_write(ctx, idx, command)
-  defp async_write(ctx, idx, {:getdel, _key} = command), do: quorum_write(ctx, idx, command)
-  defp async_write(ctx, idx, {:getex, _key, _exp} = command), do: quorum_write(ctx, idx, command)
-  defp async_write(ctx, idx, {:setrange, _key, _off, _value} = command), do: quorum_write(ctx, idx, command)
+  # Read-modify-write async paths. Latch-first, worker fallback. See
+  # docs/async-rmw-design.md. Caller tries `:ets.insert_new` on the per-shard
+  # latch table; if it wins, runs the RMW inline in its own process. If it
+  # loses (someone else already holds the latch), falls through to the
+  # per-shard RmwCoordinator GenServer which serializes via its mailbox.
+  defp async_write(ctx, idx, {:incr, key, _delta} = cmd), do: async_rmw(ctx, idx, key, cmd)
+  defp async_write(ctx, idx, {:incr_float, key, _delta} = cmd), do: async_rmw(ctx, idx, key, cmd)
+  defp async_write(ctx, idx, {:append, key, _suffix} = cmd), do: async_rmw(ctx, idx, key, cmd)
+  defp async_write(ctx, idx, {:getset, key, _new_value} = cmd), do: async_rmw(ctx, idx, key, cmd)
+  defp async_write(ctx, idx, {:getdel, key} = cmd), do: async_rmw(ctx, idx, key, cmd)
+  defp async_write(ctx, idx, {:getex, key, _exp} = cmd), do: async_rmw(ctx, idx, key, cmd)
+  defp async_write(ctx, idx, {:setrange, key, _off, _value} = cmd), do: async_rmw(ctx, idx, key, cmd)
 
   # Commands that are complex or rarely used in async namespaces
   # fall back to quorum (CAS, LOCK, UNLOCK, EXTEND, RATELIMIT, LIST_OP).
   defp async_write(ctx, idx, command) do
     quorum_write(ctx, idx, command)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Async RMW: latch-first, worker fallback
+  # ---------------------------------------------------------------------------
+
+  # Latch-first dispatch for async RMW. Wins → run in caller process.
+  # Loses → fall through to the shard's RmwCoordinator.
+  #
+  # See docs/async-rmw-design.md. All 7 RMW commands flow through here
+  # (INCR, INCR_FLOAT, APPEND, GETSET, GETDEL, GETEX, SETRANGE).
+  defp async_rmw(ctx, idx, key, cmd) do
+    latch_tab = elem(ctx.latch_refs, idx)
+
+    case :ets.insert_new(latch_tab, {key, self()}) do
+      true ->
+        try do
+          :telemetry.execute([:ferricstore, :rmw, :latch], %{}, %{shard_index: idx})
+          execute_rmw_inline(ctx, idx, cmd)
+        after
+          :ets.take(latch_tab, key)
+        end
+
+      false ->
+        try do
+          Ferricstore.Store.RmwCoordinator.execute(idx, cmd)
+        catch
+          :exit, {:timeout, _} -> {:error, "ERR RMW timeout"}
+          :exit, {:noproc, _} -> {:error, "ERR RMW worker unavailable"}
+          :exit, _ -> {:error, "ERR RMW worker crashed"}
+        end
+    end
+  end
+
+  @doc """
+  Executes an RMW command inline against local ETS + BitcaskWriter and
+  submits the delta to Raft via `Batcher.async_submit`.
+
+  **Called with the per-key latch held.** The latch guarantees exclusive
+  access to `key`'s ETS row among RMW paths. `Router.async_rmw/4` (latch
+  path) and `Ferricstore.Store.RmwCoordinator` (worker path) both call
+  this after winning the latch.
+
+  Returns the command's natural result shape (e.g. `{:ok, new_int}` for
+  INCR, `old_value_or_nil` for GETSET/GETDEL).
+  """
+  @spec execute_rmw_inline(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
+  def execute_rmw_inline(ctx, idx, cmd) do
+    size = :atomics.info(ctx.disk_pressure).size
+    under_pressure = idx < size and :atomics.get(ctx.disk_pressure, idx + 1) == 1
+
+    if under_pressure do
+      {:error, "ERR disk pressure on shard #{idx}, rejecting async write"}
+    else
+      do_rmw_inline(ctx, idx, cmd)
+    end
+  end
+
+  # Per-command RMW implementations. Mirror state_machine.ex do_incr et al.,
+  # but operate on origin-local ETS + cast BitcaskWriter + submit a DELTA
+  # command to the Batcher for replication.
+
+  defp do_rmw_inline(ctx, idx, {:incr, key, delta}) do
+    case read_live(ctx, idx, key) do
+      :missing ->
+        if delta > 9_223_372_036_854_775_807 or delta < -9_223_372_036_854_775_808 do
+          {:error, "ERR increment or decrement would overflow"}
+        else
+          install_rmw_value(ctx, idx, key, delta, 0)
+          async_submit_to_raft(idx, {:incr, key, delta})
+          {:ok, delta}
+        end
+
+      {:hit, value, expire_at_ms} ->
+        case coerce_integer(value) do
+          {:ok, int_val} ->
+            new_val = int_val + delta
+
+            if new_val > 9_223_372_036_854_775_807 or new_val < -9_223_372_036_854_775_808 do
+              {:error, "ERR increment or decrement would overflow"}
+            else
+              install_rmw_value(ctx, idx, key, new_val, expire_at_ms)
+              async_submit_to_raft(idx, {:incr, key, delta})
+              {:ok, new_val}
+            end
+
+          :error ->
+            {:error, "ERR value is not an integer or out of range"}
+        end
+    end
+  end
+
+  defp do_rmw_inline(ctx, idx, {:incr_float, key, delta}) do
+    case read_live(ctx, idx, key) do
+      :missing ->
+        new_val = delta * 1.0
+        install_rmw_value(ctx, idx, key, new_val, 0)
+        async_submit_to_raft(idx, {:incr_float, key, delta})
+        {:ok, new_val}
+
+      {:hit, value, expire_at_ms} ->
+        case coerce_float(value) do
+          {:ok, float_val} ->
+            new_val = float_val + delta
+            install_rmw_value(ctx, idx, key, new_val, expire_at_ms)
+            async_submit_to_raft(idx, {:incr_float, key, delta})
+            {:ok, new_val}
+
+          :error ->
+            {:error, "ERR value is not a valid float"}
+        end
+    end
+  end
+
+  defp do_rmw_inline(ctx, idx, {:append, key, suffix}) do
+    {old_val, expire_at_ms} =
+      case read_live(ctx, idx, key) do
+        :missing -> {"", 0}
+        {:hit, v, exp} -> {to_disk_binary(v), exp}
+      end
+
+    new_val = old_val <> suffix
+    install_rmw_value(ctx, idx, key, new_val, expire_at_ms)
+    async_submit_to_raft(idx, {:append, key, suffix})
+    {:ok, byte_size(new_val)}
+  end
+
+  defp do_rmw_inline(ctx, idx, {:getset, key, new_value}) do
+    old =
+      case read_live(ctx, idx, key) do
+        :missing -> nil
+        {:hit, v, _exp} -> v
+      end
+
+    install_rmw_value(ctx, idx, key, new_value, 0)
+    async_submit_to_raft(idx, {:getset, key, new_value})
+    old
+  end
+
+  defp do_rmw_inline(ctx, idx, {:getdel, key}) do
+    case read_live(ctx, idx, key) do
+      :missing ->
+        nil
+
+      {:hit, v, _exp} ->
+        # Delete locally + submit delta for replicas.
+        keydir = elem(ctx.keydir_refs, idx)
+        track_keydir_binary_delete(ctx, idx, keydir, key)
+        :ets.delete(keydir, key)
+
+        {_, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+        Ferricstore.Store.BitcaskWriter.delete(idx, file_path, key)
+
+        wv_size = :counters.info(ctx.write_version).size
+        if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+
+        async_submit_to_raft(idx, {:getdel, key})
+        v
+    end
+  end
+
+  defp do_rmw_inline(ctx, idx, {:getex, key, new_expire_at_ms}) do
+    case read_live(ctx, idx, key) do
+      :missing ->
+        nil
+
+      {:hit, v, _old_exp} ->
+        install_rmw_value(ctx, idx, key, v, new_expire_at_ms)
+        async_submit_to_raft(idx, {:getex, key, new_expire_at_ms})
+        v
+    end
+  end
+
+  defp do_rmw_inline(ctx, idx, {:setrange, key, offset, value}) do
+    {old_val, expire_at_ms} =
+      case read_live(ctx, idx, key) do
+        :missing -> {"", 0}
+        {:hit, v, exp} -> {to_disk_binary(v), exp}
+      end
+
+    new_val = apply_setrange(old_val, offset, value)
+    install_rmw_value(ctx, idx, key, new_val, expire_at_ms)
+    async_submit_to_raft(idx, {:setrange, key, offset, value})
+    {:ok, byte_size(new_val)}
+  end
+
+  # Read the live value for a key (treating expired TTL as missing).
+  defp read_live(ctx, idx, key) do
+    keydir = elem(ctx.keydir_refs, idx)
+    now = HLC.now_ms()
+
+    case :ets.lookup(keydir, key) do
+      [{^key, value, exp, _, _, _, _}]
+      when value != nil and (exp == 0 or exp > now) ->
+        {:hit, value, exp}
+
+      _ ->
+        :missing
+    end
+  end
+
+  # Write the new RMW value into ETS, cast BitcaskWriter for disk, bump
+  # write_version. Matches the shape of async_write_put for small values.
+  defp install_rmw_value(ctx, idx, key, value, expire_at_ms) do
+    keydir = elem(ctx.keydir_refs, idx)
+
+    value_for_ets =
+      case value do
+        v when is_integer(v) -> Integer.to_string(v)
+        v when is_float(v) -> Float.to_string(v)
+        v when is_binary(v) ->
+          if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
+      end
+
+    disk_value = to_disk_binary(value)
+    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+
+    track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+
+    if value_for_ets == nil do
+      # Large — sync NIF write then ETS with real offset.
+      case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, [{key, disk_value, expire_at_ms}]) do
+        {:ok, [{offset, _record_size}]} ->
+          :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)})
+
+        {:error, _} ->
+          # Fall back to ETS-only; caller will see the write via ETS but
+          # disk persistence failed. Already handled by disk_pressure check.
+          :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_value)})
+      end
+    else
+      :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
+      Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, key, disk_value, expire_at_ms)
+    end
+
+    wv_size = :counters.info(ctx.write_version).size
+    if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+    :ok
+  end
+
+  # Coerce a stored value (integer, float, binary-digits) to an integer.
+  defp coerce_integer(v) when is_integer(v), do: {:ok, v}
+  defp coerce_integer(v) when is_float(v), do: :error
+  defp coerce_integer(v) when is_binary(v) do
+    case Integer.parse(v) do
+      {n, ""} -> {:ok, n}
+      _ -> :error
+    end
+  end
+
+  # Coerce a stored value to a float (ints upcast).
+  defp coerce_float(v) when is_float(v), do: {:ok, v}
+  defp coerce_float(v) when is_integer(v), do: {:ok, v * 1.0}
+  defp coerce_float(v) when is_binary(v) do
+    case Float.parse(v) do
+      {f, _} -> {:ok, f}
+      :error ->
+        case Integer.parse(v) do
+          {i, ""} -> {:ok, i * 1.0}
+          _ -> :error
+        end
+    end
+  end
+
+  # SETRANGE helper: overwrite bytes at offset, zero-padding if needed.
+  defp apply_setrange(old, offset, value) do
+    old_len = byte_size(old)
+    val_len = byte_size(value)
+
+    cond do
+      val_len == 0 ->
+        if offset > old_len,
+          do: old <> :binary.copy(<<0>>, offset - old_len),
+          else: old
+
+      offset > old_len ->
+        old <> :binary.copy(<<0>>, offset - old_len) <> value
+
+      offset + val_len >= old_len ->
+        binary_part(old, 0, offset) <> value
+
+      true ->
+        binary_part(old, 0, offset) <>
+          value <>
+          binary_part(old, offset + val_len, old_len - offset - val_len)
+    end
   end
 
   defp async_write_put(ctx, idx, key, value, expire_at_ms) do

@@ -77,6 +77,7 @@ defmodule FerricStore.Instance do
     :hotness_table,
     :config_table,
     :keydir_binary_bytes,
+    :latch_refs,
     raft_enabled: true,
     connected_clients_fn: nil,
     process_rss_fn: nil,
@@ -101,6 +102,12 @@ defmodule FerricStore.Instance do
 
     # Per-shard ETS tables (anonymous — no global name pollution)
     keydir_refs = build_keydir_tables(name, shard_count)
+
+    # Per-shard latch tables — one ETS per shard, used by async RMW
+    # (see docs/async-rmw-design.md). Each row is {key, holder_pid}.
+    # :ets.insert_new provides atomic per-key locking; callers who lose
+    # the CAS fall through to the RmwCoordinator worker.
+    latch_refs = build_latch_tables(name, shard_count)
 
     # Shard process names (via Registry or atoms)
     shard_names = build_shard_names(name, shard_count)
@@ -173,6 +180,7 @@ defmodule FerricStore.Instance do
       slot_map: slot_map,
       shard_names: shard_names,
       keydir_refs: keydir_refs,
+      latch_refs: latch_refs,
       ra_system: :"#{name}_raft",
       pressure_flags: pressure_flags,
       disk_pressure: disk_pressure,
@@ -273,6 +281,39 @@ defmodule FerricStore.Instance do
       if name == :default,
         do: :"Ferricstore.Store.Shard.#{i}",
         else: :"#{name}.Shard.#{i}"
+    end)
+    |> List.to_tuple()
+  end
+
+  # Per-shard latch tables used by async RMW (see docs/async-rmw-design.md).
+  # Created here so they're ready before any RMW can be issued. :named_table
+  # so other processes can look them up directly via the name; :public so
+  # Router.async_rmw can :ets.insert_new without a GenServer hop.
+  defp build_latch_tables(name, shard_count) do
+    0..(shard_count - 1)
+    |> Enum.map(fn i ->
+      table_name =
+        if name == :default,
+          do: :"ferricstore_latch_#{i}",
+          else: :"#{name}_latch_#{i}"
+
+      # Idempotent: recreate only if it doesn't already exist (tests may
+      # call Instance.new/1 multiple times).
+      case :ets.whereis(table_name) do
+        :undefined ->
+          :ets.new(table_name, [
+            :public,
+            :set,
+            :named_table,
+            {:read_concurrency, true},
+            {:write_concurrency, :auto}
+          ])
+
+        _ref ->
+          :ets.delete_all_objects(table_name)
+      end
+
+      table_name
     end)
     |> List.to_tuple()
   end

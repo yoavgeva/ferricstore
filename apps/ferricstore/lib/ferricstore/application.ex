@@ -181,6 +181,17 @@ defmodule Ferricstore.Application do
         )
       end)
 
+    # Async RMW fallback coordinator — one per shard. Handles contended RMW
+    # commands that lost the per-key latch in Router.async_rmw. See
+    # docs/async-rmw-design.md.
+    rmw_coordinator_children =
+      Enum.map(0..(shard_count - 1), fn i ->
+        Supervisor.child_spec(
+          {Ferricstore.Store.RmwCoordinator, shard_index: i},
+          id: :"rmw_coordinator_#{i}"
+        )
+      end)
+
     # Optional libcluster node discovery (DNS, Kubernetes labels, or gossip).
     # When topologies are configured, Cluster.Supervisor is the first child so
     # that node discovery begins before the store is ready to serve traffic.
@@ -200,6 +211,7 @@ defmodule Ferricstore.Application do
       ] ++
         batcher_children ++
         bitcask_writer_children ++
+        rmw_coordinator_children ++
         [
         {Ferricstore.Store.ShardSupervisor, data_dir: data_dir, shard_count: shard_count, instance_ctx: default_ctx}
       ] ++
