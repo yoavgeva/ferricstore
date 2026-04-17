@@ -29,6 +29,22 @@ defmodule Ferricstore.Bitcask.NIF do
   @spec v2_fsync(binary()) :: :ok | {:error, term()}
   def v2_fsync(_path), do: :erlang.nif_error(:nif_not_loaded)
 
+  @doc """
+  Fsyncs a directory so that recent `File.rename/2`, `File.rm/1`,
+  `File.touch!/1`, or `File.create/1` operations on files inside it are
+  durable. Use after any namespace mutation that must survive a kernel
+  panic — rotation, compaction rename, hint-file creation, prob-file
+  create/delete, shard init.
+
+  Returns `:ok` on success or `{:error, reason}` where reason is a
+  short string suitable for logging.
+
+  POSIX: file-data fsync does NOT make the filename durable; only a
+  directory fsync does.
+  """
+  @spec v2_fsync_dir(binary()) :: :ok | {:error, term()}
+  def v2_fsync_dir(_path), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec v2_write_hint_file(binary(), [{binary(), non_neg_integer(), non_neg_integer(), non_neg_integer(), non_neg_integer()}]) :: :ok | {:error, term()}
   def v2_write_hint_file(_path, _entries), do: :erlang.nif_error(:nif_not_loaded)
 

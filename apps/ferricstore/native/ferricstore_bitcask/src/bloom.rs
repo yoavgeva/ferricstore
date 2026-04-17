@@ -201,6 +201,15 @@ pub fn bloom_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> Ni
             .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite count: {e}"))))?;
     }
 
+    // Durability: fsync before returning :ok. Without this, a kernel panic
+    // after the write but before the background pagecache flush would lose
+    // the bit. Ra replay is safe for bloom (bit-set is idempotent) but the
+    // header `count` field can desync with the actual bits set, breaking
+    // BF.CARD. See docs/bitcask-background-fsync.md.
+    if let Err(e) = crate::prob_fsync(&file) {
+        return Ok((atoms::error(), e).encode(env));
+    }
+
     crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), u32::from(any_new)).encode(env))
 }
@@ -262,6 +271,11 @@ pub fn bloom_file_madd<'a>(
     // Write final count once after all additions.
     file.write_at(&count.to_le_bytes(), 24)
         .map_err(|e| rustler::Error::Term(Box::new(format!("pwrite count: {e}"))))?;
+
+    // Durability: one fsync per batch (amortized across all elements).
+    if let Err(e) = crate::prob_fsync(&file) {
+        return Ok((atoms::error(), e).encode(env));
+    }
 
     crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), results).encode(env))

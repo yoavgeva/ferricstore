@@ -140,6 +140,52 @@ pub fn fadvise_dontneed(file: &std::fs::File, offset: i64, len: i64) {
 #[cfg(not(target_os = "linux"))]
 pub fn fadvise_dontneed(_file: &std::fs::File, _offset: i64, _len: i64) {}
 
+/// Fsync a directory so that filename-to-inode mappings (dir entries) are
+/// durable. Required after `File::create`, `rename`, `remove_file`, or
+/// `touch` of any file inside a directory whose existence must survive a
+/// kernel panic.
+///
+/// POSIX: a file's data `fsync` does NOT make the filename entry durable;
+/// only the parent directory's fsync does that. Without this call, a
+/// kernel panic after a rename/rm can leave the directory in a state
+/// where the filename mapping doesn't match what the caller expected —
+/// e.g. a freshly-compacted `00003.log` still shows as `compact_3.log`
+/// because the rename never flushed to disk.
+///
+/// Uses `File::open` (read-only) + `sync_data()` which is valid for
+/// directories on Linux and macOS. Empty path returns Err without
+/// opening.
+pub fn fsync_dir(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("empty path".to_string());
+    }
+
+    let dir = std::fs::File::open(std::path::Path::new(path))
+        .map_err(|e| format!("open dir: {e}"))?;
+
+    dir.sync_data().map_err(|e| format!("sync_data: {e}"))
+}
+
+/// Fsync a prob file (bloom/cuckoo/cms/topk) after a write before returning
+/// `:ok` to the caller. Without this, writes go to the OS page cache only
+/// and a kernel panic between the write and the background pagecache flush
+/// would lose the data.
+///
+/// For bloom: bit-set is idempotent on Ra replay but the header `count`
+/// field can desync with actual bits set (breaks `BF.CARD`).
+/// For cuckoo: kick-chain partial writes corrupt the filter; replay is
+/// NOT safe.
+/// For cms: read-modify-write counters double-count on replay.
+/// For topk: heap state corruption on partial writes.
+///
+/// Returns the formatted error string on failure so callers can propagate
+/// it as `{:error, reason}` to Elixir. Uses `sync_data()` (fdatasync) — we
+/// don't need metadata durability here, the file's size/perms never change
+/// after create.
+pub fn prob_fsync(file: &std::fs::File) -> Result<(), String> {
+    file.sync_data().map_err(|e| format!("sync_data: {e}"))
+}
+
 /// Parse the numeric file_id from a log file path.
 ///
 /// L-NEW-1 fix: `"00000000000000000000".trim_start_matches('0')` produces `""`
@@ -433,6 +479,19 @@ fn v2_fsync(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
             Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
         },
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
+    }
+}
+
+/// Fsync a directory so that recent `create` / `rename` / `remove_file`
+/// operations inside it are durable. See `fsync_dir` doc for details.
+///
+/// Returns `:ok` or `{:error, reason}`.
+#[rustler::nif(schedule = "Normal")]
+#[allow(clippy::needless_pass_by_value)]
+fn v2_fsync_dir(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
+    match fsync_dir(&path) {
+        Ok(()) => Ok(atoms::ok().encode(env)),
+        Err(msg) => Ok((atoms::error(), msg).encode(env)),
     }
 }
 
@@ -1131,6 +1190,357 @@ mod audit_fix_tests {
         // Verify unwrap_or_else recovers the inner value
         let guard = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(*guard, 42, "recovered value must be intact");
+    }
+}
+
+// ===========================================================================
+// prob_fsync edge-case tests
+// ---------------------------------------------------------------------------
+// These tests cover the `prob_fsync()` helper that was added to ensure
+// bloom/cuckoo/cms/topk writes are durable before the NIF returns :ok.
+//
+// Failure modes we want to verify:
+//
+//   * fsync on a newly-created empty file returns Ok and is cheap.
+//   * fsync on a file opened read-only returns Err (sync_data requires write).
+//   * fsync on a deleted-but-still-open file does NOT panic.
+//   * Repeated fsync on the same open file is idempotent (no FD leak).
+//   * Concurrent fsyncs across threads on the same file are safe.
+//   * File descriptor stability: after many open+write+fsync+close cycles,
+//     the number of open FDs on the process stays bounded.
+// ===========================================================================
+
+#[cfg(test)]
+mod prob_fsync_tests {
+    use super::*;
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::TempDir;
+
+    fn tmpfile() -> (TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("probe.bin");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(b"hello world").unwrap();
+        f.sync_all().unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn fsync_empty_file_ok() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("empty.bin");
+        let f = File::create(&path).unwrap();
+        assert!(prob_fsync(&f).is_ok(), "empty file fsync should succeed");
+    }
+
+    #[test]
+    fn fsync_small_file_ok() {
+        let (_dir, path) = tmpfile();
+        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        assert!(prob_fsync(&f).is_ok());
+    }
+
+    #[test]
+    fn fsync_read_only_file_returns_err() {
+        // On most Unix systems fsync/fdatasync on a read-only fd returns
+        // EBADF. prob_fsync must propagate that as an Err, not panic.
+        let (_dir, path) = tmpfile();
+        let f = File::open(&path).unwrap(); // read-only
+        let result = prob_fsync(&f);
+        // On macOS/Linux sync_data may actually succeed on RO fds for some
+        // filesystems — so we don't assert Err here. We only assert that
+        // the call doesn't panic and that any error is surfaced as the
+        // String payload of the Result (not a panic / abort).
+        match result {
+            Ok(()) => {}
+            Err(msg) => assert!(
+                msg.starts_with("sync_data:"),
+                "error must be prefixed with sync_data: — got {msg}"
+            ),
+        }
+    }
+
+    #[test]
+    fn fsync_after_unlink_does_not_panic() {
+        // Open the file, keep the fd, unlink the path, then fsync. On Unix
+        // the fd remains valid. prob_fsync must not panic — at worst return
+        // an Err (some kernels will return EIO).
+        let (dir, path) = tmpfile();
+        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        // File is gone from the directory but fd is still open.
+        let _ = prob_fsync(&f);
+
+        // Dir itself still exists; drop is fine.
+        drop(dir);
+    }
+
+    #[test]
+    fn repeated_fsync_idempotent() {
+        let (_dir, path) = tmpfile();
+        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+
+        // 1000 fsyncs on the same fd must all succeed and must not
+        // cause the process to OOM / leak descriptors. (sync_data is
+        // always idempotent per POSIX.)
+        for _ in 0..1000 {
+            prob_fsync(&f).expect("repeated fsync must succeed");
+        }
+    }
+
+    #[test]
+    fn fsync_concurrent_same_file_no_panic() {
+        // sync_data is thread-safe per POSIX. Run 4 threads pounding the
+        // same file with fsyncs — must not panic / deadlock.
+        let (_dir, path) = tmpfile();
+        let f = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let f = Arc::clone(&f);
+                thread::spawn(move || {
+                    for _ in 0..250 {
+                        let _ = prob_fsync(&f);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread must not panic");
+        }
+    }
+
+    /// FD-leak probe: open+write+fsync+close many files, ensure resources are
+    /// released (no stack overflow, no allocator growth, no panic). We can't
+    /// portably count open FDs without libc syscalls, but the `prob_fsync`
+    /// helper takes `&File` not ownership — closing is the caller's job, so
+    /// a leak here would show as a disk-space / inode problem in real
+    /// workloads. This test exercises that closing path through the Rust
+    /// Drop impl.
+    #[test]
+    fn no_fd_leak_across_many_open_cycles() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        for i in 0..2000 {
+            let path = dir.path().join(format!("f_{i}.bin"));
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&[0u8; 64]).unwrap();
+            prob_fsync(&f).expect("fsync ok");
+            // f dropped here — fd released by kernel via Drop.
+        }
+
+        // If we leaked FDs we'd hit EMFILE (too many open files) before
+        // reaching 2000 on most default ulimits (~256 on macOS).
+    }
+
+    #[test]
+    fn error_message_is_well_formed() {
+        // Explicit failure path: close the underlying fd by creating a
+        // File and dropping it, then try to sync a fresh fd pointing at a
+        // nonexistent directory's child. That returns ENOENT on open, so
+        // we exercise the "sync_data: <errno>" format indirectly by
+        // provoking a sync on a file that has been closed via into_raw_fd.
+        //
+        // Simplified: just ensure the Ok variant returns unit and the Err
+        // variant contains the sync_data: prefix if it ever fires. The
+        // ok case is covered above; the err case is exercised via
+        // fsync_read_only_file_returns_err.
+        let (_dir, path) = tmpfile();
+        let f = File::open(&path).unwrap();
+        match prob_fsync(&f) {
+            Ok(()) => {}
+            Err(msg) => {
+                assert!(
+                    msg.starts_with("sync_data:"),
+                    "error message must start with 'sync_data:' prefix, got {msg}"
+                );
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// fsync_dir edge-case tests
+// ---------------------------------------------------------------------------
+// Directory fsync makes rename/rm/create operations durable against kernel
+// panic. POSIX: fsync(dirfd) flushes the directory's entries (filename →
+// inode mappings), independent of file-data fsync.
+//
+// Cases to cover:
+//   * Happy path: existing dir returns Ok.
+//   * Nonexistent path: Err, no panic.
+//   * Path is a regular file, not a dir: Err (on most platforms — some
+//     allow fsync on files, so this is best-effort).
+//   * Empty string path: Err.
+//   * Path with no parent (root): Ok (fsyncing "/" is valid).
+//   * Concurrent fsync from multiple threads on same dir: no panic, no
+//     deadlock.
+//   * FD leak probe: many open+fsync+close cycles should not exhaust FDs.
+//   * Post-rename observability: after rename + fsync_dir, reopen via a
+//     fresh path resolution sees the new name (sanity check, not a real
+//     kernel-panic test).
+//
+// These tests are written BEFORE the helper is implemented — they should
+// fail to compile until `fsync_dir` + the NIF exist.
+// ===========================================================================
+
+#[cfg(test)]
+mod fsync_dir_tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::TempDir;
+
+    #[test]
+    fn existing_dir_ok() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        assert!(fsync_dir(&path).is_ok(), "fsync on existing dir must succeed");
+    }
+
+    #[test]
+    fn nonexistent_dir_returns_err() {
+        let missing = "/does/not/exist/for/test/xyz123";
+        let result = fsync_dir(missing);
+        assert!(result.is_err(), "fsync on missing path must return Err");
+        if let Err(msg) = result {
+            // Make sure the error is tagged so callers can log it meaningfully.
+            assert!(
+                !msg.is_empty(),
+                "err message must be non-empty"
+            );
+        }
+    }
+
+    #[test]
+    fn path_to_regular_file_ok_or_well_formed_err() {
+        // On most systems, fsync on a regular file fd is legal and equivalent
+        // to v2_fsync on that file. We accept either Ok (file treated like a
+        // file) or a well-formed Err. What we DO NOT accept: a panic.
+        let dir = tempfile::TempDir::new().unwrap();
+        let fpath = dir.path().join("not_a_dir.txt");
+        let mut f = File::create(&fpath).unwrap();
+        f.write_all(b"x").unwrap();
+        f.sync_all().unwrap();
+
+        let result = fsync_dir(fpath.to_str().unwrap());
+        match result {
+            Ok(()) => {}
+            Err(msg) => assert!(!msg.is_empty()),
+        }
+    }
+
+    #[test]
+    fn empty_path_returns_err() {
+        let result = fsync_dir("");
+        assert!(result.is_err(), "empty path must return Err");
+    }
+
+    #[test]
+    fn repeated_fsync_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+
+        for _ in 0..1000 {
+            fsync_dir(&path).expect("repeated dir fsync must succeed");
+        }
+    }
+
+    #[test]
+    fn concurrent_fsync_no_panic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path: Arc<String> = Arc::new(dir.path().to_str().unwrap().to_string());
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let p = Arc::clone(&path);
+                thread::spawn(move || {
+                    for _ in 0..250 {
+                        let _ = fsync_dir(&p);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread must not panic");
+        }
+    }
+
+    #[test]
+    fn no_fd_leak_across_cycles() {
+        // 2000 fsync_dir calls shouldn't blow past the default ulimit (~256
+        // on macOS) if the helper properly drops the open fd.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+
+        for _ in 0..2000 {
+            fsync_dir(&path).expect("fsync dir ok");
+        }
+    }
+
+    #[test]
+    fn after_rename_dir_entry_present() {
+        // This is a sanity test, not a kernel-panic test: after
+        // rename + fsync_dir, the new filename must still be visible via
+        // a fresh directory read. (That's trivially true on any reasonable
+        // filesystem; we just want to ensure fsync_dir doesn't mangle
+        // state.)
+        let dir = tempfile::TempDir::new().unwrap();
+        let old_path = dir.path().join("old.log");
+        let new_path = dir.path().join("new.log");
+
+        File::create(&old_path).unwrap();
+        fs::rename(&old_path, &new_path).unwrap();
+        fsync_dir(dir.path().to_str().unwrap()).unwrap();
+
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+
+        assert!(entries.iter().any(|n| n == "new.log"));
+        assert!(!entries.iter().any(|n| n == "old.log"));
+    }
+
+    #[test]
+    fn after_remove_dir_entry_gone() {
+        let dir: TempDir = tempfile::TempDir::new().unwrap();
+        let fpath = dir.path().join("will_be_removed.log");
+        File::create(&fpath).unwrap();
+        fs::remove_file(&fpath).unwrap();
+
+        // Must not error just because the removed file doesn't exist —
+        // we're syncing the DIR, which does exist.
+        fsync_dir(dir.path().to_str().unwrap()).unwrap();
+
+        assert!(!fpath.exists());
+    }
+
+    #[test]
+    fn error_message_well_formed() {
+        let result = fsync_dir("/nonexistent/xyz/abc");
+        match result {
+            Ok(()) => {}
+            Err(msg) => assert!(
+                !msg.is_empty() && msg.len() < 1024,
+                "error message should be non-empty and bounded, got {msg}"
+            ),
+        }
     }
 }
 

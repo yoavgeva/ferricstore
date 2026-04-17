@@ -287,19 +287,28 @@ mod tests {
     // do flat IO operations (pread, fsync, put_batch) with bounded stack depth.
     // No recursive algorithms are used in spawned tasks.
 
-    /// Verify that a large allocation failure inside a task doesn't kill the
-    /// runtime. Rust's default allocator aborts on OOM, but we can test the
-    /// fallible allocation path.
+    /// Verify that the Tokio runtime survives a task that returns `Err` from
+    /// a fallible allocation and can still schedule subsequent tasks.
+    ///
+    /// We force the error path via `Vec::try_reserve_exact` for a
+    /// `Vec<usize>` (8 bytes per element) with a count > `isize::MAX / 8`.
+    /// `Vec` always validates `capacity * size_of::<T>() <= isize::MAX` and
+    /// returns `TryReserveError::CapacityOverflow` without touching the
+    /// allocator — this is guaranteed by the standard library contract and
+    /// does not depend on platform/mode (previous `usize::MAX / 2` for
+    /// `Vec<u8>` could succeed under release-mode overcommit and failed
+    /// on macOS aarch64).
     #[test]
     fn large_allocation_failure_in_task_is_contained() {
         let rt = runtime();
 
         let alloc_handle = rt.spawn(async {
-            // Try to allocate something unreasonably large via try_reserve.
-            // This tests that the task handles allocation failure gracefully.
-            let mut v: Vec<u8> = Vec::new();
-            match v.try_reserve(usize::MAX / 2) {
-                Ok(()) => panic!("should not be able to allocate usize::MAX/2 bytes"),
+            // Vec<usize>: element size = 8, so capacity * 8 must fit in isize::MAX.
+            // Request capacity = isize::MAX (so required bytes = 8 * isize::MAX,
+            // which overflows isize::MAX). Guaranteed CapacityOverflow.
+            let mut v: Vec<usize> = Vec::new();
+            match v.try_reserve_exact(isize::MAX as usize) {
+                Ok(()) => panic!("try_reserve_exact with capacity-overflow must fail"),
                 Err(_) => "allocation_failed_gracefully",
             }
         });

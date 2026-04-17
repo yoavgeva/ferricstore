@@ -348,6 +348,9 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
                 return Ok((atoms::error(), e).encode(env));
             }
+            if let Err(e) = crate::prob_fsync(&file) {
+                return Ok((atoms::error(), e).encode(env));
+            }
             crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 1u64).encode(env));
         }
@@ -377,6 +380,9 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+                return Ok((atoms::error(), e).encode(env));
+            }
+            if let Err(e) = crate::prob_fsync(&file) {
                 return Ok((atoms::error(), e).encode(env));
             }
             crate::fadvise_dontneed(&file, 0, 0);
@@ -536,6 +542,9 @@ pub fn cuckoo_file_addnx<'a>(
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
                 return Ok((atoms::error(), e).encode(env));
             }
+            if let Err(e) = crate::prob_fsync(&file) {
+                return Ok((atoms::error(), e).encode(env));
+            }
             crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 1u64).encode(env));
         }
@@ -565,6 +574,9 @@ pub fn cuckoo_file_addnx<'a>(
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+                return Ok((atoms::error(), e).encode(env));
+            }
+            if let Err(e) = crate::prob_fsync(&file) {
                 return Ok((atoms::error(), e).encode(env));
             }
             crate::fadvise_dontneed(&file, 0, 0);
@@ -694,6 +706,9 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
             if let Err(e) = cuckoo_file_write_num_deletes(&file, hdr.num_deletes + 1) {
                 return Ok((atoms::error(), e).encode(env));
             }
+            if let Err(e) = crate::prob_fsync(&file) {
+                return Ok((atoms::error(), e).encode(env));
+            }
             crate::fadvise_dontneed(&file, 0, 0);
             return Ok((atoms::ok(), 1u64).encode(env));
         }
@@ -726,6 +741,9 @@ pub fn cuckoo_file_del<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
                 return Ok((atoms::error(), e).encode(env));
             }
             if let Err(e) = cuckoo_file_write_num_deletes(&file, hdr.num_deletes + 1) {
+                return Ok((atoms::error(), e).encode(env));
+            }
+            if let Err(e) = crate::prob_fsync(&file) {
                 return Ok((atoms::error(), e).encode(env));
             }
             crate::fadvise_dontneed(&file, 0, 0);

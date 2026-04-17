@@ -426,8 +426,13 @@ pub fn topk_file_add_v2<'a>(
     if let Err(e) = v2_write_heap(&file, width, depth, &heap_entries) {
         return Ok((atoms::error(), e).encode(env));
     }
-    // No fsync on hot path — kernel writeback flushes to disk within ~30s.
-    // Raft WAL replay reconstructs the file on crash recovery.
+    // Durability: fsync before returning. TopK is NOT idempotent under
+    // Raft replay (heap state + decay + counter RMW), so relying on
+    // pagecache flush + replay corrupts state on kernel panic. See
+    // docs/bitcask-background-fsync.md.
+    if let Err(e) = crate::prob_fsync(&file) {
+        return Ok((atoms::error(), e).encode(env));
+    }
 
     crate::fadvise_dontneed(&file, 0, 0);
     Ok(results.encode(env))
@@ -506,7 +511,10 @@ pub fn topk_file_incrby_v2<'a>(
     if let Err(e) = v2_write_heap(&file, width, depth, &heap_entries) {
         return Ok((atoms::error(), e).encode(env));
     }
-    // No fsync on hot path — same rationale as topk_file_add_v2.
+    // Durability: fsync — see comment in topk_file_add_v2.
+    if let Err(e) = crate::prob_fsync(&file) {
+        return Ok((atoms::error(), e).encode(env));
+    }
 
     crate::fadvise_dontneed(&file, 0, 0);
     Ok(results.encode(env))

@@ -248,6 +248,14 @@ pub fn cms_file_incrby<'a>(
     file.write_at(&total_count.to_le_bytes(), 24)
         .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
 
+    // Durability: fsync before returning the computed counts. CMS is a
+    // read-modify-write on counters; replay after a partial-write crash
+    // double-counts and produces cross-replica divergence. See
+    // docs/bitcask-background-fsync.md.
+    if let Err(e) = crate::prob_fsync(&file) {
+        return Ok((atoms::error(), e).encode(env));
+    }
+
     crate::fadvise_dontneed(&file, 0, 0);
     Ok((atoms::ok(), counts).encode(env))
 }
@@ -416,6 +424,12 @@ pub fn cms_file_merge(
     dst_file
         .write_at(&dst_count.to_le_bytes(), 24)
         .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+
+    // Durability: fsync the destination before returning. Sources are
+    // read-only during merge so they don't need fsync.
+    if let Err(e) = crate::prob_fsync(&dst_file) {
+        return Ok((atoms::error(), e).encode(env));
+    }
 
     crate::fadvise_dontneed(&dst_file, 0, 0);
     for (src_file, _) in &src_files {
