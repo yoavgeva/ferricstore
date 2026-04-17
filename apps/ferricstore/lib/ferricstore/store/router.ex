@@ -190,6 +190,18 @@ defmodule Ferricstore.Store.Router do
   defp async_write(ctx, idx, {:getex, key, _exp} = cmd), do: async_rmw(ctx, idx, key, cmd)
   defp async_write(ctx, idx, {:setrange, key, _off, _value} = cmd), do: async_rmw(ctx, idx, key, cmd)
 
+  # List ops are RMW at the structural level (LPUSH reads head pointer,
+  # writes new element + new head). Same latch+worker pattern as plain RMW.
+  # The latch is on the user-facing list key, serializing all list_ops on
+  # that list.
+  defp async_write(ctx, idx, {:list_op, key, _op} = cmd), do: async_list_op(ctx, idx, key, cmd)
+  defp async_write(ctx, idx, {:list_op_lmove, src_key, _dst, _from, _to} = cmd) do
+    # Single-shard LMOVE goes async on the source's latch. Cross-shard
+    # LMOVE never reaches here (Router.list_op for lmove already splits
+    # across shards via quorum_write before calling async_write).
+    async_list_op(ctx, idx, src_key, cmd)
+  end
+
   # Commands that are complex or rarely used in async namespaces
   # fall back to quorum (CAS, LOCK, UNLOCK, EXTEND, RATELIMIT, LIST_OP).
   defp async_write(ctx, idx, command) do
@@ -1349,6 +1361,118 @@ defmodule Ferricstore.Store.Router do
   # of being promoted to a dedicated file. Acceptable trade-off; users who
   # want promotion can configure the namespace as quorum.
   # ---------------------------------------------------------------------------
+
+  # Async list_op latch-first dispatch. On CAS win: execute inline under
+  # the per-key latch. On loss: bounce to RmwCoordinator, which
+  # serializes via its mailbox and then acquires the latch before running.
+  defp async_list_op(ctx, idx, key, cmd) do
+    latch_tab = elem(ctx.latch_refs, idx)
+
+    case :ets.insert_new(latch_tab, {key, self()}) do
+      true ->
+        try do
+          :telemetry.execute([:ferricstore, :list_op, :latch], %{}, %{shard_index: idx})
+          execute_list_op_inline(ctx, idx, cmd)
+        after
+          :ets.take(latch_tab, key)
+        end
+
+      false ->
+        try do
+          Ferricstore.Store.RmwCoordinator.execute(idx, cmd)
+        catch
+          :exit, {:timeout, _} -> {:error, "ERR list_op timeout"}
+          :exit, {:noproc, _} -> {:error, "ERR RMW worker unavailable"}
+          :exit, _ -> {:error, "ERR RMW worker crashed"}
+        end
+    end
+  end
+
+  @doc """
+  Executes a list_op inline under a held latch. Called from
+  `Router.async_list_op` (fast path) and `RmwCoordinator.handle_call`
+  (contended path). The latch guarantees exclusive access to the list's
+  compound keys.
+
+  Uses `ListOps.execute/3` with an origin-local compound store that
+  writes ETS + casts BitcaskWriter for each mutation. Then submits the
+  original `{:list_op, key, op}` command to Raft via
+  `Batcher.async_submit` so replicas re-execute against their own state
+  in Raft log order (deterministic convergence).
+  """
+  @spec execute_list_op_inline(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
+  def execute_list_op_inline(ctx, idx, {:list_op, key, operation} = cmd) do
+    :telemetry.execute([:ferricstore, :rmw, :worker_list_op], %{}, %{shard_index: idx})
+    store = build_origin_compound_store(ctx, idx)
+    result = Ferricstore.Store.ListOps.execute(key, store, operation)
+
+    wv_size = :counters.info(ctx.write_version).size
+    if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+
+    async_submit_to_raft(idx, cmd)
+    result
+  end
+
+  def execute_list_op_inline(ctx, idx, {:list_op_lmove, src_key, dst_key, from_dir, to_dir} = cmd) do
+    # Single-shard LMOVE: both keys live on the same shard. Uses
+    # ListOps.execute_lmove/5 which atomically pops from src and pushes
+    # to dst — guarded by our per-key latch on src_key.
+    store = build_origin_compound_store(ctx, idx)
+    result = Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
+
+    wv_size = :counters.info(ctx.write_version).size
+    if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
+
+    async_submit_to_raft(idx, cmd)
+    result
+  end
+
+  # Build an origin-local compound store that ListOps.execute can drive.
+  # Each put closes over the current active file (file_id, path); a file
+  # rotation between put and submit is rare but harmless — the submission
+  # carries the raw command, replicas apply against their own active file.
+  defp build_origin_compound_store(ctx, idx) do
+    keydir = elem(ctx.keydir_refs, idx)
+    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+
+    %{
+      compound_get: fn _redis_key, compound_key ->
+        now = Ferricstore.HLC.now_ms()
+        case :ets.lookup(keydir, compound_key) do
+          [{_, value, exp, _, _, _, _}]
+          when value != nil and (exp == 0 or exp > now) ->
+            value
+
+          _ ->
+            nil
+        end
+      end,
+      compound_put: fn _redis_key, compound_key, value, exp ->
+        disk_value = to_disk_binary(value)
+        :ets.insert(keydir, {compound_key, value, exp, LFU.initial(), :pending, 0, byte_size(disk_value)})
+        Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, compound_key, disk_value, exp)
+        :ok
+      end,
+      compound_delete: fn _redis_key, compound_key ->
+        :ets.delete(keydir, compound_key)
+        Ferricstore.Store.BitcaskWriter.delete(idx, file_path, compound_key)
+        :ok
+      end,
+      compound_scan: fn _redis_key, prefix ->
+        Ferricstore.Store.Shard.ETS.prefix_scan_entries(keydir, prefix, file_path)
+        |> Enum.sort_by(fn {field, _} -> field end)
+      end,
+      compound_count: fn _redis_key, prefix ->
+        Ferricstore.Store.Shard.ETS.prefix_count_entries(keydir, prefix)
+      end,
+      exists?: fn k ->
+        case :ets.lookup(keydir, k) do
+          [_] -> true
+          [] -> false
+        end
+      end
+    }
+  end
 
   defp async_compound_put(ctx, idx, _redis_key, compound_key, value, expire_at_ms) do
     size = :atomics.info(ctx.disk_pressure).size

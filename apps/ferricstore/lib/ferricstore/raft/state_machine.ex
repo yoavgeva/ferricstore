@@ -1352,6 +1352,18 @@ defmodule Ferricstore.Raft.StateMachine do
   defp async_key_present?(state, {:getdel, key}), do: ets_has?(state.ets, key)
   defp async_key_present?(state, {:getex, key, _exp}), do: ets_has?(state.ets, key)
   defp async_key_present?(state, {:setrange, key, _off, _v}), do: ets_has?(state.ets, key)
+
+  # List ops check the list metadata key (LM:<key>) which is always written
+  # by the origin before it submits the list_op for replication. On replicas
+  # the LM entry hasn't been created yet, so they apply the inner op.
+  defp async_key_present?(state, {:list_op, key, _op}) do
+    ets_has?(state.ets, Ferricstore.Store.CompoundKey.list_meta_key(key))
+  end
+
+  defp async_key_present?(state, {:list_op_lmove, src_key, _dst, _from, _to}) do
+    ets_has?(state.ets, Ferricstore.Store.CompoundKey.list_meta_key(src_key))
+  end
+
   # Unknown inner command shape — conservative fallback: apply it (treat as replica).
   defp async_key_present?(_state, _other), do: false
 

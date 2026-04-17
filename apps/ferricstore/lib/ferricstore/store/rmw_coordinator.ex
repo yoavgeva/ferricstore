@@ -51,12 +51,18 @@ defmodule Ferricstore.Store.RmwCoordinator do
   @doc """
   Execute an RMW command via the worker (fallback path).
 
-  Callers only reach this when they lost the latch CAS in
-  `Router.async_rmw/4`. Returns the command's natural result
-  (`{:ok, integer}` for INCR, `old_value_or_nil` for GETSET/GETDEL, etc.).
+  Callers only reach this when they lost the latch CAS in their fast
+  path. Returns the command's natural result (e.g. `{:ok, integer}` for
+  INCR, `old_value_or_nil` for GETSET/GETDEL, the push's new length for
+  LPUSH, etc.).
+
+  Accepted command shapes:
+    - Plain RMW: `{:incr, k, d}`, `{:incr_float, k, d}`, `{:append, k, s}`,
+      `{:getset, k, v}`, `{:getdel, k}`, `{:getex, k, e}`, `{:setrange, k, o, v}`.
+    - List ops: `{:list_op, k, operation}`, `{:list_op_lmove, src, dst, from, to}`.
 
   Timeouts and worker crashes propagate as `:exit` to the caller;
-  Router's `async_rmw` catches them and returns `{:error, msg}`.
+  the caller's `async_*` function catches them and returns `{:error, msg}`.
   """
   @spec execute(non_neg_integer(), tuple()) :: term()
   def execute(idx, cmd), do: GenServer.call(name(idx), {:rmw, cmd}, 10_000)
@@ -93,7 +99,7 @@ defmodule Ferricstore.Store.RmwCoordinator do
         wait_for_latch(latch_tab, key)
 
         try do
-          result = Ferricstore.Store.Router.execute_rmw_inline(ctx, state.idx, cmd)
+          result = dispatch_inline(ctx, state.idx, cmd)
           :telemetry.execute([:ferricstore, :rmw, :worker], %{}, %{shard_index: state.idx})
           {:reply, result, state}
         after
@@ -101,6 +107,17 @@ defmodule Ferricstore.Store.RmwCoordinator do
         end
     end
   end
+
+  # Dispatch to the correct inline executor based on command shape.
+  defp dispatch_inline(ctx, idx, {:list_op, _key, _op} = cmd),
+    do: Ferricstore.Store.Router.execute_list_op_inline(ctx, idx, cmd)
+
+  defp dispatch_inline(ctx, idx, {:list_op_lmove, _src, _dst, _from, _to} = cmd),
+    do: Ferricstore.Store.Router.execute_list_op_inline(ctx, idx, cmd)
+
+  # Plain RMW commands: incr, incr_float, append, getset, getdel, getex, setrange.
+  defp dispatch_inline(ctx, idx, cmd),
+    do: Ferricstore.Store.Router.execute_rmw_inline(ctx, idx, cmd)
 
   def handle_call(:sweep_latches_now, _from, state) do
     case FerricStore.Instance.get(:default) do
@@ -188,4 +205,6 @@ defmodule Ferricstore.Store.RmwCoordinator do
   defp key_of({:getdel, k}), do: k
   defp key_of({:getex, k, _}), do: k
   defp key_of({:setrange, k, _, _}), do: k
+  defp key_of({:list_op, k, _}), do: k
+  defp key_of({:list_op_lmove, src_k, _dst, _from, _to}), do: src_k
 end
