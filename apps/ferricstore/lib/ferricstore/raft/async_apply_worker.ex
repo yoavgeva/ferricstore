@@ -1,62 +1,43 @@
 defmodule Ferricstore.Raft.AsyncApplyWorker do
   @moduledoc """
-  GenServer that processes async write batches for a single FerricStore shard.
+  DEPRECATED — no longer on the async write hot path.
 
-  Per spec section 2F.3, when a namespace has durability mode `:async`, the
-  write path writes to local Bitcask + ETS first (for immediate read-your-write),
-  then submits the command to Raft in the background for replication to followers.
+  After the async-write redesign (see `docs/async-write-redesign.md` and
+  commit 88ff185), async writes batch through `Ferricstore.Raft.Batcher.async_submit`
+  and flow straight to `ra.pipeline_command/3`. `Router.async_write_put`
+  writes locally (ETS + Bitcask) before calling `Batcher.async_submit`; the
+  Batcher wraps each command as `{:async, inner}` and the state machine's
+  `apply/3` origin-skips on the node that already has the ETS entry.
 
-  ## How it works
+  This module remains compiled and started in the supervision tree because:
 
-  1. The `Batcher` detects that a slot has `:async` durability when the
-     namespace's commit window fires, OR `Router.async_write` writes locally
-     and forwards the command here for Raft submission.
-  2. `apply_batch/2` replies immediately with `:ok` (non-blocking cast).
-  3. The worker processes commands sequentially: for each `:put` it calls
-     `NIF.put_batch/2` to write to Bitcask and updates the keydir ETS table.
-     For `:delete` it calls `NIF.delete/2` and removes from ETS.
-  4. After local application, the batch is submitted to Raft via
-     `ra:pipeline_command/3` with a correlation ref. The worker handles
-     the `ra_event` response:
-     - `{:applied, ...}` -- command committed, remove from in-flight map.
-     - `{:rejected, {:not_leader, leader, corr}}` -- resubmit to the
-       hinted leader.
-     - `:exit` / noproc -- buffer for retry on a timer.
-  5. After each batch completes, a telemetry event is emitted with timing
-     and batch size measurements.
+  1. Several legacy tests still call `apply_batch/2`, `replicate/2`, and
+     `drain/1` to exercise the pre-redesign path. Removing the module would
+     break those tests. Those tests will be rewritten or deleted in a
+     follow-up pass.
+  2. Keeping the GenServer running costs effectively nothing when nothing
+     casts to it (idle message loop).
 
-  ## Raft submission guarantee
+  Do NOT add new callers. Production code should use `Batcher.async_submit/2`
+  (fire-and-forget, wrapped as `{:async, cmd}`) instead.
 
-  Unlike fire-and-forget `pipeline_command/2`, this worker tracks every
-  submission with a correlation ref and retries on failure. This ensures
-  async writes are **eventually consistent** -- the command will reach the
-  Raft log as long as the cluster is alive, even if the leader changes
-  during submission.
+  ## Pre-redesign behaviour (for context)
 
-  The client still gets `:ok` before Raft commits (that's the async contract),
-  but the command is guaranteed to enter the Raft log eventually.
+  Per spec section 2F.3, when a namespace had durability mode `:async`, the
+  write path wrote to local Bitcask + ETS first (for immediate read-your-
+  write), then forwarded the command here for Raft submission. The worker
+  applied commands locally a second time and submitted them to Raft with
+  retry-on-not-leader. That double-apply is precisely what the new design
+  eliminates.
 
-  ## Process registration
+  ## Telemetry (deprecated)
 
-  Each shard has one AsyncApplyWorker registered under the name returned by
-  `worker_name/1`, e.g. `:"Ferricstore.Raft.AsyncApplyWorker.0"`.
-
-  ## Telemetry
-
-  After each batch is processed locally:
+  Emitted only when legacy callers still invoke `apply_batch/2`:
 
       :telemetry.execute(
         [:ferricstore, :async_apply, :batch],
         %{duration_us: integer(), batch_size: integer()},
         %{shard_index: integer()}
-      )
-
-  On Raft submission failure + retry:
-
-      :telemetry.execute(
-        [:ferricstore, :async_apply, :raft_retry],
-        %{pending_count: integer()},
-        %{shard_index: integer(), reason: atom()}
       )
   """
 

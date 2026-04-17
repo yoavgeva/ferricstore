@@ -64,11 +64,20 @@ defmodule Ferricstore.Raft.Batcher do
   `:ra.pipeline_command/3` with a correlation reference. Callers are replied to
   when the `ra_event` notification arrives confirming the command was applied.
 
-  For `:async` durability (spec 2F.3), commands bypass Raft consensus
-  entirely and are sent to `Ferricstore.Raft.AsyncApplyWorker`, which
-  writes directly to the shard's Bitcask + ETS. Callers are replied to
-  immediately with `:ok` without waiting for disk I/O. This trades
-  consistency for lower write latency.
+  For `:async` durability (spec 2F.3), there are two entry points:
+
+  - `Batcher.async_submit/2` (preferred) is called by `Router.async_write_*`
+    after Router has already persisted locally (ETS + Bitcask for big values).
+    Commands accumulate in a dedicated `{prefix, :async_origin}` slot and
+    flush as one `ra.pipeline_command({:batch, [{:async, cmd}, ...]})` for
+    replication. The state machine's `{:async, inner}` clause origin-skips
+    on the node that already has the ETS entry. No callers to reply to —
+    Router already returned `:ok` to its caller.
+
+  - `Batcher.write/2` on an async namespace (legacy callers) is the blocking
+    entry; the caller is replied `:ok` immediately when the slot is flushed,
+    commands go to Raft as a regular `{:batch, [cmds]}` (no `{:async, ...}`
+    wrapper) and the state machine applies them normally on every node.
 
   ## Why a separate GenServer?
 
@@ -169,7 +178,8 @@ defmodule Ferricstore.Raft.Batcher do
 
   For `:quorum` durability, this call blocks until the ra command is
   committed and applied. For `:async` durability, the call returns as
-  soon as the command is handed off to the `AsyncApplyWorker`.
+  soon as the slot is flushed (state machine application continues in
+  the background on the origin and on replicas).
 
   ## Parameters
 

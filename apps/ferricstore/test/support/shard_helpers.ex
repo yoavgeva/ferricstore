@@ -63,7 +63,7 @@ defmodule Ferricstore.Test.ShardHelpers do
   @spec flush_all_keys() :: :ok
   def flush_all_keys do
     alias Ferricstore.Store.Router
-    alias Ferricstore.Raft.{AsyncApplyWorker, Batcher}
+    alias Ferricstore.Raft.Batcher
 
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)
 
@@ -76,17 +76,15 @@ defmodule Ferricstore.Test.ShardHelpers do
     # leaving the batcher blocked. Restart dead shards first.
     ensure_ra_shards_alive(shard_count)
 
-    # Flush Raft batchers first (moves any pending slot contents into
-    # AsyncApplyWorker casts for async namespaces, or applies via Raft
-    # for quorum namespaces), then drain async workers so their
-    # fire-and-forget writes land in ETS before we snapshot keys.
+    # Batcher.flush now waits for all in-flight async commands (tracked in
+    # `pending` with :async_no_reply) to apply via ra_event before replying.
+    # AsyncApplyWorker is deprecated — no drain needed.
     Enum.each(0..(shard_count - 1), fn i ->
       try do
         GenServer.call(Batcher.batcher_name(i), :flush, flush_timeout)
       catch
         :exit, _ -> :ok
       end
-      AsyncApplyWorker.drain(i)
     end)
 
     # Flush background BitcaskWriter so deferred writes are on disk
@@ -117,7 +115,7 @@ defmodule Ferricstore.Test.ShardHelpers do
       end)
     end)
 
-    # The deletes above go through the Raft batcher (async). Drain the
+    # The deletes above go through the Raft batcher (async). Flush the
     # pipeline again so the tombstones are applied before we return.
     Enum.each(0..(shard_count - 1), fn i ->
       try do
@@ -125,7 +123,6 @@ defmodule Ferricstore.Test.ShardHelpers do
       catch
         :exit, _ -> :ok
       end
-      AsyncApplyWorker.drain(i)
     end)
 
     # Clear cross-shard locks and intents via Raft so tests start clean.
