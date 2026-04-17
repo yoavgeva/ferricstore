@@ -2244,11 +2244,18 @@ defmodule FerricStore do
       {:ok, 0} = FerricStore.setbit("key", 7, 1)
 
   """
-  @spec setbit(key(), non_neg_integer(), 0 | 1) :: {:ok, 0 | 1}
+  @spec setbit(key(), non_neg_integer(), 0 | 1) :: {:ok, 0 | 1} | {:error, binary()}
   def setbit(key, offset, bit_value) when bit_value in [0, 1] do
-    store = build_string_store(key)
-    result = Ferricstore.Commands.Bitmap.handle("SETBIT", [key, to_string(offset), to_string(bit_value)], store)
-    wrap_result(result)
+    cond do
+      offset < 0 ->
+        {:error, "ERR bit offset is not an integer or out of range"}
+
+      offset > 4_294_967_295 ->
+        {:error, "ERR bit offset is not an integer or out of range"}
+
+      true ->
+        wrap_result(Router.setbit(default_ctx(), key, offset, bit_value))
+    end
   end
 
   @doc """
@@ -2322,10 +2329,8 @@ defmodule FerricStore do
   """
   @spec bitop(atom(), key(), [key()]) :: {:ok, non_neg_integer()}
   def bitop(op, dest_key, source_keys) when is_atom(op) and is_list(source_keys) do
-    store = build_string_store(dest_key)
     op_str = op |> Atom.to_string() |> String.upcase()
-    result = Ferricstore.Commands.Bitmap.handle("BITOP", [op_str, dest_key | source_keys], store)
-    wrap_result(result)
+    wrap_result(Router.bitmap_op(default_ctx(), "BITOP", [op_str, dest_key | source_keys]))
   end
 
   @doc """
@@ -2549,13 +2554,7 @@ defmodule FerricStore do
   """
   @spec hincrby(key(), binary(), integer()) :: {:ok, integer()} | {:error, binary()}
   def hincrby(key, field, amount) when is_integer(amount) do
-    store = build_compound_store(key)
-
-    case Ferricstore.Commands.Hash.handle(
-           "HINCRBY",
-           [key, to_string(field), Integer.to_string(amount)],
-           store
-         ) do
+    case Router.hincrby(default_ctx(), key, to_string(field), amount) do
       {:error, _} = err -> err
       new_val -> {:ok, new_val}
     end
@@ -2580,14 +2579,7 @@ defmodule FerricStore do
   """
   @spec hincrbyfloat(key(), binary(), float()) :: {:ok, binary()} | {:error, binary()}
   def hincrbyfloat(key, field, amount) when is_number(amount) do
-    store = build_compound_store(key)
-    amount_str = :erlang.float_to_binary(amount * 1.0, [:compact, decimals: 17])
-
-    case Ferricstore.Commands.Hash.handle(
-           "HINCRBYFLOAT",
-           [key, to_string(field), amount_str],
-           store
-         ) do
+    case Router.hincrbyfloat(default_ctx(), key, to_string(field), amount * 1.0) do
       {:error, _} = err -> err
       result_str -> {:ok, result_str}
     end
@@ -3295,11 +3287,9 @@ defmodule FerricStore do
       {:ok, "25.0"}
 
   """
-  @spec zincrby(key(), number(), binary()) :: {:ok, binary()}
+  @spec zincrby(key(), number(), binary()) :: {:ok, binary()} | {:error, binary()}
   def zincrby(key, increment, member) do
-    store = build_compound_store(key)
-    result = Ferricstore.Commands.SortedSet.handle("ZINCRBY", [key, to_string(increment * 1.0), member], store)
-    wrap_result(result)
+    wrap_result(Router.zincrby(default_ctx(), key, increment * 1.0, member))
   end
 
   @doc """
@@ -4139,8 +4129,7 @@ defmodule FerricStore do
   """
   @spec tdigest_create(key()) :: :ok | {:error, binary()}
   def tdigest_create(key) do
-    store = build_tdigest_store(key)
-    Ferricstore.Commands.TDigest.handle("TDIGEST.CREATE", [key], store)
+    Router.tdigest_op(default_ctx(), "TDIGEST.CREATE", [key])
   end
 
   @doc """
@@ -4159,9 +4148,8 @@ defmodule FerricStore do
   """
   @spec tdigest_add(key(), [number()]) :: :ok | {:error, binary()}
   def tdigest_add(key, values) when is_list(values) do
-    store = build_tdigest_store(key)
     value_strs = Enum.map(values, &to_string(&1 * 1.0))
-    Ferricstore.Commands.TDigest.handle("TDIGEST.ADD", [key | value_strs], store)
+    Router.tdigest_op(default_ctx(), "TDIGEST.ADD", [key | value_strs])
   end
 
   @doc """
@@ -4277,8 +4265,7 @@ defmodule FerricStore do
   """
   @spec tdigest_reset(key()) :: :ok | {:error, binary()}
   def tdigest_reset(key) do
-    store = build_tdigest_store(key)
-    Ferricstore.Commands.TDigest.handle("TDIGEST.RESET", [key], store)
+    Router.tdigest_op(default_ctx(), "TDIGEST.RESET", [key])
   end
 
   @doc """
@@ -4422,12 +4409,10 @@ defmodule FerricStore do
   """
   @spec geoadd(key(), [{number(), number(), binary()}]) :: {:ok, non_neg_integer()} | {:error, binary()}
   def geoadd(key, members) when is_list(members) do
-    store = build_compound_store(key)
     args = Enum.flat_map(members, fn {lng, lat, member} ->
       [to_string(lng * 1.0), to_string(lat * 1.0), member]
     end)
-    result = Ferricstore.Commands.Geo.handle("GEOADD", [key | args], store)
-    wrap_result(result)
+    wrap_result(Router.geo_op(default_ctx(), "GEOADD", [key | args]))
   end
 
   @doc """
@@ -4536,9 +4521,7 @@ defmodule FerricStore do
   """
   @spec json_set(key(), binary(), binary()) :: :ok | {:error, binary()}
   def json_set(key, path, value) do
-    store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.SET", [key, path, value], store)
-    case result do
+    case Router.json_op(default_ctx(), "JSON.SET", [key, path, value]) do
       :ok -> :ok
       {:error, _} = err -> err
     end
@@ -4592,9 +4575,7 @@ defmodule FerricStore do
   """
   @spec json_del(key(), binary()) :: {:ok, term()} | {:error, binary()}
   def json_del(key, path \\ "$") do
-    store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.DEL", [key, path], store)
-    wrap_result(result)
+    wrap_result(Router.json_op(default_ctx(), "JSON.DEL", [key, path]))
   end
 
   @doc """
@@ -4641,9 +4622,7 @@ defmodule FerricStore do
   """
   @spec json_numincrby(key(), binary(), binary()) :: {:ok, binary()} | {:error, binary()}
   def json_numincrby(key, path, increment) do
-    store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.NUMINCRBY", [key, path, increment], store)
-    wrap_result(result)
+    wrap_result(Router.json_op(default_ctx(), "JSON.NUMINCRBY", [key, path, increment]))
   end
 
   @doc """
@@ -4668,9 +4647,7 @@ defmodule FerricStore do
   """
   @spec json_arrappend(key(), binary(), [binary()]) :: {:ok, term()} | {:error, binary()}
   def json_arrappend(key, path, values) when is_list(values) do
-    store = build_string_store(key)
-    result = Ferricstore.Commands.Json.handle("JSON.ARRAPPEND", [key, path | values], store)
-    wrap_result(result)
+    wrap_result(Router.json_op(default_ctx(), "JSON.ARRAPPEND", [key, path | values]))
   end
 
   @doc """
@@ -4889,9 +4866,7 @@ defmodule FerricStore do
   """
   @spec pfadd(key(), [binary()]) :: {:ok, boolean()} | {:error, binary()}
   def pfadd(key, elements) when is_list(elements) do
-    store = build_string_store(key)
-    result = Ferricstore.Commands.HyperLogLog.handle("PFADD", [key | elements], store)
-    case result do
+    case Router.hll_op(default_ctx(), "PFADD", [key | elements]) do
       1 -> {:ok, true}
       0 -> {:ok, false}
       {:error, _} = err -> err
@@ -4944,9 +4919,7 @@ defmodule FerricStore do
   """
   @spec pfmerge(key(), [key()]) :: :ok | {:error, binary()}
   def pfmerge(dest_key, source_keys) when is_list(source_keys) do
-    store = build_string_store(dest_key)
-    result = Ferricstore.Commands.HyperLogLog.handle("PFMERGE", [dest_key | source_keys], store)
-    case result do
+    case Router.hll_op(default_ctx(), "PFMERGE", [dest_key | source_keys]) do
       :ok -> :ok
       {:error, _} = err -> err
     end
@@ -5201,6 +5174,12 @@ defmodule FerricStore do
   # ---------------------------------------------------------------------------
   # Private — TDigest store builder
   # ---------------------------------------------------------------------------
+  # TDigest RMW commands (TDIGEST.ADD/RESET/MERGE/CREATE) are now serialized
+  # by Raft — Router.tdigest_op submits {:tdigest_op, cmd, args} to the
+  # state machine, which calls TDigest.handle/3 with a state-machine-scoped
+  # store. Concurrent callers are serialized by Raft log order, so no latch
+  # is needed. Read-only tdigest commands (quantile/cdf/info/etc.) still
+  # run in the caller process via build_tdigest_store below.
 
   defp build_tdigest_store(_resolved_key) do
     ctx = default_ctx()

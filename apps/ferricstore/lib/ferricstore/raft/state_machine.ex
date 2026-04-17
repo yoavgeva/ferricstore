@@ -61,6 +61,8 @@ defmodule Ferricstore.Raft.StateMachine do
 
   @behaviour :ra_machine
 
+  import Bitwise
+
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Commands.Dispatcher
   alias Ferricstore.HLC
@@ -449,6 +451,114 @@ defmodule Ferricstore.Raft.StateMachine do
 
   def apply(meta, {:setrange, key, offset, value}, state) do
     result = with_pending_writes(state, fn -> do_setrange(state, key, offset, value) end)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # Atomic SETBIT — read bitmap blob, mutate one bit, write back. Previously
+  # the read+compute+write ran in the caller process (FerricStore.setbit/3),
+  # losing updates under concurrent writes on the same key.
+  def apply(meta, {:setbit, key, offset, bit_val}, state) do
+    result = with_pending_writes(state, fn -> do_setbit(state, key, offset, bit_val) end)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # Atomic HINCRBY / HINCRBYFLOAT — read compound field, add delta, write back.
+  # Previously ran in caller process and lost updates under concurrent hincrby
+  # on the same field.
+  def apply(meta, {:hincrby, key, field, delta}, state) do
+    result = with_pending_writes(state, fn -> do_hincrby(state, key, field, delta) end)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  def apply(meta, {:hincrbyfloat, key, field, delta}, state) do
+    result = with_pending_writes(state, fn -> do_hincrbyfloat(state, key, field, delta) end)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # Atomic ZINCRBY — read zset member's score, add increment, write back.
+  # Also sets the type metadata atomically if absent (first write to the key).
+  def apply(meta, {:zincrby, key, increment, member}, state) do
+    result = with_pending_writes(state, fn -> do_zincrby(state, key, increment, member) end)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # Generic JSON RMW — dispatches to Ferricstore.Commands.Json.handle with
+  # a state-machine-scoped store. Covers JSON.SET / JSON.DEL(path) /
+  # JSON.NUMINCRBY / JSON.ARRAPPEND / JSON.ARRPOP / JSON.ARRINSERT /
+  # JSON.STRAPPEND / JSON.TOGGLE / JSON.CLEAR / JSON.MERGE. Read-only
+  # ops (JSON.GET, JSON.TYPE, etc.) still run in the caller; only RMW
+  # goes through Raft.
+  def apply(meta, {:json_op, cmd, args}, state) do
+    result =
+      with_pending_writes(state, fn ->
+        Ferricstore.Commands.Json.handle(cmd, args, build_sm_store(state))
+      end)
+
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # Atomic HyperLogLog RMW — PFADD reads HLL blob, merges hashed elements,
+  # writes back. PFMERGE reads N sources + destination, writes merged blob.
+  def apply(meta, {:hll_op, cmd, args}, state) do
+    result =
+      with_pending_writes(state, fn ->
+        Ferricstore.Commands.HyperLogLog.handle(cmd, args, build_sm_store(state))
+      end)
+
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # Generic bitmap RMW — covers BITOP (merge N sources into destination) and
+  # BITFIELD (multi-subcommand RMW on one bitmap). SETBIT has its own apply
+  # clause above for the hot-path single-bit case.
+  def apply(meta, {:bitmap_op, cmd, args}, state) do
+    result =
+      with_pending_writes(state, fn ->
+        Ferricstore.Commands.Bitmap.handle(cmd, args, build_sm_store(state))
+      end)
+
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # Geo RMW — GEOADD merges members into the zset blob; GEOSEARCHSTORE
+  # writes a filtered subset to destination. Read-only ops (GEOPOS / GEODIST
+  # / GEOHASH / GEOSEARCH) don't go through this path.
+  def apply(meta, {:geo_op, cmd, args}, state) do
+    result =
+      with_pending_writes(state, fn ->
+        Ferricstore.Commands.Geo.handle(cmd, args, build_sm_store(state))
+      end)
+
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # TDigest RMW — TDIGEST.ADD/RESET/MERGE/CREATE. The old latch-based
+  # serialization (with_tdigest_latch in ferricstore.ex) had subtle races
+  # with orphan cleanup; state-machine dispatch removes the latch entirely.
+  def apply(meta, {:tdigest_op, cmd, args}, state) do
+    result =
+      with_pending_writes(state, fn ->
+        Ferricstore.Commands.TDigest.handle(cmd, args, build_sm_store(state))
+      end)
+
     old_count = state.applied_count
     new_state = %{state | applied_count: old_count + 1}
     maybe_release_cursor(meta, old_count, new_state, result)
@@ -1352,6 +1462,53 @@ defmodule Ferricstore.Raft.StateMachine do
   defp async_key_present?(state, {:getdel, key}), do: ets_has?(state.ets, key)
   defp async_key_present?(state, {:getex, key, _exp}), do: ets_has?(state.ets, key)
   defp async_key_present?(state, {:setrange, key, _off, _v}), do: ets_has?(state.ets, key)
+  defp async_key_present?(state, {:setbit, key, _off, _bit}), do: ets_has?(state.ets, key)
+
+  defp async_key_present?(state, {:hincrby, key, field, _delta}) do
+    ets_has?(state.ets, Ferricstore.Store.CompoundKey.hash_field(key, field))
+  end
+
+  defp async_key_present?(state, {:hincrbyfloat, key, field, _delta}) do
+    ets_has?(state.ets, Ferricstore.Store.CompoundKey.hash_field(key, field))
+  end
+
+  defp async_key_present?(state, {:zincrby, key, _incr, member}) do
+    ets_has?(state.ets, Ferricstore.Store.CompoundKey.zset_member(key, member))
+  end
+
+  # JSON ops: first arg is always the key (JSON.SET key path value, etc.).
+  defp async_key_present?(state, {:json_op, _cmd, [key | _]}) do
+    ets_has?(state.ets, key)
+  end
+
+  # HLL ops: first arg is always the key (PFADD key ..., PFMERGE dest ...).
+  defp async_key_present?(state, {:hll_op, _cmd, [key | _]}) do
+    ets_has?(state.ets, key)
+  end
+
+  # Bitmap ops: BITFIELD has the key as the first arg; BITOP has [op, destkey | srcs].
+  defp async_key_present?(state, {:bitmap_op, "BITOP", [_op, destkey | _]}) do
+    ets_has?(state.ets, destkey)
+  end
+
+  defp async_key_present?(state, {:bitmap_op, _cmd, [key | _]}) when is_binary(key) do
+    ets_has?(state.ets, key)
+  end
+
+  # Geo ops: GEOADD has key first; GEOSEARCHSTORE has [dest, source | ...]
+  # — dest is the written key.
+  defp async_key_present?(state, {:geo_op, "GEOSEARCHSTORE", [dest | _]}) do
+    ets_has?(state.ets, dest)
+  end
+
+  defp async_key_present?(state, {:geo_op, _cmd, [key | _]}) when is_binary(key) do
+    ets_has?(state.ets, key)
+  end
+
+  # TDigest ops: first arg is always the key.
+  defp async_key_present?(state, {:tdigest_op, _cmd, [key | _]}) when is_binary(key) do
+    ets_has?(state.ets, key)
+  end
 
   # List ops check the list metadata key (LM:<key>) which is always written
   # by the origin before it submits the list_op for replication. On replicas
@@ -1464,6 +1621,42 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:setrange, key, offset, value}) do
     do_setrange(state, key, offset, value)
+  end
+
+  defp apply_single(state, {:setbit, key, offset, bit_val}) do
+    do_setbit(state, key, offset, bit_val)
+  end
+
+  defp apply_single(state, {:hincrby, key, field, delta}) do
+    do_hincrby(state, key, field, delta)
+  end
+
+  defp apply_single(state, {:hincrbyfloat, key, field, delta}) do
+    do_hincrbyfloat(state, key, field, delta)
+  end
+
+  defp apply_single(state, {:zincrby, key, increment, member}) do
+    do_zincrby(state, key, increment, member)
+  end
+
+  defp apply_single(state, {:json_op, cmd, args}) do
+    Ferricstore.Commands.Json.handle(cmd, args, build_sm_store(state))
+  end
+
+  defp apply_single(state, {:hll_op, cmd, args}) do
+    Ferricstore.Commands.HyperLogLog.handle(cmd, args, build_sm_store(state))
+  end
+
+  defp apply_single(state, {:bitmap_op, cmd, args}) do
+    Ferricstore.Commands.Bitmap.handle(cmd, args, build_sm_store(state))
+  end
+
+  defp apply_single(state, {:geo_op, cmd, args}) do
+    Ferricstore.Commands.Geo.handle(cmd, args, build_sm_store(state))
+  end
+
+  defp apply_single(state, {:tdigest_op, cmd, args}) do
+    Ferricstore.Commands.TDigest.handle(cmd, args, build_sm_store(state))
   end
 
   defp apply_single(state, {:cas, key, expected, new_value, ttl_ms}) do
@@ -1932,6 +2125,267 @@ defmodule Ferricstore.Raft.StateMachine do
     new_val = sm_apply_setrange(old_val, offset, value)
     do_put(state, key, new_val, expire_at_ms)
     {:ok, byte_size(new_val)}
+  end
+
+  # Atomic SETBIT: read bitmap, extend with zeros to include byte_index if
+  # needed, flip the single bit, write back. Preserves expire_at_ms.
+  # Returns the OLD bit at that offset (Redis semantics).
+  defp do_setbit(state, key, offset, bit_val) do
+    {old_val, expire_at_ms} =
+      case do_get_meta(state, key) do
+        nil -> {<<>>, 0}
+        {v, exp} -> {to_disk_binary(v), exp}
+      end
+
+    byte_index = div(offset, 8)
+    bit_position = 7 - rem(offset, 8)
+
+    extended =
+      if byte_size(old_val) >= byte_index + 1 do
+        old_val
+      else
+        old_val <> :binary.copy(<<0>>, byte_index + 1 - byte_size(old_val))
+      end
+
+    old_byte = :binary.at(extended, byte_index)
+    old_bit = (old_byte >>> bit_position) &&& 1
+
+    new_byte =
+      case bit_val do
+        1 -> old_byte ||| (1 <<< bit_position)
+        0 -> old_byte &&& bnot(1 <<< bit_position)
+      end
+
+    <<prefix::binary-size(byte_index), _old::8, suffix::binary>> = extended
+    new_value = <<prefix::binary, new_byte::8, suffix::binary>>
+
+    do_put(state, key, new_value, expire_at_ms)
+    old_bit
+  end
+
+  # Atomic HINCRBY: read compound key (H:<redis_key>\0<field>), parse integer,
+  # add delta, write back. Returns new integer value, or {:error, reason}.
+  defp do_hincrby(state, redis_key, field, delta) do
+    compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
+
+    case do_get_meta(state, compound_key) do
+      nil ->
+        if delta > @int64_max or delta < @int64_min do
+          {:error, "ERR increment or decrement would overflow"}
+        else
+          do_put(state, compound_key, Integer.to_string(delta), 0)
+          delta
+        end
+
+      {value, expire_at_ms} ->
+        case coerce_integer(value) do
+          {:ok, cur} ->
+            new_val = cur + delta
+
+            if new_val > @int64_max or new_val < @int64_min do
+              {:error, "ERR increment or decrement would overflow"}
+            else
+              do_put(state, compound_key, Integer.to_string(new_val), expire_at_ms)
+              new_val
+            end
+
+          :error ->
+            {:error, "ERR hash value is not an integer"}
+        end
+    end
+  end
+
+  # Atomic HINCRBYFLOAT: same as HINCRBY but for floats.
+  defp do_hincrbyfloat(state, redis_key, field, delta) do
+    compound_key = Ferricstore.Store.CompoundKey.hash_field(redis_key, field)
+
+    case do_get_meta(state, compound_key) do
+      nil ->
+        new_val = delta * 1.0
+        do_put(state, compound_key, Float.to_string(new_val), 0)
+        Float.to_string(new_val)
+
+      {value, expire_at_ms} ->
+        case coerce_float(value) do
+          {:ok, cur} ->
+            new_val = cur + delta
+            new_str = Float.to_string(new_val)
+            do_put(state, compound_key, new_str, expire_at_ms)
+            new_str
+
+          :error ->
+            {:error, "ERR hash value is not a valid float"}
+        end
+    end
+  end
+
+  # Atomic ZINCRBY: check/set type metadata, read member score, add delta,
+  # write back. Returns the new score as a string. Returns {:error, ...} on
+  # wrong type.
+  defp do_zincrby(state, redis_key, increment, member) do
+    type_key = Ferricstore.Store.CompoundKey.type_key(redis_key)
+    expected_type = Ferricstore.Store.CompoundKey.encode_type(:zset)
+
+    with :ok <- check_or_set_type(state, redis_key, type_key, expected_type) do
+      compound_key = Ferricstore.Store.CompoundKey.zset_member(redis_key, member)
+
+      current_score =
+        case do_get(state, compound_key) do
+          nil ->
+            0.0
+
+          score_val ->
+            score_str =
+              case score_val do
+                v when is_binary(v) -> v
+                v -> to_string(v)
+              end
+
+            case Float.parse(score_str) do
+              {s, ""} -> s
+              _ -> 0.0
+            end
+        end
+
+      new_score = current_score + increment * 1.0
+      new_str = Float.to_string(new_score)
+      do_put(state, compound_key, new_str, 0)
+      new_str
+    end
+  end
+
+  # Builds a single-shard store that satisfies the command-handler store
+  # interface (get/put/delete/exists?/keys). Writes always go through
+  # `do_put` on the LOCAL shard (the one Raft routed this command to).
+  # Reads prefer local ETS but fall back to `Router.get` — reads are
+  # side-effect-free and safe from any process, which lets commands like
+  # PFMERGE read source keys that hash to other shards.
+  #
+  # Intended for RMW commands migrated into Raft (JSON, PFADD, BITOP, etc.).
+  # All writes go through do_put so they participate in with_pending_writes
+  # batching.
+  defp build_sm_store(state) do
+    local_read = fn key ->
+      case do_get(state, key) do
+        nil ->
+          # Not on this shard — fall back to cross-shard Router.get if we
+          # have an instance_ctx. This covers PFMERGE-style multi-source
+          # reads. If no ctx (uncommon in production) try the default
+          # instance as a fallback so bitop/pfmerge still work in tests
+          # that don't thread instance_ctx through to state machine config.
+          ctx =
+            state.instance_ctx ||
+              (try do
+                 FerricStore.Instance.get(:default)
+               rescue
+                 ArgumentError -> nil
+               end)
+
+          case ctx do
+            nil -> nil
+            c -> Router.get(c, key)
+          end
+
+        v ->
+          v
+      end
+    end
+
+    %{
+      get: local_read,
+      get_meta: fn key ->
+        case do_get_meta(state, key) do
+          nil -> nil
+          {v, exp} -> {v, exp}
+        end
+      end,
+      put: fn key, value, expire_at_ms ->
+        do_put(state, key, value, expire_at_ms)
+        :ok
+      end,
+      delete: fn key ->
+        do_delete(state, key)
+        :ok
+      end,
+      exists?: fn key ->
+        if ets_has?(state.ets, key) do
+          true
+        else
+          case state.instance_ctx do
+            nil -> false
+            ctx -> Router.exists?(ctx, key)
+          end
+        end
+      end,
+      keys: fn ->
+        :ets.select(state.ets, [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}])
+      end,
+      # Compound ops: redis_key and compound_key live on the same shard by
+      # design, so treat them identically to plain get/put/delete.
+      compound_get: fn _rk, ck -> do_get(state, ck) end,
+      compound_get_meta: fn _rk, ck ->
+        case do_get_meta(state, ck) do
+          nil -> nil
+          {v, exp} -> {v, exp}
+        end
+      end,
+      compound_put: fn _rk, ck, value, expire_at_ms ->
+        do_put(state, ck, value, expire_at_ms)
+        :ok
+      end,
+      compound_delete: fn _rk, ck ->
+        do_delete(state, ck)
+        :ok
+      end,
+      compound_scan: fn _rk, prefix ->
+        :ets.select(
+          state.ets,
+          [{{:"$1", :"$2", :_, :_, :_, :_, :_}, [], [{{:"$1", :"$2"}}]}]
+        )
+        |> Enum.filter(fn {k, _v} -> String.starts_with?(k, prefix) end)
+      end,
+      compound_count: fn _rk, prefix ->
+        :ets.select(
+          state.ets,
+          [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
+        )
+        |> Enum.count(fn k -> String.starts_with?(k, prefix) end)
+      end,
+      compound_delete_prefix: fn _rk, prefix ->
+        keys =
+          :ets.select(
+            state.ets,
+            [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
+          )
+          |> Enum.filter(fn k -> String.starts_with?(k, prefix) end)
+
+        Enum.each(keys, fn k -> do_delete(state, k) end)
+        :ok
+      end
+    }
+  end
+
+  # Mirror of TypeRegistry.check_or_set but operates on state machine state.
+  # Writes type metadata on first use, returns :ok or wrongtype error.
+  defp check_or_set_type(state, redis_key, type_key, expected_type) do
+    case do_get(state, type_key) do
+      nil ->
+        # No type metadata yet. Reject if the key already exists as a plain string.
+        if ets_has?(state.ets, redis_key) do
+          {:error,
+           "WRONGTYPE Operation against a key holding the wrong kind of value"}
+        else
+          do_put(state, type_key, expected_type, 0)
+          :ok
+        end
+
+      existing when is_binary(existing) and existing == expected_type ->
+        :ok
+
+      _other ->
+        {:error,
+         "WRONGTYPE Operation against a key holding the wrong kind of value"}
+    end
   end
 
   # Overwrites bytes at `offset` with `value`, zero-padding if the original

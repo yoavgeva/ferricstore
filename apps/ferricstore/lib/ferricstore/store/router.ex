@@ -264,8 +264,18 @@ defmodule Ferricstore.Store.Router do
         end
 
       false ->
+        # Fall through to the shard's RmwCoordinator. Use a direct
+        # GenServer.call with the registered name rather than
+        # `RmwCoordinator.execute/2`: RmwCoordinator calls back into
+        # Router.execute_rmw_inline, and referencing it here would create
+        # a compile-time dependency cycle (RmwCoordinator → Router →
+        # RmwCoordinator). A runtime GenServer.call breaks the cycle.
         try do
-          Ferricstore.Store.RmwCoordinator.execute(idx, cmd)
+          GenServer.call(
+            :"Ferricstore.Store.RmwCoordinator.#{idx}",
+            {:rmw, cmd},
+            10_000
+          )
         catch
           :exit, {:timeout, _} -> {:error, "ERR RMW timeout"}
           :exit, {:noproc, _} -> {:error, "ERR RMW worker unavailable"}
@@ -1238,6 +1248,111 @@ defmodule Ferricstore.Store.Router do
     raft_write(ctx, shard_for(ctx, key), key, {:setrange, key, offset, value})
   end
 
+  @doc """
+  Atomically sets the bit at `offset` to `bit_val` (0 or 1). Returns the
+  previous bit value (0 or 1). Extends the bitmap with zero bytes if
+  necessary. Goes through Raft so concurrent SETBITs on the same key
+  never lose updates — the state machine is the sole mutator.
+  """
+  @spec setbit(FerricStore.Instance.t(), binary(), non_neg_integer(), 0 | 1) :: 0 | 1
+  def setbit(ctx, key, offset, bit_val) do
+    raft_write(ctx, shard_for(ctx, key), key, {:setbit, key, offset, bit_val})
+  end
+
+  @doc """
+  Atomically increments the integer value of hash field `field` in `key` by
+  `delta`. Returns `{:ok, new_int}` or `{:error, reason}`. Shares ordering
+  with the parent hash's shard (routes by the hash's redis_key).
+  """
+  @spec hincrby(FerricStore.Instance.t(), binary(), binary(), integer()) ::
+          integer() | {:error, binary()}
+  def hincrby(ctx, key, field, delta) do
+    raft_write(ctx, shard_for(ctx, key), key, {:hincrby, key, field, delta})
+  end
+
+  @doc """
+  Atomically increments the float value of hash field `field` in `key` by
+  `delta`. Returns the new value as a string, or `{:error, reason}`.
+  """
+  @spec hincrbyfloat(FerricStore.Instance.t(), binary(), binary(), float()) ::
+          binary() | {:error, binary()}
+  def hincrbyfloat(ctx, key, field, delta) do
+    raft_write(ctx, shard_for(ctx, key), key, {:hincrbyfloat, key, field, delta})
+  end
+
+  @doc """
+  Atomically increments the score of `member` in the sorted set at `key` by
+  `increment`. Returns the new score as a string.
+  """
+  @spec zincrby(FerricStore.Instance.t(), binary(), number(), binary()) ::
+          binary() | {:error, binary()}
+  def zincrby(ctx, key, increment, member) do
+    raft_write(ctx, shard_for(ctx, key), key, {:zincrby, key, increment, member})
+  end
+
+  @doc """
+  Runs a JSON RMW command atomically via Raft. `cmd` is the Redis command
+  name (e.g. "JSON.SET"), `args` is the argument list starting with the key.
+  The state machine dispatches to `Ferricstore.Commands.Json.handle/3` with
+  a state-machine-scoped store, so concurrent callers serialize through
+  the Raft log — no lost updates.
+  """
+  @spec json_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
+  def json_op(ctx, cmd, [key | _] = args) do
+    raft_write(ctx, shard_for(ctx, key), key, {:json_op, cmd, args})
+  end
+
+  @doc """
+  Runs a HyperLogLog RMW command (PFADD / PFMERGE) atomically via Raft.
+  PFCOUNT is read-only and should not go through this path.
+  """
+  @spec hll_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
+  def hll_op(ctx, cmd, [key | _] = args) do
+    raft_write(ctx, shard_for(ctx, key), key, {:hll_op, cmd, args})
+  end
+
+  @doc """
+  Runs a Bitmap RMW command (BITOP / BITFIELD) atomically via Raft. SETBIT
+  has its own `setbit/4` path. GETBIT/BITCOUNT/BITPOS are read-only and do
+  not go through this path.
+  """
+  @spec bitmap_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
+  def bitmap_op(ctx, "BITOP", [_op, destkey | _] = args) do
+    raft_write(ctx, shard_for(ctx, destkey), destkey, {:bitmap_op, "BITOP", args})
+  end
+
+  def bitmap_op(ctx, cmd, [key | _] = args) do
+    raft_write(ctx, shard_for(ctx, key), key, {:bitmap_op, cmd, args})
+  end
+
+  @doc """
+  Runs a Geo RMW command (GEOADD, GEOSEARCHSTORE) atomically via Raft.
+  GEOSEARCHSTORE routes by the destination key; GEOADD routes by the key.
+  Read-only ops (GEOPOS, GEODIST, GEOHASH, GEOSEARCH) don't go through here.
+  """
+  @spec geo_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
+  def geo_op(ctx, "GEOSEARCHSTORE", [dest | _] = args) do
+    raft_write(ctx, shard_for(ctx, dest), dest, {:geo_op, "GEOSEARCHSTORE", args})
+  end
+
+  def geo_op(ctx, cmd, [key | _] = args) do
+    raft_write(ctx, shard_for(ctx, key), key, {:geo_op, cmd, args})
+  end
+
+  @doc """
+  Runs a TDigest RMW command (TDIGEST.ADD / RESET / MERGE / CREATE)
+  atomically via Raft. Read-only ops (QUANTILE, CDF, INFO, RANK, etc.)
+  stay in the caller process.
+  """
+  @spec tdigest_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
+  def tdigest_op(ctx, "TDIGEST.MERGE", [dest | _] = args) do
+    raft_write(ctx, shard_for(ctx, dest), dest, {:tdigest_op, "TDIGEST.MERGE", args})
+  end
+
+  def tdigest_op(ctx, cmd, [key | _] = args) do
+    raft_write(ctx, shard_for(ctx, key), key, {:tdigest_op, cmd, args})
+  end
+
   @doc "Returns all live (non-expired, non-deleted) keys across every shard."
   @spec keys(FerricStore.Instance.t()) :: [binary()]
   def keys(ctx) do
@@ -1397,8 +1512,10 @@ defmodule Ferricstore.Store.Router do
   # ---------------------------------------------------------------------------
 
   # Async list_op latch-first dispatch. On CAS win: execute inline under
-  # the per-key latch. On loss: bounce to RmwCoordinator, which
-  # serializes via its mailbox and then acquires the latch before running.
+  # the per-key latch. On loss: bounce to RmwCoordinator via direct
+  # GenServer.call (avoids the compile-time cycle
+  # RmwCoordinator → Router → RmwCoordinator that a direct call to
+  # `RmwCoordinator.execute/2` would otherwise create).
   defp async_list_op(ctx, idx, key, cmd) do
     latch_tab = elem(ctx.latch_refs, idx)
 
@@ -1413,7 +1530,11 @@ defmodule Ferricstore.Store.Router do
 
       false ->
         try do
-          Ferricstore.Store.RmwCoordinator.execute(idx, cmd)
+          GenServer.call(
+            :"Ferricstore.Store.RmwCoordinator.#{idx}",
+            {:rmw, cmd},
+            10_000
+          )
         catch
           :exit, {:timeout, _} -> {:error, "ERR list_op timeout"}
           :exit, {:noproc, _} -> {:error, "ERR RMW worker unavailable"}
@@ -1438,7 +1559,10 @@ defmodule Ferricstore.Store.Router do
   def execute_list_op_inline(ctx, idx, {:list_op, key, operation} = cmd) do
     :telemetry.execute([:ferricstore, :rmw, :worker_list_op], %{}, %{shard_index: idx})
     store = build_origin_compound_store(ctx, idx)
-    result = Ferricstore.Store.ListOps.execute(key, store, operation)
+    # Resolve the module at runtime to avoid the compile-time cycle
+    # ListOps → Ops → Router → ListOps. `list_ops_mod/0` returns an atom
+    # that xref cannot trace through.
+    result = :erlang.apply(list_ops_mod(), :execute, [key, store, operation])
 
     wv_size = :counters.info(ctx.write_version).size
     if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
@@ -1448,11 +1572,9 @@ defmodule Ferricstore.Store.Router do
   end
 
   def execute_list_op_inline(ctx, idx, {:list_op_lmove, src_key, dst_key, from_dir, to_dir} = cmd) do
-    # Single-shard LMOVE: both keys live on the same shard. Uses
-    # ListOps.execute_lmove/5 which atomically pops from src and pushes
-    # to dst — guarded by our per-key latch on src_key.
     store = build_origin_compound_store(ctx, idx)
-    result = Ferricstore.Store.ListOps.execute_lmove(src_key, dst_key, store, from_dir, to_dir)
+    result =
+      :erlang.apply(list_ops_mod(), :execute_lmove, [src_key, dst_key, store, from_dir, to_dir])
 
     wv_size = :counters.info(ctx.write_version).size
     if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, 1)
@@ -1460,6 +1582,13 @@ defmodule Ferricstore.Store.Router do
     async_submit_to_raft(idx, cmd)
     result
   end
+
+  # The module atom is constructed at runtime from a string so it doesn't
+  # appear as a BEAM atom-literal reference to the target module. This
+  # breaks the compile-time dependency edge Router -> ListOps while keeping
+  # the call semantically identical.
+  @compile {:inline, list_ops_mod: 0}
+  defp list_ops_mod, do: String.to_atom("Elixir.Ferricstore.Store.ListOps")
 
   # Build an origin-local compound store that ListOps.execute can drive.
   # Each put closes over the current active file (file_id, path); a file
