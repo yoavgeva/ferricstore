@@ -88,15 +88,19 @@ defmodule Ferricstore.Store.Router do
   # Determines the durability mode for a key by extracting its namespace
   # prefix and looking up the namespace config. Returns `:quorum` or `:async`.
   #
-  # Three-state fast path via ctx.durability_mode (~0ns struct field access):
+  # Three-state fast path via persistent_term (~5ns lookup, dynamic):
   #   :all_quorum — no async namespaces configured, return :quorum immediately
   #   :all_async  — all namespaces are async, return :async immediately
   #   :mixed      — some quorum, some async, must split key and lookup
   #
   # The flag is set by NamespaceConfig whenever durability settings change.
+  # Read from persistent_term (not Instance ctx) so updates are immediate and
+  # not shadowed by cached/restored Instance structs in tests.
   @spec durability_for_key(FerricStore.Instance.t(), binary()) :: :quorum | :async
-  defp durability_for_key(ctx, key) do
-    case ctx.durability_mode do
+  defp durability_for_key(_ctx, key) do
+    mode = :persistent_term.get(:ferricstore_durability_mode, :all_quorum)
+
+    case mode do
       :all_quorum -> :quorum
       :all_async -> :async
       :mixed ->

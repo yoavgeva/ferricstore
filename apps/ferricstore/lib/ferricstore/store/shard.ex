@@ -327,43 +327,43 @@ defmodule Ferricstore.Store.Shard do
 
   # Atomic increment: reads current value, parses as integer, adds delta, writes back.
   # Returns {:ok, new_integer} or {:error, reason}.
-  def handle_call({:incr, key, delta}, _from, state) do
-    ShardWrites.handle_incr(key, delta, state)
+  def handle_call({:incr, key, delta}, from, state) do
+    ShardWrites.handle_incr(key, delta, from, state)
   end
 
   # Atomic float increment: reads current value, parses as float, adds delta, writes back.
   # Returns {:ok, new_float_string} or {:error, reason}.
-  def handle_call({:incr_float, key, delta}, _from, state) do
-    ShardWrites.handle_incr_float(key, delta, state)
+  def handle_call({:incr_float, key, delta}, from, state) do
+    ShardWrites.handle_incr_float(key, delta, from, state)
   end
 
   # Atomic append: reads current value (or ""), appends suffix, writes back.
   # Returns {:ok, new_byte_length}.
-  def handle_call({:append, key, suffix}, _from, state) do
-    ShardWrites.handle_append(key, suffix, state)
+  def handle_call({:append, key, suffix}, from, state) do
+    ShardWrites.handle_append(key, suffix, from, state)
   end
 
   # Atomic get-and-set: returns old value (or nil), sets new value.
-  def handle_call({:getset, key, new_value}, _from, state) do
-    ShardWrites.handle_getset(key, new_value, state)
+  def handle_call({:getset, key, new_value}, from, state) do
+    ShardWrites.handle_getset(key, new_value, from, state)
   end
 
   # Atomic get-and-delete: returns value (or nil), deletes key.
-  def handle_call({:getdel, key}, _from, state) do
-    ShardWrites.handle_getdel(key, state)
+  def handle_call({:getdel, key}, from, state) do
+    ShardWrites.handle_getdel(key, from, state)
   end
 
   # Atomic get-and-update-expiry: returns value, updates TTL.
   # expire_at_ms = 0 means PERSIST (remove expiry).
-  def handle_call({:getex, key, expire_at_ms}, _from, state) do
-    ShardWrites.handle_getex(key, expire_at_ms, state)
+  def handle_call({:getex, key, expire_at_ms}, from, state) do
+    ShardWrites.handle_getex(key, expire_at_ms, from, state)
   end
 
   # Atomic set-range: overwrites portion of string at offset with value.
   # Zero-pads if key doesn't exist or string is shorter than offset.
   # Returns {:ok, new_byte_length}.
-  def handle_call({:setrange, key, offset, value}, _from, state) do
-    ShardWrites.handle_setrange(key, offset, value, state)
+  def handle_call({:setrange, key, offset, value}, from, state) do
+    ShardWrites.handle_setrange(key, offset, value, from, state)
   end
 
   def handle_call({:delete, key}, from, state) do

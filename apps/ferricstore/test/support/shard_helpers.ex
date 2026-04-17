@@ -384,13 +384,22 @@ defmodule Ferricstore.Test.ShardHelpers do
               :ok
 
             _ ->
-              # No leader — trigger election
+              # No leader — trigger election and wait for it to complete.
+              # A bare Process.sleep(200) is not enough under full-suite load;
+              # elections can take longer, and flush_all_keys relies on a
+              # healthy leader to receive ra_event replies.
               try do
                 :ra.trigger_election(server_id)
               catch
                 _, _ -> :ok
               end
-              Process.sleep(200)
+
+              eventually(
+                fn -> {:ok, _, _} = :ra.members(server_id) end,
+                "shard #{i} leader election",
+                20,
+                200
+              )
           end
       end
     end)

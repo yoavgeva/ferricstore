@@ -90,55 +90,24 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_incr(binary(), integer(), map()) :: {:reply, term(), map()}
+  @spec handle_incr(binary(), integer(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
   @doc false
-  def handle_incr(key, delta, state) do
+  def handle_incr(key, delta, from, state) do
     if state.raft? do
-      handle_incr_raft(key, delta, state)
+      handle_incr_raft(key, delta, from, state)
     else
       handle_incr_direct(key, delta, state)
     end
   end
 
-  defp handle_incr_raft(key, delta, state) do
-    {current_value, expire_at_ms} =
-      case ShardETS.ets_lookup_warm(state, key) do
-        {:hit, value, exp} -> {value, exp}
-        :expired -> {nil, 0}
-        :miss -> {Ferricstore.Store.Shard.Reads.do_get(state, key), 0}
-      end
-
-    case current_value do
-      nil ->
-        result = Ferricstore.Raft.Batcher.write(state.index, {:put, key, delta, 0})
-        new_version = state.write_version + 1
-
-        case result do
-          :ok -> {:reply, {:ok, delta}, %{state | write_version: new_version}}
-          {:error, _} = err -> {:reply, err, state}
-        end
-
-      value ->
-        case ShardETS.coerce_integer(value) do
-          {:ok, int_val} ->
-            new_val = int_val + delta
-
-            if new_val > 9_223_372_036_854_775_807 or new_val < -9_223_372_036_854_775_808 do
-              {:reply, {:error, "ERR increment or decrement would overflow"}, state}
-            else
-              result = Ferricstore.Raft.Batcher.write(state.index, {:put, key, new_val, expire_at_ms})
-              new_version = state.write_version + 1
-
-              case result do
-                :ok -> {:reply, {:ok, new_val}, %{state | write_version: new_version}}
-                {:error, _} = err -> {:reply, err, state}
-              end
-            end
-
-          :error ->
-            {:reply, {:error, "ERR value is not an integer or out of range"}, state}
-        end
-    end
+  defp handle_incr_raft(key, delta, from, state) do
+    # Send {:incr, key, delta} async so Shard GenServer doesn't block on the
+    # Batcher → Ra round-trip. Multiple concurrent callers can queue writes
+    # through a single Shard without serializing. Batcher replies directly
+    # to the original caller when the state machine applies the command.
+    # Atomicity is guaranteed by the state machine's apply/3 running serially.
+    Ferricstore.Raft.Batcher.write_async(state.index, {:incr, key, delta}, from)
+    {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
   defp handle_incr_direct(key, delta, state) do
@@ -223,24 +192,19 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_incr_float(binary(), float(), map()) :: {:reply, term(), map()}
+  @spec handle_incr_float(binary(), float(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
   @doc false
-  def handle_incr_float(key, delta, state) do
+  def handle_incr_float(key, delta, from, state) do
     if state.raft? do
-      handle_incr_float_raft(key, delta, state)
+      handle_incr_float_raft(key, delta, from, state)
     else
       handle_incr_float_direct(key, delta, state)
     end
   end
 
-  defp handle_incr_float_raft(key, delta, state) do
-    result = Ferricstore.Raft.Batcher.write(state.index, {:incr_float, key, delta})
-    new_version = state.write_version + 1
-
-    case result do
-      {:ok, _new_str} = ok -> {:reply, ok, %{state | write_version: new_version}}
-      {:error, _} = err -> {:reply, err, state}
-    end
+  defp handle_incr_float_raft(key, delta, from, state) do
+    Ferricstore.Raft.Batcher.write_async(state.index, {:incr_float, key, delta}, from)
+    {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
   defp handle_incr_float_direct(key, delta, state) do
@@ -323,24 +287,19 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_append(binary(), binary(), map()) :: {:reply, term(), map()}
+  @spec handle_append(binary(), binary(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
   @doc false
-  def handle_append(key, suffix, state) do
+  def handle_append(key, suffix, from, state) do
     if state.raft? do
-      handle_append_raft(key, suffix, state)
+      handle_append_raft(key, suffix, from, state)
     else
       handle_append_direct(key, suffix, state)
     end
   end
 
-  defp handle_append_raft(key, suffix, state) do
-    result = Ferricstore.Raft.Batcher.write(state.index, {:append, key, suffix})
-    new_version = state.write_version + 1
-
-    case result do
-      {:ok, _len} = ok -> {:reply, ok, %{state | write_version: new_version}}
-      {:error, _} = err -> {:reply, err, state}
-    end
+  defp handle_append_raft(key, suffix, from, state) do
+    Ferricstore.Raft.Batcher.write_async(state.index, {:append, key, suffix}, from)
+    {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
   defp handle_append_direct(key, suffix, state) do
@@ -394,24 +353,19 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_getset(binary(), binary(), map()) :: {:reply, term(), map()}
+  @spec handle_getset(binary(), binary(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
   @doc false
-  def handle_getset(key, new_value, state) do
+  def handle_getset(key, new_value, from, state) do
     if state.raft? do
-      handle_getset_raft(key, new_value, state)
+      handle_getset_raft(key, new_value, from, state)
     else
       handle_getset_direct(key, new_value, state)
     end
   end
 
-  defp handle_getset_raft(key, new_value, state) do
-    result = Ferricstore.Raft.Batcher.write(state.index, {:getset, key, new_value})
-    new_version = state.write_version + 1
-
-    case result do
-      {:error, _} = err -> {:reply, err, state}
-      old -> {:reply, old, %{state | write_version: new_version}}
-    end
+  defp handle_getset_raft(key, new_value, from, state) do
+    Ferricstore.Raft.Batcher.write_async(state.index, {:getset, key, new_value}, from)
+    {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
   defp handle_getset_direct(key, new_value, state) do
@@ -437,24 +391,19 @@ defmodule Ferricstore.Store.Shard.Writes do
     {:reply, old, new_state}
   end
 
-  @spec handle_getdel(binary(), map()) :: {:reply, term(), map()}
+  @spec handle_getdel(binary(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
   @doc false
-  def handle_getdel(key, state) do
+  def handle_getdel(key, from, state) do
     if state.raft? do
-      handle_getdel_raft(key, state)
+      handle_getdel_raft(key, from, state)
     else
       handle_getdel_direct(key, state)
     end
   end
 
-  defp handle_getdel_raft(key, state) do
-    result = Ferricstore.Raft.Batcher.write(state.index, {:getdel, key})
-    new_version = state.write_version + 1
-
-    case result do
-      {:error, _} = err -> {:reply, err, state}
-      old -> {:reply, old, %{state | write_version: new_version}}
-    end
+  defp handle_getdel_raft(key, from, state) do
+    Ferricstore.Raft.Batcher.write_async(state.index, {:getdel, key}, from)
+    {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
   defp handle_getdel_direct(key, state) do
@@ -492,24 +441,19 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_getex(binary(), non_neg_integer(), map()) :: {:reply, term(), map()}
+  @spec handle_getex(binary(), non_neg_integer(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
   @doc false
-  def handle_getex(key, expire_at_ms, state) do
+  def handle_getex(key, expire_at_ms, from, state) do
     if state.raft? do
-      handle_getex_raft(key, expire_at_ms, state)
+      handle_getex_raft(key, expire_at_ms, from, state)
     else
       handle_getex_direct(key, expire_at_ms, state)
     end
   end
 
-  defp handle_getex_raft(key, expire_at_ms, state) do
-    result = Ferricstore.Raft.Batcher.write(state.index, {:getex, key, expire_at_ms})
-    new_version = state.write_version + 1
-
-    case result do
-      {:error, _} = err -> {:reply, err, state}
-      value -> {:reply, value, %{state | write_version: new_version}}
-    end
+  defp handle_getex_raft(key, expire_at_ms, from, state) do
+    Ferricstore.Raft.Batcher.write_async(state.index, {:getex, key, expire_at_ms}, from)
+    {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
   defp handle_getex_direct(key, expire_at_ms, state) do
@@ -552,24 +496,19 @@ defmodule Ferricstore.Store.Shard.Writes do
     end
   end
 
-  @spec handle_setrange(binary(), non_neg_integer(), binary(), map()) :: {:reply, term(), map()}
+  @spec handle_setrange(binary(), non_neg_integer(), binary(), GenServer.from(), map()) :: {:reply, term(), map()} | {:noreply, map()}
   @doc false
-  def handle_setrange(key, offset, value, state) do
+  def handle_setrange(key, offset, value, from, state) do
     if state.raft? do
-      handle_setrange_raft(key, offset, value, state)
+      handle_setrange_raft(key, offset, value, from, state)
     else
       handle_setrange_direct(key, offset, value, state)
     end
   end
 
-  defp handle_setrange_raft(key, offset, value, state) do
-    result = Ferricstore.Raft.Batcher.write(state.index, {:setrange, key, offset, value})
-    new_version = state.write_version + 1
-
-    case result do
-      {:ok, _len} = ok -> {:reply, ok, %{state | write_version: new_version}}
-      {:error, _} = err -> {:reply, err, state}
-    end
+  defp handle_setrange_raft(key, offset, value, from, state) do
+    Ferricstore.Raft.Batcher.write_async(state.index, {:setrange, key, offset, value}, from)
+    {:noreply, %{state | write_version: state.write_version + 1}}
   end
 
   defp handle_setrange_direct(key, offset, value, state) do
