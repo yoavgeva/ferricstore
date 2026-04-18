@@ -9,7 +9,13 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
 
   require Logger
 
-  @default_sweep_interval_ms 1_000
+  # Expiry sweep runs an ETS select over the entire keydir looking for
+  # expired TTLs. On a keydir with 280K+ keys, each sweep burns millions
+  # of reductions even when nothing has expired. A 5s interval gives up
+  # some freshness (TTL hit-but-still-in-keydir window grows to 5s) for
+  # a 5x reduction in idle scheduler pressure. Application.get_env can
+  # override via :expiry_sweep_interval_ms.
+  @default_sweep_interval_ms 5_000
   @default_max_keys_per_sweep 100
   @default_frag_check_interval_ms 60_000
 
