@@ -522,10 +522,16 @@ defmodule Ferricstore.Store.Shard.Compound do
       state
     else
       active = Promotion.find_active(dedicated_path)
+      # Sync outgoing active before we stop writing to it, so any last
+      # pre-compaction bytes are durable regardless of when the page
+      # cache writes back.
+      _ = NIF.v2_fsync(active)
+
       old_fid = parse_fid_from_path(active)
       new_fid = old_fid + 1
       new_file = dedicated_file_path(dedicated_path, new_fid)
       File.touch!(new_file)
+      _ = NIF.v2_fsync_dir(dedicated_path)
 
       now = HLC.now_ms()
 
@@ -571,6 +577,8 @@ defmodule Ferricstore.Store.Shard.Compound do
                     end
                   end
                 end)
+
+                _ = NIF.v2_fsync_dir(dedicated_path)
 
               _ -> :ok
             end

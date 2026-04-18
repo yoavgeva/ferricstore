@@ -80,11 +80,26 @@ defmodule Ferricstore.Store.Promotion do
           {:ok, binary()} | {:error, term()}
   def open_dedicated(data_dir, shard_index, type, redis_key) do
     path = dedicated_path(data_dir, shard_index, type, redis_key)
+    created_dir? = not File.dir?(path)
     File.mkdir_p!(path)
+
+    if created_dir? do
+      parent = Path.dirname(path)
+      _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(parent)
+    end
+
     active_file = Path.join(path, "00000.log")
 
-    unless File.exists?(active_file) do
-      File.touch!(active_file)
+    created_file? =
+      unless File.exists?(active_file) do
+        File.touch!(active_file)
+        true
+      else
+        false
+      end
+
+    if created_dir? or created_file? do
+      _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(path)
     end
 
     {:ok, path}
@@ -117,6 +132,40 @@ defmodule Ferricstore.Store.Promotion do
         keydir
       )
 
+    active_path = find_active(shard_data_path)
+    mk = marker_key(redis_key)
+
+    # --------------------------------------------------------------------
+    # Crash-safe promotion order (docs/bitcask-background-fsync.md §D2):
+    #
+    #   1. Write the marker FIRST. If we crash here, recover_promoted
+    #      sees the marker and falls back to compound keys still in the
+    #      shared log (not yet tombstoned) — no data loss.
+    #   2. Open/create dedicated dir + write the batch. Dedicated data is
+    #      fsynced by v2_append_batch. If we crash here, recover_promoted
+    #      sees the marker, opens the dedicated dir, finds either data
+    #      (good) or empty (falls back to shared log compound keys).
+    #   3. Tombstone compound keys in shared log LAST. If we crash
+    #      partway through, the un-tombstoned keys are still in the
+    #      shared log — recover_promoted reads them via the fallback.
+    #
+    # Old order (dedicated-first → tombstones → marker) lost data when
+    # crashed between tombstones and marker: compound keys gone, no
+    # marker to locate dedicated dir, collection silently vanished.
+    # --------------------------------------------------------------------
+
+    # Step 1: marker
+    case NIF.v2_append_record(active_path, mk, type_str, 0) do
+      {:ok, {moffset, mvsize}} ->
+        track_binary_insert(keydir, shard_index, mk, type_str)
+        :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), 0, moffset, mvsize})
+
+      {:error, reason} ->
+        Logger.error("Promotion: marker write failed for #{inspect(redis_key)}: #{inspect(reason)}")
+        raise "promotion marker write failed: #{inspect(reason)}"
+    end
+
+    # Step 2: open dedicated + write batch
     {:ok, dedicated_path} = open_dedicated(data_dir, shard_index, type, redis_key)
 
     if entries != [] do
@@ -136,8 +185,7 @@ defmodule Ferricstore.Store.Promotion do
       end
     end
 
-    active_path = find_active(shard_data_path)
-
+    # Step 3: tombstone compound keys in shared log (LAST step)
     Enum.each(entries, fn {key, _value, _exp} ->
       case NIF.v2_append_tombstone(active_path, key) do
         {:ok, _} -> :ok
@@ -145,11 +193,6 @@ defmodule Ferricstore.Store.Promotion do
           Logger.warning("Promotion: tombstone write failed for #{inspect(key)}: #{inspect(reason)}")
       end
     end)
-
-    mk = marker_key(redis_key)
-    NIF.v2_append_record(active_path, mk, type_str, 0)
-    track_binary_insert(keydir, shard_index, mk, type_str)
-    :ets.insert(keydir, {mk, type_str, 0, LFU.initial(), 0, 0, 0})
 
     Logger.info(
       "Promoted #{type_label} #{inspect(redis_key)} to dedicated Bitcask " <>
@@ -225,21 +268,54 @@ defmodule Ferricstore.Store.Promotion do
           end
         end)
 
-      Enum.each(final_state, fn
-        {key, :tombstone} ->
-          track_binary_delete(keydir, shard_index, key)
-          :ets.delete(keydir, key)
+      # Crash-safety fallback (docs/bitcask-background-fsync.md §D2):
+      #
+      # If the marker exists but the dedicated dir is effectively empty
+      # (no live records), we crashed between step 1 (marker write) and
+      # step 2 (dedicated batch) of a marker-first promotion. In that
+      # case the compound keys in the SHARED log are still authoritative
+      # (step 3 tombstones hadn't run yet).
+      #
+      # recover_keydir (called before us) has already re-mapped those
+      # compound keys back into the keydir from the shared log. We
+      # simply leave them in place — by NOT overwriting them with
+      # "missing from dedicated" we preserve the data.
+      live_count =
+        Enum.count(final_state, fn {_, entry} ->
+          case entry do
+            {:live, _, _, _, _, _} -> true
+            _ -> false
+          end
+        end)
 
-        {key, {:live, fid, file_path, offset, _value_size, expire_at_ms}} ->
-          value =
-            case NIF.v2_pread_at(file_path, offset) do
-              {:ok, v} when v != nil -> v
-              _ -> nil
-            end
+      if live_count > 0 do
+        # Normal recovery path: dedicated has data, apply it.
+        Enum.each(final_state, fn
+          {key, :tombstone} ->
+            track_binary_delete(keydir, shard_index, key)
+            :ets.delete(keydir, key)
 
-          track_binary_insert(keydir, shard_index, key, value)
-          :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), fid, offset, 0})
-      end)
+          {key, {:live, fid, file_path, offset, _value_size, expire_at_ms}} ->
+            value =
+              case NIF.v2_pread_at(file_path, offset) do
+                {:ok, v} when v != nil -> v
+                _ -> nil
+              end
+
+            track_binary_insert(keydir, shard_index, key, value)
+            :ets.insert(keydir, {key, value, expire_at_ms, LFU.initial(), fid, offset, 0})
+        end)
+      else
+        # Fallback path: marker exists, dedicated empty. Compound keys
+        # in shared log (already in keydir via recover_keydir) are the
+        # source of truth. Do NOT apply tombstones from dedicated — if
+        # a tombstone somehow landed there without a corresponding live
+        # record, we still prefer the shared-log compound keys.
+        Logger.info(
+          "Promotion recovery: marker for #{inspect(redis_key)} exists but dedicated " <>
+            "dir has no live records; falling back to compound keys in shared log."
+        )
+      end
 
       total_bytes = dir_total_size(dedicated_path)
 
@@ -303,6 +379,8 @@ defmodule Ferricstore.Store.Promotion do
 
     if File.dir?(path) do
       File.rm_rf!(path)
+      parent = Path.dirname(path)
+      _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(parent)
     end
 
     Logger.debug(

@@ -300,11 +300,51 @@ defmodule Ferricstore.Store.Shard.Flush do
   @doc false
   def maybe_rotate_file(state) do
     if state.active_file_size >= state.max_active_file_size do
+      # Rotation durability handoff
+      # (docs/bitcask-background-fsync.md § Active-file rotation):
+      #
+      # 1. Synchronously fsync the outgoing active file so any bytes
+      #    written since the last checkpoint land on disk BEFORE we
+      #    publish the new active file. Otherwise the checkpointer's
+      #    next tick would target the NEW file and the OLD file's
+      #    tail could be lost on kernel panic.
+      case Ferricstore.Bitcask.NIF.v2_fsync(state.active_file_path) do
+        :ok -> :ok
+        {:error, reason} ->
+          require Logger
+          Logger.warning("Shard #{state.index}: rotation fsync of old active file failed: #{inspect(reason)}")
+      end
+
+      :telemetry.execute(
+        [:ferricstore, :bitcask, :rotation_fsync],
+        %{},
+        %{shard_index: state.index, kind: :old_file, path: state.active_file_path}
+      )
+
       write_hint_for_file(state, state.active_file_id)
       new_id = state.active_file_id + 1
       sp = state.shard_data_path
       new_path = ShardETS.file_path(sp, new_id)
       File.touch!(new_path)
+
+      # 2. Fsync the shard directory so the new filename entry
+      #    (`new_path`) is durable. Without this, a kernel panic
+      #    between touch! and the first append can leave the file
+      #    absent on reboot — the next append would create a fresh
+      #    one but we'd lose any bytes already buffered in page cache.
+      case Ferricstore.Bitcask.NIF.v2_fsync_dir(sp) do
+        :ok -> :ok
+        {:error, reason} ->
+          require Logger
+          Logger.warning("Shard #{state.index}: rotation fsync_dir failed: #{inspect(reason)}")
+      end
+
+      :telemetry.execute(
+        [:ferricstore, :bitcask, :rotation_fsync],
+        %{},
+        %{shard_index: state.index, kind: :new_dir, path: sp}
+      )
+
       Ferricstore.Store.ActiveFile.publish(state.index, new_id, new_path, sp)
 
       # Initialize file_stats for the new file

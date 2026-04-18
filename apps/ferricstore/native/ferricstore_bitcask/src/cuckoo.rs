@@ -287,8 +287,8 @@ pub fn cuckoo_file_create(
 
     file.write_all(&buf)
         .map_err(|e| rustler::Error::Term(Box::new(format!("write: {e}"))))?;
-    file.sync_all()
-        .map_err(|e| rustler::Error::Term(Box::new(format!("fsync: {e}"))))?;
+    file.sync_data()
+        .map_err(|e| rustler::Error::Term(Box::new(format!("fdatasync: {e}"))))?;
 
     Ok((atoms::ok(), atoms::ok()).encode(env))
 }

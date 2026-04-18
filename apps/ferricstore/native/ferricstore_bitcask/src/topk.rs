@@ -347,8 +347,8 @@ pub fn topk_file_create_v2(
     if let Err(e) = file.write_all(&zeros) {
         return Ok((atoms::error(), format!("write body: {e}")).encode(env));
     }
-    if let Err(e) = file.sync_all() {
-        return Ok((atoms::error(), format!("fsync: {e}")).encode(env));
+    if let Err(e) = file.sync_data() {
+        return Ok((atoms::error(), format!("fdatasync: {e}")).encode(env));
     }
 
     Ok((atoms::ok(), atoms::ok()).encode(env))

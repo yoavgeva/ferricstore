@@ -398,7 +398,8 @@ defmodule Ferricstore.Config do
 
   defp atomic_write_file(tmp_path, path, content) do
     with :ok <- File.write(tmp_path, content),
-         :ok <- File.rename(tmp_path, path) do
+         :ok <- File.rename(tmp_path, path),
+         _ <- Ferricstore.Bitcask.NIF.v2_fsync_dir(Path.dirname(path)) do
       :ok
     else
       {:error, reason} ->

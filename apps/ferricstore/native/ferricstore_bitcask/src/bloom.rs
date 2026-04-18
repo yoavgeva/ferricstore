@@ -151,8 +151,8 @@ pub fn bloom_file_create(
         return Ok((atoms::error(), format!("write bits: {e}")).encode(env));
     }
 
-    if let Err(e) = file.sync_all() {
-        return Ok((atoms::error(), format!("fsync: {e}")).encode(env));
+    if let Err(e) = file.sync_data() {
+        return Ok((atoms::error(), format!("fdatasync: {e}")).encode(env));
     }
 
     Ok((atoms::ok(), atoms::ok()).encode(env))

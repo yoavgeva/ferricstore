@@ -182,8 +182,8 @@ pub fn cms_file_create(env: Env, path: String, width: u64, depth: u64) -> NifRes
         return Ok((atoms::error(), format!("write counters: {e}")).encode(env));
     }
 
-    if let Err(e) = file.sync_all() {
-        return Ok((atoms::error(), format!("fsync: {e}")).encode(env));
+    if let Err(e) = file.sync_data() {
+        return Ok((atoms::error(), format!("fdatasync: {e}")).encode(env));
     }
 
     Ok((atoms::ok(), atoms::ok()).encode(env))

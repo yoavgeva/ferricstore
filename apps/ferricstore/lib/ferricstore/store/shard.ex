@@ -143,15 +143,28 @@ defmodule Ferricstore.Store.Shard do
     ctx = Keyword.get(opts, :instance_ctx)
 
     path = Ferricstore.DataDir.shard_data_path(data_dir, index)
+    dir_created? = not File.dir?(path)
     File.mkdir_p!(path)
+
+    if dir_created? do
+      _ = NIF.v2_fsync_dir(Path.dirname(path))
+    end
 
     # v2: scan data_dir for existing .log files, find highest file_id
     {active_file_id, active_file_size} = ShardLifecycle.discover_active_file(path)
     active_file_path = file_path(path, active_file_id)
 
     # Ensure the active file exists (touch it)
-    unless File.exists?(active_file_path) do
-      File.touch!(active_file_path)
+    file_created? =
+      unless File.exists?(active_file_path) do
+        File.touch!(active_file_path)
+        true
+      else
+        false
+      end
+
+    if dir_created? or file_created? do
+      _ = NIF.v2_fsync_dir(path)
     end
 
     # Create/clear named ETS tables.
@@ -591,6 +604,10 @@ defmodule Ferricstore.Store.Shard do
           {written, dropped, reclaimed + old_size}
         end
       end)
+
+    # Dir fsync makes rename/rm entries durable so a kernel panic after
+    # compaction doesn't resurrect pre-merge filenames.
+    _ = NIF.v2_fsync_dir(sp)
 
     # Reset file_stats for compacted files: dead bytes are now gone,
     # total bytes reflect the new compacted file size.

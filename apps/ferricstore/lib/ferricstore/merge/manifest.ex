@@ -72,7 +72,8 @@ defmodule Ferricstore.Merge.Manifest do
     binary = :erlang.term_to_binary(term)
 
     with :ok <- File.write(tmp_path, binary),
-         :ok <- File.rename(tmp_path, manifest_path) do
+         :ok <- File.rename(tmp_path, manifest_path),
+         _ <- Ferricstore.Bitcask.NIF.v2_fsync_dir(Path.dirname(manifest_path)) do
       :ok
     else
       {:error, reason} = err ->
