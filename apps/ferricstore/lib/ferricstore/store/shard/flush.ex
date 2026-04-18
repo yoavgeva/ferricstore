@@ -38,16 +38,14 @@ defmodule Ferricstore.Store.Shard.Flush do
       {:ok, locations} ->
         Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
         # Raise dirty flag so BitcaskCheckpointer picks this up on the
-        # next tick. The old shard-level deferred v2_fsync_async timer
-        # still runs alongside it — belt and braces until we remove the
-        # shard-level timer in a follow-up cleanup.
+        # next tick. This is the ONLY fsync trigger for the nosync path.
         if state.instance_ctx do
           :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
         end
         written = total_written(locations)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
-        state = %{state | pending: [], pending_count: 0, fsync_needed: true,
+        state = %{state | pending: [], pending_count: 0,
           active_file_size: state.active_file_size + written}
         maybe_notify_fragmentation(state)
 
@@ -64,13 +62,18 @@ defmodule Ferricstore.Store.Shard.Flush do
   @spec flush_pending_sync(map()) :: map()
   @doc false
   def flush_pending_sync(%{pending: []} = state) do
-    # Even with empty pending, we may need to fsync previously-nosync'd data.
-    if state.fsync_needed do
+    # Even with empty pending, we may need to fsync previously-nosync'd
+    # data. Consult the shared checkpoint_flags atomic: if any writer
+    # has raised it since the last fsync, fsync now and clear the flag.
+    idx = state.index
+
+    if state.instance_ctx &&
+         :atomics.get(state.instance_ctx.checkpoint_flags, idx + 1) == 1 do
+      :atomics.put(state.instance_ctx.checkpoint_flags, idx + 1, 0)
       NIF.v2_fsync(state.active_file_path)
-      %{state | fsync_needed: false}
-    else
-      state
     end
+
+    state
   end
 
   def flush_pending_sync(%{pending: pending} = state) do
@@ -84,10 +87,15 @@ defmodule Ferricstore.Store.Shard.Flush do
     case NIF.v2_append_batch(state.active_file_path, batch) do
       {:ok, locations} ->
         Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
+        # v2_append_batch fsyncs inside the NIF — we just wrote & fsynced
+        # in one call, so clear the checkpoint flag too.
+        if state.instance_ctx do
+          :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 0)
+        end
         written = total_written(locations)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)
-        state = %{state | pending: [], pending_count: 0, fsync_needed: false,
+        state = %{state | pending: [], pending_count: 0,
           active_file_size: state.active_file_size + written}
         maybe_notify_fragmentation(state)
 

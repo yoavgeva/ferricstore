@@ -135,8 +135,19 @@ impl HintWriter {
     /// error the temporary file is left in place; the [`Drop`] impl will
     /// remove it when the writer is dropped.
     pub fn commit(mut self) -> Result<()> {
+        // Drain the BufWriter into the OS, then fdatasync the file data.
+        // We use `sync_data()` (fdatasync) instead of `sync_all()` (fsync)
+        // because hint files never change size after this call — all
+        // body bytes were written up-front — and mtime/atime metadata is
+        // not a durability concern for recovery.
+        //
+        // The rename below makes the final filename visible but the
+        // rename's directory entry is not durable until the parent
+        // directory is fsynced. The caller (Elixir site) is responsible
+        // for `v2_fsync_dir(shard_data_path)` after this returns —
+        // rotation's dir-fsync step already covers that.
         self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        self.writer.get_ref().sync_data()?;
         std::fs::rename(&self.tmp_path, &self.final_path)?;
         Ok(())
     }
@@ -1004,6 +1015,120 @@ mod tests {
         assert!(
             reader.read_all().is_err(),
             "corruption must still be detected after crc32fast migration"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Durability tests for HintWriter::commit
+    // -------------------------------------------------------------------
+    //
+    // These lock in the contract that the design doc requires:
+    //
+    //   1. After commit() returns Ok, the final `.hint` file exists on
+    //      the filesystem with all the entries readable.
+    //   2. The temporary `.hint.tmp` file no longer exists (it was
+    //      renamed to final_path).
+    //   3. commit() does NOT error with a read-back of the file (data
+    //      was flushed + sync_data'd before rename).
+    //
+    // We can't test "fsync actually hit the disk" from userspace without
+    // a crash injector, but we can assert the full round-trip works
+    // bit-for-bit immediately after commit() returns — which is the
+    // observable contract sync_data() is supposed to provide.
+
+    #[test]
+    fn commit_leaves_final_file_readable_and_removes_tmp() {
+        let dir = tmp();
+        let final_path = dir.path().join("data.hint");
+        let tmp_path = final_path.with_extension("hint.tmp");
+
+        let entry = HintEntry {
+            file_id: 9,
+            offset: 1024,
+            value_size: 64,
+            expire_at_ms: 123_456,
+            key: b"committed".to_vec(),
+        };
+
+        let mut writer = HintWriter::open(&final_path).unwrap();
+        writer.write_entry(&entry).unwrap();
+        writer.commit().unwrap();
+
+        assert!(
+            final_path.exists(),
+            "commit() must leave the final .hint file on disk"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "commit() must rename away the .hint.tmp file"
+        );
+
+        let mut reader = HintReader::open(&final_path).unwrap();
+        let out = reader.read_all().unwrap();
+        assert_eq!(out, vec![entry]);
+    }
+
+    #[test]
+    fn commit_with_many_entries_fully_round_trips() {
+        // Stress-test the flush + sync_data + rename sequence with a
+        // payload larger than a BufWriter default buffer (8 KiB).
+        let dir = tmp();
+        let path = dir.path().join("big.hint");
+
+        let entries: Vec<HintEntry> = (0..2_000)
+            .map(|i| HintEntry {
+                file_id: i as u64,
+                offset: (i as u64) * 32,
+                value_size: 16,
+                expire_at_ms: 0,
+                key: format!("key_{:08}", i).into_bytes(),
+            })
+            .collect();
+
+        let mut writer = HintWriter::open(&path).unwrap();
+        for e in &entries {
+            writer.write_entry(e).unwrap();
+        }
+        writer.commit().unwrap();
+
+        let mut reader = HintReader::open(&path).unwrap();
+        let out = reader.read_all().unwrap();
+        assert_eq!(
+            out, entries,
+            "every entry written before commit must be readable after commit"
+        );
+    }
+
+    #[test]
+    fn drop_without_commit_leaves_no_final_file() {
+        // Documents the other half of the contract: if commit() is not
+        // called (crash / early error), the final file must NOT appear
+        // and the tmp file is cleaned up by Drop.
+        let dir = tmp();
+        let path = dir.path().join("aborted.hint");
+        let tmp_path = path.with_extension("hint.tmp");
+
+        {
+            let mut writer = HintWriter::open(&path).unwrap();
+            writer
+                .write_entry(&HintEntry {
+                    file_id: 1,
+                    offset: 0,
+                    value_size: 4,
+                    expire_at_ms: 0,
+                    key: b"abc".to_vec(),
+                })
+                .unwrap();
+            // Deliberately do not call commit(). Drop runs here.
+        }
+
+        assert!(
+            !path.exists(),
+            "no commit means the final .hint file must not appear"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "Drop must clean up the .hint.tmp file when commit was skipped"
         );
     }
 }

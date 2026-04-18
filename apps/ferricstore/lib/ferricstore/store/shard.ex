@@ -97,8 +97,6 @@ defmodule Ferricstore.Store.Shard do
     pending_reads: %{},
     # Monotonically increasing counter for async read/write correlation IDs.
     next_correlation_id: 0,
-    # Whether a deferred fsync is needed (set to true after nosync writes).
-    fsync_needed: false,
     # Whether this shard has Raft infrastructure (Batcher + ra server).
     # Application-supervised shards (0-3) always have Raft. Isolated test
     # shards with ad-hoc indices use the direct write path instead.
@@ -741,22 +739,10 @@ defmodule Ferricstore.Store.Shard do
   end
 
   def handle_info(:flush, state) do
+    # Flush any pending nosync writes to the active file. Fsync is NOT
+    # our responsibility here anymore — the BitcaskCheckpointer owns
+    # data-file durability via the per-shard checkpoint_flags atomic.
     state = flush_pending(state)
-
-    # Deferred fsync: if any nosync writes happened since the last fsync,
-    # submit an async fsync to Tokio. This amortises fsync cost across all
-    # writes in the batch window (typically 1ms). Durability window = 1 batch
-    # interval — similar to Redis AOF `appendfsync everysec` but much smaller.
-    state =
-      if state.fsync_needed do
-        corr_id = state.next_correlation_id
-        NIF.v2_fsync_async(self(), corr_id, state.active_file_path)
-        %{state | fsync_needed: false, flush_in_flight: corr_id,
-          next_correlation_id: corr_id + 1}
-      else
-        state
-      end
-
     schedule_flush(Process.get(:flush_interval_ms, @flush_interval_ms))
     {:noreply, state}
   end

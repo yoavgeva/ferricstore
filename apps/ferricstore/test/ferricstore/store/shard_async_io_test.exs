@@ -105,18 +105,21 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
       assert "nsv" == GenServer.call(pid, {:get, "nsk"})
     end
 
-    test "fsync_needed is set after nosync write" do
+    test "checkpoint_flags atomic is raised after nosync write" do
       {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
       on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
+      # Clear any prior flag state.
+      :atomics.put(ctx.checkpoint_flags, 1, 0)
+
       :ok = GenServer.call(pid, {:put, "fk", "fv", 0})
-      # Allow the flush_pending to run (triggered by put when no flush_in_flight)
+      # Allow the flush_pending to run (triggered by put when no flush_in_flight).
       Process.sleep(10)
 
-      state = :sys.get_state(pid)
-      # After a nosync write, fsync_needed should be true (or already consumed by timer)
-      # Since flush_interval is 5000ms, the timer hasn't fired yet
-      assert state.fsync_needed == true or state.flush_in_flight != nil
+      # The nosync path raises the per-shard checkpoint flag so the
+      # BitcaskCheckpointer fsyncs the active file on its next tick.
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
+             "writer must raise checkpoint_flags[1] after a nosync append"
     end
 
     test "data survives flush (sync) call" do
@@ -155,21 +158,50 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
   # Deferred fsync on timer
   # ---------------------------------------------------------------------------
 
-  describe "deferred fsync on flush timer" do
-    test "fsync is performed by flush timer" do
-      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5)
+  describe "deferred fsync via BitcaskCheckpointer" do
+    alias Ferricstore.Store.ActiveFile
+    alias Ferricstore.Store.BitcaskCheckpointer
+
+    test "checkpointer fsyncs the active file when the flag is raised" do
+      {pid, _index, dir, ctx} = start_shard(flush_interval_ms: 5000)
       on_exit(fn -> cleanup_shard(pid, ctx, dir) end)
 
+      # Start a checkpointer for this shard. The shard already publishes
+      # its active file to the ActiveFile registry during init, so the
+      # checkpointer can find it immediately.
+      ActiveFile.init(1)
+
+      {:ok, ck} =
+        BitcaskCheckpointer.start_link(
+          index: 0,
+          instance_ctx: ctx,
+          checkpoint_interval_ms: 10,
+          name: :"ck_unified_#{:erlang.unique_integer([:positive])}"
+        )
+
+      on_exit(fn -> if Process.alive?(ck), do: GenServer.stop(ck) end)
+
+      parent = self()
+      handler_id = "unified-fsync-#{:erlang.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:ferricstore, :bitcask, :checkpoint],
+        fn _e, meas, meta, _ -> send(parent, {:ck_event, meas, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      :atomics.put(ctx.checkpoint_flags, 1, 0)
       :ok = GenServer.call(pid, {:put, "tk", "tv", 0})
 
-      # Wait for the flush timer to fire and do async fsync
-      Process.sleep(50)
+      # The checkpointer tick should see the raised flag and emit a
+      # :ok telemetry event within a few ticks.
+      assert_receive {:ck_event, _meas, %{status: :ok}}, 500
 
-      state = :sys.get_state(pid)
-      # After the timer fires, fsync_needed should be false and
-      # flush_in_flight should be nil (fsync completed)
-      assert state.fsync_needed == false
-      assert state.flush_in_flight in [nil, 0]
+      # Flag must have been cleared by the checkpointer before firing fsync.
+      assert :atomics.get(ctx.checkpoint_flags, 1) == 0
     end
   end
 

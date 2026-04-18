@@ -80,6 +80,10 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       Keyword.get(opts, :checkpoint_interval_ms)
       || Application.get_env(:ferricstore, :checkpoint_interval_ms, @default_interval_ms)
 
+    # Trap exits so `terminate/2` runs on graceful shutdown and we can
+    # synchronously fsync the active file before the supervisor returns.
+    Process.flag(:trap_exit, true)
+
     state = %{
       index: index,
       instance_ctx: ctx,
@@ -91,6 +95,49 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
     schedule_tick(state)
     {:ok, state}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    # Graceful shutdown: if the shard is dirty, synchronously fsync the
+    # active file so no post-checkpoint writes are lost from page cache.
+    # Emits a `:shutdown_sync` telemetry event so tests (and operators)
+    # can observe that the shutdown barrier actually fired.
+    ctx = state.instance_ctx
+    flag_idx = state.index + 1
+
+    dirty? = ctx && :atomics.get(ctx.checkpoint_flags, flag_idx) == 1
+
+    result =
+      if dirty? do
+        case ActiveFile.get(state.index) do
+          {_fid, active_path, _sp} ->
+            r = NIF.v2_fsync(active_path)
+            if r == :ok, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
+            r
+        end
+      else
+        :clean
+      end
+
+    :telemetry.execute(
+      [:ferricstore, :bitcask, :checkpoint_shutdown],
+      %{shard_index: state.index},
+      %{dirty?: dirty?, result: result}
+    )
+
+    :ok
+  rescue
+    # ActiveFile entry may be missing if the shard is gone. Not fatal —
+    # Ra WAL replay covers us. Emit telemetry so observers see the skip.
+    exception ->
+      :telemetry.execute(
+        [:ferricstore, :bitcask, :checkpoint_shutdown],
+        %{shard_index: state.index},
+        %{dirty?: false, result: {:error, Exception.message(exception)}}
+      )
+
+      :ok
   end
 
   @impl true

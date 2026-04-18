@@ -114,4 +114,76 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     assert :atomics.get(ctx.checkpoint_flags, 1) == 1,
            "writer must raise the dirty flag so the checkpointer picks it up"
   end
+
+  test "shutdown with a dirty shard fires a synchronous fsync", %{ctx: ctx, active_path: active_path} do
+    # Append a record via the NOSYNC NIF so the data is only in page
+    # cache. Then raise the dirty flag and stop the checkpointer. The
+    # terminate/2 barrier must run v2_fsync on the active file and emit
+    # a :checkpoint_shutdown telemetry event with dirty?: true.
+    parent = self()
+    handler_id = "ck-shutdown-#{:erlang.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :bitcask, :checkpoint_shutdown],
+      fn _e, meas, meta, _ -> send(parent, {:shutdown_sync, meas, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    {:ok, pid} =
+      BitcaskCheckpointer.start_link(
+        index: 0,
+        instance_ctx: ctx,
+        # Very long tick so only terminate/2 can fire the fsync.
+        checkpoint_interval_ms: 10_000,
+        name: :"ck_shutdown_#{:erlang.unique_integer([:positive])}"
+      )
+
+    {:ok, _loc} = NIF.v2_append_batch_nosync(active_path, [{"k", "v", 0}])
+    :atomics.put(ctx.checkpoint_flags, 1, 1)
+
+    :ok = GenServer.stop(pid, :normal, 5_000)
+
+    assert_receive {:shutdown_sync, %{shard_index: 0},
+                    %{dirty?: true, result: :ok}},
+                   2_000,
+                   "terminate/2 must fsync the active file on graceful shutdown"
+
+    assert :atomics.get(ctx.checkpoint_flags, 1) == 0,
+           "successful shutdown-fsync must clear the dirty flag"
+  end
+
+  test "shutdown with a clean shard skips the fsync", %{ctx: ctx} do
+    parent = self()
+    handler_id = "ck-shutdown-clean-#{:erlang.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:ferricstore, :bitcask, :checkpoint_shutdown],
+      fn _e, meas, meta, _ -> send(parent, {:shutdown_sync, meas, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    {:ok, pid} =
+      BitcaskCheckpointer.start_link(
+        index: 0,
+        instance_ctx: ctx,
+        checkpoint_interval_ms: 10_000,
+        name: :"ck_shutdown_clean_#{:erlang.unique_integer([:positive])}"
+      )
+
+    # Ensure flag is cleared.
+    :atomics.put(ctx.checkpoint_flags, 1, 0)
+
+    :ok = GenServer.stop(pid, :normal, 5_000)
+
+    assert_receive {:shutdown_sync, %{shard_index: 0},
+                    %{dirty?: false, result: :clean}},
+                   2_000,
+                   "terminate/2 must observe the clean flag and skip fsync"
+  end
 end
