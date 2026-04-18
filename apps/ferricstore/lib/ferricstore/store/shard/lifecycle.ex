@@ -187,7 +187,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
           Logger.info("Shard: migrated #{migrated} existing prob file(s) to Raft metadata")
         end
 
-      {:error, :enoent} ->
+      {:error, _reason} ->
         :ok
     end
   end
