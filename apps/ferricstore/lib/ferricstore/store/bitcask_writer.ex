@@ -43,7 +43,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
 
   alias Ferricstore.Bitcask.NIF
 
-  @batch_size_threshold 100
+  @batch_size_threshold 2000
   @flush_interval_ms 1
 
   @doc "Starts a BitcaskWriter for the given shard index."
@@ -159,20 +159,27 @@ defmodule Ferricstore.Store.BitcaskWriter do
   @impl true
   def handle_cast({:write, path, file_id, ets, key, value, expire_at_ms}, state) do
     entry = {:write, path, file_id, ets, key, value, expire_at_ms}
-    maybe_flush_or_queue(entry, state)
+    handle_entry(entry, state)
   end
 
   def handle_cast({:tombstone, path, key}, state) do
     entry = {:tombstone, path, key}
-    maybe_flush_or_queue(entry, state)
+    handle_entry(entry, state)
   end
 
-  defp maybe_flush_or_queue(entry, state) do
+  # Drain the mailbox in one sweep so we amortize handle_cast overhead
+  # across many messages. Under heavy load the mailbox had 270K+
+  # backlogged casts and each round-trip through gen_server's dispatch
+  # loop was pure overhead. Collecting all pending casts in a single
+  # call lets us submit one large batch to the NIF per sweep.
+  defp handle_entry(entry, state) do
     new_pending = [entry | state.pending]
     new_count = state.pending_count + 1
 
-    if new_count >= @batch_size_threshold do
-      do_flush(new_pending, state.shard_index)
+    {drained_pending, drained_count} = drain_mailbox(new_pending, new_count)
+
+    if drained_count >= @batch_size_threshold or state.pending_count > 0 do
+      do_flush(drained_pending, state.shard_index)
       cancel_timer(state.flush_timer)
       {:noreply, %{state | pending: [], pending_count: 0, flush_timer: nil}}
     else
@@ -183,7 +190,25 @@ defmodule Ferricstore.Store.BitcaskWriter do
           state.flush_timer
         end
 
-      {:noreply, %{state | pending: new_pending, pending_count: new_count, flush_timer: timer}}
+      {:noreply, %{state | pending: drained_pending, pending_count: drained_count, flush_timer: timer}}
+    end
+  end
+
+  # Pull all pending {:write, ...} / {:tombstone, ...} casts off the
+  # mailbox and append to the batch. Stops when the mailbox is empty OR
+  # a non-write message is at the head (handled normally by the next
+  # dispatch).
+  defp drain_mailbox(pending, count) do
+    receive do
+      {:"$gen_cast", {:write, _, _, _, _, _, _} = tag} ->
+        {_, path, fid, ets, key, value, exp} = tag
+        entry = {:write, path, fid, ets, key, value, exp}
+        drain_mailbox([entry | pending], count + 1)
+
+      {:"$gen_cast", {:tombstone, path, key}} ->
+        drain_mailbox([{:tombstone, path, key} | pending], count + 1)
+    after
+      0 -> {pending, count}
     end
   end
 
