@@ -36,9 +36,12 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
   ## Configuration
 
-    * `:checkpoint_interval_ms` (default 50ms) — how often to check the flag.
-      Shorter = smaller durability window, more syscalls on busy shards.
-      Longer = fewer syscalls, longer replay window on kernel panic.
+    * `:checkpoint_interval_ms` (default 10_000 = 10s) — how often to
+      check the flag. Ra WAL is fdatasync'd per batch and is the source
+      of truth for acknowledged writes, so a large interval is safe:
+      on kernel panic we replay up to one interval's worth of Ra log
+      entries and rebuild Bitcask exactly. Short intervals mean more
+      fsync syscalls per shard for no durability gain.
   """
   use GenServer
 
@@ -48,7 +51,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
 
   require Logger
 
-  @default_interval_ms 50
+  @default_interval_ms 10_000
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do

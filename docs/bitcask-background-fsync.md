@@ -3,7 +3,7 @@
 This design covers the complete Bitcask durability story end-to-end:
 
 1. **Active-log checkpointer** — replace per-apply fsync in the Raft state
-   machine with a background, shared mechanism (amortized to ≤ 60s).
+   machine with a background, shared mechanism (amortized to ≤ 10s).
 2. **File/dir fsync coverage** — every namespace-mutating site (rotation,
    compaction, hint files, prob structures, dedicated-file promotion,
    shard init, manifest persistence) gets a matching fsync so crash
@@ -49,7 +49,7 @@ Profiling on Azure confirmed Ra servers spending significant time in
 Remove the per-apply Bitcask fsync from `StateMachine.apply/3`. Data files
 become page-cache-only between checkpoints. A single **`BitcaskCheckpointer`
 GenServer per shard** fsyncs the shard's active file every N seconds
-(default 60s), matching how Postgres treats heap/indexes (WAL durability;
+(default 10s), matching how Postgres treats heap/indexes (WAL durability;
 data files checkpointed periodically).
 
 ```
@@ -61,7 +61,7 @@ Ra apply  →  v2_append_batch_nosync  →  v2_fsync  →  ETS update  →  retu
 Ra apply  →  v2_append_batch_nosync  →  ETS update  →  return
             ~10µs                        ~1µs
 
-Checkpointer (every 60s, per shard):
+Checkpointer (every 10s, per shard):
    if fsync_needed flag is set:
      clear flag
      v2_fsync_async(active_file_path)
@@ -72,14 +72,14 @@ Checkpointer (every 60s, per shard):
 
 | | Today | Proposed |
 |---|-------|----------|
-| **Process crash** | Ra WAL durable, Bitcask durable. Replay is a no-op from the state machine's PoV. | Ra WAL durable, Bitcask may be ≤ 60s stale. Replay re-applies post-checkpoint commands and rebuilds Bitcask exactly. **No data loss.** |
-| **Kernel panic** | Ra WAL durable, Bitcask durable. | Ra WAL durable, Bitcask ≤ 60s stale. Same as above. **No data loss**; recovery replays up to 60s of writes. |
+| **Process crash** | Ra WAL durable, Bitcask durable. Replay is a no-op from the state machine's PoV. | Ra WAL durable, Bitcask may be ≤ 10s stale. Replay re-applies post-checkpoint commands and rebuilds Bitcask exactly. **No data loss.** |
+| **Kernel panic** | Ra WAL durable, Bitcask durable. | Ra WAL durable, Bitcask ≤ 10s stale. Same as above. **No data loss**; recovery replays up to 10s of writes. |
 | **Acknowledged client data** | Always durable. | Always durable (same) — Ra WAL is the truth. |
 | **Replay time after kernel panic** | ~milliseconds | ~10–30s at 40 K writes/s (2.4M entries). Each replay entry is cheap (`append_batch_nosync` + ETS insert). |
 
 Linux kernel writeback (`vm.dirty_writeback_centisecs` default 500 =
 every 5s) already drains dirty pages to disk asynchronously regardless
-of fsync cadence, so the "up to 60s un-durable" claim is the worst
+of fsync cadence, so the "up to 10s un-durable" claim is the worst
 case — in steady state far less is unsynced.
 
 ## Comparison with Postgres
@@ -87,14 +87,14 @@ case — in steady state far less is unsynced.
 | Aspect | Postgres | FerricStore (proposed) |
 |--------|----------|------------------------|
 | WAL durability | per-commit `fsync` of `pg_wal` | per-batch `fdatasync` of Ra WAL |
-| Data-file durability | checkpoints (default 5 min, 1 GB `max_wal_size`) | checkpoints (default 60s per shard) |
+| Data-file durability | checkpoints (default 5 min, 1 GB `max_wal_size`) | checkpoints (default 10s per shard) |
 | Recovery source | WAL replay from last checkpoint | Ra WAL replay from last applied index |
 | Crash safety | full WAL replay recovers all ACKed data | same |
 | Checkpoint I/O | dirty buffers flushed by bgwriter + checkpointer | `v2_fsync_async` per active file |
 
-Postgres defaults to 5 minutes; we pick 60s to start because Bitcask
+Postgres defaults to 5 minutes; we pick 10s to start because Bitcask
 files are append-only and smaller, and we want faster recovery bounds.
-Tunable via `:bitcask_checkpoint_interval_ms`.
+Tunable via `:checkpoint_interval_ms`.
 
 ## Reconciling with the existing shard-level `fsync_needed`
 
@@ -541,7 +541,7 @@ recovery time.
 
 ```elixir
 config :ferricstore,
-  bitcask_checkpoint_interval_ms: 60_000   # default 60s
+  checkpoint_interval_ms: 10_000   # default 10s
   # Set to 0 to disable the checkpointer and fall back to per-apply
   # fsync in the state machine (legacy behavior). Useful during the
   # initial rollout; default in future releases stays at 60_000.
@@ -587,16 +587,16 @@ error rates.
 
 ### Kernel panic between checkpoints
 
-- Bitcask may be ≤ 60s stale on that shard.
+- Bitcask may be ≤ 10s stale on that shard.
 - Ra WAL is durable; replay rebuilds the stale portion on restart.
 - No ACKed data is lost.
 
-### Very slow disk (fsync takes > 60s)
+### Very slow disk (fsync takes > 10s)
 
 - Next tick would fire while the previous async fsync is still pending.
 - Checkpointer tracks `in_flight: boolean` and skips ticks when an
   fsync is outstanding.
-- If fsync takes > 60s consistently, we emit a telemetry warning and
+- If fsync takes > 10s consistently, we emit a telemetry warning and
   set DiskPressure.
 
 ### Dirty writeback doesn't happen
@@ -657,7 +657,7 @@ needed.
   on published data from similar systems.
 - **Latency**: p99 write latency drops (no 100–200µs fsync stall per
   apply batch).
-- **Recovery time**: slightly longer (≤ 60s of WAL to replay) but
+- **Recovery time**: slightly longer (≤ 10s of WAL to replay) but
   still seconds, not minutes.
 - **Code simplicity**: state machine loses the fsync dance in
   `apply/3`; shard GenServer loses the ad-hoc `fsync_needed` timer;

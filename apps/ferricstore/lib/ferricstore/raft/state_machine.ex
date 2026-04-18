@@ -1871,7 +1871,8 @@ defmodule Ferricstore.Raft.StateMachine do
             # active file on its next tick. We no longer fsync synchronously
             # here — Ra WAL is already durable, so acknowledged client data
             # can never be lost. Bitcask data files are checkpointed on a
-            # predictable cadence (default 50ms).
+            # predictable cadence (default 10s); on kernel panic, Ra WAL
+            # replay rebuilds any un-fsynced Bitcask bytes.
             if state.instance_ctx do
               :atomics.put(state.instance_ctx.checkpoint_flags, state.shard_index + 1, 1)
               Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.shard_index)
