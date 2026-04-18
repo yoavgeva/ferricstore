@@ -36,8 +36,14 @@ defmodule FerricstoreServer.StartupTest do
       end
     end
 
-    test "ShardSupervisor has exactly 4 children" do
-      children = Supervisor.which_children(ShardSupervisor)
+    test "ShardSupervisor has exactly 4 shard children" do
+      children =
+        ShardSupervisor
+        |> Supervisor.which_children()
+        |> Enum.filter(fn {id, _, _, _} ->
+          is_atom(id) and String.starts_with?(Atom.to_string(id), "shard_")
+        end)
+
       assert length(children) == 4, "Expected 4 shard children, got #{length(children)}"
     end
 

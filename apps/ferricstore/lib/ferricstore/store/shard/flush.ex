@@ -37,6 +37,13 @@ defmodule Ferricstore.Store.Shard.Flush do
     case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
       {:ok, locations} ->
         Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.index)
+        # Raise dirty flag so BitcaskCheckpointer picks this up on the
+        # next tick. The old shard-level deferred v2_fsync_async timer
+        # still runs alongside it — belt and braces until we remove the
+        # shard-level timer in a follow-up cleanup.
+        if state.instance_ctx do
+          :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
+        end
         written = total_written(locations)
         state = update_ets_locations(state, batch, locations)
         state = track_flush_bytes(state, written)

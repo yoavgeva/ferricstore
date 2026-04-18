@@ -1867,14 +1867,13 @@ defmodule Ferricstore.Raft.StateMachine do
 
         case NIF.v2_append_batch_nosync(state.active_file_path, batch) do
           {:ok, locations} ->
-            # Quorum durability: fsync after the batch so all writes are on
-            # disk before the caller gets :ok. This is one fsync per Raft
-            # batch (not per write), so throughput stays high. Async writes
-            # also go through Raft eventually, so they get the fsync too
-            # (no user-visible latency cost since nobody waits for async Raft).
-            quorum_fsync(state)
-
+            # Mark this shard dirty so the BitcaskCheckpointer fsyncs the
+            # active file on its next tick. We no longer fsync synchronously
+            # here — Ra WAL is already durable, so acknowledged client data
+            # can never be lost. Bitcask data files are checkpointed on a
+            # predictable cadence (default 50ms).
             if state.instance_ctx do
+              :atomics.put(state.instance_ctx.checkpoint_flags, state.shard_index + 1, 1)
               Ferricstore.Store.DiskPressure.clear(state.instance_ctx, state.shard_index)
             else
               Ferricstore.Store.DiskPressure.clear(state.shard_index)
@@ -1908,18 +1907,6 @@ defmodule Ferricstore.Raft.StateMachine do
 
       _ ->
         :ok
-    end
-  end
-
-  # Fsync the active Bitcask log file after a batch write.
-  # Every write that reaches the state machine came through Raft (quorum path).
-  # One fsync per batch amortizes the cost across all writes in the batch.
-  defp quorum_fsync(state) do
-    case NIF.v2_fsync(state.active_file_path) do
-      :ok -> :ok
-      {:error, reason} ->
-        require Logger
-        Logger.error("StateMachine quorum_fsync failed: #{inspect(reason)}")
     end
   end
 

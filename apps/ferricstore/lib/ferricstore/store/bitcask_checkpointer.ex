@@ -1,0 +1,214 @@
+defmodule Ferricstore.Store.BitcaskCheckpointer do
+  @moduledoc """
+  Per-shard background fsync for Bitcask data files.
+
+  Replaces the per-apply `v2_fsync` in `StateMachine.flush_pending_writes` and
+  the old shard-level `fsync_needed` deferred fsync timer. One shared
+  mechanism, one shared flag (atomics on the Instance), covering all write
+  paths (Raft state machine + async BitcaskWriter).
+
+  ## Correctness
+
+  Ra WAL is the source of truth for client-visible durability. Writes hit
+  Bitcask data files via `v2_append_batch_nosync` (page cache only). On a
+  crash, the Ra log replays any post-checkpoint entries and rebuilds the
+  Bitcask state exactly — no acknowledged data is lost.
+
+  The checkpointer's job is to move data from page cache to disk on a
+  predictable cadence, bounding replay time after kernel panic.
+
+  ## Algorithm
+
+      every checkpoint_interval_ms:
+        if :atomics.get(checkpoint_flags, idx+1) == 1:
+          :atomics.put(checkpoint_flags, idx+1, 0)   # clear BEFORE fsync
+          {_fid, active_path, _sp} = ActiveFile.get(idx)
+          NIF.v2_fsync_async(self(), corr_id, active_path)
+        else: skip (idle shard — no syscalls)
+
+  Clearing the flag before firing async-fsync is intentional: a writer
+  that arrives during the fsync re-sets the flag, so the next tick picks
+  it up. The current fsync may miss bytes from that concurrent write,
+  which is fine because Ra WAL is authoritative.
+
+  On fsync error (disk full, I/O error), we re-set the flag so the next
+  tick retries, and raise DiskPressure to shed writes.
+
+  ## Configuration
+
+    * `:checkpoint_interval_ms` (default 50ms) — how often to check the flag.
+      Shorter = smaller durability window, more syscalls on busy shards.
+      Longer = fewer syscalls, longer replay window on kernel panic.
+  """
+  use GenServer
+
+  alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Store.ActiveFile
+  alias Ferricstore.Store.DiskPressure
+
+  require Logger
+
+  @default_interval_ms 50
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    index = Keyword.fetch!(opts, :index)
+    name = Keyword.get(opts, :name, process_name(index, Keyword.get(opts, :instance_ctx)))
+    GenServer.start_link(__MODULE__, opts, name: name)
+  end
+
+  @doc "Canonical process name for the checkpointer of a given shard."
+  @spec process_name(non_neg_integer(), map() | nil) :: atom()
+  def process_name(index, nil), do: :"ferricstore_checkpointer_#{index}"
+  def process_name(index, %{name: inst}), do: :"ferricstore_checkpointer_#{inst}_#{index}"
+
+  @doc """
+  Forces a synchronous fsync of the shard's active file right now.
+  Used by graceful shutdown (see design doc §shutdown ordering) and by
+  tests. Bypasses the async path and clears the dirty flag on success.
+  """
+  @spec sync_now(pid() | atom()) :: :ok | {:error, term()}
+  def sync_now(server) do
+    GenServer.call(server, :sync_now, 30_000)
+  end
+
+  @impl true
+  def init(opts) do
+    index = Keyword.fetch!(opts, :index)
+    ctx = Keyword.get(opts, :instance_ctx)
+    interval_ms =
+      Keyword.get(opts, :checkpoint_interval_ms)
+      || Application.get_env(:ferricstore, :checkpoint_interval_ms, @default_interval_ms)
+
+    state = %{
+      index: index,
+      instance_ctx: ctx,
+      interval_ms: interval_ms,
+      in_flight?: false,
+      next_corr_id: 1,
+      current_corr_id: nil
+    }
+
+    schedule_tick(state)
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(:tick, state) do
+    state =
+      if state.in_flight? do
+        # Previous fsync still pending — skip this tick. The flag remains
+        # set (or may have been re-set by a writer). Next tick re-checks
+        # after the in-flight completes.
+        state
+      else
+        maybe_fire_fsync(state)
+      end
+
+    schedule_tick(state)
+    {:noreply, state}
+  end
+
+  # Tokio async-fsync completion.
+  def handle_info({:tokio_complete, corr_id, :ok, _}, %{current_corr_id: corr_id} = state) do
+    :telemetry.execute(
+      [:ferricstore, :bitcask, :checkpoint],
+      %{shard_index: state.index},
+      %{status: :ok}
+    )
+
+    {:noreply, %{state | in_flight?: false, current_corr_id: nil}}
+  end
+
+  def handle_info({:tokio_complete, corr_id, :error, reason}, %{current_corr_id: corr_id} = state) do
+    # "No such file or directory" = the active file was wiped (test
+    # cleanup, shard shutdown, rotation race). Don't raise disk pressure
+    # — the next tick will see the new ActiveFile entry. Just drop the
+    # tick silently.
+    enoent? =
+      is_binary(reason) and String.contains?(reason, "No such file or directory")
+
+    unless enoent? do
+      if state.instance_ctx do
+        :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
+        DiskPressure.set(state.instance_ctx, state.index)
+      end
+
+      :telemetry.execute(
+        [:ferricstore, :bitcask, :checkpoint],
+        %{shard_index: state.index},
+        %{status: :error, reason: reason}
+      )
+
+      Logger.error(
+        "BitcaskCheckpointer shard=#{state.index}: fsync failed: #{inspect(reason)}"
+      )
+    end
+
+    {:noreply, %{state | in_flight?: false, current_corr_id: nil}}
+  end
+
+  # Ignore tokio_complete messages for stale correlation ids (e.g. from a
+  # previous run or a sync_now). The state machine branch above keys on
+  # `current_corr_id`; anything else falls through here.
+  def handle_info({:tokio_complete, _corr, _status, _}, state), do: {:noreply, state}
+
+  @impl true
+  def handle_call(:sync_now, _from, state) do
+    ctx = state.instance_ctx
+    flag_idx = state.index + 1
+
+    reply =
+      case ActiveFile.get(state.index) do
+        {_fid, active_path, _sp} ->
+          # Clear flag first so concurrent writes re-set it.
+          if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
+
+          case NIF.v2_fsync(active_path) do
+            :ok ->
+              :ok
+
+            {:error, reason} = err ->
+              # Re-raise on failure.
+              if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
+              Logger.error("BitcaskCheckpointer shard=#{state.index}: sync_now failed: #{inspect(reason)}")
+              err
+          end
+      end
+
+    {:reply, reply, state}
+  end
+
+  # -------------------------------------------------------------------
+  # Internals
+  # -------------------------------------------------------------------
+
+  defp schedule_tick(%{interval_ms: ms}) do
+    Process.send_after(self(), :tick, ms)
+  end
+
+  defp maybe_fire_fsync(%{instance_ctx: nil} = state), do: state
+
+  defp maybe_fire_fsync(state) do
+    flag_idx = state.index + 1
+
+    if :atomics.get(state.instance_ctx.checkpoint_flags, flag_idx) == 1 do
+      :atomics.put(state.instance_ctx.checkpoint_flags, flag_idx, 0)
+
+      case ActiveFile.get(state.index) do
+        {_fid, active_path, _sp} ->
+          corr_id = state.next_corr_id
+          NIF.v2_fsync_async(self(), corr_id, active_path)
+          %{state | in_flight?: true, next_corr_id: corr_id + 1, current_corr_id: corr_id}
+      end
+    else
+      state
+    end
+  rescue
+    # If ActiveFile entry is missing (shard just booted, registry not
+    # populated yet), re-raise the flag and try again next tick.
+    _ ->
+      :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
+      state
+  end
+end

@@ -14,7 +14,15 @@ defmodule Ferricstore.Store.ShardSupervisorTest do
   test "starts 4 shards by default" do
     sup = Process.whereis(ShardSupervisor)
     assert is_pid(sup)
-    assert length(Supervisor.which_children(sup)) == 4
+
+    shards =
+      sup
+      |> Supervisor.which_children()
+      |> Enum.filter(fn {id, _, _, _} ->
+        is_atom(id) and String.starts_with?(Atom.to_string(id), "shard_")
+      end)
+
+    assert length(shards) == 4
   end
 
   test "each shard process is alive" do

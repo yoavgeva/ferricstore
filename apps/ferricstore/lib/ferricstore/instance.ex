@@ -26,6 +26,7 @@ defmodule FerricStore.Instance do
           ra_system: atom(),
           pressure_flags: reference(),
           disk_pressure: reference(),
+          checkpoint_flags: reference(),
           write_version: reference(),
           stats_counter: reference(),
           lfu_decay_time: non_neg_integer(),
@@ -60,6 +61,7 @@ defmodule FerricStore.Instance do
     :ra_system,
     :pressure_flags,
     :disk_pressure,
+    :checkpoint_flags,
     :write_version,
     :stats_counter,
     :lfu_decay_time,
@@ -133,6 +135,19 @@ defmodule FerricStore.Instance do
         }
       end
 
+    # Per-shard dirty flag for the BitcaskCheckpointer. 1 = "a nosync
+    # append happened since the last fsync_async". The checkpointer
+    # clears the flag before firing async fsync; writers re-set it on
+    # every batch. Read/written from any process — no GenServer hop.
+    checkpoint_flags =
+      if name == :default do
+        try_get_pt(:ferricstore_checkpoint_flags, fn ->
+          :atomics.new(shard_count, signed: false)
+        end)
+      else
+        :atomics.new(shard_count, signed: false)
+      end
+
     # Per-shard counter for off-heap binary bytes in ETS keydirs.
     # :ets.info(:memory) doesn't count refc binaries (> 64 bytes).
     # We track insertions/deletions to give MemoryGuard accurate numbers.
@@ -184,6 +199,7 @@ defmodule FerricStore.Instance do
       ra_system: :"#{name}_raft",
       pressure_flags: pressure_flags,
       disk_pressure: disk_pressure,
+      checkpoint_flags: checkpoint_flags,
       write_version: write_version,
       stats_counter: stats_counter,
       lfu_decay_time: lfu_decay_time,

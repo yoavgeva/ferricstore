@@ -138,7 +138,13 @@ defmodule FerricstoreServer.ApplicationTest do
     end
 
     test "starts exactly 4 shard children by default" do
-      children = Supervisor.which_children(ShardSupervisor)
+      children =
+        ShardSupervisor
+        |> Supervisor.which_children()
+        |> Enum.filter(fn {id, _, _, _} ->
+          is_atom(id) and String.starts_with?(Atom.to_string(id), "shard_")
+        end)
+
       assert length(children) == 4
     end
 
