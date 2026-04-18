@@ -80,7 +80,7 @@ defmodule Ferricstore.Commands.Cuckoo do
   def handle("CF.DEL", [key, element], store) do
     path = prob_path(store, key, "cuckoo")
 
-    if File.exists?(path) do
+    if Ferricstore.FS.exists?(path) do
       result = do_prob_write(store, {:cuckoo_del, key, element})
 
       case result do
@@ -124,7 +124,7 @@ defmodule Ferricstore.Commands.Cuckoo do
   def handle("CF.MEXISTS", [key | elements], store) when elements != [] do
     path = prob_path(store, key, "cuckoo")
 
-    case File.exists?(path) do
+    case Ferricstore.FS.exists?(path) do
       false ->
         List.duplicate(0, length(elements))
 
@@ -205,7 +205,7 @@ defmodule Ferricstore.Commands.Cuckoo do
   @spec nif_delete(binary(), map()) :: :ok
   def nif_delete(key, store) do
     path = prob_path(store, key, "cuckoo")
-    File.rm(path)
+    _ = Ferricstore.FS.rm(path)
     :ok
   end
 
@@ -254,7 +254,7 @@ defmodule Ferricstore.Commands.Cuckoo do
     path = prob_path(store, key, "cuckoo")
     dir = Path.dirname(path)
     ensure_prob_dir(dir)
-    unless File.exists?(path) do
+    unless Ferricstore.FS.exists?(path) do
       if auto_params do
         %{capacity: cap, bucket_size: bs} = auto_params
         NIF.cuckoo_file_create(path, cap, bs)
@@ -268,7 +268,7 @@ defmodule Ferricstore.Commands.Cuckoo do
     path = prob_path(store, key, "cuckoo")
     dir = Path.dirname(path)
     ensure_prob_dir(dir)
-    unless File.exists?(path) do
+    unless Ferricstore.FS.exists?(path) do
       if auto_params do
         %{capacity: cap, bucket_size: bs} = auto_params
         NIF.cuckoo_file_create(path, cap, bs)
@@ -286,8 +286,8 @@ defmodule Ferricstore.Commands.Cuckoo do
   # Creates the prob dir if missing and fsyncs its parent so the new
   # directory entry is durable.
   defp ensure_prob_dir(dir) do
-    unless File.dir?(dir) do
-      File.mkdir_p!(dir)
+    unless Ferricstore.FS.dir?(dir) do
+      Ferricstore.FS.mkdir_p!(dir)
       _ = NIF.v2_fsync_dir(Path.dirname(dir))
     end
 
@@ -300,7 +300,7 @@ defmodule Ferricstore.Commands.Cuckoo do
     case Map.get(store, :exists?) do
       nil ->
         path = prob_path(store, key, "cuckoo")
-        File.exists?(path)
+        Ferricstore.FS.exists?(path)
 
       exists_fn ->
         exists_fn.(key)

@@ -262,7 +262,7 @@ defmodule Ferricstore.Store.Shard.Flush do
   @spec compute_file_stats(binary(), :ets.tid()) :: %{non_neg_integer() => {non_neg_integer(), non_neg_integer()}}
   @doc false
   def compute_file_stats(shard_path, keydir) do
-    case File.ls(shard_path) do
+    case Ferricstore.FS.ls(shard_path) do
       {:ok, files} ->
         # 1. Get total bytes per file from disk
         file_totals =
@@ -340,7 +340,7 @@ defmodule Ferricstore.Store.Shard.Flush do
       new_id = state.active_file_id + 1
       sp = state.shard_data_path
       new_path = ShardETS.file_path(sp, new_id)
-      File.touch!(new_path)
+      Ferricstore.FS.touch!(new_path)
 
       # 2. Fsync the shard directory so the new filename entry
       #    (`new_path`) is durable. Without this, a kernel panic

@@ -785,7 +785,7 @@ defmodule Ferricstore.Raft.StateMachine do
     result = do_prob_command(state, fn ->
       dst_path = prob_path(state, dst_key, "cms")
       ensure_prob_dir(state)
-      unless File.exists?(dst_path) do
+      unless Ferricstore.FS.exists?(dst_path) do
         %{width: w, depth: d} = create_params
         NIF.cms_file_create(dst_path, w, d)
         prob_fsync_dir(state)
@@ -1741,7 +1741,7 @@ defmodule Ferricstore.Raft.StateMachine do
     do_prob_command(state, fn ->
       dst_path = prob_path(state, dst_key, "cms")
       ensure_prob_dir(state)
-      unless File.exists?(dst_path) do
+      unless Ferricstore.FS.exists?(dst_path) do
         %{width: w, depth: d} = create_params
         NIF.cms_file_create(dst_path, w, d)
         prob_fsync_dir(state)
@@ -2954,8 +2954,8 @@ defmodule Ferricstore.Raft.StateMachine do
   defp ensure_prob_dir(state) do
     dir = prob_dir(state)
 
-    unless File.exists?(dir) do
-      File.mkdir_p!(dir)
+    unless Ferricstore.FS.exists?(dir) do
+      Ferricstore.FS.mkdir_p!(dir)
       _ = NIF.v2_fsync_dir(Path.dirname(dir))
     end
   end
@@ -2969,7 +2969,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Auto-creates a bloom filter file if it doesn't exist.
   defp auto_create_bloom_if_needed(state, path, key, auto_create_params) do
-    unless File.exists?(path) do
+    unless Ferricstore.FS.exists?(path) do
       if auto_create_params do
         %{num_bits: nb, num_hashes: nh} = auto_create_params
         NIF.bloom_file_create(path, nb, nh)
@@ -2990,7 +2990,7 @@ defmodule Ferricstore.Raft.StateMachine do
 
   # Auto-creates a cuckoo filter file if it doesn't exist.
   defp auto_create_cuckoo_if_needed(state, path, key, auto_create_params) do
-    unless File.exists?(path) do
+    unless Ferricstore.FS.exists?(path) do
       if auto_create_params do
         %{capacity: cap, bucket_size: bs} = auto_create_params
         NIF.cuckoo_file_create(path, cap, bs)
@@ -3012,10 +3012,10 @@ defmodule Ferricstore.Raft.StateMachine do
         try do
           deleted? =
             case :erlang.binary_to_term(value) do
-              {:bloom_meta, %{path: path}} -> File.rm(path) == :ok
-              {:cms_meta, _} -> File.rm(prob_path(state, key, "cms")) == :ok
-              {:cuckoo_meta, _} -> File.rm(prob_path(state, key, "cuckoo")) == :ok
-              {:topk_meta, %{path: path}} -> File.rm(path) == :ok
+              {:bloom_meta, %{path: path}} -> Ferricstore.FS.rm(path) == :ok
+              {:cms_meta, _} -> Ferricstore.FS.rm(prob_path(state, key, "cms")) == :ok
+              {:cuckoo_meta, _} -> Ferricstore.FS.rm(prob_path(state, key, "cuckoo")) == :ok
+              {:topk_meta, %{path: path}} -> Ferricstore.FS.rm(path) == :ok
               _ -> false
             end
 

@@ -28,7 +28,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @spec discover_active_file(binary()) :: {non_neg_integer(), non_neg_integer()}
   @doc false
   def discover_active_file(shard_path) do
-    case File.ls(shard_path) do
+    case Ferricstore.FS.ls(shard_path) do
       {:ok, files} ->
         # Clean up leftover compaction temp files from a previous crash.
         # These are always incomplete — if compaction had finished, the
@@ -62,7 +62,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   @spec recover_keydir(binary(), :ets.tid(), non_neg_integer()) :: :ok
   @doc false
   def recover_keydir(shard_path, keydir, shard_index) do
-    case File.ls(shard_path) do
+    case Ferricstore.FS.ls(shard_path) do
       {:ok, files} ->
         log_files =
           files
@@ -176,7 +176,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   def migrate_prob_files(shard_data_path, keydir, index) do
     prob_dir = Path.join(shard_data_path, "prob")
 
-    case File.ls(prob_dir) do
+    case Ferricstore.FS.ls(prob_dir) do
       {:ok, files} ->
         migrated =
           Enum.reduce(files, 0, fn filename, count ->
@@ -372,7 +372,7 @@ defmodule Ferricstore.Store.Shard.Lifecycle do
   defp cleanup_compact_temps(shard_path, files) do
     Enum.each(files, fn name ->
       if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
-        File.rm(Path.join(shard_path, name))
+        _ = Ferricstore.FS.rm(Path.join(shard_path, name))
         Logger.warning("Shard: removed leftover compaction temp file #{name}")
       end
     end)

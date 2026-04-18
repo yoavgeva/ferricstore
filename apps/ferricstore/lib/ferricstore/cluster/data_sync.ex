@@ -408,7 +408,7 @@ defmodule Ferricstore.Cluster.DataSync do
 
     files =
       if source_node == node() do
-        {:ok, f} = File.ls(source_path)
+        {:ok, f} = Ferricstore.FS.ls(source_path)
         f
       else
         {:ok, f} = :erpc.call(source_node, File, :ls, [source_path])
@@ -421,7 +421,7 @@ defmodule Ferricstore.Cluster.DataSync do
 
       is_dir =
         if source_node == node() do
-          File.dir?(src)
+          Ferricstore.FS.dir?(src)
         else
           :erpc.call(source_node, File, :dir?, [src])
         end

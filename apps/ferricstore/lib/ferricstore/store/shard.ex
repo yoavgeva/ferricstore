@@ -146,8 +146,8 @@ defmodule Ferricstore.Store.Shard do
     ctx = Keyword.get(opts, :instance_ctx)
 
     path = Ferricstore.DataDir.shard_data_path(data_dir, index)
-    dir_created? = not File.dir?(path)
-    File.mkdir_p!(path)
+    dir_created? = not Ferricstore.FS.dir?(path)
+    Ferricstore.FS.mkdir_p!(path)
 
     if dir_created? do
       _ = NIF.v2_fsync_dir(Path.dirname(path))
@@ -159,8 +159,8 @@ defmodule Ferricstore.Store.Shard do
 
     # Ensure the active file exists (touch it)
     file_created? =
-      unless File.exists?(active_file_path) do
-        File.touch!(active_file_path)
+      unless Ferricstore.FS.exists?(active_file_path) do
+        Ferricstore.FS.touch!(active_file_path)
         true
       else
         false
@@ -500,7 +500,7 @@ defmodule Ferricstore.Store.Shard do
 
     # Compute file-level stats for merge scheduler
     {total_bytes, live_bytes, dead_bytes, file_count} =
-      case File.ls(sp) do
+      case Ferricstore.FS.ls(sp) do
         {:ok, files} ->
           log_files = Enum.filter(files, &String.ends_with?(&1, ".log"))
           fc = length(log_files)
@@ -529,7 +529,7 @@ defmodule Ferricstore.Store.Shard do
     sp = state.shard_data_path
 
     sizes =
-      case File.ls(sp) do
+      case Ferricstore.FS.ls(sp) do
         {:ok, files} ->
           files
           |> Enum.filter(&String.ends_with?(&1, ".log"))
@@ -580,7 +580,7 @@ defmodule Ferricstore.Store.Shard do
 
           case NIF.v2_copy_records(source, dest, offsets) do
             {:ok, _results} ->
-              File.rename!(dest, source)
+              Ferricstore.FS.rename!(dest, source)
 
               new_size =
                 case File.stat(source) do
@@ -592,7 +592,7 @@ defmodule Ferricstore.Store.Shard do
 
             {:error, reason} ->
               Logger.error("Shard #{state.index}: compaction copy_records failed for #{source}: #{inspect(reason)}")
-              File.rm(dest)
+              _ = Ferricstore.FS.rm(dest)
               {written, dropped, reclaimed}
           end
         else
@@ -603,7 +603,7 @@ defmodule Ferricstore.Store.Shard do
               _ -> 0
             end
 
-          File.rm(source)
+          _ = Ferricstore.FS.rm(source)
           {written, dropped, reclaimed + old_size}
         end
       end)

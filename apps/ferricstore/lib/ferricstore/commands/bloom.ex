@@ -187,7 +187,7 @@ defmodule Ferricstore.Commands.Bloom do
   @spec nif_delete(binary(), map()) :: :ok
   def nif_delete(key, store) do
     path = prob_path(store, key, "bloom")
-    File.rm(path)
+    _ = Ferricstore.FS.rm(path)
     :ok
   end
 
@@ -263,7 +263,7 @@ defmodule Ferricstore.Commands.Bloom do
     case Map.get(store, :exists?) do
       nil ->
         path = prob_path(store, key, "bloom")
-        File.exists?(path)
+        Ferricstore.FS.exists?(path)
 
       exists_fn ->
         exists_fn.(key)
@@ -301,7 +301,7 @@ defmodule Ferricstore.Commands.Bloom do
     path = prob_path(store, key, "bloom")
     dir = Path.dirname(path)
     ensure_prob_dir(dir)
-    unless File.exists?(path) do
+    unless Ferricstore.FS.exists?(path) do
       if auto_params do
         %{num_bits: nb, num_hashes: nh} = auto_params
         NIF.bloom_file_create(path, nb, nh)
@@ -315,7 +315,7 @@ defmodule Ferricstore.Commands.Bloom do
     path = prob_path(store, key, "bloom")
     dir = Path.dirname(path)
     ensure_prob_dir(dir)
-    unless File.exists?(path) do
+    unless Ferricstore.FS.exists?(path) do
       if auto_params do
         %{num_bits: nb, num_hashes: nh} = auto_params
         NIF.bloom_file_create(path, nb, nh)
@@ -328,8 +328,8 @@ defmodule Ferricstore.Commands.Bloom do
   # Creates the prob dir if missing and fsyncs its parent so the new
   # directory entry is durable. No-op if the dir already exists.
   defp ensure_prob_dir(dir) do
-    unless File.dir?(dir) do
-      File.mkdir_p!(dir)
+    unless Ferricstore.FS.dir?(dir) do
+      Ferricstore.FS.mkdir_p!(dir)
       _ = NIF.v2_fsync_dir(Path.dirname(dir))
     end
 

@@ -389,9 +389,9 @@ defmodule Ferricstore.Commands.Server do
   end
 
   defp clear_prob_dir(prob_dir) do
-    with true <- File.exists?(prob_dir),
-         {:ok, files} <- File.ls(prob_dir) do
-      Enum.each(files, fn file -> File.rm(Path.join(prob_dir, file)) end)
+    with true <- Ferricstore.FS.exists?(prob_dir),
+         {:ok, files} <- Ferricstore.FS.ls(prob_dir) do
+      Enum.each(files, fn file -> Ferricstore.FS.rm(Path.join(prob_dir, file)) end)
       # Fsync the prob dir so the removals are durable — without this
       # a crash after FLUSHDB can resurrect probabilistic filter files
       # that were supposed to be wiped.
@@ -730,7 +730,7 @@ defmodule Ferricstore.Commands.Server do
 
         {data_files, hint_files, total_bytes} =
           try do
-            case File.ls(shard_dir) do
+            case Ferricstore.FS.ls(shard_dir) do
               {:ok, files} ->
                 data = Enum.filter(files, &String.ends_with?(&1, ".log"))
                 hints = Enum.filter(files, &String.ends_with?(&1, ".hint"))

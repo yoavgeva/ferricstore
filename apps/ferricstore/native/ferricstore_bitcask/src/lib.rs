@@ -33,6 +33,7 @@ pub mod bloom;
 pub mod cms;
 pub mod compaction;
 pub mod cuckoo;
+pub mod fs_nif;
 pub mod hint;
 pub mod io_backend;
 pub mod keydir;

@@ -1217,16 +1217,16 @@ defmodule FerricstoreServer.Acl do
 
     contents = header <> lines <> "\n"
 
-    with :ok <- File.mkdir_p(data_dir),
+    with :ok <- Ferricstore.FS.mkdir_p(data_dir),
          :ok <- File.write(tmp, contents),
          :ok <- File.chmod(tmp, 0o600),
          :ok <- fsync_file(tmp),
-         :ok <- File.rename(tmp, path),
+         :ok <- Ferricstore.FS.rename(tmp, path),
          _ <- Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir) do
       :ok
     else
       {:error, reason} ->
-        File.rm(tmp)
+        _ = Ferricstore.FS.rm(tmp)
         {:error, "ERR ACL save failed: #{inspect(reason)}"}
     end
   catch

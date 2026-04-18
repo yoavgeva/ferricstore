@@ -59,18 +59,18 @@ defmodule Ferricstore.DataDir do
   """
   @spec ensure_layout!(binary(), pos_integer()) :: :ok
   def ensure_layout!(data_dir, shard_count \\ 4) do
-    File.mkdir_p!(data_dir)
+    Ferricstore.FS.mkdir_p!(data_dir)
 
     # Directories that get per-shard subdirectories
     sharded_dirs = ~w(data dedicated prob raft)
 
     for dir <- sharded_dirs, i <- 0..(shard_count - 1) do
-      File.mkdir_p!(Path.join([data_dir, dir, "shard_#{i}"]))
+      Ferricstore.FS.mkdir_p!(Path.join([data_dir, dir, "shard_#{i}"]))
     end
 
     # Top-level-only directories (no per-shard subdivision)
     for dir <- ~w(registry hints) do
-      File.mkdir_p!(Path.join(data_dir, dir))
+      Ferricstore.FS.mkdir_p!(Path.join(data_dir, dir))
     end
 
     Logger.debug("DataDir layout ensured under #{data_dir} (#{shard_count} shards)")
@@ -106,7 +106,7 @@ defmodule Ferricstore.DataDir do
   def shard_data_path(data_dir, shard_index) do
     legacy_path = Path.join(data_dir, "shard_#{shard_index}")
 
-    if File.dir?(legacy_path) do
+    if Ferricstore.FS.dir?(legacy_path) do
       legacy_path
     else
       Path.join([data_dir, "data", "shard_#{shard_index}"])

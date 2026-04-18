@@ -194,4 +194,85 @@ defmodule Ferricstore.Bitcask.NIF do
 
   @spec topk_file_info_v2_async(pid(), term(), binary()) :: :ok | {:error, term()}
   def topk_file_info_v2_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
+
+  # -------------------------------------------------------------------
+  # Filesystem metadata NIFs (Normal scheduler; replace :prim_file)
+  #
+  # Motivation: every `File.touch!`, `File.mkdir_p!`, `File.rename`,
+  # `File.rm`, `File.exists?`, `File.dir?`, `File.ls` call in Elixir
+  # dispatches to the `:prim_file` async-thread pool and appears as
+  # `erts_internal:dirty_nif_finalizer/1` in BEAM crash dumps, breaking
+  # scheduler-utilization observability. These replacements run on the
+  # Normal scheduler with `consume_timeslice` so BEAM accounting stays
+  # accurate. For potentially long operations (rm_rf on a big tree),
+  # use the `_async` variants which spawn onto the Tokio blocking pool.
+  #
+  # Error shape: `{:error, {atom_kind, message_binary}}` where `kind` is
+  # one of: `:not_found`, `:already_exists`, `:permission_denied`,
+  # `:not_a_directory`, `:is_a_directory`, `:directory_not_empty`,
+  # `:invalid_path`, `:other`.
+  # -------------------------------------------------------------------
+
+  @type fs_error :: {:error, {atom(), binary()}}
+
+  @doc """
+  Creates an empty file if it does not exist. Idempotent on an existing
+  file (does not truncate). Equivalent to `File.touch!/1` without the
+  timestamp update (matches our callers' usage).
+  """
+  @spec fs_touch(binary()) :: :ok | fs_error()
+  def fs_touch(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Recursive mkdir -p. Idempotent when the directory already exists.
+  Equivalent to `File.mkdir_p/1`.
+  """
+  @spec fs_mkdir_p(binary()) :: :ok | fs_error()
+  def fs_mkdir_p(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Atomic rename. On POSIX, `rename` replaces the target atomically.
+  Cross-device renames return `{:error, {:other, _}}` — caller must
+  handle with copy+remove.
+  """
+  @spec fs_rename(binary(), binary()) :: :ok | fs_error()
+  def fs_rename(_old_path, _new_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Remove a single file. Use `fs_rm_rf_async/3` for directory trees.
+  """
+  @spec fs_rm(binary()) :: :ok | fs_error()
+  def fs_rm(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Does the path exist? Follows symlinks (broken symlink → false).
+  Never returns an error for the common kinds (missing, no-permission).
+  """
+  @spec fs_exists(binary()) :: boolean()
+  def fs_exists(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Is the path a directory? Follows symlinks. Returns `false` for
+  missing paths (matches `File.dir?/1`).
+  """
+  @spec fs_is_dir(binary()) :: boolean()
+  def fs_is_dir(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  List the entries in a directory (names only, no path prefix).
+  Yields every 256 entries to keep BEAM reductions accurate on huge
+  directories.
+  """
+  @spec fs_ls(binary()) :: {:ok, [binary()]} | fs_error()
+  def fs_ls(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc """
+  Async recursive remove. Runs on the Tokio blocking pool; sends
+  `{:tokio_complete, correlation_id, :ok}` or
+  `{:tokio_complete, correlation_id, :error, {kind, msg}}` to the
+  caller on completion. Idempotent: removing a non-existent path sends
+  `:ok`.
+  """
+  @spec fs_rm_rf_async(pid(), term(), binary()) :: :ok | fs_error()
+  def fs_rm_rf_async(_caller_pid, _correlation_id, _path), do: :erlang.nif_error(:nif_not_loaded)
 end

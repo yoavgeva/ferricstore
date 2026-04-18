@@ -72,13 +72,13 @@ defmodule Ferricstore.Merge.Manifest do
     binary = :erlang.term_to_binary(term)
 
     with :ok <- File.write(tmp_path, binary),
-         :ok <- File.rename(tmp_path, manifest_path),
+         :ok <- Ferricstore.FS.rename(tmp_path, manifest_path),
          _ <- Ferricstore.Bitcask.NIF.v2_fsync_dir(Path.dirname(manifest_path)) do
       :ok
     else
       {:error, reason} = err ->
         # Clean up tmp file on failure.
-        File.rm(tmp_path)
+        _ = Ferricstore.FS.rm(tmp_path)
         Logger.error("Failed to write merge manifest at #{manifest_path}: #{inspect(reason)}")
         err
     end
@@ -94,7 +94,7 @@ defmodule Ferricstore.Merge.Manifest do
   def read(data_dir) do
     path = manifest_path(data_dir)
 
-    if File.exists?(path) do
+    if Ferricstore.FS.exists?(path) do
       case File.read(path) do
         {:ok, binary} ->
           try do
@@ -119,7 +119,7 @@ defmodule Ferricstore.Merge.Manifest do
   def delete(data_dir) do
     path = manifest_path(data_dir)
 
-    case File.rm(path) do
+    case Ferricstore.FS.rm(path) do
       :ok ->
         # Fsync the directory so the manifest's removal is durable —
         # otherwise on a crash the stale manifest can re-appear and
@@ -127,7 +127,7 @@ defmodule Ferricstore.Merge.Manifest do
         _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir)
         :ok
 
-      {:error, :enoent} -> :ok
+      {:error, {:not_found, _}} -> :ok
       {:error, reason} -> {:error, reason}
     end
   end
@@ -213,7 +213,7 @@ defmodule Ferricstore.Merge.Manifest do
         ids -> Enum.max(ids)
       end
 
-    case File.ls(data_dir) do
+    case Ferricstore.FS.ls(data_dir) do
       {:ok, files} ->
         files
         |> Enum.filter(&log_or_hint_file?/1)
@@ -243,7 +243,8 @@ defmodule Ferricstore.Merge.Manifest do
     case Integer.parse(stem) do
       {file_id, ""} when file_id > max_input_id ->
         Logger.info("Removing partial merge output: #{name}")
-        File.rm(Path.join(data_dir, name))
+        _ = Ferricstore.FS.rm(Path.join(data_dir, name))
+        :ok
 
       _ ->
         :ok

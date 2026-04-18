@@ -123,7 +123,7 @@ defmodule Ferricstore.Commands.CMS do
   @spec nif_delete(binary(), map()) :: :ok
   def nif_delete(key, store) do
     path = prob_path(store, key, "cms")
-    File.rm(path)
+    _ = Ferricstore.FS.rm(path)
     :ok
   end
 
@@ -178,7 +178,7 @@ defmodule Ferricstore.Commands.CMS do
     dst_path = prob_path(store, dst_key, "cms")
     dir = Path.dirname(dst_path)
     ensure_prob_dir(dir)
-    unless File.exists?(dst_path) do
+    unless Ferricstore.FS.exists?(dst_path) do
       %{width: w, depth: d} = create_params
       NIF.cms_file_create(dst_path, w, d)
       _ = NIF.v2_fsync_dir(dir)
@@ -189,8 +189,8 @@ defmodule Ferricstore.Commands.CMS do
   # Creates the prob dir if missing and fsyncs its parent so the new
   # directory entry is durable.
   defp ensure_prob_dir(dir) do
-    unless File.dir?(dir) do
-      File.mkdir_p!(dir)
+    unless Ferricstore.FS.dir?(dir) do
+      Ferricstore.FS.mkdir_p!(dir)
       _ = NIF.v2_fsync_dir(Path.dirname(dir))
     end
 
@@ -200,7 +200,7 @@ defmodule Ferricstore.Commands.CMS do
   defp check_not_exists(key, store) do
     exists =
       case Map.get(store, :exists?) do
-        nil -> File.exists?(prob_path(store, key, "cms"))
+        nil -> Ferricstore.FS.exists?(prob_path(store, key, "cms"))
         exists_fn -> exists_fn.(key)
       end
 

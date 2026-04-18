@@ -446,7 +446,7 @@ defmodule Ferricstore.Store.Shard.Compound do
   @spec promoted_dir_size(binary()) :: non_neg_integer()
   @doc false
   def promoted_dir_size(dir_path) do
-    case File.ls(dir_path) do
+    case Ferricstore.FS.ls(dir_path) do
       {:ok, files} ->
         files
         |> Enum.filter(&String.ends_with?(&1, ".log"))
@@ -530,7 +530,7 @@ defmodule Ferricstore.Store.Shard.Compound do
       old_fid = parse_fid_from_path(active)
       new_fid = old_fid + 1
       new_file = dedicated_file_path(dedicated_path, new_fid)
-      File.touch!(new_file)
+      Ferricstore.FS.touch!(new_file)
       _ = NIF.v2_fsync_dir(dedicated_path)
 
       now = HLC.now_ms()
@@ -553,7 +553,7 @@ defmodule Ferricstore.Store.Shard.Compound do
         # Roll back the `touch!(new_file)` above: remove the empty
         # placeholder and fsync the dir so no zombie empty file
         # remains after a crash.
-        File.rm(new_file)
+        _ = Ferricstore.FS.rm(new_file)
         _ = NIF.v2_fsync_dir(dedicated_path)
         state
       else
@@ -571,13 +571,13 @@ defmodule Ferricstore.Store.Shard.Compound do
               :ets.insert(state.keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), new_fid, offset, value_size})
             end)
 
-            case File.ls(dedicated_path) do
+            case Ferricstore.FS.ls(dedicated_path) do
               {:ok, files} ->
                 Enum.each(files, fn name ->
                   if String.ends_with?(name, ".log") do
                     fid = name |> String.trim_trailing(".log") |> String.to_integer()
                     if fid < new_fid do
-                      File.rm(Path.join(dedicated_path, name))
+                      _ = Ferricstore.FS.rm(Path.join(dedicated_path, name))
                     end
                   end
                 end)
@@ -604,7 +604,7 @@ defmodule Ferricstore.Store.Shard.Compound do
             Logger.error("Shard #{state.index}: dedicated compaction write failed: #{inspect(reason)}")
             # Roll back the `touch!(new_file)` on write error. Fsync
             # so the rollback survives a subsequent crash.
-            File.rm(new_file)
+            _ = Ferricstore.FS.rm(new_file)
             _ = NIF.v2_fsync_dir(dedicated_path)
             state
         end

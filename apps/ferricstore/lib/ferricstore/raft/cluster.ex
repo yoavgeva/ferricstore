@@ -43,8 +43,8 @@ defmodule Ferricstore.Raft.Cluster do
   def start_system(data_dir) do
     ra_data_dir = Path.join(data_dir, "ra") |> to_charlist()
     ra_dir_str = Path.join(data_dir, "ra")
-    created? = not File.dir?(ra_dir_str)
-    File.mkdir_p!(ra_dir_str)
+    created? = not Ferricstore.FS.dir?(ra_dir_str)
+    Ferricstore.FS.mkdir_p!(ra_dir_str)
 
     # Fsync the parent so the `ra/` directory entry is durable. ra
     # manages its own files' durability internally, but the dir entry

@@ -709,9 +709,9 @@ defmodule FerricStore.Impl do
     for i <- 0..(ctx.shard_count - 1) do
       shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, i)
       prob_dir = Path.join(shard_path, "prob")
-      case File.ls(prob_dir) do
+      case Ferricstore.FS.ls(prob_dir) do
         {:ok, files} ->
-          Enum.each(files, &File.rm(Path.join(prob_dir, &1)))
+          Enum.each(files, &Ferricstore.FS.rm(Path.join(prob_dir, &1)))
           _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(prob_dir)
 
         _ ->

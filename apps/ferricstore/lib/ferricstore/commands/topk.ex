@@ -265,8 +265,8 @@ defmodule Ferricstore.Commands.TopK do
   defp apply_prob_locally(store, {:topk_create, key, k, width, depth, decay}) do
     path = prob_path(store, key, "topk")
     dir = Path.dirname(path)
-    created_dir? = not File.dir?(dir)
-    File.mkdir_p!(dir)
+    created_dir? = not Ferricstore.FS.dir?(dir)
+    Ferricstore.FS.mkdir_p!(dir)
 
     if created_dir? do
       _ = NIF.v2_fsync_dir(Path.dirname(dir))

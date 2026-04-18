@@ -310,11 +310,11 @@ defmodule Ferricstore.Application do
         shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
         active_file_path = :persistent_term.get({:ferricstore_active_file_path, i}, nil)
 
-        if active_file_path && File.exists?(active_file_path) do
+        if active_file_path && Ferricstore.FS.exists?(active_file_path) do
           Ferricstore.Bitcask.NIF.v2_fsync(active_file_path)
         else
           # Fallback: fsync all log files in the shard directory
-          case File.ls(shard_path) do
+          case Ferricstore.FS.ls(shard_path) do
             {:ok, files} ->
               files
               |> Enum.filter(&String.ends_with?(&1, ".log"))
@@ -393,7 +393,7 @@ defmodule Ferricstore.Application do
   end
 
   defp list_wal_files(ra_dir) do
-    case File.ls(ra_dir) do
+    case Ferricstore.FS.ls(ra_dir) do
       {:ok, files} -> Enum.filter(files, &String.ends_with?(&1, ".wal"))
       _ -> []
     end
@@ -631,7 +631,7 @@ defmodule Ferricstore.Application do
     priv_dir = :code.priv_dir(:ferricstore)
     beam_path = Path.join(priv_dir, "patched/ra_log_wal.beam")
 
-    if File.exists?(beam_path) do
+    if Ferricstore.FS.exists?(beam_path) do
       binary = File.read!(beam_path)
       :code.purge(:ra_log_wal)
       {:module, :ra_log_wal} = :code.load_binary(:ra_log_wal, ~c"ra_log_wal.erl", binary)

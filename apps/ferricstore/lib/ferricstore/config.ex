@@ -325,7 +325,7 @@ defmodule Ferricstore.Config do
     state = refresh_read_only(state)
     path = config_file_path()
     dir = Path.dirname(path)
-    File.mkdir_p(dir)
+    Ferricstore.FS.mkdir_p(dir)
     tmp_path = path <> ".tmp"
 
     # Read existing file content (if any)
@@ -398,12 +398,12 @@ defmodule Ferricstore.Config do
 
   defp atomic_write_file(tmp_path, path, content) do
     with :ok <- File.write(tmp_path, content),
-         :ok <- File.rename(tmp_path, path),
+         :ok <- Ferricstore.FS.rename(tmp_path, path),
          _ <- Ferricstore.Bitcask.NIF.v2_fsync_dir(Path.dirname(path)) do
       :ok
     else
       {:error, reason} ->
-        File.rm(tmp_path)
+        _ = Ferricstore.FS.rm(tmp_path)
         {:error, "ERR failed to write/rename config file: #{inspect(reason)}"}
     end
   end

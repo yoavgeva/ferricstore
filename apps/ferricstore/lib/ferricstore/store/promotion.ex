@@ -80,8 +80,8 @@ defmodule Ferricstore.Store.Promotion do
           {:ok, binary()} | {:error, term()}
   def open_dedicated(data_dir, shard_index, type, redis_key) do
     path = dedicated_path(data_dir, shard_index, type, redis_key)
-    created_dir? = not File.dir?(path)
-    File.mkdir_p!(path)
+    created_dir? = not Ferricstore.FS.dir?(path)
+    Ferricstore.FS.mkdir_p!(path)
 
     if created_dir? do
       parent = Path.dirname(path)
@@ -91,8 +91,8 @@ defmodule Ferricstore.Store.Promotion do
     active_file = Path.join(path, "00000.log")
 
     created_file? =
-      unless File.exists?(active_file) do
-        File.touch!(active_file)
+      unless Ferricstore.FS.exists?(active_file) do
+        Ferricstore.FS.touch!(active_file)
         true
       else
         false
@@ -377,8 +377,8 @@ defmodule Ferricstore.Store.Promotion do
 
     path = dedicated_path(data_dir, shard_index, type, redis_key)
 
-    if File.dir?(path) do
-      File.rm_rf!(path)
+    if Ferricstore.FS.dir?(path) do
+      Ferricstore.FS.rm_rf!(path)
       parent = Path.dirname(path)
       _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(parent)
     end
@@ -412,7 +412,7 @@ defmodule Ferricstore.Store.Promotion do
 
   # Returns total size of all .log files in a directory.
   defp dir_total_size(dir) do
-    case File.ls(dir) do
+    case Ferricstore.FS.ls(dir) do
       {:ok, files} ->
         files
         |> Enum.filter(&String.ends_with?(&1, ".log"))
@@ -432,12 +432,12 @@ defmodule Ferricstore.Store.Promotion do
   # Returns all .log files in a directory as [{file_id, full_path}], sorted by file_id.
   # Cleans up leftover compact_*.log temp files from crashed compaction.
   defp list_log_files(dir) do
-    case File.ls(dir) do
+    case Ferricstore.FS.ls(dir) do
       {:ok, files} ->
         # Delete leftover compaction temp files (same as shared shard C2 fix)
         Enum.each(files, fn name ->
           if String.starts_with?(name, "compact_") and String.ends_with?(name, ".log") do
-            File.rm(Path.join(dir, name))
+            _ = Ferricstore.FS.rm(Path.join(dir, name))
           end
         end)
 
