@@ -203,6 +203,14 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
   # `current_corr_id`; anything else falls through here.
   def handle_info({:tokio_complete, _corr, _status, _}, state), do: {:noreply, state}
 
+  # We trap_exit so terminate/2 runs the shutdown fsync on graceful stop.
+  # As a side effect we must explicitly shut down when a linker process
+  # dies — otherwise the checkpointer lingers after the test process
+  # that called `start_link` exits.
+  def handle_info({:EXIT, _from, reason}, state) do
+    {:stop, reason, state}
+  end
+
   @impl true
   def handle_call(:sync_now, _from, state) do
     ctx = state.instance_ctx

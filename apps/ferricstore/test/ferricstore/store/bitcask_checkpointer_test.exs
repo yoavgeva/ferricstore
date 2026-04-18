@@ -19,6 +19,20 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
   alias Ferricstore.Store.BitcaskCheckpointer
   alias Ferricstore.Bitcask.NIF
 
+  # Checkpointer is linked via start_link — when the test process exits,
+  # the :EXIT signal shuts the checkpointer down. on_exit runs AFTER the
+  # test process is gone, so the pid may already be dead by then. Tolerate
+  # that race: alive? + GenServer.stop is still racy; catch + :noproc is
+  # the sturdy form.
+  defp safe_stop(pid) do
+    try do
+      GenServer.stop(pid, :normal, 5000)
+    catch
+      :exit, {:noproc, _} -> :ok
+      :exit, :noproc -> :ok
+    end
+  end
+
   setup do
     # Minimal instance-like context with just `checkpoint_flags` (the
     # only field the checkpointer reads). Using shard_index 0 so
@@ -71,7 +85,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
         name: :"ck_dirty_#{:erlang.unique_integer([:positive])}"
       )
 
-    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+    on_exit(fn -> safe_stop(pid) end)
 
     # No flag set → no checkpoint should fire over three ticks.
     refute_receive {:checkpoint, _meas, %{status: :ok}}, 100
@@ -98,7 +112,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
         name: :"ck_sync_#{:erlang.unique_integer([:positive])}"
       )
 
-    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+    on_exit(fn -> safe_stop(pid) end)
 
     :atomics.put(ctx.checkpoint_flags, 1, 1)
     assert :ok = BitcaskCheckpointer.sync_now(pid)

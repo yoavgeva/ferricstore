@@ -13,9 +13,14 @@ defmodule Ferricstore.Store.Shard do
 
   1. The key is written to ETS immediately (reads see it at once).
   2. The entry is appended to an in-memory pending list.
-  3. A recurring timer fires every `@flush_interval_ms` and calls
-     `NIF.v2_append_batch/2` with all accumulated entries, then updates
-     ETS entries with their disk locations (file_id, offset, value_size).
+  3. A recurring `:drain_pending` timer fires every `@flush_interval_ms`
+     and calls `NIF.v2_append_batch_nosync/2` with all accumulated
+     entries, then updates ETS entries with their disk locations
+     (file_id, offset, value_size). This step moves bytes from BEAM
+     memory to the kernel page cache — **no fsync**.
+     Data-file durability is owned by `Ferricstore.Store.BitcaskCheckpointer`,
+     which runs on its own, longer tick and issues `v2_fsync` against
+     the same active file.
   4. File rotation occurs when the active file exceeds 256 MB.
 
   ## Read path: ETS bypass
@@ -233,7 +238,7 @@ defmodule Ferricstore.Store.Shard do
         Map.get(merge_config_overrides, :dead_bytes_threshold, @default_dead_bytes_threshold)
     }
 
-    schedule_flush(flush_ms)
+    schedule_drain_pending(flush_ms)
     ShardLifecycle.schedule_expiry_sweep()
     ShardLifecycle.schedule_frag_check()
     max_file_size = if ctx, do: ctx.max_active_file_size, else: @default_max_active_file_size
@@ -738,12 +743,12 @@ defmodule Ferricstore.Store.Shard do
     end
   end
 
-  def handle_info(:flush, state) do
-    # Flush any pending nosync writes to the active file. Fsync is NOT
-    # our responsibility here anymore — the BitcaskCheckpointer owns
-    # data-file durability via the per-shard checkpoint_flags atomic.
+  def handle_info(:drain_pending, state) do
+    # Drain any pending writes from BEAM memory to the active file
+    # (page cache only — NO fsync). BitcaskCheckpointer is responsible
+    # for actual disk durability on its own, longer tick.
     state = flush_pending(state)
-    schedule_flush(Process.get(:flush_interval_ms, @flush_interval_ms))
+    schedule_drain_pending(Process.get(:flush_interval_ms, @flush_interval_ms))
     {:noreply, state}
   end
 
@@ -902,7 +907,7 @@ defmodule Ferricstore.Store.Shard do
   defp track_delete_dead_bytes(state, key), do: ShardFlush.track_delete_dead_bytes(state, key)
   defp maybe_notify_fragmentation(state), do: ShardFlush.maybe_notify_fragmentation(state)
   defp compute_file_stats(shard_path, keydir), do: ShardFlush.compute_file_stats(shard_path, keydir)
-  defp schedule_flush(ms), do: ShardFlush.schedule_flush(ms)
+  defp schedule_drain_pending(ms), do: ShardFlush.schedule_drain_pending(ms)
 
   # -------------------------------------------------------------------
   # Private: read helpers (delegates to Shard.Reads / Shard.ETS)

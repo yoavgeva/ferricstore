@@ -413,9 +413,15 @@ defmodule Ferricstore.Store.Shard.Flush do
   # Schedule flush timer
   # -------------------------------------------------------------------
 
-  @spec schedule_flush(non_neg_integer()) :: reference()
-  @doc false
-  def schedule_flush(ms) do
-    Process.send_after(self(), :flush, ms)
+  @doc """
+  Schedules the periodic `:drain_pending` timer tick. The tick drains
+  `state.pending` to the active file via `v2_append_batch_nosync` —
+  i.e. BEAM memory → kernel page cache. It does NOT fsync. Data-file
+  durability is owned by `Ferricstore.Store.BitcaskCheckpointer`, which
+  runs on its own (much longer) interval.
+  """
+  @spec schedule_drain_pending(non_neg_integer()) :: reference()
+  def schedule_drain_pending(ms) do
+    Process.send_after(self(), :drain_pending, ms)
   end
 end
