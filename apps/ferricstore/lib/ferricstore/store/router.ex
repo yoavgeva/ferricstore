@@ -573,8 +573,7 @@ defmodule Ferricstore.Store.Router do
       Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, key, disk_value, expire_at_ms)
       size = :counters.info(ctx.write_version).size
       if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
-      # TEMP: disabled async_submit_to_raft to isolate Batcher bottleneck
-      # async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
+      async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
       :ok
     end
   end
