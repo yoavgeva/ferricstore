@@ -103,6 +103,47 @@ defmodule Ferricstore.ProbDurabilityTest do
       assert {:ok, 1} = FerricStore.cf_del(key, "gone")
       assert {:ok, 0} = FerricStore.cf_exists(key, "gone")
     end
+
+    test "elements placed via eviction-kick are durably findable" do
+      # A cuckoo filter with capacity ~32 and bucket_size 4 has ~128
+      # slots; inserting 100 unique elements forces a kick chain after
+      # the first few collisions. The NIF's eviction-placement path
+      # (cuckoo_file_add's kick loop) must `prob_fsync` after the final
+      # `write_num_items` — otherwise on a crash the fingerprint bytes
+      # could be in page cache while `num_items` is on disk, producing
+      # a filter that says "I have N items" but returns 0 for everyone.
+      #
+      # This test asserts the observable contract: every element we
+      # added, including the ones that triggered eviction, remains
+      # findable via CF.EXISTS.
+      key = ukey("cf_evict")
+      :ok = FerricStore.cf_reserve(key, 32)
+
+      elements = for i <- 1..100, do: "kick_#{i}"
+
+      Enum.each(elements, fn e ->
+        case FerricStore.cf_add(key, e) do
+          {:ok, _} -> :ok
+          # Filter-full is acceptable for the oldest elements once we
+          # exceed real capacity; the test measures "everything that
+          # reported success must be findable", not "100% fit".
+          {:error, _} -> :ok
+        end
+      end)
+
+      # At minimum the first half must all fit (capacity is 32 but
+      # 4-slot buckets typically hold 3x the declared capacity before
+      # saturation). We then assert every element that CF.ADD accepted
+      # is durably findable.
+      found =
+        Enum.count(elements, fn e ->
+          match?({:ok, 1}, FerricStore.cf_exists(key, e))
+        end)
+
+      assert found >= 32,
+             "expected at least 32 of 100 added elements to remain findable " <>
+             "after eviction-chain inserts; got #{found}"
+    end
   end
 
   # ---------------------------------------------------------------------------

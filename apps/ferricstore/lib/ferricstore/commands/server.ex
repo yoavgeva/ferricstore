@@ -392,6 +392,11 @@ defmodule Ferricstore.Commands.Server do
     with true <- File.exists?(prob_dir),
          {:ok, files} <- File.ls(prob_dir) do
       Enum.each(files, fn file -> File.rm(Path.join(prob_dir, file)) end)
+      # Fsync the prob dir so the removals are durable — without this
+      # a crash after FLUSHDB can resurrect probabilistic filter files
+      # that were supposed to be wiped.
+      _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(prob_dir)
+      :ok
     else
       _ -> :ok
     end

@@ -161,8 +161,11 @@ defmodule Ferricstore.Commands.CMS do
 
   defp apply_prob_locally(store, {:cms_create, key, width, depth}) do
     path = prob_path(store, key, "cms")
-    File.mkdir_p!(Path.dirname(path))
-    NIF.cms_file_create(path, width, depth)
+    dir = Path.dirname(path)
+    ensure_prob_dir(dir)
+    result = NIF.cms_file_create(path, width, depth)
+    _ = NIF.v2_fsync_dir(dir)
+    result
   end
 
   defp apply_prob_locally(store, {:cms_incrby, key, items}) do
@@ -173,12 +176,25 @@ defmodule Ferricstore.Commands.CMS do
   # src_paths are pre-resolved absolute paths from the handler
   defp apply_prob_locally(store, {:cms_merge, dst_key, src_paths, weights, create_params}) do
     dst_path = prob_path(store, dst_key, "cms")
-    File.mkdir_p!(Path.dirname(dst_path))
+    dir = Path.dirname(dst_path)
+    ensure_prob_dir(dir)
     unless File.exists?(dst_path) do
       %{width: w, depth: d} = create_params
       NIF.cms_file_create(dst_path, w, d)
+      _ = NIF.v2_fsync_dir(dir)
     end
     NIF.cms_file_merge(dst_path, src_paths, weights)
+  end
+
+  # Creates the prob dir if missing and fsyncs its parent so the new
+  # directory entry is durable.
+  defp ensure_prob_dir(dir) do
+    unless File.dir?(dir) do
+      File.mkdir_p!(dir)
+      _ = NIF.v2_fsync_dir(Path.dirname(dir))
+    end
+
+    :ok
   end
 
   defp check_not_exists(key, store) do

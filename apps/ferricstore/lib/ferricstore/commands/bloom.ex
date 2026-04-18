@@ -286,22 +286,26 @@ defmodule Ferricstore.Commands.Bloom do
     end
   end
 
-  # Direct NIF application for test stores without Raft.
+  # Direct NIF application for test stores without Raft. Every path that
+  # creates a prob file fsyncs the containing dir so the filename entry
+  # is durable — matches the Raft state-machine path.
   defp apply_prob_locally(store, {:bloom_create, key, num_bits, num_hashes, _meta}) do
     path = prob_path(store, key, "bloom")
-    dir = Path.dirname(path)
-    File.mkdir_p!(dir)
-    NIF.bloom_file_create(path, num_bits, num_hashes)
+    ensure_prob_dir(Path.dirname(path))
+    result = NIF.bloom_file_create(path, num_bits, num_hashes)
+    _ = NIF.v2_fsync_dir(Path.dirname(path))
+    result
   end
 
   defp apply_prob_locally(store, {:bloom_add, key, element, auto_params}) do
     path = prob_path(store, key, "bloom")
     dir = Path.dirname(path)
-    File.mkdir_p!(dir)
+    ensure_prob_dir(dir)
     unless File.exists?(path) do
       if auto_params do
         %{num_bits: nb, num_hashes: nh} = auto_params
         NIF.bloom_file_create(path, nb, nh)
+        _ = NIF.v2_fsync_dir(dir)
       end
     end
     NIF.bloom_file_add(path, element)
@@ -310,14 +314,26 @@ defmodule Ferricstore.Commands.Bloom do
   defp apply_prob_locally(store, {:bloom_madd, key, elements, auto_params}) do
     path = prob_path(store, key, "bloom")
     dir = Path.dirname(path)
-    File.mkdir_p!(dir)
+    ensure_prob_dir(dir)
     unless File.exists?(path) do
       if auto_params do
         %{num_bits: nb, num_hashes: nh} = auto_params
         NIF.bloom_file_create(path, nb, nh)
+        _ = NIF.v2_fsync_dir(dir)
       end
     end
     NIF.bloom_file_madd(path, elements)
+  end
+
+  # Creates the prob dir if missing and fsyncs its parent so the new
+  # directory entry is durable. No-op if the dir already exists.
+  defp ensure_prob_dir(dir) do
+    unless File.dir?(dir) do
+      File.mkdir_p!(dir)
+      _ = NIF.v2_fsync_dir(Path.dirname(dir))
+    end
+
+    :ok
   end
 
   defp recover_bloom_meta(key, store, num_bits, num_hashes) do

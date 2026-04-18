@@ -262,6 +262,13 @@ impl Store {
         };
 
         if entry.expire_at_ms != 0 && entry.expire_at_ms <= now_ms {
+            // Logically expired — remove from keydir and write a tombstone so the
+            // key does not resurrect after a store close+reopen.  We intentionally
+            // do NOT call sync() here: the tombstone becomes durable on the next
+            // put/sync or on a clean shutdown.  In the worst case (crash before the
+            // next sync) the expired key re-appears on the following open, the TTL
+            // check fires again, and another tombstone is written — acceptable per
+            // Bitcask crash-recovery semantics. Mirror of the comment in `get`.
             self.keydir.delete(key);
             self.writer.write_tombstone(key)?;
             return Ok(None);

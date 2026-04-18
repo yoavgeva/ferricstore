@@ -1221,7 +1221,8 @@ defmodule FerricstoreServer.Acl do
          :ok <- File.write(tmp, contents),
          :ok <- File.chmod(tmp, 0o600),
          :ok <- fsync_file(tmp),
-         :ok <- File.rename(tmp, path) do
+         :ok <- File.rename(tmp, path),
+         _ <- Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir) do
       :ok
     else
       {:error, reason} ->

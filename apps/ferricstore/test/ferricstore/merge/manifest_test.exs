@@ -261,4 +261,46 @@ defmodule Ferricstore.Merge.ManifestTest do
       refute Manifest.exists?(shard_dir)
     end
   end
+
+  describe "durability" do
+    test "delete/1 fsyncs the directory after removing the manifest", %{dir: dir} do
+      # Write then delete — after delete, neither the manifest file
+      # nor any lingering tmp should be visible. The dir fsync inside
+      # delete/1 is what makes the removal survive a kernel panic.
+      plan = %{shard_index: 0, input_file_ids: [1, 2]}
+      :ok = Manifest.write(dir, plan)
+      assert Manifest.exists?(dir)
+
+      assert :ok = Manifest.delete(dir)
+
+      refute Manifest.exists?(dir),
+             "delete/1 must remove the manifest from the dir listing"
+
+      # Manifest.delete on an already-missing manifest is a no-op :ok.
+      assert :ok = Manifest.delete(dir)
+    end
+
+    test "recover_if_needed removes partial-output files and fsyncs the dir", %{dir: dir} do
+      # Simulate an interrupted merge: manifest exists listing inputs
+      # [1, 2], plus a stale output file with id > 2 left from the
+      # prior crashed merge attempt.
+      :ok = Manifest.write(dir, %{shard_index: 0, input_file_ids: [1, 2]})
+      File.touch!(Path.join(dir, "00001.log"))
+      File.touch!(Path.join(dir, "00002.log"))
+      stale = Path.join(dir, "00003.log")
+      File.touch!(stale)
+
+      Manifest.recover_if_needed(dir, 0)
+
+      refute File.exists?(stale),
+             "recover_if_needed must remove partial-output files"
+
+      refute Manifest.exists?(dir),
+             "recover_if_needed must also delete the manifest"
+
+      # Inputs remain.
+      assert File.exists?(Path.join(dir, "00001.log"))
+      assert File.exists?(Path.join(dir, "00002.log"))
+    end
+  end
 end

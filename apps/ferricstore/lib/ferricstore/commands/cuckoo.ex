@@ -243,17 +243,22 @@ defmodule Ferricstore.Commands.Cuckoo do
 
   defp apply_prob_locally(store, {:cuckoo_create, key, capacity, bucket_size}) do
     path = prob_path(store, key, "cuckoo")
-    File.mkdir_p!(Path.dirname(path))
-    NIF.cuckoo_file_create(path, capacity, bucket_size)
+    dir = Path.dirname(path)
+    ensure_prob_dir(dir)
+    result = NIF.cuckoo_file_create(path, capacity, bucket_size)
+    _ = NIF.v2_fsync_dir(dir)
+    result
   end
 
   defp apply_prob_locally(store, {:cuckoo_add, key, element, auto_params}) do
     path = prob_path(store, key, "cuckoo")
-    File.mkdir_p!(Path.dirname(path))
+    dir = Path.dirname(path)
+    ensure_prob_dir(dir)
     unless File.exists?(path) do
       if auto_params do
         %{capacity: cap, bucket_size: bs} = auto_params
         NIF.cuckoo_file_create(path, cap, bs)
+        _ = NIF.v2_fsync_dir(dir)
       end
     end
     NIF.cuckoo_file_add(path, element)
@@ -261,11 +266,13 @@ defmodule Ferricstore.Commands.Cuckoo do
 
   defp apply_prob_locally(store, {:cuckoo_addnx, key, element, auto_params}) do
     path = prob_path(store, key, "cuckoo")
-    File.mkdir_p!(Path.dirname(path))
+    dir = Path.dirname(path)
+    ensure_prob_dir(dir)
     unless File.exists?(path) do
       if auto_params do
         %{capacity: cap, bucket_size: bs} = auto_params
         NIF.cuckoo_file_create(path, cap, bs)
+        _ = NIF.v2_fsync_dir(dir)
       end
     end
     NIF.cuckoo_file_addnx(path, element)
@@ -274,6 +281,17 @@ defmodule Ferricstore.Commands.Cuckoo do
   defp apply_prob_locally(store, {:cuckoo_del, key, element}) do
     path = prob_path(store, key, "cuckoo")
     NIF.cuckoo_file_del(path, element)
+  end
+
+  # Creates the prob dir if missing and fsyncs its parent so the new
+  # directory entry is durable.
+  defp ensure_prob_dir(dir) do
+    unless File.dir?(dir) do
+      File.mkdir_p!(dir)
+      _ = NIF.v2_fsync_dir(Path.dirname(dir))
+    end
+
+    :ok
   end
 
   # Checks if a cuckoo filter key already exists. Uses store.exists? when

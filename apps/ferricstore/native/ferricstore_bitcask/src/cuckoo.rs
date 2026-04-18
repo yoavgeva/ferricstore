@@ -449,6 +449,14 @@ pub fn cuckoo_file_add<'a>(env: Env<'a>, path: String, element: Binary<'a>) -> N
                 if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
                     return Ok((atoms::error(), e).encode(env));
                 }
+                // Post-eviction placement must be fsynced like the
+                // direct-insert paths above — otherwise a kernel panic
+                // between the slot write and writeback leaves
+                // num_items++ on disk with the fingerprint bytes only
+                // in page cache.
+                if let Err(e) = crate::prob_fsync(&file) {
+                    return Ok((atoms::error(), e).encode(env));
+                }
                 crate::fadvise_dontneed(&file, 0, 0);
                 return Ok((atoms::ok(), 1u64).encode(env));
             }
@@ -637,6 +645,11 @@ pub fn cuckoo_file_addnx<'a>(
                     return Ok((atoms::error(), e).encode(env));
                 }
                 if let Err(e) = cuckoo_file_write_num_items(&file, hdr.num_items + 1) {
+                    return Ok((atoms::error(), e).encode(env));
+                }
+                // Post-eviction placement must be fsynced — see the
+                // matching comment in `cuckoo_file_add`.
+                if let Err(e) = crate::prob_fsync(&file) {
                     return Ok((atoms::error(), e).encode(env));
                 }
                 crate::fadvise_dontneed(&file, 0, 0);

@@ -704,13 +704,18 @@ defmodule FerricStore.Impl do
   @spec flushdb(FerricStore.Instance.t()) :: :ok
   def flushdb(ctx) do
     Router.keys(ctx) |> Enum.each(&Router.delete(ctx, &1))
-    # Clean prob dirs across all shards
+    # Clean prob dirs across all shards. Fsync each prob dir after the
+    # rm loop so the removals survive a crash.
     for i <- 0..(ctx.shard_count - 1) do
       shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, i)
       prob_dir = Path.join(shard_path, "prob")
       case File.ls(prob_dir) do
-        {:ok, files} -> Enum.each(files, &File.rm(Path.join(prob_dir, &1)))
-        _ -> :ok
+        {:ok, files} ->
+          Enum.each(files, &File.rm(Path.join(prob_dir, &1)))
+          _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(prob_dir)
+
+        _ ->
+          :ok
       end
     end
     :ok

@@ -120,7 +120,13 @@ defmodule Ferricstore.Merge.Manifest do
     path = manifest_path(data_dir)
 
     case File.rm(path) do
-      :ok -> :ok
+      :ok ->
+        # Fsync the directory so the manifest's removal is durable —
+        # otherwise on a crash the stale manifest can re-appear and
+        # trigger a spurious "interrupted merge" cleanup on next boot.
+        _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir)
+        :ok
+
       {:error, :enoent} -> :ok
       {:error, reason} -> {:error, reason}
     end
@@ -212,6 +218,12 @@ defmodule Ferricstore.Merge.Manifest do
         files
         |> Enum.filter(&log_or_hint_file?/1)
         |> Enum.each(&maybe_remove_partial(&1, data_dir, max_input_id))
+
+        # One dir fsync after the whole sweep so the removals are
+        # durable. Without this a double-crash can resurrect stale
+        # partial output files.
+        _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir)
+        :ok
 
       {:error, _reason} ->
         :ok

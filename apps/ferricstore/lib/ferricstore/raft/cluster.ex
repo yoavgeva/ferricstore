@@ -42,7 +42,17 @@ defmodule Ferricstore.Raft.Cluster do
   @spec start_system(binary()) :: :ok | {:error, term()}
   def start_system(data_dir) do
     ra_data_dir = Path.join(data_dir, "ra") |> to_charlist()
-    File.mkdir_p!(Path.join(data_dir, "ra"))
+    ra_dir_str = Path.join(data_dir, "ra")
+    created? = not File.dir?(ra_dir_str)
+    File.mkdir_p!(ra_dir_str)
+
+    # Fsync the parent so the `ra/` directory entry is durable. ra
+    # manages its own files' durability internally, but the dir entry
+    # itself needs the parent fsync or a kernel panic between mkdir
+    # and ra's first file-create can lose the directory on reboot.
+    if created? do
+      _ = Ferricstore.Bitcask.NIF.v2_fsync_dir(data_dir)
+    end
 
     names = :ra_system.derive_names(@ra_system)
 

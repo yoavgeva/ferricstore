@@ -264,8 +264,20 @@ defmodule Ferricstore.Commands.TopK do
 
   defp apply_prob_locally(store, {:topk_create, key, k, width, depth, decay}) do
     path = prob_path(store, key, "topk")
-    File.mkdir_p!(Path.dirname(path))
-    NIF.topk_file_create_v2(path, k, width, depth, decay)
+    dir = Path.dirname(path)
+    created_dir? = not File.dir?(dir)
+    File.mkdir_p!(dir)
+
+    if created_dir? do
+      _ = NIF.v2_fsync_dir(Path.dirname(dir))
+    end
+
+    result = NIF.topk_file_create_v2(path, k, width, depth, decay)
+    # Fsync the prob dir so the new filename entry is durable. Matches
+    # the Raft state-machine path's `prob_fsync_dir` after every
+    # *_file_create.
+    _ = NIF.v2_fsync_dir(dir)
+    result
   end
 
   defp apply_prob_locally(store, {:topk_add, key, elements}) do

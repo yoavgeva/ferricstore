@@ -550,7 +550,11 @@ defmodule Ferricstore.Store.Shard.Compound do
         )
 
       if live_entries == [] do
+        # Roll back the `touch!(new_file)` above: remove the empty
+        # placeholder and fsync the dir so no zombie empty file
+        # remains after a crash.
         File.rm(new_file)
+        _ = NIF.v2_fsync_dir(dedicated_path)
         state
       else
         batch = Enum.map(live_entries, fn {k, v, exp} -> {k, v, exp} end)
@@ -598,7 +602,10 @@ defmodule Ferricstore.Store.Shard.Compound do
 
           {:error, reason} ->
             Logger.error("Shard #{state.index}: dedicated compaction write failed: #{inspect(reason)}")
+            # Roll back the `touch!(new_file)` on write error. Fsync
+            # so the rollback survives a subsequent crash.
             File.rm(new_file)
+            _ = NIF.v2_fsync_dir(dedicated_path)
             state
         end
       end
