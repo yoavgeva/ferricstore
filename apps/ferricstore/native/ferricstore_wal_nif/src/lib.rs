@@ -16,11 +16,12 @@ mod wal_handle;
 #[cfg(test)]
 mod tests;
 
-use rustler::{Atom, Binary, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term, Resource};
+use rustler::{Atom, Binary, Env, LocalPid, NifResult, OwnedBinary, ResourceArc, Term};
 use wal_handle::WalHandle;
 
-// Implement Resource trait for WalHandle
-impl Resource for WalHandle {}
+// WalHandle is registered as a NIF resource via `rustler::resource!` in
+// the on_load callback below. The macro auto-implements `Resource`; no
+// manual impl is needed (and would conflict with the macro).
 
 mod atoms {
     rustler::atoms! {
