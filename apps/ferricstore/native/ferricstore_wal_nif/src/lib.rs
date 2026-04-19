@@ -147,4 +147,13 @@ fn flatten_iolist(term: Term, out: &mut Vec<u8>) -> NifResult<()> {
 // NIF Registration
 // ---------------------------------------------------------------------------
 
-rustler::init!("ferricstore_wal_nif");
+/// Called once when the NIF is loaded. Registers resource types so
+/// `ResourceArc::new(WalHandle {...})` works — without this call
+/// `ResourceArc::new` panics with
+/// `Option::unwrap() on a None value` at rustler/src/resource/arc.rs.
+fn on_load(env: Env, _info: Term) -> bool {
+    rustler::resource!(WalHandle, env);
+    true
+}
+
+rustler::init!("ferricstore_wal_nif", load = on_load);
