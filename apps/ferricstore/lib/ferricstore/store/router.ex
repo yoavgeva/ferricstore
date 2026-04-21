@@ -914,6 +914,39 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
+  @spec batch_get(FerricStore.Instance.t(), [binary()]) :: [binary() | nil]
+  def batch_get(ctx, keys) do
+    now = HLC.now_ms()
+
+    Enum.map(keys, fn key ->
+      idx = shard_for(ctx, key)
+      keydir = resolve_keydir(ctx, idx)
+
+      case ets_get_full(ctx, idx, keydir, key, now) do
+        {:hit, value, lfu} ->
+          sampled_read_bookkeeping_fast(ctx, keydir, key, lfu)
+          value
+
+        {:cold, file_id, offset, value_size} when file_id > 0 and value_size > 0 ->
+          shard_path = Ferricstore.DataDir.shard_data_path(ctx.data_dir, idx)
+          path = Path.join(shard_path, "#{String.pad_leading(Integer.to_string(file_id), 5, "0")}.log")
+
+          case Ferricstore.Bitcask.NIF.v2_pread_at(path, offset) do
+            {:ok, value} ->
+              Stats.record_cold_read(ctx, key)
+              warm_ets_after_cold_read(ctx, keydir, key, value, file_id, offset)
+              value
+            _ ->
+              nil
+          end
+
+        _ ->
+          Stats.incr_keyspace_misses(ctx)
+          nil
+      end
+    end)
+  end
+
   @doc """
   Returns `{value, expire_at_ms}` for a live key, or `nil` if the key does
   not exist or is expired.

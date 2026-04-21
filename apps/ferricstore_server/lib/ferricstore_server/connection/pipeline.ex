@@ -93,11 +93,62 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   def pipeline_dispatch(commands, state, handle_command_fn, send_response_fn) do
-    case try_batch_set_fast_path(commands, state, send_response_fn) do
-      {:ok, result} -> result
-      :fallback -> sliding_window_dispatch(commands, state, handle_command_fn, send_response_fn)
+    case try_batch_get_fast_path(commands, state, send_response_fn) do
+      {:ok, result} ->
+        result
+
+      :fallback ->
+        case try_batch_set_fast_path(commands, state, send_response_fn) do
+          {:ok, result} -> result
+          :fallback -> sliding_window_dispatch(commands, state, handle_command_fn, send_response_fn)
+        end
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Batch GET fast path
+  # ---------------------------------------------------------------------------
+
+  defp try_batch_get_fast_path(commands, state, send_response_fn) do
+    if requires_auth?(state) or state.multi_state == :queuing do
+      :fallback
+    else
+      case extract_plain_gets(commands) do
+        {:ok, keys} ->
+          acl_ok = state.acl_cache == :full_access or
+                   (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
+
+          if not acl_ok do
+            :fallback
+          else
+            ctx = state.instance_ctx
+            Stats.incr_commands_by(state.stats_counter, length(keys))
+            values = Router.batch_get(ctx, keys)
+
+            response = Enum.map(values, &Encoder.encode/1)
+            send_response_fn.(state.socket, state.transport, response)
+            {:ok, {:continue, state}}
+          end
+
+        :fallback ->
+          :fallback
+      end
+    end
+  end
+
+  defp extract_plain_gets(commands), do: extract_plain_gets(commands, [])
+
+  defp extract_plain_gets([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp extract_plain_gets([[name, key] | rest], acc) when is_binary(name) and is_binary(key) do
+    if fast_upcase(name) == "GET" do
+      extract_plain_gets(rest, [key | acc])
+    else
+      :fallback
+    end
+  end
+
+  defp extract_plain_gets(_, _acc), do: :fallback
 
   # ---------------------------------------------------------------------------
   # Batch SET fast path
