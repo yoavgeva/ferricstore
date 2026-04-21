@@ -79,16 +79,17 @@ fn thread_loop_inner(
 
     loop {
         // =====================================================================
-        // Phase 1: IDLE — block until first Flush arrives (zero CPU when idle)
+        // Phase 1: IDLE — block until first message (zero CPU when idle)
         // =====================================================================
         let msg = match rx.recv() {
             Ok(msg) => msg,
-            Err(_) => return, // Channel closed — handle dropped
+            Err(_) => return,
         };
 
         match msg {
             ThreadMsg::Close => {
-                let _ = do_final_flush(&mut file, &buffer, &file_size);
+                drain_to_kernel(&mut file, &buffer, &file_size);
+                let _ = file.sync_data();
                 return;
             }
             ThreadMsg::Flush(caller) => {
@@ -97,7 +98,12 @@ fn thread_loop_inner(
         }
 
         // =====================================================================
-        // Phase 2: COMMIT DELAY — wait briefly to batch more (first cycle only)
+        // Phase 2: Drain buffer to kernel immediately (before sync decision)
+        // =====================================================================
+        drain_to_kernel(&mut file, &buffer, &file_size);
+
+        // =====================================================================
+        // Phase 3: Commit delay — collect more Flush requests, keep draining
         // =====================================================================
         if !commit_delay.is_zero() {
             let deadline = Instant::now() + commit_delay;
@@ -109,124 +115,100 @@ fn thread_loop_inner(
                 match rx.recv_timeout(remaining) {
                     Ok(ThreadMsg::Flush(c)) => callers.push(c),
                     Ok(ThreadMsg::Close) => {
-                        do_flush(&mut file, &buffer, &file_size, &mut callers);
-                        let _ = do_final_flush(&mut file, &buffer, &file_size);
+                        drain_to_kernel(&mut file, &buffer, &file_size);
+                        let _ = file.sync_data();
+                        notify_callers_success(&mut callers);
                         return;
                     }
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => {
-                        do_flush(&mut file, &buffer, &file_size, &mut callers);
+                        drain_to_kernel(&mut file, &buffer, &file_size);
+                        let _ = file.sync_data();
+                        notify_callers_success(&mut callers);
                         return;
                     }
                 }
+                drain_to_kernel(&mut file, &buffer, &file_size);
             }
         }
 
         // =====================================================================
-        // Phase 3: SELF-DRIVING LOOP — keep flushing while buffer has data
+        // Phase 4: Self-driving — drain, sync when callers waiting, repeat
         // =====================================================================
         loop {
-            // Flush: take buffer → write → fdatasync → notify callers
-            do_flush(&mut file, &buffer, &file_size, &mut callers);
+            // Drain any remaining buffer to kernel
+            drain_to_kernel(&mut file, &buffer, &file_size);
 
-            // Collect any Flush messages that arrived during I/O (non-blocking)
+            // Sync + notify if we have callers
+            if !callers.is_empty() {
+                match file.sync_data() {
+                    Ok(()) => {
+                        notify_callers_success(&mut callers);
+                    }
+                    Err(e) => {
+                        notify_callers_error(&mut callers, &e);
+                        return;
+                    }
+                }
+            }
+
+            // Collect messages that arrived during I/O
             loop {
                 match rx.try_recv() {
                     Ok(ThreadMsg::Flush(c)) => callers.push(c),
                     Ok(ThreadMsg::Close) => {
-                        let _ = do_final_flush(&mut file, &buffer, &file_size);
+                        drain_to_kernel(&mut file, &buffer, &file_size);
+                        let _ = file.sync_data();
+                        notify_callers_success(&mut callers);
                         return;
                     }
-                    Err(_) => break, // No more messages
+                    Err(_) => break,
                 }
             }
 
-            // Check: is there more data in the buffer?
+            // More callers arrived? Drain and loop for another sync.
+            if !callers.is_empty() {
+                continue;
+            }
+
+            // Buffer has data? Drain it to kernel (writes flow continuously).
             let has_data = {
                 let buf = buffer.lock().expect("buffer mutex poisoned");
                 !buf.is_empty()
             };
-
             if has_data {
-                // More data arrived during I/O — loop immediately (no delay).
-                // If we have no callers yet, that's fine — they'll arrive by
-                // the time we finish the next flush, and we'll collect them.
                 continue;
             }
 
-            // Buffer empty. If we have pending callers (Flush messages arrived
-            // but no data), they need to be notified after a sync.
-            if !callers.is_empty() {
-                // Sync for the callers (even if buffer was empty, they expect
-                // {wal_sync_complete} which guarantees prior writes are durable).
-                do_flush(&mut file, &buffer, &file_size, &mut callers);
-                continue;
-            }
-
-            // Truly idle: no data, no callers. Return to Phase 1.
+            // Truly idle. Return to Phase 1.
             break;
         }
     }
 }
 
-/// Take the shared buffer, write to disk, fdatasync, notify all callers.
-fn do_flush(
+/// Drain shared buffer to kernel page cache. No fdatasync.
+/// Returns true if data was written.
+fn drain_to_kernel(
     file: &mut File,
     buffer: &Mutex<AlignedBuffer>,
     file_size: &AtomicU64,
-    callers: &mut Vec<FlushCaller>,
-) {
-    // Take ownership of buffered data (nanoseconds under lock)
+) -> bool {
     let taken = {
         let mut buf = buffer.lock().expect("buffer mutex poisoned");
         buf.take()
     };
 
-    let bytes_this_flush = taken.logical_len as u64;
-
-    // Write to disk if there's data
-    if !taken.is_empty() {
-        let write_slice = taken.as_padded_slice();
-        match write_all_retry(file, write_slice) {
-            Ok(()) => {
-                file_size.fetch_add(bytes_this_flush, Ordering::Release);
-            }
-            Err(e) => {
-                notify_callers_error(callers, &e);
-                return;
-            }
-        }
+    if taken.is_empty() {
+        return false;
     }
 
-    // fdatasync
-    match file.sync_data() {
-        Ok(()) => {
-            notify_callers_success(callers);
-        }
-        Err(e) => {
-            notify_callers_error(callers, &e);
-        }
-    }
-}
-
-/// Final flush on close: take any remaining buffer, write, sync.
-fn do_final_flush(
-    file: &mut File,
-    buffer: &Mutex<AlignedBuffer>,
-    file_size: &AtomicU64,
-) -> io::Result<()> {
-    let taken = {
-        let mut buf = buffer.lock().expect("buffer mutex poisoned");
-        buf.take()
-    };
-
-    if !taken.is_empty() {
-        write_all_retry(file, taken.as_padded_slice())?;
-        file_size.fetch_add(taken.logical_len as u64, Ordering::Release);
-    }
-
-    file.sync_data()?;
-    Ok(())
+    let bytes = taken.logical_len as u64;
+    // write_all_retry only fails on persistent I/O errors — panic is appropriate
+    // since the WAL is unrecoverable at that point.
+    write_all_retry(file, taken.as_padded_slice())
+        .expect("WAL write failed");
+    file_size.fetch_add(bytes, Ordering::Release);
+    true
 }
 
 /// Write with retry on EINTR.
@@ -444,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn test_do_flush_writes_and_syncs() {
+    fn test_drain_to_kernel() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
@@ -453,27 +435,21 @@ mod tests {
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
 
-        // Write some data into the buffer
         {
             let mut buf = buffer.lock().unwrap();
             buf.extend(b"test data 12345");
         }
 
-        // Flush (no callers to notify in pure Rust test)
-        let mut callers = Vec::new();
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
-
-        // Verify file_size was updated
+        assert!(drain_to_kernel(&mut file, &buffer, &file_size));
         assert_eq!(file_size.load(Ordering::Acquire), 15);
 
-        // Verify data on disk (may be padded for O_DIRECT)
         let contents = std::fs::read(&path).unwrap();
         assert!(contents.len() >= 15);
         assert_eq!(&contents[..15], b"test data 12345");
     }
 
     #[test]
-    fn test_do_flush_empty_buffer() {
+    fn test_drain_empty_buffer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
@@ -482,15 +458,12 @@ mod tests {
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
 
-        let mut callers = Vec::new();
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
-
-        // No data should have been written
+        assert!(!drain_to_kernel(&mut file, &buffer, &file_size));
         assert_eq!(file_size.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn test_do_flush_multiple_writes() {
+    fn test_drain_multiple_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
@@ -499,26 +472,23 @@ mod tests {
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
 
-        // First write
         {
             let mut buf = buffer.lock().unwrap();
             buf.extend(b"first ");
         }
-        let mut callers = Vec::new();
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
+        assert!(drain_to_kernel(&mut file, &buffer, &file_size));
         assert_eq!(file_size.load(Ordering::Acquire), 6);
 
-        // Second write (appends to file)
         {
             let mut buf = buffer.lock().unwrap();
             buf.extend(b"second");
         }
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
+        assert!(drain_to_kernel(&mut file, &buffer, &file_size));
         assert_eq!(file_size.load(Ordering::Acquire), 12);
     }
 
     #[test]
-    fn test_do_final_flush() {
+    fn test_drain_then_sync() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
@@ -532,7 +502,8 @@ mod tests {
             buf.extend(b"final data");
         }
 
-        do_final_flush(&mut file, &buffer, &file_size).unwrap();
+        drain_to_kernel(&mut file, &buffer, &file_size);
+        file.sync_data().unwrap();
         assert_eq!(file_size.load(Ordering::Acquire), 10);
     }
 
@@ -692,8 +663,8 @@ mod tests {
             buf.extend(&data);
         }
 
-        let mut callers = Vec::new();
-        do_flush(&mut file, &buffer, &file_size, &mut callers);
+        drain_to_kernel(&mut file, &buffer, &file_size);
+        file.sync_data().unwrap();
 
         assert_eq!(file_size.load(Ordering::Acquire), 10 * 1024 * 1024);
         let contents = std::fs::read(&path).unwrap();

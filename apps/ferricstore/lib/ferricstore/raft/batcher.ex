@@ -99,7 +99,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   alias Ferricstore.NamespaceConfig
 
-  @default_max_batch_size 5_000
+  @default_max_batch_size 50_000
 
   # Async retry tuning (Option R1 from the rejected-retry design). When Ra
   # returns :rejected {:not_leader, hint, corr} for an async batch, the
