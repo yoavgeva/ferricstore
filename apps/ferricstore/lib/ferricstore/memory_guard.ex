@@ -729,6 +729,7 @@ defmodule Ferricstore.MemoryGuard do
     cgroup_v2_limit()
     || cgroup_v1_limit()
     || host_total_memory()
+    || proc_meminfo_total()
     || 1_073_741_824
   end
 
@@ -765,6 +766,21 @@ defmodule Ferricstore.MemoryGuard do
       end
     rescue _ -> nil
     catch _, _ -> nil
+    end
+  end
+
+  defp proc_meminfo_total do
+    case File.read("/proc/meminfo") do
+      {:ok, content} ->
+        case Regex.run(~r/MemTotal:\s+(\d+)\s+kB/, content) do
+          [_, kb_str] ->
+            case Integer.parse(kb_str) do
+              {kb, _} -> kb * 1024
+              _ -> nil
+            end
+          _ -> nil
+        end
+      _ -> nil
     end
   end
 

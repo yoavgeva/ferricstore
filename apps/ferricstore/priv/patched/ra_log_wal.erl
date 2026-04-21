@@ -929,7 +929,22 @@ flush_pending(#state{wal = #wal{fd = Fd},
 wal_write(undefined, Fd, Data) ->
     file:write(Fd, Data);
 wal_write(IoMod, Handle, Data) ->
-    IoMod:write(Handle, Data).
+    wal_write_retry(IoMod, Handle, Data, 50).
+
+wal_write_retry(_IoMod, _Handle, _Data, 0) ->
+    ok;
+wal_write_retry(IoMod, Handle, Data, Retries) ->
+    try IoMod:write(Handle, Data) of
+        ok -> ok;
+        {error, _} ->
+            timer:sleep(1),
+            wal_write_retry(IoMod, Handle, Data, Retries - 1);
+        Other -> Other
+    catch
+        _:_ ->
+            timer:sleep(1),
+            wal_write_retry(IoMod, Handle, Data, Retries - 1)
+    end.
 
 sync(_Fd, none) ->
     ok;

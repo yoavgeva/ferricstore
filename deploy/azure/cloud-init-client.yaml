@@ -68,7 +68,9 @@ write_files:
         git clone https://github.com/yoavgeva/ferricstore.git "$HOME/ferricstore"
       fi
       cd "$HOME/ferricstore"
-      git pull
+      git fetch origin
+      git checkout perf/write-throughput-optimization
+      git pull origin perf/write-throughput-optimization
       export FERRICSTORE_BUILD_NIF=1
       mix local.hex --force
       mix local.rebar --force

@@ -19,6 +19,7 @@ SSH_USER=${3:-ferric}
 CLIENTS=50
 THREADS=4
 REQUESTS=100000
+PIPELINE=50
 DATA_SIZE=256
 KEY_MAX=1000000
 PREPOP_KEYS=100000
@@ -43,7 +44,8 @@ restart_ferricstore() {
   ssh ${SSH_USER}@${SERVER} "sudo mkdir -p /etc/systemd/system/ferricstore.service.d && \
     echo '[Service]
 Environment=FERRICSTORE_SHARD_COUNT=${shards}
-Environment=FERRICSTORE_NAMESPACE_DURABILITY=async:=async' | sudo tee /etc/systemd/system/ferricstore.service.d/bench.conf > /dev/null && \
+Environment=FERRICSTORE_NAMESPACE_DURABILITY=async:=async
+Environment=FERRICSTORE_PROTECTED_MODE=false' | sudo tee /etc/systemd/system/ferricstore.service.d/bench.conf > /dev/null && \
     sudo systemctl daemon-reload && \
     sudo systemctl start ferricstore"
 
@@ -67,8 +69,10 @@ prepopulate() {
     --protocol=resp3 \
     --clients=50 --threads=4 \
     --requests=$((PREPOP_KEYS / 50 / 4)) \
+    --pipeline=$PIPELINE \
     --command="SET bench:read:__key__ __data__" \
-    --key-pattern=P:P --key-minimum=1 --key-maximum=$PREPOP_KEYS \
+    --command-key-pattern=P \
+    --key-minimum=1 --key-maximum=$PREPOP_KEYS \
     --data-size=$DATA_SIZE \
     --hide-histogram > /dev/null 2>&1
   log "Pre-population done"
@@ -87,8 +91,9 @@ run_bench() {
     --protocol=resp3 \
     --clients=$CLIENTS --threads=$THREADS \
     --requests=$REQUESTS \
+    --pipeline=$PIPELINE \
     --data-size=$DATA_SIZE \
-    --key-pattern=R:R --key-minimum=1 --key-maximum=$KEY_MAX \
+    --key-minimum=1 --key-maximum=$KEY_MAX \
     --json-out-file="$json_file" \
     --hide-histogram \
     "$@" 2>&1 | tee "$RESULTS_DIR/${label}.txt"
@@ -136,7 +141,7 @@ cat > "$RESULTS_DIR/metadata.txt" << EOF
 === Shard Benchmark ===
 Date: $(date)
 Server: $SERVER:$PORT
-Clients: $CLIENTS, Threads: $THREADS
+Clients: $CLIENTS, Threads: $THREADS, Pipeline: $PIPELINE
 Requests: $REQUESTS per run
 Data size: ${DATA_SIZE}B
 Key space: $KEY_MAX
@@ -180,6 +185,7 @@ for SHARDS in 2 3 4; do
 
   # Mixed 80/20
   run_bench "mixed" $SHARDS "mixed_80_20" \
+    --key-pattern=R:R \
     --ratio=1:4 \
     --key-maximum=$PREPOP_KEYS
   extract_to_csv $SHARDS "mixed_80_20"

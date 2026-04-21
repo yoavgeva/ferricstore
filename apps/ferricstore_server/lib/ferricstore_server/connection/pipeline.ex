@@ -137,14 +137,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
                   {:ok, do_batch_set_quorum(kv_pairs, state, send_response_fn)}
 
                 :mixed ->
-                  {async_kvs, quorum_kvs} = Enum.split_with(kv_pairs, fn {key, _} ->
-                    Router.durability_for_key_public(ctx, key) == :async
-                  end)
-
-                  if quorum_kvs == [] do
-                    {:ok, do_batch_set_async(async_kvs, state, send_response_fn)}
-                  else
-                    :fallback
+                  case classify_batch_durability(ctx, kv_pairs) do
+                    :all_async ->
+                      {:ok, do_batch_set_async(kv_pairs, state, send_response_fn)}
+                    :all_quorum ->
+                      {:ok, do_batch_set_quorum(kv_pairs, state, send_response_fn)}
+                    :mixed ->
+                      :fallback
                   end
               end
             end
@@ -171,6 +170,20 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp extract_plain_sets(_, _acc), do: :fallback
+
+  defp classify_batch_durability(_ctx, []), do: :all_quorum
+  defp classify_batch_durability(ctx, [{first_key, _} | rest]) do
+    first = Router.durability_for_key_public(ctx, first_key)
+    if all_same_durability?(ctx, rest, first), do: durability_to_class(first), else: :mixed
+  end
+
+  defp all_same_durability?(_ctx, [], _expected), do: true
+  defp all_same_durability?(ctx, [{key, _} | rest], expected) do
+    Router.durability_for_key_public(ctx, key) == expected and all_same_durability?(ctx, rest, expected)
+  end
+
+  defp durability_to_class(:async), do: :all_async
+  defp durability_to_class(:quorum), do: :all_quorum
 
   defp do_batch_set_async(kv_pairs, state, send_response_fn) do
     Stats.incr_commands_by(state.stats_counter, length(kv_pairs))

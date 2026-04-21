@@ -327,7 +327,40 @@ defmodule Ferricstore.NamespaceConfig do
       _ -> :ok
     end
 
+    apply_env_namespace_overrides()
+
     {:ok, %{}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Env var: FERRICSTORE_NAMESPACE_DURABILITY
+  # Format: "prefix1=mode1,prefix2=mode2" e.g. "async:=async,cache:=async"
+  # ---------------------------------------------------------------------------
+
+  defp apply_env_namespace_overrides do
+    case System.get_env("FERRICSTORE_NAMESPACE_DURABILITY") do
+      nil -> :ok
+      "" -> :ok
+      raw ->
+        raw
+        |> String.split(",", trim: true)
+        |> Enum.each(fn pair ->
+          case String.split(pair, "=", parts: 2) do
+            [prefix, mode] ->
+              prefix = String.trim(prefix)
+              mode = String.trim(mode)
+              case set(prefix, "durability", mode, "env") do
+                :ok -> :ok
+                {:error, reason} ->
+                  require Logger
+                  Logger.warning("FERRICSTORE_NAMESPACE_DURABILITY: failed to set #{prefix}=#{mode}: #{reason}")
+              end
+            _ ->
+              require Logger
+              Logger.warning("FERRICSTORE_NAMESPACE_DURABILITY: invalid entry #{inspect(pair)}")
+          end
+        end)
+    end
   end
 
   # ---------------------------------------------------------------------------
