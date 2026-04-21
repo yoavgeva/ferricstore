@@ -161,11 +161,12 @@ defmodule FerricstoreServer.Application do
   # child spec suitable for embedding in any supervisor.  The listener will
   # bind to `port` (0 = ephemeral, useful in tests).
   defp ranch_listener_spec(port) do
+    nodelay = Application.get_env(:ferricstore, :tcp_nodelay, true)
     transport_opts = %{socket_opts: [
       port: port,
-      nodelay: true,
-      recbuf: 65_536,
-      sndbuf: 65_536,
+      nodelay: nodelay,
+      recbuf: Application.get_env(:ferricstore, :tcp_recbuf, 131_072),
+      sndbuf: Application.get_env(:ferricstore, :tcp_sndbuf, 131_072),
       backlog: 1024,
       keepalive: true
     ]}

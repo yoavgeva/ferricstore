@@ -270,20 +270,24 @@ fn notify_callers_error(callers: &mut Vec<FlushCaller>, error: &io::Error) {
     }
 }
 
+/// ra WAL header: "RAWA" (4 bytes) + version (1 byte) = 5 bytes.
+/// Written by ra_log_wal:make_tmp/1 before the NIF opens the file.
+pub const WAL_HEADER_SIZE: u64 = 5;
+
 // ---------------------------------------------------------------------------
 // File opening
 // ---------------------------------------------------------------------------
 
 /// Open a WAL file with platform-appropriate flags.
+/// Seeks past the WAL header so writes start at offset 5.
 pub fn open_wal_file(path: &str, pre_allocate_bytes: u64) -> io::Result<(File, bool)> {
     #[cfg(target_os = "linux")]
-    {
-        open_wal_file_linux(path, pre_allocate_bytes)
-    }
+    let (mut file, o_direct) = open_wal_file_linux(path, pre_allocate_bytes)?;
     #[cfg(not(target_os = "linux"))]
-    {
-        open_wal_file_fallback(path, pre_allocate_bytes)
-    }
+    let (mut file, o_direct) = open_wal_file_fallback(path, pre_allocate_bytes)?;
+
+    file.seek(SeekFrom::Start(WAL_HEADER_SIZE))?;
+    Ok((file, o_direct))
 }
 
 #[cfg(target_os = "linux")]

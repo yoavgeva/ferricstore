@@ -34,10 +34,18 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
     %{nodes: nodes}
   end
 
-  # Helper: execute a Router function on a remote peer node with ctx.
   defp remote_router(node_name, fun, args) do
     ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
     :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
+  end
+
+  defp eventually(fun, attempts \\ 50, interval_ms \\ 100) do
+    fun.()
+  rescue
+    e in [ExUnit.AssertionError] ->
+      if attempts <= 1, do: reraise(e, __STACKTRACE__)
+      :timer.sleep(interval_ms)
+      eventually(fun, attempts - 1, interval_ms)
   end
 
   # ---------------------------------------------------------------------------
@@ -57,28 +65,24 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
         key = "ra001:committed:#{node.index}"
         val = "quorum_val_#{node.index}"
 
-        # PUT should return :ok only after Raft commit
         result = remote_router(node.name, :put, [key, val, 0])
-        assert result == :ok, "PUT should succeed (Raft commit on self-quorum)"
+        assert result == :ok, "PUT should succeed, got: #{inspect(result)} on #{node.name}"
 
-        # Immediately after ACK, the entry must be in the ra log.
-        # We verify by checking ra:members returns a valid leader and
-        # the value is readable (proving apply() ran after commit).
         shard_idx = remote_router(node.name, :shard_for, [key])
         server_id = {:"ferricstore_shard_#{shard_idx}", node.name}
 
-        # ra:members confirms the server is healthy with a committed log
         {:ok, members, {_leader_name, leader_node}} =
           :rpc.call(node.name, :ra, :members, [server_id])
 
-        assert leader_node == node.name,
-               "node should be its own leader in single-node mode"
+        assert is_atom(leader_node), "should have a leader"
+        assert length(members) == 3, "ra group should have 3 members"
 
-        assert members != [], "ra group should have at least 1 member"
-
-        # Value must be readable immediately after ACK (apply ran)
-        read_val = remote_router(node.name, :get, [key])
-        assert read_val == val, "value should be readable immediately after Raft commit ACK"
+        # Value must be readable on the leader (where apply happened).
+        # On followers, apply may lag — wait briefly for replication.
+        eventually(fn ->
+          read_val = remote_router(leader_node, :get, [key])
+          assert read_val == val, "value should be readable on leader after Raft commit ACK"
+        end)
       end)
     end
   end
@@ -98,19 +102,24 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
     test "SET on one node, GET returns value on same node (single-node Raft)", %{nodes: nodes} do
       [n1, n2, n3] = nodes
 
-      # Write on n1
+      # Write on n1 — may forward to leader if n1 isn't leader for the shard
       :ok = remote_router(n1.name, :put, ["ra002:key", "applied", 0])
 
-      # Readable on n1 (the only member of its Raft group)
-      assert remote_router(n1.name, :get, ["ra002:key"]) == "applied"
+      # Readable on n1 after apply (may need brief wait if forwarded to leader)
+      eventually(fn ->
+        assert remote_router(n1.name, :get, ["ra002:key"]) == "applied"
+      end)
 
-      # In single-node mode, n2 and n3 are independent and won't see n1's data.
-      # Verify they each independently apply their own writes.
+      # All nodes in the same Raft group — writes replicate to all members.
       :ok = remote_router(n2.name, :put, ["ra002:n2_key", "n2_val", 0])
       :ok = remote_router(n3.name, :put, ["ra002:n3_key", "n3_val", 0])
 
-      assert remote_router(n2.name, :get, ["ra002:n2_key"]) == "n2_val"
-      assert remote_router(n3.name, :get, ["ra002:n3_key"]) == "n3_val"
+      eventually(fn ->
+        assert remote_router(n2.name, :get, ["ra002:n2_key"]) == "n2_val"
+      end)
+      eventually(fn ->
+        assert remote_router(n3.name, :get, ["ra002:n3_key"]) == "n3_val"
+      end)
     end
 
     @tag :cluster
@@ -198,17 +207,22 @@ defmodule Ferricstore.Cluster.RaftLogReplicationTest do
     @tag :cluster
     test "delete + re-write sequence is deterministic across nodes", %{nodes: nodes} do
       Enum.each(nodes, fn node ->
-        :ok = remote_router(node.name, :put, ["ra005:del", "exists", 0])
-        :ok = remote_router(node.name, :delete, ["ra005:del"])
-        nil_val = remote_router(node.name, :get, ["ra005:del"])
-        assert nil_val == nil, "key should be nil after delete"
+        :ok = remote_router(node.name, :put, ["ra005:del:#{node.index}", "exists", 0])
+        :ok = remote_router(node.name, :delete, ["ra005:del:#{node.index}"])
 
-        :ok = remote_router(node.name, :put, ["ra005:del", "reborn", 0])
+        eventually(fn ->
+          nil_val = remote_router(node.name, :get, ["ra005:del:#{node.index}"])
+          assert nil_val == nil, "key should be nil after delete"
+        end)
+
+        :ok = remote_router(node.name, :put, ["ra005:del:#{node.index}", "reborn", 0])
       end)
 
       Enum.each(nodes, fn node ->
-        val = remote_router(node.name, :get, ["ra005:del"])
-        assert val == "reborn", "RA-005: delete+re-write should be deterministic"
+        eventually(fn ->
+          val = remote_router(node.name, :get, ["ra005:del:#{node.index}"])
+          assert val == "reborn", "RA-005: delete+re-write should be deterministic"
+        end)
       end)
     end
   end
@@ -353,14 +367,15 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
       assert elapsed < 3_000,
              "LE-001: leaders should be confirmed within 3 seconds, took #{elapsed}ms"
 
-      # Verify each remaining node is its own leader
-      Enum.each(remaining, fn node ->
-        for shard <- 0..3 do
-          server_id = {:"ferricstore_shard_#{shard}", node.name}
-          {:ok, _members, {_name, leader}} = :rpc.call(node.name, :ra, :members, [server_id])
-          assert leader == node.name, "LE-001: #{node.name} should be leader for shard #{shard}"
-        end
-      end)
+      remaining_names = Enum.map(remaining, & &1.name)
+
+      for shard <- 0..3 do
+        node = hd(remaining)
+        server_id = {:"ferricstore_shard_#{shard}", node.name}
+        {:ok, _members, {_name, leader}} = :rpc.call(node.name, :ra, :members, [server_id])
+        assert leader in remaining_names,
+               "LE-001: leader for shard #{shard} should be a surviving node, got #{inspect(leader)}"
+      end
     end
   end
 
@@ -376,9 +391,7 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
 
   describe "LE-002: single leader per shard" do
     @tag :cluster
-    test "each node reports itself as leader for all shards (single-node mode)", %{
-      nodes: nodes
-    } do
+    test "each shard has exactly one leader across the cluster", %{nodes: nodes} do
       alive_nodes =
         Enum.filter(nodes, fn node ->
           case :rpc.call(node.name, Node, :self, []) do
@@ -387,31 +400,30 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
           end
         end)
 
-      Enum.each(alive_nodes, fn node ->
-        for shard <- 0..3 do
-          server_id = {:"ferricstore_shard_#{shard}", node.name}
-          result = :rpc.call(node.name, :ra, :members, [server_id])
+      for shard <- 0..3 do
+        leaders =
+          Enum.map(alive_nodes, fn node ->
+            server_id = {:"ferricstore_shard_#{shard}", node.name}
+            case :rpc.call(node.name, :ra, :members, [server_id]) do
+              {:ok, _members, {_leader_name, leader_node}} ->
+                leader_node
+              _ ->
+                flunk("LE-002: ra:members failed for shard #{shard} on #{node.name}")
+            end
+          end)
+          |> Enum.uniq()
 
-          case result do
-            {:ok, members, {_leader_name, leader_node}} ->
-              assert leader_node == node.name,
-                     "LE-002: shard #{shard} on #{node.name} should have self as leader, " <>
-                       "but leader is #{inspect(leader_node)}"
+        assert length(leaders) == 1,
+               "LE-002: shard #{shard} should have exactly one leader, got #{inspect(leaders)}"
 
-              # In single-node mode, the member list should have exactly 1 entry
-              assert length(members) == 1,
-                     "LE-002: shard #{shard} on #{node.name} should have 1 member, " <>
-                       "got #{length(members)}"
-
-            _ ->
-              flunk("LE-002: ra:members failed for shard #{shard} on #{node.name}: #{inspect(result)}")
-          end
-        end
-      end)
+        [leader] = leaders
+        assert leader in Enum.map(alive_nodes, & &1.name),
+               "LE-002: leader for shard #{shard} should be an alive node"
+      end
     end
 
     @tag :cluster
-    test "no node claims to be leader for another node's shard", %{nodes: nodes} do
+    test "all nodes agree on the leader for each shard", %{nodes: nodes} do
       alive_nodes =
         Enum.filter(nodes, fn node ->
           case :rpc.call(node.name, Node, :self, []) do
@@ -420,24 +432,21 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
           end
         end)
 
-      # Collect all leadership claims: {shard, node_claiming_leadership}
-      claims =
-        for node <- alive_nodes, shard <- 0..3 do
-          server_id = {:"ferricstore_shard_#{shard}", node.name}
-
-          case :rpc.call(node.name, :ra, :members, [server_id]) do
-            {:ok, _members, {_name, leader}} -> {shard, node.name, leader}
-            _ -> nil
+      for shard <- 0..3 do
+        claims =
+          for node <- alive_nodes do
+            server_id = {:"ferricstore_shard_#{shard}", node.name}
+            case :rpc.call(node.name, :ra, :members, [server_id]) do
+              {:ok, _members, {_name, leader}} -> leader
+              _ -> nil
+            end
           end
-        end
-        |> Enum.reject(&is_nil/1)
+          |> Enum.reject(&is_nil/1)
+          |> Enum.uniq()
 
-      # In single-node mode, every node should claim itself as leader
-      Enum.each(claims, fn {shard, queried_node, claimed_leader} ->
-        assert queried_node == claimed_leader,
-               "LE-002: node #{queried_node} claims leader for shard #{shard} is " <>
-                 "#{claimed_leader} (should be self)"
-      end)
+        assert length(claims) == 1,
+               "LE-002: nodes disagree on leader for shard #{shard}: #{inspect(claims)}"
+      end
     end
   end
 end
@@ -553,5 +562,14 @@ defmodule Ferricstore.Cluster.SnapshotJoinTest do
         ClusterHelper.stop_cluster(all_nodes)
       end
     end
+  end
+
+  defp eventually(fun, attempts \\ 50, interval_ms \\ 100) do
+    fun.()
+  rescue
+    e in [ExUnit.AssertionError] ->
+      if attempts <= 1, do: reraise(e, __STACKTRACE__)
+      :timer.sleep(interval_ms)
+      eventually(fun, attempts - 1, interval_ms)
   end
 end

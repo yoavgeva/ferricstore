@@ -4,9 +4,13 @@
 
 #[cfg(test)]
 mod integration {
+    use crate::background_thread::WAL_HEADER_SIZE;
     use crate::wal_handle::WalHandle;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    const HDR: u64 = WAL_HEADER_SIZE;
+    const HDR_USIZE: usize = WAL_HEADER_SIZE as usize;
 
     // -----------------------------------------------------------------------
     // Basic operations
@@ -19,18 +23,17 @@ mod integration {
 
         let handle = WalHandle::open(path.clone(), 0, 0, 64 * 1024 * 1024).unwrap();
         assert!(handle.check_alive().is_ok());
-        assert_eq!(handle.file_size(), 0);
+        assert_eq!(handle.file_size(), HDR);
 
         handle.buffer_write(b"entry1").unwrap();
         handle.buffer_write(b"entry2").unwrap();
         handle.close().unwrap();
 
-        assert_eq!(handle.file_size(), 12);
+        assert_eq!(handle.file_size(), HDR + 12);
         assert!(handle.check_alive().is_err());
 
-        // Verify on disk
         let contents = std::fs::read(&path).unwrap();
-        assert_eq!(&contents[..12], b"entry1entry2");
+        assert_eq!(&contents[HDR_USIZE..HDR_USIZE + 12], b"entry1entry2");
     }
 
     #[test]
@@ -69,7 +72,7 @@ mod integration {
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 0);
+        assert_eq!(handle.file_size(), HDR);
     }
 
     // -----------------------------------------------------------------------
@@ -90,7 +93,7 @@ mod integration {
         }
 
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 100_000 * data.len() as u64);
+        assert_eq!(handle.file_size(), HDR + 100_000 * data.len() as u64);
     }
 
     #[test]
@@ -145,7 +148,7 @@ mod integration {
         }
 
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 50 * 1000 * 1024);
+        assert_eq!(handle.file_size(), HDR + 50 * 1000 * 1024);
     }
 
     #[test]
@@ -170,9 +173,9 @@ mod integration {
         let path = dir.path().join("empty.wal").to_str().unwrap().to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
-        handle.buffer_write(b"").unwrap(); // empty write should be fine
+        handle.buffer_write(b"").unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 0);
+        assert_eq!(handle.file_size(), HDR);
     }
 
     #[test]
@@ -183,7 +186,7 @@ mod integration {
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"X").unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 1);
+        assert_eq!(handle.file_size(), HDR + 1);
     }
 
     #[test]
@@ -198,7 +201,7 @@ mod integration {
         handle.buffer_write(&data).unwrap();
         handle.close().unwrap();
 
-        assert_eq!(handle.file_size(), 10 * 1024 * 1024);
+        assert_eq!(handle.file_size(), HDR + 10 * 1024 * 1024);
     }
 
     #[test]
@@ -214,7 +217,7 @@ mod integration {
         }
 
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 50_000);
+        assert_eq!(handle.file_size(), HDR + 50_000);
     }
 
     #[test]
@@ -227,7 +230,7 @@ mod integration {
         let data = vec![0xAA; 4096];
         handle.buffer_write(&data).unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 4096);
+        assert_eq!(handle.file_size(), HDR + 4096);
     }
 
     #[test]
@@ -240,12 +243,11 @@ mod integration {
         let data = vec![0xBB; 4097];
         handle.buffer_write(&data).unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 4097); // logical size is exact
+        assert_eq!(handle.file_size(), HDR + 4097);
 
-        // On-disk file may be padded
         let on_disk = std::fs::read(&path).unwrap();
-        assert!(on_disk.len() >= 4097);
-        assert_eq!(&on_disk[..4097], &data[..]);
+        assert!(on_disk.len() >= HDR_USIZE + 4097);
+        assert_eq!(&on_disk[HDR_USIZE..HDR_USIZE + 4097], &data[..]);
     }
 
     #[test]
@@ -258,7 +260,7 @@ mod integration {
         let data = vec![0xCC; 4095];
         handle.buffer_write(&data).unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 4095);
+        assert_eq!(handle.file_size(), HDR + 4095);
     }
 
     // -----------------------------------------------------------------------
@@ -363,10 +365,10 @@ mod integration {
         handle.buffer_write(b"0123456789ABCDEF").unwrap();
         handle.close().unwrap();
 
-        assert_eq!(&handle.pread(0, 4).unwrap(), b"0123");
-        assert_eq!(&handle.pread(4, 4).unwrap(), b"4567");
-        assert_eq!(&handle.pread(10, 6).unwrap(), b"ABCDEF");
-        assert_eq!(&handle.pread(0, 16).unwrap(), b"0123456789ABCDEF");
+        assert_eq!(&handle.pread(HDR + 0, 4).unwrap(), b"0123");
+        assert_eq!(&handle.pread(HDR + 4, 4).unwrap(), b"4567");
+        assert_eq!(&handle.pread(HDR + 10, 6).unwrap(), b"ABCDEF");
+        assert_eq!(&handle.pread(HDR + 0, 16).unwrap(), b"0123456789ABCDEF");
     }
 
     #[test]
@@ -378,7 +380,7 @@ mod integration {
         handle.buffer_write(b"ABCDE").unwrap();
         handle.close().unwrap();
 
-        assert_eq!(&handle.pread(2, 1).unwrap(), b"C");
+        assert_eq!(&handle.pread(HDR + 2, 1).unwrap(), b"C");
     }
 
     #[test]
@@ -390,8 +392,7 @@ mod integration {
         handle.buffer_write(b"12345").unwrap();
         handle.close().unwrap();
 
-        // Read last byte
-        assert_eq!(&handle.pread(4, 1).unwrap(), b"5");
+        assert_eq!(&handle.pread(HDR + 4, 1).unwrap(), b"5");
     }
 
     #[test]
@@ -403,8 +404,7 @@ mod integration {
         handle.buffer_write(b"short").unwrap();
         handle.close().unwrap();
 
-        // Reading beyond data — may read padding zeros or fail
-        let result = handle.pread(0, 100);
+        let result = handle.pread(HDR, 100);
         let _ = result; // no crash or UB
     }
 
@@ -417,7 +417,7 @@ mod integration {
         handle.buffer_write(b"data").unwrap();
         handle.close().unwrap();
 
-        let result = handle.pread(0, 0).unwrap();
+        let result = handle.pread(HDR, 0).unwrap();
         assert!(result.is_empty());
     }
 
@@ -431,7 +431,7 @@ mod integration {
         handle.buffer_write(&data).unwrap();
         handle.close().unwrap();
 
-        let result = handle.pread(0, 1024 * 1024).unwrap();
+        let result = handle.pread(HDR, 1024 * 1024).unwrap();
         assert_eq!(result.len(), 1024 * 1024);
         assert_eq!(&result[..], &data[..]);
     }
@@ -493,11 +493,10 @@ mod integration {
         }
         handle.close().unwrap();
 
-        // Read back and verify
         let contents = std::fs::read(&path).unwrap();
         for i in 0u32..1000 {
             let expected = format!("ENTRY_{i:05}_DATA\n");
-            let offset = i as usize * expected.len();
+            let offset = HDR_USIZE + i as usize * expected.len();
             assert_eq!(
                 &contents[offset..offset + expected.len()],
                 expected.as_bytes(),
@@ -523,9 +522,9 @@ mod integration {
         handle.buffer_write(&data).unwrap();
         handle.close().unwrap();
 
-        assert_eq!(handle.file_size(), 25600);
+        assert_eq!(handle.file_size(), HDR + 25600);
         let contents = std::fs::read(&path).unwrap();
-        assert_eq!(&contents[..25600], &data[..]);
+        assert_eq!(&contents[HDR_USIZE..HDR_USIZE + 25600], &data[..]);
     }
 
     #[test]
@@ -551,10 +550,10 @@ mod integration {
         }
 
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), expected.len() as u64);
+        assert_eq!(handle.file_size(), HDR + expected.len() as u64);
 
         let contents = std::fs::read(&path).unwrap();
-        assert_eq!(&contents[..expected.len()], &expected[..]);
+        assert_eq!(&contents[HDR_USIZE..HDR_USIZE + expected.len()], &expected[..]);
     }
 
     // -----------------------------------------------------------------------
@@ -577,7 +576,7 @@ mod integration {
         handle.close().unwrap();
 
         let contents = std::fs::read(&path).unwrap();
-        assert!(contents.starts_with(b"entry_0\n"));
+        assert_eq!(&contents[HDR_USIZE..HDR_USIZE + 8], b"entry_0\n");
         assert!(handle.file_size() > 0);
     }
 
@@ -589,7 +588,7 @@ mod integration {
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"immediate").unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 9);
+        assert_eq!(handle.file_size(), HDR + 9);
     }
 
     // -----------------------------------------------------------------------
@@ -624,7 +623,7 @@ mod integration {
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"unicode path test").unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 17);
+        assert_eq!(handle.file_size(), HDR + 17);
     }
 
     #[test]
@@ -635,7 +634,7 @@ mod integration {
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"spaces").unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 6);
+        assert_eq!(handle.file_size(), HDR + 6);
     }
 
     // -----------------------------------------------------------------------
@@ -710,11 +709,11 @@ mod integration {
         }
 
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 80000); // 10000 × 8 bytes
+        assert_eq!(handle.file_size(), HDR + 80000);
 
         let contents = std::fs::read(&path).unwrap();
         for i in 0u64..10000 {
-            let offset = (i * 8) as usize;
+            let offset = HDR_USIZE + (i * 8) as usize;
             let val = u64::from_le_bytes(contents[offset..offset + 8].try_into().unwrap());
             assert_eq!(val, i, "entry {i} out of order");
         }
@@ -730,8 +729,7 @@ mod integration {
         handle.buffer_write(b"durable data").unwrap();
         handle.close().unwrap();
 
-        // Read back immediately — should be there
         let contents = std::fs::read(&path).unwrap();
-        assert_eq!(&contents[..12], b"durable data");
+        assert_eq!(&contents[HDR_USIZE..HDR_USIZE + 12], b"durable data");
     }
 }

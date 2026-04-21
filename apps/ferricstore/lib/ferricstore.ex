@@ -5165,7 +5165,7 @@ defmodule FerricStore do
       exists?: fn k -> Router.exists?(ctx, k) end,
       keys: fn -> Router.keys(ctx) end,
       prob_dir: fn ->
-        File.mkdir_p!(prob_dir)
+        Ferricstore.FS.mkdir_p!(prob_dir)
         prob_dir
       end
     }

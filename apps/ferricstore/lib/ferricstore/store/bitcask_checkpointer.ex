@@ -219,7 +219,6 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
     reply =
       case ActiveFile.get(state.index) do
         {_fid, active_path, _sp} ->
-          # Clear flag first so concurrent writes re-set it.
           if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 0)
 
           case NIF.v2_fsync(active_path) do
@@ -227,7 +226,6 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
               :ok
 
             {:error, reason} = err ->
-              # Re-raise on failure.
               if ctx, do: :atomics.put(ctx.checkpoint_flags, flag_idx, 1)
               Logger.error("BitcaskCheckpointer shard=#{state.index}: sync_now failed: #{inspect(reason)}")
               err
@@ -235,6 +233,8 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       end
 
     {:reply, reply, state}
+  rescue
+    _ -> {:reply, {:error, :not_initialized}, state}
   end
 
   # -------------------------------------------------------------------
@@ -263,8 +263,6 @@ defmodule Ferricstore.Store.BitcaskCheckpointer do
       state
     end
   rescue
-    # If ActiveFile entry is missing (shard just booted, registry not
-    # populated yet), re-raise the flag and try again next tick.
     _ ->
       :atomics.put(state.instance_ctx.checkpoint_flags, state.index + 1, 1)
       state

@@ -90,7 +90,7 @@ defmodule Ferricstore.Raft.Batcher do
 
     * `:shard_id` (required) -- the ra server ID for this shard
     * `:shard_index` (required) -- zero-based shard index
-    * `:max_batch_size` -- flush immediately when batch reaches this size (default: 1000)
+    * `:max_batch_size` -- flush single-write slot when it reaches this size (default: #{@default_max_batch_size})
   """
 
   use GenServer
@@ -99,7 +99,7 @@ defmodule Ferricstore.Raft.Batcher do
 
   alias Ferricstore.NamespaceConfig
 
-  @default_max_batch_size 50_000
+  @default_max_batch_size 5_000
 
   # Async retry tuning (Option R1 from the rejected-retry design). When Ra
   # returns :rejected {:not_leader, hint, corr} for an async batch, the
@@ -155,7 +155,7 @@ defmodule Ferricstore.Raft.Batcher do
           cmds: [command()],
           froms: [GenServer.from()],
           timer_ref: reference() | nil,
-          window_ms: pos_integer()
+          window_ms: non_neg_integer()
         }
 
   defstruct [
@@ -246,6 +246,19 @@ defmodule Ferricstore.Raft.Batcher do
   @spec write_async_quorum(non_neg_integer(), command(), GenServer.from()) :: :ok
   def write_async_quorum(shard_index, command, reply_to) do
     GenServer.cast(batcher_name(shard_index), {:write_quorum, command, reply_to})
+  end
+
+  @doc """
+  Submits multiple quorum write commands in a single message.
+
+  Takes a list of commands and a single `from` ref. All commands are
+  enqueued into the quorum slot as a batch. The `from` receives a
+  single `{:ok, [results]}` reply after Ra commit — one round-trip
+  per shard, not per command.
+  """
+  @spec write_batch(non_neg_integer(), [command()], GenServer.from()) :: :ok
+  def write_batch(shard_index, cmds, from) do
+    GenServer.cast(batcher_name(shard_index), {:write_batch, cmds, from})
   end
 
   @doc """
@@ -426,12 +439,11 @@ defmodule Ferricstore.Raft.Batcher do
   # callers (`:single`/`:batch` froms) with `{:error, :reset}` so they
   # don't hang forever.
   def handle_call(:__reset_pending__, _from, state) do
-    # Drain callers so they unblock instead of timing out in 60s tests.
     Enum.each(state.pending, fn
-      {_corr, {froms, :single, _mono}} -> Enum.each(froms, &GenServer.reply(&1, {:error, :reset}))
-      {_corr, {froms, :batch, _mono}} -> Enum.each(froms, &GenServer.reply(&1, {:error, :reset}))
-      {_corr, {froms, :single}} -> Enum.each(froms, &GenServer.reply(&1, {:error, :reset}))
-      {_corr, {froms, :batch}} -> Enum.each(froms, &GenServer.reply(&1, {:error, :reset}))
+      {_corr, {froms, :single, _mono}} -> reply_all_froms(froms, {:error, :reset})
+      {_corr, {froms, :batch, _mono}} -> reply_all_froms(froms, {:error, :reset})
+      {_corr, {froms, :single}} -> reply_all_froms(froms, {:error, :reset})
+      {_corr, {froms, :batch}} -> reply_all_froms(froms, {:error, :reset})
       _ -> :ok
     end)
 
@@ -451,6 +463,10 @@ defmodule Ferricstore.Raft.Batcher do
 
   def handle_cast({:write_quorum, command, reply_to}, state) do
     enqueue_write_forced_quorum(command, reply_to, state)
+  end
+
+  def handle_cast({:write_batch, cmds, from}, state) do
+    enqueue_write_batch(cmds, from, state)
   end
 
   @impl true
@@ -491,9 +507,13 @@ defmodule Ferricstore.Raft.Batcher do
             %{acc | pending: new_pending}
 
           {{froms, :single, _mono}, new_pending} ->
-            # Single command: result is the direct apply result
             [from] = froms
-            GenServer.reply(from, result)
+            case from do
+              {:batch_from, inner_from, _count} ->
+                GenServer.reply(inner_from, {:ok, [result]})
+              _ ->
+                GenServer.reply(from, result)
+            end
             %{acc | pending: new_pending}
 
           {{froms, :batch, _mono}, new_pending} ->
@@ -566,9 +586,7 @@ defmodule Ferricstore.Raft.Batcher do
             _ -> state.shard_id
           end
 
-        Enum.each(froms, fn from ->
-          GenServer.reply(from, {:error, {:not_leader, leader}})
-        end)
+        reply_all_froms(froms, {:error, {:not_leader, leader}})
 
         {:noreply, maybe_reply_flush_waiters(new_state)}
     end
@@ -609,8 +627,9 @@ defmodule Ferricstore.Raft.Batcher do
   def terminate(_reason, state) do
     # Reply to all callers waiting in unflushed slots.
     Enum.each(state.slots, fn {_slot_key, slot} ->
-      Enum.each(slot.froms, fn from ->
-        safe_reply(from, {:error, :batcher_terminated})
+      Enum.each(slot.froms, fn
+        {:batch_from, from, _count} -> safe_reply(from, {:error, :batcher_terminated})
+        from -> safe_reply(from, {:error, :batcher_terminated})
       end)
     end)
 
@@ -618,9 +637,8 @@ defmodule Ferricstore.Raft.Batcher do
     # entries (retry-aware 5-tuple or legacy 3-tuple) have no froms to
     # reply to — Router already got :ok.
     Enum.each(state.pending, fn
-      {_corr, {_froms, :async_no_reply}} -> :ok
       {_corr, {_froms, :async_no_reply, _batch, _retry, _mono}} -> :ok
-      {_corr, {froms, _kind}} ->
+      {_corr, {froms, _kind, _mono}} ->
         Enum.each(froms, fn from ->
           safe_reply(from, {:error, :batcher_terminated})
         end)
@@ -635,26 +653,46 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp reply_batch(froms, {:ok, results}) when is_list(results) do
-    if length(results) == length(froms) do
-      Enum.zip(froms, results)
-      |> Enum.each(fn {from, r} -> GenServer.reply(from, r) end)
+    expected = Enum.reduce(froms, 0, fn
+      {:batch_from, _, count}, acc -> acc + count
+      _, acc -> acc + 1
+    end)
+
+    if length(results) == expected do
+      dispatch_batch_results(froms, results)
     else
       Logger.error(
         "Batcher: batch result count mismatch — " <>
-          "#{length(froms)} callers but #{length(results)} results"
+          "expected #{expected} results but got #{length(results)}"
       )
 
-      Enum.each(froms, fn from ->
-        GenServer.reply(from, {:error, :batch_result_mismatch})
-      end)
+      reply_batch_error(froms, {:error, :batch_result_mismatch})
     end
   end
 
   defp reply_batch(froms, other) do
-    Enum.each(froms, fn from -> GenServer.reply(from, other) end)
+    reply_batch_error(froms, other)
   end
 
-  # Replies to a caller, catching errors if the caller already exited.
+  defp dispatch_batch_results([], []), do: :ok
+  defp dispatch_batch_results([{:batch_from, from, count} | rest_froms], results) do
+    {slice, rest_results} = Enum.split(results, count)
+    GenServer.reply(from, {:ok, slice})
+    dispatch_batch_results(rest_froms, rest_results)
+  end
+  defp dispatch_batch_results([from | rest_froms], [result | rest_results]) do
+    GenServer.reply(from, result)
+    dispatch_batch_results(rest_froms, rest_results)
+  end
+
+  defp reply_batch_error(froms, error) do
+    Enum.each(froms, fn
+      {:batch_from, from, _count} -> GenServer.reply(from, error)
+      from -> GenServer.reply(from, error)
+    end)
+  end
+
+  defp safe_reply({:batch_from, from, _count}, msg), do: safe_reply(from, msg)
   defp safe_reply(from, msg) do
     try do
       GenServer.reply(from, msg)
@@ -663,9 +701,58 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
+  defp reply_all_froms(froms, msg) do
+    Enum.each(froms, fn
+      {:batch_from, from, _count} -> GenServer.reply(from, msg)
+      from -> GenServer.reply(from, msg)
+    end)
+  end
+
   # ---------------------------------------------------------------------------
   # Private: write enqueue (shared by handle_call and handle_cast)
   # ---------------------------------------------------------------------------
+
+  @max_pending 64
+
+  # Accumulates write_batch commands into the quorum slot, flushing when
+  # count >= max_batch_size or on next message loop (timer 0). Rejects
+  # new batches when too many ra commands are already in flight.
+  defp enqueue_write_batch(cmds, from, state) do
+    if map_size(state.pending) >= @max_pending do
+      {pid, ref} = from
+      send(pid, {ref, {:error, :overloaded}})
+      {:noreply, state}
+    else
+      prefix = extract_prefix(hd(cmds))
+      slot_key = {prefix, :quorum}
+
+      slot = Map.get(state.slots, slot_key, new_slot(0))
+      cmd_count = length(cmds)
+
+      updated_slot = %{
+        slot
+        | cmds: Enum.reverse(cmds) ++ slot.cmds,
+          froms: [{:batch_from, from, cmd_count} | slot.froms],
+          count: Map.get(slot, :count, 0) + cmd_count
+      }
+
+      state = %{state | slots: Map.put(state.slots, slot_key, updated_slot)}
+
+      if updated_slot.count >= state.max_batch_size do
+        case do_flush_slot(state, slot_key) do
+          {:noreply, new_state} -> {:noreply, new_state}
+        end
+      else
+        if updated_slot.timer_ref == nil do
+          ref = Process.send_after(self(), {:flush_slot, slot_key}, 0)
+          updated_slot = %{updated_slot | timer_ref: ref}
+          {:noreply, %{state | slots: Map.put(state.slots, slot_key, updated_slot)}}
+        else
+          {:noreply, state}
+        end
+      end
+    end
+  end
 
   # Enqueues a write command into the appropriate namespace slot.
   # Returns `{:noreply, state}` -- the caller is replied to later when the
@@ -978,9 +1065,7 @@ defmodule Ferricstore.Raft.Batcher do
         )
 
       {_corr, {froms, kind, _mono}} when kind in [:single, :batch] ->
-        Enum.each(froms, fn from ->
-          GenServer.reply(from, {:error, :timeout})
-        end)
+        reply_all_froms(froms, {:error, :timeout})
 
         :telemetry.execute(
           [:ferricstore, :batcher, :quorum_timeout],

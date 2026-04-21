@@ -1,0 +1,1 @@
+/Users/yoavgea/repos/ferricstore/apps/ferricstore_server/native/resp_parser_nif/target/release/libresp_parser_nif.dylib: /Users/yoavgea/repos/ferricstore/apps/ferricstore_server/native/resp_parser_nif/src/lib.rs

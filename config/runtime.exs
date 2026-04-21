@@ -94,16 +94,22 @@ if config_env() == :prod do
          "true" -> true
          "once" -> :once
          n -> String.to_integer(n)
-       end)
+       end),
+    tcp_nodelay:
+      System.get_env("FERRICSTORE_TCP_NODELAY", "true") == "true",
+    tcp_recbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_RECBUF", "131072")),
+    tcp_sndbuf: String.to_integer(System.get_env("FERRICSTORE_TCP_SNDBUF", "131072"))
 
   # ---------------------------------------------------------------------------
   # Raft / Internals
   # ---------------------------------------------------------------------------
   config :ferricstore,
     release_cursor_interval:
-      String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "100000")),
+      String.to_integer(System.get_env("FERRICSTORE_RELEASE_CURSOR_INTERVAL", "10000")),
     promotion_threshold:
-      String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100"))
+      String.to_integer(System.get_env("FERRICSTORE_PROMOTION_THRESHOLD", "100")),
+    wal_commit_delay_us:
+      String.to_integer(System.get_env("FERRICSTORE_WAL_COMMIT_DELAY_US", "200"))
 
   # ---------------------------------------------------------------------------
   # Supervisor (test-only tuning, production defaults are fine)

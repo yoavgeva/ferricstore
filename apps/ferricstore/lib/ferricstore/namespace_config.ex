@@ -62,7 +62,7 @@ defmodule Ferricstore.NamespaceConfig do
   @typedoc "A namespace configuration entry."
   @type ns_entry :: %{
           prefix: binary(),
-          window_ms: pos_integer(),
+          window_ms: non_neg_integer(),
           durability: :quorum | :async,
           changed_at: non_neg_integer(),
           changed_by: binary()
@@ -132,9 +132,10 @@ defmodule Ferricstore.NamespaceConfig do
   @spec set(binary(), binary(), binary(), binary()) :: :ok | {:error, binary()}
   def set(prefix, field, value, changed_by)
       when is_binary(prefix) and is_binary(field) and is_binary(value) and is_binary(changed_by) do
+    normalized = String.trim_trailing(prefix, ":")
     case validate_field_value(field, value) do
       {:ok, parsed_field, parsed_value} ->
-        do_set(prefix, parsed_field, parsed_value, changed_by)
+        do_set(normalized, parsed_field, parsed_value, changed_by)
 
       {:error, _} = err ->
         err
@@ -316,8 +317,15 @@ defmodule Ferricstore.NamespaceConfig do
     # Initialize the fast-path flags for Router.durability_for_key/1.
     # No namespaces configured at startup — use the global default.
     default = get_default_durability()
-    :persistent_term.put(:ferricstore_durability_mode, if(default == :async, do: :all_async, else: :all_quorum))
+    init_mode = if(default == :async, do: :all_async, else: :all_quorum)
+    :persistent_term.put(:ferricstore_durability_mode, init_mode)
     :persistent_term.put(:ferricstore_has_async_ns, default == :async)
+
+    try do
+      FerricStore.Instance.update_durability_mode(:default, init_mode)
+    rescue
+      _ -> :ok
+    end
 
     {:ok, %{}}
   end
@@ -460,11 +468,14 @@ defmodule Ferricstore.NamespaceConfig do
     {has_async, has_quorum} = scan_durability_flags()
     durability_mode = compute_durability_mode(has_async, has_quorum)
 
-    # Router.durability_for_key reads this persistent_term directly,
-    # so updates are immediately visible to all write paths without needing
-    # to rebuild cached Instance structs.
     :persistent_term.put(:ferricstore_durability_mode, durability_mode)
     :persistent_term.put(:ferricstore_has_async_ns, has_async)
+
+    try do
+      FerricStore.Instance.update_durability_mode(:default, durability_mode)
+    rescue
+      _ -> :ok
+    end
 
     notify_batchers()
 
@@ -486,13 +497,18 @@ defmodule Ferricstore.NamespaceConfig do
     end
   end
 
-  defp compute_durability_mode(false, false) do
-    if get_default_durability() == :async, do: :all_async, else: :all_quorum
-  end
+  defp compute_durability_mode(has_async, has_quorum) do
+    default = get_default_durability()
+    effective_async = has_async or default == :async
+    effective_quorum = has_quorum or default == :quorum
 
-  defp compute_durability_mode(false, true), do: :all_quorum
-  defp compute_durability_mode(true, false), do: :all_async
-  defp compute_durability_mode(true, true), do: :mixed
+    case {effective_async, effective_quorum} do
+      {true, true} -> :mixed
+      {true, false} -> :all_async
+      {false, true} -> :all_quorum
+      {false, false} -> :all_quorum
+    end
+  end
 
   defp notify_batchers do
     shard_count = Application.get_env(:ferricstore, :shard_count, 4)

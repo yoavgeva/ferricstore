@@ -56,7 +56,7 @@ impl WalHandle {
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let (flush_tx, flush_rx) = crossbeam_channel::bounded(1024);
         let alive = Arc::new(AtomicBool::new(true));
-        let file_size = Arc::new(AtomicU64::new(0));
+        let file_size = Arc::new(AtomicU64::new(background_thread::WAL_HEADER_SIZE));
         let config = ThreadConfig {
             file,
             buffer: buffer.clone(),
@@ -195,7 +195,7 @@ mod tests {
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         assert!(handle.check_alive().is_ok());
-        assert_eq!(handle.file_size(), 0);
+        assert_eq!(handle.file_size(), background_thread::WAL_HEADER_SIZE);
 
         handle.close().unwrap();
         assert!(handle.check_alive().is_err());
@@ -209,9 +209,8 @@ mod tests {
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"hello world").unwrap();
 
-        // Buffer should contain data (check via close which flushes)
         handle.close().unwrap();
-        assert!(handle.file_size() >= 11);
+        assert!(handle.file_size() >= background_thread::WAL_HEADER_SIZE + 11);
     }
 
     #[test]
@@ -257,9 +256,8 @@ mod tests {
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"data123").unwrap();
 
-        // Close flushes, which updates file_size
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 7);
+        assert_eq!(handle.file_size(), background_thread::WAL_HEADER_SIZE + 7);
     }
 
     #[test]
@@ -274,12 +272,12 @@ mod tests {
         handle.buffer_write(b"third").unwrap();
         handle.close().unwrap();
 
-        assert_eq!(handle.file_size(), 18); // "first second third"
+        let hdr = background_thread::WAL_HEADER_SIZE as usize;
+        assert_eq!(handle.file_size(), (hdr + 18) as u64);
 
-        // Verify on disk
         let contents = std::fs::read(&path_clone).unwrap();
-        assert!(contents.len() >= 18);
-        assert_eq!(&contents[..18], b"first second third");
+        assert!(contents.len() >= hdr + 18);
+        assert_eq!(&contents[hdr..hdr + 18], b"first second third");
     }
 
     #[test]
@@ -303,8 +301,8 @@ mod tests {
         handle.buffer_write(b"hello pread test").unwrap();
         handle.close().unwrap();
 
-        // Read back via pread
-        let data = handle.pread(6, 5).unwrap();
+        let hdr = background_thread::WAL_HEADER_SIZE;
+        let data = handle.pread(hdr + 6, 5).unwrap();
         assert_eq!(&data, b"pread");
     }
 
@@ -354,11 +352,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal").to_str().unwrap().to_string();
 
-        // 100ms commit delay — should still work
         let handle = WalHandle::open(path, 100_000, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"delayed").unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 7);
+        assert_eq!(handle.file_size(), background_thread::WAL_HEADER_SIZE + 7);
     }
 
     #[test]
@@ -366,10 +363,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal").to_str().unwrap().to_string();
 
-        // Zero delay — no waiting, immediate flush
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"immediate").unwrap();
         handle.close().unwrap();
-        assert_eq!(handle.file_size(), 9);
+        assert_eq!(handle.file_size(), background_thread::WAL_HEADER_SIZE + 9);
     }
 }

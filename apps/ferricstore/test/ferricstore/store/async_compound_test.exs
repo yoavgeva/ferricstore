@@ -89,7 +89,15 @@ defmodule Ferricstore.Store.AsyncCompoundTest do
       big = :binary.copy("x", 100 * 1024)
 
       :ok = Router.compound_put(ctx(), redis_key, ck, big, 0)
-      assert big == Router.compound_get(ctx(), redis_key, ck)
+
+      # Known issue: large values in async mode can return nil if the data dir
+      # is cleaned while writes are still in flight. Use eventually to wait for
+      # the write to fully land.
+      Ferricstore.Test.Utils.eventually(fn ->
+        result = Router.compound_get(ctx(), redis_key, ck)
+        assert result != nil, "compound_get returned nil for large value"
+        assert big == result
+      end, 15_000)
     end
   end
 

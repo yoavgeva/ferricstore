@@ -35,6 +35,15 @@ defmodule Ferricstore.Cluster.TopologyTest do
     :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
   end
 
+  defp eventually(fun, attempts \\ 50, interval_ms \\ 100) do
+    fun.()
+  rescue
+    e in [ExUnit.AssertionError] ->
+      if attempts <= 1, do: reraise(e, __STACKTRACE__)
+      :timer.sleep(interval_ms)
+      eventually(fun, attempts - 1, interval_ms)
+  end
+
   # ---------------------------------------------------------------------------
   # Section 5.2: Three-Node Cluster -- Normal Operation
   # ---------------------------------------------------------------------------
@@ -55,7 +64,7 @@ defmodule Ferricstore.Cluster.TopologyTest do
   end
 
   @tag :cluster
-  test "each node can serve read/write operations independently", %{nodes: nodes} do
+  test "each node can serve read/write operations", %{nodes: nodes} do
     Enum.each(nodes, fn node ->
       key = "topo:rw:#{node.index}"
       value = "value_#{node.index}"
@@ -63,8 +72,11 @@ defmodule Ferricstore.Cluster.TopologyTest do
       result = remote_router(node.name, :put, [key, value, 0])
       assert result == :ok, "PUT on #{node.name} should succeed"
 
-      read = remote_router(node.name, :get, [key])
-      assert read == value, "GET on #{node.name} should return #{value}"
+      # Read may need to wait for follower apply if write was forwarded
+      eventually(fn ->
+        read = remote_router(node.name, :get, [key])
+        assert read == value, "GET on #{node.name} should return #{value}"
+      end)
     end)
   end
 
@@ -105,28 +117,28 @@ defmodule Ferricstore.Cluster.TopologyTest do
   # ---------------------------------------------------------------------------
 
   @tag :cluster
-  test "CT-007: write on one node, read from another node (independent mode)", %{nodes: nodes} do
+  test "CT-007: write on one node, read from another node (Raft-replicated)", %{nodes: nodes} do
     [n1, n2, n3] = nodes
 
-    # Write distinct values on each node
     :ok = remote_router(n1.name, :put, ["ct007:n1", "from_n1", 0])
     :ok = remote_router(n2.name, :put, ["ct007:n2", "from_n2", 0])
-
-    # Each node reads back its own value (independent single-node Raft)
-    assert remote_router(n1.name, :get, ["ct007:n1"]) == "from_n1"
-    assert remote_router(n2.name, :get, ["ct007:n2"]) == "from_n2"
-
-    # Cross-node reads: in single-node mode, n2 does NOT see n1's data
-    # (each node is an independent Raft cluster). When multi-node Raft is
-    # added, this will change to assert equality instead.
-    n2_reads_n1 = remote_router(n2.name, :get, ["ct007:n1"])
-    assert n2_reads_n1 == nil,
-           "in single-node mode, n2 should not see n1's key (no replication yet)"
-
-    # Verify n3 also operates independently
     :ok = remote_router(n3.name, :put, ["ct007:n3", "from_n3", 0])
-    assert remote_router(n3.name, :get, ["ct007:n3"]) == "from_n3"
-    assert remote_router(n1.name, :get, ["ct007:n3"]) == nil
+
+    # Multi-node Raft: writes replicate to all members. Cross-node reads work.
+    eventually(fn ->
+      assert remote_router(n2.name, :get, ["ct007:n1"]) == "from_n1",
+             "n2 should see n1's key via Raft replication"
+    end)
+
+    eventually(fn ->
+      assert remote_router(n1.name, :get, ["ct007:n3"]) == "from_n3",
+             "n1 should see n3's key via Raft replication"
+    end)
+
+    eventually(fn ->
+      assert remote_router(n3.name, :get, ["ct007:n2"]) == "from_n2",
+             "n3 should see n2's key via Raft replication"
+    end)
   end
 end
 
@@ -213,7 +225,6 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
 
   @tag :cluster
   test "killed node does not affect other nodes' shard leaders", %{nodes: nodes} do
-    # Only test remaining nodes (first node may have been killed by previous test)
     alive_nodes =
       Enum.filter(nodes, fn node ->
         case :rpc.call(node.name, Node, :self, []) do
@@ -224,10 +235,13 @@ defmodule Ferricstore.Cluster.NodeFailureTest do
 
     :ok = ClusterHelper.wait_for_leaders(alive_nodes, 4, timeout: 15_000)
 
-    Enum.each(alive_nodes, fn node ->
-      leader = ClusterHelper.find_leader([node], 0)
-      assert leader == node.name, "node #{node.name} should be its own leader"
-    end)
+    alive_names = Enum.map(alive_nodes, & &1.name)
+
+    for shard <- 0..3 do
+      leader = ClusterHelper.find_leader(alive_nodes, shard)
+      assert leader in alive_names,
+             "shard #{shard} leader #{inspect(leader)} should be an alive node"
+    end
   end
 end
 
@@ -444,76 +458,86 @@ defmodule Ferricstore.Cluster.PartitionTest do
     %{nodes: nodes}
   end
 
-  # Helper: execute a Router function on a remote peer node with ctx.
   defp remote_router(node_name, fun, args) do
     ctx = :erpc.call(node_name, FerricStore.Instance, :get, [:default])
     :erpc.call(node_name, Ferricstore.Store.Router, fun, [ctx | args])
   end
 
-  @tag :cluster
-  test "partitioned node loses connectivity to peers", %{nodes: nodes} do
-    [n1, _n2, n3] = nodes
-
-    # Partition n3 from the others
-    ClusterHelper.partition_node(n3, nodes)
-
-    # Give distribution time to register the disconnect
-    Process.sleep(500)
-
-    # n1 should not see n3 in its connected nodes
-    n1_nodes = :rpc.call(n1.name, Node, :list, [])
-    refute n3.name in n1_nodes, "n3 should be disconnected from n1"
-
-    # n3 should not see n1
-    n3_nodes = :rpc.call(n3.name, Node, :list, [])
-    refute n1.name in n3_nodes, "n1 should be disconnected from n3"
-
-    # Each node can still operate independently (single-node Raft)
-    result =
-      remote_router(n3.name, :put, [
-        "topo:part:isolated",
-        "works",
-        0
-      ])
-
-    assert result == :ok,
-           "partitioned node should still operate in single-node mode"
-
-    result2 =
-      remote_router(n1.name, :put, [
-        "topo:part:majority",
-        "also_works",
-        0
-      ])
-
-    assert result2 == :ok
-
-    # Heal partition
-    ClusterHelper.heal_partition(n3, nodes)
-    Process.sleep(500)
-
-    # Nodes should see each other again
-    n1_nodes_after = :rpc.call(n1.name, Node, :list, [])
-    assert n3.name in n1_nodes_after, "n3 should be reconnected to n1 after heal"
+  defp eventually(fun, attempts \\ 50, interval_ms \\ 200) do
+    fun.()
+  rescue
+    e in [ExUnit.AssertionError] ->
+      if attempts <= 1, do: reraise(e, __STACKTRACE__)
+      :timer.sleep(interval_ms)
+      eventually(fun, attempts - 1, interval_ms)
   end
 
   @tag :cluster
-  test "heal partition: nodes reconnect and operations continue", %{nodes: nodes} do
+  test "partitioned node loses Raft membership", %{nodes: nodes} do
     [n1, _n2, n3] = nodes
+    shards = :rpc.call(n1.name, Application, :get_env, [:ferricstore, :shard_count, 4])
+    ra_system = :rpc.call(n1.name, Ferricstore.Raft.Cluster, :system_name, [])
+
+    # Stop ra on n3 — simulates network partition from Raft's perspective
+    for i <- 0..(shards - 1) do
+      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+      :rpc.call(n3.name, :ra, :stop_server, [ra_system, server_id])
+    end
+
+    Process.sleep(500)
+
+    # Majority side (n1+n2) can still write (2-of-3 quorum)
+    result =
+      remote_router(n1.name, :put, [
+        "topo:part:majority",
+        "works_with_quorum",
+        0
+      ])
+
+    assert result == :ok, "majority side should still accept writes"
+
+    # Restart ra on n3 — simulates partition heal
+    for i <- 0..(shards - 1) do
+      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+      :rpc.call(n3.name, :ra, :restart_server, [ra_system, server_id])
+    end
+
+    ClusterHelper.wait_for_leaders(nodes, shards, timeout: 10_000)
+
+    # n3 should catch up and see the write
+    eventually(fn ->
+      val = remote_router(n3.name, :get, ["topo:part:majority"])
+      assert val == "works_with_quorum", "n3 should catch up after rejoin"
+    end)
+  end
+
+  @tag :cluster
+  test "heal partition: node catches up on writes made during its absence", %{nodes: nodes} do
+    [n1, _n2, n3] = nodes
+    shards = :rpc.call(n1.name, Application, :get_env, [:ferricstore, :shard_count, 4])
+    ra_system = :rpc.call(n1.name, Ferricstore.Raft.Cluster, :system_name, [])
 
     # Write before partition
     remote_router(n1.name, :put, ["topo:heal:pre", "before", 0])
 
-    # Partition n3
-    ClusterHelper.partition_node(n3, nodes)
-    Process.sleep(300)
+    # Stop ra on n3
+    for i <- 0..(shards - 1) do
+      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+      :rpc.call(n3.name, :ra, :stop_server, [ra_system, server_id])
+    end
 
-    # Write on n1 during partition
+    Process.sleep(500)
+
+    # Write on n1 during n3's absence
     remote_router(n1.name, :put, ["topo:heal:during", "during", 0])
 
-    # Heal partition
-    ClusterHelper.heal_partition(n3, nodes)
-    Process.sleep(300)
+    # Restart ra on n3
+    for i <- 0..(shards - 1) do
+      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+      :rpc.call(n3.name, :ra, :restart_server, [ra_system, server_id])
+    end
+
+    ClusterHelper.wait_for_leaders(nodes, shards, timeout: 10_000)
 
     # n1 should still have its data
     n1_val = remote_router(n1.name, :get, ["topo:heal:pre"])
@@ -522,38 +546,33 @@ defmodule Ferricstore.Cluster.PartitionTest do
     n1_during = remote_router(n1.name, :get, ["topo:heal:during"])
     assert n1_during == "during"
 
-    # n3 can still operate after reconnect
-    n3_result =
-      remote_router(n3.name, :put, ["topo:heal:post", "after", 0])
+    # n3 catches up and can operate
+    eventually(fn ->
+      val = remote_router(n3.name, :get, ["topo:heal:during"])
+      assert val == "during", "n3 should catch up on writes made during absence"
+    end)
 
+    n3_result = remote_router(n3.name, :put, ["topo:heal:post", "after", 0])
     assert n3_result == :ok
   end
 
-  # ---------------------------------------------------------------------------
-  # CT-009: Rejoin after partition -- node catches up
-  # (Section 5.5 NP-004)
-  #
-  # Partition a node, write data to the majority side during partition,
-  # heal the partition, and verify both sides resume normal operation.
-  #
-  # In single-node Raft mode, there is no Raft log replication, so the
-  # isolated node will NOT receive writes from the majority side. This
-  # test verifies the partition/heal infrastructure and that each side
-  # preserves its own writes. When multi-node Raft is added, the
-  # isolated node should catch up via Raft log sync after heal.
-  # ---------------------------------------------------------------------------
-
   @tag :cluster
-  test "CT-009: rejoin after partition -- nodes resume and local data preserved", %{
+  test "CT-009: rejoin after partition -- node catches up on 50 writes", %{
     nodes: nodes
   } do
     [n1, n2, n3] = nodes
+    shards = :rpc.call(n1.name, Application, :get_env, [:ferricstore, :shard_count, 4])
+    ra_system = :rpc.call(n1.name, Ferricstore.Raft.Cluster, :system_name, [])
 
-    # Partition n3 from the cluster
-    ClusterHelper.partition_node(n3, nodes)
+    # Stop ra on n3 — simulates partition
+    for i <- 0..(shards - 1) do
+      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+      :rpc.call(n3.name, :ra, :stop_server, [ra_system, server_id])
+    end
+
     Process.sleep(500)
 
-    # Write 50 keys on n1 during partition
+    # Write 50 keys on n1 during n3's absence (majority still has quorum)
     for i <- 1..50 do
       :ok =
         remote_router(n1.name, :put, [
@@ -563,45 +582,35 @@ defmodule Ferricstore.Cluster.PartitionTest do
         ])
     end
 
-    # Write 10 keys on isolated n3 during partition
-    for i <- 1..10 do
-      :ok =
-        remote_router(n3.name, :put, [
-          "ct009:isolated:#{i}",
-          "iso_#{i}",
-          0
-        ])
+    # Restart ra on n3 — heals the partition
+    for i <- 0..(shards - 1) do
+      server_id = :rpc.call(n3.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+      :rpc.call(n3.name, :ra, :restart_server, [ra_system, server_id])
     end
 
-    # Heal partition
-    ClusterHelper.heal_partition(n3, nodes)
-    Process.sleep(500)
+    ClusterHelper.wait_for_leaders(nodes, shards, timeout: 15_000)
 
     # Verify n1 still has its data
     for i <- 1..50 do
       val = remote_router(n1.name, :get, ["ct009:majority:#{i}"])
-      assert val == "val_#{i}", "n1 should retain majority-side writes after heal"
+      assert val == "val_#{i}", "n1 should retain writes"
     end
 
-    # Verify n3 still has its isolated writes
-    for i <- 1..10 do
-      val = remote_router(n3.name, :get, ["ct009:isolated:#{i}"])
-      assert val == "iso_#{i}", "n3 should retain isolated writes after heal"
-    end
+    # n3 catches up via Raft log replay — eventually sees all 50 keys
+    eventually(fn ->
+      missing = Enum.count(1..50, fn i ->
+        remote_router(n3.name, :get, ["ct009:majority:#{i}"]) == nil
+      end)
+      assert missing == 0, "n3 still missing #{missing}/50 keys"
+    end, 60, 200)
 
-    # Both sides can write new data after heal
-    :ok = remote_router(n1.name, :put, ["ct009:post_heal:n1", "ok", 0])
-    :ok = remote_router(n2.name, :put, ["ct009:post_heal:n2", "ok", 0])
-    :ok = remote_router(n3.name, :put, ["ct009:post_heal:n3", "ok", 0])
+    # All nodes can write after rejoin
+    :ok = remote_router(n1.name, :put, ["ct009:post:n1", "ok", 0])
+    :ok = remote_router(n2.name, :put, ["ct009:post:n2", "ok", 0])
+    :ok = remote_router(n3.name, :put, ["ct009:post:n3", "ok", 0])
 
-    assert remote_router(n1.name, :get, ["ct009:post_heal:n1"]) == "ok"
-    assert remote_router(n2.name, :get, ["ct009:post_heal:n2"]) == "ok"
-    assert remote_router(n3.name, :get, ["ct009:post_heal:n3"]) == "ok"
-
-    # Verify Erlang distribution fully restored
-    n1_peers = :rpc.call(n1.name, Node, :list, [])
-    assert n3.name in n1_peers, "n3 should be visible to n1 after heal"
-    n3_peers = :rpc.call(n3.name, Node, :list, [])
-    assert n1.name in n3_peers, "n1 should be visible to n3 after heal"
+    eventually(fn -> assert remote_router(n1.name, :get, ["ct009:post:n1"]) == "ok" end)
+    eventually(fn -> assert remote_router(n2.name, :get, ["ct009:post:n2"]) == "ok" end)
+    eventually(fn -> assert remote_router(n3.name, :get, ["ct009:post:n3"]) == "ok" end)
   end
 end

@@ -38,6 +38,10 @@ defmodule FerricstoreServer.Resp.Encoder do
   """
 
   @crlf "\r\n"
+  @ok_response "+OK\r\n"
+
+  @doc "Pre-encoded `+OK\\r\\n` binary for batch responses."
+  def ok_response, do: @ok_response
 
   @type encodable ::
           :ok

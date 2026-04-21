@@ -46,14 +46,8 @@ defmodule FerricstoreServer.Spec.DurabilityComprehensiveTest do
     Enum.each(0..(shard_count - 1), &Batcher.flush/1)
   end
 
-  defp drain_async_workers do
-    shard_count = Application.get_env(:ferricstore, :shard_count, 4)
-    Enum.each(0..(shard_count - 1), &Ferricstore.Raft.AsyncApplyWorker.drain/1)
-  end
-
   defp flush_to_disk do
     flush_all_batchers()
-    drain_async_workers()
     ShardHelpers.flush_all_shards()
   end
 

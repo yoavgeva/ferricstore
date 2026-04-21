@@ -278,7 +278,8 @@ defmodule Ferricstore.Commands.CommandsEdgeCasesTest do
     end
 
     test "MemoryGuard.stats returns expected fields" do
-      stats = Ferricstore.MemoryGuard.stats()
+      # Under full-suite load, MemoryGuard may be busy — use longer timeout
+      stats = GenServer.call(Ferricstore.MemoryGuard, :stats, 30_000)
       assert is_map(stats)
       assert Map.has_key?(stats, :total_bytes)
       assert Map.has_key?(stats, :max_bytes)

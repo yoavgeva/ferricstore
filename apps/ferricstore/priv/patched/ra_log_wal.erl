@@ -116,7 +116,10 @@
                names :: ra_system:names(),
                explicit_gc = false :: boolean(),
                pre_allocate = false :: boolean(),
-               ra_log_snapshot_state_tid :: ets:tid()
+               ra_log_snapshot_state_tid :: ets:tid(),
+               wal_io_module :: atom() | undefined,
+               wal_commit_delay_us = 200 :: non_neg_integer(),
+               wal_max_buffer_bytes = 67108864 :: non_neg_integer()
               }).
 
 -record(wal, {fd :: option(file:io_device()),
@@ -343,6 +346,9 @@ init(#{system := System,
     CRef = ra_counters:new(WalName,
                            ?COUNTER_FIELDS,
                            #{ra_system => System, module => ?MODULE}),
+    WalIoModule = maps:get(wal_io_module, Conf0, undefined),
+    WalCommitDelayUs = maps:get(wal_commit_delay_us, Conf0, 200),
+    WalMaxBufferBytes = maps:get(wal_max_buffer_bytes, Conf0, 64 * 1024 * 1024),
     Conf = #conf{dir = Dir,
                  system = System,
                  segment_writer = SegWriter,
@@ -356,7 +362,10 @@ init(#{system := System,
                  names = Names,
                  explicit_gc = Gc,
                  pre_allocate = PreAllocate,
-                 ra_log_snapshot_state_tid = ets:whereis(ra_log_snapshot_state)},
+                 ra_log_snapshot_state_tid = ets:whereis(ra_log_snapshot_state),
+                 wal_io_module = WalIoModule,
+                 wal_commit_delay_us = WalCommitDelayUs,
+                 wal_max_buffer_bytes = WalMaxBufferBytes},
     try recover_wal(Dir, Conf) of
         Result ->
             % wait for the segment writer to process any flush requests
@@ -422,22 +431,28 @@ handle_op({call, From, {last_writer_seq, UId}},
 %% to the module's ops processing. When our spawned sync process sends
 %% {wal_async_sync_complete} back to this process, it arrives here.
 handle_op({info, {wal_async_sync_complete}},
-          {#state{pending_sync = _PendingSync} = State0, Actions}) ->
+          {#state{} = State0, Actions}) ->
     State1 = State0#state{sync_in_flight = false},
-    %% Notify all writers that have been queued since the last sync.
     State2 = notify_all_pending(State1),
-    %% If more entries arrived during the sync, start another sync cycle.
     State3 = case State2#state.pending_sync of
                  [] -> State2;
                  _ -> maybe_start_async_sync(State2)
              end,
     {State3, Actions};
+handle_op({info, {wal_sync_complete, _Ref}},
+          {#state{} = State0, Actions}) ->
+    State1 = State0#state{sync_in_flight = false},
+    State2 = notify_all_pending(State1),
+    State3 = case State2#state.pending_sync of
+                 [] -> State2;
+                 _ -> maybe_start_async_sync(State2)
+             end,
+    {State3, Actions};
+handle_op({info, {wal_sync_error, _Ref, Reason}}, _State) ->
+    throw({stop, {wal_sync_failed, Reason}});
 handle_op({info, {'EXIT', _, normal}}, {State, Actions}) ->
-    %% Normal exit from a spawned process (e.g., our async sync process).
-    %% This is expected and should be ignored.
     {State, Actions};
 handle_op({info, {'EXIT', _, Reason}}, _State) ->
-    %% Abnormal exit from a linked process — crash the WAL.
     %% This is here for testing purposes (original ra code) and also catches
     %% failures from our async sync process (e.g., fdatasync I/O error).
     throw({stop, Reason}).
@@ -526,8 +541,11 @@ extract_file_num([F | _]) ->
 
 cleanup(#state{wal = #wal{fd = undefined}}) ->
     ok;
-cleanup(#state{wal = #wal{fd = Fd}}) ->
-    _ = ra_file:sync(Fd),
+cleanup(#state{wal = #wal{fd = Fd},
+               conf = #conf{wal_io_module = IoMod,
+                            sync_method = SyncMeth}}) ->
+    _ = try wal_sync_blocking(IoMod, Fd, SyncMeth) catch _:_ -> ok end,
+    _ = close_file(Fd),
     ok.
 
 serialize_header(UId, Trunc, {Next, Cache} = WriterCache) ->
@@ -703,39 +721,48 @@ drain_pending_sync(#state{pending_sync = [],
                           sync_in_flight = false} = State) ->
     State;
 drain_pending_sync(#state{wal = #wal{fd = Fd},
-                          conf = #conf{sync_method = SyncMeth},
+                          conf = #conf{sync_method = SyncMeth,
+                                       wal_io_module = IoMod},
                           sync_in_flight = true,
                           pending_sync = Pending} = State) when Pending =/= [] ->
-    %% A sync is in flight AND we have pending writers. Wait for the in-flight
-    %% sync to complete, then do our own sync to cover any data written after
-    %% the in-flight sync started, and finally notify all pending writers.
-    receive
-        {wal_async_sync_complete} -> ok
-    after 30000 ->
-        %% Timeout — the sync process might have died. Since it's linked,
-        %% we would have crashed too unless trap_exit is set (which it is).
-        ok
-    end,
-    sync(Fd, SyncMeth),
+    wait_for_sync_complete(),
+    wal_sync_blocking(IoMod, Fd, SyncMeth),
     State1 = State#state{sync_in_flight = false},
     notify_all_pending(State1);
 drain_pending_sync(#state{wal = #wal{fd = Fd},
-                          conf = #conf{sync_method = SyncMeth},
+                          conf = #conf{sync_method = SyncMeth,
+                                       wal_io_module = IoMod},
                           sync_in_flight = false,
                           pending_sync = Pending} = State) when Pending =/= [] ->
-    %% No sync in flight but pending writers. Sync and notify.
-    sync(Fd, SyncMeth),
+    wal_sync_blocking(IoMod, Fd, SyncMeth),
     notify_all_pending(State#state{sync_in_flight = false});
 drain_pending_sync(#state{sync_in_flight = true,
                           wal = #wal{fd = Fd},
-                          conf = #conf{sync_method = SyncMeth}} = State) ->
-    %% sync in flight but no pending writers — wait for completion
-    receive
-        {wal_async_sync_complete} -> ok
-    after 30000 -> ok
-    end,
-    sync(Fd, SyncMeth),
+                          conf = #conf{sync_method = SyncMeth,
+                                       wal_io_module = IoMod}} = State) ->
+    wait_for_sync_complete(),
+    wal_sync_blocking(IoMod, Fd, SyncMeth),
     State#state{sync_in_flight = false}.
+
+wait_for_sync_complete() ->
+    receive
+        {wal_async_sync_complete} -> ok;
+        {wal_sync_complete, _Ref} -> ok;
+        {wal_sync_error, _Ref, Reason} -> throw({stop, {wal_sync_failed, Reason}})
+    after 30000 -> ok
+    end.
+
+wal_sync_blocking(undefined, Fd, SyncMeth) ->
+    sync(Fd, SyncMeth);
+wal_sync_blocking(IoMod, Handle, _SyncMeth) ->
+    Ref = make_ref(),
+    ok = IoMod:sync(Handle, self(), Ref),
+    receive
+        {wal_sync_complete, Ref} -> ok;
+        {wal_sync_error, Ref, Reason} -> throw({stop, {wal_sync_failed, Reason}})
+    after 30000 ->
+        throw({stop, wal_sync_timeout})
+    end.
 
 roll_over(#state{wal = Wal0, file_num = Num0,
                  writers = Writers,
@@ -748,11 +775,6 @@ roll_over(#state{wal = Wal0, file_num = Num0,
     Fn = ra_lib:zpad_filename("", "wal", Num),
     NextFile = filename:join(Dir, Fn),
     ?DEBUG("WAL in ~ts: opening new file ~ts", [System, Fn]),
-    %% if this is the first wal since restart randomise the first
-    %% max wal size to reduce the likelihood that each erlang node will
-    %% flush mem tables at the same time
-    %% persist writers map so that sequence tracking survives crashes
-    %% even after all WAL files have been deleted by the segment writer
     ok = persist_writers(Dir, Writers),
     NextMaxBytes =
         case Wal0 of
@@ -763,7 +785,6 @@ roll_over(#state{wal = Wal0, file_num = Num0,
                  filename = Filename} ->
                 _ = file:advise(Wal0#wal.fd, 0, 0, dont_need),
                 ok = close_file(Wal0#wal.fd),
-                %% floor all sequences
                 MemTables = maps:map(
                               fun (UId, TidRanges) ->
                                       SmallestIdx = smallest_live_index(Conf0, UId),
@@ -785,9 +806,24 @@ roll_over(#state{wal = Wal0, file_num = Num0,
                  wal = Wal,
                  file_num = Num}.
 
-open_wal(File, Max, #conf{} = Conf0) ->
-    {ok, Fd} = prepare_file(File, ?FILE_MODES),
-    Conf = maybe_pre_allocate(Conf0, Fd, Max),
+open_wal(File, Max, #conf{wal_io_module = IoMod,
+                          wal_commit_delay_us = CommitDelayUs,
+                          wal_max_buffer_bytes = MaxBufBytes} = Conf0) ->
+    {Fd, Conf} = case IoMod of
+        undefined ->
+            {ok, Fd0} = prepare_file(File, ?FILE_MODES),
+            {Fd0, maybe_pre_allocate(Conf0, Fd0, Max)};
+        _Mod ->
+            Tmp = make_tmp(File),
+            ok = prim_file:rename(Tmp, File),
+            FileBin = case File of
+                          L when is_list(L) -> list_to_binary(L);
+                          B when is_binary(B) -> B
+                      end,
+            {ok, Handle} = IoMod:open(FileBin, CommitDelayUs, Max, MaxBufBytes),
+            persistent_term:put(ferricstore_wal_handle, Handle),
+            {Handle, Conf0}
+    end,
     {Conf, #wal{fd = Fd,
                 max_size = Max,
                 filename = File}}.
@@ -863,8 +899,19 @@ maybe_pre_allocate(Conf, _Fd, _Max0) ->
 
 close_file(undefined) ->
     ok;
-close_file(Fd) ->
-    file:close(Fd).
+close_file(Fd) when is_pid(Fd) ->
+    file:close(Fd);
+close_file(Handle) ->
+    try ferricstore_wal_nif:close(Handle) of
+        _ -> ok
+    catch _:_ ->
+        %% Not a NIF handle — try standard file:close
+        try file:close(Handle) of
+            _ -> ok
+        catch _:_ ->
+            ok
+        end
+    end.
 
 start_batch(#state{conf = #conf{counter = CRef}} = State) ->
     ok = counters:add(CRef, ?C_BATCHES, 1),
@@ -874,10 +921,15 @@ start_batch(#state{conf = #conf{counter = CRef}} = State) ->
 %% The sync is done asynchronously by maybe_start_async_sync/1.
 flush_pending(#state{wal = #wal{fd = Fd},
                      batch = #batch{pending = Pend},
-                     conf = #conf{}} = State0) ->
-    ok = file:write(Fd, Pend),
+                     conf = #conf{wal_io_module = IoMod}} = State0) ->
+    ok = wal_write(IoMod, Fd, Pend),
     %% NO sync here — it's done asynchronously
     State0#state{batch = undefined}.
+
+wal_write(undefined, Fd, Data) ->
+    file:write(Fd, Data);
+wal_write(IoMod, Handle, Data) ->
+    IoMod:write(Handle, Data).
 
 sync(_Fd, none) ->
     ok;
@@ -916,23 +968,22 @@ maybe_start_async_sync(#state{pending_sync = []} = State) ->
 maybe_start_async_sync(#state{conf = #conf{sync_method = none}} = State) ->
     %% sync_method = none: no sync needed, notify immediately.
     notify_all_pending(State);
-maybe_start_async_sync(#state{wal = #wal{filename = Filename},
-                               conf = #conf{sync_method = SyncMeth}} = State) ->
+maybe_start_async_sync(#state{wal = #wal{fd = Fd, filename = Filename},
+                               conf = #conf{sync_method = SyncMeth,
+                                            wal_io_module = IoMod}} = State) ->
     Self = self(),
-    %% spawn_link: if fdatasync crashes, the WAL crashes too (correct behavior —
-    %% we don't want to silently lose durability). If the WAL crashes, the
-    %% linked sync process also dies (no orphaned syncs).
-    %%
-    %% IMPORTANT: We cannot use the WAL's own Fd from a spawned process because
-    %% files opened with [raw] mode tie the prim_file fd to the opening process.
-    %% Instead, we open a SEPARATE fd to the same file, call datasync on it
-    %% (which flushes the kernel page cache for the entire file), and close it.
-    spawn_link(fun() ->
-        {ok, SyncFd} = file:open(Filename, [raw, write, binary]),
-        ok = file:SyncMeth(SyncFd),
-        ok = file:close(SyncFd),
-        Self ! {wal_async_sync_complete}
-    end),
+    case IoMod of
+        undefined ->
+            spawn_link(fun() ->
+                {ok, SyncFd} = file:open(Filename, [raw, write, binary]),
+                ok = file:SyncMeth(SyncFd),
+                ok = file:close(SyncFd),
+                Self ! {wal_async_sync_complete}
+            end);
+        _Mod ->
+            Ref = make_ref(),
+            ok = IoMod:sync(Fd, Self, Ref)
+    end,
     State#state{sync_in_flight = true}.
 
 %% PATCHED: notify all writers queued in pending_sync.

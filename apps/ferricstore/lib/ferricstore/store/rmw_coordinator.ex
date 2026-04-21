@@ -108,17 +108,6 @@ defmodule Ferricstore.Store.RmwCoordinator do
     end
   end
 
-  # Dispatch to the correct inline executor based on command shape.
-  defp dispatch_inline(ctx, idx, {:list_op, _key, _op} = cmd),
-    do: Ferricstore.Store.Router.execute_list_op_inline(ctx, idx, cmd)
-
-  defp dispatch_inline(ctx, idx, {:list_op_lmove, _src, _dst, _from, _to} = cmd),
-    do: Ferricstore.Store.Router.execute_list_op_inline(ctx, idx, cmd)
-
-  # Plain RMW commands: incr, incr_float, append, getset, getdel, getex, setrange.
-  defp dispatch_inline(ctx, idx, cmd),
-    do: Ferricstore.Store.Router.execute_rmw_inline(ctx, idx, cmd)
-
   def handle_call(:sweep_latches_now, _from, state) do
     case FerricStore.Instance.get(:default) do
       nil -> :ok
@@ -144,6 +133,15 @@ defmodule Ferricstore.Store.RmwCoordinator do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp dispatch_inline(ctx, idx, {:list_op, _key, _op} = cmd),
+    do: Ferricstore.Store.Router.execute_list_op_inline(ctx, idx, cmd)
+
+  defp dispatch_inline(ctx, idx, {:list_op_lmove, _src, _dst, _from, _to} = cmd),
+    do: Ferricstore.Store.Router.execute_list_op_inline(ctx, idx, cmd)
+
+  defp dispatch_inline(ctx, idx, cmd),
+    do: Ferricstore.Store.Router.execute_rmw_inline(ctx, idx, cmd)
 
   # Acquire the per-key latch. Only the worker process ever spins here, so
   # there's no thundering herd.
@@ -186,13 +184,15 @@ defmodule Ferricstore.Store.RmwCoordinator do
     dead =
       :ets.foldl(
         fn {key, pid}, acc ->
-          if Process.alive?(pid), do: acc, else: [key | acc]
+          if Process.alive?(pid), do: acc, else: [{key, pid} | acc]
         end,
         [],
         tab
       )
 
-    Enum.each(dead, fn key -> :ets.delete(tab, key) end)
+    Enum.each(dead, fn {key, pid} ->
+      :ets.select_delete(tab, [{{key, pid}, [], [true]}])
+    end)
 
     if dead != [] do
       Logger.debug("RmwCoordinator: swept #{length(dead)} stale latch entries")

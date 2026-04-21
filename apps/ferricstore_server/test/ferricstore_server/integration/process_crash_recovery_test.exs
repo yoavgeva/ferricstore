@@ -138,15 +138,15 @@ defmodule FerricstoreServer.Integration.ProcessCrashRecoveryTest do
       "writes should work after BitcaskWriter crash")
   end
 
-  test "AsyncApplyWorker crash: quorum writes unaffected" do
-    k = ukey("async")
+  test "Batcher crash: quorum writes unaffected" do
+    k = ukey("batcher")
     Router.put(FerricStore.Instance.get(:default), k, "safe")
     ShardHelpers.flush_all_shards()
 
-    kill_and_wait(Ferricstore.Raft.AsyncApplyWorker.worker_name(0))
+    kill_and_wait(Ferricstore.Raft.Batcher.batcher_name(0))
 
     ShardHelpers.eventually(fn -> Router.get(FerricStore.Instance.get(:default), k) == "safe" end,
-      "data should survive AsyncApplyWorker crash")
+      "data should survive Batcher crash")
   end
 
   # ===========================================================================

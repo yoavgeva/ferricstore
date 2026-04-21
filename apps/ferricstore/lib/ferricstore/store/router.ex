@@ -44,23 +44,6 @@ defmodule Ferricstore.Store.Router do
   # Write-path dispatch: quorum writes bypass Shard, async writes use Shard
   # ---------------------------------------------------------------------------
 
-  # Submits a write command directly to ra via `pipeline_command/4`, bypassing
-  # the Batcher GenServer entirely. The ra WAL's internal gen_batch_server
-  # already batches all commands between fdatasync calls, making the Batcher's
-  # 1ms accumulation window redundant and harmful (it serialises 50 writers
-  # through one GenServer and adds ~1ms latency per write).
-  #
-  # `pipeline_command` is non-blocking (cast). It returns `:ok` immediately
-  # and sends a `{:ra_event, Leader, {:applied, [{Corr, Result}]}}` message
-  # to the calling process when the command commits. Since Router functions
-  # execute in the **caller's** process (Task, Connection, etc.), the ra_event
-  # lands in the caller's mailbox -- not a GenServer's -- so the selective
-  # receive below is safe.
-  #
-  # After a non-error result, increments the shared write version counter
-  # so that WATCH/EXEC can detect the mutation. False positives (incrementing
-  # when no state actually changed) are safe -- they only cause a spurious
-  # WATCH failure, which the client retries.
   @spec quorum_write(FerricStore.Instance.t(), non_neg_integer(), tuple()) :: term()
   defp quorum_write(ctx, idx, command) do
     result =
@@ -75,32 +58,39 @@ defmodule Ferricstore.Store.Router do
       end
 
     case result do
-      {:error, _} -> :ok
+      {:error, {:not_leader, {_shard, leader_node}}} when is_atom(leader_node) ->
+        forward_to_leader(leader_node, idx, command)
+
+      {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
+        forward_to_leader(leader_node, idx, command)
+
+      {:error, _} ->
+        result
+
       _ ->
         size = :counters.info(ctx.write_version).size
         if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
+        result
     end
+  end
 
-    result
+  defp forward_to_leader(leader_node, idx, command) do
+    try do
+      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
+      :erpc.call(leader_node, GenServer, :call, [elem(remote_ctx.shard_names, idx), command, 10_000], 10_000)
+    catch
+      :exit, _ -> {:error, "ERR leader forwarding failed"}
+    end
   end
 
 
-  # Determines the durability mode for a key by extracting its namespace
-  # prefix and looking up the namespace config. Returns `:quorum` or `:async`.
-  #
-  # Three-state fast path via persistent_term (~5ns lookup, dynamic):
-  #   :all_quorum — no async namespaces configured, return :quorum immediately
-  #   :all_async  — all namespaces are async, return :async immediately
-  #   :mixed      — some quorum, some async, must split key and lookup
-  #
-  # The flag is set by NamespaceConfig whenever durability settings change.
-  # Read from persistent_term (not Instance ctx) so updates are immediate and
-  # not shadowed by cached/restored Instance structs in tests.
-  @spec durability_for_key(FerricStore.Instance.t(), binary()) :: :quorum | :async
-  defp durability_for_key(_ctx, key) do
-    mode = :persistent_term.get(:ferricstore_durability_mode, :all_quorum)
+  @doc "Public wrapper for durability_for_key, used by batch SET fast path."
+  @spec durability_for_key_public(FerricStore.Instance.t(), binary()) :: :quorum | :async
+  def durability_for_key_public(ctx, key), do: durability_for_key(ctx, key)
 
-    case mode do
+  @spec durability_for_key(FerricStore.Instance.t(), binary()) :: :quorum | :async
+  defp durability_for_key(ctx, key) do
+    case ctx.durability_mode do
       :all_quorum -> :quorum
       :all_async -> :async
       :mixed ->
@@ -141,9 +131,8 @@ defmodule Ferricstore.Store.Router do
   # write_concurrency so any process can write. BitcaskWriter is a cast.
   # This eliminates the GenServer serialization bottleneck.
   #
-  # For read-modify-write (INCR etc.), concurrent same-key mutations may
-  # race (last writer wins). This matches the async durability contract —
-  # users choosing async accept eventual consistency.
+  # For read-modify-write (INCR etc.), concurrent same-key mutations are
+  # serialized via the per-key latch + RmwCoordinator worker. No lost updates.
 
   defp async_write(ctx, idx, {:put, key, value, expire_at_ms}) do
     size = :atomics.info(ctx.disk_pressure).size
@@ -1039,6 +1028,134 @@ defmodule Ferricstore.Store.Router do
   @spec max_value_size() :: pos_integer()
   @doc "Returns the maximum allowed value size in bytes."
   def max_value_size, do: @max_value_size
+
+  @doc """
+  Batch async PUT for pipelined SET commands without options.
+
+  Takes a list of `{key, value}` tuples. All keys must target async
+  durability namespaces. Groups by shard, does batch ETS inserts per
+  shard, fires BitcaskWriter casts and Raft submissions individually
+  (they batch internally). Returns `:ok` or `{:error, reason}`.
+
+  Caller must validate key/value sizes and check pressure flags before
+  calling. This skips all per-key validation for speed.
+  """
+  @spec batch_async_put(FerricStore.Instance.t(), [{binary(), binary()}]) :: :ok | {:error, binary()}
+  def batch_async_put(ctx, kv_pairs) do
+    lfu_val = LFU.initial()
+    hot_max = ctx.hot_cache_max_value_size
+    wv_size = :counters.info(ctx.write_version).size
+
+    kv_pairs
+    |> Enum.group_by(fn {key, _value} -> shard_for(ctx, key) end)
+    |> Enum.each(fn {idx, shard_kvs} ->
+      keydir = elem(ctx.keydir_refs, idx)
+      {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+
+      {ets_tuples, disk_ops} =
+        Enum.reduce(shard_kvs, {[], []}, fn {key, value}, {ets_acc, disk_acc} ->
+          value_for_ets = if byte_size(value) > hot_max, do: nil, else: value
+          track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
+
+          ets_tuple = {key, value_for_ets, 0, lfu_val, :pending, 0, 0}
+          disk_op = {idx, file_path, file_id, keydir, key, value, 0}
+          {[ets_tuple | ets_acc], [disk_op | disk_acc]}
+        end)
+
+      :ets.insert(keydir, ets_tuples)
+
+      Enum.each(disk_ops, fn {idx2, fp, fid, kd, k, v, exp} ->
+        Ferricstore.Store.BitcaskWriter.write(idx2, fp, fid, kd, k, v, exp)
+        async_submit_to_raft(idx2, {:put, k, v, exp})
+      end)
+
+      if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
+    end)
+
+    :ok
+  end
+
+  @doc """
+  Batch quorum PUT for pipelined SET commands.
+
+  Groups commands by shard, submits each group as a single batch to its
+  Batcher with ONE reply ref per shard, then waits for all shard replies.
+  Returns a list of results in input order.
+
+  Uses one ref per shard (not per command) so the connection process's
+  selective receive scans at most shard_count refs instead of N*pipeline
+  refs — critical for high concurrency where TCP messages flood the
+  mailbox.
+  """
+  @spec batch_quorum_put(FerricStore.Instance.t(), [{binary(), binary()}]) :: [:ok | {:error, binary()}]
+  def batch_quorum_put(ctx, kv_pairs) do
+    wv_size = :counters.info(ctx.write_version).size
+    me = self()
+
+    indexed =
+      Enum.with_index(kv_pairs)
+      |> Enum.map(fn {{key, value}, i} ->
+        idx = shard_for(ctx, key)
+        {i, idx, {:put, key, value, 0}}
+      end)
+
+    by_shard = Enum.group_by(indexed, fn {_i, idx, _cmd} -> idx end)
+
+    shard_refs =
+      Enum.map(by_shard, fn {shard_idx, entries} ->
+        ref = make_ref()
+        cmds = Enum.map(entries, fn {_i, _idx, cmd} -> cmd end)
+        indices = Enum.map(entries, fn {i, _idx, _cmd} -> i end)
+        Ferricstore.Raft.Batcher.write_batch(shard_idx, cmds, {me, ref})
+        {ref, shard_idx, indices}
+      end)
+
+    count = length(kv_pairs)
+    results = collect_shard_replies(shard_refs, wv_size, ctx, %{}, System.monotonic_time(:millisecond))
+
+    0..(count - 1)
+    |> Enum.map(fn i -> Map.get(results, i, {:error, "ERR write timeout"}) end)
+  end
+
+  defp collect_shard_replies([], _wv_size, _ctx, acc, _start), do: acc
+  defp collect_shard_replies(remaining_refs, wv_size, ctx, acc, start) do
+    elapsed = System.monotonic_time(:millisecond) - start
+    timeout = max(10_000 - elapsed, 0)
+
+    receive do
+      {ref, result} when is_reference(ref) ->
+        case List.keytake(remaining_refs, ref, 0) do
+          {{^ref, shard_idx, indices}, rest} ->
+            acc = apply_shard_results(result, indices, shard_idx, wv_size, ctx, acc)
+            collect_shard_replies(rest, wv_size, ctx, acc, start)
+
+          nil ->
+            collect_shard_replies(remaining_refs, wv_size, ctx, acc, start)
+        end
+    after
+      timeout -> acc
+    end
+  end
+
+  defp apply_shard_results({:ok, results}, indices, shard_idx, wv_size, ctx, acc) when is_list(results) do
+    ok_count = Enum.count(results, fn r -> r == :ok or (not match?({:error, _}, r)) end)
+    if ok_count > 0 and shard_idx < wv_size do
+      :counters.add(ctx.write_version, shard_idx + 1, ok_count)
+    end
+
+    Enum.zip(indices, results)
+    |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
+  end
+
+  defp apply_shard_results(result, indices, shard_idx, wv_size, ctx, acc) do
+    case result do
+      {:error, _} ->
+        Enum.reduce(indices, acc, fn i, a -> Map.put(a, i, result) end)
+      _ ->
+        if shard_idx < wv_size, do: :counters.add(ctx.write_version, shard_idx + 1, length(indices))
+        Enum.reduce(indices, acc, fn i, a -> Map.put(a, i, result) end)
+    end
+  end
 
   @doc """
   Stores `key` with `value`. `expire_at_ms` is an absolute Unix-epoch

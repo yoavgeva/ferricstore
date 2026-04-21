@@ -135,6 +135,20 @@ defmodule Ferricstore.Stats do
     :ok
   end
 
+  @doc "Increments the total commands processed counter using a cached counter ref."
+  @spec incr_commands(reference()) :: :ok
+  def incr_commands(counter_ref) do
+    :counters.add(counter_ref, @counter_commands, 1)
+    :ok
+  end
+
+  @doc "Increments the total commands processed counter by N using a cached counter ref."
+  @spec incr_commands_by(reference(), pos_integer()) :: :ok
+  def incr_commands_by(counter_ref, n) do
+    :counters.add(counter_ref, @counter_commands, n)
+    :ok
+  end
+
   @doc "Returns the total number of connections received since startup."
   @spec total_connections() :: non_neg_integer()
   def total_connections do

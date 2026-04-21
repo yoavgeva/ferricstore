@@ -120,11 +120,7 @@ defmodule Ferricstore.Application do
     # NOTE: When using the local ra fork (path dep), the fork already includes
     # the async fdatasync changes directly in source. Skip hot-load to avoid
     # overriding the fork's beam with a potentially stale patched version.
-    if ra_is_path_dep?() do
-      Logger.info("Using local ra fork — skipping patched WAL hot-load")
-    else
-      install_patched_wal()
-    end
+    install_patched_wal()
 
     # Start Erlang distribution if cluster is configured.
     # Must happen before ra system start so ra can communicate across nodes.

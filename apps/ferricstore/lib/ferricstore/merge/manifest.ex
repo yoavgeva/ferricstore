@@ -73,7 +73,7 @@ defmodule Ferricstore.Merge.Manifest do
 
     with :ok <- File.write(tmp_path, binary),
          :ok <- Ferricstore.FS.rename(tmp_path, manifest_path),
-         _ <- Ferricstore.Bitcask.NIF.v2_fsync_dir(Path.dirname(manifest_path)) do
+         :ok <- Ferricstore.Bitcask.NIF.v2_fsync_dir(Path.dirname(manifest_path)) do
       :ok
     else
       {:error, reason} = err ->
@@ -193,7 +193,7 @@ defmodule Ferricstore.Merge.Manifest do
   """
   @spec exists?(Path.t()) :: boolean()
   def exists?(data_dir) do
-    File.exists?(manifest_path(data_dir))
+    Ferricstore.FS.exists?(manifest_path(data_dir))
   end
 
   # -------------------------------------------------------------------

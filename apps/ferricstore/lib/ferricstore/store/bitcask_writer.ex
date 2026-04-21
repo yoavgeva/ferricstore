@@ -178,7 +178,7 @@ defmodule Ferricstore.Store.BitcaskWriter do
 
     {drained_pending, drained_count} = drain_mailbox(new_pending, new_count)
 
-    if drained_count >= @batch_size_threshold or state.pending_count > 0 do
+    if drained_count >= @batch_size_threshold do
       do_flush(drained_pending, state.shard_index)
       cancel_timer(state.flush_timer)
       {:noreply, %{state | pending: [], pending_count: 0, flush_timer: nil}}

@@ -78,11 +78,9 @@ defmodule Ferricstore.Cluster.LockTest do
     end
 
     @tag :cluster
-    test "lock is independently acquirable on each node", %{nodes: nodes} do
-      # In single-node Raft mode, each node has its own state, so the
-      # same key can be locked independently on each node.
-      # When multi-node Raft is added, this test should change to verify
-      # that only one node can hold the lock.
+    test "lock is acquirable from any node (leader-forwarded)", %{nodes: nodes} do
+      # Multi-node Raft: lock writes forward to the shard leader.
+      # Each key locks on a unique key to avoid conflicts.
       Enum.each(nodes, fn node ->
         result =
           remote_router(node.name, :lock, [
@@ -286,12 +284,11 @@ defmodule Ferricstore.Cluster.LockTest do
 
   describe "lock visible across nodes" do
     @tag :cluster
-    test "lock acquired on one node is visible on same node only (single-node mode)", %{
+    test "lock acquired on one node is visible on all nodes (Raft-replicated)", %{
       nodes: nodes
     } do
       [n1, n2, n3] = nodes
 
-      # Acquire lock on n1
       result =
         remote_router(n1.name, :lock, [
           "lock:cross:vis",
@@ -301,7 +298,6 @@ defmodule Ferricstore.Cluster.LockTest do
 
       assert result == :ok, "lock should be acquired on n1"
 
-      # On n1, the lock is held -- another owner cannot acquire
       blocked =
         remote_router(n1.name, :lock, [
           "lock:cross:vis",
@@ -312,8 +308,7 @@ defmodule Ferricstore.Cluster.LockTest do
       assert match?({:error, _}, blocked),
              "lock on n1 should block other owners on n1"
 
-      # In single-node mode, n2 has independent state -- the same key
-      # is NOT locked on n2 (no Raft replication between nodes).
+      # Multi-node Raft: lock is replicated — n2 and n3 cannot acquire
       n2_result =
         remote_router(n2.name, :lock, [
           "lock:cross:vis",
@@ -321,12 +316,9 @@ defmodule Ferricstore.Cluster.LockTest do
           30_000
         ])
 
-      # When multi-node Raft is added, this should change to:
-      #   assert match?({:error, _}, n2_result)
-      assert n2_result == :ok,
-             "in single-node mode, n2 should independently acquire the same lock key"
+      assert match?({:error, _}, n2_result),
+             "lock should be visible on n2 via Raft replication"
 
-      # Same for n3
       n3_result =
         remote_router(n3.name, :lock, [
           "lock:cross:vis",
@@ -334,15 +326,14 @@ defmodule Ferricstore.Cluster.LockTest do
           30_000
         ])
 
-      assert n3_result == :ok,
-             "in single-node mode, n3 should independently acquire the same lock key"
+      assert match?({:error, _}, n3_result),
+             "lock should be visible on n3 via Raft replication"
     end
 
     @tag :cluster
-    test "lock acquired and unlocked on one node does not affect other nodes", %{nodes: nodes} do
+    test "lock released on one node is re-acquirable from another node", %{nodes: nodes} do
       [n1, n2 | _] = nodes
 
-      # Acquire and release on n1
       :ok =
         remote_router(n1.name, :lock, [
           "lock:cross:iso",
@@ -353,17 +344,7 @@ defmodule Ferricstore.Cluster.LockTest do
       result = remote_router(n1.name, :unlock, ["lock:cross:iso", "worker_a"])
       assert result == 1, "unlock on n1 should succeed"
 
-      # n1 lock is released, re-acquirable
-      reacquire =
-        remote_router(n1.name, :lock, [
-          "lock:cross:iso",
-          "worker_b",
-          30_000
-        ])
-
-      assert reacquire == :ok
-
-      # n2 never had this lock, so it can acquire independently
+      # After release, any node can acquire (Raft-replicated unlock)
       n2_result =
         remote_router(n2.name, :lock, [
           "lock:cross:iso",
@@ -372,7 +353,7 @@ defmodule Ferricstore.Cluster.LockTest do
         ])
 
       assert n2_result == :ok,
-             "n2 should acquire independently (no cross-node state in single-node mode)"
+             "n2 should acquire lock after n1 released it"
     end
   end
 end

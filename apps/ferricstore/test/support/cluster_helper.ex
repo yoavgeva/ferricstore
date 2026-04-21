@@ -372,18 +372,24 @@ defmodule Ferricstore.Test.ClusterHelper do
       if is_pid(cm_pid), do: :rpc.call(n.name, :sys, :suspend, [cm_pid])
     end)
 
-    # Stop ra servers on the partitioned node — ra monitors remote processes
-    # which triggers automatic Erlang distribution reconnection
+    # Stop ra servers on ALL nodes — ra monitors trigger reconnection
     ra_system = :rpc.call(node.name, Ferricstore.Raft.Cluster, :system_name, [])
 
-    for i <- 0..(shards - 1) do
-      server_id = :rpc.call(node.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+    for n <- all_nodes, i <- 0..(shards - 1) do
+      server_id = :rpc.call(n.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
       try do
-        :rpc.call(node.name, :ra, :stop_server, [ra_system, server_id])
+        :rpc.call(n.name, :ra, :stop_server, [ra_system, server_id])
       catch
         _, _ -> :ok
       end
     end
+
+    # Block the partitioned node from accepting connections from peers
+    # by setting -connect_all false and using net_kernel:allow
+    # Actually, use erlang:set_cookie on the partitioned node ITSELF
+    # to a random value — this prevents ANY node from connecting to it
+    real_cookie = :rpc.call(node.name, :erlang, :get_cookie, [])
+    :rpc.call(node.name, :erlang, :set_cookie, [node.name, :partitioned_node_blocked])
 
     # Disconnect
     Enum.each(others, fn other ->
@@ -391,13 +397,22 @@ defmodule Ferricstore.Test.ClusterHelper do
       :rpc.call(other.name, :erlang, :disconnect_node, [node.name])
     end)
 
-    # Wait until disconnected
-    Ferricstore.Test.ShardHelpers.eventually(fn ->
-      peers = :rpc.call(node.name, :erlang, :nodes, [])
-      unless is_list(peers) and Enum.all?(other_names, fn n -> n not in peers end) do
-        raise "#{node.name} still connected to #{inspect(peers)}"
+    Process.sleep(200)
+
+    # Stash state and restart ra on majority side
+    Process.put({:partition_cookie, node.name}, real_cookie)
+
+    for n <- others, i <- 0..(shards - 1) do
+      server_id = :rpc.call(n.name, Ferricstore.Raft.Cluster, :shard_server_id, [i])
+      try do
+        :rpc.call(n.name, :ra, :restart_server, [ra_system, server_id])
+      catch
+        _, _ -> :ok
       end
-    end, "partition should disconnect #{node.name}", 20, 200)
+    end
+
+    # Wait for majority side to elect leaders (2-of-3 quorum)
+    wait_for_leaders(others, shards, timeout: 10_000)
 
     :ok
   end
@@ -412,11 +427,30 @@ defmodule Ferricstore.Test.ClusterHelper do
     others = Enum.reject(all_nodes, &(&1.name == node.name))
     shards = :rpc.call(node.name, Application, :get_env, [:ferricstore, :shard_count, 4])
 
-    # Reconnect first
-    Enum.each(others, fn other ->
-      :rpc.call(node.name, Node, :connect, [other.name])
-      :rpc.call(other.name, Node, :connect, [node.name])
-    end)
+    # Restore the node's own cookie so distribution handshake works again
+    real_cookie = Process.get({:partition_cookie, node.name}, :ferricstore)
+    :rpc.call(node.name, :erlang, :set_cookie, [node.name, real_cookie])
+
+    # Reconnect from both sides — use erpc with short timeout to avoid blocking
+    connect = fn from, to ->
+      try do :erpc.call(from, Node, :connect, [to], 2_000)
+      catch _, _ -> false
+      end
+    end
+
+    Ferricstore.Test.ShardHelpers.eventually(fn ->
+      Enum.each(others, fn other ->
+        connect.(other.name, node.name)
+        connect.(node.name, other.name)
+      end)
+      Process.sleep(200)
+      peers = :rpc.call(node.name, :erlang, :nodes, [], 2_000)
+      other_names = Enum.map(others, & &1.name)
+      connected = if is_list(peers), do: Enum.filter(peers, fn n -> n in other_names end), else: []
+      if length(connected) < length(others) do
+        raise "#{node.name} sees #{length(connected)}/#{length(others)} peers"
+      end
+    end, "heal should reconnect #{node.name}", 20, 500)
 
     # Restart ra servers on the partitioned node
     ra_system = :rpc.call(node.name, Ferricstore.Raft.Cluster, :system_name, [])
@@ -435,15 +469,6 @@ defmodule Ferricstore.Test.ClusterHelper do
       cm_pid = :rpc.call(n.name, Process, :whereis, [Ferricstore.Cluster.Manager])
       if is_pid(cm_pid), do: :rpc.call(n.name, :sys, :resume, [cm_pid])
     end)
-
-    # Wait until the healed node sees all others
-    Ferricstore.Test.ShardHelpers.eventually(fn ->
-      peers = :rpc.call(node.name, :erlang, :nodes, [])
-      other_names = Enum.map(others, & &1.name)
-      unless is_list(peers) and Enum.all?(other_names, fn n -> n in peers end) do
-        raise "#{node.name} not reconnected to all peers yet"
-      end
-    end, "heal should reconnect #{node.name}", 30, 200)
 
     :ok
   end

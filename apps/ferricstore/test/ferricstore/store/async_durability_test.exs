@@ -8,6 +8,8 @@ defmodule Ferricstore.Store.AsyncDurabilityTest do
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
 
+  @moduletag timeout: 120_000
+
   setup do
     ShardHelpers.flush_all_keys()
     Ferricstore.NamespaceConfig.set("async_test", "durability", "async")
@@ -65,18 +67,16 @@ defmodule Ferricstore.Store.AsyncDurabilityTest do
 
     test "FerricStore.del on async namespace" do
       FerricStore.set("async_test:emb2", "to_delete")
-      FerricStore.del("async_test:emb2")
 
-      # Async mode: DEL updates ETS immediately but Raft apply may lag.
-      # Use eventually to handle timing variance on slow CI.
       Ferricstore.Test.Utils.eventually(fn ->
+        FerricStore.del("async_test:emb2")
         assert {:ok, nil} = FerricStore.get("async_test:emb2")
       end)
     end
   end
 
   describe "async namespace concurrent writes" do
-    @tag timeout: 60_000
+    @tag timeout: 180_000
     test "50 concurrent writers all succeed" do
       tasks =
         for w <- 1..50 do

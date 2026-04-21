@@ -7,6 +7,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   alias Ferricstore.Store.Router
   alias FerricstoreServer.Connection.Auth, as: ConnAuth
   alias FerricstoreServer.Connection.Store, as: ConnStore
+  alias FerricstoreServer.Connection.TcpOpts
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
   # Commands that must be executed synchronously because they read or mutate
@@ -92,7 +93,106 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   def pipeline_dispatch(commands, state, handle_command_fn, send_response_fn) do
-    sliding_window_dispatch(commands, state, handle_command_fn, send_response_fn)
+    case try_batch_set_fast_path(commands, state, send_response_fn) do
+      {:ok, result} -> result
+      :fallback -> sliding_window_dispatch(commands, state, handle_command_fn, send_response_fn)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Batch SET fast path
+  # ---------------------------------------------------------------------------
+  # When ALL commands in a pipeline batch are plain `SET key value` (no options),
+  # bypass the normal sliding_window_dispatch which serializes each SET.
+  #
+  # Async: batch ETS inserts, reply OK immediately.
+  # Quorum: submit all to Batcher(s) concurrently, wait for all Ra commits,
+  #         then send all responses. This lets all SETs share the same Batcher
+  #         batch + WAL fdatasync instead of serializing through it.
+
+  defp try_batch_set_fast_path(commands, state, send_response_fn) do
+    if requires_auth?(state) or state.multi_state == :queuing do
+      :fallback
+    else
+      case extract_plain_sets(commands) do
+        {:ok, kv_pairs} ->
+          ctx = state.instance_ctx
+          live_ctx = FerricStore.Instance.get(:default)
+          acl_ok = state.acl_cache == :full_access or
+                   (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
+
+          if not acl_ok do
+            :fallback
+          else
+            pressure_ok = :atomics.get(ctx.pressure_flags, 1) == 0 and
+                          :atomics.get(ctx.pressure_flags, 2) == 0
+            if not pressure_ok do
+              :fallback
+            else
+              case live_ctx.durability_mode do
+                :all_async ->
+                  {:ok, do_batch_set_async(kv_pairs, state, send_response_fn)}
+
+                :all_quorum ->
+                  {:ok, do_batch_set_quorum(kv_pairs, state, send_response_fn)}
+
+                :mixed ->
+                  {async_kvs, quorum_kvs} = Enum.split_with(kv_pairs, fn {key, _} ->
+                    Router.durability_for_key_public(ctx, key) == :async
+                  end)
+
+                  if quorum_kvs == [] do
+                    {:ok, do_batch_set_async(async_kvs, state, send_response_fn)}
+                  else
+                    :fallback
+                  end
+              end
+            end
+          end
+
+        :fallback ->
+          :fallback
+      end
+    end
+  end
+
+  defp extract_plain_sets(commands) do
+    extract_plain_sets(commands, [])
+  end
+
+  defp extract_plain_sets([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp extract_plain_sets([[name, key, value] | rest], acc) when is_binary(name) and is_binary(key) do
+    if fast_upcase(name) == "SET" do
+      extract_plain_sets(rest, [{key, value} | acc])
+    else
+      :fallback
+    end
+  end
+
+  defp extract_plain_sets(_, _acc), do: :fallback
+
+  defp do_batch_set_async(kv_pairs, state, send_response_fn) do
+    Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
+    Router.batch_async_put(state.instance_ctx, kv_pairs)
+
+    ok = Encoder.ok_response()
+    response = List.duplicate(ok, length(kv_pairs))
+    send_response_fn.(state.socket, state.transport, response)
+    {:continue, state}
+  end
+
+  defp do_batch_set_quorum(kv_pairs, state, send_response_fn) do
+    Stats.incr_commands_by(state.stats_counter, length(kv_pairs))
+    results = Router.batch_quorum_put(state.instance_ctx, kv_pairs)
+
+    response = Enum.map(results, fn
+      :ok -> Encoder.ok_response()
+      {:error, _} = err -> Encoder.encode(err)
+    end)
+
+    send_response_fn.(state.socket, state.transport, response)
+    {:continue, state}
   end
 
   # ---------------------------------------------------------------------------
@@ -100,7 +200,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # ---------------------------------------------------------------------------
 
   defp sliding_window_dispatch(commands, state, handle_command_fn, send_response_fn) do
-    do_sliding_window(commands, [], true, state, handle_command_fn, send_response_fn)
+    if state.transport == :ranch_tcp do
+      TcpOpts.set_cork(state.socket, true)
+      result = do_sliding_window(commands, [], true, state, handle_command_fn, send_response_fn)
+      TcpOpts.set_cork(state.socket, false)
+      result
+    else
+      do_sliding_window(commands, [], true, state, handle_command_fn, send_response_fn)
+    end
   end
 
   # Base case: no more commands, flush any remaining pure group.
@@ -177,17 +284,24 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   defp flush_pure_reads_fast_normalised(normalised, store, state, send_response_fn) do
-    Enum.reduce_while(normalised, {:continue, state}, fn {_cmd, norm}, {:continue, acc_state} ->
-      case dispatch_pure_command_normalised(norm, store, acc_state) do
-        {:quit, response} ->
-          send_response_fn.(acc_state.socket, acc_state.transport, response)
-          {:halt, {:quit, acc_state}}
+    {final_action, responses} =
+      Enum.reduce_while(normalised, {:continue, []}, fn {_cmd, norm}, {:continue, acc} ->
+        case dispatch_pure_command_normalised(norm, store, state) do
+          {:quit, response} ->
+            {:halt, {:quit, [response | acc]}}
 
-        {:continue, response} ->
-          send_response_fn.(acc_state.socket, acc_state.transport, response)
-          {:cont, {:continue, acc_state}}
-      end
-    end)
+          {:continue, response} ->
+            {:cont, {:continue, [response | acc]}}
+        end
+      end)
+
+    batched = Enum.reverse(responses)
+    send_response_fn.(state.socket, state.transport, batched)
+
+    case final_action do
+      :quit -> {:quit, state}
+      :continue -> {:continue, state}
+    end
   end
 
   defp flush_pure_group_sliding_window_normalised(normalised, store, state, send_response_fn) do
@@ -267,11 +381,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
 
   @doc false
   def normalise_cmd({:inline, [name | args]}) when is_binary(name),
-    do: {String.upcase(name), args}
+    do: {fast_upcase(name), args}
 
   def normalise_cmd({:inline, []}), do: :unknown
-  def normalise_cmd([name | args]) when is_binary(name), do: {String.upcase(name), args}
+  def normalise_cmd([name | args]) when is_binary(name), do: {fast_upcase(name), args}
   def normalise_cmd(_other), do: :unknown
+
+  defp fast_upcase(<<first, _::binary>> = cmd) when first >= ?A and first <= ?Z, do: cmd
+  defp fast_upcase(cmd), do: String.upcase(cmd)
 
   @doc false
   def stateful_command_normalised?(:unknown, _state), do: true
@@ -330,7 +447,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   def dispatch_pure_command_normalised({name, args}, store, state) do
     with :ok <- ConnAuth.check_command_cached(state.acl_cache, name),
          :ok <- ConnAuth.check_keys_cached(state.acl_cache, name, args) do
-      Stats.incr_commands()
+      Stats.incr_commands(state.stats_counter)
 
       result =
         try do
@@ -367,7 +484,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
   defp in_pubsub_mode?(state), do: MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
 
   defp requires_auth?(state) do
-    not state.authenticated and Ferricstore.Config.get_value("requirepass") != ""
+    not state.authenticated and state.require_auth
   end
 
   defp format_peer(nil), do: "unknown"

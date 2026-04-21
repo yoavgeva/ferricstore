@@ -87,12 +87,14 @@ defmodule FerricstoreServer.Connection do
     :created_at,
     :peer,
     :instance_ctx,
+    :stats_counter,
     buffer: "",
     multi_state: :none,
     multi_queue: [],
     multi_queue_count: 0,
     watched_keys: %{},
     authenticated: false,
+    require_auth: false,
     username: "default",
     sandbox_namespace: nil,
     pubsub_channels: nil,
@@ -125,10 +127,12 @@ defmodule FerricstoreServer.Connection do
           created_at: integer(),
           peer: {:inet.ip_address(), :inet.port_number()} | nil,
           instance_ctx: FerricStore.Instance.t(),
+          stats_counter: reference(),
           multi_state: multi_state(),
           multi_queue: [{binary(), [binary()]}],
           multi_queue_count: non_neg_integer(),
           watched_keys: %{binary() => non_neg_integer()},
+          require_auth: boolean(),
           tracking: ClientTracking.tracking_config() | nil,
           acl_cache: acl_cache()
         }
@@ -214,6 +218,8 @@ defmodule FerricstoreServer.Connection do
             created_at: System.monotonic_time(:millisecond),
             peer: peer,
             instance_ctx: ctx,
+            stats_counter: ctx.stats_counter,
+            require_auth: Ferricstore.Config.get_value("requirepass") != "",
             tracking: ClientTracking.new_config(),
             acl_cache: default_cache,
             active_mode: active_mode
@@ -383,8 +389,17 @@ defmodule FerricstoreServer.Connection do
     handle_command(tokens, state)
   end
 
+  # Fast path: no auth required, default user with full access — skip ACL checks entirely.
+  # This is the common case for 99% of deployments (no requirepass, default user).
+  defp handle_command([name | args], %{require_auth: false, acl_cache: %{commands: :all, keys: :all}} = state)
+       when is_binary(name) do
+    cmd = fast_upcase(name)
+    Stats.incr_commands(state.stats_counter)
+    dispatch(cmd, args, state)
+  end
+
   defp handle_command([name | args], state) when is_binary(name) do
-    cmd = String.upcase(name)
+    cmd = fast_upcase(name)
 
     cond do
       requires_auth?(state) and cmd not in @pre_auth_cmds ->
@@ -393,11 +408,10 @@ defmodule FerricstoreServer.Connection do
       cmd not in @acl_bypass_cmds ->
         with :ok <- ConnAuth.check_command_cached(state.acl_cache, cmd),
              :ok <- ConnAuth.check_keys_cached(state.acl_cache, cmd, args) do
-          Stats.incr_commands()
+          Stats.incr_commands(state.stats_counter)
           dispatch(cmd, args, state)
         else
           {:error, _reason} = err ->
-            # Fix 5: Log command denials to the audit log.
             FerricstoreServer.Acl.log_command_denied(
               state.username,
               cmd,
@@ -409,7 +423,7 @@ defmodule FerricstoreServer.Connection do
         end
 
       true ->
-        Stats.incr_commands()
+        Stats.incr_commands(state.stats_counter)
         dispatch(cmd, args, state)
     end
   end
@@ -419,8 +433,14 @@ defmodule FerricstoreServer.Connection do
   end
 
   defp requires_auth?(state) do
-    not state.authenticated and Ferricstore.Config.get_value("requirepass") != ""
+    not state.authenticated and state.require_auth
   end
+
+  # Redis commands are ASCII. If first byte is A-Z the command is already uppercase
+  # (covers 99.9% of cases — redis-cli and memtier always send uppercase).
+  # Avoids String.upcase/1 which is O(n) and always allocates a new binary.
+  defp fast_upcase(<<first, _::binary>> = cmd) when first >= ?A and first <= ?Z, do: cmd
+  defp fast_upcase(cmd), do: String.upcase(cmd)
 
   # ---------------------------------------------------------------------------
   # Dispatch table (all clauses contiguous)

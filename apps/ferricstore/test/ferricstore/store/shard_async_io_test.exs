@@ -46,7 +46,13 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
     catch
       :exit, _ -> :ok
     end
-    FerricStore.Instance.cleanup(ctx.name)
+
+    try do
+      FerricStore.Instance.cleanup(ctx.name)
+    catch
+      :exit, _ -> :ok
+    end
+
     File.rm_rf(dir)
   end
 
@@ -179,7 +185,13 @@ defmodule Ferricstore.Store.ShardAsyncIoTest do
           name: :"ck_unified_#{:erlang.unique_integer([:positive])}"
         )
 
-      on_exit(fn -> if Process.alive?(ck), do: GenServer.stop(ck) end)
+      on_exit(fn ->
+        try do
+          if Process.alive?(ck), do: GenServer.stop(ck, :normal, 5000)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
 
       parent = self()
       handler_id = "unified-fsync-#{:erlang.unique_integer([:positive])}"

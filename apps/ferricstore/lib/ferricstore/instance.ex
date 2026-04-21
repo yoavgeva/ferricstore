@@ -254,6 +254,14 @@ defmodule FerricStore.Instance do
     updated
   end
 
+  @spec update_durability_mode(atom(), atom()) :: t()
+  def update_durability_mode(name, mode) when mode in [:all_quorum, :all_async, :mixed] do
+    ctx = get(name)
+    updated = %{ctx | durability_mode: mode}
+    :persistent_term.put({FerricStore.Instance, name}, updated)
+    updated
+  end
+
   @doc """
   Removes the cached instance context.
   """

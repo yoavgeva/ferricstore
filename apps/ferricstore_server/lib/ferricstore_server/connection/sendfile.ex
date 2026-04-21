@@ -3,6 +3,7 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Store.Router
+  alias FerricstoreServer.Connection.TcpOpts
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
   @sendfile_threshold_bytes Application.compile_env(
@@ -83,16 +84,16 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
   defp send_with_cork(socket, fd, offset, size, key, state) do
     header = [?$, Integer.to_string(size), "\r\n"]
-    set_cork(socket, true)
+    TcpOpts.set_cork(socket, true)
 
     case :gen_tcp.send(socket, header) do
       :ok ->
         result = send_file_and_trailer(socket, fd, offset, size, key, state)
-        set_cork(socket, false)
+        TcpOpts.set_cork(socket, false)
         result
 
       {:error, _} ->
-        set_cork(socket, false)
+        TcpOpts.set_cork(socket, false)
         :fallback
     end
   end
@@ -111,23 +112,6 @@ defmodule FerricstoreServer.Connection.Sendfile do
 
       {:error, reason} ->
         {:error_after_header, reason}
-    end
-  end
-
-  defp set_cork(socket, enabled) do
-    value = if enabled, do: 1, else: 0
-
-    case :os.type() do
-      {:unix, :linux} ->
-        # TCP_CORK = 3, IPPROTO_TCP = 6
-        :inet.setopts(socket, [{:raw, 6, 3, <<value::native-32>>}])
-
-      {:unix, _bsd_or_darwin} ->
-        # TCP_NOPUSH = 4 on macOS/BSD, IPPROTO_TCP = 6
-        :inet.setopts(socket, [{:raw, 6, 4, <<value::native-32>>}])
-
-      _ ->
-        :ok
     end
   end
 

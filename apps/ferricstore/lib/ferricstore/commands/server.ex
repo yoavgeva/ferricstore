@@ -281,6 +281,47 @@ defmodule Ferricstore.Commands.Server do
     AuditLog.log(:dangerous_command, %{command: "DEBUG", args: ["FLUSHALL"]})
     handle("FLUSHALL", [], store)
   end
+  def handle("DEBUG", ["SET-DURABILITY", mode], _store) when mode in ["quorum", "async"] do
+    atom_mode = if mode == "quorum", do: :all_quorum, else: :all_async
+    FerricStore.Instance.update_durability_mode(:default, atom_mode)
+    {:simple, "OK durability_mode=#{atom_mode}"}
+  end
+  def handle("DEBUG", ["BATCHER-STATS"], _store) do
+    ctx = FerricStore.Instance.get(:default)
+    shard_count = ctx.shard_count
+
+    batcher_parts = for i <- 0..(shard_count - 1) do
+      name = :"Ferricstore.Raft.Batcher.#{i}"
+      case Process.whereis(name) do
+        nil -> "B#{i}=down"
+        pid ->
+          info = Process.info(pid, [:message_queue_len, :reductions])
+          "B#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+      end
+    end
+
+    wal_name = :ra_ferricstore_raft_log_wal
+    wal_part = case Process.whereis(wal_name) do
+      nil -> "WAL=down"
+      pid ->
+        info = Process.info(pid, [:message_queue_len, :reductions])
+        "WAL:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+    end
+
+    ra_parts = for i <- 0..(shard_count - 1) do
+      name = :"ferricstore_shard_#{i}"
+      case Process.whereis(name) do
+        nil -> "R#{i}=down"
+        pid ->
+          info = Process.info(pid, [:message_queue_len, :reductions])
+          "R#{i}:mq=#{info[:message_queue_len]},r=#{info[:reductions]}"
+      end
+    end
+
+    all = batcher_parts ++ [wal_part] ++ ra_parts
+    {:simple, Enum.join(all, " | ")}
+  end
+
   def handle("DEBUG", ["SET-ACTIVE-EXPIRE", _flag], _store), do: :ok
   def handle("DEBUG", ["CHANGE-REPL-ID"], _store), do: :ok
   def handle("DEBUG", ["QUICKLIST-PACKED-THRESHOLD" | _], _store), do: :ok

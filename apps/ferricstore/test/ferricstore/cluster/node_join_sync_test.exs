@@ -171,11 +171,12 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       final_keys = write_keys(node_a, "post_sync", 1..50)
       all_keys = initial_keys ++ during_sync_keys ++ final_keys
 
-      # 6. Wait for all keys on node_d
+      # 6. Wait for all keys on node_d — auto-discovery + Raft join + replication
+      #    can take a while on loaded machines with 4 BEAM VMs
       eventually(fn ->
         missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
         assert missing_count == 0, "#{missing_count} keys still missing on node_d"
-      end, "not all keys replicated to node_d", 60, 500)
+      end, "not all keys replicated to node_d", 120, 500)
 
       IO.puts("Total keys: #{length(all_keys)}, missing on node_d: 0")
 
@@ -220,13 +221,15 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       written = :ets.tab2list(write_log)
       written_keys = Enum.map(written, fn {key, _seq} -> key end)
 
-      # Every single written key must be readable on node_d
-      missing = Enum.filter(written_keys, fn key ->
-        read_key(node_d, key) == nil
-      end)
+      # Every acknowledged write must be readable on node_d
+      eventually(fn ->
+        missing = Enum.filter(written_keys, fn key ->
+          read_key(node_d, key) == nil
+        end)
 
-      assert missing == [],
-             "#{length(missing)} writes lost during sync: #{inspect(Enum.take(missing, 10))}"
+        assert missing == [],
+               "#{length(missing)}/#{length(written_keys)} writes not replicated: #{inspect(Enum.take(missing, 5))}"
+      end, "all writes replicated to node_d", 60, 500)
 
       :ets.delete(write_log)
     end
@@ -737,8 +740,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
 
         try do
-          :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{seq}", 0])
-          :ets.insert(write_log, {key, seq})
+          case :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{seq}", 0]) do
+            :ok -> :ets.insert(write_log, {key, seq})
+            _ -> :ok
+          end
         rescue
           _ -> :ok
         end

@@ -148,12 +148,9 @@ fn flatten_iolist(term: Term, out: &mut Vec<u8>) -> NifResult<()> {
 // NIF Registration
 // ---------------------------------------------------------------------------
 
-/// Called once when the NIF is loaded. Registers resource types so
-/// `ResourceArc::new(WalHandle {...})` works — without this call
-/// `ResourceArc::new` panics with
-/// `Option::unwrap() on a None value` at rustler/src/resource/arc.rs.
+#[allow(non_local_definitions)]
 fn on_load(env: Env, _info: Term) -> bool {
-    rustler::resource!(WalHandle, env);
+    let _ = rustler::resource!(WalHandle, env);
     true
 }
 

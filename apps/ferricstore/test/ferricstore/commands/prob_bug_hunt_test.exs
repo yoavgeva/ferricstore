@@ -586,12 +586,14 @@ defmodule Ferricstore.Commands.ProbBugHuntTest do
 
     test "BF.EXISTS on non-existent key returns 0" do
       store = MockStore.make()
-      assert 0 = Bloom.handle("BF.EXISTS", ["nokey", "elem"], store)
+      unique = "nokey_#{:erlang.unique_integer([:positive])}"
+      assert 0 = Bloom.handle("BF.EXISTS", [unique, "elem"], store)
     end
 
     test "BF.MEXISTS on non-existent key returns all zeros" do
       store = MockStore.make()
-      assert [0, 0, 0] = Bloom.handle("BF.MEXISTS", ["nokey", "a", "b", "c"], store)
+      unique = "nokey_#{:erlang.unique_integer([:positive])}"
+      assert [0, 0, 0] = Bloom.handle("BF.MEXISTS", [unique, "a", "b", "c"], store)
     end
 
     test "BF.CARD on non-existent key returns 0" do

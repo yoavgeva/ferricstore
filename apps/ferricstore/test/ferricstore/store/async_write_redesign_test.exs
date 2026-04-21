@@ -153,10 +153,8 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
 
       Task.await_many(tasks, 30_000)
 
-      # Give final writes time to apply
-      :timer.sleep(200)
-
-      # 25 * 40 = 1000 increments. Starting from 0 → 1000.
+      # 25 * 40 = 1000 increments. Latch+worker serializes all same-key
+      # RMWs, so no lost updates. Final value must be exactly 1000.
       assert Router.get(ctx(), key) == "1000"
     end
   end
