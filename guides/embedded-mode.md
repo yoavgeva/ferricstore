@@ -785,6 +785,74 @@ defmodule MyApp.CacheTest do
 end
 ```
 
+## Multiple Instances
+
+By default, FerricStore starts a single `:default` instance that the
+`FerricStore` module uses. For applications that need isolated cache
+domains (separate data directories, memory limits, or eviction policies),
+define named instances with `use FerricStore`:
+
+```elixir
+defmodule MyApp.Sessions do
+  use FerricStore,
+    data_dir: "/data/sessions",
+    shard_count: 2,
+    max_memory_bytes: 512_000_000,
+    eviction_policy: :volatile_lfu
+end
+
+defmodule MyApp.PageCache do
+  use FerricStore,
+    data_dir: "/data/page_cache",
+    shard_count: 4,
+    max_memory_bytes: 2_000_000_000,
+    eviction_policy: :allkeys_lfu
+end
+```
+
+### Supervision Tree
+
+Add each instance as a child in your application supervisor. Each instance
+starts its own shards, ETS tables, and Raft system independently:
+
+```elixir
+defmodule MyApp.Application do
+  use Application
+
+  def start(_type, _args) do
+    children = [
+      MyApp.Sessions,
+      MyApp.PageCache
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end
+end
+```
+
+### Usage
+
+Each module gets the full FerricStore API. Instances are completely isolated --
+keys in one instance are invisible to another:
+
+```elixir
+MyApp.Sessions.set("sess:abc", session_data, ttl: :timer.minutes(30))
+{:ok, data} = MyApp.Sessions.get("sess:abc")
+
+MyApp.PageCache.set("page:/home", html, ttl: :timer.hours(1))
+{:ok, nil} = MyApp.PageCache.get("sess:abc")  # not found here
+```
+
+### When to Use Multiple Instances
+
+- **Separate data directories** -- session data on fast NVMe, page cache on larger disk
+- **Different eviction policies** -- `:volatile_lfu` for sessions (TTL-based), `:allkeys_lfu` for a general cache
+- **Independent memory budgets** -- prevent one workload from evicting another's hot keys
+- **Isolation in tests** -- each test module can use its own instance with `ExUnit.Callbacks.tmp_dir`
+
+A single instance with namespace prefixes (`session:`, `cache:`) is simpler
+and sufficient when you don't need separate eviction pools or data directories.
+
 ## Integration with Phoenix
 
 A common pattern is to use FerricStore as a session store or cache in a Phoenix application:
