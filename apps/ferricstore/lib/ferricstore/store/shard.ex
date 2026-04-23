@@ -158,6 +158,7 @@ defmodule Ferricstore.Store.Shard do
     active_file_path = file_path(path, active_file_id)
 
     # Ensure the active file exists (touch it)
+    # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
     file_created? =
       unless Ferricstore.FS.exists?(active_file_path) do
         Ferricstore.FS.touch!(active_file_path)

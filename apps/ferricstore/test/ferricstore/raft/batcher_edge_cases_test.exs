@@ -123,6 +123,7 @@ defmodule Ferricstore.Raft.BatcherEdgeCasesTest do
         end)
 
       results = Task.await_many(tasks, 15_000)
+      # credo:disable-for-next-line Credo.Check.Readability.Semicolons
       assert Enum.all?(results, fn {:ok, _} -> true; _ -> false end)
 
       for k <- same_shard_keys do

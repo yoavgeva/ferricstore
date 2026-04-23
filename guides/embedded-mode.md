@@ -239,6 +239,12 @@ false = FerricStore.hexists("user:42", "email")
 # nums is now: 2, 3, 4
 ```
 
+> **Blocking list commands (`BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`) are not
+> available in embedded mode.** These commands require a persistent TCP
+> connection to block on. In embedded mode, use `lpop`/`rpop` with a polling
+> loop, or subscribe to list-push events via Phoenix PubSub for a
+> reactive pattern.
+
 ### Sets
 
 ```elixir
