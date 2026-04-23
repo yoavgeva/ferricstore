@@ -42,8 +42,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             apps/ferricstore/native/ferricstore_bitcask/target
+            apps/ferricstore/native/ferricstore_wal_nif/target
             apps/ferricstore_server/native/resp_parser_nif/target
-          key: cargo-Linux-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore_server/native/resp_parser_nif/Cargo.lock') }}
+          key: cargo-Linux-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore_server/native/resp_parser_nif/Cargo.lock') }}
           restore-keys: cargo-Linux-
 
       - name: Install dependencies
@@ -52,15 +53,20 @@ jobs:
       - name: Check Rust formatting
         run: |
           cargo fmt --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml -- --check
+          cargo fmt --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml -- --check
           cargo fmt --manifest-path apps/ferricstore_server/native/resp_parser_nif/Cargo.toml -- --check
 
       - name: Run Clippy
         run: |
           cargo clippy --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path apps/ferricstore_server/native/resp_parser_nif/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Rust tests (bitcask)
         run: cargo test --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+
+      - name: Run Rust tests (wal_nif)
+        run: cargo test --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
 
       - name: Run Rust tests (resp_parser_nif)
         run: cargo test --manifest-path apps/ferricstore_server/native/resp_parser_nif/Cargo.toml
@@ -117,8 +123,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             apps/ferricstore/native/ferricstore_bitcask/target
+            apps/ferricstore/native/ferricstore_wal_nif/target
             apps/ferricstore_server/native/resp_parser_nif/target
-          key: cargo-macOS-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore_server/native/resp_parser_nif/Cargo.lock') }}
+          key: cargo-macOS-${{ hashFiles('apps/ferricstore/native/ferricstore_bitcask/Cargo.lock', 'apps/ferricstore/native/ferricstore_wal_nif/Cargo.lock', 'apps/ferricstore_server/native/resp_parser_nif/Cargo.lock') }}
           restore-keys: cargo-macOS-
 
       - name: Install dependencies
@@ -127,15 +134,20 @@ jobs:
       - name: Check Rust formatting
         run: |
           cargo fmt --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml -- --check
+          cargo fmt --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml -- --check
           cargo fmt --manifest-path apps/ferricstore_server/native/resp_parser_nif/Cargo.toml -- --check
 
       - name: Run Clippy
         run: |
           cargo clippy --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml --all-targets -- -D warnings
           cargo clippy --manifest-path apps/ferricstore_server/native/resp_parser_nif/Cargo.toml --all-targets -- -D warnings
 
       - name: Run Rust tests (bitcask)
         run: cargo test --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+
+      - name: Run Rust tests (wal_nif)
+        run: cargo test --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
 
       - name: Run Rust tests (resp_parser_nif)
         run: cargo test --manifest-path apps/ferricstore_server/native/resp_parser_nif/Cargo.toml
