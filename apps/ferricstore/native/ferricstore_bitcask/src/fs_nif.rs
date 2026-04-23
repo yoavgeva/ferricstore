@@ -224,11 +224,9 @@ fn fs_ls(env: Env<'_>, path: String) -> NifResult<Term<'_>> {
         match entry.file_name().into_string() {
             Ok(s) => names.push(s),
             Err(_) => {
-                return Ok((
-                    atoms::error(),
-                    (invalid_path(), "non-utf8 filename in dir"),
-                )
-                    .encode(env));
+                return Ok(
+                    (atoms::error(), (invalid_path(), "non-utf8 filename in dir")).encode(env),
+                );
             }
         }
         if idx & 255 == 255 {
@@ -277,7 +275,13 @@ fn fs_rm_rf_async(
             Ok(()) => (atoms::tokio_complete(), correlation_id, atoms::ok()).encode(env),
             Err(e) => {
                 let err_term = encode_error_owned(env, &e);
-                (atoms::tokio_complete(), correlation_id, atoms::error(), err_term).encode(env)
+                (
+                    atoms::tokio_complete(),
+                    correlation_id,
+                    atoms::error(),
+                    err_term,
+                )
+                    .encode(env)
             }
         });
     });
@@ -345,7 +349,11 @@ mod tests {
             (io::ErrorKind::PermissionDenied, None, "permission_denied"),
             (io::ErrorKind::Other, Some(libc::ENOTDIR), "not_a_directory"),
             (io::ErrorKind::Other, Some(libc::EISDIR), "is_a_directory"),
-            (io::ErrorKind::Other, Some(libc::ENOTEMPTY), "directory_not_empty"),
+            (
+                io::ErrorKind::Other,
+                Some(libc::ENOTEMPTY),
+                "directory_not_empty",
+            ),
             (io::ErrorKind::Other, Some(libc::EINVAL), "invalid_path"),
             (io::ErrorKind::Other, Some(libc::EIO), "other"),
         ];

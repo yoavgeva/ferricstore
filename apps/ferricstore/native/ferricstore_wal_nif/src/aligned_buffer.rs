@@ -96,6 +96,7 @@ impl AlignedBuffer {
     }
 
     /// Clear the buffer without deallocating.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.len = 0;
     }
@@ -159,7 +160,10 @@ impl TakenBuffer {
 impl Drop for TakenBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.padded_len > 0 {
-            free_aligned(self.ptr, round_up(self.padded_len, ALIGNMENT).max(ALIGNMENT));
+            free_aligned(
+                self.ptr,
+                round_up(self.padded_len, ALIGNMENT).max(ALIGNMENT),
+            );
         }
     }
 }
@@ -268,7 +272,7 @@ mod tests {
     #[test]
     fn test_grow() {
         let mut buf = AlignedBuffer::with_capacity(ALIGNMENT); // minimal capacity
-        // Write more than capacity
+                                                               // Write more than capacity
         let data = vec![0xABu8; ALIGNMENT * 3];
         buf.extend(&data);
         assert_eq!(buf.len(), ALIGNMENT * 3);

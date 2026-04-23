@@ -1988,7 +1988,10 @@ mod tests {
         // Both files should have identical sizes
         let size_s = fs::metadata(&path_small).unwrap().len();
         let size_n = fs::metadata(&path_normal).unwrap().len();
-        assert_eq!(size_s, size_n, "open_small and open must produce same file size");
+        assert_eq!(
+            size_s, size_n,
+            "open_small and open must produce same file size"
+        );
 
         // Both should decode identically
         let mut rs = LogReader::open(&path_small).unwrap();
@@ -2052,7 +2055,10 @@ mod tests {
 
         let mut reader = LogReader::open(&path).unwrap();
         let result = reader.read_at(0);
-        assert!(result.is_err(), "corrupted record must fail CRC check via read_at");
+        assert!(
+            result.is_err(),
+            "corrupted record must fail CRC check via read_at"
+        );
         let err_msg = result.unwrap_err().0;
         assert!(
             err_msg.contains("CRC mismatch"),
@@ -2085,7 +2091,11 @@ mod tests {
 
         let mut reader = LogReader::open(&path).unwrap();
         let records = reader.iter_from_start_tolerant().unwrap();
-        assert_eq!(records.len(), 2, "tolerant iter must discard the torn third record");
+        assert_eq!(
+            records.len(),
+            2,
+            "tolerant iter must discard the torn third record"
+        );
         assert_eq!(records[0].key, b"good1");
         assert_eq!(records[1].key, b"good2");
     }
@@ -2145,8 +2155,14 @@ mod tests {
         let offsets = [off0, off1, off2, off3, off4, off5];
         for (i, off) in offsets.iter().enumerate() {
             let record = reader.read_at(*off).unwrap().unwrap();
-            assert_eq!(record.key, records[i].key, "read_at offset {off} key mismatch");
-            assert_eq!(record.value, records[i].value, "read_at offset {off} value mismatch");
+            assert_eq!(
+                record.key, records[i].key,
+                "read_at offset {off} key mismatch"
+            );
+            assert_eq!(
+                record.value, records[i].value,
+                "read_at offset {off} value mismatch"
+            );
             assert_eq!(
                 record.expire_at_ms, records[i].expire_at_ms,
                 "read_at offset {off} expiry mismatch"
@@ -2281,7 +2297,10 @@ mod tests {
 
         let r3 = reader.read_at(offsets[2]).unwrap().unwrap();
         assert_eq!(r3.key, b"pre3");
-        assert!(r3.value.is_none(), "preencoded tombstone must decode as None");
+        assert!(
+            r3.value.is_none(),
+            "preencoded tombstone must decode as None"
+        );
     }
 
     // ------------------------------------------------------------------

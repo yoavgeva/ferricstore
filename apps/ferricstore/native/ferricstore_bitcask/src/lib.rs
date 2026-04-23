@@ -27,6 +27,14 @@
 #![allow(clippy::ref_option)]
 #![allow(clippy::manual_let_else)]
 #![allow(clippy::doc_link_with_quotes)]
+// Rustler NIF functions require owned String/Vec params (not &str/&[u8]):
+#![allow(clippy::needless_pass_by_value)]
+// Wildcard imports in match arms for io::ErrorKind are clearer:
+#![allow(clippy::enum_glob_use)]
+// map().flatten() is clearer than and_then() in some contexts:
+#![allow(clippy::map_flatten)]
+// format!("{}", x) vs format!("{x}") — both fine, don't force inline:
+#![allow(clippy::uninlined_format_args)]
 
 pub mod async_io;
 pub mod bloom;
@@ -161,8 +169,8 @@ pub fn fsync_dir(path: &str) -> Result<(), String> {
         return Err("empty path".to_string());
     }
 
-    let dir = std::fs::File::open(std::path::Path::new(path))
-        .map_err(|e| format!("open dir: {e}"))?;
+    let dir =
+        std::fs::File::open(std::path::Path::new(path)).map_err(|e| format!("open dir: {e}"))?;
 
     dir.sync_data().map_err(|e| format!("sync_data: {e}"))
 }
@@ -1240,7 +1248,11 @@ mod prob_fsync_tests {
     #[test]
     fn fsync_small_file_ok() {
         let (_dir, path) = tmpfile();
-        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         assert!(prob_fsync(&f).is_ok());
     }
 
@@ -1270,7 +1282,11 @@ mod prob_fsync_tests {
         // the fd remains valid. prob_fsync must not panic — at worst return
         // an Err (some kernels will return EIO).
         let (dir, path) = tmpfile();
-        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         std::fs::remove_file(&path).unwrap();
 
         // File is gone from the directory but fd is still open.
@@ -1283,7 +1299,11 @@ mod prob_fsync_tests {
     #[test]
     fn repeated_fsync_idempotent() {
         let (_dir, path) = tmpfile();
-        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
 
         // 1000 fsyncs on the same fd must all succeed and must not
         // cause the process to OOM / leak descriptors. (sync_data is
@@ -1409,7 +1429,10 @@ mod fsync_dir_tests {
     fn existing_dir_ok() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().to_str().unwrap().to_string();
-        assert!(fsync_dir(&path).is_ok(), "fsync on existing dir must succeed");
+        assert!(
+            fsync_dir(&path).is_ok(),
+            "fsync on existing dir must succeed"
+        );
     }
 
     #[test]
@@ -1419,10 +1442,7 @@ mod fsync_dir_tests {
         assert!(result.is_err(), "fsync on missing path must return Err");
         if let Err(msg) = result {
             // Make sure the error is tagged so callers can log it meaningfully.
-            assert!(
-                !msg.is_empty(),
-                "err message must be non-empty"
-            );
+            assert!(!msg.is_empty(), "err message must be non-empty");
         }
     }
 

@@ -46,25 +46,34 @@ pub struct ThreadConfig {
     pub alive: Arc<AtomicBool>,
     pub file_size: Arc<AtomicU64>,
     pub commit_delay: Duration,
-    pub use_o_direct: bool,
+    pub _use_o_direct: bool,
 }
 
 /// Run the background thread loop.
 /// This is called from std::thread::spawn — runs entirely outside BEAM.
 pub fn thread_loop(config: ThreadConfig) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        thread_loop_inner(config.file, config.buffer, config.rx,
-                         config.file_size, config.commit_delay);
+        thread_loop_inner(
+            config.file,
+            config.buffer,
+            config.rx,
+            config.file_size,
+            config.commit_delay,
+        );
     }));
 
     // On panic or normal exit, mark thread as dead
     config.alive.store(false, Ordering::Release);
 
     if let Err(panic) = result {
-        eprintln!("[ferricstore_wal_nif] WAL thread panicked: {:?}",
-                  panic.downcast_ref::<String>().map(|s| s.as_str())
-                       .or_else(|| panic.downcast_ref::<&str>().copied())
-                       .unwrap_or("unknown"));
+        eprintln!(
+            "[ferricstore_wal_nif] WAL thread panicked: {:?}",
+            panic
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown")
+        );
     }
 }
 
@@ -188,11 +197,7 @@ fn thread_loop_inner(
 
 /// Drain shared buffer to kernel page cache. No fdatasync.
 /// Returns true if data was written.
-fn drain_to_kernel(
-    file: &mut File,
-    buffer: &Mutex<AlignedBuffer>,
-    file_size: &AtomicU64,
-) -> bool {
+fn drain_to_kernel(file: &mut File, buffer: &Mutex<AlignedBuffer>, file_size: &AtomicU64) -> bool {
     let taken = {
         let mut buf = buffer.lock().expect("buffer mutex poisoned");
         buf.take()
@@ -205,8 +210,7 @@ fn drain_to_kernel(
     let bytes = taken.logical_len as u64;
     // write_all_retry only fails on persistent I/O errors — panic is appropriate
     // since the WAL is unrecoverable at that point.
-    write_all_retry(file, taken.as_padded_slice())
-        .expect("WAL write failed");
+    write_all_retry(file, taken.as_padded_slice()).expect("WAL write failed");
     file_size.fetch_add(bytes, Ordering::Release);
     true
 }
@@ -227,12 +231,12 @@ fn write_all_retry(file: &mut File, data: &[u8]) -> io::Result<()> {
 /// Notify all callers that sync completed successfully.
 fn notify_callers_success(callers: &mut Vec<FlushCaller>) {
     for mut caller in callers.drain(..) {
-        caller.env.send_and_clear(&caller.pid, |env| {
+        let _ = caller.env.send_and_clear(&caller.pid, |env| {
             let ref_term = caller.saved_ref.load(env);
-            rustler::types::tuple::make_tuple(env, &[
-                crate::atoms::wal_sync_complete().encode(env),
-                ref_term,
-            ])
+            rustler::types::tuple::make_tuple(
+                env,
+                &[crate::atoms::wal_sync_complete().encode(env), ref_term],
+            )
         });
     }
 }
@@ -241,13 +245,16 @@ fn notify_callers_success(callers: &mut Vec<FlushCaller>) {
 fn notify_callers_error(callers: &mut Vec<FlushCaller>, error: &io::Error) {
     let reason = format!("{error}");
     for mut caller in callers.drain(..) {
-        caller.env.send_and_clear(&caller.pid, |env| {
+        let _ = caller.env.send_and_clear(&caller.pid, |env| {
             let ref_term = caller.saved_ref.load(env);
-            rustler::types::tuple::make_tuple(env, &[
-                crate::atoms::wal_sync_error().encode(env),
-                ref_term,
-                reason.as_str().encode(env),
-            ])
+            rustler::types::tuple::make_tuple(
+                env,
+                &[
+                    crate::atoms::wal_sync_error().encode(env),
+                    ref_term,
+                    reason.as_str().encode(env),
+                ],
+            )
         });
     }
 }
@@ -279,6 +286,7 @@ fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File,
     // Try O_DIRECT first
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .read(true)
         .custom_flags(libc::O_DIRECT) // NO O_DSYNC — fdatasync is explicit
@@ -287,9 +295,8 @@ fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File,
     match file {
         Ok(f) => {
             if pre_allocate_bytes > 0 {
-                let ret = unsafe {
-                    libc::fallocate(f.as_raw_fd(), 0, 0, pre_allocate_bytes as i64)
-                };
+                let ret =
+                    unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, pre_allocate_bytes as i64) };
                 if ret != 0 {
                     // fallocate failed (e.g., ENOSPC) — close and cleanup
                     drop(f);
@@ -303,6 +310,7 @@ fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File,
             // O_DIRECT not supported on this filesystem — fall back
             let f = std::fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .write(true)
                 .read(true)
                 .open(path)?;
@@ -315,6 +323,7 @@ fn open_wal_file_linux(path: &str, pre_allocate_bytes: u64) -> io::Result<(File,
 fn open_wal_file_fallback(path: &str, _pre_allocate_bytes: u64) -> io::Result<(File, bool)> {
     let f = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .read(true)
         .open(path)?;
@@ -339,6 +348,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     /// Helper: create a thread config for testing (no BEAM notifications).
+    #[allow(dead_code)]
     fn test_config(commit_delay_us: u64) -> (ThreadConfig, crossbeam_channel::Sender<ThreadMsg>) {
         let tmp = NamedTempFile::new().unwrap();
         let file = tmp.reopen().unwrap();
@@ -353,7 +363,7 @@ mod tests {
             alive: alive.clone(),
             file_size: file_size.clone(),
             commit_delay: Duration::from_micros(commit_delay_us),
-            use_o_direct: false,
+            _use_o_direct: false,
         };
         (config, tx)
     }
@@ -430,7 +440,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
-            .create(true).write(true).read(true).open(&path).unwrap();
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
@@ -453,7 +468,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
-            .create(true).write(true).read(true).open(&path).unwrap();
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
@@ -467,7 +487,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
-            .create(true).write(true).read(true).open(&path).unwrap();
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
@@ -492,7 +517,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
-            .create(true).write(true).read(true).open(&path).unwrap();
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));
@@ -512,7 +542,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let file = std::fs::OpenOptions::new()
-            .create(true).write(true).read(true).open(&path).unwrap();
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let alive = Arc::new(AtomicBool::new(true));
@@ -533,7 +568,7 @@ mod tests {
                     alive: alive_clone,
                     file_size: fs_clone,
                     commit_delay: Duration::ZERO,
-                    use_o_direct: false,
+                    _use_o_direct: false,
                 });
             })
             .unwrap();
@@ -563,7 +598,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let file = std::fs::OpenOptions::new()
-            .create(true).write(true).read(true).open(&path).unwrap();
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let alive = Arc::new(AtomicBool::new(true));
@@ -584,7 +624,7 @@ mod tests {
                     alive: alive_clone,
                     file_size: fs_clone,
                     commit_delay: Duration::ZERO,
-                    use_o_direct: false,
+                    _use_o_direct: false,
                 });
             })
             .unwrap();
@@ -604,7 +644,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let file = std::fs::OpenOptions::new()
-            .create(true).write(true).read(true).open(&path).unwrap();
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let alive = Arc::new(AtomicBool::new(true));
@@ -625,7 +670,7 @@ mod tests {
                     alive: alive_clone,
                     file_size: fs_clone,
                     commit_delay: Duration::from_millis(50), // 50ms delay
-                    use_o_direct: false,
+                    _use_o_direct: false,
                 });
             })
             .unwrap();
@@ -651,7 +696,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.wal");
         let mut file = std::fs::OpenOptions::new()
-            .create(true).write(true).read(true).open(&path).unwrap();
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
 
         let buffer = Arc::new(Mutex::new(AlignedBuffer::new()));
         let file_size = Arc::new(AtomicU64::new(0));

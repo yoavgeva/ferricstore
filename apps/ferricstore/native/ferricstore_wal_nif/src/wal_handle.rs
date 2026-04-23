@@ -64,7 +64,7 @@ impl WalHandle {
             alive: alive.clone(),
             file_size: file_size.clone(),
             commit_delay: Duration::from_micros(commit_delay_us),
-            use_o_direct: _o_direct,
+            _use_o_direct: _o_direct,
         };
 
         let thread_handle = std::thread::Builder::new()
@@ -96,9 +96,10 @@ impl WalHandle {
     pub fn buffer_write(&self, data: &[u8]) -> Result<(), rustler::Error> {
         self.check_alive()?;
 
-        let mut buf = self.buffer.lock().map_err(|_| {
-            rustler::Error::Term(Box::new("buffer_mutex_poisoned"))
-        })?;
+        let mut buf = self
+            .buffer
+            .lock()
+            .map_err(|_| rustler::Error::Term(Box::new("buffer_mutex_poisoned")))?;
 
         if buf.len() as u64 + data.len() as u64 > self.max_buffer_bytes {
             return Err(rustler::Error::Term(Box::new("backpressure")));
@@ -160,14 +161,14 @@ impl WalHandle {
 
     /// Read bytes from the WAL at offset. For recovery.
     pub fn pread(&self, offset: u64, len: u64) -> Result<Vec<u8>, rustler::Error> {
-        let mut file = self.read_file.lock().map_err(|_| {
-            rustler::Error::Term(Box::new("read_mutex_poisoned"))
-        })?;
+        let mut file = self
+            .read_file
+            .lock()
+            .map_err(|_| rustler::Error::Term(Box::new("read_mutex_poisoned")))?;
 
         background_thread::pread_from_file(&mut file, offset, len)
             .map_err(|e| rustler::Error::Term(Box::new(format!("{e}"))))
     }
-
 }
 
 impl Drop for WalHandle {

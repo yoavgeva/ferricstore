@@ -7,7 +7,7 @@ mod integration {
     use crate::background_thread::WAL_HEADER_SIZE;
     use crate::wal_handle::WalHandle;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     const HDR: u64 = WAL_HEADER_SIZE;
     const HDR_USIZE: usize = WAL_HEADER_SIZE as usize;
@@ -19,7 +19,12 @@ mod integration {
     #[test]
     fn test_full_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("lifecycle.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("lifecycle.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path.clone(), 0, 0, 64 * 1024 * 1024).unwrap();
         assert!(handle.check_alive().is_ok());
@@ -38,7 +43,12 @@ mod integration {
 
     #[test]
     fn test_open_nonexistent_directory() {
-        let result = WalHandle::open("/nonexistent/path/test.wal".to_string(), 0, 0, 64 * 1024 * 1024);
+        let result = WalHandle::open(
+            "/nonexistent/path/test.wal".to_string(),
+            0,
+            0,
+            64 * 1024 * 1024,
+        );
         assert!(result.is_err());
     }
 
@@ -55,7 +65,12 @@ mod integration {
     #[test]
     fn test_double_close() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("double_close.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("double_close.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.close().unwrap();
@@ -68,7 +83,12 @@ mod integration {
     #[test]
     fn test_close_without_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("no_writes.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("no_writes.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.close().unwrap();
@@ -82,7 +102,12 @@ mod integration {
     #[test]
     fn test_high_throughput_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("throughput.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("throughput.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 256 * 1024 * 1024).unwrap();
 
@@ -99,7 +124,12 @@ mod integration {
     #[test]
     fn test_concurrent_writers_stress() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("concurrent.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("concurrent.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = Arc::new(WalHandle::open(path, 0, 0, 256 * 1024 * 1024).unwrap());
 
@@ -127,7 +157,12 @@ mod integration {
     fn test_writer_contention_under_load() {
         // Many writers competing for the mutex simultaneously
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("contention.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("contention.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = Arc::new(WalHandle::open(path, 0, 0, 512 * 1024 * 1024).unwrap());
 
@@ -156,7 +191,12 @@ mod integration {
         let dir = tempfile::tempdir().unwrap();
 
         for i in 0..50 {
-            let path = dir.path().join(format!("cycle_{i}.wal")).to_str().unwrap().to_string();
+            let path = dir
+                .path()
+                .join(format!("cycle_{i}.wal"))
+                .to_str()
+                .unwrap()
+                .to_string();
             let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
             handle.buffer_write(b"data").unwrap();
             handle.close().unwrap();
@@ -237,7 +277,12 @@ mod integration {
     fn test_one_byte_over_alignment() {
         // 4097 bytes — forces padding to 8192
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("over_align.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("over_align.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path.clone(), 0, 0, 64 * 1024 * 1024).unwrap();
         let data = vec![0xBB; 4097];
@@ -254,7 +299,12 @@ mod integration {
     fn test_one_byte_under_alignment() {
         // 4095 bytes — still pads to 4096
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("under_align.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("under_align.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         let data = vec![0xCC; 4095];
@@ -276,10 +326,10 @@ mod integration {
         let handle = WalHandle::open(path, 0, 0, 1024).unwrap();
 
         // Fill buffer to limit
-        handle.buffer_write(&vec![0u8; 900]).unwrap();
+        handle.buffer_write(&[0u8; 900]).unwrap();
 
         // Next write exceeds limit
-        let result = handle.buffer_write(&vec![0u8; 200]);
+        let result = handle.buffer_write(&[0u8; 200]);
         assert!(result.is_err());
 
         handle.close().unwrap();
@@ -288,7 +338,12 @@ mod integration {
     #[test]
     fn test_backpressure_exact_boundary() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bp_exact.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("bp_exact.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 100).unwrap();
 
@@ -309,7 +364,7 @@ mod integration {
         let path = dir.path().join("bp_zero.wal").to_str().unwrap().to_string();
 
         let handle = WalHandle::open(path, 0, 0, 100).unwrap();
-        handle.buffer_write(&vec![0u8; 100]).unwrap();
+        handle.buffer_write(&[0u8; 100]).unwrap();
 
         // Empty write at limit should succeed (adds 0 bytes)
         handle.buffer_write(b"").unwrap();
@@ -320,7 +375,12 @@ mod integration {
     #[test]
     fn test_backpressure_concurrent_writers_hit_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bp_concurrent.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("bp_concurrent.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         // Small buffer — concurrent writers will fight for space
         let handle = Arc::new(WalHandle::open(path, 0, 0, 4096).unwrap());
@@ -346,8 +406,10 @@ mod integration {
         }
 
         // Some writes should have been rejected due to backpressure
-        assert!(errors.load(std::sync::atomic::Ordering::Relaxed) > 0,
-                "expected some backpressure errors with small buffer and many writers");
+        assert!(
+            errors.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "expected some backpressure errors with small buffer and many writers"
+        );
 
         handle.close().unwrap();
     }
@@ -365,16 +427,21 @@ mod integration {
         handle.buffer_write(b"0123456789ABCDEF").unwrap();
         handle.close().unwrap();
 
-        assert_eq!(&handle.pread(HDR + 0, 4).unwrap(), b"0123");
+        assert_eq!(&handle.pread(HDR, 4).unwrap(), b"0123");
         assert_eq!(&handle.pread(HDR + 4, 4).unwrap(), b"4567");
         assert_eq!(&handle.pread(HDR + 10, 6).unwrap(), b"ABCDEF");
-        assert_eq!(&handle.pread(HDR + 0, 16).unwrap(), b"0123456789ABCDEF");
+        assert_eq!(&handle.pread(HDR, 16).unwrap(), b"0123456789ABCDEF");
     }
 
     #[test]
     fn test_pread_single_byte() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pread_one.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("pread_one.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"ABCDE").unwrap();
@@ -386,7 +453,12 @@ mod integration {
     #[test]
     fn test_pread_at_end() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pread_end.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("pread_end.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"12345").unwrap();
@@ -398,7 +470,12 @@ mod integration {
     #[test]
     fn test_pread_beyond_logical_size() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pread_beyond.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("pread_beyond.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"short").unwrap();
@@ -411,7 +488,12 @@ mod integration {
     #[test]
     fn test_pread_zero_length() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pread_zero.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("pread_zero.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"data").unwrap();
@@ -424,7 +506,12 @@ mod integration {
     #[test]
     fn test_pread_large_read() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pread_large.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("pread_large.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         let data = vec![0x42u8; 1024 * 1024]; // 1MB
@@ -456,7 +543,12 @@ mod integration {
     #[test]
     fn test_concurrent_close_attempts() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("multi_close.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("multi_close.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = Arc::new(WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap());
 
@@ -482,7 +574,12 @@ mod integration {
     #[test]
     fn test_write_read_integrity() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("integrity.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("integrity.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path.clone(), 0, 0, 64 * 1024 * 1024).unwrap();
 
@@ -531,18 +628,23 @@ mod integration {
     fn test_interleaved_write_patterns() {
         // Different sized writes interleaved — tests buffer coalescing
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("interleaved.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("interleaved.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path.clone(), 0, 0, 64 * 1024 * 1024).unwrap();
 
         let mut expected = Vec::new();
         for i in 0..1000 {
             let size = match i % 5 {
-                0 => 1,        // tiny
-                1 => 64,       // small
-                2 => 256,      // medium
-                3 => 4096,     // alignment boundary
-                _ => 10000,    // large
+                0 => 1,     // tiny
+                1 => 64,    // small
+                2 => 256,   // medium
+                3 => 4096,  // alignment boundary
+                _ => 10000, // large
             };
             let data = vec![(i % 256) as u8; size];
             handle.buffer_write(&data).unwrap();
@@ -553,7 +655,10 @@ mod integration {
         assert_eq!(handle.file_size(), HDR + expected.len() as u64);
 
         let contents = std::fs::read(&path).unwrap();
-        assert_eq!(&contents[HDR_USIZE..HDR_USIZE + expected.len()], &expected[..]);
+        assert_eq!(
+            &contents[HDR_USIZE..HDR_USIZE + expected.len()],
+            &expected[..]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -583,7 +688,12 @@ mod integration {
     #[test]
     fn test_zero_delay_immediate_flush() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("no_delay.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("no_delay.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"immediate").unwrap();
@@ -618,7 +728,12 @@ mod integration {
     #[test]
     fn test_path_with_unicode() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wal_ünïcödé_テスト.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("wal_ünïcödé_テスト.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"unicode path test").unwrap();
@@ -629,7 +744,12 @@ mod integration {
     #[test]
     fn test_path_with_spaces() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wal file with spaces.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("wal file with spaces.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
         handle.buffer_write(b"spaces").unwrap();
@@ -665,7 +785,12 @@ mod integration {
         let dir = tempfile::tempdir().unwrap();
 
         for i in 0..100 {
-            let path = dir.path().join(format!("leak_{i}.wal")).to_str().unwrap().to_string();
+            let path = dir
+                .path()
+                .join(format!("leak_{i}.wal"))
+                .to_str()
+                .unwrap()
+                .to_string();
             let handle = WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap();
             handle.buffer_write(b"x").unwrap();
             handle.close().unwrap();
@@ -676,7 +801,12 @@ mod integration {
     #[test]
     fn test_arc_drop_last_reference() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("arc_drop.wal").to_str().unwrap().to_string();
+        let path = dir
+            .path()
+            .join("arc_drop.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         let handle = Arc::new(WalHandle::open(path, 0, 0, 64 * 1024 * 1024).unwrap());
         let h2 = handle.clone();

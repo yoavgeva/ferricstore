@@ -1219,8 +1219,7 @@ mod tests {
         let mut fingerprints: HashSet<String> =
             heap_entries.iter().map(|e| e.element.clone()).collect();
 
-        let estimated =
-            v2_cms_increment(&mut counters, width, depth, element.as_bytes(), count);
+        let estimated = v2_cms_increment(&mut counters, width, depth, element.as_bytes(), count);
         let evicted = v2_heap_add(&mut heap_entries, &mut fingerprints, k, element, estimated);
 
         v2_write_cms(&file, &counters).unwrap();
@@ -1249,11 +1248,12 @@ mod tests {
         let file = crate::open_random_read(std::path::Path::new(path)).unwrap();
         let (k, width, depth, _decay, heap_len) = v2_read_header(&file).unwrap();
         let mut entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
-        entries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.element.cmp(&b.element)));
-        entries
-            .into_iter()
-            .map(|e| (e.element, e.count))
-            .collect()
+        entries.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.element.cmp(&b.element))
+        });
+        entries.into_iter().map(|e| (e.element, e.count)).collect()
     }
 
     #[test]
@@ -1279,7 +1279,10 @@ mod tests {
         // Bump "d" so its CMS estimate exceeds the heap minimum (all at 1).
         // Increment "d" by 10 so it clearly beats the min.
         topk_incrby_one(&path, "d", 10);
-        assert!(topk_query(&path, "d"), "d should have evicted a min element");
+        assert!(
+            topk_query(&path, "d"),
+            "d should have evicted a min element"
+        );
 
         // One of a/b/c got evicted
         let in_heap: Vec<bool> = ["a", "b", "c"]

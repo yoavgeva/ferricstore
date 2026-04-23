@@ -76,7 +76,12 @@ fn write(handle: ResourceArc<WalHandle>, iodata: Term) -> NifResult<Atom> {
 /// Returns :ok immediately.
 #[rustler::nif]
 #[allow(unused_variables)]
-fn sync(env: Env, handle: ResourceArc<WalHandle>, caller_pid: LocalPid, ref_term: Term<'_>) -> NifResult<Atom> {
+fn sync(
+    env: Env,
+    handle: ResourceArc<WalHandle>,
+    caller_pid: LocalPid,
+    ref_term: Term<'_>,
+) -> NifResult<Atom> {
     handle.check_alive()?;
 
     // Save the ref in an OwnedEnv so it survives past this NIF call
@@ -105,9 +110,15 @@ fn position(handle: ResourceArc<WalHandle>) -> NifResult<(Atom, u64)> {
 
 /// Read bytes from WAL at offset. Used during recovery.
 #[rustler::nif]
-fn pread<'a>(env: Env<'a>, handle: ResourceArc<WalHandle>, offset: u64, len: u64) -> NifResult<(Atom, Binary<'a>)> {
+fn pread<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<WalHandle>,
+    offset: u64,
+    len: u64,
+) -> NifResult<(Atom, Binary<'a>)> {
     let data = handle.pread(offset, len)?;
-    let mut binary = OwnedBinary::new(data.len()).ok_or(rustler::Error::Term(Box::new("alloc_failed")))?;
+    let mut binary =
+        OwnedBinary::new(data.len()).ok_or(rustler::Error::Term(Box::new("alloc_failed")))?;
     binary.as_mut_slice().copy_from_slice(&data);
     Ok((atoms::ok(), binary.release(env)))
 }

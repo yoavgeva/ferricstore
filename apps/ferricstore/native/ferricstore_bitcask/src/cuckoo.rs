@@ -1460,9 +1460,22 @@ mod tests {
 
         // Try primary bucket.
         for slot in 0..hdr.bucket_size {
-            let s = cuckoo_file_read_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+            let s = cuckoo_file_read_slot(
+                &file,
+                b1,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            )?;
             if s.iter().all(|&b| b == 0) {
-                cuckoo_file_write_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &fp)?;
+                cuckoo_file_write_slot(
+                    &file,
+                    b1,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                    &fp,
+                )?;
                 cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
                 return Ok(true);
             }
@@ -1470,9 +1483,22 @@ mod tests {
 
         // Try alternate bucket.
         for slot in 0..hdr.bucket_size {
-            let s = cuckoo_file_read_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+            let s = cuckoo_file_read_slot(
+                &file,
+                b2,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            )?;
             if s.iter().all(|&b| b == 0) {
-                cuckoo_file_write_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &fp)?;
+                cuckoo_file_write_slot(
+                    &file,
+                    b2,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                    &fp,
+                )?;
                 cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
                 return Ok(true);
             }
@@ -1483,13 +1509,39 @@ mod tests {
         let mut cur_bucket = b1;
         for kicks in 0..(hdr.max_kicks as u32) {
             let slot_idx = (kicks as usize) % (hdr.bucket_size as usize);
-            let evicted = cuckoo_file_read_slot(&file, cur_bucket, slot_idx, hdr.bucket_size, hdr.fingerprint_size)?;
-            cuckoo_file_write_slot(&file, cur_bucket, slot_idx, hdr.bucket_size, hdr.fingerprint_size, &cur_fp)?;
+            let evicted = cuckoo_file_read_slot(
+                &file,
+                cur_bucket,
+                slot_idx,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            )?;
+            cuckoo_file_write_slot(
+                &file,
+                cur_bucket,
+                slot_idx,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+                &cur_fp,
+            )?;
             let alt = cuckoo_file_alternate_bucket(cur_bucket, &evicted, hdr.num_buckets);
             for slot in 0..hdr.bucket_size {
-                let s = cuckoo_file_read_slot(&file, alt, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+                let s = cuckoo_file_read_slot(
+                    &file,
+                    alt,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                )?;
                 if s.iter().all(|&b| b == 0) {
-                    cuckoo_file_write_slot(&file, alt, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &evicted)?;
+                    cuckoo_file_write_slot(
+                        &file,
+                        alt,
+                        slot as usize,
+                        hdr.bucket_size,
+                        hdr.fingerprint_size,
+                        &evicted,
+                    )?;
                     cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
                     return Ok(true);
                 }
@@ -1512,7 +1564,13 @@ mod tests {
         let b2 = cuckoo_file_alternate_bucket(b1, &fp, hdr.num_buckets);
         for bucket in &[b1, b2] {
             for slot in 0..hdr.bucket_size {
-                let s = cuckoo_file_read_slot(&file, *bucket, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+                let s = cuckoo_file_read_slot(
+                    &file,
+                    *bucket,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                )?;
                 if s == fp {
                     return Ok(true);
                 }
@@ -1534,9 +1592,22 @@ mod tests {
         let empty = vec![0u8; hdr.fingerprint_size as usize];
         for bucket in &[b1, b2] {
             for slot in 0..hdr.bucket_size {
-                let s = cuckoo_file_read_slot(&file, *bucket, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+                let s = cuckoo_file_read_slot(
+                    &file,
+                    *bucket,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                )?;
                 if s == fp {
-                    cuckoo_file_write_slot(&file, *bucket, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &empty)?;
+                    cuckoo_file_write_slot(
+                        &file,
+                        *bucket,
+                        slot as usize,
+                        hdr.bucket_size,
+                        hdr.fingerprint_size,
+                        &empty,
+                    )?;
                     cuckoo_file_write_num_items(&file, hdr.num_items.wrapping_sub(1))?;
                     cuckoo_file_write_num_deletes(&file, hdr.num_deletes + 1)?;
                     return Ok(true);
@@ -1560,7 +1631,13 @@ mod tests {
         // Check existence first.
         for bucket in &[b1, b2] {
             for slot in 0..hdr.bucket_size {
-                let s = cuckoo_file_read_slot(&file, *bucket, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+                let s = cuckoo_file_read_slot(
+                    &file,
+                    *bucket,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                )?;
                 if s == fp {
                     return Ok(0);
                 }
@@ -1569,17 +1646,43 @@ mod tests {
 
         // Not found — insert (try primary, then alternate, then eviction).
         for slot in 0..hdr.bucket_size {
-            let s = cuckoo_file_read_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+            let s = cuckoo_file_read_slot(
+                &file,
+                b1,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            )?;
             if s.iter().all(|&b| b == 0) {
-                cuckoo_file_write_slot(&file, b1, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &fp)?;
+                cuckoo_file_write_slot(
+                    &file,
+                    b1,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                    &fp,
+                )?;
                 cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
                 return Ok(1);
             }
         }
         for slot in 0..hdr.bucket_size {
-            let s = cuckoo_file_read_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+            let s = cuckoo_file_read_slot(
+                &file,
+                b2,
+                slot as usize,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            )?;
             if s.iter().all(|&b| b == 0) {
-                cuckoo_file_write_slot(&file, b2, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &fp)?;
+                cuckoo_file_write_slot(
+                    &file,
+                    b2,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                    &fp,
+                )?;
                 cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
                 return Ok(1);
             }
@@ -1590,13 +1693,39 @@ mod tests {
         let mut cur_bucket = b1;
         for kicks in 0..(hdr.max_kicks as u32) {
             let slot_idx = (kicks as usize) % (hdr.bucket_size as usize);
-            let evicted = cuckoo_file_read_slot(&file, cur_bucket, slot_idx, hdr.bucket_size, hdr.fingerprint_size)?;
-            cuckoo_file_write_slot(&file, cur_bucket, slot_idx, hdr.bucket_size, hdr.fingerprint_size, &cur_fp)?;
+            let evicted = cuckoo_file_read_slot(
+                &file,
+                cur_bucket,
+                slot_idx,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+            )?;
+            cuckoo_file_write_slot(
+                &file,
+                cur_bucket,
+                slot_idx,
+                hdr.bucket_size,
+                hdr.fingerprint_size,
+                &cur_fp,
+            )?;
             let alt = cuckoo_file_alternate_bucket(cur_bucket, &evicted, hdr.num_buckets);
             for slot in 0..hdr.bucket_size {
-                let s = cuckoo_file_read_slot(&file, alt, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+                let s = cuckoo_file_read_slot(
+                    &file,
+                    alt,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                )?;
                 if s.iter().all(|&b| b == 0) {
-                    cuckoo_file_write_slot(&file, alt, slot as usize, hdr.bucket_size, hdr.fingerprint_size, &evicted)?;
+                    cuckoo_file_write_slot(
+                        &file,
+                        alt,
+                        slot as usize,
+                        hdr.bucket_size,
+                        hdr.fingerprint_size,
+                        &evicted,
+                    )?;
                     cuckoo_file_write_num_items(&file, hdr.num_items + 1)?;
                     return Ok(1);
                 }
@@ -1620,7 +1749,13 @@ mod tests {
         let mut total = 0u64;
         for bucket in &[b1, b2] {
             for slot in 0..hdr.bucket_size {
-                let s = cuckoo_file_read_slot(&file, *bucket, slot as usize, hdr.bucket_size, hdr.fingerprint_size)?;
+                let s = cuckoo_file_read_slot(
+                    &file,
+                    *bucket,
+                    slot as usize,
+                    hdr.bucket_size,
+                    hdr.fingerprint_size,
+                )?;
                 if s == fp {
                     total += 1;
                 }
@@ -1765,7 +1900,12 @@ mod tests {
     #[test]
     fn nonexistent_file_errors_for_all_ops() {
         let dir = tempfile::tempdir().unwrap();
-        let bad = dir.path().join("missing.cuckoo").to_str().unwrap().to_string();
+        let bad = dir
+            .path()
+            .join("missing.cuckoo")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         assert!(test_exists(&bad, b"x").is_err());
         assert!(test_add(&bad, b"x").is_err());
@@ -1927,10 +2067,7 @@ mod tests {
                     for i in 0..20 {
                         let elem = format!("conc_{i}");
                         let exists = test_exists(&p, elem.as_bytes()).unwrap();
-                        assert!(
-                            exists,
-                            "thread {t}: element {elem} should exist"
-                        );
+                        assert!(exists, "thread {t}: element {elem} should exist");
                     }
                 })
             })
@@ -1998,10 +2135,7 @@ mod tests {
 
         // bucket_idx=3, slot_idx=1 with bucket_size=4, fp_size=1
         // => HEADER_SIZE + (3*4 + 1)*1 = HEADER_SIZE + 13
-        assert_eq!(
-            cuckoo_file_slot_offset(3, 1, 4, 1),
-            HEADER_SIZE as u64 + 13
-        );
+        assert_eq!(cuckoo_file_slot_offset(3, 1, 4, 1), HEADER_SIZE as u64 + 13);
     }
 
     #[test]

@@ -72,7 +72,10 @@ mod resp {
 
     /// Parse all complete RESP messages from `buf`.
     /// Returns (parsed_values, consumed_bytes) on success.
-    pub(crate) fn parse_resp(buf: &[u8], max_value_size: usize) -> Result<(Vec<RespValue<'_>>, usize), RespError> {
+    pub(crate) fn parse_resp(
+        buf: &[u8],
+        max_value_size: usize,
+    ) -> Result<(Vec<RespValue<'_>>, usize), RespError> {
         let mut pos = 0;
         let mut commands = Vec::new();
 
@@ -87,7 +90,9 @@ mod resp {
                     pos = new_pos;
                 }
                 RespParseResult::Incomplete => break,
-                RespParseResult::Fallback => return Err(RespError::ProtocolError("fallback".into())),
+                RespParseResult::Fallback => {
+                    return Err(RespError::ProtocolError("fallback".into()))
+                }
                 RespParseResult::Error(e) => return Err(e),
             }
         }
@@ -95,7 +100,11 @@ mod resp {
         Ok((commands, pos))
     }
 
-    pub(crate) fn parse_one_resp(buf: &[u8], pos: usize, max_value_size: usize) -> RespParseResult<'_> {
+    pub(crate) fn parse_one_resp(
+        buf: &[u8],
+        pos: usize,
+        max_value_size: usize,
+    ) -> RespParseResult<'_> {
         if pos >= buf.len() {
             return RespParseResult::Incomplete;
         }
@@ -107,7 +116,9 @@ mod resp {
             b'-' => parse_simple_error_resp(buf, pos + 1),
             b':' => parse_integer_resp(buf, pos + 1),
             b'_' => parse_null_resp(buf, pos + 1),
-            b'#' | b',' | b'(' | b'!' | b'=' | b'%' | b'~' | b'>' | b'|' => RespParseResult::Fallback,
+            b'#' | b',' | b'(' | b'!' | b'=' | b'%' | b'~' | b'>' | b'|' => {
+                RespParseResult::Fallback
+            }
             _ => parse_inline_resp(buf, pos),
         }
     }
@@ -155,7 +166,11 @@ mod resp {
         RespParseResult::Ok(RespValue::Array(elements), cur)
     }
 
-    fn parse_bulk_string_resp(buf: &[u8], pos: usize, max_value_size: usize) -> RespParseResult<'_> {
+    fn parse_bulk_string_resp(
+        buf: &[u8],
+        pos: usize,
+        max_value_size: usize,
+    ) -> RespParseResult<'_> {
         let (line, after_crlf) = match find_crlf(buf, pos) {
             Some((cr_pos, after)) => (&buf[pos..cr_pos], after),
             None => return RespParseResult::Incomplete,
@@ -600,8 +615,8 @@ rustler::init!("Elixir.FerricstoreServer.Resp.ParserNif");
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::resp::*;
+    use super::*;
 
     const MAX_SIZE: usize = 512 * 1024 * 1024; // 512 MB — generous limit for tests
 
@@ -1113,12 +1128,30 @@ mod tests {
 
     #[test]
     fn incomplete_just_type_byte() {
-        assert_eq!(parse_one_resp(b"*", 0, MAX_SIZE), RespParseResult::Incomplete);
-        assert_eq!(parse_one_resp(b"$", 0, MAX_SIZE), RespParseResult::Incomplete);
-        assert_eq!(parse_one_resp(b"+", 0, MAX_SIZE), RespParseResult::Incomplete);
-        assert_eq!(parse_one_resp(b"-", 0, MAX_SIZE), RespParseResult::Incomplete);
-        assert_eq!(parse_one_resp(b":", 0, MAX_SIZE), RespParseResult::Incomplete);
-        assert_eq!(parse_one_resp(b"_", 0, MAX_SIZE), RespParseResult::Incomplete);
+        assert_eq!(
+            parse_one_resp(b"*", 0, MAX_SIZE),
+            RespParseResult::Incomplete
+        );
+        assert_eq!(
+            parse_one_resp(b"$", 0, MAX_SIZE),
+            RespParseResult::Incomplete
+        );
+        assert_eq!(
+            parse_one_resp(b"+", 0, MAX_SIZE),
+            RespParseResult::Incomplete
+        );
+        assert_eq!(
+            parse_one_resp(b"-", 0, MAX_SIZE),
+            RespParseResult::Incomplete
+        );
+        assert_eq!(
+            parse_one_resp(b":", 0, MAX_SIZE),
+            RespParseResult::Incomplete
+        );
+        assert_eq!(
+            parse_one_resp(b"_", 0, MAX_SIZE),
+            RespParseResult::Incomplete
+        );
     }
 
     #[test]
@@ -1255,7 +1288,12 @@ mod tests {
             let mut input = vec![prefix];
             input.extend_from_slice(b"data\r\n");
             let result = parse_one_resp(&input, 0, MAX_SIZE);
-            assert_eq!(result, RespParseResult::Fallback, "prefix={}", prefix as char);
+            assert_eq!(
+                result,
+                RespParseResult::Fallback,
+                "prefix={}",
+                prefix as char
+            );
         }
     }
 
@@ -1289,10 +1327,7 @@ mod tests {
         // Array containing nil bulk strings
         let input = b"*2\r\n$-1\r\n$-1\r\n";
         let (val, _) = parse_ok(input);
-        assert_eq!(
-            val,
-            RespValue::Array(vec![RespValue::Nil, RespValue::Nil])
-        );
+        assert_eq!(val, RespValue::Array(vec![RespValue::Nil, RespValue::Nil]));
     }
 
     #[test]
