@@ -84,7 +84,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
           acl_ok = state.acl_cache == :full_access or
                    (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
 
-          # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsInUnless
+          # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
           if not acl_ok do
             :fallback
           else
@@ -139,13 +139,13 @@ defmodule FerricstoreServer.Connection.Pipeline do
           acl_ok = state.acl_cache == :full_access or
                    (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
 
-          # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsInUnless
+          # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
           if not acl_ok do
             :fallback
           else
             pressure_ok = :atomics.get(ctx.pressure_flags, 1) == 0 and
                           :atomics.get(ctx.pressure_flags, 2) == 0
-            # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsInUnless
+            # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
             if not pressure_ok do
               :fallback
             else
@@ -241,7 +241,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
       acl_ok = state.acl_cache == :full_access or
                (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
 
-      # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsInUnless
+      # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
       if not acl_ok do
         general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
       else
@@ -301,7 +301,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
                         :atomics.get(ctx.pressure_flags, 2) == 0
 
           results =
-            # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsInUnless
+            # credo:disable-for-next-line Credo.Check.Refactor.NegatedConditionsWithElse
             if not pressure_ok do
               List.duplicate({:error, "ERR server under pressure"}, length(kv_pairs))
             else

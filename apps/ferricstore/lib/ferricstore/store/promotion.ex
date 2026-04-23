@@ -90,8 +90,8 @@ defmodule Ferricstore.Store.Promotion do
 
     active_file = Path.join(path, "00000.log")
 
-    # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
     created_file? =
+      # credo:disable-for-next-line Credo.Check.Refactor.UnlessWithElse
       unless Ferricstore.FS.exists?(active_file) do
         Ferricstore.FS.touch!(active_file)
         true
