@@ -1618,6 +1618,7 @@ mod tests {
     }
 
     /// Add only if not exists. Returns Ok(1) if added, Ok(0) if already present.
+    #[allow(clippy::too_many_lines)]
     fn test_addnx(path: &str, element: &[u8]) -> Result<u64, String> {
         let file = cuckoo_file_open_rw(path).map_err(|e| format!("{e:?}"))?;
         let hdr = cuckoo_read_header(&file)?;

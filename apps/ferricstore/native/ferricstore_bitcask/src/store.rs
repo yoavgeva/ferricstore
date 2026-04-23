@@ -195,7 +195,7 @@ impl Store {
         // ensuring new writes don't end up after unreadable data.
         if let Some(valid_end) = active_valid_end {
             if active_path.exists() {
-                let file_len = fs::metadata(&active_path).map(|m| m.len()).unwrap_or(0);
+                let file_len = fs::metadata(&active_path).map_or(0, |m| m.len());
                 if valid_end < file_len {
                     let f = fs::OpenOptions::new()
                         .write(true)
@@ -844,7 +844,7 @@ impl Store {
         for &fid in file_ids {
             let path = log_path(&self.data_dir, fid);
             if path.exists() {
-                bytes_before += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                bytes_before += fs::metadata(&path).map_or(0, |m| m.len());
             }
         }
         let max_input = file_ids.iter().copied().max().unwrap_or(0);
@@ -884,7 +884,7 @@ impl Store {
         let mut bytes_after: u64 = 0;
         let new_path = self.log_path_for(new_file_id);
         if new_path.exists() {
-            bytes_after = fs::metadata(&new_path).map(|m| m.len()).unwrap_or(0);
+            bytes_after = fs::metadata(&new_path).map_or(0, |m| m.len());
         }
         Ok((
             output.records_written as u64,
