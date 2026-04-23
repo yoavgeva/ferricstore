@@ -1057,14 +1057,11 @@ open_at_first_record(File) ->
         {ok, <<?MAGIC, ?CURRENT_VERSION:8/unsigned>>} ->
             %% the only version currently supported
             Fd;
+        {ok, <<0, 0, 0, 0, _/binary>>} ->
+            %% Pre-allocated file filled with zeros. Nothing to recover.
+            Fd;
         {ok, <<Magic:4/binary, UnknownVersion:8/unsigned>>} ->
             exit({unknown_wal_file_format, Magic, UnknownVersion});
-        %% PATCHED: handle empty or truncated WAL files.
-        %% An empty WAL file (0 bytes) returns `eof` from file:read/2.
-        %% A partially-written header (< 5 bytes, e.g. from kill -9 during
-        %% WAL rotation) returns {ok, ShortBin} that doesn't match the
-        %% 5-byte pattern above. In both cases, treat the file as empty —
-        %% there are no valid records to recover.
         eof ->
             Fd;
         {ok, _PartialHeader} ->
