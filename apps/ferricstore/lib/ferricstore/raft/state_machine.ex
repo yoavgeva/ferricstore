@@ -1540,11 +1540,28 @@ defmodule Ferricstore.Raft.StateMachine do
   # Private: command execution
   # ---------------------------------------------------------------------------
 
-  # Inside a batch, async commands obey the same origin-skip rule. If this
-  # node has the key → it was the origin (Router wrote it), skip. Otherwise
-  # apply the inner command normally.
+  # Async PUT on origin: skip ETS (Router already inserted) but still
+  # accumulate disk write for flush_pending_writes. On replicas, apply
+  # normally (both ETS + disk).
+  # All other async commands (INCR, APPEND, etc.) keep origin-skip to
+  # avoid double-apply of read-modify-write operations.
+  defp apply_single(state, {:async, {:put, key, value, expire_at_ms} = _inner}) do
+    if async_key_present?(state, {:put, key, value, expire_at_ms}) do
+      disk_val = to_disk_binary(value)
+      pending = Process.get(:sm_pending_writes, [])
+      Process.put(:sm_pending_writes, [{key, disk_val, expire_at_ms} | pending])
+      :ok
+    else
+      apply_single(state, {:put, key, value, expire_at_ms})
+    end
+  end
+
   defp apply_single(state, {:async, inner_cmd}) do
-    apply_single(state, inner_cmd)
+    if async_key_present?(state, inner_cmd) do
+      :ok
+    else
+      apply_single(state, inner_cmd)
+    end
   end
 
   defp apply_single(state, {:put, key, value, expire_at_ms}) do
