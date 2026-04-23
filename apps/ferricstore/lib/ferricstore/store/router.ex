@@ -1106,13 +1106,16 @@ defmodule Ferricstore.Store.Router do
       :ets.insert(keydir, ets_tuples)
 
       if large_disk_batch != [] do
-        case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, Enum.reverse(large_disk_batch)) do
+        reversed = Enum.reverse(large_disk_batch)
+        case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, reversed) do
           {:ok, locations} ->
-            Enum.zip(large_disk_batch |> Enum.reverse(), locations)
+            Enum.zip(reversed, locations)
             |> Enum.each(fn {{key, value, _exp}, {offset, _rec_size}} ->
               :ets.update_element(keydir, key, [{5, file_id}, {6, offset}, {7, byte_size(value)}])
             end)
-          {:error, _} -> :ok
+          {:error, reason} ->
+            Enum.each(large_disk_batch, fn {key, _, _} -> :ets.delete(keydir, key) end)
+            throw({:disk_error, reason})
         end
       end
 
@@ -1122,6 +1125,9 @@ defmodule Ferricstore.Store.Router do
     end)
 
     :ok
+  catch
+    :throw, {:disk_error, reason} ->
+      {:error, "ERR disk write failed: #{inspect(reason)}"}
   end
 
   @doc """

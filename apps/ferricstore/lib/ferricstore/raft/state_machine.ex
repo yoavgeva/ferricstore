@@ -215,24 +215,15 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   # Async commands. Router on the origin node has already persisted the write
-  # locally (ETS for small values; ETS + Bitcask for big values) before calling
-  # Batcher.async_submit. When this apply/3 runs on the origin, the key is
-  # already in ETS — skip to avoid redundant ETS/Bitcask writes and potential
-  # races with concurrent writes to the same key. On replicas (which never ran
-  # Router for this write), ETS is empty — apply the inner command normally.
+  # Async single-command path (currently unreachable — Batcher wraps in {:batch, ...},
+  # but kept consistent with apply_single for safety). Delegates to apply_single
+  # which handles origin-skip with disk accumulation for PUT.
   @impl true
-  def apply(meta, {:async, inner_cmd}, state) do
-    case async_key_present?(state, inner_cmd) do
-      true ->
-        # Origin: skip. Data already durable locally.
-        old_count = state.applied_count
-        new_state = %{state | applied_count: old_count + 1}
-        maybe_release_cursor(meta, old_count, new_state, :ok)
-
-      false ->
-        # Replica: apply inner normally.
-        __MODULE__.apply(meta, inner_cmd, state)
-    end
+  def apply(meta, {:async, _inner_cmd} = cmd, state) do
+    result = with_pending_writes(state, fn -> apply_single(state, cmd) end)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
   end
 
   @impl true
@@ -1459,12 +1450,14 @@ defmodule Ferricstore.Raft.StateMachine do
   # ETS, needs to apply). Deterministic per-node because it reads the
   # node's own local ETS state.
   defp async_key_present?(state, {:put, key, _value, _exp}), do: ets_has?(state.ets, key)
-  defp async_key_present?(state, {:delete, key}), do: ets_has?(state.ets, key)
+  # Delete/getdel: Router deletes from ETS before Raft submit, so ets_has?
+  # always returns false on origin. Always apply — tombstone writes are idempotent.
+  defp async_key_present?(_state, {:delete, _key}), do: false
   defp async_key_present?(state, {:incr, key, _delta}), do: ets_has?(state.ets, key)
   defp async_key_present?(state, {:incr_float, key, _delta}), do: ets_has?(state.ets, key)
   defp async_key_present?(state, {:append, key, _suffix}), do: ets_has?(state.ets, key)
   defp async_key_present?(state, {:getset, key, _v}), do: ets_has?(state.ets, key)
-  defp async_key_present?(state, {:getdel, key}), do: ets_has?(state.ets, key)
+  defp async_key_present?(_state, {:getdel, _key}), do: false
   defp async_key_present?(state, {:getex, key, _exp}), do: ets_has?(state.ets, key)
   defp async_key_present?(state, {:setrange, key, _off, _v}), do: ets_has?(state.ets, key)
   defp async_key_present?(state, {:setbit, key, _off, _bit}), do: ets_has?(state.ets, key)
