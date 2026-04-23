@@ -40,8 +40,7 @@ static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 /// without the runtime.
 pub fn runtime() -> &'static Runtime {
     TOKIO_RT.get_or_init(|| {
-        let num_cpus = std::thread::available_parallelism()
-            .map_or(4, std::num::NonZero::get);
+        let num_cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let workers = num_cpus.clamp(1, 4);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
