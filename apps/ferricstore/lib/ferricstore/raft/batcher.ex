@@ -90,7 +90,7 @@ defmodule Ferricstore.Raft.Batcher do
 
     * `:shard_id` (required) -- the ra server ID for this shard
     * `:shard_index` (required) -- zero-based shard index
-    * `:max_batch_size` -- flush single-write slot when it reaches this size (default: #{@default_max_batch_size})
+    * `:max_batch_size` -- flush single-write slot when it reaches this size (default: 50_000)
   """
 
   use GenServer

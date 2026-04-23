@@ -82,20 +82,6 @@ defmodule Ferricstore.Store.BitcaskWriter do
   end
 
   @doc """
-  Queues a deferred Bitcask tombstone (delete) for background processing.
-
-  Called from `Router.async_delete/2` when raft is disabled. The tombstone
-  is written in the same ordered batch as value writes, so a tombstone
-  for key K will always appear after any preceding value write for K.
-  The ETS entry has already been deleted by the caller before this cast.
-
-  ## Parameters
-
-    - `shard_index` -- zero-based shard index
-    - `active_file_path` -- the active log file path at the time of the delete
-    - `key` -- the key to tombstone
-  """
-  @doc """
   Queues a batch of deferred Bitcask writes in a single cast.
 
   Same semantics as calling `write/7` for each entry, but sends one
@@ -110,6 +96,14 @@ defmodule Ferricstore.Store.BitcaskWriter do
     )
   end
 
+  @doc """
+  Queues a deferred Bitcask tombstone (delete) for background processing.
+
+  Called from `Router.async_delete/2` when raft is disabled. The tombstone
+  is written in the same ordered batch as value writes, so a tombstone
+  for key K will always appear after any preceding value write for K.
+  The ETS entry has already been deleted by the caller before this cast.
+  """
   @spec delete(non_neg_integer(), binary(), binary()) :: :ok
   def delete(shard_index, active_file_path, key) do
     GenServer.cast(

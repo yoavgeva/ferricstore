@@ -378,6 +378,9 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         assert!(!o_direct);
 
+        #[cfg(target_os = "linux")]
+        let _ = o_direct;
+
         // File should exist
         assert!(path.exists());
     }

@@ -612,15 +612,6 @@ defmodule Ferricstore.Application do
   # This must be called BEFORE ra_system:start/1 so the patched module is
   # loaded before the WAL process starts.
   # Check if ra is a local path dependency (fork) vs hex package.
-  defp ra_is_path_dep? do
-    case :code.which(:ra_log_wal) do
-      path when is_list(path) ->
-        not String.contains?(List.to_string(path), "/deps/ra/")
-
-      _ ->
-        false
-    end
-  end
 
   @spec install_patched_wal() :: :ok | :error
   defp install_patched_wal do

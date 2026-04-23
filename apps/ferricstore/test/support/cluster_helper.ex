@@ -363,7 +363,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   @spec partition_node(map(), [map()]) :: :ok
   def partition_node(node, all_nodes) do
     others = Enum.reject(all_nodes, &(&1.name == node.name))
-    other_names = Enum.map(others, & &1.name)
+    _other_names = Enum.map(others, & &1.name)
     shards = :rpc.call(node.name, Application, :get_env, [:ferricstore, :shard_count, 4])
 
     # Suspend ClusterManager on ALL nodes to prevent auto-reconnect
