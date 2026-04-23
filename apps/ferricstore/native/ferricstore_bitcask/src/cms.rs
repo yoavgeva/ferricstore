@@ -869,4 +869,227 @@ mod tests {
         let indices2 = hash_indices_standalone(b"foobarbaz", 100, 5);
         assert_ne!(indices, indices2);
     }
+
+    // -----------------------------------------------------------------------
+    // Incrby / query file I/O tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: do pread/pwrite incrby for a single element, return min count.
+    fn file_incrby_one(path: &str, element: &[u8], count: i64) -> i64 {
+        let file = crate::open_random_rw(Path::new(path)).unwrap();
+        let (width, depth, mut total_count) = cms_file_read_header(&file).unwrap();
+        let indices = hash_indices_standalone(element, width, depth);
+        let mut buf = [0u8; 8];
+        let mut min_val = i64::MAX;
+        for (row, &col) in indices.iter().enumerate() {
+            let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
+            file.read_at(&mut buf, offset).unwrap();
+            let mut val = i64::from_le_bytes(buf);
+            val += count;
+            file.write_at(&val.to_le_bytes(), offset).unwrap();
+            min_val = min_val.min(val);
+        }
+        total_count = total_count.wrapping_add(count as u64);
+        file.write_at(&total_count.to_le_bytes(), 24).unwrap();
+        min_val
+    }
+
+    /// Helper: query a single element via pread, return min count.
+    fn file_query_one(path: &str, element: &[u8]) -> i64 {
+        let file = crate::open_random_read(Path::new(path)).unwrap();
+        let (width, depth, _) = cms_file_read_header(&file).unwrap();
+        let indices = hash_indices_standalone(element, width, depth);
+        let mut buf = [0u8; 8];
+        let mut min_val = i64::MAX;
+        for (row, &col) in indices.iter().enumerate() {
+            let offset = MMAP_HEADER_SIZE as u64 + (row as u64 * width + col) * 8;
+            file.read_at(&mut buf, offset).unwrap();
+            min_val = min_val.min(i64::from_le_bytes(buf));
+        }
+        min_val
+    }
+
+    #[test]
+    fn incrby_by_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_cms_file(dir.path(), "incr1.cms", 100, 5);
+        let min = file_incrby_one(&path, b"elem", 1);
+        assert_eq!(min, 1);
+    }
+
+    #[test]
+    fn incrby_by_ten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_cms_file(dir.path(), "incr10.cms", 100, 5);
+        let min = file_incrby_one(&path, b"elem", 10);
+        assert_eq!(min, 10);
+    }
+
+    #[test]
+    fn incrby_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_cms_file(dir.path(), "incr_neg.cms", 100, 5);
+        // Increment up first, then decrement
+        file_incrby_one(&path, b"x", 5);
+        let min = file_incrby_one(&path, b"x", -3);
+        assert_eq!(min, 2);
+    }
+
+    #[test]
+    fn incrby_accumulates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_cms_file(dir.path(), "accum.cms", 100, 5);
+        file_incrby_one(&path, b"item", 3);
+        file_incrby_one(&path, b"item", 7);
+        file_incrby_one(&path, b"item", 2);
+        let count = file_query_one(&path, b"item");
+        assert_eq!(count, 12);
+    }
+
+    #[test]
+    fn query_multiple_independent_elements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_cms_file(dir.path(), "multi.cms", 200, 7);
+        file_incrby_one(&path, b"alpha", 10);
+        file_incrby_one(&path, b"beta", 20);
+        file_incrby_one(&path, b"gamma", 5);
+
+        let a = file_query_one(&path, b"alpha");
+        let b = file_query_one(&path, b"beta");
+        let g = file_query_one(&path, b"gamma");
+        let unseen = file_query_one(&path, b"delta");
+
+        // CMS can overcount due to collisions, but never undercount
+        assert!(a >= 10, "alpha: expected >=10, got {a}");
+        assert!(b >= 20, "beta: expected >=20, got {b}");
+        assert!(g >= 5, "gamma: expected >=5, got {g}");
+        assert_eq!(unseen, 0);
+    }
+
+    #[test]
+    fn merge_two_files_additive() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = create_cms_file(dir.path(), "merge_dst.cms", 50, 3);
+        let src = create_cms_file(dir.path(), "merge_src.cms", 50, 3);
+
+        file_incrby_one(&dst, b"key", 10);
+        file_incrby_one(&src, b"key", 7);
+
+        // Merge src into dst with weight 1
+        {
+            let dst_file = crate::open_random_rw(Path::new(&dst)).unwrap();
+            let src_file = crate::open_random_read(Path::new(&src)).unwrap();
+            let (width, depth, _) = cms_file_read_header(&dst_file).unwrap();
+            let total = width * depth;
+            let mut db = [0u8; 8];
+            let mut sb = [0u8; 8];
+            for i in 0..total {
+                let offset = MMAP_HEADER_SIZE as u64 + i * 8;
+                dst_file.read_at(&mut db, offset).unwrap();
+                src_file.read_at(&mut sb, offset).unwrap();
+                let val = i64::from_le_bytes(db) + i64::from_le_bytes(sb);
+                dst_file.write_at(&val.to_le_bytes(), offset).unwrap();
+            }
+        }
+
+        let count = file_query_one(&dst, b"key");
+        assert_eq!(count, 17);
+    }
+
+    #[test]
+    fn merge_with_weight() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = create_cms_file(dir.path(), "mw_dst.cms", 50, 3);
+        let src = create_cms_file(dir.path(), "mw_src.cms", 50, 3);
+
+        file_incrby_one(&dst, b"w", 4);
+        file_incrby_one(&src, b"w", 3);
+
+        // Merge src into dst with weight 2: dst += src * 2
+        {
+            let dst_file = crate::open_random_rw(Path::new(&dst)).unwrap();
+            let src_file = crate::open_random_read(Path::new(&src)).unwrap();
+            let (width, depth, _) = cms_file_read_header(&dst_file).unwrap();
+            let total = width * depth;
+            let mut db = [0u8; 8];
+            let mut sb = [0u8; 8];
+            let weight: i64 = 2;
+            for i in 0..total {
+                let offset = MMAP_HEADER_SIZE as u64 + i * 8;
+                dst_file.read_at(&mut db, offset).unwrap();
+                src_file.read_at(&mut sb, offset).unwrap();
+                let val = i64::from_le_bytes(db) + i64::from_le_bytes(sb) * weight;
+                dst_file.write_at(&val.to_le_bytes(), offset).unwrap();
+            }
+        }
+
+        // 4 + 3*2 = 10
+        let count = file_query_one(&dst, b"w");
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn counter_large_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_cms_file(dir.path(), "large.cms", 100, 5);
+        // Increment near i64 max / 2 twice — should not panic
+        let big = i64::MAX / 2;
+        let min1 = file_incrby_one(&path, b"big", big);
+        assert_eq!(min1, big);
+        // Second increment wraps — just verify no panic
+        let min2 = file_incrby_one(&path, b"big", big);
+        assert_eq!(min2, big.wrapping_add(big));
+    }
+
+    #[test]
+    fn concurrent_reads_during_incrby() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_cms_file(dir.path(), "conc.cms", 200, 5);
+        let path_arc = Arc::new(path);
+
+        // Writer thread
+        let pw = Arc::clone(&path_arc);
+        let writer = thread::spawn(move || {
+            for _ in 0..100 {
+                file_incrby_one(&pw, b"concurrent", 1);
+            }
+        });
+
+        // Reader threads
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let pr = Arc::clone(&path_arc);
+            readers.push(thread::spawn(move || {
+                for _ in 0..50 {
+                    let count = file_query_one(&pr, b"concurrent");
+                    // count must be non-negative (no corruption)
+                    assert!(count >= 0, "negative count during concurrent read: {count}");
+                }
+            }));
+        }
+
+        writer.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
+        }
+
+        // Final count must be exactly 100
+        let final_count = file_query_one(&path_arc, b"concurrent");
+        assert_eq!(final_count, 100);
+    }
+
+    #[test]
+    fn total_count_in_header_tracks_increments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_cms_file(dir.path(), "hdr_count.cms", 100, 5);
+        file_incrby_one(&path, b"a", 3);
+        file_incrby_one(&path, b"b", 7);
+
+        let file = crate::open_random_read(Path::new(&path)).unwrap();
+        let (_, _, total_count) = cms_file_read_header(&file).unwrap();
+        assert_eq!(total_count, 10);
+    }
 }

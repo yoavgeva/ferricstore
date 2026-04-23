@@ -1183,4 +1183,221 @@ mod tests {
         assert_eq!(read_entries[0].element.len(), MAX_ELEMENT_LEN);
         assert_eq!(read_entries[0].count, 10);
     }
+
+    // -----------------------------------------------------------------------
+    // End-to-end file I/O tests (heap + CMS coordination)
+    // -----------------------------------------------------------------------
+
+    /// Helper: add elements to a TopK file using the same logic as the NIF,
+    /// returning evicted element names (None = no eviction).
+    fn topk_add_elements(path: &str, elements: &[&str]) -> Vec<Option<String>> {
+        let file = crate::open_random_rw(std::path::Path::new(path)).unwrap();
+        let (k, width, depth, _decay, heap_len) = v2_read_header(&file).unwrap();
+        let mut counters = v2_read_cms(&file, width, depth).unwrap();
+        let mut heap_entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
+        let mut fingerprints: HashSet<String> =
+            heap_entries.iter().map(|e| e.element.clone()).collect();
+
+        let mut results = Vec::new();
+        for &elem in elements {
+            let estimated = v2_cms_increment(&mut counters, width, depth, elem.as_bytes(), 1);
+            let evicted = v2_heap_add(&mut heap_entries, &mut fingerprints, k, elem, estimated);
+            results.push(evicted);
+        }
+
+        v2_write_cms(&file, &counters).unwrap();
+        v2_write_heap(&file, width, depth, &heap_entries).unwrap();
+        results
+    }
+
+    /// Helper: incrby a single element, return evicted name if any.
+    fn topk_incrby_one(path: &str, element: &str, count: i64) -> Option<String> {
+        let file = crate::open_random_rw(std::path::Path::new(path)).unwrap();
+        let (k, width, depth, _decay, heap_len) = v2_read_header(&file).unwrap();
+        let mut counters = v2_read_cms(&file, width, depth).unwrap();
+        let mut heap_entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
+        let mut fingerprints: HashSet<String> =
+            heap_entries.iter().map(|e| e.element.clone()).collect();
+
+        let estimated =
+            v2_cms_increment(&mut counters, width, depth, element.as_bytes(), count);
+        let evicted = v2_heap_add(&mut heap_entries, &mut fingerprints, k, element, estimated);
+
+        v2_write_cms(&file, &counters).unwrap();
+        v2_write_heap(&file, width, depth, &heap_entries).unwrap();
+        evicted
+    }
+
+    /// Helper: query whether an element is in the heap.
+    fn topk_query(path: &str, element: &str) -> bool {
+        let file = crate::open_random_read(std::path::Path::new(path)).unwrap();
+        let (k, width, depth, _decay, heap_len) = v2_read_header(&file).unwrap();
+        let heap_entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
+        heap_entries.iter().any(|e| e.element == element)
+    }
+
+    /// Helper: get CMS count estimate for an element.
+    fn topk_count(path: &str, element: &str) -> i64 {
+        let file = crate::open_random_read(std::path::Path::new(path)).unwrap();
+        let (_k, width, depth, _decay, _heap_len) = v2_read_header(&file).unwrap();
+        let counters = v2_read_cms(&file, width, depth).unwrap();
+        v2_cms_estimate(&counters, width, depth, element.as_bytes())
+    }
+
+    /// Helper: list heap entries sorted descending by count.
+    fn topk_list(path: &str) -> Vec<(String, i64)> {
+        let file = crate::open_random_read(std::path::Path::new(path)).unwrap();
+        let (k, width, depth, _decay, heap_len) = v2_read_header(&file).unwrap();
+        let mut entries = v2_read_heap(&file, width, depth, heap_len, k).unwrap();
+        entries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.element.cmp(&b.element)));
+        entries
+            .into_iter()
+            .map(|e| (e.element, e.count))
+            .collect()
+    }
+
+    #[test]
+    fn create_add_and_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_topk_file(dir.path(), "add_query.topk", 5, 64, 5, 0.9);
+        topk_add_elements(&path, &["hello"]);
+        assert!(topk_query(&path, "hello"));
+        assert!(!topk_query(&path, "world"));
+    }
+
+    #[test]
+    fn topk_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_topk_file(dir.path(), "evict.topk", 3, 64, 5, 0.9);
+
+        // Add 3 elements — fills the heap
+        topk_add_elements(&path, &["a", "b", "c"]);
+        assert!(topk_query(&path, "a"));
+        assert!(topk_query(&path, "b"));
+        assert!(topk_query(&path, "c"));
+
+        // Bump "d" so its CMS estimate exceeds the heap minimum (all at 1).
+        // Increment "d" by 10 so it clearly beats the min.
+        topk_incrby_one(&path, "d", 10);
+        assert!(topk_query(&path, "d"), "d should have evicted a min element");
+
+        // One of a/b/c got evicted
+        let in_heap: Vec<bool> = ["a", "b", "c"]
+            .iter()
+            .map(|e| topk_query(&path, e))
+            .collect();
+        let still_in = in_heap.iter().filter(|&&v| v).count();
+        assert_eq!(still_in, 2, "exactly one of a/b/c should be evicted");
+    }
+
+    #[test]
+    fn add_same_element_accumulates_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_topk_file(dir.path(), "accum.topk", 5, 64, 5, 0.9);
+
+        topk_add_elements(&path, &["x", "x", "x", "x", "x"]);
+
+        let count = topk_count(&path, "x");
+        assert_eq!(count, 5);
+        assert!(topk_query(&path, "x"));
+    }
+
+    #[test]
+    fn query_nonexistent_returns_zero_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_topk_file(dir.path(), "noexist.topk", 5, 64, 5, 0.9);
+
+        let count = topk_count(&path, "never_added");
+        assert_eq!(count, 0);
+        assert!(!topk_query(&path, "never_added"));
+    }
+
+    #[test]
+    fn list_returns_sorted_descending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_topk_file(dir.path(), "list.topk", 5, 64, 5, 0.9);
+
+        topk_incrby_one(&path, "low", 1);
+        topk_incrby_one(&path, "mid", 5);
+        topk_incrby_one(&path, "high", 10);
+
+        let list = topk_list(&path);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].0, "high");
+        assert_eq!(list[0].1, 10);
+        assert_eq!(list[1].0, "mid");
+        assert_eq!(list[1].1, 5);
+        assert_eq!(list[2].0, "low");
+        assert_eq!(list[2].1, 1);
+    }
+
+    #[test]
+    fn info_metadata_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_topk_file(dir.path(), "info.topk", 10, 128, 7, 0.85);
+        let file = crate::open_random_read(std::path::Path::new(&path)).unwrap();
+        let (k, width, depth, decay, heap_len) = v2_read_header(&file).unwrap();
+        assert_eq!(k, 10);
+        assert_eq!(width, 128);
+        assert_eq!(depth, 7);
+        assert!((decay - 0.85).abs() < 1e-10);
+        assert_eq!(heap_len, 0);
+    }
+
+    #[test]
+    fn large_k_stress() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = 100u32;
+        let path = create_topk_file(dir.path(), "stress.topk", k, 256, 5, 0.9);
+
+        // Add 200 distinct elements
+        for i in 0..200u32 {
+            let name = format!("elem_{i:04}");
+            topk_incrby_one(&path, &name, (i + 1) as i64);
+        }
+
+        let list = topk_list(&path);
+        assert_eq!(list.len(), k as usize);
+
+        // All entries in the list should have count >= 100 (bottom half evicted).
+        // CMS can overcount due to hash collisions, so use >= not >.
+        for (name, count) in &list {
+            assert!(
+                *count >= 100,
+                "element {name} with count {count} should have been evicted"
+            );
+        }
+
+        // The top element's CMS estimate should be >= 200 (may overcount
+        // due to collisions, so we only check the lower bound).
+        assert!(
+            list[0].1 >= 200,
+            "top element count {} should be >= 200",
+            list[0].1
+        );
+    }
+
+    #[test]
+    fn incrby_with_large_increment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_topk_file(dir.path(), "big_incr.topk", 5, 64, 5, 0.9);
+        topk_incrby_one(&path, "big", 1_000_000);
+        let count = topk_count(&path, "big");
+        assert_eq!(count, 1_000_000);
+    }
+
+    #[test]
+    fn eviction_preserves_higher_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = create_topk_file(dir.path(), "pres.topk", 2, 64, 5, 0.9);
+
+        topk_incrby_one(&path, "keep_a", 100);
+        topk_incrby_one(&path, "keep_b", 50);
+
+        // This has a lower count than both, should NOT evict
+        topk_incrby_one(&path, "loser", 1);
+        assert!(!topk_query(&path, "loser"));
+        assert!(topk_query(&path, "keep_a"));
+        assert!(topk_query(&path, "keep_b"));
+    }
 }
