@@ -5027,6 +5027,94 @@ defmodule FerricStore do
     {:ok, results}
   end
 
+  @doc """
+  Batch GET: takes a list of keys, returns a list of values (nil for missing).
+
+  Goes directly to `Router.batch_get` — single HLC timestamp, zero GenServer,
+  zero Pipe struct overhead. Designed for erpc callers.
+  """
+  @spec batch_get([binary()]) :: [binary() | nil]
+  def batch_get(keys) when is_list(keys) do
+    ctx = FerricStore.Instance.get(:default)
+    Ferricstore.Store.Router.batch_get(ctx, keys)
+  end
+
+  @doc """
+  Packed binary batch GET — minimal distribution overhead.
+
+  Input: single binary with packed keys: `<<count::32, key_len::16, key::binary, ...>>`
+  Output: single binary with packed values: `<<val_len::32, val::binary, ...>>`
+  where val_len=0xFFFFFFFF means nil.
+
+  One flat binary over distribution instead of a list of N binaries —
+  eliminates per-element external term format encoding.
+  """
+  @spec packed_batch_get(binary()) :: binary()
+  def packed_batch_get(packed_keys) when is_binary(packed_keys) do
+    ctx = FerricStore.Instance.get(:default)
+    <<count::32, rest::binary>> = packed_keys
+    keys = unpack_keys(rest, count, [])
+    values = Ferricstore.Store.Router.batch_get(ctx, keys)
+    pack_values(values, [])
+  end
+
+  defp unpack_keys(_rest, 0, acc), do: Enum.reverse(acc)
+  defp unpack_keys(<<len::16, key::binary-size(len), rest::binary>>, n, acc) do
+    unpack_keys(rest, n - 1, [key | acc])
+  end
+
+  defp pack_values([], acc), do: IO.iodata_to_binary(Enum.reverse(acc))
+  defp pack_values([nil | rest], acc) do
+    pack_values(rest, [<<0xFFFFFFFF::32>> | acc])
+  end
+  defp pack_values([value | rest], acc) when is_binary(value) do
+    pack_values(rest, [<<byte_size(value)::32, value::binary>> | acc])
+  end
+
+  @doc """
+  Batch SET: takes a list of `{key, value}` pairs, returns a list of results.
+
+  Routes through `Router.batch_quorum_put` or `batch_async_put` based on
+  namespace durability. Designed for erpc callers.
+  """
+  @spec batch_set([{binary(), binary()}]) :: [:ok | {:error, binary()}]
+  def batch_set(kv_pairs) when is_list(kv_pairs) do
+    ctx = FerricStore.Instance.get(:default)
+
+    case ctx.durability_mode do
+      :all_async ->
+        Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs)
+        List.duplicate(:ok, length(kv_pairs))
+
+      :all_quorum ->
+        Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
+
+      :mixed ->
+        indexed = Enum.with_index(kv_pairs)
+        {async_kvs, quorum_kvs} = Enum.split_with(indexed, fn {{k, _v}, _i} ->
+          Ferricstore.Store.Router.durability_for_key_public(ctx, k) == :async
+        end)
+
+        async_results = if async_kvs != [] do
+          Ferricstore.Store.Router.batch_async_put(ctx, Enum.map(async_kvs, fn {{k, v}, _} -> {k, v} end))
+          Enum.map(async_kvs, fn {_, i} -> {i, :ok} end)
+        else
+          []
+        end
+
+        quorum_results = if quorum_kvs != [] do
+          results = Ferricstore.Store.Router.batch_quorum_put(ctx, Enum.map(quorum_kvs, fn {{k, v}, _} -> {k, v} end))
+          Enum.zip(Enum.map(quorum_kvs, fn {_, i} -> i end), results)
+        else
+          []
+        end
+
+        (async_results ++ quorum_results)
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.map(&elem(&1, 1))
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Private — integer parsing for INCR
   # ---------------------------------------------------------------------------
@@ -5395,14 +5483,173 @@ defmodule FerricStore.Pipe do
 
   def execute(%__MODULE__{commands: commands}) do
     ordered = Enum.reverse(commands)
+    ctx = FerricStore.Instance.get(:default)
 
-    queue = Enum.map(ordered, &to_resp_command/1)
+    case classify_batch(ordered) do
+      :all_gets ->
+        keys = Enum.map(ordered, fn {:get, k} -> k end)
+        values = Ferricstore.Store.Router.batch_get(ctx, keys)
+        Enum.map(values, fn v -> {:ok, v} end)
 
-    raw_results = Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
+      :all_sets ->
+        kv_pairs = Enum.map(ordered, fn {:set, k, v, _opts} -> {k, v} end)
+        execute_batch_sets(ctx, ordered, kv_pairs)
 
-    ordered
-    |> Enum.zip(raw_results)
-    |> Enum.map(fn {cmd, raw} -> normalize_result(cmd, raw) end)
+      {:mixed_get_set, _} ->
+        execute_mixed_get_set(ctx, ordered)
+
+      :complex ->
+        queue = Enum.map(ordered, &to_resp_command/1)
+        raw_results = Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
+
+        ordered
+        |> Enum.zip(raw_results)
+        |> Enum.map(fn {cmd, raw} -> normalize_result(cmd, raw) end)
+    end
+  end
+
+  defp classify_batch(commands) do
+    classify_batch(commands, nil, MapSet.new())
+  end
+
+  defp classify_batch([], kind, _written), do: kind || :complex
+
+  defp classify_batch([{:get, key} | rest], kind, written) do
+    if MapSet.member?(written, key) do
+      :complex
+    else
+      new_kind = case kind do
+        nil -> :all_gets
+        :all_gets -> :all_gets
+        :all_sets -> {:mixed_get_set, true}
+        {:mixed_get_set, _} -> {:mixed_get_set, true}
+        _ -> :complex
+      end
+      if new_kind == :complex, do: :complex, else: classify_batch(rest, new_kind, written)
+    end
+  end
+
+  defp classify_batch([{:set, key, _v, opts} | rest], kind, written) do
+    if opts != [] do
+      :complex
+    else
+      new_kind = case kind do
+        nil -> :all_sets
+        :all_sets -> :all_sets
+        :all_gets -> {:mixed_get_set, true}
+        {:mixed_get_set, _} -> {:mixed_get_set, true}
+        _ -> :complex
+      end
+      if new_kind == :complex, do: :complex, else: classify_batch(rest, new_kind, MapSet.put(written, key))
+    end
+  end
+
+  defp classify_batch(_, _, _), do: :complex
+
+  defp execute_batch_sets(ctx, ordered, kv_pairs) do
+    case ctx.durability_mode do
+      :all_async ->
+        Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs)
+        Enum.map(ordered, fn _ -> :ok end)
+
+      :all_quorum ->
+        Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
+
+      :mixed ->
+        indexed = Enum.with_index(kv_pairs)
+        {async_kvs, quorum_kvs} = Enum.split_with(indexed, fn {{k, _v}, _i} ->
+          Ferricstore.Store.Router.durability_for_key_public(ctx, k) == :async
+        end)
+
+        async_results = if async_kvs != [] do
+          Ferricstore.Store.Router.batch_async_put(ctx, Enum.map(async_kvs, fn {{k, v}, _} -> {k, v} end))
+          Enum.map(async_kvs, fn {_, i} -> {i, :ok} end)
+        else
+          []
+        end
+
+        quorum_results = if quorum_kvs != [] do
+          results = Ferricstore.Store.Router.batch_quorum_put(ctx, Enum.map(quorum_kvs, fn {{k, v}, _} -> {k, v} end))
+          Enum.zip(Enum.map(quorum_kvs, fn {_, i} -> i end), results)
+        else
+          []
+        end
+
+        (async_results ++ quorum_results)
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.map(&elem(&1, 1))
+    end
+  end
+
+  defp execute_mixed_get_set(ctx, ordered) do
+    indexed = Enum.with_index(ordered)
+    get_ops = for {{:get, key}, i} <- indexed, do: {i, key}
+    set_ops = for {{:set, key, value, _}, i} <- indexed, do: {i, key, value}
+
+    set_results =
+      if set_ops != [] do
+        kv_pairs = Enum.map(set_ops, fn {_i, k, v} -> {k, v} end)
+
+        results = case ctx.durability_mode do
+          :all_async ->
+            Ferricstore.Store.Router.batch_async_put(ctx, kv_pairs)
+            List.duplicate(:ok, length(kv_pairs))
+
+          :all_quorum ->
+            Ferricstore.Store.Router.batch_quorum_put(ctx, kv_pairs)
+
+          :mixed ->
+            {async_ops, quorum_ops} = Enum.split_with(set_ops, fn {_i, k, _v} ->
+              Ferricstore.Store.Router.durability_for_key_public(ctx, k) == :async
+            end)
+
+            async_r = if async_ops != [] do
+              Ferricstore.Store.Router.batch_async_put(ctx, Enum.map(async_ops, fn {_, k, v} -> {k, v} end))
+              List.duplicate(:ok, length(async_ops))
+            else
+              []
+            end
+
+            quorum_r = if quorum_ops != [] do
+              Ferricstore.Store.Router.batch_quorum_put(ctx, Enum.map(quorum_ops, fn {_, k, v} -> {k, v} end))
+            else
+              []
+            end
+
+            recombine_results(async_ops, async_r, quorum_ops, quorum_r)
+        end
+
+        set_ops
+        |> Enum.zip(results)
+        |> Map.new(fn {{i, _, _}, r} -> {i, r} end)
+      else
+        %{}
+      end
+
+    get_results =
+      if get_ops != [] do
+        keys = Enum.map(get_ops, &elem(&1, 1))
+        values = Ferricstore.Store.Router.batch_get(ctx, keys)
+        get_ops
+        |> Enum.zip(values)
+        |> Map.new(fn {{i, _}, v} -> {i, {:ok, v}} end)
+      else
+        %{}
+      end
+
+    count = length(ordered)
+    for i <- 0..(count - 1) do
+      Map.get(get_results, i) || Map.get(set_results, i)
+    end
+  end
+
+  defp recombine_results(async_ops, async_results, quorum_ops, quorum_results) do
+    async_map = async_ops |> Enum.zip(async_results) |> Map.new(fn {{i, _, _}, r} -> {i, r} end)
+    quorum_map = quorum_ops |> Enum.zip(quorum_results) |> Map.new(fn {{i, _, _}, r} -> {i, r} end)
+    combined = Map.merge(async_map, quorum_map)
+    (async_ops ++ quorum_ops)
+    |> Enum.sort_by(fn {i, _, _} -> i end)
+    |> Enum.map(fn {i, _, _} -> Map.fetch!(combined, i) end)
   end
 
   # The Coordinator returns raw Dispatcher results (RESP-level values).

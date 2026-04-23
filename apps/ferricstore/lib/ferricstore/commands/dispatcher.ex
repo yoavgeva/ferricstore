@@ -117,13 +117,45 @@ defmodule Ferricstore.Commands.Dispatcher do
   """
   @spec dispatch(binary(), [binary()], map()) :: term()
 
-  # Fast path for the most common read commands: skip monotonic_time + SlowLog
-  # overhead (~100-200ns). These commands are always sub-microsecond for hot
-  # keys and would never appear in the slow log. The fast path avoids two
-  # System.monotonic_time calls + the SlowLog.maybe_log threshold check.
+  # Fast path: skip monotonic_time + SlowLog overhead (~250ns saved per call).
+  # Read-only commands are sub-microsecond ETS lookups — never slow-log worthy.
   def dispatch("GET", args, store), do: Strings.handle("GET", args, store)
   def dispatch("MGET", args, store), do: Strings.handle("MGET", args, store)
   def dispatch("EXISTS", args, store), do: Strings.handle("EXISTS", args, store)
+  def dispatch("HGET", args, store), do: Hash.handle("HGET", args, store)
+  def dispatch("HMGET", args, store), do: Hash.handle("HMGET", args, store)
+  def dispatch("HGETALL", args, store), do: Hash.handle("HGETALL", args, store)
+  def dispatch("HEXISTS", args, store), do: Hash.handle("HEXISTS", args, store)
+  def dispatch("HLEN", args, store), do: Hash.handle("HLEN", args, store)
+  def dispatch("HKEYS", args, store), do: Hash.handle("HKEYS", args, store)
+  def dispatch("HVALS", args, store), do: Hash.handle("HVALS", args, store)
+  def dispatch("LRANGE", args, store), do: List.handle("LRANGE", args, store)
+  def dispatch("LLEN", args, store), do: List.handle("LLEN", args, store)
+  def dispatch("LINDEX", args, store), do: List.handle("LINDEX", args, store)
+  def dispatch("SISMEMBER", args, store), do: Set.handle("SISMEMBER", args, store)
+  def dispatch("SMISMEMBER", args, store), do: Set.handle("SMISMEMBER", args, store)
+  def dispatch("SMEMBERS", args, store), do: Set.handle("SMEMBERS", args, store)
+  def dispatch("SCARD", args, store), do: Set.handle("SCARD", args, store)
+  def dispatch("ZSCORE", args, store), do: SortedSet.handle("ZSCORE", args, store)
+  def dispatch("ZRANK", args, store), do: SortedSet.handle("ZRANK", args, store)
+  def dispatch("ZRANGE", args, store), do: SortedSet.handle("ZRANGE", args, store)
+  def dispatch("ZCARD", args, store), do: SortedSet.handle("ZCARD", args, store)
+  def dispatch("STRLEN", args, store), do: Strings.handle("STRLEN", args, store)
+  def dispatch("GETRANGE", args, store), do: Strings.handle("GETRANGE", args, store)
+  def dispatch("TTL", args, store), do: Expiry.handle("TTL", args, store)
+  def dispatch("PTTL", args, store), do: Expiry.handle("PTTL", args, store)
+  def dispatch("TYPE", args, store), do: Generic.handle("TYPE", args, store)
+  def dispatch("GETBIT", args, store), do: Bitmap.handle("GETBIT", args, store)
+  def dispatch("BITCOUNT", args, store), do: Bitmap.handle("BITCOUNT", args, store)
+  def dispatch("PFCOUNT", args, store), do: HyperLogLog.handle("PFCOUNT", args, store)
+  def dispatch("JSON.GET", args, store), do: Json.handle("JSON.GET", args, store)
+  def dispatch("JSON.TYPE", args, store), do: Json.handle("JSON.TYPE", args, store)
+  def dispatch("JSON.STRLEN", args, store), do: Json.handle("JSON.STRLEN", args, store)
+  def dispatch("XLEN", args, store), do: Stream.handle("XLEN", args, store)
+  def dispatch("XRANGE", args, store), do: Stream.handle("XRANGE", args, store)
+  def dispatch("GEODIST", args, store), do: Geo.handle("GEODIST", args, store)
+  def dispatch("GEOPOS", args, store), do: Geo.handle("GEOPOS", args, store)
+  def dispatch("GEOHASH", args, store), do: Geo.handle("GEOHASH", args, store)
 
   def dispatch(name, args, store) do
     # The command name is expected to be already uppercase from normalise_cmd

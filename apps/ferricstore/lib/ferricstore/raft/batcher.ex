@@ -258,7 +258,7 @@ defmodule Ferricstore.Raft.Batcher do
   """
   @spec write_batch(non_neg_integer(), [command()], GenServer.from()) :: :ok
   def write_batch(shard_index, cmds, from) do
-    GenServer.cast(batcher_name(shard_index), {:write_batch, cmds, from})
+    GenServer.cast(batcher_name(shard_index), {:write_batch, cmds, length(cmds), from})
   end
 
   @doc """
@@ -281,6 +281,18 @@ defmodule Ferricstore.Raft.Batcher do
   @spec async_submit(non_neg_integer(), command()) :: :ok
   def async_submit(shard_index, inner_command) do
     GenServer.cast(batcher_name(shard_index), {:async_submit, inner_command})
+  end
+
+  @doc """
+  Submits a list of async commands to the batcher in a single cast.
+
+  Same semantics as calling `async_submit/2` for each command, but sends
+  one GenServer cast instead of N — reduces message passing overhead for
+  batch async writes.
+  """
+  @spec async_submit_batch(non_neg_integer(), [command()]) :: :ok
+  def async_submit_batch(shard_index, commands) do
+    GenServer.cast(batcher_name(shard_index), {:async_submit_batch, commands})
   end
 
   @doc """
@@ -461,12 +473,23 @@ defmodule Ferricstore.Raft.Batcher do
     enqueue_async_submit(inner_command, state)
   end
 
+  def handle_cast({:async_submit_batch, commands}, state) do
+    Enum.reduce(commands, {:noreply, state}, fn cmd, {:noreply, st} ->
+      enqueue_async_submit(cmd, st)
+    end)
+  end
+
   def handle_cast({:write_quorum, command, reply_to}, state) do
     enqueue_write_forced_quorum(command, reply_to, state)
   end
 
+  def handle_cast({:write_batch, cmds, cmd_count, from}, state) do
+    enqueue_write_batch(cmds, cmd_count, from, state)
+  end
+
+  # Backwards compat: old callers without count
   def handle_cast({:write_batch, cmds, from}, state) do
-    enqueue_write_batch(cmds, from, state)
+    enqueue_write_batch(cmds, length(cmds), from, state)
   end
 
   @impl true
@@ -717,7 +740,7 @@ defmodule Ferricstore.Raft.Batcher do
   # Accumulates write_batch commands into the quorum slot, flushing when
   # count >= max_batch_size or on next message loop (timer 0). Rejects
   # new batches when too many ra commands are already in flight.
-  defp enqueue_write_batch(cmds, from, state) do
+  defp enqueue_write_batch(cmds, cmd_count, from, state) do
     if map_size(state.pending) >= @max_pending do
       {pid, ref} = from
       send(pid, {ref, {:error, :overloaded}})
@@ -727,11 +750,10 @@ defmodule Ferricstore.Raft.Batcher do
       slot_key = {prefix, :quorum}
 
       slot = Map.get(state.slots, slot_key, new_slot(0))
-      cmd_count = length(cmds)
 
       updated_slot = %{
         slot
-        | cmds: Enum.reverse(cmds) ++ slot.cmds,
+        | cmds: prepend_reversed(cmds, slot.cmds),
           froms: [{:batch_from, from, cmd_count} | slot.froms],
           count: Map.get(slot, :count, 0) + cmd_count
       }
@@ -753,6 +775,11 @@ defmodule Ferricstore.Raft.Batcher do
       end
     end
   end
+
+  # Prepend items in reverse order onto acc, equivalent to Enum.reverse(list) ++ acc
+  # but avoids allocating the intermediate reversed list.
+  defp prepend_reversed([], acc), do: acc
+  defp prepend_reversed([h | t], acc), do: prepend_reversed(t, [h | acc])
 
   # Enqueues a write command into the appropriate namespace slot.
   # Returns `{:noreply, state}` -- the caller is replied to later when the

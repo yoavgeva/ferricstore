@@ -80,8 +80,7 @@ defmodule FerricstoreServer.Connection.Store do
       ratelimit_add: fn key, window, max, count -> Router.ratelimit_add(ctx, key, window, max, count) end,
       list_op: fn key, op -> Router.list_op(ctx, key, op) end,
       compound_get: fn redis_key, compound_key ->
-        shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))
-        GenServer.call(shard, {:compound_get, redis_key, compound_key})
+        Router.compound_get(ctx, redis_key, compound_key)
       end,
       compound_get_meta: fn redis_key, compound_key ->
         shard = elem(ctx.shard_names, Router.shard_for(ctx, redis_key))

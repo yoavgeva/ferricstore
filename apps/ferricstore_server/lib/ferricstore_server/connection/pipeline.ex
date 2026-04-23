@@ -1,5 +1,5 @@
 defmodule FerricstoreServer.Connection.Pipeline do
-  @moduledoc "Sliding-window pipeline dispatcher that groups pure commands by shard and executes them concurrently."
+  @moduledoc "Pipeline dispatcher with batch fast paths for GET, SET, and mixed GET+SET workloads."
 
   alias FerricstoreServer.Resp.Encoder
   alias Ferricstore.Commands.Dispatcher
@@ -10,46 +10,12 @@ defmodule FerricstoreServer.Connection.Pipeline do
   alias FerricstoreServer.Connection.TcpOpts
   alias FerricstoreServer.Connection.Tracking, as: ConnTracking
 
-  # Commands that must be executed synchronously because they read or mutate
-  # connection-level state (transaction mode, pub/sub subscriptions, auth,
-  # sandbox, blocking ops, etc.).
-  @stateful_cmds ~w(
+  @stateful_cmds MapSet.new(~w(
     HELLO CLIENT QUIT AUTH ACL RESET SANDBOX
     MULTI EXEC DISCARD WATCH UNWATCH
     SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
     BLPOP BRPOP BLMOVE BLMPOP
-  )
-
-  # Commands that ALWAYS span multiple shards regardless of arg count.
-  @always_multi_cmds ~w(MGET MSET MSETNX BITOP PFCOUNT PFMERGE
-    SDIFF SINTER SUNION SDIFFSTORE SINTERSTORE SUNIONSTORE SINTERCARD)
-
-  # Commands that take a variable number of keys.
-  @variadic_key_cmds ~w(DEL UNLINK EXISTS)
-
-  # Server-level commands that span all shards and must act as barriers.
-  @barrier_server_cmds ~w(DBSIZE FLUSHDB FLUSHALL KEYS SCAN RANDOMKEY)
-
-  # Server-level commands that don't target a specific key.
-  @server_cmds_no_key ~w(PING ECHO DBSIZE FLUSHDB FLUSHALL KEYS INFO COMMAND
-    SELECT LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF
-    MEMORY RANDOMKEY SCAN OBJECT WAIT
-    CLUSTER.HEALTH CLUSTER.STATS FERRICSTORE.HOTNESS FERRICSTORE.METRICS)
-
-  # Commands that read keys (O(1) MapSet lookup for hot-path read classification).
-  @read_cmds ~w(GET MGET GETRANGE STRLEN GETEX GETDEL GETSET
-    HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN
-    LRANGE LLEN LINDEX LPOS
-    SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER
-    ZSCORE ZRANK ZREVRANK ZRANGE ZCARD ZCOUNT ZRANDMEMBER ZMSCORE
-    TYPE EXISTS TTL PTTL EXPIRETIME PEXPIRETIME
-    GETBIT BITCOUNT BITPOS PFCOUNT
-    OBJECT SUBSTR
-    GEOHASH GEOPOS GEODIST GEOSEARCH
-    XLEN XRANGE XREVRANGE XREAD XINFO
-    JSON.GET JSON.TYPE JSON.STRLEN JSON.OBJKEYS JSON.OBJLEN JSON.ARRLEN JSON.MGET)
-
-  @read_cmds_set MapSet.new(@read_cmds)
+  ))
 
   # Maximum commands in a single pipeline batch (100K).
   @max_pipeline_size 100_000
@@ -65,14 +31,14 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Dispatches a pipeline of commands using a sliding window.
+  Dispatches a pipeline of commands with tiered fast paths.
 
-  For a single command, falls through to sequential dispatch (no benefit from
-  async). For multiple commands, groups consecutive "pure" commands and
-  dispatches them concurrently as Tasks.
-
-  `handle_command_fn` is `fn cmd, state -> {:quit | :continue, response, state}`.
-  `send_response_fn` is `fn socket, transport, iodata -> :ok`.
+  Fast paths (all skip per-command overhead, batch response into one TCP write):
+  1. All GETs → direct ETS batch lookup
+  2. All SETs → batch Raft/ETS insert
+  3. Mixed GET+SET → split, batch each, reassemble
+  4. Other pure commands → batch Dispatcher.dispatch with per-command ACL
+  5. Stateful (MULTI/AUTH/etc) → sequential through handle_command_fn
   """
   @spec pipeline_dispatch(
           commands :: [term()],
@@ -100,7 +66,7 @@ defmodule FerricstoreServer.Connection.Pipeline do
       :fallback ->
         case try_batch_set_fast_path(commands, state, send_response_fn) do
           {:ok, result} -> result
-          :fallback -> sliding_window_dispatch(commands, state, handle_command_fn, send_response_fn)
+          :fallback -> try_mixed_fast_path(commands, state, handle_command_fn, send_response_fn)
         end
     end
   end
@@ -260,283 +226,282 @@ defmodule FerricstoreServer.Connection.Pipeline do
   end
 
   # ---------------------------------------------------------------------------
-  # Sliding window dispatch
+  # Mixed GET+SET fast path
   # ---------------------------------------------------------------------------
+  # When a pipeline contains only plain GETs and plain SETs (the 80/20 case),
+  # split into two groups, batch each, then reassemble responses in order.
 
-  defp sliding_window_dispatch(commands, state, handle_command_fn, send_response_fn) do
+  defp try_mixed_fast_path(commands, state, handle_command_fn, send_response_fn) do
+    if requires_auth?(state) or state.multi_state == :queuing do
+      general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
+    else
+      acl_ok = state.acl_cache == :full_access or
+               (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
+
+      if not acl_ok do
+        general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
+      else
+        case classify_mixed_pipeline(commands) do
+          {:ok, ops} -> do_mixed_fast_path(ops, state, send_response_fn)
+          :fallback -> general_batch_dispatch(commands, state, handle_command_fn, send_response_fn)
+        end
+      end
+    end
+  end
+
+  defp classify_mixed_pipeline(commands), do: classify_mixed_pipeline(commands, [], 0, MapSet.new())
+
+  defp classify_mixed_pipeline([], acc, _idx, _written_keys), do: {:ok, Enum.reverse(acc)}
+
+  defp classify_mixed_pipeline([[name, key] | rest], acc, idx, written_keys) when is_binary(name) and is_binary(key) do
+    if fast_upcase(name) == "GET" do
+      if MapSet.member?(written_keys, key) do
+        :fallback
+      else
+        classify_mixed_pipeline(rest, [{:get, idx, key} | acc], idx + 1, written_keys)
+      end
+    else
+      :fallback
+    end
+  end
+
+  defp classify_mixed_pipeline([[name, key, value] | rest], acc, idx, written_keys) when is_binary(name) and is_binary(key) do
+    if fast_upcase(name) == "SET" do
+      classify_mixed_pipeline(rest, [{:set, idx, key, value} | acc], idx + 1, MapSet.put(written_keys, key))
+    else
+      :fallback
+    end
+  end
+
+  defp classify_mixed_pipeline(_, _, _, _), do: :fallback
+
+  defp do_mixed_fast_path(ops, state, send_response_fn) do
+    ctx = state.instance_ctx
+    count = length(ops)
+    Stats.incr_commands_by(state.stats_counter, count)
+
+    get_ops = for {:get, idx, key} <- ops, do: {idx, key}
+    set_ops = for {:set, idx, key, value} <- ops, do: {idx, key, value}
+
+    # Execute SETs first so subsequent GETs in the same pipeline see the new values.
+    set_results =
+      case set_ops do
+        [] ->
+          %{}
+
+        _ ->
+          kv_pairs = Enum.map(set_ops, fn {_idx, key, value} -> {key, value} end)
+          live_ctx = FerricStore.Instance.get(:default)
+
+          pressure_ok = :atomics.get(ctx.pressure_flags, 1) == 0 and
+                        :atomics.get(ctx.pressure_flags, 2) == 0
+
+          results =
+            if not pressure_ok do
+              List.duplicate({:error, "ERR server under pressure"}, length(kv_pairs))
+            else
+              case live_ctx.durability_mode do
+                :all_async ->
+                  Router.batch_async_put(ctx, kv_pairs)
+                  List.duplicate(:ok, length(kv_pairs))
+
+                :all_quorum ->
+                  Router.batch_quorum_put(ctx, kv_pairs)
+
+                :mixed ->
+                  {async_pairs, quorum_pairs, _} = split_by_durability(ctx, set_ops)
+
+                  async_results = if async_pairs != [] do
+                    Router.batch_async_put(ctx, Enum.map(async_pairs, fn {_idx, k, v} -> {k, v} end))
+                    List.duplicate(:ok, length(async_pairs))
+                  else
+                    []
+                  end
+
+                  quorum_results = if quorum_pairs != [] do
+                    Router.batch_quorum_put(ctx, Enum.map(quorum_pairs, fn {_idx, k, v} -> {k, v} end))
+                  else
+                    []
+                  end
+
+                  recombine_set_results(async_pairs, async_results, quorum_pairs, quorum_results)
+              end
+            end
+
+          set_ops
+          |> Enum.zip(results)
+          |> Map.new(fn {{idx, _key, _value}, result} ->
+            encoded = case result do
+              :ok -> Encoder.ok_response()
+              {:error, _} = err -> Encoder.encode(err)
+            end
+            {idx, encoded}
+          end)
+      end
+
+    get_results =
+      case get_ops do
+        [] -> %{}
+        _ ->
+          keys = Enum.map(get_ops, &elem(&1, 1))
+          values = Router.batch_get(ctx, keys)
+          get_ops
+          |> Enum.zip(values)
+          |> Map.new(fn {{idx, _key}, value} -> {idx, Encoder.encode(value)} end)
+      end
+
+    response = for i <- 0..(count - 1), do: Map.get(get_results, i) || Map.get(set_results, i)
+    send_response_fn.(state.socket, state.transport, response)
+    {:continue, state}
+  end
+
+  defp split_by_durability(ctx, set_ops) do
+    {async_ops, quorum_ops} = Enum.split_with(set_ops, fn {_idx, key, _value} ->
+      Router.durability_for_key_public(ctx, key) == :async
+    end)
+    {async_ops, quorum_ops, nil}
+  end
+
+  defp recombine_set_results(async_ops, async_results, quorum_ops, quorum_results) do
+    async_map = async_ops |> Enum.zip(async_results) |> Map.new(fn {{idx, _, _}, r} -> {idx, r} end)
+    quorum_map = quorum_ops |> Enum.zip(quorum_results) |> Map.new(fn {{idx, _, _}, r} -> {idx, r} end)
+    combined = Map.merge(async_map, quorum_map)
+    (async_ops ++ quorum_ops)
+    |> Enum.sort_by(fn {idx, _, _} -> idx end)
+    |> Enum.map(fn {idx, _, _} -> Map.fetch!(combined, idx) end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # General batch dispatch (fallback for non-GET/SET pipelines)
+  # ---------------------------------------------------------------------------
+  # Dispatches each command through the Dispatcher with per-command ACL checks,
+  # batches all responses, and sends them in one write. Stateful commands
+  # (MULTI, AUTH, SUBSCRIBE, etc.) force a flush-and-sequential boundary.
+
+  defp general_batch_dispatch(commands, state, handle_command_fn, send_response_fn) do
+    acl_ok = state.acl_cache == :full_access or
+             (is_map(state.acl_cache) and state.acl_cache.commands == :all and state.acl_cache.keys == :all)
+
+    if requires_auth?(state) or state.multi_state == :queuing or not acl_ok do
+      sequential_dispatch(commands, state, handle_command_fn, send_response_fn)
+    else
+      case split_at_stateful(commands, state) do
+        {:all_pure, pure_cmds} ->
+          do_batch_pure(pure_cmds, state, send_response_fn)
+
+        {:split, pure_prefix, stateful_cmd, rest} ->
+          case do_batch_pure(pure_prefix, state, send_response_fn) do
+            {:quit, _} = quit -> quit
+            {:continue, new_state} ->
+              case handle_command_fn.(stateful_cmd, new_state) do
+                {:quit, response, quit_state} ->
+                  send_response_fn.(quit_state.socket, quit_state.transport, response)
+                  {:quit, quit_state}
+                {:continue, response, new_state2} ->
+                  send_response_fn.(new_state2.socket, new_state2.transport, response)
+                  if rest == [] do
+                    {:continue, new_state2}
+                  else
+                    general_batch_dispatch(rest, new_state2, handle_command_fn, send_response_fn)
+                  end
+              end
+          end
+      end
+    end
+  end
+
+  defp split_at_stateful(commands, state) do
+    split_at_stateful(commands, state, [])
+  end
+
+  defp split_at_stateful([], _state, acc), do: {:all_pure, Enum.reverse(acc)}
+
+  defp split_at_stateful([cmd | rest], state, acc) do
+    name = extract_command_name(cmd)
+    if MapSet.member?(@stateful_cmds, name) or (is_binary(name) and String.starts_with?(name, "CLIENT")) do
+      {:split, Enum.reverse(acc), cmd, rest}
+    else
+      split_at_stateful(rest, state, [cmd | acc])
+    end
+  end
+
+  defp do_batch_pure([], state, _send_response_fn), do: {:continue, state}
+
+  defp do_batch_pure(commands, state, send_response_fn) do
+    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
+
+    {action, responses} =
+      Enum.reduce_while(commands, {:continue, []}, fn cmd, {:continue, acc} ->
+        {name, args} = normalise_cmd(cmd)
+        Stats.incr_commands(state.stats_counter)
+
+        result =
+          case ConnAuth.check_command_cached(state.acl_cache, name) do
+            :ok ->
+              case ConnAuth.check_keys_cached(state.acl_cache, name, args) do
+                :ok ->
+                  try do
+                    result = Dispatcher.dispatch(name, args, store)
+                    ConnTracking.maybe_notify_keyspace(name, args, result)
+                    ConnTracking.maybe_notify_tracking(name, args, result, state)
+                    result
+                  catch
+                    :exit, {:noproc, _} ->
+                      {:error, "ERR server not ready, shard process unavailable"}
+                    :exit, {reason, _} ->
+                      {:error, "ERR internal error: #{inspect(reason)}"}
+                  end
+                {:error, _} = err ->
+                  log_acl_denied(state, name)
+                  err
+              end
+            {:error, _} = err ->
+              log_acl_denied(state, name)
+              err
+          end
+
+        {:cont, {:continue, [Encoder.encode(result) | acc]}}
+      end)
+
+    if state.transport == :ranch_tcp, do: TcpOpts.set_cork(state.socket, true)
+    send_response_fn.(state.socket, state.transport, Enum.reverse(responses))
+    if state.transport == :ranch_tcp, do: TcpOpts.set_cork(state.socket, false)
+
+    {action, state}
+  end
+
+  defp log_acl_denied(state, name) do
+    FerricstoreServer.Acl.log_command_denied(
+      state.username,
+      name,
+      format_peer(state.peer),
+      state.client_id
+    )
+  end
+
+  # Pure sequential fallback for auth-required or queuing states
+  defp sequential_dispatch(commands, state, handle_command_fn, send_response_fn) do
     if state.transport == :ranch_tcp do
       TcpOpts.set_cork(state.socket, true)
-      result = do_sliding_window(commands, [], true, state, handle_command_fn, send_response_fn)
+      result = do_sequential(commands, state, handle_command_fn, send_response_fn)
       TcpOpts.set_cork(state.socket, false)
       result
     else
-      do_sliding_window(commands, [], true, state, handle_command_fn, send_response_fn)
+      do_sequential(commands, state, handle_command_fn, send_response_fn)
     end
   end
 
-  # Base case: no more commands, flush any remaining pure group.
-  defp do_sliding_window([], pure_acc, all_reads?, state, handle_command_fn, send_response_fn) do
-    case flush_pure_group_pre(Enum.reverse(pure_acc), all_reads?, state, handle_command_fn, send_response_fn) do
-      {:quit, _quit_state} = quit -> quit
-      {:continue, new_state} -> {:continue, new_state}
-    end
-  end
+  defp do_sequential([], state, _handle_command_fn, _send_response_fn), do: {:continue, state}
 
-  defp do_sliding_window([cmd | rest], pure_acc, all_reads?, state, handle_command_fn, send_response_fn) do
-    normalised = normalise_cmd(cmd)
-
-    cond do
-      stateful_command_normalised?(normalised, state) ->
-        case flush_pure_group_pre(Enum.reverse(pure_acc), all_reads?, state, handle_command_fn, send_response_fn) do
-          {:quit, _quit_state} = quit ->
-            quit
-
-          {:continue, flushed_state} ->
-            case handle_command_fn.(cmd, flushed_state) do
-              {:quit, response, quit_state} ->
-                send_response_fn.(quit_state.socket, quit_state.transport, response)
-                {:quit, quit_state}
-
-              {:continue, response, new_state} ->
-                send_response_fn.(new_state.socket, new_state.transport, response)
-                do_sliding_window(rest, [], true, new_state, handle_command_fn, send_response_fn)
-            end
-        end
-
-      barrier_command_normalised?(normalised) ->
-        case flush_pure_group_pre(Enum.reverse(pure_acc), all_reads?, state, handle_command_fn, send_response_fn) do
-          {:quit, _quit_state} = quit ->
-            quit
-
-          {:continue, flushed_state} ->
-            is_read = read_cmd?(normalised)
-            do_sliding_window(rest, [{cmd, normalised}], is_read, flushed_state, handle_command_fn, send_response_fn)
-        end
-
-      true ->
-        is_read = read_cmd?(normalised)
-        do_sliding_window(rest, [{cmd, normalised} | pure_acc], all_reads? and is_read, state, handle_command_fn, send_response_fn)
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Flush pure group
-  # ---------------------------------------------------------------------------
-
-  defp flush_pure_group_pre([], _all_reads?, state, _handle_command_fn, _send_response_fn), do: {:continue, state}
-
-  defp flush_pure_group_pre([{single_cmd, _norm}], _all_reads?, state, handle_command_fn, send_response_fn) do
-    case handle_command_fn.(single_cmd, state) do
+  defp do_sequential([cmd | rest], state, handle_command_fn, send_response_fn) do
+    case handle_command_fn.(cmd, state) do
       {:quit, response, quit_state} ->
         send_response_fn.(quit_state.socket, quit_state.transport, response)
         {:quit, quit_state}
 
       {:continue, response, new_state} ->
         send_response_fn.(new_state.socket, new_state.transport, response)
-        {:continue, new_state}
-    end
-  end
-
-  defp flush_pure_group_pre(normalised, all_reads?, state, _handle_command_fn, send_response_fn) do
-    store = ConnStore.build_store(state.instance_ctx, state.sandbox_namespace)
-
-    if all_reads? do
-      flush_pure_reads_fast_normalised(normalised, store, state, send_response_fn)
-    else
-      flush_pure_group_sliding_window_normalised(normalised, store, state, send_response_fn)
-    end
-  end
-
-  defp flush_pure_reads_fast_normalised(normalised, store, state, send_response_fn) do
-    {final_action, responses} =
-      Enum.reduce_while(normalised, {:continue, []}, fn {_cmd, norm}, {:continue, acc} ->
-        case dispatch_pure_command_normalised(norm, store, state) do
-          {:quit, response} ->
-            {:halt, {:quit, [response | acc]}}
-
-          {:continue, response} ->
-            {:cont, {:continue, [response | acc]}}
-        end
-      end)
-
-    batched = Enum.reverse(responses)
-    send_response_fn.(state.socket, state.transport, batched)
-
-    case final_action do
-      :quit -> {:quit, state}
-      :continue -> {:continue, state}
-    end
-  end
-
-  defp flush_pure_group_sliding_window_normalised(normalised, store, state, send_response_fn) do
-    indexed_cmds =
-      normalised
-      |> Enum.with_index()
-      |> Enum.map(fn {{_cmd, norm}, idx} -> {norm, idx, command_shard_key_normalised(state.instance_ctx, norm)} end)
-
-    lanes = Enum.group_by(indexed_cmds, fn {_norm, _idx, shard_key} -> shard_key end)
-
-    total = length(normalised)
-    conn_pid = self()
-
-    lane_tasks =
-      Enum.map(lanes, fn {_shard_key, lane_cmds} ->
-        Task.async(fn ->
-          Enum.each(lane_cmds, fn {norm, idx, _shard_key} ->
-            result = dispatch_pure_command_normalised(norm, store, state)
-            send(conn_pid, {:lane_result, idx, result})
-          end)
-        end)
-      end)
-
-    result = sliding_window_collect(state, 0, total, %{}, send_response_fn)
-
-    Enum.each(lane_tasks, fn task ->
-      Task.await(task, :infinity)
-    end)
-
-    result
-  end
-
-  # ---------------------------------------------------------------------------
-  # Sliding window collect
-  # ---------------------------------------------------------------------------
-
-  defp sliding_window_collect(state, cursor, total, _buffer, _send_response_fn) when cursor >= total do
-    {:continue, state}
-  end
-
-  defp sliding_window_collect(state, cursor, total, buffer, send_response_fn) do
-    case Map.pop(buffer, cursor) do
-      {{action, response}, new_buffer} ->
-        case action do
-          :quit ->
-            send_response_fn.(state.socket, state.transport, response)
-            {:quit, state}
-
-          :continue ->
-            send_response_fn.(state.socket, state.transport, response)
-            sliding_window_collect(state, cursor + 1, total, new_buffer, send_response_fn)
-        end
-
-      {nil, _buffer} ->
-        receive do
-          {:lane_result, ^cursor, {action, response}} ->
-            case action do
-              :quit ->
-                send_response_fn.(state.socket, state.transport, response)
-                {:quit, state}
-
-              :continue ->
-                send_response_fn.(state.socket, state.transport, response)
-                sliding_window_collect(state, cursor + 1, total, buffer, send_response_fn)
-            end
-
-          {:lane_result, idx, result} when idx > cursor ->
-            new_buffer = Map.put(buffer, idx, result)
-            sliding_window_collect(state, cursor, total, new_buffer, send_response_fn)
-        end
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Command classification helpers
-  # ---------------------------------------------------------------------------
-
-  @doc false
-  def normalise_cmd({:inline, [name | args]}) when is_binary(name),
-    do: {fast_upcase(name), args}
-
-  def normalise_cmd({:inline, []}), do: :unknown
-  def normalise_cmd([name | args]) when is_binary(name), do: {fast_upcase(name), args}
-  def normalise_cmd(_other), do: :unknown
-
-  defp fast_upcase(<<first, _::binary>> = cmd) when first >= ?A and first <= ?Z, do: cmd
-  defp fast_upcase(cmd), do: String.upcase(cmd)
-
-  @doc false
-  def stateful_command_normalised?(:unknown, _state), do: true
-
-  def stateful_command_normalised?({name, _args}, state) do
-    state.multi_state == :queuing or
-      in_pubsub_mode?(state) or
-      requires_auth?(state) or
-      name in @stateful_cmds or
-      String.starts_with?(name, "CLIENT")
-  end
-
-  @doc false
-  def read_cmd?({name, _args}), do: MapSet.member?(@read_cmds_set, name)
-  def read_cmd?(:unknown), do: false
-
-  @doc false
-  def barrier_command_normalised?(:unknown), do: false
-
-  def barrier_command_normalised?({name, args}) do
-    name in @always_multi_cmds or
-      name in @barrier_server_cmds or
-      (name in @variadic_key_cmds and match?([_, _ | _], args))
-  end
-
-  @doc false
-  def command_shard_key_normalised(_ctx, :unknown), do: :server
-
-  def command_shard_key_normalised(ctx, {name, args}) do
-    cond do
-      name in @always_multi_cmds ->
-        :barrier
-
-      name in @variadic_key_cmds ->
-        case args do
-          [single_key] -> {:shard, Router.shard_for(ctx, single_key)}
-          _ -> :barrier
-        end
-
-      name in @server_cmds_no_key ->
-        :server
-
-      args != [] ->
-        {:shard, Router.shard_for(ctx, hd(args))}
-
-      true ->
-        :server
-    end
-  end
-
-  @doc false
-  def dispatch_pure_command_normalised(:unknown, _store, _state) do
-    {:continue, Encoder.encode({:error, "ERR unknown command format"})}
-  end
-
-  def dispatch_pure_command_normalised({name, args}, store, state) do
-    with :ok <- ConnAuth.check_command_cached(state.acl_cache, name),
-         :ok <- ConnAuth.check_keys_cached(state.acl_cache, name, args) do
-      Stats.incr_commands(state.stats_counter)
-
-      result =
-        try do
-          Dispatcher.dispatch(name, args, store)
-        catch
-          :exit, {:noproc, _} ->
-            {:error, "ERR server not ready, shard process unavailable"}
-
-          :exit, {reason, _} ->
-            {:error, "ERR internal error: #{inspect(reason)}"}
-        end
-
-      ConnTracking.maybe_notify_keyspace(name, args, result)
-      ConnTracking.maybe_notify_tracking(name, args, result, state)
-      {:continue, Encoder.encode(result)}
-    else
-      {:error, _reason} = err ->
-        FerricstoreServer.Acl.log_command_denied(
-          state.username,
-          name,
-          format_peer(state.peer),
-          state.client_id
-        )
-
-        {:continue, Encoder.encode(err)}
+        do_sequential(rest, new_state, handle_command_fn, send_response_fn)
     end
   end
 
@@ -544,8 +509,18 @@ defmodule FerricstoreServer.Connection.Pipeline do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp in_pubsub_mode?(%{pubsub_channels: nil}), do: false
-  defp in_pubsub_mode?(state), do: MapSet.size(state.pubsub_channels) > 0 or MapSet.size(state.pubsub_patterns) > 0
+  defp fast_upcase(<<first, _::binary>> = cmd) when first >= ?A and first <= ?Z, do: cmd
+  defp fast_upcase(cmd), do: String.upcase(cmd)
+
+  defp normalise_cmd({:inline, [name | args]}) when is_binary(name),
+    do: {fast_upcase(name), args}
+  defp normalise_cmd({:inline, []}), do: {"UNKNOWN", []}
+  defp normalise_cmd([name | args]) when is_binary(name), do: {fast_upcase(name), args}
+  defp normalise_cmd(_other), do: {"UNKNOWN", []}
+
+  defp extract_command_name([name | _]) when is_binary(name), do: fast_upcase(name)
+  defp extract_command_name({:inline, [name | _]}) when is_binary(name), do: fast_upcase(name)
+  defp extract_command_name(_), do: "UNKNOWN"
 
   defp requires_auth?(state) do
     not state.authenticated and state.require_auth

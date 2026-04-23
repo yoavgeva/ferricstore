@@ -95,6 +95,21 @@ defmodule Ferricstore.Store.BitcaskWriter do
     - `active_file_path` -- the active log file path at the time of the delete
     - `key` -- the key to tombstone
   """
+  @doc """
+  Queues a batch of deferred Bitcask writes in a single cast.
+
+  Same semantics as calling `write/7` for each entry, but sends one
+  GenServer cast instead of N. Each entry is a tuple:
+  `{active_file_path, active_file_id, ets_table, key, value, expire_at_ms}`.
+  """
+  @spec write_batch(non_neg_integer(), [{binary(), non_neg_integer(), atom(), binary(), binary(), non_neg_integer()}]) :: :ok
+  def write_batch(shard_index, entries) do
+    GenServer.cast(
+      writer_name(shard_index),
+      {:write_batch, entries}
+    )
+  end
+
   @spec delete(non_neg_integer(), binary(), binary()) :: :ok
   def delete(shard_index, active_file_path, key) do
     GenServer.cast(
@@ -165,6 +180,28 @@ defmodule Ferricstore.Store.BitcaskWriter do
   def handle_cast({:tombstone, path, key}, state) do
     entry = {:tombstone, path, key}
     handle_entry(entry, state)
+  end
+
+  def handle_cast({:write_batch, entries}, state) do
+    new_pending = Enum.reduce(entries, state.pending, fn {path, fid, ets, key, value, exp}, acc ->
+      [{:write, path, fid, ets, key, value, exp} | acc]
+    end)
+    new_count = state.pending_count + length(entries)
+
+    if new_count >= @batch_size_threshold do
+      do_flush(new_pending, state.shard_index)
+      cancel_timer(state.flush_timer)
+      {:noreply, %{state | pending: [], pending_count: 0, flush_timer: nil}}
+    else
+      timer =
+        if state.flush_timer == nil do
+          Process.send_after(self(), :flush_timer, @flush_interval_ms)
+        else
+          state.flush_timer
+        end
+
+      {:noreply, %{state | pending: new_pending, pending_count: new_count, flush_timer: timer}}
+    end
   end
 
   # Drain the mailbox in one sweep so we amortize handle_cast overhead
