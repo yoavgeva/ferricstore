@@ -557,9 +557,9 @@ defmodule Ferricstore.Store.Router do
           {:error, "ERR disk write failed: #{inspect(reason)}"}
       end
     else
-      # Small value: inline in ETS for instant reads, async Bitcask write.
+      # Small value: ETS insert only. Bitcask write deferred to state machine
+      # apply (flush_pending_writes) — avoids per-key NIF overhead in Router.
       :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
-      Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, key, disk_value, expire_at_ms)
       size = :counters.info(ctx.write_version).size
       if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
       async_submit_to_raft(idx, {:put, key, value, expire_at_ms})
@@ -1085,22 +1085,38 @@ defmodule Ferricstore.Store.Router do
       keydir = elem(ctx.keydir_refs, idx)
       {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
 
-      {ets_tuples, disk_ops} =
-        Enum.reduce(shard_kvs, {[], []}, fn {key, value}, {ets_acc, disk_acc} ->
+      {ets_tuples, raft_cmds, large_disk_batch} =
+        Enum.reduce(shard_kvs, {[], [], []}, fn {key, value}, {ets_acc, raft_acc, disk_acc} ->
           value_for_ets = if byte_size(value) > hot_max, do: nil, else: value
           track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
 
           ets_tuple = {key, value_for_ets, 0, lfu_val, :pending, 0, 0}
-          disk_op = {idx, file_path, file_id, keydir, key, value, 0}
-          {[ets_tuple | ets_acc], [disk_op | disk_acc]}
+          raft_cmd = {:put, key, value, 0}
+
+          disk_acc =
+            if value_for_ets == nil do
+              [{key, value, 0} | disk_acc]
+            else
+              disk_acc
+            end
+
+          {[ets_tuple | ets_acc], [raft_cmd | raft_acc], disk_acc}
         end)
 
       :ets.insert(keydir, ets_tuples)
 
-      Enum.each(disk_ops, fn {idx2, fp, fid, kd, k, v, exp} ->
-        Ferricstore.Store.BitcaskWriter.write(idx2, fp, fid, kd, k, v, exp)
-        async_submit_to_raft(idx2, {:put, k, v, exp})
-      end)
+      if large_disk_batch != [] do
+        case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, Enum.reverse(large_disk_batch)) do
+          {:ok, locations} ->
+            Enum.zip(large_disk_batch |> Enum.reverse(), locations)
+            |> Enum.each(fn {{key, value, _exp}, {offset, _rec_size}} ->
+              :ets.update_element(keydir, key, [{5, file_id}, {6, offset}, {7, byte_size(value)}])
+            end)
+          {:error, _} -> :ok
+        end
+      end
+
+      Ferricstore.Raft.Batcher.async_submit_batch(idx, raft_cmds)
 
       if idx < wv_size, do: :counters.add(ctx.write_version, idx + 1, length(shard_kvs))
     end)
@@ -1125,25 +1141,25 @@ defmodule Ferricstore.Store.Router do
     wv_size = :counters.info(ctx.write_version).size
     me = self()
 
-    indexed =
-      Enum.with_index(kv_pairs)
-      |> Enum.map(fn {{key, value}, i} ->
+    # Single pass: group by shard, build cmds + indices lists simultaneously
+    {by_shard, count} =
+      kv_pairs
+      |> Enum.reduce({%{}, 0}, fn {key, value}, {shards, i} ->
         idx = shard_for(ctx, key)
-        {i, idx, {:put, key, value, 0}}
+        cmd = {:put, key, value, 0}
+        entry = Map.get(shards, idx, {[], []})
+        {cmds, indices} = entry
+        shards = Map.put(shards, idx, {[cmd | cmds], [i | indices]})
+        {shards, i + 1}
       end)
-
-    by_shard = Enum.group_by(indexed, fn {_i, idx, _cmd} -> idx end)
 
     shard_refs =
-      Enum.map(by_shard, fn {shard_idx, entries} ->
+      Enum.map(by_shard, fn {shard_idx, {cmds, indices}} ->
         ref = make_ref()
-        cmds = Enum.map(entries, fn {_i, _idx, cmd} -> cmd end)
-        indices = Enum.map(entries, fn {i, _idx, _cmd} -> i end)
-        Ferricstore.Raft.Batcher.write_batch(shard_idx, cmds, {me, ref})
-        {ref, shard_idx, indices}
+        Ferricstore.Raft.Batcher.write_batch(shard_idx, Enum.reverse(cmds), {me, ref})
+        {ref, shard_idx, Enum.reverse(indices)}
       end)
 
-    count = length(kv_pairs)
     results = collect_shard_replies(shard_refs, wv_size, ctx, %{}, System.monotonic_time(:millisecond))
 
     0..(count - 1)
@@ -1608,8 +1624,19 @@ defmodule Ferricstore.Store.Router do
 
   @spec compound_get(FerricStore.Instance.t(), binary(), binary()) :: binary() | nil
   def compound_get(ctx, redis_key, compound_key) do
-    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
-    GenServer.call(shard, {:compound_get, redis_key, compound_key})
+    idx = shard_for(ctx, redis_key)
+    keydir = resolve_keydir(ctx, idx)
+    now = HLC.now_ms()
+
+    case ets_get_full(ctx, idx, keydir, compound_key, now) do
+      {:hit, value, lfu} ->
+        sampled_read_bookkeeping_fast(ctx, keydir, compound_key, lfu)
+        value
+
+      _ ->
+        shard = elem(ctx.shard_names, idx)
+        GenServer.call(shard, {:compound_get, redis_key, compound_key})
+    end
   end
 
   @spec compound_get_meta(FerricStore.Instance.t(), binary(), binary()) :: {binary(), non_neg_integer()} | nil

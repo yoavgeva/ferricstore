@@ -1544,11 +1544,7 @@ defmodule Ferricstore.Raft.StateMachine do
   # node has the key → it was the origin (Router wrote it), skip. Otherwise
   # apply the inner command normally.
   defp apply_single(state, {:async, inner_cmd}) do
-    if async_key_present?(state, inner_cmd) do
-      :ok
-    else
-      apply_single(state, inner_cmd)
-    end
+    apply_single(state, inner_cmd)
   end
 
   defp apply_single(state, {:put, key, value, expire_at_ms}) do
