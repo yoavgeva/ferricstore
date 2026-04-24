@@ -335,7 +335,8 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       end)
 
       # Start isolated shard (index 98 to avoid conflicts).
-      opts = [index: 98, data_dir: tmp_dir, flush_interval_ms: 1]
+      iso_ctx = minimal_instance_ctx(tmp_dir)
+      opts = [index: 98, data_dir: tmp_dir, flush_interval_ms: 1, instance_ctx: iso_ctx]
       {:ok, pid} = GenServer.start_link(Ferricstore.Store.Shard, opts)
 
       # Write several keys.
@@ -409,5 +410,31 @@ defmodule FerricstoreServer.NodeLifecycleTest do
       assert Ferricstore.Stats.total_connections() > 0
       assert Ferricstore.Stats.total_commands() > 0
     end
+  end
+
+  defp minimal_instance_ctx(data_dir) do
+    n = 128
+    %FerricStore.Instance{
+      name: :"nlc_test_#{:erlang.unique_integer([:positive])}",
+      data_dir: data_dir, shard_count: n, slot_map: {}, shard_names: {},
+      keydir_refs: {}, ra_system: nil,
+      pressure_flags: :atomics.new(3, signed: false),
+      disk_pressure: :atomics.new(n, signed: false),
+      checkpoint_flags: :atomics.new(n, signed: false),
+      write_version: :counters.new(n, [:write_concurrency]),
+      stats_counter: :counters.new(10, [:atomics]),
+      lfu_decay_time: 1, lfu_log_factor: 10,
+      lfu_initial_ref: :atomics.new(2, signed: false),
+      hot_cache_max_value_size: 65_536, sync_flush_timeout_ms: 5_000,
+      max_active_file_size: 64 * 1024 * 1024, read_sample_rate: 1,
+      eviction_policy: :volatile_lfu, max_memory_bytes: 1_073_741_824,
+      keydir_max_ram: 256 * 1024 * 1024, memory_limit: 1_073_741_824,
+      keydir_binary_bytes: :atomics.new(n, signed: true), latch_refs: {},
+      raft_enabled: false, durability_mode: :quorum,
+      hotness_table: :ets.new(:test_hotness, [:set, :public]),
+      config_table: :ets.new(:test_config, [:set, :public]),
+      connected_clients_fn: fn -> 0 end, process_rss_fn: nil,
+      server_info_fn: fn -> %{} end, raft_apply_hook: nil
+    }
   end
 end

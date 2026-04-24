@@ -61,7 +61,7 @@ defmodule FerricstoreServer.Spec.MemoryPressureTelemetryTest do
   # Trigger check repeatedly until we receive a telemetry event with the
   # expected level. ETS memory fluctuates between measurement and check,
   # so the ratio may land in a different band on the first try.
-  defp trigger_until_level(pid, expected_level, retries \\ 5) do
+  defp trigger_until_level(pid, expected_level, retries \\ 15) do
     drain_pressure_messages()
     trigger_check(pid)
 

@@ -323,7 +323,7 @@ jobs:
 
           # Run all durability tests, capture exit codes
           mix test --only shard_kill --timeout 120000 2>&1 | tee /tmp/durability_shard_kill.log
-          elixir --sname ci_jepsen --cookie ferricstore_test -S mix test --include jepsen --timeout 120000 2>&1 | tee /tmp/durability_jepsen.log
+          elixir --sname ci_jepsen --cookie ferricstore_test -S mix test --only jepsen --timeout 120000 2>&1 | tee /tmp/durability_jepsen.log
           mix test apps/ferricstore/test --only large_alloc --timeout 120000 2>&1 | tee /tmp/durability_large_alloc.log
 
           # Count total failures across all runs
