@@ -14,23 +14,33 @@ defmodule FerricstoreServer.Spec.InputValidationTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup_all do
-    ShardHelpers.wait_shards_alive()
+    :persistent_term.put(:ferricstore_keydir_full, false)
+    :persistent_term.put(:ferricstore_reject_writes, false)
+    ShardHelpers.wait_shards_alive(30_000)
     %{port: Listener.port()}
   end
 
   setup %{port: port} do
     sock = connect_and_hello(port)
     on_exit(fn -> :gen_tcp.close(sock) end)
-    %{sock: sock}
+    %{sock: sock, port: port}
   end
 
-  defp connect_and_hello(port) do
+  defp connect_and_hello(port, retries \\ 5) do
     {:ok, sock} =
       :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, packet: :raw])
 
     send_cmd(sock, ["HELLO", "3"])
-    _greeting = recv_response(sock)
-    sock
+
+    case recv_response(sock) do
+      {:error, _} when retries > 0 ->
+        :gen_tcp.close(sock)
+        Process.sleep(200)
+        connect_and_hello(port, retries - 1)
+
+      _ ->
+        sock
+    end
   end
 
   defp send_cmd(sock, cmd) do
@@ -43,13 +53,18 @@ defmodule FerricstoreServer.Spec.InputValidationTest do
   defp recv_response(sock), do: recv_response(sock, "")
 
   defp recv_response(sock, buf) do
-    {:ok, data} = :gen_tcp.recv(sock, 0, 10_000)
-    buf2 = buf <> data
+    case :gen_tcp.recv(sock, 0, 10_000) do
+      {:ok, data} ->
+        buf2 = buf <> data
 
-    case Parser.parse(buf2) do
-      {:ok, [val], ""} -> val
-      {:ok, [val], _rest} -> val
-      {:ok, [], _} -> recv_response(sock, buf2)
+        case Parser.parse(buf2) do
+          {:ok, [val], ""} -> val
+          {:ok, [val], _rest} -> val
+          {:ok, [], _} -> recv_response(sock, buf2)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

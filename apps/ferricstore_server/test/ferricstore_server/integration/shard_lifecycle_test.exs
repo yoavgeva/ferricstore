@@ -458,7 +458,12 @@ defmodule FerricstoreServer.Integration.ShardLifecycleTest do
     end
 
     test "shard count matches configured count" do
-      children = Supervisor.which_children(Ferricstore.Store.ShardSupervisor)
+      children =
+        Supervisor.which_children(Ferricstore.Store.ShardSupervisor)
+        |> Enum.filter(fn {id, _, _, _} ->
+          is_atom(id) and String.starts_with?(Atom.to_string(id), "shard_")
+        end)
+
       assert length(children) == 4, "Expected 4 shard children, got #{length(children)}"
     end
   end

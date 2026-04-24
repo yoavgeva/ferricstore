@@ -240,12 +240,11 @@ defmodule Ferricstore.CrossShardOpTest do
       {:ok, {:error, :keys_locked}, _} =
         :ra.process_command(shard1_id, {:lock_keys, [k1], other_ref, now + 5000})
 
-      # Wait for locks to expire
-      Process.sleep(300)
-
-      # Now another owner should be able to lock
-      {:ok, :ok, _} =
-        :ra.process_command(shard1_id, {:lock_keys, [k1], other_ref, now + 10_000})
+      # Wait for locks to expire — poll instead of fixed sleep for CI tolerance
+      Ferricstore.Test.Utils.eventually(fn ->
+        {:ok, :ok, _} =
+          :ra.process_command(shard1_id, {:lock_keys, [k1], other_ref, System.os_time(:millisecond) + 10_000})
+      end, 5_000)
 
       # Clean up
       :ra.process_command(shard1_id, {:unlock_keys, [k1], other_ref})

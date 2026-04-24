@@ -18,11 +18,14 @@ defmodule FerricstoreServer.Integration.RaCrashResilienceTest do
   alias Ferricstore.Test.ShardHelpers
 
   setup do
+    :persistent_term.put(:ferricstore_keydir_full, false)
+    :persistent_term.put(:ferricstore_reject_writes, false)
     ShardHelpers.wait_shards_alive(30_000)
     ShardHelpers.flush_all_keys()
 
     on_exit(fn ->
-      # Ensure ra is back for subsequent tests
+      :persistent_term.put(:ferricstore_keydir_full, false)
+      :persistent_term.put(:ferricstore_reject_writes, false)
       ShardHelpers.wait_shards_alive(30_000)
     end)
 

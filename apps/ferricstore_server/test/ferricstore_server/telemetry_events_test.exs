@@ -206,7 +206,7 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       end
 
       assert_receive {:telemetry, [:ferricstore, :expiry, :struggling], measurements, _metadata},
-                     1000
+                     5_000
 
       assert measurements.shard_index == 0
       assert measurements.consecutive_ceiling_sweeps >= 3

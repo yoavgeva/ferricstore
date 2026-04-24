@@ -404,6 +404,8 @@ defmodule FerricstoreServer.Spec.MemoryGuardBudgetTest do
     end
 
     test "CONFIG SET hot-cache-min-ram updates the value" do
+      # Ensure max >= min so cross-validation passes
+      Application.put_env(:ferricstore, :hot_cache_max_ram, 1_073_741_824)
       assert :ok = Ferricstore.Config.set("hot-cache-min-ram", "536870912")
       [{"hot-cache-min-ram", value}] = Ferricstore.Config.get("hot-cache-min-ram")
       assert value == "536870912"

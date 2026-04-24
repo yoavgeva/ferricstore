@@ -11,6 +11,11 @@ defmodule Ferricstore.Store.ShardSupervisorTest do
   than starting a second instance (which would conflict on registered names).
   """
 
+  setup do
+    Ferricstore.Test.ShardHelpers.wait_shards_alive()
+    :ok
+  end
+
   test "starts 4 shards by default" do
     sup = Process.whereis(ShardSupervisor)
     assert is_pid(sup)
