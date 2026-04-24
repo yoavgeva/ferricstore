@@ -43,7 +43,9 @@ defmodule Ferricstore.MixProject do
         "../../guides/architecture.md",
         "../../guides/deployment.md",
         "../../guides/security.md",
-        "../../guides/extensions.md"
+        "../../guides/extensions.md",
+        "../../guides/best-practices.md",
+        "../../guides/comparison.md"
       ],
       groups_for_extras: [
         Guides: Path.wildcard("../../guides/*.md")
