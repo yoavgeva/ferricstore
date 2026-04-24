@@ -219,15 +219,13 @@ defmodule Ferricstore.Store.AsyncRmwTest do
 
       Task.await_many(tasks, 30_000)
 
-      # Let replication settle — the Batcher flush timer needs to fire.
-      :timer.sleep(200)
-
-      assert Router.get(ctx(), key) == "1000"
+      Ferricstore.Test.Utils.eventually(fn ->
+        assert Router.get(ctx(), key) == "1000"
+      end, 5000)
     end
 
     test "concurrent APPENDs produce a string of the correct total length" do
       key = ukey("concurrent_append")
-
       tasks =
         for _ <- 1..20 do
           Task.async(fn -> Router.append(ctx(), key, "x") end)

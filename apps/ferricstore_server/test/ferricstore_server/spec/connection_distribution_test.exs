@@ -231,28 +231,25 @@ defmodule FerricstoreServer.Spec.ConnectionDistributionTest do
 
     test "adding keys increases total_keys" do
       store = MockStore.make()
+      ctx = FerricStore.Instance.get(:default)
 
-      # Baseline
-      result_before = Dispatcher.dispatch("CLUSTER.STATS", [], store)
-      lines_before = String.split(result_before, "\r\n")
-      total_line_before = Enum.find(lines_before, &String.starts_with?(&1, "total_keys:"))
-      [_, total_str_before] = String.split(total_line_before, ": ")
-      total_before = String.to_integer(total_str_before)
-
-      # Add keys
+      # Add keys with unique names
       new_keys = for i <- 1..3, do: ukey("incr_stats_#{i}")
-      Enum.each(new_keys, fn k -> Router.put(FerricStore.Instance.get(:default), k, "v", 0) end)
 
-      result_after = Dispatcher.dispatch("CLUSTER.STATS", [], store)
-      lines_after = String.split(result_after, "\r\n")
-      total_line_after = Enum.find(lines_after, &String.starts_with?(&1, "total_keys:"))
-      [_, total_str_after] = String.split(total_line_after, ": ")
-      total_after = String.to_integer(total_str_after)
+      # Get baseline AFTER flushing, right before adding
+      total_before = extract_total_keys(Dispatcher.dispatch("CLUSTER.STATS", [], store))
 
+      Enum.each(new_keys, fn k -> Router.put(ctx, k, "v", 0) end)
+
+      # Verify each key is readable (proves they were written)
+      Enum.each(new_keys, fn k ->
+        assert Router.get(ctx, k) == "v"
+      end)
+
+      total_after = extract_total_keys(Dispatcher.dispatch("CLUSTER.STATS", [], store))
       assert total_after >= total_before + 3
 
-      # Cleanup
-      Enum.each(new_keys, fn k -> Router.delete(FerricStore.Instance.get(:default), k) end)
+      Enum.each(new_keys, fn k -> Router.delete(ctx, k) end)
     end
   end
 end

@@ -12,16 +12,23 @@ defmodule Ferricstore.MemoryGuardBinaryTrackingTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
-  alias Ferricstore.Test.ShardHelpers
 
   setup do
-    ShardHelpers.flush_all_keys()
+    ctx = Ferricstore.Test.IsolatedInstance.checkout()
+
+    on_exit(fn ->
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
+    end)
+
+    Process.put(:test_ctx, ctx)
     :ok
   end
 
+  defp ctx, do: Process.get(:test_ctx)
+
   describe "binary bytes tracking" do
     test "small values (< 64 bytes) don't add to binary counter" do
-      ctx = FerricStore.Instance.get(:default)
+      ctx = ctx()
       ref = ctx.keydir_binary_bytes
 
       # Get baseline for all shards
@@ -42,7 +49,7 @@ defmodule Ferricstore.MemoryGuardBinaryTrackingTest do
     end
 
     test "large values (> 64 bytes) are tracked in binary counter" do
-      ctx = FerricStore.Instance.get(:default)
+      ctx = ctx()
       ref = ctx.keydir_binary_bytes
 
       baseline = total_binary_bytes(ref, ctx.shard_count)
@@ -68,7 +75,7 @@ defmodule Ferricstore.MemoryGuardBinaryTrackingTest do
     end
 
     test "deleting keys decrements binary counter" do
-      ctx = FerricStore.Instance.get(:default)
+      ctx = ctx()
       ref = ctx.keydir_binary_bytes
 
       large_value = String.duplicate("x", 1000)
@@ -96,7 +103,7 @@ defmodule Ferricstore.MemoryGuardBinaryTrackingTest do
     end
 
     test "updating a key adjusts binary counter (delta, not double-count)" do
-      ctx = FerricStore.Instance.get(:default)
+      ctx = ctx()
       ref = ctx.keydir_binary_bytes
 
       baseline = total_binary_bytes(ref, ctx.shard_count)
@@ -118,7 +125,7 @@ defmodule Ferricstore.MemoryGuardBinaryTrackingTest do
     end
 
     test "MemoryGuard sees binary bytes in keydir accounting" do
-      ctx = FerricStore.Instance.get(:default)
+      ctx = ctx()
 
       # Write large values to make binary bytes significant
       large_value = String.duplicate("x", 10_000)

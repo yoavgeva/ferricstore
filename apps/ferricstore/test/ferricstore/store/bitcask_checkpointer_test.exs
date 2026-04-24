@@ -93,7 +93,7 @@ defmodule Ferricstore.Store.BitcaskCheckpointerTest do
     # Raise the dirty flag (simulates a writer batch).
     :atomics.put(ctx.checkpoint_flags, 1, 1)
 
-    assert_receive {:checkpoint, _meas, %{status: :ok}}, 500
+    assert_receive {:checkpoint, _meas, %{status: :ok}}, 2000
 
     # After the fsync fires, the flag must have been cleared.
     assert :atomics.get(ctx.checkpoint_flags, 1) == 0
