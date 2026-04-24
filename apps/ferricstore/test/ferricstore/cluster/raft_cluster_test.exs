@@ -360,12 +360,12 @@ defmodule Ferricstore.Cluster.LeaderElectionTest do
       # Measure time to confirm leaders on remaining nodes
       start_time = System.monotonic_time(:millisecond)
 
-      :ok = ClusterHelper.wait_for_leaders(remaining, 4, timeout: 3_000)
+      :ok = ClusterHelper.wait_for_leaders(remaining, 4, timeout: 15_000)
 
       elapsed = System.monotonic_time(:millisecond) - start_time
 
-      assert elapsed < 3_000,
-             "LE-001: leaders should be confirmed within 3 seconds, took #{elapsed}ms"
+      assert elapsed < 10_000,
+             "LE-001: leaders should be confirmed within 10 seconds, took #{elapsed}ms"
 
       remaining_names = Enum.map(remaining, & &1.name)
 

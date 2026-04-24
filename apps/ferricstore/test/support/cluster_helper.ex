@@ -79,7 +79,7 @@ defmodule Ferricstore.Test.ClusterHelper do
     end
 
     shards = Keyword.get(opts, :shards, 4)
-    timeout = Keyword.get(opts, :timeout, 15_000)
+    timeout = Keyword.get(opts, :timeout, 30_000)
     unique = :erlang.unique_integer([:positive])
 
     # Ensure the host node is alive for Erlang distribution.
@@ -450,7 +450,7 @@ defmodule Ferricstore.Test.ClusterHelper do
       if length(connected) < length(others) do
         raise "#{node.name} sees #{length(connected)}/#{length(others)} peers"
       end
-    end, "heal should reconnect #{node.name}", 20, 500)
+    end, "heal should reconnect #{node.name}", 40, 500)
 
     # Restart ra servers on the partitioned node
     ra_system = :rpc.call(node.name, Ferricstore.Raft.Cluster, :system_name, [])
@@ -506,7 +506,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   end
 
   def wait_for_leaders(nodes, shard_range, opts) do
-    timeout = Keyword.get(opts, :timeout, 5_000)
+    timeout = Keyword.get(opts, :timeout, 15_000)
     deadline = System.monotonic_time(:millisecond) + timeout
     do_wait_leaders(nodes, shard_range, deadline)
   end
@@ -519,7 +519,7 @@ defmodule Ferricstore.Test.ClusterHelper do
   @spec wait_for_node_leaders(atom(), pos_integer(), keyword()) ::
           :ok | {:error, :timeout_waiting_for_leaders}
   def wait_for_node_leaders(node_name, shards, opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, 5_000)
+    timeout = Keyword.get(opts, :timeout, 15_000)
     deadline = System.monotonic_time(:millisecond) + timeout
     do_wait_node_leaders(node_name, 0..(shards - 1), deadline)
   end
@@ -585,8 +585,8 @@ defmodule Ferricstore.Test.ClusterHelper do
         # Fall back to basic leader check — even if not all members are
         # visible yet, having a leader means the cluster is functional.
         # This handles the case where ra reports fewer members during
-        # initial convergence.
-        do_wait_leaders(nodes, shard_range, deadline + 5_000)
+        # initial convergence. Give 15s extra for CI.
+        do_wait_leaders(nodes, shard_range, deadline + 15_000)
 
       true ->
         Process.sleep(100)

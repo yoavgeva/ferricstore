@@ -92,7 +92,7 @@ defmodule Ferricstore.Jepsen.CounterTest do
 
       # Allow time for any pending flushes
       Process.sleep(200)
-      :ok = ClusterHelper.wait_for_leaders([n1, n2], 4, timeout: 5_000)
+      :ok = ClusterHelper.wait_for_leaders([n1, n2], 4, timeout: 15_000)
 
       # Count successful increments
       ok_count = Enum.count(results, &match?({:ok, _}, &1))

@@ -423,7 +423,7 @@ defmodule Ferricstore.Raft.Cluster do
 
   # Waits for the ra server to elect a leader. In single-node mode this
   # should happen almost immediately after triggering the election.
-  defp wait_for_leader(server_id, attempts \\ 50)
+  defp wait_for_leader(server_id, attempts \\ 200)
   defp wait_for_leader(_server_id, 0), do: {:error, :leader_election_timeout}
 
   defp wait_for_leader(server_id, attempts) do
@@ -432,11 +432,11 @@ defmodule Ferricstore.Raft.Cluster do
         :ok
 
       {:error, _} ->
-        Process.sleep(10)
+        Process.sleep(50)
         wait_for_leader(server_id, attempts - 1)
 
       {:timeout, _} ->
-        Process.sleep(10)
+        Process.sleep(50)
         wait_for_leader(server_id, attempts - 1)
     end
   end

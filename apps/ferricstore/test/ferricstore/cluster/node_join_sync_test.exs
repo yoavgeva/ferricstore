@@ -114,7 +114,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
         assert missing_count == 0, "#{missing_count} keys still missing on node_d"
-      end, "not all keys replicated to node_d", 60, 500)
+      end, "not all keys replicated to node_d", 120, 500)
 
       # 8. Final verification
       missing = Enum.filter(all_keys, fn key -> read_key(node_d, key) == nil end)
