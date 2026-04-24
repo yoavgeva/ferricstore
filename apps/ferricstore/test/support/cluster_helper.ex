@@ -302,6 +302,11 @@ defmodule Ferricstore.Test.ClusterHelper do
     end
 
     remaining = Enum.reject(nodes, &(&1.name == target.name))
+
+    for node <- remaining do
+      :rpc.call(node.name, :erlang, :disconnect_node, [target.name])
+    end
+
     {target, remaining}
   end
 
@@ -599,13 +604,16 @@ defmodule Ferricstore.Test.ClusterHelper do
   # ---------------------------------------------------------------------------
 
   defp do_wait_leaders(nodes, shard_range, deadline) do
+    alive_names = MapSet.new(nodes, & &1.name)
+
     all_have_leaders =
       Enum.all?(shard_range, fn shard ->
         Enum.any?(nodes, fn node ->
           server_id = {:"ferricstore_shard_#{shard}", node.name}
 
           case :rpc.call(node.name, :ra, :members, [server_id]) do
-            {:ok, _members, _leader} -> true
+            {:ok, _members, {_shard_name, leader_node}} ->
+              MapSet.member?(alive_names, leader_node)
             _ -> false
           end
         end)
