@@ -374,13 +374,14 @@ defmodule FerricstoreServer.ShutdownTest do
 
   defp minimal_instance_ctx(data_dir) do
     n = 128
+    nil_tuple = List.to_tuple(List.duplicate(nil, n))
     %FerricStore.Instance{
       name: :"shutdown_test_#{:erlang.unique_integer([:positive])}",
       data_dir: data_dir,
       shard_count: n,
-      slot_map: {},
-      shard_names: {},
-      keydir_refs: {},
+      slot_map: nil_tuple,
+      shard_names: nil_tuple,
+      keydir_refs: nil_tuple,
       ra_system: nil,
       pressure_flags: :atomics.new(3, signed: false),
       disk_pressure: :atomics.new(n, signed: false),
@@ -399,7 +400,7 @@ defmodule FerricstoreServer.ShutdownTest do
       keydir_max_ram: 256 * 1024 * 1024,
       memory_limit: 1_073_741_824,
       keydir_binary_bytes: :atomics.new(n, signed: true),
-      latch_refs: {},
+      latch_refs: nil_tuple,
       raft_enabled: false,
       durability_mode: :quorum,
       hotness_table: :ets.new(:test_hotness, [:set, :public]),
