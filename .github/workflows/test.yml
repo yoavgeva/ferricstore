@@ -74,9 +74,12 @@ jobs:
       - name: Build NIF (release)
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+          cargo build --release --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
           mkdir -p apps/ferricstore/priv/native
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/libferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.so apps/ferricstore/priv/native/ferricstore_bitcask.so
+          cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/libferricstore_wal_nif.so
+          cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.so apps/ferricstore/priv/native/ferricstore_wal_nif.so
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
@@ -155,9 +158,12 @@ jobs:
       - name: Build NIF (release)
         run: |
           cargo build --release --manifest-path apps/ferricstore/native/ferricstore_bitcask/Cargo.toml
+          cargo build --release --manifest-path apps/ferricstore/native/ferricstore_wal_nif/Cargo.toml
           mkdir -p apps/ferricstore/priv/native
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib apps/ferricstore/priv/native/libferricstore_bitcask.so
           cp apps/ferricstore/native/ferricstore_bitcask/target/release/libferricstore_bitcask.dylib apps/ferricstore/priv/native/ferricstore_bitcask.so
+          cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.dylib apps/ferricstore/priv/native/libferricstore_wal_nif.so
+          cp apps/ferricstore/native/ferricstore_wal_nif/target/release/libferricstore_wal_nif.dylib apps/ferricstore/priv/native/ferricstore_wal_nif.so
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
