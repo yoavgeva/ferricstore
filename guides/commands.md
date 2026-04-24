@@ -1114,7 +1114,7 @@ Returns server information. Supports sections: `server`, `clients`, `memory`, `k
 | **RESP3 syntax** | `INFO [section]` |
 | **FerricStore sections** | `raft` (per-shard role/term/commit), `bitcask` (per-shard file counts/sizes), `ferricstore` (raft committed, hot cache evictions), `keydir_analysis` (per-prefix key breakdown), `namespace_config` (group-commit settings) |
 
-The `server` section reports `redis_version: 7.4.0` for client compatibility along with `ferricstore_version: 0.2.0`.
+The `server` section reports `redis_version: 7.4.0` for client compatibility along with `ferricstore_version: 0.3.0`.
 
 ### CONFIG
 
