@@ -16,23 +16,23 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
-  alias Ferricstore.Test.ShardHelpers
 
   @ns "rdesign_async"
 
   setup do
-    ShardHelpers.flush_all_keys()
+    ctx = Ferricstore.Test.IsolatedInstance.checkout()
     Ferricstore.NamespaceConfig.set(@ns, "durability", "async")
 
     on_exit(fn ->
       Ferricstore.NamespaceConfig.set(@ns, "durability", "quorum")
-      ShardHelpers.flush_all_keys()
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
     end)
 
+    Process.put(:test_ctx, ctx)
     :ok
   end
 
-  defp ctx, do: FerricStore.Instance.get(:default)
+  defp ctx, do: Process.get(:test_ctx)
 
   # ---------------------------------------------------------------------------
   # Pipeline / Batcher routing
@@ -40,8 +40,8 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
 
   describe "async routing" do
     test "async writes produce batched ra.pipeline_command submissions" do
-      # Batcher already emits telemetry on its async flush path. Verify the
-      # telemetry fires with multiple commands batched together.
+      # This test requires the Raft-backed default instance (Batcher submits to Raft).
+      default_ctx = FerricStore.Instance.get(:default)
       handler_id = {:redesign_test, :batcher_async}
 
       _ =
@@ -57,7 +57,7 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
       try do
         tasks =
           for i <- 1..50 do
-            Task.async(fn -> Router.put(ctx(), "#{@ns}:batch_#{i}", "v#{i}", 0) end)
+            Task.async(fn -> Router.put(default_ctx, "#{@ns}:batch_#{i}", "v#{i}", 0) end)
           end
 
         Task.await_many(tasks, 5_000)
@@ -140,13 +140,14 @@ defmodule Ferricstore.Store.AsyncWriteRedesignTest do
 
     test "concurrent INCRs on same key sum correctly (atomicity)" do
       key = "#{@ns}:incr_concurrent_#{:erlang.unique_integer([:positive])}"
-      Router.put(ctx(), key, "0", 0)
+      c = ctx()
+      Router.put(c, key, "0", 0)
 
       tasks =
         for _ <- 1..25 do
           Task.async(fn ->
             for _ <- 1..40 do
-              Router.incr(ctx(), key, 1)
+              Router.incr(c, key, 1)
             end
           end)
         end

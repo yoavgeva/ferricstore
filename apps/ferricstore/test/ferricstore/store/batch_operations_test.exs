@@ -2,24 +2,24 @@ defmodule Ferricstore.Store.BatchOperationsTest do
   use ExUnit.Case, async: false
 
   alias Ferricstore.Store.Router
-  alias Ferricstore.Test.ShardHelpers
 
   @ns_async "batch_test_async"
   @ns_quorum "batch_test_quorum"
 
   setup do
-    ShardHelpers.flush_all_keys()
+    ctx = Ferricstore.Test.IsolatedInstance.checkout()
     Ferricstore.NamespaceConfig.set(@ns_async, "durability", "async")
 
     on_exit(fn ->
       Ferricstore.NamespaceConfig.set(@ns_async, "durability", "quorum")
-      ShardHelpers.flush_all_keys()
+      Ferricstore.Test.IsolatedInstance.checkin(ctx)
     end)
 
+    Process.put(:test_ctx, ctx)
     :ok
   end
 
-  defp ctx, do: FerricStore.Instance.get(:default)
+  defp ctx, do: Process.get(:test_ctx)
 
   # ---------------------------------------------------------------------------
   # batch_async_put
