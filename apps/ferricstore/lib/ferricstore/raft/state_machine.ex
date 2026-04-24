@@ -1533,16 +1533,23 @@ defmodule Ferricstore.Raft.StateMachine do
   # Private: command execution
   # ---------------------------------------------------------------------------
 
-  # Async PUT on origin: skip ETS (Router already inserted) but still
-  # accumulate disk write for flush_pending_writes. On replicas, apply
-  # normally (both ETS + disk).
-  # All other async commands (INCR, APPEND, etc.) keep origin-skip to
-  # avoid double-apply of read-modify-write operations.
+  # Async PUT on origin: skip ETS (Router already inserted) and accumulate
+  # disk write only for small values (file_id == :pending means Router
+  # deferred disk write to us). Large values already have a real file_id
+  # and offset from Router's synchronous NIF write — skip disk too.
+  # On replicas, apply normally (both ETS + disk).
   defp apply_single(state, {:async, {:put, key, value, expire_at_ms} = _inner}) do
     if async_key_present?(state, {:put, key, value, expire_at_ms}) do
-      disk_val = to_disk_binary(value)
-      pending = Process.get(:sm_pending_writes, [])
-      Process.put(:sm_pending_writes, [{key, disk_val, expire_at_ms} | pending])
+      case :ets.lookup(state.ets, key) do
+        [{^key, _v, _e, _lfu, :pending, 0, _vs}] ->
+          disk_val = to_disk_binary(value)
+          pending = Process.get(:sm_pending_writes, [])
+          Process.put(:sm_pending_writes, [{key, disk_val, expire_at_ms} | pending])
+
+        _ ->
+          :ok
+      end
+
       :ok
     else
       apply_single(state, {:put, key, value, expire_at_ms})

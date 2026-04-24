@@ -454,22 +454,20 @@ defmodule Ferricstore.Store.Router do
       end
 
     disk_value = to_disk_binary(value)
-    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
 
     track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
 
     if value_for_ets == nil do
       # Large — sync NIF write then ETS with real offset.
-      case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, [{key, disk_value, expire_at_ms}]) do
-        {:ok, [{offset, _record_size}]} ->
+      case nif_append_batch_with_file(idx, [{key, disk_value, expire_at_ms}]) do
+        {:ok, file_id, [{offset, _record_size}]} ->
           :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)})
 
         {:error, _} ->
-          # Fall back to ETS-only; caller will see the write via ETS but
-          # disk persistence failed. Already handled by disk_pressure check.
           :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, byte_size(disk_value)})
       end
     else
+      {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
       :ets.insert(keydir, {key, value_for_ets, expire_at_ms, LFU.initial(), :pending, 0, 0})
       Ferricstore.Store.BitcaskWriter.write(idx, file_path, file_id, keydir, key, disk_value, expire_at_ms)
     end
@@ -536,8 +534,6 @@ defmodule Ferricstore.Store.Router do
         if byte_size(v) > ctx.hot_cache_max_value_size, do: nil, else: v
     end
     disk_value = to_disk_binary(value)
-    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
-
     # Track off-heap binary bytes for MemoryGuard accuracy
     track_keydir_binary_insert(ctx, idx, keydir, key, value_for_ets)
 
@@ -545,8 +541,8 @@ defmodule Ferricstore.Store.Router do
       # Large value: sync NIF write to get offset, then ETS with real location.
       # Cannot use async BitcaskWriter because ETS value is nil (too large for
       # hot cache) and readers would see nil until the async write completes.
-      case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, [{key, disk_value, expire_at_ms}]) do
-        {:ok, [{offset, _record_size}]} ->
+      case nif_append_batch_with_file(idx, [{key, disk_value, expire_at_ms}]) do
+        {:ok, file_id, [{offset, _record_size}]} ->
           :ets.insert(keydir, {key, nil, expire_at_ms, LFU.initial(), file_id, offset, byte_size(disk_value)})
           size = :counters.info(ctx.write_version).size
           if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
@@ -570,6 +566,32 @@ defmodule Ferricstore.Store.Router do
   defp to_disk_binary(v) when is_integer(v), do: Integer.to_string(v)
   defp to_disk_binary(v) when is_float(v), do: Float.to_string(v)
   defp to_disk_binary(v) when is_binary(v), do: v
+
+  # NIF batch write with retry on stale active file (ENOENT after rotation).
+  # Returns {:ok, file_id, locations} or {:error, reason}.
+  defp nif_append_batch_with_file(idx, batch) do
+    {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+
+    case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, batch) do
+      {:ok, locations} ->
+        {:ok, file_id, locations}
+
+      {:error, reason} when is_binary(reason) ->
+        if String.contains?(reason, "No such file") do
+          {fresh_id, fresh_path, _} = Ferricstore.Store.ActiveFile.get(idx)
+
+          case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(fresh_path, batch) do
+            {:ok, locations} -> {:ok, fresh_id, locations}
+            {:error, _} = err -> err
+          end
+        else
+          {:error, reason}
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
 
   # -- Keydir binary memory tracking --
   # Only counts binaries > 64 bytes (refc binaries, off-heap).
@@ -1083,7 +1105,6 @@ defmodule Ferricstore.Store.Router do
     |> Enum.group_by(fn {key, _value} -> shard_for(ctx, key) end)
     |> Enum.each(fn {idx, shard_kvs} ->
       keydir = elem(ctx.keydir_refs, idx)
-      {file_id, file_path, _} = Ferricstore.Store.ActiveFile.get(idx)
 
       {ets_tuples, raft_cmds, large_disk_batch} =
         Enum.reduce(shard_kvs, {[], [], []}, fn {key, value}, {ets_acc, raft_acc, disk_acc} ->
@@ -1107,8 +1128,8 @@ defmodule Ferricstore.Store.Router do
 
       if large_disk_batch != [] do
         reversed = Enum.reverse(large_disk_batch)
-        case Ferricstore.Bitcask.NIF.v2_append_batch_nosync(file_path, reversed) do
-          {:ok, locations} ->
+        case nif_append_batch_with_file(idx, reversed) do
+          {:ok, file_id, locations} ->
             Enum.zip(reversed, locations)
             |> Enum.each(fn {{key, value, _exp}, {offset, _rec_size}} ->
               :ets.update_element(keydir, key, [{5, file_id}, {6, offset}, {7, byte_size(value)}])
