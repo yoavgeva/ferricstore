@@ -59,10 +59,10 @@ defmodule Ferricstore.Store.Router do
 
     case result do
       {:error, {:not_leader, {_shard, leader_node}}} when is_atom(leader_node) ->
-        forward_to_leader(leader_node, idx, command)
+        forward_to_leader(ctx, leader_node, idx, command)
 
       {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
-        forward_to_leader(leader_node, idx, command)
+        forward_to_leader(ctx, leader_node, idx, command)
 
       {:error, _} ->
         result
@@ -74,12 +74,21 @@ defmodule Ferricstore.Store.Router do
     end
   end
 
-  defp forward_to_leader(leader_node, idx, command) do
-    try do
-      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
-      :erpc.call(leader_node, GenServer, :call, [elem(remote_ctx.shard_names, idx), command, 10_000], 10_000)
-    catch
-      :exit, _ -> {:error, "ERR leader forwarding failed"}
+  defp forward_to_leader(ctx, leader_node, idx, command) do
+    if leader_node == node() do
+      {:error, "ERR not leader, election in progress"}
+    else
+      try do
+        remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
+        :erpc.call(leader_node, GenServer, :call, [elem(remote_ctx.shard_names, idx), command, 10_000], 10_000)
+      catch
+        :exit, _ ->
+          try do
+            GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
+          catch
+            :exit, _ -> {:error, "ERR leader unavailable"}
+          end
+      end
     end
   end
 
