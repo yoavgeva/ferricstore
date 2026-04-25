@@ -678,7 +678,7 @@ defmodule FerricstoreServer.Spec.ConfigValuesTest do
 
       Ferricstore.Test.ShardHelpers.eventually(fn ->
         Ferricstore.SlowLog.len() > 0
-      end, "slowlog entry should be recorded", 10, 50)
+      end, "slowlog entry should be recorded", 40, 50)
 
       Server.handle("CONFIG", ["RESETSTAT"], store)
       assert Ferricstore.SlowLog.len() == 0

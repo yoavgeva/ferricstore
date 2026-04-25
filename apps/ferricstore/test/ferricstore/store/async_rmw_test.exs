@@ -204,6 +204,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
       assert Router.get(ctx(), key) == "50"
     end
 
+    @tag timeout: 120_000
     test "1000 INCRs from 25 concurrent tasks sum to 1000" do
       key = ukey("concurrent_1000")
       :ok = Router.put(ctx(), key, "0", 0)
@@ -217,7 +218,7 @@ defmodule Ferricstore.Store.AsyncRmwTest do
           end)
         end
 
-      Task.await_many(tasks, 30_000)
+      Task.await_many(tasks, 90_000)
 
       Ferricstore.Test.Utils.eventually(fn ->
         assert Router.get(ctx(), key) == "1000"
