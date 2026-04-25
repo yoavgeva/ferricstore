@@ -82,11 +82,11 @@ defmodule Ferricstore.Store.Router do
         remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
         :erpc.call(leader_node, GenServer, :call, [elem(remote_ctx.shard_names, idx), command, 10_000], 10_000)
       catch
-        :exit, _ ->
+        _, _ ->
           try do
             GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
           catch
-            :exit, _ -> {:error, "ERR leader unavailable"}
+            _, _ -> {:error, "ERR leader unavailable"}
           end
       end
     end
