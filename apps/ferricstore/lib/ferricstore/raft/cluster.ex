@@ -194,7 +194,16 @@ defmodule Ferricstore.Raft.Cluster do
 
   defp add_member_with_retry(shard_index, node, membership, retries) do
     leader = shard_server_id(shard_index)
-    new_member = %{id: shard_server_id_on(shard_index, node), membership: membership}
+
+    new_member =
+      case membership do
+        :promotable ->
+          %{id: shard_server_id_on(shard_index, node), membership: membership,
+            uid: shard_uid(shard_index)}
+
+        _ ->
+          %{id: shard_server_id_on(shard_index, node), membership: membership}
+      end
 
     case :ra.add_member(leader, new_member) do
       {_, _, _leader} -> :ok
