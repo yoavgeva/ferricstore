@@ -554,8 +554,19 @@ defmodule Ferricstore.Cluster.Manager do
   defp start_raft_on_target(target_node, shard_count, sync_indices) do
     Logger.info("ClusterManager: starting Raft on #{target_node}")
 
-    cluster_members = [node() | Node.list()] |> Enum.uniq()
-    cluster_members = if target_node in cluster_members, do: cluster_members, else: [target_node | cluster_members]
+    # Build cluster members from known Raft participants only.
+    # Use shard 0's current membership as the authoritative source —
+    # don't use Node.list() which includes non-cluster nodes (test runner, etc).
+    cluster_members =
+      case RaftCluster.members(0) do
+        {:ok, members, _leader} ->
+          nodes = Enum.map(members, fn {_name, n} -> n end) |> Enum.uniq()
+          if target_node in nodes, do: nodes, else: [target_node | nodes]
+
+        _ ->
+          nodes = [node() | Node.list()] |> Enum.uniq()
+          if target_node in nodes, do: nodes, else: [target_node | nodes]
+      end
 
     for shard_idx <- 0..(shard_count - 1) do
       try do
@@ -563,8 +574,6 @@ defmodule Ferricstore.Cluster.Manager do
         shard_data_path = Ferricstore.DataDir.shard_data_path(target_ctx.data_dir, shard_idx)
         keydir = elem(target_ctx.keydir_refs, shard_idx)
 
-        # skip_below_index tells the state machine to ignore entries already
-        # present in the Bitcask data copied during sync.
         skip_idx = Map.get(sync_indices, shard_idx, 0)
 
         result = :erpc.call(target_node, Ferricstore.Raft.Cluster, :join_shard_server, [
@@ -576,6 +585,23 @@ defmodule Ferricstore.Cluster.Manager do
       catch
         kind, reason ->
           Logger.warning("ClusterManager: shard #{shard_idx} Raft join failed on #{target_node}: #{inspect({kind, reason})}")
+      end
+    end
+
+    # Trigger elections on all shards to force the new followers to contact
+    # their leaders and start receiving replication. Without this, followers
+    # can get stuck in await_condition if the leader's initial append_entries
+    # round-trip fails during the join_shard_server sequence.
+    Process.sleep(100)
+    ra_sys = RaftCluster.system_name()
+
+    for shard_idx <- 0..(shard_count - 1) do
+      server_id = RaftCluster.shard_server_id_on(shard_idx, target_node)
+
+      try do
+        :erpc.call(target_node, :ra, :trigger_election, [server_id], 5_000)
+      catch
+        _, _ -> :ok
       end
     end
   end

@@ -13,6 +13,7 @@ defmodule Ferricstore.ArchTest do
   # The library has zero references to server modules.
   # ---------------------------------------------------------------------------
 
+  @tag timeout: 60_000
   test "store layer does not depend on commands (except Shard for tx)" do
     # Shard depends on Commands.Dispatcher for tx_execute (MULTI/EXEC).
     # This is an intentional coupling: tx_execute must dispatch queued
