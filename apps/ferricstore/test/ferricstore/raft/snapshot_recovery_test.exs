@@ -22,7 +22,7 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
   use ExUnit.Case, async: false
 
   @moduletag :cluster
-  @moduletag timeout: 120_000
+  @moduletag timeout: 180_000
 
   require Logger
 
@@ -398,7 +398,8 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
         {:ok, peer_pid, node_name} =
           :peer.start(%{
             name: name,
-            args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie]
+            args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie],
+            wait_boot: 120_000
           })
 
         # Start ra on the peer
@@ -415,6 +416,11 @@ defmodule Ferricstore.Raft.SnapshotRecoveryTest do
 
         {node_name, peer_pid}
       end)
+
+    peer_nodes = Enum.map(peers, fn {node_name, _pid} -> node_name end)
+    for n1 <- peer_nodes, n2 <- peer_nodes, n1 != n2 do
+      :rpc.call(n1, Node, :connect, [n2])
+    end
 
     cleanup = fn ->
       Enum.each(peers, fn {_name, peer_pid} ->

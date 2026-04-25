@@ -101,7 +101,8 @@ defmodule Ferricstore.Test.ClusterHelper do
         {:ok, peer_pid, node_name} =
           :peer.start(%{
             name: name,
-            args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie]
+            args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie],
+            wait_boot: 120_000
           })
 
         %{name: node_name, peer: peer_pid, data_dir: data_dir, index: i}
@@ -198,7 +199,8 @@ defmodule Ferricstore.Test.ClusterHelper do
     {:ok, peer_pid, node_name} =
       :peer.start(%{
         name: name,
-        args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie]
+        args: code_paths ++ [~c"-connect_all", ~c"false", ~c"-setcookie", cookie],
+        wait_boot: 120_000
       })
 
     # Store peer_pid in process dictionary so stop_node can find it.
@@ -208,12 +210,13 @@ defmodule Ferricstore.Test.ClusterHelper do
 
     configure_remote_node(node_name, data_dir, shards)
 
-    # If cluster_nodes are provided, set them so start_shard_server uses
-    # the full member list (joins existing group instead of creating new one).
-    # Without cluster_nodes, starts as standalone (single-node Raft groups).
     cluster_nodes = Keyword.get(opts, :cluster_nodes, [])
     if cluster_nodes != [] do
       :rpc.call(node_name, Application, :put_env, [:ferricstore, :cluster_nodes, cluster_nodes])
+      # New joiner nodes must start with raft_enabled: false so they don't
+      # create conflicting single-node Raft groups. The existing cluster's
+      # Manager will add them via auto-join (triggered by :nodeup).
+      :rpc.call(node_name, Application, :put_env, [:ferricstore, :raft_enabled, false])
     end
 
     cluster_role = Keyword.get(opts, :cluster_role)

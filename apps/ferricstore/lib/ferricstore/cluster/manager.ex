@@ -189,18 +189,31 @@ defmodule Ferricstore.Cluster.Manager do
       not raft_enabled ->
         {:noreply, state}
 
-      # Case 1: We know this node — it's in our cluster_nodes config
+      # Case 1: We know this node — it's in our cluster_nodes config.
+      # Only initiate auto-join if WE are an established node (have Raft leaders).
+      # Fresh nodes with cluster_nodes config should wait for the existing
+      # cluster to add them via Case 2, not try to add existing nodes to themselves.
       node in state.cluster_nodes ->
         new_known = MapSet.put(state.known_nodes, node)
-        spawn(fn ->
-          # Read the remote node's role, not ours
-          remote_role = try do
-            :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_role, :voter], 5_000)
-          catch
-            _, _ -> :voter
+        has_leaders = Enum.any?(0..(state.shard_count - 1), fn i ->
+          case RaftCluster.members(i) do
+            {:ok, members, _leader} -> length(members) > 1
+            _ -> false
           end
-          do_auto_join(node, remote_role)
         end)
+
+        if has_leaders do
+          spawn(fn ->
+            remote_role = try do
+              :erpc.call(node, Application, :get_env, [:ferricstore, :cluster_role, :voter], 5_000)
+            catch
+              _, _ -> :voter
+            end
+            do_auto_join(node, remote_role)
+          end)
+        else
+          Logger.info("ClusterManager: deferring join for #{node} — we have no multi-member shards yet, waiting for existing cluster to add us")
+        end
         {:noreply, %{state | known_nodes: new_known, mode: :cluster}}
 
       # Case 2: We don't know this node, but it might want to join us.
@@ -295,15 +308,16 @@ defmodule Ferricstore.Cluster.Manager do
 
     if target_has_data do
       # Disk clone / rejoin path: target already has Bitcask data.
-      # Skip data sync — just add to Raft groups and start ra servers.
       Logger.info("ClusterManager: #{target_node} has pre-existing data, skipping data sync")
       stop_raft_on_target(target_node, state.shard_count)
+
       {raft_result, _} = do_add_node(target_node, membership, state)
 
       case raft_result do
         :ok ->
           sync_indices = read_target_indices(target_node, state.shard_count)
           start_raft_on_target(target_node, state.shard_count, sync_indices)
+          kickstart_replication(target_node, state.shard_count)
           Logger.info("ClusterManager: #{target_node} added to Raft groups (disk clone)")
           :ok
 
@@ -313,7 +327,9 @@ defmodule Ferricstore.Cluster.Manager do
       end
     else
       # Empty node path: needs data sync.
-      # Stop existing ra servers → sync data → add to Raft → start ra as follower.
+      # Stop existing ra servers → sync data → start ra as follower → add to Raft.
+      # Order matters: the ra server must be running before add_member so it can
+      # receive the leader's initial append_entries immediately.
       stop_raft_on_target(target_node, state.shard_count)
 
       sync_result = direct_sync(target_node, ctx)
@@ -325,6 +341,7 @@ defmodule Ferricstore.Cluster.Manager do
           case raft_result do
             :ok ->
               start_raft_on_target(target_node, state.shard_count, sync_indices)
+              kickstart_replication(target_node, state.shard_count)
               Logger.info("ClusterManager: #{target_node} fully joined and synced")
               :ok
 
@@ -588,18 +605,24 @@ defmodule Ferricstore.Cluster.Manager do
       end
     end
 
-    # Trigger elections on all shards to force the new followers to contact
-    # their leaders and start receiving replication. Without this, followers
-    # can get stuck in await_condition if the leader's initial append_entries
-    # round-trip fails during the join_shard_server sequence.
+    :ok
+  end
+
+  defp kickstart_replication(target_node, shard_count) do
     Process.sleep(100)
-    ra_sys = RaftCluster.system_name()
 
     for shard_idx <- 0..(shard_count - 1) do
-      server_id = RaftCluster.shard_server_id_on(shard_idx, target_node)
+      follower_id = RaftCluster.shard_server_id_on(shard_idx, target_node)
 
       try do
-        :erpc.call(target_node, :ra, :trigger_election, [server_id], 5_000)
+        :erpc.call(target_node, :ra, :trigger_election, [follower_id], 5_000)
+      catch
+        _, _ -> :ok
+      end
+
+      leader_id = RaftCluster.shard_server_id(shard_idx)
+      try do
+        :ra.members(leader_id, 2_000)
       catch
         _, _ -> :ok
       end

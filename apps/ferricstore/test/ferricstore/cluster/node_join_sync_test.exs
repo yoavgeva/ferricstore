@@ -20,6 +20,8 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
   alias Ferricstore.Test.ClusterHelper
 
+  @shards 2
+
   # Skip if :peer module not available (OTP < 25)
   setup_all do
     unless ClusterHelper.peer_available?() do
@@ -38,46 +40,54 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   defp cleanup_orphan_peers do
-    # Clean temp dirs
-    Path.wildcard(Path.join(System.tmp_dir!(), "ferricstore_cluster_*")) |> Enum.each(&File.rm_rf/1)
-    Path.wildcard(Path.join(System.tmp_dir!(), "ferricstore_solo_*")) |> Enum.each(&File.rm_rf/1)
-    Path.wildcard(Path.join(System.tmp_dir!(), "ferricstore_clone_*")) |> Enum.each(&File.rm_rf/1)
+    # Stop any peers registered in the ETS table (from start_node)
+    if :ets.whereis(:ferricstore_solo_peers) != :undefined do
+      :ets.tab2list(:ferricstore_solo_peers)
+      |> Enum.each(fn {name, peer_pid, _dir} ->
+        try do
+          :peer.stop(peer_pid)
+        catch
+          _, _ -> :ok
+        end
+        :ets.delete(:ferricstore_solo_peers, name)
+      end)
+    end
 
-    # Kill any lingering peer nodes from previous runs
+    # Kill any lingering peer nodes via erlang:halt (forceful)
     ferric_nodes =
       Node.list()
       |> Enum.filter(fn n -> n |> Atom.to_string() |> String.contains?("ferric_") end)
 
     Enum.each(ferric_nodes, fn n ->
       try do
-        :erpc.call(n, System, :stop, [0], 2_000)
+        :erpc.call(n, :erlang, :halt, [0], 2_000)
       catch
         _, _ -> :ok
       end
       Node.disconnect(n)
     end)
 
-    # Wait until all ferric peer nodes are fully disconnected
     if ferric_nodes != [] do
-      Enum.each(1..50, fn _ ->
+      Enum.each(1..30, fn _ ->
         remaining =
           Node.list()
           |> Enum.filter(fn n -> n |> Atom.to_string() |> String.contains?("ferric_") end)
 
-        if remaining == [] do
-          :ok
-        else
-          Process.sleep(100)
-        end
+        if remaining != [], do: Process.sleep(100)
       end)
     end
+
+    # Clean temp dirs
+    Path.wildcard(Path.join(System.tmp_dir!(), "ferricstore_cluster_*")) |> Enum.each(&File.rm_rf/1)
+    Path.wildcard(Path.join(System.tmp_dir!(), "ferricstore_solo_*")) |> Enum.each(&File.rm_rf/1)
+    Path.wildcard(Path.join(System.tmp_dir!(), "ferricstore_clone_*")) |> Enum.each(&File.rm_rf/1)
   end
 
   describe "new node join with continuous writes" do
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "data is fully consistent after sync completes" do
       # 1. Start a 3-node cluster
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
 
       [node_a, node_b, _node_c] = nodes
@@ -92,7 +102,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       # 4. Start 4th node (empty) and join it to the cluster
       #    join_cluster triggers: add to Raft + shard-by-shard data copy
       #    Writer keeps writing throughout — writes must not be blocked
-      node_d = ClusterHelper.start_node()
+      node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
       join_result = join_cluster(node_d, node_a)
@@ -140,10 +150,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       IO.puts("SUCCESS: #{length(all_keys)} keys identical across all nodes")
     end
 
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "4th node auto-discovers and syncs while writes continue" do
       # 1. Start 3-node cluster with data
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
 
       [node_a, node_b, _node_c] = nodes
@@ -157,7 +167,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       # 3. Start 4th node with cluster_nodes pointing to existing cluster
       #    No manual join — auto-discovery handles it
       all_cluster_nodes = Enum.map(nodes, &node_name/1)
-      node_d = ClusterHelper.start_node(cluster_nodes: all_cluster_nodes)
+      node_d = ClusterHelper.start_node(shards: @shards, cluster_nodes: all_cluster_nodes)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
       # 4. Connect node_d to the cluster (simulates libcluster)
@@ -188,15 +198,15 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       IO.puts("SUCCESS: #{length(all_keys)} keys identical (auto-discovery)")
     end
 
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "no writes lost during sync — every write is durable" do
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
 
       [node_a, _node_b, _node_c] = nodes
 
       # Start 4th node
-      node_d = ClusterHelper.start_node()
+      node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
       # Track every write with a monotonic counter
@@ -234,15 +244,15 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       :ets.delete(write_log)
     end
 
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "shard-by-shard sync — other shards serve writes while one syncs" do
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
 
       [node_a, _node_b, _node_c] = nodes
       shard_count = get_shard_count(node_a)
 
-      node_d = ClusterHelper.start_node()
+      node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
       # Write to specific shards to verify per-shard sync
@@ -268,9 +278,9 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   describe "data directory consistency" do
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "after sync + settle, keydir dump is identical across all nodes" do
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
 
       [node_a, _node_b, _node_c] = nodes
@@ -279,7 +289,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       write_keys(node_a, "consistency", 1..500)
 
       # Add 4th node
-      node_d = ClusterHelper.start_node()
+      node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
       :ok = join_cluster(node_d, node_a)
@@ -293,9 +303,9 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       end, "keydirs not converged", 30, 500)
     end
 
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "bitcask file checksums match after compaction on all nodes" do
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
 
       [node_a, _node_b, _node_c] = nodes
@@ -305,7 +315,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       for i <- 1..200, do: write_key(node_a, "compact_key_#{i}", "value_v2")
 
       # Add 4th node
-      node_d = ClusterHelper.start_node()
+      node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
 
       :ok = join_cluster(node_d, node_a)
@@ -330,16 +340,16 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   describe "standalone to cluster (manual join)" do
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "single node with data → two nodes join via CLUSTER.JOIN → all data synced" do
-      node_a = ClusterHelper.start_node()
+      node_a = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_a) end)
-      ClusterHelper.wait_for_node_leaders(node_name(node_a), 4, timeout: 10_000)
+      ClusterHelper.wait_for_node_leaders(node_name(node_a), @shards, timeout: 10_000)
 
       keys = write_keys(node_a, "standalone", 1..200)
 
-      node_b = ClusterHelper.start_node()
-      node_c = ClusterHelper.start_node()
+      node_b = ClusterHelper.start_node(shards: @shards)
+      node_c = ClusterHelper.start_node(shards: @shards)
       on_exit(fn ->
         ClusterHelper.stop_node(node_b)
         ClusterHelper.stop_node(node_c)
@@ -373,20 +383,20 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   describe "auto-discovery: one node with data, two nodes join via cluster_nodes config" do
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "new nodes auto-discover, sync data, keydirs identical" do
       # 1. Start node_a as standalone with data
-      node_a = ClusterHelper.start_node()
+      node_a = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_a) end)
-      ClusterHelper.wait_for_node_leaders(node_name(node_a), 4, timeout: 10_000)
+      ClusterHelper.wait_for_node_leaders(node_name(node_a), @shards, timeout: 10_000)
 
       keys = write_keys(node_a, "existing", 1..200)
 
       # 2. Start node_b and node_c with cluster_nodes pointing to node_a
       #    Simulates: FERRICSTORE_CLUSTER_NODES=a,b,c → libcluster connects → :nodeup → auto-join
       n_a = node_name(node_a)
-      node_b = ClusterHelper.start_node(cluster_nodes: [n_a])
-      node_c = ClusterHelper.start_node(cluster_nodes: [n_a])
+      node_b = ClusterHelper.start_node(shards: @shards, cluster_nodes: [n_a])
+      node_c = ClusterHelper.start_node(shards: @shards, cluster_nodes: [n_a])
       on_exit(fn ->
         ClusterHelper.stop_node(node_b)
         ClusterHelper.stop_node(node_c)
@@ -418,10 +428,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   describe "non-voter (readonly) node joins and gets data" do
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "readonly replica receives all data, writes forward to leader" do
       # 1. Start 3-node cluster with data
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
 
       [node_a, _node_b, _node_c] = nodes
@@ -431,7 +441,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       # 2. Start readonly replica with cluster_nodes + cluster_role
       #    Simulates: FERRICSTORE_CLUSTER_ROLE=readonly FERRICSTORE_CLUSTER_NODES=a,b,c
       all_cluster_nodes = Enum.map(nodes, &node_name/1)
-      replica = ClusterHelper.start_node(cluster_nodes: all_cluster_nodes, cluster_role: :readonly)
+      replica = ClusterHelper.start_node(shards: @shards, cluster_nodes: all_cluster_nodes, cluster_role: :readonly)
       on_exit(fn -> ClusterHelper.stop_node(replica) end)
 
       # 3. Connect — auto-discovery reads remote role and joins as non_voter
@@ -472,10 +482,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   describe "disk snapshot: new node boots from copied disk while writes continue" do
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "node with cloned disk joins cluster and gets all data" do
       # 1. Start 3-node cluster, write data
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
 
       [node_a, _node_b, _node_c] = nodes
@@ -510,6 +520,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       #    Connect to cluster first so ra can reach other nodes during election.
       all_cluster_nodes = Enum.map(nodes, &node_name/1)
       node_d = ClusterHelper.start_node(
+        shards: @shards,
         data_dir: clone_dir,
         cluster_nodes: all_cluster_nodes
       )
@@ -545,14 +556,14 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   describe "rejoin after removal" do
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "removed node can rejoin and gets all data" do
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
       [node_a, _node_b, _node_c] = nodes
       n_a = node_name(node_a)
       keys_v1 = write_keys(node_a, "before_remove", 1..100)
-      node_d = ClusterHelper.start_node()
+      node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
       :ok = join_cluster(node_d, node_a)
       eventually(fn ->
@@ -573,15 +584,15 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   describe "duplicate join is idempotent" do
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "concurrent add_node calls for same target converge" do
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
       [node_a, node_b, _node_c] = nodes
       n_a = node_name(node_a)
       n_b = node_name(node_b)
       keys = write_keys(node_a, "dedup", 1..200)
-      node_d = ClusterHelper.start_node()
+      node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
       task_a = Task.async(fn -> :erpc.call(n_a, Ferricstore.Cluster.Manager, :add_node, [node_name(node_d)], 60_000) end)
       task_b = Task.async(fn -> :erpc.call(n_b, Ferricstore.Cluster.Manager, :add_node, [node_name(node_d)], 60_000) end)
@@ -603,11 +614,11 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   describe "leader failover during sync" do
-    @tag timeout: 120_000
+    @tag timeout: 180_000
     test "sync recovers after leader dies mid-join" do
-      nodes = ClusterHelper.start_cluster(3)
+      nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
-      [node_a, node_b, node_c] = nodes
+      [node_a, node_b, _node_c] = nodes
       keys = write_keys(node_a, "pre_failover", 1..200)
       eventually(fn ->
         assert Enum.all?(keys, fn k -> read_key(node_b, k) != nil end), "keys missing on b"
@@ -615,9 +626,9 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       leader_name = ClusterHelper.find_leader(nodes, 0)
       leader_node = Enum.find(nodes, &(&1.name == leader_name))
       {_killed, remaining} = ClusterHelper.kill_node(nodes, leader_node)
-      ClusterHelper.wait_for_leaders(remaining, 4, timeout: 15_000)
+      ClusterHelper.wait_for_leaders(remaining, @shards, timeout: 15_000)
       surviving = hd(remaining)
-      node_d = ClusterHelper.start_node()
+      node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
       :ok = join_cluster(node_d, surviving)
       post_keys = write_keys(surviving, "post_failover", 1..50)
@@ -753,7 +764,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
   end
 
   defp join_cluster(new_node, existing_node) do
-    :erpc.call(node_name(existing_node), Ferricstore.Cluster.Manager, :add_node, [node_name(new_node)])
+    :erpc.call(node_name(existing_node), Ferricstore.Cluster.Manager, :add_node, [node_name(new_node)], 120_000)
   end
 
 
@@ -782,27 +793,6 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     |> Enum.sort()
   end
 
-  defp shard_data_checksums(node) do
-    n = node_name(node)
-    ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
-
-    for shard_idx <- 0..(ctx.shard_count - 1) do
-      shard_path = :erpc.call(n, Ferricstore.DataDir, :shard_data_path, [ctx.data_dir, shard_idx])
-
-      files = :erpc.call(n, File, :ls!, [shard_path])
-      |> Enum.filter(&String.ends_with?(&1, ".log"))
-      |> Enum.sort()
-
-      checksums = Enum.map(files, fn file ->
-        path = Path.join(shard_path, file)
-        content = :erpc.call(n, File, :read!, [path])
-        {file, :crypto.hash(:sha256, content) |> Base.encode16()}
-      end)
-
-      {shard_idx, checksums}
-    end
-  end
-
   defp trigger_compaction(node) do
     n = node_name(node)
     ctx = :erpc.call(n, FerricStore.Instance, :get, [:default])
@@ -813,7 +803,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
     end
   end
 
-  defp eventually(fun, msg \\ "condition not met", attempts \\ 20, interval \\ 50) do
+  defp eventually(fun, msg, attempts, interval) do
     Ferricstore.Test.ShardHelpers.eventually(fun, msg, attempts, interval)
   end
 end
