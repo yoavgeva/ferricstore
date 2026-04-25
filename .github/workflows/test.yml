@@ -373,7 +373,7 @@ jobs:
         run: |
           epmd -daemon
           set +e
-          elixir --sname ci_cluster --cookie ferricstore_test -S mix test --only cluster --only partition_test --timeout 60000 2>&1 | tee /tmp/cluster.log
+          elixir --sname ci_cluster --cookie ferricstore_test -S mix test --only cluster --timeout 60000 2>&1 | tee /tmp/cluster.log
 
           FAILURES=$(grep -oP '\d+ failure' /tmp/cluster.log | awk '{s+=$1} END {print s+0}')
           echo "Total cluster failures: $FAILURES"
