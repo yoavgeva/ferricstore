@@ -112,11 +112,10 @@ defmodule Ferricstore.Cluster.ClusterApiTest do
       assert result == :ok
     end
 
-    test "adding self with different membership returns error (cluster_change_not_permitted)" do
-      # ra rejects changing membership type of an existing member via add_member;
-      # the node is already a :voter so requesting :promotable is rejected.
+    test "adding self with different membership updates membership type" do
+      # ra accepts changing membership type of an existing member via add_member.
       result = Cluster.add_member(0, node(), :promotable)
-      assert {:error, _reason} = result
+      assert result == :ok
     end
   end
 
