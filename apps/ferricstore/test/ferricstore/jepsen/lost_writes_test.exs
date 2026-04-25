@@ -71,9 +71,9 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
             end
         end
 
-        # Kill a sibling node every 30 writes to introduce disruption.
-        # The writing node stays alive so its data must be preserved.
-        if rem(i, 30) == 0 do
+        # Kill one sibling node at the midpoint to test disruption while
+        # maintaining Raft quorum (need 2 of 3 alive).
+        if i == 50 do
           alive =
             Enum.filter(nodes, fn n ->
               case :rpc.call(n.name, Node, :self, []) do
@@ -82,10 +82,10 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
               end
             end)
 
-          if length(alive) > 1 do
+          if length(alive) > 2 do
             target = List.last(alive)
             ClusterHelper.kill_node(nodes, target)
-            Process.sleep(200)
+            Process.sleep(500)
           end
         end
       end
@@ -158,13 +158,21 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
         HistoryRecorder.record_ok(history, key, value, writer.name)
       end
 
-      # Kill all other nodes (may be empty if only 1 was alive)
-      Enum.each(targets, fn target ->
-        ClusterHelper.kill_node(nodes, target)
-      end)
+      # Kill at most 1 other node to maintain Raft quorum (need 2 of 3).
+      if targets != [] do
+        ClusterHelper.kill_node(nodes, hd(targets))
+      end
+
+      remaining =
+        Enum.filter(nodes, fn n ->
+          case :rpc.call(n.name, Node, :self, []) do
+            {:badrpc, _} -> false
+            _ -> true
+          end
+        end)
 
       Process.sleep(500)
-      :ok = ClusterHelper.wait_for_leaders([writer], 4, timeout: 30_000)
+      :ok = ClusterHelper.wait_for_leaders(remaining, 4, timeout: 30_000)
 
       # All 50 writes must be readable on the surviving writer
       result = HistoryRecorder.verify_durability(history, [writer])

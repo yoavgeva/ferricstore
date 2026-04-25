@@ -222,16 +222,19 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
       alive_nodes = alive(nodes)
 
       Enum.each(alive_nodes, fn node ->
-        # Default namespace is :quorum -- verify durability
         key = "quorum:contrast:#{node.index}"
         value = "durable_value"
 
         :ok = :rpc.call(node.name, FerricStore, :set, [key, value])
 
-        {:ok, read} = :rpc.call(node.name, FerricStore, :get, [key])
+        # In multi-node Raft the write may land on the leader and replicate
+        # back asynchronously, so poll until the local node sees it.
+        Ferricstore.Test.ShardHelpers.eventually(fn ->
+          {:ok, read} = :rpc.call(node.name, FerricStore, :get, [key])
 
-        assert read == value,
-               "Quorum write should be immediately durable on #{node.name}"
+          assert read == value,
+                 "Quorum write should be durable on #{node.name}"
+        end, "quorum write durable on #{node.name}", 20, 100)
       end)
     end
   end

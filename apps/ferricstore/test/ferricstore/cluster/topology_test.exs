@@ -277,13 +277,11 @@ defmodule Ferricstore.Cluster.FailoverTest do
     end
 
     # Allow distribution to fully settle from any previous module's
-    # cluster teardown before starting our own fresh cluster. The
-    # NodeFailureTest module kills peer nodes, and the BEAM distribution
-    # layer needs time to fully clean up stale connections before new
-    # peer nodes with potentially similar names can be started reliably.
-    Process.sleep(500)
+    # cluster teardown before starting our own fresh cluster.
+    Process.sleep(2_000)
 
     nodes = ClusterHelper.start_cluster(3)
+    :ok = ClusterHelper.wait_for_leaders(nodes, 4, timeout: 30_000)
     on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
     %{nodes: nodes}
   end

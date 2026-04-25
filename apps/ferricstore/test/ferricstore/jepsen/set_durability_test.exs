@@ -53,7 +53,8 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
 
       on_exit(fn -> if Process.alive?(history), do: HistoryRecorder.stop(history) end)
 
-      # SADD 200 members on n1, killing sibling nodes every 50 adds
+      # SADD 200 members on n1, killing one sibling at the midpoint
+      # to test disruption while maintaining Raft quorum (need 2 of 3).
       for i <- 1..200 do
         member = "member:#{i}"
 
@@ -65,27 +66,25 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
             :ok
         end
 
-        # Kill a sibling every 50 adds to introduce disruption
-        if rem(i, 50) == 0 do
-          alive_siblings =
-            Enum.filter([n2, n3], fn n ->
-              case :rpc.call(n.name, Node, :self, []) do
-                {:badrpc, _} -> false
-                _ -> true
-              end
-            end)
-
-          if alive_siblings != [] do
-            target = hd(alive_siblings)
-            ClusterHelper.kill_node(nodes, target)
-            Process.sleep(100)
-          end
+        # Kill one sibling at the midpoint to introduce disruption
+        if i == 100 do
+          ClusterHelper.kill_node(nodes, n3)
+          Process.sleep(500)
         end
       end
 
       # Allow pending flushes
       Process.sleep(200)
-      :ok = ClusterHelper.wait_for_leaders([n1], 4, timeout: 30_000)
+
+      alive =
+        Enum.filter(nodes, fn n ->
+          case :rpc.call(n.name, Node, :self, []) do
+            {:badrpc, _} -> false
+            _ -> true
+          end
+        end)
+
+      :ok = ClusterHelper.wait_for_leaders(alive, 4, timeout: 30_000)
 
       # Verify all ACKed members are present on n1 (the writing node)
       violations = HistoryRecorder.verify_set_durability(history, [n1], key)
