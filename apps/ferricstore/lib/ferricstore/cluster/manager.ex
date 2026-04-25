@@ -311,12 +311,12 @@ defmodule Ferricstore.Cluster.Manager do
       Logger.info("ClusterManager: #{target_node} has pre-existing data, skipping data sync")
       stop_raft_on_target(target_node, state.shard_count)
 
+      sync_indices = read_target_indices(target_node, state.shard_count)
+      start_raft_on_target(target_node, state.shard_count, sync_indices)
       {raft_result, _} = do_add_node(target_node, membership, state)
 
       case raft_result do
         :ok ->
-          sync_indices = read_target_indices(target_node, state.shard_count)
-          start_raft_on_target(target_node, state.shard_count, sync_indices)
           kickstart_replication(target_node, state.shard_count)
           Logger.info("ClusterManager: #{target_node} added to Raft groups (disk clone)")
           :ok
@@ -327,20 +327,22 @@ defmodule Ferricstore.Cluster.Manager do
       end
     else
       # Empty node path: needs data sync.
-      # Stop existing ra servers → sync data → start ra as follower → add to Raft.
-      # Order matters: the ra server must be running before add_member so it can
-      # receive the leader's initial append_entries immediately.
+      # Order: sync data → start ra server → add_member → kickstart.
+      # The ra server must be running BEFORE add_member so it can receive
+      # the leader's initial append_entries immediately. The server won't
+      # elect itself because initial_members includes all cluster nodes
+      # and quorum requires votes from nodes that don't know it yet.
       stop_raft_on_target(target_node, state.shard_count)
 
       sync_result = direct_sync(target_node, ctx)
 
       case sync_result do
         {:ok, sync_indices} ->
+          start_raft_on_target(target_node, state.shard_count, sync_indices)
           {raft_result, _} = do_add_node(target_node, membership, state)
 
           case raft_result do
             :ok ->
-              start_raft_on_target(target_node, state.shard_count, sync_indices)
               kickstart_replication(target_node, state.shard_count)
               Logger.info("ClusterManager: #{target_node} fully joined and synced")
               :ok
