@@ -576,7 +576,15 @@ defmodule Ferricstore.Cluster.Manager do
       catch
         _, _ -> :ok
       end
+
+      try do
+        :erpc.call(target_node, :ra, :force_delete_server, [ra_sys, server_id])
+      catch
+        _, _ -> :ok
+      end
     end
+
+    Process.sleep(50)
   end
 
   defp start_raft_on_target(target_node, shard_count, sync_indices) do
