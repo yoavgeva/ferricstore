@@ -316,12 +316,12 @@ defmodule Ferricstore.Cluster.DataSync do
       #    but not yet applied would be skipped on the joiner if we used
       #    commit_index, losing those writes.
       leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
-      raft_index = get_raft_index_on(leader_node, leader_server_id)
+      {raft_index, overview_info} = get_raft_index_with_detail(leader_node, leader_server_id)
 
       # 3. Copy shard data directory from leader to target
       copy_directory_from(leader_node, leader_shard_data, target_node, target_shard_data)
 
-      Logger.info("Shard #{shard_index}: sync complete at raft last_applied #{raft_index}")
+      Logger.info("Shard #{shard_index}: sync complete at raft last_applied=#{raft_index} #{overview_info}")
       {:ok, raft_index}
     rescue
       e -> {:error, Exception.message(e)}
@@ -366,13 +366,30 @@ defmodule Ferricstore.Cluster.DataSync do
   end
 
   defp get_raft_index_on(leader_node, server_id) do
-    if leader_node == node() do
-      get_raft_index(server_id)
-    else
-      case :erpc.call(leader_node, :ra, :member_overview, [server_id]) do
-        {:ok, overview, _} -> Map.get(overview, :last_applied, 0)
-        _ -> 0
+    {index, _detail} = get_raft_index_with_detail(leader_node, server_id)
+    index
+  end
+
+  defp get_raft_index_with_detail(leader_node, server_id) do
+    overview_result =
+      if leader_node == node() do
+        :ra.member_overview(server_id)
+      else
+        try do
+          :erpc.call(leader_node, :ra, :member_overview, [server_id])
+        catch
+          _, _ -> :error
+        end
       end
+
+    case overview_result do
+      {:ok, overview, _} ->
+        la = Map.get(overview, :last_applied, 0)
+        ci = Map.get(overview, :commit_index, 0)
+        {la, "(commit_index=#{ci})"}
+
+      _ ->
+        {0, "(no overview)"}
     end
   end
 
