@@ -98,12 +98,16 @@ defmodule Ferricstore.Test.AuditFormatter do
     Enum.reduce(0..(shard_count - 1), {0, 0}, fn i, {ets_acc, _prefix_acc} ->
       ets =
         try do
-          :ets.info(:"keydir_#{i}", :size)
+          case :ets.info(:"keydir_#{i}", :size) do
+            :undefined -> 0
+            n when is_integer(n) -> n
+            _ -> 0
+          end
         rescue
           _ -> 0
         end
 
-      {ets_acc + (ets || 0), 0}
+      {ets_acc + ets, 0}
     end)
   end
 

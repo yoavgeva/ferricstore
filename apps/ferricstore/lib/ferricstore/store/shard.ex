@@ -538,10 +538,12 @@ defmodule Ferricstore.Store.Shard do
         {:ok, files} ->
           files
           |> Enum.filter(&String.ends_with?(&1, ".log"))
-          |> Enum.map(fn name ->
+          |> Enum.flat_map(fn name ->
             fid = name |> String.trim_trailing(".log") |> String.to_integer()
-            size = File.stat!(Path.join(sp, name)).size
-            {fid, size}
+            case File.stat(Path.join(sp, name)) do
+              {:ok, %{size: size}} -> [{fid, size}]
+              {:error, _} -> []
+            end
           end)
         _ -> []
       end
