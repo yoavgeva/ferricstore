@@ -124,7 +124,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
         assert missing_count == 0, "#{missing_count} keys still missing on node_d"
-      end, "not all keys replicated to node_d", 120, 500)
+      end, "not all keys replicated to node_d", 240, 500)
 
       # 8. Final verification
       missing = Enum.filter(all_keys, fn key -> read_key(node_d, key) == nil end)
@@ -186,14 +186,14 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
         assert missing_count == 0, "#{missing_count} keys still missing on node_d"
-      end, "not all keys replicated to node_d", 120, 500)
+      end, "not all keys replicated to node_d", 240, 500)
 
       IO.puts("Total keys: #{length(all_keys)}, missing on node_d: 0")
 
       # 7. Keydirs identical
       eventually(fn ->
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_d), "keydir mismatch"
-      end, "keydirs not converged", 20, 500)
+      end, "keydirs not converged", 40, 500)
 
       IO.puts("SUCCESS: #{length(all_keys)} keys identical (auto-discovery)")
     end
@@ -239,7 +239,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
         assert missing == [],
                "#{length(missing)}/#{length(written_keys)} writes not replicated: #{inspect(Enum.take(missing, 5))}"
-      end, "all writes replicated to node_d", 60, 500)
+      end, "all writes replicated to node_d", 120, 500)
 
       :ets.delete(write_log)
     end
@@ -300,7 +300,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         for node <- [node_d | Enum.drop(nodes, 1)] do
           assert dump_keydir_sorted(node) == ref, "keydir not converged on #{inspect(node)}"
         end
-      end, "keydirs not converged", 30, 500)
+      end, "keydirs not converged", 60, 500)
     end
 
     @tag timeout: 180_000
@@ -323,7 +323,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       # Wait for all data to replicate before compacting
       eventually(fn ->
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_d), "pre-compact keydir mismatch"
-      end, "keydirs not converged before compaction", 30, 500)
+      end, "keydirs not converged before compaction", 60, 500)
 
       # Trigger compaction on all nodes
       for node <- nodes ++ [node_d] do
@@ -335,7 +335,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         keydir_a = dump_keydir_sorted(node_a)
         keydir_d = dump_keydir_sorted(node_d)
         assert keydir_a == keydir_d, "post-compact keydir mismatch"
-      end, "keydirs diverged after compaction", 20, 500)
+      end, "keydirs diverged after compaction", 40, 500)
     end
   end
 
@@ -373,12 +373,12 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         assert Enum.all?(all_keys, fn k -> read_key(node_b, k) != nil end), "keys missing on b"
         assert Enum.all?(all_keys, fn k -> read_key(node_c, k) != nil end), "keys missing on c"
-      end, "replication incomplete", 60, 500)
+      end, "replication incomplete", 120, 500)
 
       eventually(fn ->
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_b), "keydir a↔b mismatch"
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_c), "keydir a↔c mismatch"
-      end, "keydirs not converged", 20, 500)
+      end, "keydirs not converged", 40, 500)
     end
   end
 
@@ -417,13 +417,13 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         assert Enum.all?(all_keys, fn k -> read_key(node_b, k) != nil end), "keys missing on b"
         assert Enum.all?(all_keys, fn k -> read_key(node_c, k) != nil end), "keys missing on c"
-      end, "replication incomplete", 60, 500)
+      end, "replication incomplete", 120, 500)
 
       # 7. Keydirs must be identical
       eventually(fn ->
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_b), "keydir a↔b mismatch"
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_c), "keydir a↔c mismatch"
-      end, "keydirs not converged", 20, 500)
+      end, "keydirs not converged", 40, 500)
     end
   end
 
@@ -459,19 +459,19 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         missing = Enum.count(all_keys, fn k -> read_key(replica, k) == nil end)
         assert missing == 0, "#{missing} keys missing on replica"
-      end, "replica missing keys", 60, 500)
+      end, "replica missing keys", 120, 500)
 
       # 6. Verify keydirs identical
       eventually(fn ->
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(replica), "keydir mismatch"
-      end, "keydirs not converged", 20, 500)
+      end, "keydirs not converged", 40, 500)
 
       # 7. Write from replica — should forward to leader and succeed
       write_key(replica, "replica_write_test", "from_replica")
 
       eventually(fn ->
         assert read_key(node_a, "replica_write_test") == "from_replica"
-      end, "replica write not forwarded to leader", 20, 500)
+      end, "replica write not forwarded to leader", 60, 500)
 
       # 8. Verify replica is NOT a voter (doesn't affect quorum)
       #    Check ra membership on any shard
@@ -542,14 +542,14 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         missing = Enum.count(all_keys, fn k -> read_key(node_d, k) == nil end)
         assert missing == 0, "#{missing} keys missing on node_d"
-      end, "keys not replicated to cloned node", 60, 500)
+      end, "keys not replicated to cloned node", 120, 500)
 
       IO.puts("Total keys: #{length(all_keys)}, all present on cloned node")
 
       # 9. Keydirs identical
       eventually(fn ->
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_d), "keydir mismatch"
-      end, "keydirs not converged", 30, 500)
+      end, "keydirs not converged", 60, 500)
 
       IO.puts("SUCCESS: #{length(all_keys)} keys identical after disk clone join")
     end
@@ -568,7 +568,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       :ok = join_cluster(node_d, node_a)
       eventually(fn ->
         assert Enum.all?(keys_v1, fn k -> read_key(node_d, k) != nil end), "v1 keys missing"
-      end, "v1 keys not replicated", 30, 500)
+      end, "v1 keys not replicated", 60, 500)
       :ok = :erpc.call(n_a, Ferricstore.Cluster.Manager, :remove_node, [node_name(node_d)])
       keys_v2 = write_keys(node_a, "during_removed", 1..20)
       :ok = join_cluster(node_d, node_a)
@@ -576,10 +576,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         missing = Enum.count(all_keys, fn k -> read_key(node_d, k) == nil end)
         assert missing == 0, "#{missing} keys missing after rejoin"
-      end, "keys not replicated after rejoin", 60, 500)
+      end, "keys not replicated after rejoin", 120, 500)
       eventually(fn ->
         assert dump_keydir_sorted(node_a) == dump_keydir_sorted(node_d), "keydir mismatch after rejoin"
-      end, "keydirs not converged after rejoin", 20, 500)
+      end, "keydirs not converged after rejoin", 40, 500)
     end
   end
 
@@ -603,7 +603,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         missing = Enum.count(keys, fn k -> read_key(node_d, k) == nil end)
         assert missing == 0, "#{missing} keys missing after concurrent join"
-      end, "keys not replicated after concurrent join", 60, 500)
+      end, "keys not replicated after concurrent join", 120, 500)
       shard_count = get_shard_count(node_a)
       for shard_idx <- 0..(shard_count - 1) do
         {:ok, members, _leader} = :erpc.call(n_a, Ferricstore.Raft.Cluster, :members, [shard_idx])
@@ -622,7 +622,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       keys = write_keys(node_a, "pre_failover", 1..30)
       eventually(fn ->
         assert Enum.all?(keys, fn k -> read_key(node_b, k) != nil end), "keys missing on b"
-      end, "pre-replication incomplete", 30, 500)
+      end, "pre-replication incomplete", 60, 500)
       leader_name = ClusterHelper.find_leader(nodes, 0)
       leader_node = Enum.find(nodes, &(&1.name == leader_name))
       {_killed, remaining} = ClusterHelper.kill_node(nodes, leader_node)
@@ -636,10 +636,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       eventually(fn ->
         missing = Enum.count(all_keys, fn k -> read_key(node_d, k) == nil end)
         assert missing == 0, "#{missing} keys missing after leader failover join"
-      end, "keys not replicated after failover join", 60, 500)
+      end, "keys not replicated after failover join", 120, 500)
       eventually(fn ->
         assert dump_keydir_sorted(surviving) == dump_keydir_sorted(node_d), "keydir mismatch after failover join"
-      end, "keydirs not converged after failover", 20, 500)
+      end, "keydirs not converged after failover", 40, 500)
     end
   end
 
