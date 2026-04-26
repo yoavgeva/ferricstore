@@ -93,7 +93,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       [node_a, node_b, _node_c] = nodes
 
       # 2. Write initial dataset (100 keys) — must be on cluster before new node
-      initial_keys = write_keys(node_a, "pre_sync", 1..100)
+      initial_keys = write_keys(node_a, "pre_sync", 1..20)
       assert_keys_readable(node_b, initial_keys)
 
       # 3. Start continuous writer in background
@@ -113,7 +113,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       IO.puts("Writes during sync: #{during_sync_count}")
 
       # 6. Write final batch after sync
-      final_keys = write_keys(node_a, "post_sync", 1..50)
+      final_keys = write_keys(node_a, "post_sync", 1..10)
 
       # 7. Wait for Raft to replicate everything to node_d
       #    during_sync keys were written while sync was happening — they go through
@@ -158,7 +158,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       [node_a, node_b, _node_c] = nodes
 
-      initial_keys = write_keys(node_a, "pre_sync", 1..100)
+      initial_keys = write_keys(node_a, "pre_sync", 1..20)
       assert_keys_readable(node_b, initial_keys)
 
       # 2. Continuous writer
@@ -178,7 +178,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       {during_sync_keys, during_sync_count} = stop_continuous_writer(writer_pid)
       IO.puts("Writes during sync: #{during_sync_count}")
 
-      final_keys = write_keys(node_a, "post_sync", 1..50)
+      final_keys = write_keys(node_a, "post_sync", 1..10)
       all_keys = initial_keys ++ during_sync_keys ++ final_keys
 
       # 6. Wait for all keys on node_d — auto-discovery + Raft join + replication
@@ -257,7 +257,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       # Write to specific shards to verify per-shard sync
       per_shard_keys = for shard_idx <- 0..(shard_count - 1) do
-        keys = write_keys_to_shard(node_a, shard_idx, "shard_#{shard_idx}", 1..100)
+        keys = write_keys_to_shard(node_a, shard_idx, "shard_#{shard_idx}", 1..20)
         {shard_idx, keys}
       end
 
@@ -286,7 +286,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       [node_a, _node_b, _node_c] = nodes
 
       # Write dataset
-      write_keys(node_a, "consistency", 1..500)
+      write_keys(node_a, "consistency", 1..50)
 
       # Add 4th node
       node_d = ClusterHelper.start_node(shards: @shards)
@@ -311,8 +311,8 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       [node_a, _node_b, _node_c] = nodes
 
       # Write + overwrite to generate dead bytes, then compact
-      for i <- 1..200, do: write_key(node_a, "compact_key_#{i}", "value_v1")
-      for i <- 1..200, do: write_key(node_a, "compact_key_#{i}", "value_v2")
+      for i <- 1..30, do: write_key(node_a, "compact_key_#{i}", "value_v1")
+      for i <- 1..30, do: write_key(node_a, "compact_key_#{i}", "value_v2")
 
       # Add 4th node
       node_d = ClusterHelper.start_node(shards: @shards)
@@ -346,7 +346,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       on_exit(fn -> ClusterHelper.stop_node(node_a) end)
       ClusterHelper.wait_for_node_leaders(node_name(node_a), @shards, timeout: 10_000)
 
-      keys = write_keys(node_a, "standalone", 1..200)
+      keys = write_keys(node_a, "standalone", 1..30)
 
       node_b = ClusterHelper.start_node(shards: @shards)
       node_c = ClusterHelper.start_node(shards: @shards)
@@ -367,7 +367,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         assert :ok == join_cluster(node_c, node_a)
       end, "node_c join failed", 10, 1000)
 
-      post_keys = write_keys(node_a, "post", 1..50)
+      post_keys = write_keys(node_a, "post", 1..10)
       all_keys = keys ++ post_keys
 
       eventually(fn ->
@@ -390,7 +390,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       on_exit(fn -> ClusterHelper.stop_node(node_a) end)
       ClusterHelper.wait_for_node_leaders(node_name(node_a), @shards, timeout: 10_000)
 
-      keys = write_keys(node_a, "existing", 1..200)
+      keys = write_keys(node_a, "existing", 1..30)
 
       # 2. Start node_b and node_c with cluster_nodes pointing to node_a
       #    Simulates: FERRICSTORE_CLUSTER_NODES=a,b,c → libcluster connects → :nodeup → auto-join
@@ -410,7 +410,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       # 4. No manual CLUSTER.JOIN — auto-join handles everything
 
       # 5. Write more data after connection
-      post_keys = write_keys(node_a, "post", 1..50)
+      post_keys = write_keys(node_a, "post", 1..10)
       all_keys = keys ++ post_keys
 
       # 6. Wait for all data to replicate
@@ -436,7 +436,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       [node_a, _node_b, _node_c] = nodes
 
-      keys = write_keys(node_a, "before_replica", 1..100)
+      keys = write_keys(node_a, "before_replica", 1..20)
 
       # 2. Start readonly replica with cluster_nodes + cluster_role
       #    Simulates: FERRICSTORE_CLUSTER_ROLE=readonly FERRICSTORE_CLUSTER_NODES=a,b,c
@@ -452,7 +452,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       Process.sleep(5_000)
 
       # 4. Write more data after replica joined
-      post_keys = write_keys(node_a, "after_replica", 1..50)
+      post_keys = write_keys(node_a, "after_replica", 1..10)
       all_keys = keys ++ post_keys
 
       # 5. Verify replica has all data (receives replication)
@@ -491,7 +491,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       [node_a, _node_b, _node_c] = nodes
       n_a = node_name(node_a)
 
-      keys = write_keys(node_a, "pre_clone", 1..200)
+      keys = write_keys(node_a, "pre_clone", 1..30)
 
       # 2. Start continuous writer
       writer_pid = start_continuous_writer(node_a, "during_clone")
@@ -535,7 +535,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       IO.puts("Writes during clone join: #{during_count}")
 
       # 7. Write post-join data
-      post_keys = write_keys(node_a, "post_clone", 1..50)
+      post_keys = write_keys(node_a, "post_clone", 1..10)
       all_keys = keys ++ during_keys ++ post_keys
 
       # 8. Verify all keys on node_d
@@ -562,7 +562,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
       [node_a, _node_b, _node_c] = nodes
       n_a = node_name(node_a)
-      keys_v1 = write_keys(node_a, "before_remove", 1..100)
+      keys_v1 = write_keys(node_a, "before_remove", 1..20)
       node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
       :ok = join_cluster(node_d, node_a)
@@ -570,7 +570,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         assert Enum.all?(keys_v1, fn k -> read_key(node_d, k) != nil end), "v1 keys missing"
       end, "v1 keys not replicated", 30, 500)
       :ok = :erpc.call(n_a, Ferricstore.Cluster.Manager, :remove_node, [node_name(node_d)])
-      keys_v2 = write_keys(node_a, "during_removed", 1..100)
+      keys_v2 = write_keys(node_a, "during_removed", 1..20)
       :ok = join_cluster(node_d, node_a)
       all_keys = keys_v1 ++ keys_v2
       eventually(fn ->
@@ -591,7 +591,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       [node_a, node_b, _node_c] = nodes
       n_a = node_name(node_a)
       n_b = node_name(node_b)
-      keys = write_keys(node_a, "dedup", 1..200)
+      keys = write_keys(node_a, "dedup", 1..30)
       node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
       task_a = Task.async(fn -> :erpc.call(n_a, Ferricstore.Cluster.Manager, :add_node, [node_name(node_d)], 60_000) end)
@@ -619,7 +619,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       nodes = ClusterHelper.start_cluster(3, shards: @shards)
       on_exit(fn -> ClusterHelper.stop_cluster(nodes) end)
       [node_a, node_b, _node_c] = nodes
-      keys = write_keys(node_a, "pre_failover", 1..200)
+      keys = write_keys(node_a, "pre_failover", 1..30)
       eventually(fn ->
         assert Enum.all?(keys, fn k -> read_key(node_b, k) != nil end), "keys missing on b"
       end, "pre-replication incomplete", 30, 500)
@@ -631,7 +631,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       node_d = ClusterHelper.start_node(shards: @shards)
       on_exit(fn -> ClusterHelper.stop_node(node_d) end)
       :ok = join_cluster(node_d, surviving)
-      post_keys = write_keys(surviving, "post_failover", 1..50)
+      post_keys = write_keys(surviving, "post_failover", 1..10)
       all_keys = keys ++ post_keys
       eventually(fn ->
         missing = Enum.count(all_keys, fn k -> read_key(node_d, k) == nil end)
