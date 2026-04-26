@@ -702,20 +702,22 @@ defmodule Ferricstore.Test.ClusterHelper do
   defp ensure_distribution! do
     case Node.self() do
       :nonode@nohost ->
-        # Start distribution with a unique short name.
-        # Short names avoid DNS resolution issues and work reliably
-        # on macOS/Linux without extra host configuration.
         unique = :erlang.unique_integer([:positive])
         node_name = :"ferric_runner_#{unique}"
 
-        case Node.start(node_name, :shortnames) do
-          {:ok, _} ->
+        task = Task.async(fn -> Node.start(node_name, :shortnames) end)
+
+        case Task.yield(task, 10_000) || Task.shutdown(task, :brutal_kill) do
+          {:ok, {:ok, _}} ->
             :ok
 
-          {:error, reason} ->
+          {:ok, {:error, reason}} ->
             raise "Failed to start Erlang distribution (#{inspect(reason)}). " <>
-                    "Cluster tests require distributed BEAM. " <>
                     "Try running with: elixir --sname test -S mix test"
+
+          _ ->
+            raise "Node.start timed out after 10s. " <>
+                    "Run with: elixir --sname test -S mix test"
         end
 
       _ ->
