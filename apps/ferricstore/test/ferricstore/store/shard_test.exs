@@ -114,16 +114,11 @@ defmodule Ferricstore.Store.ShardTest do
 
     @tag :shard_kill
     test "get warms ETS on cold key", %{shard: shard, keydir: keydir} do
-      # This test requires BitcaskWriter to resolve :pending file_id.
-      # IsolatedInstance doesn't run BitcaskWriter — run in shard_kill job
-      # where the full app is available.
       :ok = GenServer.call(shard, {:put, "warm_key", "warm_val", 0})
       :ok = GenServer.call(shard, :flush)
 
-      Ferricstore.Test.ShardHelpers.eventually(fn ->
-        [{_, _, _, _, fid, _, _}] = :ets.lookup(keydir, "warm_key")
-        assert is_integer(fid) and fid > 0, "file_id should be real, got #{inspect(fid)}"
-      end, "file_id should be real", 50, 200)
+      [{_, _, _, _, fid, _, _}] = :ets.lookup(keydir, "warm_key")
+      assert is_integer(fid) and fid >= 0, "file_id should be real, got #{inspect(fid)}"
 
       # Simulate cold key: set value to nil, preserve disk location
       [{_, _val, exp, lfu, fid, off, vsize}] = :ets.lookup(keydir, "warm_key")

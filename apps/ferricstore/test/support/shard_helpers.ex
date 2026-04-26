@@ -24,6 +24,19 @@ defmodule Ferricstore.Test.ShardHelpers do
   def flush_all_shards do
     shard_count = shard_count()
 
+    # Drain Raft batchers first. With Raft enabled, Router.put sends writes
+    # to Batcher.write_async which pipelines them to ra. Batcher.flush
+    # submits all pending slots and waits for in-flight commands to apply.
+    # Without this, writes may still be in the Batcher pipeline when we
+    # flush shards and BitcaskWriter — the data never reaches Bitcask.
+    Enum.each(0..(shard_count - 1), fn i ->
+      try do
+        Ferricstore.Raft.Batcher.flush(i)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
     Enum.each(0..(shard_count - 1), fn i ->
       name = :"Ferricstore.Store.Shard.#{i}"
 
@@ -35,7 +48,7 @@ defmodule Ferricstore.Test.ShardHelpers do
 
     # Also flush background BitcaskWriter processes so deferred writes
     # from StateMachine.apply are on disk before tests verify disk state.
-    Ferricstore.Store.BitcaskWriter.flush_all()
+    Ferricstore.Store.BitcaskWriter.flush_all(shard_count)
 
     # Fsync all active Bitcask log files. BitcaskWriter uses nosync writes
     # (data in OS page cache only). Without explicit fsync, data can be lost

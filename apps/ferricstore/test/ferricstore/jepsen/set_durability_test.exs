@@ -104,7 +104,6 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
     @tag :jepsen
     @tag timeout: 300_000
     test "set: no phantom member appears that was never ACKed", %{nodes: nodes} do
-      # Find an alive node
       alive =
         Enum.filter(nodes, fn n ->
           case :rpc.call(n.name, Node, :self, []) do
@@ -114,6 +113,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
         end)
 
       assert alive != [], "need at least 1 alive node"
+      :ok = ClusterHelper.wait_for_leaders(alive, 4, timeout: 30_000)
       node = hd(alive)
 
       key = "jepsen:set:phantom"
@@ -179,6 +179,7 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
         end)
 
       assert alive != [], "need at least 1 alive node"
+      :ok = ClusterHelper.wait_for_leaders(alive, 4, timeout: 30_000)
       node = hd(alive)
 
       key = "jepsen:set:concurrent"

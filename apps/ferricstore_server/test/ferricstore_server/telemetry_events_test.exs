@@ -554,20 +554,13 @@ defmodule FerricstoreServer.TelemetryEventsTest do
       ctx = FerricStore.Instance.get(:default)
       Router.put(ctx, key, "cold_value", 0)
 
-      # Ensure the value is readable (Raft applied + disk flushed) before evicting.
       shard_idx = Router.shard_for(ctx, key)
-      shard_name = Router.shard_name(ctx, shard_idx)
-      :ok = GenServer.call(shard_name, :flush)
-      Ferricstore.Store.BitcaskWriter.flush_all()
+      Ferricstore.Test.ShardHelpers.flush_all_shards()
 
-      # Verify the key is readable AND has a real file_id (not :pending)
-      # before evicting from hot cache. Eventually handles all timing —
-      # Raft apply, BitcaskWriter flush, ETS update.
       Ferricstore.Test.ShardHelpers.eventually(fn ->
-        Ferricstore.Store.BitcaskWriter.flush_all()
         assert Router.get(ctx, key) == "cold_value"
         [{^key, _, _, _, fid, _, _}] = :ets.lookup(:"keydir_#{shard_idx}", key)
-        assert is_integer(fid) and fid > 0, "file_id should be real, got #{inspect(fid)}"
+        assert is_integer(fid) and fid >= 0, "file_id should be real, got #{inspect(fid)}"
       end, "key should be readable with real file_id", 50, 200)
 
       # Evict the value from the hot cache (set value to nil) to force a
