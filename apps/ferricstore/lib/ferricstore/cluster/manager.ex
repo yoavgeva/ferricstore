@@ -606,7 +606,7 @@ defmodule Ferricstore.Cluster.Manager do
 
         result = :erpc.call(target_node, Ferricstore.Raft.Cluster, :join_shard_server, [
           shard_idx, shard_data_path, 0, Path.join(shard_data_path, "00000.log"), keydir,
-          cluster_members, [skip_below_index: skip_idx, membership: :promotable]
+          cluster_members, [skip_below_index: skip_idx]
         ])
 
         Logger.info("ClusterManager: shard #{shard_idx} Raft joined on #{target_node} (skip_below=#{skip_idx}): #{inspect(result)}")
