@@ -69,27 +69,16 @@ defmodule Ferricstore.Cluster.ManagerTest do
   # ---------------------------------------------------------------------------
 
   describe "role to membership mapping" do
-    test "add_node with :voter role returns :ok or partial error" do
-      # In a clean single-node Raft, self is already a :voter, so ra returns
-      # :already_member -> :ok. However, if other tests in this describe block
-      # have already run and changed some shards' membership state, some shards
-      # may reject the change. Both outcomes are valid for this unit test.
-      result = Manager.add_node(node(), :voter)
-      assert result == :ok or match?({:error, {:partial_add, _}}, result)
+    test "add_node with self returns :ok (self-join is a no-op)" do
+      assert Manager.add_node(node(), :voter) == :ok
     end
 
-    test "add_node with :replica role returns partial error (membership type mismatch)" do
-      # In single-node mode, the local node is already a :voter member.
-      # Requesting :replica (mapped to :promotable) triggers :cluster_change_not_permitted
-      # on some shards because ra doesn't allow changing membership type via add_member.
-      result = Manager.add_node(node(), :replica)
-      assert result == :ok or match?({:error, {:partial_add, _}}, result)
+    test "add_node with :replica role on self returns :ok (self-join is a no-op)" do
+      assert Manager.add_node(node(), :replica) == :ok
     end
 
-    test "add_node with :readonly role returns partial error (membership type mismatch)" do
-      # Same as :replica -- :readonly maps to :non_voter which conflicts with existing :voter.
-      result = Manager.add_node(node(), :readonly)
-      assert result == :ok or match?({:error, {:partial_add, _}}, result)
+    test "add_node with :readonly role on self returns :ok (self-join is a no-op)" do
+      assert Manager.add_node(node(), :readonly) == :ok
     end
   end
 

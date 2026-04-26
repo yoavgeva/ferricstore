@@ -290,6 +290,15 @@ defmodule Ferricstore.Cluster.Manager do
   #
   # This is the single code path for both :nodeup auto-join and CLUSTER.JOIN.
   defp do_join_node(target_node, membership, state) do
+    if target_node == node() do
+      Logger.info("ClusterManager: ignoring self-join for #{target_node}")
+      :ok
+    else
+      do_join_node_remote(target_node, membership, state)
+    end
+  end
+
+  defp do_join_node_remote(target_node, membership, state) do
     Logger.info("ClusterManager: joining #{target_node} (#{membership})")
 
     # Stop ra on target if it's running (standalone node)
