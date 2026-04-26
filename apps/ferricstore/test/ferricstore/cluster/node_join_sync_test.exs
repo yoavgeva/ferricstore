@@ -216,17 +216,36 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       # 6. Wait for all keys on node_d — auto-discovery + Raft join + replication
       #    can take a while on loaded machines with 4 BEAM VMs
+      poll_count2 = :counters.new(1, [:atomics])
       eventually(fn ->
-        missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
-        if missing_count > 0 do
+        missing = Enum.filter(all_keys, fn key -> read_key(node_d, key) == nil end)
+        :counters.add(poll_count2, 1, 1)
+        pc = :counters.get(poll_count2, 1)
+        if missing != [] and (pc == 1 or pc == 5 or rem(pc, 50) == 0) do
           joiner_n = node_name(node_d)
+          IO.puts("  poll ##{pc}: #{length(missing)}/#{length(all_keys)} keys missing")
           for s <- 0..(@shards - 1) do
             jid = {:"ferricstore_shard_#{s}", joiner_n}
             m = try do :erpc.call(joiner_n, :ra, :key_metrics, [jid]) catch _, _ -> :error end
-            IO.puts("  poll: shard #{s} joiner metrics=#{inspect(m)}")
+            ctx = try do :erpc.call(joiner_n, FerricStore.Instance, :get, [:default]) catch _, _ -> nil end
+            ets_size = if ctx do
+              kd = elem(ctx.keydir_refs, s)
+              try do :erpc.call(joiner_n, :ets, :info, [kd, :size]) catch _, _ -> :error end
+            end
+            IO.puts("    shard #{s}: raft=#{inspect(m)}, ets_size=#{inspect(ets_size)}")
+          end
+          sample = Enum.take(missing, 3)
+          for k <- sample do
+            ctx = try do :erpc.call(joiner_n, FerricStore.Instance, :get, [:default]) catch _, _ -> nil end
+            if ctx do
+              shard = :erpc.call(joiner_n, Ferricstore.Store.Router, :shard_for, [ctx, k])
+              kd = elem(ctx.keydir_refs, shard)
+              ets_entry = try do :erpc.call(joiner_n, :ets, :lookup, [kd, k]) catch _, _ -> :error end
+              IO.puts("    missing key #{inspect(k)} shard=#{shard} ets=#{inspect(ets_entry)}")
+            end
           end
         end
-        assert missing_count == 0, "#{missing_count} keys still missing on node_d"
+        assert missing == [], "#{length(missing)} keys still missing on node_d"
       end, "not all keys replicated to node_d", 240, 500)
 
       IO.puts("Total keys: #{length(all_keys)}, missing on node_d: 0")
