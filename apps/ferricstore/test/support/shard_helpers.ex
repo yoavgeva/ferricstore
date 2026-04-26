@@ -625,13 +625,18 @@ defmodule Ferricstore.Test.ShardHelpers do
   def setup_isolated_data_dir do
     wait_shards_alive()
 
-    # Wipe all shard data directories and restart shards.
-    # This gives each test a clean filesystem — no stale log records
-    # from previous tests to confuse recover_keydir after restart.
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     shard_count = shard_count()
+    ra_sys = Ferricstore.Raft.Cluster.system_name()
 
-    # Kill all shards first
+    # 1. Stop all ra servers and force-delete their persistent state
+    for i <- 0..(shard_count - 1) do
+      server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+      try do :ra.stop_server(ra_sys, server_id) catch _, _ -> :ok end
+      try do :ra.force_delete_server(ra_sys, server_id) catch _, _ -> :ok end
+    end
+
+    # 2. Kill all shard processes
     for i <- 0..(shard_count - 1) do
       name = Router.shard_name(FerricStore.Instance.get(:default), i)
       pid = Process.whereis(name)
@@ -642,13 +647,39 @@ defmodule Ferricstore.Test.ShardHelpers do
       end
     end
 
-    # Wipe shard data directories (shards are dead, safe to delete)
+    # 3. Wipe shard data dirs
     for i <- 0..(shard_count - 1) do
       shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
       File.rm_rf!(shard_path)
     end
 
-    # Supervisor restarts shards with fresh empty dirs
+    # 4. Wait for shard supervisor to restart all shards. Some may have
+    #    been restarted by the supervisor before the wipe completed and
+    #    will have stale ra state — the resolve_active_file fallback in
+    #    StateMachine handles this gracefully.
+    wait_shards_alive(30_000)
+
+    # 5. After shards are alive, verify they have clean data dirs. If a
+    #    shard was restarted with stale ra state during the wipe, kill it
+    #    one more time and force-delete ra so the next restart is clean.
+    for i <- 0..(shard_count - 1) do
+      shard_path = Ferricstore.DataDir.shard_data_path(data_dir, i)
+      active_path = Path.join(shard_path, "00000.log")
+      unless File.exists?(active_path) do
+        server_id = Ferricstore.Raft.Cluster.shard_server_id(i)
+        try do :ra.stop_server(ra_sys, server_id) catch _, _ -> :ok end
+        try do :ra.force_delete_server(ra_sys, server_id) catch _, _ -> :ok end
+        name = Router.shard_name(FerricStore.Instance.get(:default), i)
+        pid = Process.whereis(name)
+        if pid && Process.alive?(pid) do
+          ref = Process.monitor(pid)
+          Process.exit(pid, :kill)
+          receive do {:DOWN, ^ref, _, _, _} -> :ok after 5_000 -> :ok end
+        end
+        File.rm_rf!(shard_path)
+      end
+    end
+
     wait_shards_alive(30_000)
     Ferricstore.Health.set_ready(true)
     :ok
