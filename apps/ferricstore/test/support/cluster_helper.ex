@@ -145,15 +145,27 @@ defmodule Ferricstore.Test.ClusterHelper do
     # election wait). With concurrent start, this is ~2s total instead of 6s.
     Enum.each(tasks, fn task -> Task.await(task, 30_000) end)
 
-    # Re-trigger elections now that all nodes have ra servers running.
-    # The initial elections during Shard.init may have failed because not
-    # all peers were ready. Triggering again ensures quorum is reached.
-    Enum.each(nodes, fn node ->
-      for shard <- 0..(shards - 1) do
-        server_id = {:"ferricstore_shard_#{shard}", node.name}
-        :rpc.call(node.name, :ra, :trigger_election, [server_id])
+    # Re-trigger elections only for shards that don't have a leader yet.
+    # Triggering on all nodes causes split-votes on slow CI machines.
+    first_node = hd(nodes).name
+
+    for shard <- 0..(shards - 1) do
+      server_id = {:"ferricstore_shard_#{shard}", first_node}
+
+      has_leader? =
+        try do
+          case :rpc.call(first_node, :ra, :members, [server_id, 2_000]) do
+            {:ok, _members, _leader} -> true
+            _ -> false
+          end
+        catch
+          _, _ -> false
+        end
+
+      unless has_leader? do
+        :rpc.call(first_node, :ra, :trigger_election, [server_id])
       end
-    end)
+    end
 
     # Phase 5: Wait for all shards to have elected leaders with full
     # membership across the cluster.
