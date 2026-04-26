@@ -624,6 +624,24 @@ defmodule Ferricstore.Cluster.Manager do
       end
     end
 
+    for shard_idx <- 0..(shard_count - 1) do
+      shard_name = :"Ferricstore.Store.Shard.#{shard_idx}"
+      try do
+        :erpc.call(target_node, GenServer, :call, [shard_name, :enable_raft, 5_000])
+      catch
+        _, _ -> :ok
+      end
+    end
+
+    try do
+      :erpc.call(target_node, Application, :put_env, [:ferricstore, :raft_enabled, true])
+      ctx = :erpc.call(target_node, FerricStore.Instance, :get, [:default])
+      :erpc.call(target_node, :persistent_term, :put,
+        [{FerricStore.Instance, :default}, %{ctx | raft_enabled: true}])
+    catch
+      _, _ -> :ok
+    end
+
     :ok
   end
 

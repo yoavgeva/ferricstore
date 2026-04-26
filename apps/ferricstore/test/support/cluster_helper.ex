@@ -249,6 +249,15 @@ defmodule Ferricstore.Test.ClusterHelper do
       end)
     end)
 
+    # Connect this node to its cluster_nodes so existing nodes see :nodeup
+    # and can trigger auto-join. The peer starts with -connect_all false,
+    # so connections must be explicit.
+    if cluster_nodes != [] do
+      Enum.each(cluster_nodes, fn cn ->
+        :rpc.call(node_name, Node, :connect, [cn])
+      end)
+    end
+
     node_name
   end
 

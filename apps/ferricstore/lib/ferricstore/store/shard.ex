@@ -489,6 +489,10 @@ defmodule Ferricstore.Store.Shard do
     {:reply, :ok, %{state | writes_paused: false}}
   end
 
+  def handle_call(:enable_raft, _from, state) do
+    {:reply, :ok, %{state | raft?: true}}
+  end
+
   # -------------------------------------------------------------------
   # handle_call — stats, merge, admin
   # -------------------------------------------------------------------
