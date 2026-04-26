@@ -619,15 +619,15 @@ defmodule Ferricstore.Cluster.Manager do
     :ok
   end
 
-  defp kickstart_replication(target_node, shard_count) do
+  defp kickstart_replication(_target_node, shard_count) do
     Process.sleep(100)
 
     for shard_idx <- 0..(shard_count - 1) do
-      leader_id = RaftCluster.shard_server_id(shard_idx)
+      local_id = RaftCluster.shard_server_id(shard_idx)
 
       has_leader? =
         try do
-          case :ra.members(leader_id, 2_000) do
+          case :ra.members(local_id, 2_000) do
             {:ok, _members, _leader} -> true
             _ -> false
           end
@@ -636,10 +636,8 @@ defmodule Ferricstore.Cluster.Manager do
         end
 
       unless has_leader? do
-        follower_id = RaftCluster.shard_server_id_on(shard_idx, target_node)
-
         try do
-          :erpc.call(target_node, :ra, :trigger_election, [follower_id], 5_000)
+          :ra.trigger_election(local_id)
         catch
           _, _ -> :ok
         end
