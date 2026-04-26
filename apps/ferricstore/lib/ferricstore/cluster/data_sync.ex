@@ -365,11 +365,6 @@ defmodule Ferricstore.Cluster.DataSync do
     end
   end
 
-  defp get_raft_index_on(leader_node, server_id) do
-    {index, _detail} = get_raft_index_with_detail(leader_node, server_id)
-    index
-  end
-
   defp get_raft_index_with_detail(leader_node, server_id) do
     overview_result =
       if leader_node == node() do
@@ -456,11 +451,4 @@ defmodule Ferricstore.Cluster.DataSync do
     end)
   end
 
-  @spec get_raft_index(:ra.server_id()) :: non_neg_integer()
-  defp get_raft_index(server_id) do
-    case :ra.member_overview(server_id) do
-      {:ok, overview, _} -> Map.get(overview, :last_applied, 0)
-      _ -> 0
-    end
-  end
 end
