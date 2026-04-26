@@ -120,37 +120,6 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       #    Raft which replicates to node_d after it joins the group
       all_keys = initial_keys ++ during_sync_keys ++ final_keys
 
-      # Diagnostic: check ra state on leader and follower
-      n_a = node_name(node_a)
-      n_d = node_name(node_d)
-
-      for shard <- 0..(@shards - 1) do
-        lid = Ferricstore.Raft.Cluster.shard_server_id_on(shard, n_a)
-        fid = Ferricstore.Raft.Cluster.shard_server_id_on(shard, n_d)
-        lm = try do :ra.key_metrics(lid, 5_000) catch _, e -> {:error, e} end
-        fm = try do :ra.key_metrics(fid, 5_000) catch _, e -> {:error, e} end
-        IO.puts("DIAG shard#{shard} leader=#{inspect(lm)}")
-        IO.puts("DIAG shard#{shard} follower=#{inspect(fm)}")
-      end
-
-      # Check which keys are actually missing and whether they're in ETS
-      missing_keys = Enum.filter(all_keys, fn key -> read_key(node_d, key) == nil end)
-      IO.puts("DIAG missing #{length(missing_keys)}/#{length(all_keys)} keys on node_d right after join")
-      if missing_keys != [] do
-        sample = Enum.take(missing_keys, 3)
-        for k <- sample do
-          # Direct ETS lookup on node_d for each shard's keydir
-          ctx_d = :erpc.call(n_d, FerricStore.Instance, :get, [:default], 5_000)
-          shard_idx = :erpc.call(n_d, Ferricstore.Store.Router, :shard_for, [ctx_d, k], 5_000)
-          keydir = :erpc.call(n_d, fn -> elem(ctx_d.keydir_refs, shard_idx) end, 5_000)
-          ets_val = :erpc.call(n_d, :ets, :lookup, [keydir, k], 5_000)
-          router_val = :erpc.call(n_d, Ferricstore.Store.Router, :get, [ctx_d, k], 5_000)
-          leader_val = :erpc.call(n_a, Ferricstore.Store.Router, :get, [
-            :erpc.call(n_a, FerricStore.Instance, :get, [:default], 5_000), k], 5_000)
-          IO.puts("DIAG key=#{k} shard=#{shard_idx} ets=#{inspect(ets_val, limit: 50)} router_d=#{inspect(router_val)} leader=#{inspect(leader_val)}")
-        end
-      end
-
       # Poll until all keys are readable (Raft replication may take a few seconds)
       eventually(fn ->
         missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
