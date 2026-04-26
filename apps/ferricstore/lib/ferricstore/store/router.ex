@@ -1687,8 +1687,7 @@ defmodule Ferricstore.Store.Router do
 
     case durability_for_key(ctx, redis_key) do
       :quorum ->
-        shard = elem(ctx.shard_names, idx)
-        GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms})
+        quorum_write(ctx, idx, {:compound_put, redis_key, compound_key, value, expire_at_ms})
 
       :async ->
         async_compound_put(ctx, idx, redis_key, compound_key, value, expire_at_ms)
@@ -1701,8 +1700,7 @@ defmodule Ferricstore.Store.Router do
 
     case durability_for_key(ctx, redis_key) do
       :quorum ->
-        shard = elem(ctx.shard_names, idx)
-        GenServer.call(shard, {:compound_delete, redis_key, compound_key})
+        quorum_write(ctx, idx, {:compound_delete, redis_key, compound_key})
 
       :async ->
         async_compound_delete(ctx, idx, compound_key)
@@ -1899,8 +1897,8 @@ defmodule Ferricstore.Store.Router do
 
   @spec compound_delete_prefix(FerricStore.Instance.t(), binary(), binary()) :: :ok
   def compound_delete_prefix(ctx, redis_key, prefix) do
-    shard = elem(ctx.shard_names, shard_for(ctx, redis_key))
-    GenServer.call(shard, {:compound_delete_prefix, redis_key, prefix})
+    idx = shard_for(ctx, redis_key)
+    quorum_write(ctx, idx, {:compound_delete_prefix, redis_key, prefix})
   end
 
   # -------------------------------------------------------------------

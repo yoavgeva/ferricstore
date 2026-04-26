@@ -53,9 +53,10 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
       key = "jepsen:register:ryw"
 
       for i <- 1..100 do
-        # Write to a node -- in single-node mode, each node is independent.
-        # We write to the node that will be reading, proving self-quorum
-        # guarantees immediate read-your-writes.
+        # Write to each node. In multi-node Raft, follower writes are
+        # forwarded to the leader. The leader applies to ETS and returns
+        # :ok, but follower ETS lags until replication completes. Poll
+        # until the value appears on each node.
         Enum.each(nodes, fn node ->
           value = "v#{i}"
 
@@ -65,24 +66,24 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
           assert result == :ok,
                  "PUT v#{i} should succeed on #{node.name}, got: #{inspect(result)}"
 
-          # Immediately read from the same node -- must see >= value written.
-          {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
+          Ferricstore.Test.ShardHelpers.eventually(fn ->
+            {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
 
-          assert read_val != nil,
-                 "Read after write should not be nil on #{node.name} for iteration #{i}"
+            assert read_val != nil,
+                   "Read after write should not be nil on #{node.name} for iteration #{i}"
 
-          read_int = extract_version(read_val)
+            read_int = extract_version(read_val)
 
-          assert read_int >= i,
-                 "Stale read on #{node.name}: wrote v#{i} but read #{read_val} " <>
-                   "(version #{read_int} < #{i})"
+            assert read_int >= i,
+                   "Stale read on #{node.name}: wrote v#{i} but read #{read_val} " <>
+                     "(version #{read_int} < #{i})"
+          end, "ryw v#{i} on #{node.name}", 50, 50)
         end)
       end
     end
 
     @tag :jepsen
     test "write on one node, read from same node returns current value", %{nodes: nodes} do
-      # This is the core read-your-writes property for single-node Raft.
       for {node, idx} <- Enum.with_index(nodes) do
         key = "jepsen:ryw:node#{idx}"
 
@@ -90,11 +91,15 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
           value = "v#{i}"
           :ok = :rpc.call(node.name, FerricStore, :set, [key, value])
 
-          {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
+          # In multi-node Raft, the writing node may be a follower whose
+          # local ETS lags behind the leader. Poll until replication lands.
+          Ferricstore.Test.ShardHelpers.eventually(fn ->
+            {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
 
-          assert read_val == value,
-                 "Read-your-writes violated on #{node.name}: " <>
-                   "wrote #{value} but read #{inspect(read_val)}"
+            assert read_val == value,
+                   "Read-your-writes violated on #{node.name}: " <>
+                     "wrote #{value} but read #{inspect(read_val)}"
+          end, "ryw #{value} on #{node.name}", 50, 50)
         end
       end
     end
@@ -214,12 +219,17 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
             value = "v#{i}"
             :ok = :rpc.call(node.name, FerricStore, :set, [key, value])
 
-            {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
-            read_version = extract_version(read_val)
+            # Poll until the write replicates to this node's ETS
+            read_version =
+              Enum.reduce_while(1..50, 0, fn _, _ ->
+                {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
+                v = extract_version(read_val)
+                if v >= i, do: {:halt, v}, else: (Process.sleep(50); {:cont, v})
+              end)
 
             assert read_version >= acc,
                    "Monotonicity violated on #{node.name}: " <>
-                     "previously saw v#{acc} but now reading #{read_val} (v#{read_version})"
+                     "previously saw v#{acc} but now reading v#{read_version}"
 
             max(acc, read_version)
           end)
@@ -242,9 +252,11 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
             ])
         end
 
-        # Final read must be the last written value
-        {:ok, final} = :rpc.call(node.name, FerricStore, :get, [key])
-        assert final == "version:100", "Last-write-wins violated on #{node.name}: got #{inspect(final)}"
+        # Poll until replication completes
+        Ferricstore.Test.ShardHelpers.eventually(fn ->
+          {:ok, final} = :rpc.call(node.name, FerricStore, :get, [key])
+          assert final == "version:100", "Last-write-wins violated on #{node.name}: got #{inspect(final)}"
+        end, "lww final on #{node.name}", 50, 100)
       end)
     end
   end

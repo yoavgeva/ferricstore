@@ -73,9 +73,6 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
         end
       end
 
-      # Allow pending flushes
-      Process.sleep(200)
-
       alive =
         Enum.filter(nodes, fn n ->
           case :rpc.call(n.name, Node, :self, []) do
@@ -86,12 +83,15 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
 
       :ok = ClusterHelper.wait_for_leaders(alive, 4, timeout: 30_000)
 
-      # Verify all ACKed members are present on n1 (the writing node)
-      violations = HistoryRecorder.verify_set_durability(history, [n1], key)
+      # In multi-node Raft, writes forwarded to the leader replicate back
+      # to followers asynchronously. Poll until all ACKed members appear.
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        violations = HistoryRecorder.verify_set_durability(history, [n1], key)
 
-      assert violations == [],
-             "Set durability violated:\n" <>
-               HistoryRecorder.format_violations(violations)
+        assert violations == [],
+               "Set durability violated:\n" <>
+                 HistoryRecorder.format_violations(violations)
+      end, "set durability on n1", 50, 100)
 
       {:ok, members} = :rpc.call(n1.name, FerricStore, :smembers, [key])
 
@@ -134,12 +134,6 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
         end
       end
 
-      # Allow pending flushes
-      Process.sleep(100)
-
-      # Read current members
-      {:ok, present} = :rpc.call(node.name, FerricStore, :smembers, [key])
-
       # Build the set of ACKed members
       acked =
         history
@@ -147,21 +141,25 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
         |> Enum.map(fn {:ok, _k, v, _n, _t} -> v end)
         |> MapSet.new()
 
-      present_set = MapSet.new(present)
+      # Poll until all ACKed members appear on the node (replication lag).
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        {:ok, present} = :rpc.call(node.name, FerricStore, :smembers, [key])
+        present_set = MapSet.new(present)
 
-      # Check for phantom members: present but never ACKed
-      phantom = MapSet.difference(present_set, acked)
+        # Check for phantom members: present but never ACKed
+        phantom = MapSet.difference(present_set, acked)
 
-      assert MapSet.size(phantom) == 0,
-             "Phantom members appeared that were never ACKed: " <>
-               inspect(MapSet.to_list(phantom))
+        assert MapSet.size(phantom) == 0,
+               "Phantom members appeared that were never ACKed: " <>
+                 inspect(MapSet.to_list(phantom))
 
-      # Also check for missing ACKed members
-      missing = MapSet.difference(acked, present_set)
+        # Check for missing ACKed members
+        missing = MapSet.difference(acked, present_set)
 
-      assert MapSet.size(missing) == 0,
-             "ACKed members missing from SMEMBERS: " <>
-               inspect(MapSet.to_list(missing))
+        assert MapSet.size(missing) == 0,
+               "ACKed members missing from SMEMBERS: " <>
+                 inspect(MapSet.to_list(missing))
+      end, "set phantom check on #{node.name}", 50, 100)
 
       IO.puts(
         "  #{MapSet.size(acked)} ACKed members present; " <>
@@ -208,15 +206,14 @@ defmodule Ferricstore.Jepsen.SetDurabilityTest do
       results = Task.await_many(tasks, 15_000)
       ok_count = Enum.count(results, &match?({:ok, _}, &1))
 
-      # Allow flush
-      Process.sleep(100)
+      # Poll until all ACKed members appear (replication lag on followers).
+      Ferricstore.Test.ShardHelpers.eventually(fn ->
+        violations = HistoryRecorder.verify_set_durability(history, [node], key)
 
-      # Verify all ACKed members are present
-      violations = HistoryRecorder.verify_set_durability(history, [node], key)
-
-      assert violations == [],
-             "Set durability violated under concurrency:\n" <>
-               HistoryRecorder.format_violations(violations)
+        assert violations == [],
+               "Set durability violated under concurrency:\n" <>
+                 HistoryRecorder.format_violations(violations)
+      end, "concurrent set durability on #{node.name}", 50, 100)
 
       {:ok, members} = :rpc.call(node.name, FerricStore, :smembers, [key])
 

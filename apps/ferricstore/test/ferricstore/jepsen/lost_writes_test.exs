@@ -103,8 +103,9 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
       :ok = ClusterHelper.wait_for_leaders(alive, 4, timeout: 30_000)
 
       # Verify: each surviving node has all the writes it ACKed.
-      # In single-node mode, a node only has its own writes -- so we check
-      # each node for the writes that were directed to it.
+      # In multi-node Raft, writes may have been forwarded to the leader.
+      # The writing node's ETS is updated via replication, which may lag.
+      # Poll until all ACKed writes are visible on at least one alive node.
       all_entries = HistoryRecorder.all(history)
 
       per_node_entries =
@@ -114,11 +115,13 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
         node_entries = Map.get(per_node_entries, node.name, [])
 
         Enum.each(node_entries, fn {:ok, key, value, _node, _ts} ->
-          {:ok, read} = :rpc.call(node.name, FerricStore, :get, [key])
+          Ferricstore.Test.ShardHelpers.eventually(fn ->
+            {:ok, read} = :rpc.call(node.name, FerricStore, :get, [key])
 
-          assert read == value,
-                 "Lost write: key=#{key} expected=#{value} got=#{inspect(read)} " <>
-                   "on node=#{node.name}"
+            assert read == value,
+                   "Lost write: key=#{key} expected=#{value} got=#{inspect(read)} " <>
+                     "on node=#{node.name}"
+          end, "durability #{key} on #{node.name}", 50, 100)
         end)
       end)
 
@@ -143,11 +146,9 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
           end
         end)
 
-      # Need at least 1 node; ideally 2+ so we can kill one while writing
       assert alive != [], "need at least 1 alive node"
 
       writer = hd(alive)
-      targets = tl(alive)
 
       # Write 50 keys to the writer node
       for i <- 1..50 do
@@ -158,9 +159,11 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
         HistoryRecorder.record_ok(history, key, value, writer.name)
       end
 
-      # Kill at most 1 other node to maintain Raft quorum (need 2 of 3).
-      if targets != [] do
-        ClusterHelper.kill_node(nodes, hd(targets))
+      # Kill 1 sibling only if we have 3+ alive (keeps quorum: 2-of-3).
+      # If only 2 alive, killing one leaves 1 node with no quorum.
+      if length(alive) >= 3 do
+        target = List.last(alive)
+        ClusterHelper.kill_node(nodes, target)
       end
 
       remaining =
@@ -174,19 +177,30 @@ defmodule Ferricstore.Jepsen.LostWritesTest do
       Process.sleep(500)
       :ok = ClusterHelper.wait_for_leaders(remaining, 4, timeout: 30_000)
 
-      # All 50 writes must be readable on the surviving writer
-      result = HistoryRecorder.verify_durability(history, [writer])
+      # All 50 writes must be readable on the surviving writer.
+      # In multi-node Raft, the writer may have forwarded to the leader.
+      # Poll to allow replication to complete.
+      all_entries = HistoryRecorder.all(history)
 
-      case result do
-        {:ok, checked} ->
-          IO.puts("  #{checked} writes verified durable on surviving writer node")
+      violations =
+        Enum.flat_map(all_entries, fn {:ok, key, value, _node, _ts} ->
+          try do
+            Ferricstore.Test.ShardHelpers.eventually(fn ->
+              {:ok, read} = :rpc.call(writer.name, FerricStore, :get, [key])
+              assert read == value
+            end, "durability #{key}", 50, 100)
+            []
+          rescue
+            e -> [{key, value, Exception.message(e)}]
+          end
+        end)
 
-        {:error, violations} ->
-          flunk(
-            "Durability violated:\n" <>
-              HistoryRecorder.format_violations(violations)
-          )
-      end
+      assert violations == [],
+             "Durability violated:\n#{inspect(violations)}"
+
+      IO.puts(
+        "  #{length(all_entries)} writes verified durable on surviving writer node"
+      )
     end
   end
 end

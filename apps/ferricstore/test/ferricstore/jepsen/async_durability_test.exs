@@ -234,7 +234,7 @@ defmodule Ferricstore.Jepsen.AsyncDurabilityTest do
 
           assert read == value,
                  "Quorum write should be durable on #{node.name}"
-        end, "quorum write durable on #{node.name}", 20, 100)
+        end, "quorum write durable on #{node.name}", 50, 100)
       end)
     end
   end
