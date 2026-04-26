@@ -107,6 +107,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       join_result = join_cluster(node_d, node_a)
       IO.puts("join_cluster result: #{inspect(join_result)}")
+      dump_raft_diagnostics(node_a, node_d, @shards, "after join")
 
       # 5. Stop the continuous writer
       {during_sync_keys, during_sync_count} = stop_continuous_writer(writer_pid)
@@ -120,9 +121,19 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       #    Raft which replicates to node_d after it joins the group
       all_keys = initial_keys ++ during_sync_keys ++ final_keys
 
+      dump_raft_diagnostics(node_a, node_d, @shards, "before poll")
+
       # Poll until all keys are readable (Raft replication may take a few seconds)
       eventually(fn ->
         missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
+        if missing_count > 0 do
+          joiner_n = node_name(node_d)
+          for s <- 0..(@shards - 1) do
+            jid = {:"ferricstore_shard_#{s}", joiner_n}
+            m = try do :erpc.call(joiner_n, :ra, :key_metrics, [jid]) catch _, _ -> :error end
+            IO.puts("  poll: shard #{s} joiner metrics=#{inspect(m)}")
+          end
+        end
         assert missing_count == 0, "#{missing_count} keys still missing on node_d"
       end, "not all keys replicated to node_d", 240, 500)
 
@@ -175,16 +186,27 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       # 5. Stop writer after giving auto-join time to complete
       Process.sleep(3_000)
+      dump_raft_diagnostics(node_a, node_d, @shards, "after auto-join wait")
       {during_sync_keys, during_sync_count} = stop_continuous_writer(writer_pid)
       IO.puts("Writes during sync: #{during_sync_count}")
 
       final_keys = write_keys(node_a, "post_sync", 1..10)
       all_keys = initial_keys ++ during_sync_keys ++ final_keys
 
+      dump_raft_diagnostics(node_a, node_d, @shards, "before poll (auto-discover)")
+
       # 6. Wait for all keys on node_d — auto-discovery + Raft join + replication
       #    can take a while on loaded machines with 4 BEAM VMs
       eventually(fn ->
         missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
+        if missing_count > 0 do
+          joiner_n = node_name(node_d)
+          for s <- 0..(@shards - 1) do
+            jid = {:"ferricstore_shard_#{s}", joiner_n}
+            m = try do :erpc.call(joiner_n, :ra, :key_metrics, [jid]) catch _, _ -> :error end
+            IO.puts("  poll: shard #{s} joiner metrics=#{inspect(m)}")
+          end
+        end
         assert missing_count == 0, "#{missing_count} keys still missing on node_d"
       end, "not all keys replicated to node_d", 240, 500)
 
@@ -410,13 +432,21 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       # 4. No manual CLUSTER.JOIN — auto-join handles everything
 
       # 5. Write more data after connection
+      Process.sleep(2_000)
+      dump_raft_diagnostics(node_a, node_b, @shards, "auto-discover b")
+      dump_raft_diagnostics(node_a, node_c, @shards, "auto-discover c")
       post_keys = write_keys(node_a, "post", 1..10)
       all_keys = keys ++ post_keys
 
       # 6. Wait for all data to replicate
       eventually(fn ->
-        assert Enum.all?(all_keys, fn k -> read_key(node_b, k) != nil end), "keys missing on b"
-        assert Enum.all?(all_keys, fn k -> read_key(node_c, k) != nil end), "keys missing on c"
+        missing_b = Enum.count(all_keys, fn k -> read_key(node_b, k) == nil end)
+        missing_c = Enum.count(all_keys, fn k -> read_key(node_c, k) == nil end)
+        if missing_b > 0 or missing_c > 0 do
+          IO.puts("  poll: b missing=#{missing_b} c missing=#{missing_c}")
+        end
+        assert missing_b == 0, "#{missing_b} keys missing on b"
+        assert missing_c == 0, "#{missing_c} keys missing on c"
       end, "replication incomplete", 120, 500)
 
       # 7. Keydirs must be identical
@@ -450,6 +480,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       # Wait for auto-join to complete (spawned process with 2s delay + sync time)
       Process.sleep(5_000)
+      dump_raft_diagnostics(node_a, replica, @shards, "readonly after join wait")
 
       # 4. Write more data after replica joined
       post_keys = write_keys(node_a, "after_replica", 1..10)
@@ -458,6 +489,9 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       # 5. Verify replica has all data (receives replication)
       eventually(fn ->
         missing = Enum.count(all_keys, fn k -> read_key(replica, k) == nil end)
+        if missing > 0 do
+          IO.puts("  poll: replica missing=#{missing}")
+        end
         assert missing == 0, "#{missing} keys missing on replica"
       end, "replica missing keys", 120, 500)
 
@@ -531,6 +565,7 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
 
       # 6. Stop writer after join has time to complete
       Process.sleep(5_000)
+      dump_raft_diagnostics(node_a, node_d, @shards, "disk clone after join wait")
       {during_keys, during_count} = stop_continuous_writer(writer_pid)
       IO.puts("Writes during clone join: #{during_count}")
 
@@ -541,6 +576,9 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       # 8. Verify all keys on node_d
       eventually(fn ->
         missing = Enum.count(all_keys, fn k -> read_key(node_d, k) == nil end)
+        if missing > 0 do
+          IO.puts("  poll: clone missing=#{missing}")
+        end
         assert missing == 0, "#{missing} keys missing on node_d"
       end, "keys not replicated to cloned node", 120, 500)
 
@@ -801,6 +839,41 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       shard = elem(ctx.shard_names, shard_idx)
       :erpc.call(n, GenServer, :call, [shard, {:run_compaction, []}])
     end
+  end
+
+  defp dump_raft_diagnostics(leader_node, joiner_node, shard_count, label) do
+    leader_n = node_name(leader_node)
+    joiner_n = node_name(joiner_node)
+
+    IO.puts("\n=== RAFT DIAGNOSTICS [#{label}] ===")
+
+    for shard <- 0..(shard_count - 1) do
+      leader_id = {:"ferricstore_shard_#{shard}", leader_n}
+      joiner_id = {:"ferricstore_shard_#{shard}", joiner_n}
+
+      leader_info =
+        try do
+          {:ok, members, leader} = :erpc.call(leader_n, :ra, :members, [leader_id, 5_000])
+          metrics = :erpc.call(leader_n, :ra, :key_metrics, [leader_id])
+          %{members: length(members), leader: leader, metrics: metrics}
+        catch
+          _, e -> %{error: inspect(e)}
+        end
+
+      joiner_info =
+        try do
+          metrics = :erpc.call(joiner_n, :ra, :key_metrics, [joiner_id])
+          %{metrics: metrics}
+        catch
+          _, e -> %{error: inspect(e)}
+        end
+
+      IO.puts("  shard #{shard}:")
+      IO.puts("    leader_node: #{inspect(leader_info)}")
+      IO.puts("    joiner_node: #{inspect(joiner_info)}")
+    end
+
+    IO.puts("=== END DIAGNOSTICS ===\n")
   end
 
   defp eventually(fun, msg, attempts, interval) do
