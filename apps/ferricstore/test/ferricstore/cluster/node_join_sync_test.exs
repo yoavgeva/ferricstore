@@ -120,6 +120,19 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       #    Raft which replicates to node_d after it joins the group
       all_keys = initial_keys ++ during_sync_keys ++ final_keys
 
+      # Diagnostic: check ra state on leader and follower
+      n_a = node_name(node_a)
+      n_d = node_name(node_d)
+
+      for shard <- 0..(@shards - 1) do
+        lid = Ferricstore.Raft.Cluster.shard_server_id_on(shard, n_a)
+        fid = Ferricstore.Raft.Cluster.shard_server_id_on(shard, n_d)
+        lo = try do :ra.member_overview(lid) catch _, e -> {:error, e} end
+        fo = try do :erpc.call(n_d, :ra, :member_overview, [fid], 5_000) catch _, e -> {:error, e} end
+        IO.puts("DIAG shard#{shard} leader=#{inspect(lo, limit: 300)}")
+        IO.puts("DIAG shard#{shard} follower=#{inspect(fo, limit: 300)}")
+      end
+
       # Poll until all keys are readable (Raft replication may take a few seconds)
       eventually(fn ->
         missing_count = Enum.count(all_keys, fn key -> read_key(node_d, key) == nil end)
