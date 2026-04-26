@@ -796,8 +796,14 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
         key = "#{prefix}_#{seq}"
 
         try do
-          :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{seq}", 0])
-          continuous_write_loop(n, ctx, prefix, seq + 1, [key | keys], parent)
+          case :erpc.call(n, Ferricstore.Store.Router, :put, [ctx, key, "value_#{seq}", 0]) do
+            :ok ->
+              continuous_write_loop(n, ctx, prefix, seq + 1, [key | keys], parent)
+
+            {:error, _} ->
+              Process.sleep(10)
+              continuous_write_loop(n, ctx, prefix, seq, keys, parent)
+          end
         rescue
           _ ->
             Process.sleep(10)
