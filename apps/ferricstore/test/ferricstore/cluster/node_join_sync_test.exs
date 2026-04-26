@@ -127,10 +127,10 @@ defmodule Ferricstore.Cluster.NodeJoinSyncTest do
       for shard <- 0..(@shards - 1) do
         lid = Ferricstore.Raft.Cluster.shard_server_id_on(shard, n_a)
         fid = Ferricstore.Raft.Cluster.shard_server_id_on(shard, n_d)
-        lo = try do :ra.member_overview(lid) catch _, e -> {:error, e} end
-        fo = try do :erpc.call(n_d, :ra, :member_overview, [fid], 5_000) catch _, e -> {:error, e} end
-        IO.puts("DIAG shard#{shard} leader=#{inspect(lo, limit: 300)}")
-        IO.puts("DIAG shard#{shard} follower=#{inspect(fo, limit: 300)}")
+        lm = try do :ra.key_metrics(lid, 5_000) catch _, e -> {:error, e} end
+        fm = try do :ra.key_metrics(fid, 5_000) catch _, e -> {:error, e} end
+        IO.puts("DIAG shard#{shard} leader=#{inspect(lm)}")
+        IO.puts("DIAG shard#{shard} follower=#{inspect(fm)}")
       end
 
       # Poll until all keys are readable (Raft replication may take a few seconds)
