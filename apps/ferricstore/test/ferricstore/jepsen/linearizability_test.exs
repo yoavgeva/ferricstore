@@ -224,7 +224,13 @@ defmodule Ferricstore.Jepsen.LinearizabilityTest do
               Enum.reduce_while(1..50, 0, fn _, _ ->
                 {:ok, read_val} = :rpc.call(node.name, FerricStore, :get, [key])
                 v = extract_version(read_val)
-                if v >= i, do: {:halt, v}, else: (Process.sleep(50); {:cont, v})
+
+                if v >= i do
+                  {:halt, v}
+                else
+                  Process.sleep(50)
+                  {:cont, v}
+                end
               end)
 
             assert read_version >= acc,
