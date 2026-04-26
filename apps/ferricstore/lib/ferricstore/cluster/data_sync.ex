@@ -310,20 +310,18 @@ defmodule Ferricstore.Cluster.DataSync do
     pause_shard(leader_node, shard_name)
 
     try do
-      # 2. Get current Raft index from the leader
+      # 2. Get current Raft index (last_applied, not commit_index) from the
+      #    leader. last_applied tracks what the state machine has actually
+      #    flushed to Bitcask. commit_index can be ahead — entries committed
+      #    but not yet applied would be skipped on the joiner if we used
+      #    commit_index, losing those writes.
       leader_server_id = RaftCluster.shard_server_id_on(shard_index, leader_node)
       raft_index = get_raft_index_on(leader_node, leader_server_id)
 
       # 3. Copy shard data directory from leader to target
       copy_directory_from(leader_node, leader_shard_data, target_node, target_shard_data)
 
-      # NOTE: We do NOT copy the ra WAL dir. The WAL contains node-specific
-      # server IDs that won't work on the target. Instead, after add_member,
-      # ra will send the target a snapshot + recent entries through its own
-      # replication mechanism. The Bitcask files we just copied provide the
-      # data; ra provides the ongoing replication stream.
-
-      Logger.info("Shard #{shard_index}: sync complete at raft index #{raft_index}")
+      Logger.info("Shard #{shard_index}: sync complete at raft last_applied #{raft_index}")
       {:ok, raft_index}
     rescue
       e -> {:error, Exception.message(e)}
@@ -372,7 +370,7 @@ defmodule Ferricstore.Cluster.DataSync do
       get_raft_index(server_id)
     else
       case :erpc.call(leader_node, :ra, :member_overview, [server_id]) do
-        {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
+        {:ok, overview, _} -> Map.get(overview, :last_applied, 0)
         _ -> 0
       end
     end
@@ -444,7 +442,7 @@ defmodule Ferricstore.Cluster.DataSync do
   @spec get_raft_index(:ra.server_id()) :: non_neg_integer()
   defp get_raft_index(server_id) do
     case :ra.member_overview(server_id) do
-      {:ok, overview, _} -> Map.get(overview, :commit_index, 0)
+      {:ok, overview, _} -> Map.get(overview, :last_applied, 0)
       _ -> 0
     end
   end
