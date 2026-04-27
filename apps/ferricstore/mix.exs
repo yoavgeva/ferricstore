@@ -79,7 +79,7 @@ defmodule Ferricstore.MixProject do
     [
       {:rustler_precompiled, "~> 0.8"},
       {:rustler, "~> 0.37", optional: true},
-      {:ra, github: "yoavgeva/ra", branch: "ferricstore-optimizations"},
+      {:ra, "~> 3.1.3-ferricstore.1", hex: :ra_ferricstore},
       {:libcluster, "3.3.3"},
       {:libcluster_consul, "1.3.0", optional: true},
       {:libcluster_etcd, "1.1.2", optional: true},
