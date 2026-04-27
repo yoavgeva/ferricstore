@@ -70,11 +70,19 @@ jobs:
           # checksum-ferricstore_wal_nif.exs from the GitHub Release artifacts.
           # These checksum files MUST be in the package tarball published to Hex
           # so users can verify the precompiled binaries they download.
+          #
+          # The mix rustler_precompiled.download task forces "Elixir." prefix
+          # so it doesn't work for atom-named modules like :ferricstore_wal_nif.
+          # We call the underlying API directly via mix run for both modules.
           mix rustler_precompiled.download Ferricstore.Bitcask.NIF --all --print
-          mix rustler_precompiled.download :ferricstore_wal_nif --all --print
+          mix run --no-start -e '
+            module = :ferricstore_wal_nif
+            {:module, _} = Code.ensure_compiled(module)
+            nifs = RustlerPrecompiled.available_nifs(module)
+            result = RustlerPrecompiled.download_nif_artifacts_with_checksums!(nifs, [])
+            RustlerPrecompiled.write_checksum!(module, result)
+          '
           ls -la checksum-*.exs
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
       # Publish in dependency order: core first, then packages that depend on it
       - name: Publish ferricstore (core)
