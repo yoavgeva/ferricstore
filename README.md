@@ -54,7 +54,7 @@ If you're using Cachex or Nebulex today, FerricStore gives you:
 
 ```elixir
 # mix.exs
-{:ferricstore, "~> 0.3.2"}
+{:ferricstore, "~> 0.3.3"}
 ```
 
 ```elixir

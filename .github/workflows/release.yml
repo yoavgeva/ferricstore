@@ -144,12 +144,18 @@ jobs:
           fi
 
           SRC="${{ env.NIF_DIRECTORY }}/target/${TARGET}/release/${LIB_FILE}"
-          ARCHIVE_NAME="${CRATE}-v${VERSION}-nif-${NIF_VERSION}-${TARGET}"
-          ARCHIVE_FILE="${ARCHIVE_NAME}.tar.gz"
+          # RustlerPrecompiled expects:
+          #   * Tarball name:  lib<crate>-v<ver>-nif-<n>-<triple>.so.tar.gz
+          #   * File inside:   lib<crate>-v<ver>-nif-<n>-<triple>.so
+          # on every non-Windows platform — yes, even on macOS we use .so.
+          INSIDE_NAME="lib${CRATE}-v${VERSION}-nif-${NIF_VERSION}-${TARGET}.so"
+          ARCHIVE_FILE="${INSIDE_NAME}.tar.gz"
+          STAGING_DIR="staging-${TARGET}"
 
-          mkdir -p "${ARCHIVE_NAME}"
-          cp "${SRC}" "${ARCHIVE_NAME}/${LIB_FILE}"
-          tar -czf "${ARCHIVE_FILE}" "${ARCHIVE_NAME}"
+          mkdir -p "${STAGING_DIR}"
+          cp "${SRC}" "${STAGING_DIR}/${INSIDE_NAME}"
+          tar -czf "${ARCHIVE_FILE}" -C "${STAGING_DIR}" "${INSIDE_NAME}"
+          ARCHIVE_NAME="${INSIDE_NAME}"
 
           # Generate checksum
           shasum -a 256 "${ARCHIVE_FILE}" | cut -d ' ' -f 1 > "${ARCHIVE_FILE}.sha256"
