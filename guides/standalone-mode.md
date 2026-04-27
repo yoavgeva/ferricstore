@@ -31,8 +31,8 @@ If you want standalone mode inside an umbrella or host application, add both pac
 # mix.exs
 def deps do
   [
-    {:ferricstore, "~> 0.3.4"},
-    {:ferricstore_server, "~> 0.3.4"}
+    {:ferricstore, "~> 0.3.5"},
+    {:ferricstore_server, "~> 0.3.5"}
   ]
 end
 ```

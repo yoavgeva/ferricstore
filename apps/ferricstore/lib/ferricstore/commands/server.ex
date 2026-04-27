@@ -488,7 +488,7 @@ defmodule Ferricstore.Commands.Server do
 
     fields = [
       {"redis_version", "7.4.0"},
-      {"ferricstore_version", "0.3.4"},
+      {"ferricstore_version", "0.3.5"},
       {"redis_mode", redis_mode},
       {"os", os_string},
       {"arch_bits", "64"},
