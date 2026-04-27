@@ -5,10 +5,6 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-env:
-  NIF_DIRECTORY: "apps/ferricstore/native/ferricstore_bitcask"
-  PROJECT_NAME: "ferricstore_bitcask"
-
 permissions:
   contents: write
   id-token: write
@@ -19,11 +15,12 @@ jobs:
   # Linux builds: use rustler-precompiled-action with cross-compilation
   # -------------------------------------------------------------------------
   build_linux:
-    name: NIF ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
+    name: NIF ${{ matrix.crate }} ${{ matrix.nif }} - ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
       matrix:
+        crate: ["ferricstore_bitcask", "ferricstore_wal_nif"]
         nif: ["2.16"]
         job:
           - { target: aarch64-unknown-linux-gnu,   os: ubuntu-22.04, use-cross: true }
@@ -39,6 +36,7 @@ jobs:
         run: |
           VERSION=$(sed -n 's/.*@version "\(.*\)"/\1/p' apps/ferricstore/mix.exs)
           echo "PROJECT_VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "NIF_DIRECTORY=apps/ferricstore/native/${{ matrix.crate }}" >> $GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -49,14 +47,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v0-precomp
-          shared-key: ${{ matrix.job.target }}-${{ matrix.nif }}
+          shared-key: ${{ matrix.crate }}-${{ matrix.job.target }}-${{ matrix.nif }}
           workspaces: ${{ env.NIF_DIRECTORY }}
 
       - name: Build precompiled NIF
         uses: philss/rustler-precompiled-action@v1.1.5
         id: build
         with:
-          project-name: ${{ env.PROJECT_NAME }}
+          project-name: ${{ matrix.crate }}
           project-version: ${{ env.PROJECT_VERSION }}
           target: ${{ matrix.job.target }}
           nif-version: ${{ matrix.nif }}
@@ -85,11 +83,12 @@ jobs:
   # The action always installs cross which fails on macOS (ENOEXEC).
   # -------------------------------------------------------------------------
   build_macos:
-    name: NIF ${{ matrix.nif }} - ${{ matrix.target }} (${{ matrix.os }})
+    name: NIF ${{ matrix.crate }} ${{ matrix.nif }} - ${{ matrix.target }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        crate: ["ferricstore_bitcask", "ferricstore_wal_nif"]
         nif: ["2.16"]
         target:
           - aarch64-apple-darwin
@@ -104,6 +103,7 @@ jobs:
         run: |
           VERSION=$(sed -n 's/.*@version "\(.*\)"/\1/p' apps/ferricstore/mix.exs)
           echo "PROJECT_VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "NIF_DIRECTORY=apps/ferricstore/native/${{ matrix.crate }}" >> $GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -114,7 +114,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v0-precomp
-          shared-key: ${{ matrix.target }}-${{ matrix.nif }}
+          shared-key: ${{ matrix.crate }}-${{ matrix.target }}-${{ matrix.nif }}
           workspaces: ${{ env.NIF_DIRECTORY }}
 
       - name: Build NIF
@@ -129,7 +129,8 @@ jobs:
           TARGET=${{ matrix.target }}
           NIF_VERSION=${{ matrix.nif }}
           VERSION=${{ env.PROJECT_VERSION }}
-          LIB_NAME="libferricstore_bitcask"
+          CRATE=${{ matrix.crate }}
+          LIB_NAME="lib${CRATE}"
 
           # Find the built library
           if [ -f "${{ env.NIF_DIRECTORY }}/target/${TARGET}/release/${LIB_NAME}.dylib" ]; then
@@ -143,7 +144,7 @@ jobs:
           fi
 
           SRC="${{ env.NIF_DIRECTORY }}/target/${TARGET}/release/${LIB_FILE}"
-          ARCHIVE_NAME="${{ env.PROJECT_NAME }}-v${VERSION}-nif-${NIF_VERSION}-${TARGET}"
+          ARCHIVE_NAME="${CRATE}-v${VERSION}-nif-${NIF_VERSION}-${TARGET}"
           ARCHIVE_FILE="${ARCHIVE_NAME}.tar.gz"
 
           mkdir -p "${ARCHIVE_NAME}"

@@ -1,7 +1,23 @@
 defmodule Ferricstore.Bitcask.NIF do
   @moduledoc "Rustler NIF bindings for Bitcask record I/O, hint files, and mmap-backed probabilistic data structure file operations."
 
-  use Rustler, otp_app: :ferricstore, crate: "ferricstore_bitcask", skip_compilation?: true
+  version = Mix.Project.config()[:version]
+
+  use RustlerPrecompiled,
+    otp_app: :ferricstore,
+    crate: "ferricstore_bitcask",
+    base_url: "https://github.com/yoavgeva/ferricstore/releases/download/v#{version}",
+    version: version,
+    nif_versions: ["2.16"],
+    targets: ~w(
+      aarch64-apple-darwin
+      x86_64-apple-darwin
+      aarch64-unknown-linux-gnu
+      x86_64-unknown-linux-gnu
+      aarch64-unknown-linux-musl
+      x86_64-unknown-linux-musl
+    ),
+    force_build: System.get_env("FERRICSTORE_BUILD") in ["1", "true"]
 
   # -- Tracking allocator --
   @spec rust_allocated_bytes() :: {:ok, non_neg_integer()} | {:error, term()}

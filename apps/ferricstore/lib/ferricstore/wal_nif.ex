@@ -12,7 +12,23 @@ defmodule :ferricstore_wal_nif do
   so ra_log_wal can call it as IoMod:write(Handle, Data).
   """
 
-  use Rustler, otp_app: :ferricstore, crate: "ferricstore_wal_nif", skip_compilation?: true
+  version = Mix.Project.config()[:version]
+
+  use RustlerPrecompiled,
+    otp_app: :ferricstore,
+    crate: "ferricstore_wal_nif",
+    base_url: "https://github.com/yoavgeva/ferricstore/releases/download/v#{version}",
+    version: version,
+    nif_versions: ["2.16"],
+    targets: ~w(
+      aarch64-apple-darwin
+      x86_64-apple-darwin
+      aarch64-unknown-linux-gnu
+      x86_64-unknown-linux-gnu
+      aarch64-unknown-linux-musl
+      x86_64-unknown-linux-musl
+    ),
+    force_build: System.get_env("FERRICSTORE_BUILD") in ["1", "true"]
 
   @doc "Open a WAL file. Spawns background I/O thread."
   def open(_path, _commit_delay_us, _pre_allocate_bytes, _max_buffer_bytes),
