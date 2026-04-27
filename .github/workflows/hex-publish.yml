@@ -21,9 +21,6 @@ jobs:
           elixir-version: "1.19"
           otp-version: "28"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Cache deps
         uses: actions/cache@v4
         with:
@@ -67,27 +64,48 @@ jobs:
 
       - name: Generate NIF checksum files
         env:
-          # Force-build mode so the module compiles without trying to download
-          # NIFs at module-load time. The actual cargo build still runs but
-          # produces .so/.dylib for the runner's platform only — we don't
-          # ship that build, only use the compiled .ex modules to enumerate
-          # available_nifs/1 and download artifacts from GitHub Release.
-          RUSTLER_PRECOMPILED_FORCE_BUILD_ALL: "1"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Generate checksum files directly from the GitHub Release artifacts
+          # using a pure shell script. This avoids loading the RustlerPrecompiled
+          # macros, which would fail at compile time without an existing checksum.
           set -euo pipefail
           cd apps/ferricstore
-          # Bitcask: standard module name — use the mix task.
-          mix rustler_precompiled.download Ferricstore.Bitcask.NIF --all --print --no-config
-          # WAL: atom-named module — call the API directly because the mix task
-          # always wraps as String.to_atom("Elixir.\#{name}").
-          mix run --no-start -e '
-            module = :ferricstore_wal_nif
-            {:module, _} = Code.ensure_compiled(module)
-            nifs = RustlerPrecompiled.available_nifs(module)
-            result = RustlerPrecompiled.download_nif_artifacts_with_checksums!(nifs, [])
-            RustlerPrecompiled.write_checksum!(module, result)
-          '
-          ls -la checksum-*.exs
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p /tmp/nif_artifacts
+          gh release download "v${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir /tmp/nif_artifacts \
+            --pattern '*.tar.gz'
+
+          generate_checksum_file() {
+            local out_file="$1"
+            shift
+            {
+              echo "%{"
+              for pattern in "$@"; do
+                for f in /tmp/nif_artifacts/${pattern}; do
+                  [ -f "$f" ] || continue
+                  local basename=$(basename "$f")
+                  local sum=$(shasum -a 256 "$f" | cut -d' ' -f1)
+                  echo "  \"${basename}\" => \"sha256:${sum}\","
+                done
+              done
+              echo "}"
+            } > "$out_file"
+            echo "Generated $out_file:"
+            cat "$out_file"
+          }
+
+          generate_checksum_file \
+            "checksum-Elixir.Ferricstore.Bitcask.NIF.exs" \
+            "ferricstore_bitcask-v${VERSION}-*.tar.gz" \
+            "libferricstore_bitcask-v${VERSION}-*.tar.gz"
+
+          generate_checksum_file \
+            "checksum-ferricstore_wal_nif.exs" \
+            "ferricstore_wal_nif-v${VERSION}-*.tar.gz" \
+            "libferricstore_wal_nif-v${VERSION}-*.tar.gz"
 
       # Publish in dependency order: core first, then packages that depend on it
       - name: Publish ferricstore (core)
