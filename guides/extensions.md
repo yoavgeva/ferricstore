@@ -17,7 +17,7 @@ FerricStore ships with extension packages that integrate with the Elixir ecosyst
 
 ```elixir
 # mix.exs
-{:ferricstore_session, "~> 0.3.3"}
+{:ferricstore_session, "~> 0.3.4"}
 
 # In your Phoenix endpoint:
 plug Plug.Session,
@@ -123,4 +123,4 @@ The extension packages depend on `ferricstore` (the core engine). You must have 
 
 | Package | FerricStore | Ecto | Elixir |
 |---------|-------------|------|--------|
-| `ferricstore_ecto 0.3.x` | `~> 0.3.3` | `~> 3.11` | `~> 1.19` |
+| `ferricstore_ecto 0.3.x` | `~> 0.3.4` | `~> 3.11` | `~> 1.19` |

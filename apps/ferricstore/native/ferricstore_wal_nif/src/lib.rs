@@ -128,31 +128,15 @@ fn pread<'a>(
 // ---------------------------------------------------------------------------
 
 /// Convert Erlang iodata (binary or iolist) to bytes.
+///
+/// Uses rustler's `decode_as_binary`, which calls `enif_inspect_iolist_as_binary`
+/// under the hood. That function correctly handles every shape of valid iodata —
+/// flat binaries, deeply nested lists, improper lists like `[H | <<tail>>]`, and
+/// integer bytes. Our previous hand-rolled flattener returned `:badarg` on
+/// improper lists, which crashed the ra WAL on every flush of a real batch.
 fn iodata_to_bytes(term: Term) -> NifResult<Vec<u8>> {
-    // Try as binary first (fast path)
-    if let Ok(bin) = term.decode::<Binary>() {
-        return Ok(bin.as_slice().to_vec());
-    }
-
-    // iolist: flatten recursively
-    let mut result = Vec::new();
-    flatten_iolist(term, &mut result)?;
-    Ok(result)
-}
-
-fn flatten_iolist(term: Term, out: &mut Vec<u8>) -> NifResult<()> {
-    if let Ok(bin) = term.decode::<Binary>() {
-        out.extend_from_slice(bin.as_slice());
-    } else if let Ok(items) = term.decode::<Vec<Term>>() {
-        for item in items {
-            flatten_iolist(item, out)?;
-        }
-    } else if let Ok(byte) = term.decode::<u8>() {
-        out.push(byte);
-    } else {
-        return Err(rustler::Error::BadArg);
-    }
-    Ok(())
+    let bin = term.decode_as_binary()?;
+    Ok(bin.as_slice().to_vec())
 }
 
 // ---------------------------------------------------------------------------
