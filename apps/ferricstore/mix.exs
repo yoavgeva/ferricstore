@@ -63,6 +63,7 @@ defmodule Ferricstore.MixProject do
         "native/ferricstore_bitcask/.cargo",
         "native/ferricstore_bitcask/src",
         "native/ferricstore_bitcask/Cargo*",
+        "native/ferricstore_wal_nif/.cargo",
         "native/ferricstore_wal_nif/src",
         "native/ferricstore_wal_nif/Cargo*",
         "checksum-*.exs",
