@@ -21,6 +21,9 @@ jobs:
           elixir-version: "1.19"
           otp-version: "28"
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Cache deps
         uses: actions/cache@v4
         with:
@@ -63,18 +66,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate NIF checksum files
+        env:
+          # Force-build mode so the module compiles without trying to download
+          # NIFs at module-load time. The actual cargo build still runs but
+          # produces .so/.dylib for the runner's platform only — we don't
+          # ship that build, only use the compiled .ex modules to enumerate
+          # available_nifs/1 and download artifacts from GitHub Release.
+          RUSTLER_PRECOMPILED_FORCE_BUILD_ALL: "1"
         run: |
           set -euo pipefail
           cd apps/ferricstore
-          # Generates checksum-Elixir.Ferricstore.Bitcask.NIF.exs and
-          # checksum-ferricstore_wal_nif.exs from the GitHub Release artifacts.
-          # These checksum files MUST be in the package tarball published to Hex
-          # so users can verify the precompiled binaries they download.
-          #
-          # The mix rustler_precompiled.download task forces "Elixir." prefix
-          # so it doesn't work for atom-named modules like :ferricstore_wal_nif.
-          # We call the underlying API directly via mix run for both modules.
-          mix rustler_precompiled.download Ferricstore.Bitcask.NIF --all --print
+          # Bitcask: standard module name — use the mix task.
+          mix rustler_precompiled.download Ferricstore.Bitcask.NIF --all --print --no-config
+          # WAL: atom-named module — call the API directly because the mix task
+          # always wraps as String.to_atom("Elixir.\#{name}").
           mix run --no-start -e '
             module = :ferricstore_wal_nif
             {:module, _} = Code.ensure_compiled(module)
