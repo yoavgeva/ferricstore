@@ -5160,29 +5160,17 @@ defmodule FerricStore do
       getdel: fn k -> Router.getdel(ctx, k) end,
       getex: fn k, e -> Router.getex(ctx, k, e) end,
       setrange: fn k, o, v -> Router.setrange(ctx, k, o, v) end,
-      compound_get: fn _redis_key, compound_key ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:get, compound_key})
+      compound_get: fn redis_key, compound_key -> Router.compound_get(ctx, redis_key, compound_key) end,
+      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+        Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
       end,
-      compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:put, compound_key, value, expire_at_ms})
+      compound_delete: fn redis_key, compound_key ->
+        Router.compound_delete(ctx, redis_key, compound_key)
       end,
-      compound_delete: fn _redis_key, compound_key ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:delete, compound_key})
-      end,
-      compound_scan: fn _redis_key, prefix ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:scan_prefix, prefix})
-      end,
-      compound_count: fn _redis_key, prefix ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:count_prefix, prefix})
-      end,
-      compound_delete_prefix: fn _redis_key, prefix ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:delete_prefix, prefix})
+      compound_scan: fn redis_key, prefix -> Router.compound_scan(ctx, redis_key, prefix) end,
+      compound_count: fn redis_key, prefix -> Router.compound_count(ctx, redis_key, prefix) end,
+      compound_delete_prefix: fn redis_key, prefix ->
+        Router.compound_delete_prefix(ctx, redis_key, prefix)
       end
     }
   end
@@ -5236,7 +5224,7 @@ defmodule FerricStore do
     ctx = default_ctx()
     data_dir = Application.get_env(:ferricstore, :data_dir, "data")
     index = Router.shard_for(ctx, key)
-    prob_dir = Path.join([data_dir, "prob", "shard_#{index}"])
+    shard_data_path = Ferricstore.DataDir.shard_data_path(data_dir, index)
 
     %{
       get: fn key ->
@@ -5257,7 +5245,19 @@ defmodule FerricStore do
       delete: fn k -> Router.delete(ctx, k) end,
       exists?: fn k -> Router.exists?(ctx, k) end,
       keys: fn -> Router.keys(ctx) end,
+      # Route topk writes through Raft so all replicas materialize the same
+      # mmap file and follower TOPK.LIST/QUERY work. Without prob_write the
+      # command falls back to applying locally on the originating node only.
+      prob_write: fn cmd -> Router.prob_write(ctx, cmd) end,
       prob_dir: fn ->
+        prob_dir = Path.join(shard_data_path, "prob")
+        Ferricstore.FS.mkdir_p!(prob_dir)
+        prob_dir
+      end,
+      prob_dir_for_key: fn key ->
+        idx = Router.shard_for(ctx, key)
+        sp = Ferricstore.DataDir.shard_data_path(data_dir, idx)
+        prob_dir = Path.join(sp, "prob")
         Ferricstore.FS.mkdir_p!(prob_dir)
         prob_dir
       end
@@ -5324,29 +5324,21 @@ defmodule FerricStore do
       delete: fn k -> Router.delete(ctx, k) end,
       exists?: fn k -> Router.exists?(ctx, k) end,
       keys: fn -> Router.keys(ctx) end,
-      compound_get: fn _redis_key, compound_key ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:get, compound_key})
+      # Compound ops route through Router so they get the same not_leader →
+      # forward + read-your-write barrier as plain Router.put. Going direct
+      # to the local shard skips that and silently loses writes when the
+      # local node isn't the leader for this key's shard.
+      compound_get: fn redis_key, compound_key -> Router.compound_get(ctx, redis_key, compound_key) end,
+      compound_put: fn redis_key, compound_key, value, expire_at_ms ->
+        Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
       end,
-      compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:put, compound_key, value, expire_at_ms})
+      compound_delete: fn redis_key, compound_key ->
+        Router.compound_delete(ctx, redis_key, compound_key)
       end,
-      compound_delete: fn _redis_key, compound_key ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:delete, compound_key})
-      end,
-      compound_scan: fn _redis_key, prefix ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:scan_prefix, prefix})
-      end,
-      compound_count: fn _redis_key, prefix ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:count_prefix, prefix})
-      end,
-      compound_delete_prefix: fn _redis_key, prefix ->
-        shard = Router.resolve_shard(ctx, Router.shard_for(ctx, key))
-        GenServer.call(shard, {:delete_prefix, prefix})
+      compound_scan: fn redis_key, prefix -> Router.compound_scan(ctx, redis_key, prefix) end,
+      compound_count: fn redis_key, prefix -> Router.compound_count(ctx, redis_key, prefix) end,
+      compound_delete_prefix: fn redis_key, prefix ->
+        Router.compound_delete_prefix(ctx, redis_key, prefix)
       end
     }
   end

@@ -78,18 +78,74 @@ defmodule Ferricstore.Store.Router do
     if leader_node == node() do
       {:error, "ERR not leader, election in progress"}
     else
-      try do
-        remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
-        :erpc.call(leader_node, GenServer, :call, [elem(remote_ctx.shard_names, idx), command, 10_000], 10_000)
-      catch
-        _, _ ->
-          try do
-            GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
-          catch
-            _, _ -> {:error, "ERR leader unavailable"}
-          end
+      cond do
+        bypass_shard?(command) ->
+          # No shard handler exists for these tuples (json/bitmap/geo/hll/
+          # tdigest "*_op"). Forward by re-running async_write on the leader
+          # node — its local Batcher is the leader and won't reject.
+          forward_bypass_to_leader(leader_node, idx, command)
+
+        true ->
+          forward_via_shard_call(ctx, leader_node, idx, command)
       end
     end
+  end
+
+  defp forward_via_shard_call(ctx, leader_node, idx, command) do
+    try do
+      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
+      result =
+        :erpc.call(leader_node, GenServer, :call, [elem(remote_ctx.shard_names, idx), command, 10_000], 10_000)
+
+      case result do
+        # Leader's batcher detected a cross-node caller and tagged the reply
+        # with the ra_index. Barrier on local apply so reads on this node
+        # see the just-written value (read-your-write across redirects).
+        {:remote_applied_at, ra_index, real_result} ->
+          _ = Ferricstore.Raft.Batcher.await_local_applied(idx, ra_index, 5_000)
+          real_result
+
+        other ->
+          other
+      end
+    catch
+      _, _ ->
+        try do
+          GenServer.call(elem(ctx.shard_names, idx), command, 10_000)
+        catch
+          _, _ -> {:error, "ERR leader unavailable"}
+        end
+    end
+  end
+
+  defp forward_bypass_to_leader(leader_node, _idx, command) do
+    try do
+      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
+      :erpc.call(leader_node, __MODULE__, :run_bypass_locally, [remote_ctx, command], 10_000)
+    catch
+      _, _ -> {:error, "ERR leader unavailable"}
+    end
+  end
+
+  @doc false
+  # Public-but-undocumented entry point invoked via erpc from peer nodes
+  # when a bypass_shard? command is forwarded to its shard's leader.
+  # Re-runs the command on the local (leader) node, going through the
+  # normal raft_write path which now recognizes us as the leader.
+  def run_bypass_locally(ctx, command) do
+    key =
+      case command do
+        {:json_op, _, [k | _]} -> k
+        {:bitmap_op, "BITOP", [_op, dest | _]} -> dest
+        {:bitmap_op, _, [k | _]} -> k
+        {:geo_op, "GEOSEARCHSTORE", [dest | _]} -> dest
+        {:geo_op, _, [k | _]} -> k
+        {:hll_op, _, [k | _]} -> k
+        {:tdigest_op, "TDIGEST.MERGE", [dest | _]} -> dest
+        {:tdigest_op, _, [k | _]} -> k
+      end
+
+    raft_write(ctx, shard_for(ctx, key), key, command)
   end
 
 
@@ -119,18 +175,79 @@ defmodule Ferricstore.Store.Router do
   # Async:  write ETS immediately, submit to Raft non-blocking (fire-and-forget).
   #         Like Redis Cluster — client sees the write before replication completes.
   #         Leader crash before replication = data loss (documented trade-off).
+  #
+  # Linearizable commands (CAS, LOCK, UNLOCK, EXTEND, RATELIMIT) always go
+  # through `quorum_write`, regardless of the namespace's durability setting.
+  # Their contract is linearizability — running them through the async path
+  # makes their result observable on origin before replication, breaking the
+  # primitive. Whitelisting at this seam keeps the rule local and obvious.
   @spec raft_write(FerricStore.Instance.t(), non_neg_integer(), binary(), tuple()) :: term()
   defp raft_write(ctx, idx, key, command) do
     if ctx.raft_enabled do
-      case durability_for_key(ctx, key) do
-        :quorum -> quorum_write(ctx, idx, command)
-        :async -> async_write(ctx, idx, command)
+      cond do
+        # Commands the Shard GenServer doesn't handle (json/bitmap/geo/hll/
+        # tdigest "*_op" tuples). These must skip the shard and go directly
+        # via Batcher to Raft. async_write uses Batcher.write_async_quorum
+        # which submits to the forced-quorum slot and returns the actual
+        # state machine result (RMW-safe).
+        bypass_shard?(command) -> async_write(ctx, idx, command)
+        always_quorum?(command) -> quorum_write(ctx, idx, command)
+        durability_for_key(ctx, key) == :quorum -> quorum_write(ctx, idx, command)
+        true -> async_write(ctx, idx, command)
       end
     else
       # No Raft — direct GenServer.call to the shard
       GenServer.call(elem(ctx.shard_names, idx), command)
     end
   end
+
+  # Tuples that have no Shard.handle_call clause. Sending them through
+  # quorum_write would deadlock the shard caller for 10s. The forced-quorum
+  # batcher slot already gives us strong consistency and the real return
+  # value, so these route there directly regardless of namespace.
+  defp bypass_shard?({:json_op, _, _}), do: true
+  defp bypass_shard?({:bitmap_op, _, _}), do: true
+  defp bypass_shard?({:geo_op, _, _}), do: true
+  defp bypass_shard?({:hll_op, _, _}), do: true
+  defp bypass_shard?({:tdigest_op, _, _}), do: true
+  defp bypass_shard?(_), do: false
+
+  # Linearizable primitives — must NEVER take the async path even if the
+  # namespace is configured `:async`. Adding a new coordination primitive?
+  # Add it here.
+  @doc false
+  def always_quorum?({:cas, _, _, _, _}), do: true
+  def always_quorum?({:lock, _, _, _}), do: true
+  def always_quorum?({:unlock, _, _}), do: true
+  def always_quorum?({:extend, _, _, _}), do: true
+  def always_quorum?({:ratelimit_add, _, _, _, _, _}), do: true
+
+  # Probabilistic structures: results (e.g., Bloom "was it new?", TopK
+  # evicted member, CMS post-increment count) are computed by the state
+  # machine. The async fast path early-replies before that result is
+  # available, so prob commands must run through quorum_write to return
+  # the materialized value. Tuple shapes match those in
+  # `state_machine.ex` apply/3 clauses.
+  def always_quorum?({:bloom_create, _, _, _, _}), do: true
+  def always_quorum?({:bloom_add, _, _, _}), do: true
+  def always_quorum?({:bloom_madd, _, _, _}), do: true
+  def always_quorum?({:cuckoo_create, _, _, _}), do: true
+  def always_quorum?({:cuckoo_add, _, _, _}), do: true
+  def always_quorum?({:cuckoo_addnx, _, _, _}), do: true
+  def always_quorum?({:cuckoo_del, _, _}), do: true
+  def always_quorum?({:cms_create, _, _, _}), do: true
+  def always_quorum?({:cms_incrby, _, _}), do: true
+  def always_quorum?({:cms_merge, _, _, _, _}), do: true
+  def always_quorum?({:topk_create, _, _, _, _, _}), do: true
+  def always_quorum?({:topk_add, _, _}), do: true
+  def always_quorum?({:topk_incrby, _, _}), do: true
+  def always_quorum?(_), do: false
+
+  # NOTE: json/bitmap/geo/hll/tdigest ops route through async_write →
+  # Batcher.write_async_quorum, which goes directly to the Batcher (bypassing
+  # the Shard GenServer that has no handler for these tuples). The
+  # forced-quorum slot returns the actual state machine result, so RMW
+  # semantics are preserved without quorum_write deadlocking.
 
   # Async write path (like Redis Cluster — async replication):
   # 1. Execute locally: direct ETS write + BitcaskWriter (no GenServer)
@@ -231,13 +348,23 @@ defmodule Ferricstore.Store.Router do
       end
 
     case result do
-      {:error, _} -> :ok
+      # Local node isn't the leader for this shard. Forward via the same
+      # path quorum_write uses so callers get a real result, not the
+      # internal :not_leader error.
+      {:error, {:not_leader, {_shard, leader_node}}} when is_atom(leader_node) ->
+        forward_to_leader(ctx, leader_node, idx, command)
+
+      {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
+        forward_to_leader(ctx, leader_node, idx, command)
+
+      {:error, _} ->
+        result
+
       _ ->
         size = :counters.info(ctx.write_version).size
         if idx < size, do: :counters.add(ctx.write_version, idx + 1, 1)
+        result
     end
-
-    result
   end
 
   # ---------------------------------------------------------------------------
@@ -1177,16 +1304,19 @@ defmodule Ferricstore.Store.Router do
     wv_size = :counters.info(ctx.write_version).size
     me = self()
 
-    # Single pass: group by shard, build cmds + indices lists simultaneously
-    {by_shard, count} =
+    # Single pass: group by shard, build cmds + indices lists simultaneously,
+    # also remember the kv_pairs subset per shard so we can re-issue the
+    # batch via erpc on :not_leader replies.
+    {by_shard, count, by_shard_kvs} =
       kv_pairs
-      |> Enum.reduce({%{}, 0}, fn {key, value}, {shards, i} ->
+      |> Enum.reduce({%{}, 0, %{}}, fn {key, value}, {shards, i, kvs_map} ->
         idx = shard_for(ctx, key)
         cmd = {:put, key, value, 0}
         entry = Map.get(shards, idx, {[], []})
         {cmds, indices} = entry
         shards = Map.put(shards, idx, {[cmd | cmds], [i | indices]})
-        {shards, i + 1}
+        kvs_map = Map.update(kvs_map, idx, [{key, value}], fn acc -> [{key, value} | acc] end)
+        {shards, i + 1, kvs_map}
       end)
 
     shard_refs =
@@ -1198,8 +1328,35 @@ defmodule Ferricstore.Store.Router do
 
     results = collect_shard_replies(shard_refs, wv_size, ctx, %{}, System.monotonic_time(:millisecond))
 
+    # Per-shard not_leader → forward that shard's slice to its hinted leader.
+    # Each shard reports independently; we re-issue just the failing shard.
+    results =
+      Enum.reduce(by_shard_kvs, results, fn {shard_idx, kvs}, acc ->
+        # All indices for this shard share the same shard-level reply
+        first_index = Map.get(by_shard, shard_idx) |> elem(1) |> List.last()
+
+        case Map.get(acc, first_index) do
+          {:error, {:not_leader, {_shard_name, leader_node}}} when is_atom(leader_node) ->
+            merge_forwarded(acc, by_shard, shard_idx, kvs, leader_node, ctx)
+
+          {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
+            merge_forwarded(acc, by_shard, shard_idx, kvs, leader_node, ctx)
+
+          _ ->
+            acc
+        end
+      end)
+
     0..(count - 1)
     |> Enum.map(fn i -> Map.get(results, i, {:error, "ERR write timeout"}) end)
+  end
+
+  defp merge_forwarded(acc, by_shard, shard_idx, kvs, leader_node, ctx) do
+    {_, indices} = Map.fetch!(by_shard, shard_idx)
+    indices = Enum.reverse(indices)
+    new_results = forward_batch_to_leader(ctx, leader_node, shard_idx, Enum.reverse(kvs))
+    Enum.zip(indices, new_results)
+    |> Enum.reduce(acc, fn {i, r}, a -> Map.put(a, i, r) end)
   end
 
   defp collect_shard_replies([], _wv_size, _ctx, acc, _start), do: acc
@@ -1239,6 +1396,25 @@ defmodule Ferricstore.Store.Router do
       _ ->
         if shard_idx < wv_size, do: :counters.add(ctx.write_version, shard_idx + 1, length(indices))
         Enum.reduce(indices, acc, fn i, a -> Map.put(a, i, result) end)
+    end
+  end
+
+  # Forward a batch to the leader's node. Used by batch_quorum_put when
+  # the local Batcher rejects with :not_leader. Issues an erpc to run
+  # batch_quorum_put on the leader, then returns its results.
+  defp forward_batch_to_leader(_ctx, leader_node, _shard_idx, kv_pairs) when leader_node == node() do
+    Enum.map(kv_pairs, fn _ -> {:error, "ERR not leader, election in progress"} end)
+  end
+
+  defp forward_batch_to_leader(_ctx, leader_node, _shard_idx, kv_pairs) do
+    try do
+      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
+      :erpc.call(leader_node, __MODULE__, :batch_quorum_put, [remote_ctx, kv_pairs], 10_000)
+    catch
+      _, reason ->
+        require Logger
+        Logger.warning("batch forward to #{inspect(leader_node)} failed: #{inspect(reason)}")
+        Enum.map(kv_pairs, fn _ -> {:error, "ERR leader unavailable"} end)
     end
   end
 
@@ -1519,8 +1695,24 @@ defmodule Ferricstore.Store.Router do
   not go through this path.
   """
   @spec bitmap_op(FerricStore.Instance.t(), binary(), [term()]) :: term()
-  def bitmap_op(ctx, "BITOP", [_op, destkey | _] = args) do
-    raft_write(ctx, shard_for(ctx, destkey), destkey, {:bitmap_op, "BITOP", args})
+  # BITOP reads multiple source keys and writes a destination — the sources
+  # may live on different shards. Use CrossShardOp for cross-shard correctness;
+  # if all keys (sources + dest) hash to the same shard, the same path
+  # collapses to a single-shard quorum write transparently.
+  def bitmap_op(ctx, "BITOP", [_op_str, destkey | source_keys] = args) do
+    keys_with_roles = [{destkey, :write} | Enum.map(source_keys, &{&1, :read})]
+
+    Ferricstore.CrossShardOp.execute(
+      keys_with_roles,
+      fn _store ->
+        # Dispatch through the normal raft path with the dest's shard as the
+        # coordinator. With CrossShardOp's locks held this is now safe even
+        # if the source is on a different shard (the read in execute_bitop
+        # is consistent because the lock blocks concurrent writers).
+        raft_write(ctx, shard_for(ctx, destkey), destkey, {:bitmap_op, "BITOP", args})
+      end,
+      intent: %{command: :bitop, keys: %{targets: [destkey | source_keys]}}
+    )
   end
 
   def bitmap_op(ctx, cmd, [key | _] = args) do

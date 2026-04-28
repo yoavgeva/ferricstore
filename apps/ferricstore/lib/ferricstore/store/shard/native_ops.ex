@@ -25,8 +25,11 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   end
 
   defp handle_cas_raft(key, expected, new_value, expire_at_ms, state) do
-    # expire_at_ms is already absolute (converted by Router.cas)
-    result = Ferricstore.Raft.Batcher.write(state.index, {:cas, key, expected, new_value, expire_at_ms})
+    # expire_at_ms is already absolute (converted by Router.cas).
+    # Use the forced-quorum path so the result is the state machine's
+    # actual reply (1/0/nil) — Batcher.write would early-reply :ok in an
+    # :async namespace, breaking CAS's linearizability contract.
+    result = forced_quorum_call(state.index, {:cas, key, expected, new_value, expire_at_ms})
 
     case result do
       r when r in [1, 0, nil] ->
@@ -35,6 +38,21 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
       {:error, _} = err ->
         {:reply, err, state}
+    end
+  end
+
+  # Synchronous wrapper around Batcher.write_async_quorum: enqueues into the
+  # quorum slot regardless of namespace, then receives the reply for this
+  # specific command.
+  defp forced_quorum_call(shard_index, command) do
+    ref = make_ref()
+    from = {self(), ref}
+    Ferricstore.Raft.Batcher.write_async_quorum(shard_index, command, from)
+
+    receive do
+      {^ref, reply} -> reply
+    after
+      10_000 -> {:error, "ERR forced-quorum write timeout"}
     end
   end
 
@@ -66,7 +84,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   defp handle_lock_raft(key, owner, expire_at_ms, state) do
     # expire_at_ms is already absolute (converted by Router.lock)
-    result = Ferricstore.Raft.Batcher.write(state.index, {:lock, key, owner, expire_at_ms})
+    result = forced_quorum_call(state.index, {:lock, key, owner, expire_at_ms})
 
     case result do
       :ok ->
@@ -111,7 +129,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
   end
 
   defp handle_unlock_raft(key, owner, state) do
-    result = Ferricstore.Raft.Batcher.write(state.index, {:unlock, key, owner})
+    result = forced_quorum_call(state.index, {:unlock, key, owner})
 
     case result do
       1 ->
@@ -158,7 +176,7 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   defp handle_extend_raft(key, owner, expire_at_ms, state) do
     # expire_at_ms is already absolute (converted by Router.extend)
-    result = Ferricstore.Raft.Batcher.write(state.index, {:extend, key, owner, expire_at_ms})
+    result = forced_quorum_call(state.index, {:extend, key, owner, expire_at_ms})
 
     case result do
       1 ->
@@ -200,7 +218,9 @@ defmodule Ferricstore.Store.Shard.NativeOps do
 
   defp handle_ratelimit_add_raft(key, window_ms, max, count, state) do
     now_ms = HLC.now_ms()
-    result = Ferricstore.Raft.Batcher.write(state.index, {:ratelimit_add, key, window_ms, max, count, now_ms})
+    # Force-quorum path — Batcher.write would early-reply :ok on an :async
+    # namespace, breaking ratelimit's contract.
+    result = forced_quorum_call(state.index, {:ratelimit_add, key, window_ms, max, count, now_ms})
 
     case result do
       [_status, _count, _remaining, _ttl] = reply ->
@@ -350,17 +370,65 @@ defmodule Ferricstore.Store.Shard.NativeOps do
       compound_get: fn _redis_key, compound_key ->
         do_compound_get(state, compound_key)
       end,
+      # In cluster mode the local node may not be the leader for this shard.
+      # Batcher.write will reply :not_leader if so. We forward to the leader's
+      # Shard via the same forward path Router.quorum_write uses.
+      # NOTE: this runs INSIDE the local Shard GenServer (handle_list_op_raft),
+      # so we must not re-call our own pid; route only to the LEADER's shard
+      # process directly.
       compound_put: fn _redis_key, compound_key, value, expire_at_ms ->
-        Ferricstore.Raft.Batcher.write(state.index, {:put, compound_key, value, expire_at_ms})
+        cluster_safe_compound_write(state, {:put, compound_key, value, expire_at_ms})
       end,
       compound_delete: fn _redis_key, compound_key ->
-        Ferricstore.Raft.Batcher.write(state.index, {:delete, compound_key})
+        cluster_safe_compound_write(state, {:delete, compound_key})
       end,
       compound_scan: fn _redis_key, prefix ->
         results = ShardETS.prefix_scan_entries(state.keydir, prefix, state.shard_data_path)
         Enum.sort_by(results, fn {field, _} -> field end)
       end
     }
+  end
+
+  # Writes from inside a Shard GenServer can't go through Router (would
+  # GenServer.call ourselves). Submit via Batcher.write; if rejected as
+  # not-leader, do a remote GenServer.call to the leader's shard. The
+  # leader's Batcher will tag the reply with the ra_index so we can wait
+  # for our own local apply before returning to the caller.
+  defp cluster_safe_compound_write(state, command) do
+    case Ferricstore.Raft.Batcher.write(state.index, command) do
+      {:error, {:not_leader, {_shard_name, leader_node}}} when is_atom(leader_node) ->
+        forward_compound_to_leader(state, leader_node, command)
+
+      {:error, {:not_leader, leader_node}} when is_atom(leader_node) ->
+        forward_compound_to_leader(state, leader_node, command)
+
+      other ->
+        other
+    end
+  end
+
+  defp forward_compound_to_leader(state, leader_node, command) when leader_node == node() do
+    {:error, "ERR not leader, election in progress"}
+  end
+
+  defp forward_compound_to_leader(state, leader_node, command) do
+    try do
+      remote_ctx = :erpc.call(leader_node, FerricStore.Instance, :get, [:default], 5_000)
+      shard = elem(remote_ctx.shard_names, state.index)
+
+      result = :erpc.call(leader_node, GenServer, :call, [shard, command, 10_000], 10_000)
+
+      case result do
+        {:remote_applied_at, ra_index, real_result} ->
+          _ = Ferricstore.Raft.Batcher.await_local_applied(state.index, ra_index, 5_000)
+          real_result
+
+        other ->
+          other
+      end
+    catch
+      _, _ -> {:error, "ERR leader unavailable"}
+    end
   end
 
   @spec build_list_compound_store_direct(binary(), map()) :: map()

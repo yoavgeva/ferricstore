@@ -446,8 +446,12 @@ defmodule Ferricstore.Store.Shard do
   end
 
   # 6-tuple variant: includes pre-computed now_ms from Router.raft_write.
+  # In cluster mode this MUST go through Raft (replicated) just like the
+  # 5-tuple variant — otherwise a follower's ratelimit-add lands locally
+  # only and other nodes never see the increment. Falls back to direct in
+  # non-Raft mode.
   def handle_call({:ratelimit_add, key, window_ms, max, count, _now_ms}, _from, state) do
-    ShardNativeOps.handle_ratelimit_add_direct(key, window_ms, max, count, state)
+    ShardNativeOps.handle_ratelimit_add(key, window_ms, max, count, state)
   end
 
   # -------------------------------------------------------------------

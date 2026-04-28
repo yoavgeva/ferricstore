@@ -507,9 +507,9 @@ defmodule FerricstoreServer.Spec.NativeCommandsTest do
       # inside the GenServer process, which owns the :protected ETS table.
       :sys.replace_state(FetchOrCompute, fn state ->
         case :ets.lookup(table, key) do
-          [{^key, computer_pid, waiters, _started_at, hint}] ->
+          [{^key, computer_pid, waiters, _started_at, hint, compute_id}] ->
             old_time = System.monotonic_time(:millisecond) - 60_000
-            :ets.insert(table, {key, computer_pid, waiters, old_time, hint})
+            :ets.insert(table, {key, computer_pid, waiters, old_time, hint, compute_id})
 
           [] ->
             :ok

@@ -256,7 +256,7 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
           hlc_ts = HLC.now()
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
           wrapped = {{:put, "rc_hlc_#{i}", "v#{i}", 0}, %{hlc_ts: hlc_ts}}
-          {new_state, :ok} = StateMachine.apply(meta, wrapped, acc)
+          {new_state, {:applied_at, _, :ok}, _effects} = StateMachine.apply(meta, wrapped, acc)
           new_state
         end)
 
@@ -267,10 +267,11 @@ defmodule Ferricstore.Raft.HlcRaftIntegrationTest do
       meta = %{index: 3, term: 1, system_time: System.os_time(:millisecond)}
       wrapped = {{:put, "rc_hlc_3", "v3", 0}, %{hlc_ts: hlc_ts}}
 
-      {new_state, :ok, effects} = StateMachine.apply(meta, wrapped, state_before)
+      {new_state, {:applied_at, _, :ok}, effects} = StateMachine.apply(meta, wrapped, state_before)
 
       assert new_state.applied_count == 3
-      assert [{:release_cursor, 3, _cursor_state}] = effects
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
+      assert {:release_cursor, 3, _cursor_state} = cursor_effect
     end
   end
 

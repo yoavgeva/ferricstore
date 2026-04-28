@@ -52,7 +52,7 @@ defmodule Ferricstore.Commands.ServerInfoTest do
       assert is_binary(result)
       assert result =~ "# Server"
       assert result =~ "redis_version:7.4.0"
-      assert result =~ "ferricstore_version:0.1.0"
+      assert result =~ ~r/ferricstore_version:\d+\.\d+\.\d+/
       assert result =~ "tcp_port:"
       assert result =~ "uptime_in_seconds:"
       assert result =~ "process_id:"

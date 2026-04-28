@@ -131,7 +131,7 @@ defmodule Ferricstore.Transaction.Coordinator do
       {:ra_event, _leader, {:applied, applied_list}} ->
         case List.keyfind(applied_list, corr, 0) do
           {^corr, result} ->
-            {:ok, result}
+            {:ok, unwrap_applied(result)}
 
           nil ->
             wait_for_ra_result(corr, shard_id, idx, command)
@@ -160,6 +160,11 @@ defmodule Ferricstore.Transaction.Coordinator do
         {:error, "ERR cross-shard transaction timeout"}
     end
   end
+
+  # State machine wraps every reply as {:applied_at, ra_index, real_result}
+  # for read-your-write consistency. Unwrap before passing to reassemble_results.
+  defp unwrap_applied({:applied_at, _idx, real}), do: real
+  defp unwrap_applied(other), do: other
 
   # Reassembles per-shard results back into the original command order.
   defp reassemble_results(shard_results, index_map, total) do

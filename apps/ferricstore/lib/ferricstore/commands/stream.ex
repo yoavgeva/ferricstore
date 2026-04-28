@@ -93,12 +93,17 @@ defmodule Ferricstore.Commands.Stream do
   # XLEN key
   # -------------------------------------------------------------------------
 
-  def handle("XLEN", [key], _store) do
+  def handle("XLEN", [key], store) do
+    # `@meta_table` is local-only (not Raft-replicated), so on a follower we
+    # don't have it. Fall back to counting the stream's compound entries —
+    # those go through Router.compound_put and are present on every node.
+    # On the originating node we still consult the meta table for O(1) speed
+    # when populated; followers and post-migration always count via prefix.
     ensure_meta_table()
 
     case :ets.lookup(@meta_table, key) do
       [{^key, len, _first, _last, _ms, _seq}] -> len
-      [] -> 0
+      [] -> count_stream_entries(store, key)
     end
   end
 
@@ -1037,6 +1042,14 @@ defmodule Ferricstore.Commands.Stream do
   defp stream_keys_for(store, prefix) do
     Ops.keys(store)
     |> Enum.filter(&String.starts_with?(&1, prefix))
+  end
+
+  # Count compound entries with prefix `X:<stream_key>\0` — used by XLEN as
+  # the fallback path on nodes where the local `@meta_table` doesn't have
+  # the stream registered (notably Raft followers).
+  defp count_stream_entries(store, stream_key) do
+    prefix = "X:#{stream_key}" <> @sep
+    stream_keys_for(store, prefix) |> length()
   end
 
   # ---------------------------------------------------------------------------

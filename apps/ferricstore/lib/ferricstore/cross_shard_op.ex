@@ -201,7 +201,7 @@ defmodule Ferricstore.CrossShardOp do
         else
           shard_id = Cluster.shard_server_id(shard_idx)
 
-          case :ra.process_command(shard_id, {:lock_keys, keys_to_lock, owner_ref, expire_at}) do
+          case unwrap_ra_reply(:ra.process_command(shard_id, {:lock_keys, keys_to_lock, owner_ref, expire_at})) do
             {:ok, :ok, _} ->
               {:cont, {:ok, [shard_idx | locked]}}
 
@@ -273,7 +273,7 @@ defmodule Ferricstore.CrossShardOp do
         {shard_idx, keys,
          Task.async(fn ->
            shard_id = Cluster.shard_server_id(shard_idx)
-           :ra.process_command(shard_id, {:unlock_keys, keys, owner_ref})
+           unwrap_ra_reply(:ra.process_command(shard_id, {:unlock_keys, keys, owner_ref}))
          end)}
       end)
 
@@ -319,12 +319,12 @@ defmodule Ferricstore.CrossShardOp do
       )
 
     shard_id = Cluster.shard_server_id(coordinator_shard)
-    :ra.process_command(shard_id, {:cross_shard_intent, owner_ref, full_intent})
+    unwrap_ra_reply(:ra.process_command(shard_id, {:cross_shard_intent, owner_ref, full_intent}))
   end
 
   defp delete_intent(coordinator_shard, owner_ref) do
     shard_id = Cluster.shard_server_id(coordinator_shard)
-    :ra.process_command(shard_id, {:delete_intent, owner_ref})
+    unwrap_ra_reply(:ra.process_command(shard_id, {:delete_intent, owner_ref}))
   end
 
   # ---------------------------------------------------------------------------
@@ -337,6 +337,12 @@ defmodule Ferricstore.CrossShardOp do
     ctx = FerricStore.Instance.get(:default)
     shard = Router.shard_name(ctx, shard_idx)
 
+    # Reads can stay local (we read our own ETS — fast). Writes route through
+    # Router so they get the not_leader → forward path. Without this, msetnx
+    # and other cross-shard ops would silently no-op when the local node
+    # isn't the leader for the target shard (the local shard call returns
+    # {:error, {:not_leader, ...}}, the closure returns it as a value, and
+    # the caller treats it as success).
     %{
       shard_idx: shard_idx,
       get: fn key ->
@@ -353,20 +359,8 @@ defmodule Ferricstore.CrossShardOp do
           :exit, _ -> nil
         end
       end,
-      put: fn key, value, expire_at_ms ->
-        try do
-          GenServer.call(shard, {:put, key, value, expire_at_ms}, 5_000)
-        catch
-          :exit, _ -> {:error, "ERR shard unavailable"}
-        end
-      end,
-      delete: fn key ->
-        try do
-          GenServer.call(shard, {:delete, key}, 5_000)
-        catch
-          :exit, _ -> {:error, "ERR shard unavailable"}
-        end
-      end,
+      put: fn key, value, expire_at_ms -> Router.put(ctx, key, value, expire_at_ms) end,
+      delete: fn key -> Router.delete(ctx, key) end,
       exists?: fn key ->
         try do
           GenServer.call(shard, {:exists, key}, 5_000)
@@ -389,18 +383,10 @@ defmodule Ferricstore.CrossShardOp do
         end
       end,
       compound_put: fn redis_key, compound_key, value, expire_at_ms ->
-        try do
-          GenServer.call(shard, {:compound_put, redis_key, compound_key, value, expire_at_ms}, 5_000)
-        catch
-          :exit, _ -> {:error, "ERR shard unavailable"}
-        end
+        Router.compound_put(ctx, redis_key, compound_key, value, expire_at_ms)
       end,
       compound_delete: fn redis_key, compound_key ->
-        try do
-          GenServer.call(shard, {:compound_delete, redis_key, compound_key}, 5_000)
-        catch
-          :exit, _ -> {:error, "ERR shard unavailable"}
-        end
+        Router.compound_delete(ctx, redis_key, compound_key)
       end,
       compound_scan: fn redis_key, prefix ->
         try do
@@ -486,7 +472,7 @@ defmodule Ferricstore.CrossShardOp do
         shard_idx = Router.shard_for(ctx, key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
-        case :ra.process_command(shard_id, {:locked_put, key, value, expire_at_ms, owner_ref}) do
+        case unwrap_ra_reply(:ra.process_command(shard_id, {:locked_put, key, value, expire_at_ms, owner_ref})) do
           {:ok, result, _} -> result
           {:error, reason} -> {:error, reason}
         end
@@ -495,7 +481,7 @@ defmodule Ferricstore.CrossShardOp do
         shard_idx = Router.shard_for(ctx, key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
-        case :ra.process_command(shard_id, {:locked_delete, key, owner_ref}) do
+        case unwrap_ra_reply(:ra.process_command(shard_id, {:locked_delete, key, owner_ref})) do
           {:ok, result, _} -> result
           {:error, reason} -> {:error, reason}
         end
@@ -504,7 +490,7 @@ defmodule Ferricstore.CrossShardOp do
         shard_idx = Router.shard_for(ctx, redis_key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
-        case :ra.process_command(shard_id, {:locked_put, compound_key, value, expire_at_ms, owner_ref}) do
+        case unwrap_ra_reply(:ra.process_command(shard_id, {:locked_put, compound_key, value, expire_at_ms, owner_ref})) do
           {:ok, result, _} -> result
           {:error, reason} -> {:error, reason}
         end
@@ -513,7 +499,7 @@ defmodule Ferricstore.CrossShardOp do
         shard_idx = Router.shard_for(ctx, redis_key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
-        case :ra.process_command(shard_id, {:locked_delete, compound_key, owner_ref}) do
+        case unwrap_ra_reply(:ra.process_command(shard_id, {:locked_delete, compound_key, owner_ref})) do
           {:ok, result, _} -> result
           {:error, reason} -> {:error, reason}
         end
@@ -522,7 +508,7 @@ defmodule Ferricstore.CrossShardOp do
         shard_idx = Router.shard_for(ctx, redis_key)
         shard_id = Cluster.shard_server_id(shard_idx)
 
-        case :ra.process_command(shard_id, {:locked_delete_prefix, prefix, owner_ref}) do
+        case unwrap_ra_reply(:ra.process_command(shard_id, {:locked_delete_prefix, prefix, owner_ref})) do
           {:ok, result, _} -> result
           {:error, reason} -> {:error, reason}
         end
@@ -585,4 +571,11 @@ defmodule Ferricstore.CrossShardOp do
       [prefix | _] -> prefix
     end
   end
+
+  # The ferricstore state machine wraps every reply as `{:applied_at, ra_index, real}`
+  # so the Batcher can gate on local-apply for read-your-write. CrossShardOp uses
+  # `:ra.process_command/2` which surfaces that wrap directly to the caller —
+  # unwrap before pattern-matching against `{:ok, :ok, _}` etc.
+  defp unwrap_ra_reply({:ok, {:applied_at, _idx, real}, leader}), do: {:ok, real, leader}
+  defp unwrap_ra_reply(other), do: other
 end

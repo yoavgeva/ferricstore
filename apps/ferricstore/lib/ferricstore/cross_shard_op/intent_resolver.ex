@@ -49,6 +49,11 @@ defmodule Ferricstore.CrossShardOp.IntentResolver do
     shard_id = Cluster.shard_server_id(shard_idx)
 
     case :ra.process_command(shard_id, {:get_intents}) do
+      {:ok, {:applied_at, _idx, intents}, _} when is_map(intents) and map_size(intents) > 0 ->
+        Enum.each(intents, fn {owner_ref, intent} ->
+          resolve_single_intent(shard_idx, owner_ref, intent)
+        end)
+
       {:ok, intents, _} when is_map(intents) and map_size(intents) > 0 ->
         Enum.each(intents, fn {owner_ref, intent} ->
           resolve_single_intent(shard_idx, owner_ref, intent)

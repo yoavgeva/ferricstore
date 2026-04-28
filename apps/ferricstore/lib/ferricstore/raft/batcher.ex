@@ -167,7 +167,18 @@ defmodule Ferricstore.Raft.Batcher do
     # Map from correlation ref -> {froms, :single | :batch} for in-flight ra commands
     pending: %{},
     # List of {from} callers waiting for all in-flight to drain (flush barrier)
-    flush_waiters: []
+    flush_waiters: [],
+    # Highest ra_index this node's state machine has applied locally. Updated
+    # via `{:locally_applied, ra_index}` messages emitted by the local state
+    # machine apply via a `:local` send_msg effect (every voter node fires).
+    # We use this to gate quorum-write replies so the originating node only
+    # tells the user `:ok` after its OWN ETS has the entry, fixing the
+    # read-your-write hole on followers.
+    last_local_applied: 0,
+    # Replies pending local apply: list of {ra_index, kind, froms, result}
+    # waiting for `last_local_applied >= ra_index`. Drained in order on each
+    # `:locally_applied` message.
+    local_apply_waiters: []
   ]
 
   # ---------------------------------------------------------------------------
@@ -307,6 +318,20 @@ defmodule Ferricstore.Raft.Batcher do
   def batcher_name(shard_index), do: :"Ferricstore.Raft.Batcher.#{shard_index}"
 
   @doc """
+  Blocks until this node's local state machine for `shard_index` has applied
+  the entry at `ra_index`. Used by `Router.forward_to_leader/4` to barrier
+  read-your-write after a quorum write was redirected to a peer leader.
+
+  Returns `:ok` once `last_local_applied >= ra_index`, or `{:error, :timeout}`
+  if the local apply hasn't caught up within `timeout_ms`.
+  """
+  @spec await_local_applied(non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
+          :ok | {:error, :timeout}
+  def await_local_applied(shard_index, ra_index, timeout_ms \\ 10_000) do
+    GenServer.call(batcher_name(shard_index), {:await_local_applied, ra_index}, timeout_ms)
+  end
+
+  @doc """
   Synchronously flushes all pending writes across all namespace slots.
 
   Used in tests and before shard shutdown to ensure all writes are committed.
@@ -416,6 +441,18 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
+  # Caller waits until the local state machine has applied at least `ra_index`.
+  # If we've already passed that, reply immediately; otherwise queue the from
+  # in `local_apply_waiters` and reply when `:locally_applied` catches up.
+  def handle_call({:await_local_applied, ra_index}, from, state) do
+    if state.last_local_applied >= ra_index do
+      {:reply, :ok, state}
+    else
+      waiter = {ra_index, :await_caller, [from], :ok}
+      {:noreply, %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}}
+    end
+  end
+
   # Test-only hooks. See the __-prefixed public functions at the end of
   # the module for the corresponding API.
   def handle_call({:__inject_async_pending__, corr, batch, retry_count, mono}, _from, state) do
@@ -511,18 +548,23 @@ defmodule Ferricstore.Raft.Batcher do
 
   # Handle ra_event notifications from pipeline_command.
   # Applied commands: {ra_event, Leader, {applied, [{correlation, result}]}}
+  #
+  # The leader sends `:applied` after IT has applied the entry. The originating
+  # node's local state machine may not have applied yet (especially when the
+  # originating node is a follower). For *quorum* writes we hold the reply
+  # until `last_local_applied >= ra_index` so reads-after-write on the same
+  # node are consistent. The state machine wraps every result as
+  # `{:applied_at, ra_index, real_result}` to give us the index here.
   def handle_info({:ra_event, _leader, {:applied, applied_list}}, state) do
     new_state =
-      Enum.reduce(applied_list, state, fn {corr, result}, acc ->
+      Enum.reduce(applied_list, state, fn {corr, raw_result}, acc ->
+        {ra_index, result} = unwrap_applied(raw_result)
+
         case Map.pop(acc.pending, corr) do
           {nil, _pending} ->
-            # Unknown correlation -- ignore (could be stale after leader change)
             acc
 
-          # Async entry — either the old 2-tuple shape (legacy) or the
-          # retry-aware 5-tuple shape. Either way, no callers to reply to
-          # (Router/async_ns already replied :ok). Remove from pending so
-          # flush waiters observe completion.
+          # Async entries: no callers to reply to. Just track and clear.
           {{_froms, :async_no_reply}, new_pending} ->
             %{acc | pending: new_pending}
 
@@ -530,23 +572,96 @@ defmodule Ferricstore.Raft.Batcher do
             %{acc | pending: new_pending}
 
           {{froms, :single, _mono}, new_pending} ->
-            [from] = froms
-            case from do
-              {:batch_from, inner_from, _count} ->
-                GenServer.reply(inner_from, {:ok, [result]})
-              _ ->
-                GenServer.reply(from, result)
-            end
-            %{acc | pending: new_pending}
+            acc2 = %{acc | pending: new_pending}
+            gate_reply(acc2, ra_index, :single, froms, result)
 
           {{froms, :batch, _mono}, new_pending} ->
-            reply_batch(froms, result)
-            %{acc | pending: new_pending}
+            acc2 = %{acc | pending: new_pending}
+            gate_reply(acc2, ra_index, :batch, froms, result)
         end
       end)
 
     new_state = maybe_reply_flush_waiters(new_state)
     {:noreply, new_state}
+  end
+
+  # Local state machine applied an entry at `ra_index`. Bump our high-water
+  # mark and drain any waiters whose entries are now safe to reply.
+  def handle_info({:locally_applied, ra_index}, state) do
+    new_state =
+      if ra_index > state.last_local_applied do
+        %{state | last_local_applied: ra_index}
+        |> drain_local_apply_waiters()
+        |> maybe_reply_flush_waiters()
+      else
+        state
+      end
+
+    {:noreply, new_state}
+  end
+
+  # If the new-shape wrapped reply is present, unwrap; otherwise pass through
+  # for backward compatibility with WAL entries that pre-date this change.
+  defp unwrap_applied({:applied_at, ra_index, real_result}), do: {ra_index, real_result}
+  defp unwrap_applied(other), do: {0, other}
+
+  # Reply now if the local state machine has already applied at this index;
+  # otherwise queue and reply when `:locally_applied` catches up. ra_index = 0
+  # means the result wasn't wrapped (legacy WAL entry) — reply immediately.
+  defp gate_reply(state, 0, kind, froms, result) do
+    do_reply(kind, froms, result, 0)
+    state
+  end
+
+  defp gate_reply(%{last_local_applied: lla} = state, ra_index, kind, froms, result)
+       when lla >= ra_index do
+    do_reply(kind, froms, result, ra_index)
+    state
+  end
+
+  defp gate_reply(state, ra_index, kind, froms, result) do
+    waiter = {ra_index, kind, froms, result}
+    %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}
+  end
+
+  # When the caller is on a different node, it was forwarded by
+  # Router.forward_to_leader. Send the result wrapped with the ra_index so
+  # the originator can barrier on its own local apply before returning to
+  # the user (read-your-write across a leader redirect).
+  defp do_reply(:single, [from], result, ra_index) do
+    case from do
+      {:batch_from, inner_from, _count} ->
+        GenServer.reply(inner_from, {:ok, [maybe_wrap_remote(inner_from, result, ra_index)]})
+
+      _ ->
+        GenServer.reply(from, maybe_wrap_remote(from, result, ra_index))
+    end
+  end
+
+  defp do_reply(:batch, froms, result, _ra_index) do
+    # Batch results aren't wrapped per-entry — each `from` gets its slice of
+    # the batch's results. Forwarders that issue batches don't barrier on
+    # individual indices today; they'd need their own gating if added.
+    reply_batch(froms, result)
+  end
+
+  defp do_reply(:await_caller, [from], result, _ra_index) do
+    GenServer.reply(from, result)
+  end
+
+  defp maybe_wrap_remote({pid, _ref}, result, ra_index) when node(pid) != node() and ra_index > 0 do
+    {:remote_applied_at, ra_index, result}
+  end
+
+  defp maybe_wrap_remote(_from, result, _ra_index), do: result
+
+  defp drain_local_apply_waiters(%{last_local_applied: lla} = state) do
+    {ready, still_waiting} =
+      Enum.split_with(state.local_apply_waiters, fn {idx, _, _, _} -> idx <= lla end)
+
+    Enum.each(ready, fn {idx, kind, froms, result} -> do_reply(kind, froms, result, idx) end)
+
+    %{state | local_apply_waiters: still_waiting}
   end
 
   # Handle rejected commands (not_leader). For async entries we re-submit
@@ -594,10 +709,10 @@ defmodule Ferricstore.Raft.Batcher do
       {{_froms, :async_no_reply}, new_pending} ->
         {:noreply, maybe_reply_flush_waiters(%{state | pending: new_pending})}
 
-      # Quorum entry — reply to the blocked caller(s) with error.
-      # Matches both the 3-tuple shape ({froms, :single|:batch, mono}) used
-      # by pipeline_submit and the legacy 2-tuple shape still present in
-      # other code paths.
+      # Quorum entry — local server isn't leader. Reply :not_leader so
+      # Router.forward_to_leader takes over (and barriers on local apply
+      # via await_local_applied/2 after the leader replies, fixing
+      # read-your-write across the redirect).
       {pending_entry, new_pending}
       when is_tuple(pending_entry) and elem(pending_entry, 1) in [:single, :batch] ->
         froms = elem(pending_entry, 0)
@@ -787,7 +902,14 @@ defmodule Ferricstore.Raft.Batcher do
   @spec enqueue_write(command(), GenServer.from(), %__MODULE__{}) :: {:noreply, %__MODULE__{}}
   defp enqueue_write(command, from, state) do
     prefix = extract_prefix(command)
-    {{window_ms, durability}, state} = lookup_ns_config(prefix, state)
+    {{window_ms, ns_durability}, state} = lookup_ns_config(prefix, state)
+
+    # Linearizable primitives (CAS/LOCK/UNLOCK/EXTEND/RATELIMIT, prob structures)
+    # must take the quorum path even on async-configured namespaces — the caller
+    # needs the actual state machine result, not a premature :ok.
+    durability =
+      if Ferricstore.Store.Router.always_quorum?(command), do: :quorum, else: ns_durability
+
     slot_key = {prefix, durability}
 
     slot = Map.get(state.slots, slot_key, new_slot(window_ms))
@@ -923,7 +1045,14 @@ defmodule Ferricstore.Raft.Batcher do
       %{shard_index: state.shard_index, origin: true}
     )
 
-    wrapped = Enum.map(batch, fn cmd -> {:async, cmd} end)
+    # Wrap each command with the originating node so the state machine on
+    # every peer can decide skip-vs-apply by *node identity*, not by ETS
+    # presence. The presence-based heuristic was wrong for repeated RMW on
+    # the same key — the second `incr` arrives at a follower whose ETS now
+    # contains the first incr's result, and the heuristic mis-classifies the
+    # follower as the origin and skips. Origin tagging is deterministic.
+    origin = node()
+    wrapped = Enum.map(batch, fn cmd -> {:async, origin, cmd} end)
     submit_async_with_retry(state, wrapped, state.shard_id, 0)
   end
 
@@ -1037,10 +1166,14 @@ defmodule Ferricstore.Raft.Batcher do
     end
   end
 
-  # Reply to flush waiters when all in-flight pipelined commands have completed.
+  # Reply to flush waiters once everything is drained: in-flight ra commands
+  # are all applied AND the local state machine has caught up to all their
+  # indices (no entries left in `local_apply_waiters`).
   @spec maybe_reply_flush_waiters(%__MODULE__{}) :: %__MODULE__{}
-  defp maybe_reply_flush_waiters(%{pending: pending, flush_waiters: waiters} = state) do
-    if map_size(pending) == 0 and waiters != [] do
+  defp maybe_reply_flush_waiters(
+         %{pending: pending, flush_waiters: waiters, local_apply_waiters: lwaiters} = state
+       ) do
+    if map_size(pending) == 0 and lwaiters == [] and waiters != [] do
       Enum.each(waiters, fn from -> GenServer.reply(from, :ok) end)
       %{state | flush_waiters: []}
     else

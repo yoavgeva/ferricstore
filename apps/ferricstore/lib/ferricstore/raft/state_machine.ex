@@ -215,10 +215,20 @@ defmodule Ferricstore.Raft.StateMachine do
   end
 
   # Async commands. Router on the origin node has already persisted the write
-  # Async single-command path (currently unreachable — Batcher wraps in {:batch, ...},
-  # but kept consistent with apply_single for safety). Delegates to apply_single
-  # which handles origin-skip with disk accumulation for PUT.
+  # Async single-command path. Delegates to apply_single which handles
+  # origin-skip via the embedded origin node tag.
   @impl true
+  def apply(meta, {:async, _origin, _inner_cmd} = cmd, state) do
+    result = with_pending_writes(state, fn -> apply_single(state, cmd) end)
+    old_count = state.applied_count
+    new_state = %{state | applied_count: old_count + 1}
+    maybe_release_cursor(meta, old_count, new_state, result)
+  end
+
+  # Backward-compat for 2-tuple async commands written by older binaries.
+  # Treat as origin-unknown — apply unconditionally. Idempotent for put/delete,
+  # may over-count repeated RMW on the same key (acceptable for one-time WAL
+  # recovery; new writes use the 3-tuple form below).
   def apply(meta, {:async, _inner_cmd} = cmd, state) do
     result = with_pending_writes(state, fn -> apply_single(state, cmd) end)
     old_count = state.applied_count
@@ -1029,16 +1039,31 @@ defmodule Ferricstore.Raft.StateMachine do
   @spec maybe_release_cursor(map(), non_neg_integer(), shard_state(), term()) ::
           {shard_state(), term()} | {shard_state(), term(), list()}
   defp maybe_release_cursor(%{index: ra_index}, old_count, state, result) do
+    # Wrap every reply with the ra_index it was applied at so the originating
+    # Batcher can wait for the LOCAL state machine to also reach that index
+    # before replying to the user. Otherwise a writer on a follower can see
+    # the leader's :applied event (replied) before the local follower's state
+    # machine has applied — read-your-write violation in cluster mode.
+    wrapped_result = {:applied_at, ra_index, result}
+
+    # Notify the local Batcher for this shard that ra_index was applied
+    # *locally*. The `:local` send_msg option causes ra to fire this on every
+    # node that has a local member (i.e., every voter), so each node's Batcher
+    # tracks its OWN last_local_applied_idx independently.
+    batcher_name = Ferricstore.Raft.Batcher.batcher_name(state.shard_index)
+    notify_effect = {:send_msg, batcher_name, {:locally_applied, ra_index}, [:local]}
+
     interval = state.release_cursor_interval
 
     if div(old_count, interval) != div(state.applied_count, interval) do
-      {state, result, [{:release_cursor, ra_index, state}]}
+      {state, wrapped_result, [notify_effect, {:release_cursor, ra_index, state}]}
     else
-      {state, result}
+      {state, wrapped_result, [notify_effect]}
     end
   end
 
   defp maybe_release_cursor(_meta, _old_count, state, result) do
+    # No meta (e.g. cross-shard sub-apply) — pass through untouched.
     {state, result}
   end
 
@@ -1533,11 +1558,55 @@ defmodule Ferricstore.Raft.StateMachine do
   # Private: command execution
   # ---------------------------------------------------------------------------
 
-  # Async PUT on origin: skip ETS (Router already inserted) and accumulate
+  # 3-tuple async clauses (current shape, with origin node tag).
+  #
+  # Origin node decides skip vs apply: each peer compares the embedded
+  # `origin` against its own `node()`. Deterministic and correct even when
+  # the same key receives multiple RMW commands in rapid succession.
+  #
+  # Single-node mode (no Erlang distribution) reports `node() == :nonode@nohost`,
+  # which equals the originating node by the same name — so the origin-skip
+  # still fires correctly and avoids the double-write.
+
+  # Async PUT, origin: skip ETS (Router already inserted) but accumulate
   # disk write only for small values (file_id == :pending means Router
   # deferred disk write to us). Large values already have a real file_id
   # and offset from Router's synchronous NIF write — skip disk too.
-  # On replicas, apply normally (both ETS + disk).
+  defp apply_single(state, {:async, origin, {:put, key, value, expire_at_ms} = _inner})
+       when origin == node() do
+    case :ets.lookup(state.ets, key) do
+      [{^key, _v, _e, _lfu, :pending, 0, _vs}] ->
+        disk_val = to_disk_binary(value)
+        pending = Process.get(:sm_pending_writes, [])
+        Process.put(:sm_pending_writes, [{key, disk_val, expire_at_ms} | pending])
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  # Async PUT, replica: apply normally (both ETS + disk).
+  defp apply_single(state, {:async, _origin, {:put, key, value, expire_at_ms}}) do
+    apply_single(state, {:put, key, value, expire_at_ms})
+  end
+
+  # Other async commands, origin: skip — Router already applied locally.
+  defp apply_single(_state, {:async, origin, _inner_cmd}) when origin == node() do
+    :ok
+  end
+
+  # Other async commands, replica: apply.
+  defp apply_single(state, {:async, _origin, inner_cmd}) do
+    apply_single(state, inner_cmd)
+  end
+
+  # 2-tuple async clauses (legacy shape from binaries before origin tagging).
+  # Kept for WAL backward compatibility — replays still work. New writes use
+  # the 3-tuple form. Falls back to the ETS-presence heuristic which is
+  # imperfect for repeated RMW on the same key but correct for the common
+  # case (single put/delete/incr per key per batch).
   defp apply_single(state, {:async, {:put, key, value, expire_at_ms} = _inner}) do
     if async_key_present?(state, {:put, key, value, expire_at_ms}) do
       case :ets.lookup(state.ets, key) do
@@ -1584,6 +1653,19 @@ defmodule Ferricstore.Raft.StateMachine do
 
   defp apply_single(state, {:list_op, key, operation}) do
     do_list_op(state, key, operation)
+  end
+
+  # When a `:list_op_lmove` arrives on a replica wrapped as `{:async, origin, cmd}`,
+  # the 3-tuple async clause unwraps and re-dispatches via apply_single. We need
+  # to handle the inner shape here so followers re-execute and converge.
+  defp apply_single(state, {:list_op_lmove, src_key, dst_key, from_dir, to_dir}) do
+    store = build_compound_store(state)
+
+    :erlang.apply(
+      Ferricstore.Store.ListOps,
+      :execute_lmove,
+      [src_key, dst_key, store, from_dir, to_dir]
+    )
   end
 
   defp apply_single(state, {:compound_put, compound_key, value, expire_at_ms}) do

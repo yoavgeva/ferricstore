@@ -652,14 +652,14 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       state_before =
         Enum.reduce(1..(interval - 1), state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
+          {new_state, {:applied_at, _, :ok}, effects} =
+            StateMachine.apply(meta, {:put, "sn001_#{i}", "v#{i}", 0}, acc)
 
-          case StateMachine.apply(meta, {:put, "sn001_#{i}", "v#{i}", 0}, acc) do
-            {new_state, :ok} ->
-              new_state
-
-            {_state, :ok, _effects} ->
-              flunk("release_cursor emitted at apply #{i}, before interval #{interval}")
+          if Enum.any?(effects, &match?({:release_cursor, _, _}, &1)) do
+            flunk("release_cursor emitted at apply #{i}, before interval #{interval}")
           end
+
+          new_state
         end)
 
       assert state_before.applied_count == interval - 1
@@ -667,11 +667,12 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       # The interval-th apply should emit release_cursor
       meta = %{index: interval, term: 1, system_time: System.os_time(:millisecond)}
 
-      {new_state, :ok, effects} =
+      {new_state, {:applied_at, _, :ok}, effects} =
         StateMachine.apply(meta, {:put, "sn001_#{interval}", "v#{interval}", 0}, state_before)
 
       assert new_state.applied_count == interval
-      assert [{:release_cursor, ^interval, cursor_state}] = effects
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
+      assert {:release_cursor, ^interval, cursor_state} = cursor_effect
       assert cursor_state.applied_count == interval
     end
 
@@ -695,11 +696,13 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
 
           case StateMachine.apply(meta, {:put, "sn001m_#{i}", "v#{i}", 0}, acc) do
-            {new_state, :ok} ->
-              {new_state, cursors}
+            {new_state, {:applied_at, _, :ok}, effects} ->
+              cursor_idx = Enum.find_value(effects, fn
+                {:release_cursor, idx, _snap} -> idx
+                _ -> nil
+              end)
 
-            {new_state, :ok, [{:release_cursor, idx, _snap}]} ->
-              {new_state, cursors ++ [idx]}
+              if cursor_idx, do: {new_state, cursors ++ [cursor_idx]}, else: {new_state, cursors}
           end
         end)
 
@@ -755,7 +758,7 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       state_before =
         Enum.reduce(1..3, state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          {new_state, :ok} = StateMachine.apply(meta, {:put, "sn_batch_#{i}", "v#{i}", 0}, acc)
+          {new_state, {:applied_at, _, :ok}, _effects} = StateMachine.apply(meta, {:put, "sn_batch_#{i}", "v#{i}", 0}, acc)
           new_state
         end)
 
@@ -765,13 +768,14 @@ defmodule FerricstoreServer.Spec.RaftStateMachineTest do
       batch = for i <- 1..4, do: {:put, "sn_batch_b_#{i}", "vb#{i}", 0}
       meta = %{index: 4, term: 1, system_time: System.os_time(:millisecond)}
 
-      {new_state, {:ok, results}, effects} =
+      {new_state, {:applied_at, _, {:ok, results}}, effects} =
         StateMachine.apply(meta, {:batch, batch}, state_before)
 
       assert length(results) == 4
       assert new_state.applied_count == 7
       # Single release_cursor emitted for the batch
-      assert [{:release_cursor, 4, _cursor_state}] = effects
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
+      assert {:release_cursor, 4, _cursor_state} = cursor_effect
     end
   end
 end

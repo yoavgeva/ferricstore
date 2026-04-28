@@ -355,15 +355,14 @@ defmodule Ferricstore.Raft.StateMachineTest do
       result =
         Enum.reduce(1..4, state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          apply_result = StateMachine.apply(meta, {:put, "rc_key_#{i}", "v#{i}", 0}, acc)
+          {new_state, {:applied_at, _, :ok}, effects} =
+            StateMachine.apply(meta, {:put, "rc_key_#{i}", "v#{i}", 0}, acc)
 
-          case apply_result do
-            {new_state, :ok} ->
-              new_state
-
-            {_new_state, :ok, _effects} ->
-              flunk("release_cursor emitted before interval reached at apply #{i}")
+          if Enum.any?(effects, &match?({:release_cursor, _, _}, &1)) do
+            flunk("release_cursor emitted before interval reached at apply #{i}")
           end
+
+          new_state
         end)
 
       assert result.applied_count == 4
@@ -384,7 +383,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state_before =
         Enum.reduce(1..(interval - 1), state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          {new_state, :ok} = StateMachine.apply(meta, {:put, "rc_#{i}", "v#{i}", 0}, acc)
+          {new_state, {:applied_at, _, :ok}, _effects} = StateMachine.apply(meta, {:put, "rc_#{i}", "v#{i}", 0}, acc)
           new_state
         end)
 
@@ -393,13 +392,14 @@ defmodule Ferricstore.Raft.StateMachineTest do
       # The N-th apply (index = interval) should emit release_cursor
       meta = %{index: interval, term: 1, system_time: System.os_time(:millisecond)}
 
-      {new_state, :ok, effects} =
+      {new_state, {:applied_at, _, :ok}, effects} =
         StateMachine.apply(meta, {:put, "rc_#{interval}", "v#{interval}", 0}, state_before)
 
       assert new_state.applied_count == interval
 
       # Verify the release_cursor effect
-      assert [{:release_cursor, ra_index, cursor_state}] = effects
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
+      assert {:release_cursor, ra_index, cursor_state} = cursor_effect
       assert ra_index == interval
       assert cursor_state.shard_index == 0
       assert cursor_state.applied_count == interval
@@ -420,15 +420,15 @@ defmodule Ferricstore.Raft.StateMachineTest do
       {_final_state, cursor_indices} =
         Enum.reduce(1..9, {state, []}, fn i, {acc, cursors} ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          apply_result = StateMachine.apply(meta, {:put, "mc_#{i}", "v#{i}", 0}, acc)
+          {new_state, {:applied_at, _, :ok}, effects} =
+            StateMachine.apply(meta, {:put, "mc_#{i}", "v#{i}", 0}, acc)
 
-          case apply_result do
-            {new_state, :ok} ->
-              {new_state, cursors}
+          cursor_idx = Enum.find_value(effects, fn
+            {:release_cursor, idx, _snap} -> idx
+            _ -> nil
+          end)
 
-            {new_state, :ok, [{:release_cursor, idx, _snap_state}]} ->
-              {new_state, cursors ++ [idx]}
-          end
+          if cursor_idx, do: {new_state, cursors ++ [cursor_idx]}, else: {new_state, cursors}
         end)
 
       assert cursor_indices == [3, 6, 9]
@@ -447,16 +447,17 @@ defmodule Ferricstore.Raft.StateMachineTest do
 
       # Put two keys (applied_count = 2), then delete at the 3rd apply
       meta1 = %{index: 10, term: 1, system_time: System.os_time(:millisecond)}
-      {s1, :ok} = StateMachine.apply(meta1, {:put, "del_rc_a", "va", 0}, state)
+      {s1, {:applied_at, _, :ok}, _e1} = StateMachine.apply(meta1, {:put, "del_rc_a", "va", 0}, state)
 
       meta2 = %{index: 11, term: 1, system_time: System.os_time(:millisecond)}
-      {s2, :ok} = StateMachine.apply(meta2, {:put, "del_rc_b", "vb", 0}, s1)
+      {s2, {:applied_at, _, :ok}, _e2} = StateMachine.apply(meta2, {:put, "del_rc_b", "vb", 0}, s1)
 
       # 3rd command is a delete -- should trigger release_cursor
       meta3 = %{index: 12, term: 1, system_time: System.os_time(:millisecond)}
-      {_s3, :ok, effects} = StateMachine.apply(meta3, {:delete, "del_rc_a"}, s2)
+      {_s3, {:applied_at, _, :ok}, effects} = StateMachine.apply(meta3, {:delete, "del_rc_a"}, s2)
 
-      assert [{:release_cursor, 12, _cursor_state}] = effects
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
+      assert {:release_cursor, 12, _cursor_state} = cursor_effect
     end
 
     test "release_cursor emitted for batch that crosses interval boundary", %{
@@ -477,7 +478,7 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state_before =
         Enum.reduce(1..3, state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          {new_state, :ok} = StateMachine.apply(meta, {:put, "pre_#{i}", "v#{i}", 0}, acc)
+          {new_state, {:applied_at, _, :ok}, _e} = StateMachine.apply(meta, {:put, "pre_#{i}", "v#{i}", 0}, acc)
           new_state
         end)
 
@@ -491,21 +492,14 @@ defmodule Ferricstore.Raft.StateMachineTest do
       ]
 
       meta = %{index: 4, term: 1, system_time: System.os_time(:millisecond)}
-      result = StateMachine.apply(meta, {:batch, batch}, state_before)
 
-      case result do
-        {new_state, {:ok, results}, effects} ->
-          assert results == [:ok, :ok, :ok]
-          assert new_state.applied_count == 6
-          assert [{:release_cursor, 4, _cursor_state}] = effects
+      {new_state, {:applied_at, _, {:ok, results}}, effects} =
+        StateMachine.apply(meta, {:batch, batch}, state_before)
 
-        {new_state, {:ok, results}} ->
-          # If batch doesn't cross, that's a bug -- fail
-          flunk(
-            "Expected release_cursor for batch crossing interval. " <>
-              "applied_count=#{new_state.applied_count}, results=#{inspect(results)}"
-          )
-      end
+      assert results == [:ok, :ok, :ok]
+      assert new_state.applied_count == 6
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
+      assert {:release_cursor, 4, _cursor_state} = cursor_effect
     end
 
     test "release_cursor not emitted when meta has no index", %{state: state} do
@@ -543,13 +537,16 @@ defmodule Ferricstore.Raft.StateMachineTest do
       state_after =
         Enum.reduce(1..2, state, fn i, acc ->
           meta = %{index: i, term: 1, system_time: System.os_time(:millisecond)}
-          {new_state, :ok} = StateMachine.apply(meta, {:put, "snap_#{i}", "v#{i}", 0}, acc)
+          {new_state, {:applied_at, _, :ok}, _e} = StateMachine.apply(meta, {:put, "snap_#{i}", "v#{i}", 0}, acc)
           new_state
         end)
 
       meta = %{index: 3, term: 1, system_time: System.os_time(:millisecond)}
-      {_new_state, :ok, [{:release_cursor, 3, cursor_state}]} =
+      {_new_state, {:applied_at, _, :ok}, effects} =
         StateMachine.apply(meta, {:put, "snap_3", "v3", 0}, state_after)
+
+      cursor_effect = Enum.find(effects, &match?({:release_cursor, _, _}, &1))
+      assert {:release_cursor, 3, cursor_state} = cursor_effect
 
       # The snapshot state should reflect the current state
       assert cursor_state.shard_index == 2

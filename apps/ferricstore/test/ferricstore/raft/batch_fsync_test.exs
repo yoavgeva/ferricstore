@@ -33,7 +33,7 @@ defmodule Ferricstore.Raft.BatchFsyncTest do
         :ra.process_command(shard_id, {:batch, batch_commands}, %{reply_from: :local, timeout: 10_000})
       end)
 
-    assert {:ok, individual_results} = results
+    {:applied_at, _idx, {:ok, individual_results}} = results
     assert length(individual_results) == 20
 
     # Measure: 20 individual writes to the same shard (each its own Raft command + fsync)
