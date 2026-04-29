@@ -605,9 +605,22 @@ defmodule Ferricstore.Raft.Batcher do
   defp unwrap_applied({:applied_at, ra_index, real_result}), do: {ra_index, real_result}
   defp unwrap_applied(other), do: {0, other}
 
-  # Reply now if the local state machine has already applied at this index;
-  # otherwise queue and reply when `:locally_applied` catches up. ra_index = 0
-  # means the result wasn't wrapped (legacy WAL entry) — reply immediately.
+  # Reply now if:
+  #   1. ra_index = 0 (legacy WAL entry, no wrap), or
+  #   2. local SM has already applied at this index, or
+  #   3. all callers are LOCAL — the gate exists to prevent read-your-write
+  #      violations across leader redirects (cross-node case). When the
+  #      caller's pid is on this node, the application is already on the same
+  #      node as the local SM; ra's `:applied` event arriving here means the
+  #      local SM has applied (we're the leader) or will apply via normal ra
+  #      replication. Either way the local caller observing :ok will then
+  #      issue subsequent reads to the same node, and the SM applies before
+  #      reads have a chance to interleave (apply runs on the ra dirty thread,
+  #      reply runs on this Batcher process — ordered by ra's mailbox).
+  #
+  # The cross-node case (caller is on a different node) STILL goes through the
+  # waiter queue: the leader's Batcher tags the reply via maybe_wrap_remote,
+  # and the originating node's Router barriers via await_local_applied.
   defp gate_reply(state, 0, kind, froms, result) do
     do_reply(kind, froms, result, 0)
     state
@@ -620,8 +633,24 @@ defmodule Ferricstore.Raft.Batcher do
   end
 
   defp gate_reply(state, ra_index, kind, froms, result) do
-    waiter = {ra_index, kind, froms, result}
-    %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}
+    if all_local_callers?(froms) do
+      do_reply(kind, froms, result, ra_index)
+      state
+    else
+      waiter = {ra_index, kind, froms, result}
+      %{state | local_apply_waiters: [waiter | state.local_apply_waiters]}
+    end
+  end
+
+  # All caller pids belong to this node — no read-your-write barrier needed
+  # because the caller will issue subsequent reads on this same node where
+  # the local SM apply happens-before-or-after this reply via the ra mailbox.
+  defp all_local_callers?(froms) do
+    Enum.all?(froms, fn
+      {pid, _ref} when is_pid(pid) -> node(pid) == node()
+      {:batch_from, {pid, _ref}, _count} when is_pid(pid) -> node(pid) == node()
+      _ -> false
+    end)
   end
 
   # When the caller is on a different node, it was forwarded by
