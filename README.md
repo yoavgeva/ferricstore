@@ -1,3 +1,14 @@
+# Archived: FerricStore Moved
+
+This repository is archived and no longer maintained.
+
+FerricStore has moved to:
+
+https://github.com/ferricstore/ferricstore
+
+Please use the new repository for issues, pull requests, releases, and
+documentation.
+
 # FerricStore
 
 [![Hex.pm](https://img.shields.io/hexpm/v/ferricstore.svg)](https://hex.pm/packages/ferricstore)
